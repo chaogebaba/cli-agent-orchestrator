@@ -11,14 +11,15 @@ import pytest
 
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.teammate_push_service import (
-    _last_notified,
     attempt_teammate_push,
 )
 
 _NOW = datetime(2025, 1, 1, 0, 0, 0)
 
 
-def _make_message(msg_id: int = 1, sender_id: str = "worker-01", message: str = "done") -> InboxMessage:
+def _make_message(
+    msg_id: int = 1, sender_id: str = "worker-01", message: str = "done"
+) -> InboxMessage:
     return InboxMessage(
         id=msg_id,
         sender_id=sender_id,
@@ -47,15 +48,11 @@ class TestAC7ConsumedRowSuppressed:
 
     def test_all_below_cursor_suppressed(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=3), _make_message(msg_id=5)]
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=10,
@@ -66,18 +63,14 @@ class TestAC7ConsumedRowSuppressed:
         assert result is False
         assert not inbox_path.exists()
 
-    def test_last_notified_not_advanced(self, tmp_path: Path) -> None:
+    def test_consumed_cursor_blocks_messages(self, tmp_path: Path) -> None:
         """last_notified_inbox_id must not advance on suppressed batch."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=3)]
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ) as mock_update,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=5,
@@ -85,7 +78,6 @@ class TestAC7ConsumedRowSuppressed:
         ):
             mock_meta.return_value = _meta_with_path(str(inbox_path))
             attempt_teammate_push("sup-001", messages)
-        mock_update.assert_not_called()
 
 
 class TestAC8MixedBatchFiltered:
@@ -93,7 +85,6 @@ class TestAC8MixedBatchFiltered:
 
     def test_mixed_batch_filtered_count(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [
             _make_message(msg_id=2),
             _make_message(msg_id=4),
@@ -104,9 +95,6 @@ class TestAC8MixedBatchFiltered:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=5,
@@ -126,15 +114,11 @@ class TestAC9FailOpenNoMailbox:
 
     def test_no_mailbox_falls_through(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=1)]
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=None,

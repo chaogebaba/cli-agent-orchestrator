@@ -27,7 +27,6 @@ from cli_agent_orchestrator.services.teammate_push_service import (
     _TEXT_PREVIEW_CHARS,
     _acquire_lockfile,
     _build_entry,
-    _last_notified,
     _release_lockfile,
     _resolve_inbox_path,
     _should_teammate_push,
@@ -121,8 +120,6 @@ class TestAC2FlagOnWellFormedEntry:
         messages = [_make_message(msg_id=5, sender_id="kiro_dev", message="Gate passed")]
 
         # Clear in-memory dedup state.
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
@@ -130,9 +127,6 @@ class TestAC2FlagOnWellFormedEntry:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ) as mock_update,
         ):
             mock_cfg.get.return_value = True
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
@@ -161,13 +155,10 @@ class TestAC2FlagOnWellFormedEntry:
     def test_from_field_is_cao_bridge(self, tmp_path: Path) -> None:
         """The `from` field must always be 'cao-bridge'."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1, sender_id="grok_dev")]
@@ -184,13 +175,10 @@ class TestAC3WriteFailureGracefulFallback:
         """Non-existent parent dir that can't be created → graceful failure."""
         # Use a path under /proc (Linux) which can't have dirs created.
         inbox_path = Path("/proc/fake_cao_test/inbox.json")
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -203,13 +191,10 @@ class TestAC3WriteFailureGracefulFallback:
         """Corrupt JSON in existing inbox file → graceful failure."""
         inbox_path = tmp_path / "inbox.json"
         inbox_path.write_text("NOT VALID JSON {{{", encoding="utf-8")
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -221,13 +206,10 @@ class TestAC3WriteFailureGracefulFallback:
         """Inbox file contains JSON object (not array) → abort write."""
         inbox_path = tmp_path / "inbox.json"
         inbox_path.write_text('{"not": "an array"}', encoding="utf-8")
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -244,16 +226,11 @@ class TestAC3WriteFailureGracefulFallback:
         inbox_path.write_text("[]", encoding="utf-8")
         # Make directory read-only so tempfile creation fails.
         inbox_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
-        _last_notified.clear()
-
         try:
             with (
                 patch(
                     "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
                 ) as mock_meta,
-                patch(
-                    "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-                ),
             ):
                 mock_meta.return_value = _metadata_with_path(str(inbox_path))
                 messages = [_make_message(msg_id=1)]
@@ -334,13 +311,10 @@ class TestAC5StaleInboxPath:
         stale_path = tmp_path / "old-session" / "gone" / "team-lead.json"
         # Don't create the directory → mkdir will succeed (graceful), but let's use
         # a path under /proc to truly prevent creation.
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path("/proc/no_such_cao_path/inbox.json")
             messages = [_make_message(msg_id=1)]
@@ -387,13 +361,10 @@ class TestAC7PullSettlementUnchanged:
         """Messages stay PENDING after bridge write — only ack settles them."""
         inbox_path = tmp_path / "inbox.json"
         messages = [_make_message(msg_id=10, sender_id="worker-01")]
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
@@ -407,31 +378,29 @@ class TestSHOULD2DedupPersistence:
     """SHOULD-2 — Dedup via last_notified_inbox_id persistence."""
 
     def test_dedup_skips_already_notified(self, tmp_path: Path) -> None:
-        """Messages with id <= last_notified_inbox_id are skipped."""
+        """F476: Client-side dedup removed; consumption cursor blocks old messages."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
-        _last_notified["sup-001"] = 5  # Already notified up to id 5.
-
         messages = [_make_message(msg_id=3), _make_message(msg_id=5)]
 
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
+                return_value=5,  # consumed through 5
+            ),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
 
-        # No new messages → no write.
+        # All messages at or below consumption cursor → no write.
         assert result is False
         assert not inbox_path.exists()
 
     def test_dedup_allows_newer_messages(self, tmp_path: Path) -> None:
         """Messages with id > last_notified_inbox_id are notified."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
-        _last_notified["sup-001"] = 5
 
         messages = [_make_message(msg_id=3), _make_message(msg_id=6)]
 
@@ -439,7 +408,6 @@ class TestSHOULD2DedupPersistence:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
@@ -449,26 +417,25 @@ class TestSHOULD2DedupPersistence:
         assert len(entries) == 1
 
     def test_persists_high_water_mark(self, tmp_path: Path) -> None:
-        """After successful push, last_notified_inbox_id is persisted."""
+        """F476: push no longer persists last_notified; test consumption cursor dedup."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ) as mock_update,
+                "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
+                return_value=0,
+            ),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=7), _make_message(msg_id=9)]
-            attempt_teammate_push("sup-001", messages)
+            result = attempt_teammate_push("sup-001", messages)
 
-        # In-memory state should be updated.
-        assert _last_notified["sup-001"] == 9
-        # Dedicated column setter should have been called with id=9.
-        mock_update.assert_called_once_with("sup-001", 9)
+        # Push succeeds
+        assert result is True
+        # F476: _last_notified no longer populated by the push path
+        # Dedicated column setter is no longer called (it's a stub)
 
 
 class TestWriteInboxAppend:
@@ -554,8 +521,6 @@ class TestOnInsertConfigGateBypass:
     def test_push_succeeds_when_config_flag_false(self, tmp_path: Path) -> None:
         """Flag OFF still writes a CC inbox entry on insert (proves the bypass)."""
         inbox_path = tmp_path / "teams" / "session-abc" / "inboxes" / "team-lead.json"
-        _last_notified.clear()
-
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
@@ -563,9 +528,6 @@ class TestOnInsertConfigGateBypass:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
         ):
             mock_cfg.get.return_value = False
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
@@ -580,18 +542,11 @@ class TestOnInsertConfigGateBypass:
     def test_returns_false_when_no_inbox_path_in_metadata(self, tmp_path: Path) -> None:
         """No cc_team_inbox_path in metadata → validation blocks the push."""
         inbox_path = tmp_path / "should_not_exist" / "inbox.json"
-        _last_notified.clear()
-
         with (
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
-            ),
+            patch("cli_agent_orchestrator.services.teammate_push_service.ConfigService"),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
         ):
             mock_meta.return_value = _metadata_without_path()
             result = attempt_teammate_push_on_insert("sup-001", [_make_message(msg_id=5)])
@@ -602,18 +557,11 @@ class TestOnInsertConfigGateBypass:
     def test_returns_false_on_empty_messages(self, tmp_path: Path) -> None:
         """Empty messages list → early-out, no write."""
         inbox_path = tmp_path / "should_not_exist" / "inbox.json"
-        _last_notified.clear()
-
         with (
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
-            ),
+            patch("cli_agent_orchestrator.services.teammate_push_service.ConfigService"),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
-            ),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push_on_insert("sup-001", [])
@@ -624,12 +572,8 @@ class TestOnInsertConfigGateBypass:
     def test_returns_false_on_empty_string_terminal_id(self, tmp_path: Path) -> None:
         """Empty terminal_id → early-out, no write (guards the truthiness guard)."""
         inbox_path = tmp_path / "should_not_exist" / "inbox.json"
-        _last_notified.clear()
-
         with (
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
-            ),
+            patch("cli_agent_orchestrator.services.teammate_push_service.ConfigService"),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,

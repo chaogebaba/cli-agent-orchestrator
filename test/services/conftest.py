@@ -1,7 +1,8 @@
 """Deterministic Kiro probe fixture for terminal-service unit lifecycles."""
 
-import pytest
 from unittest.mock import AsyncMock
+
+import pytest
 
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities
 
@@ -47,8 +48,6 @@ def mock_confirm_launch_health(request, monkeypatch):
     )
 
 
-
-
 # --- F165: Shared real-sqlite fixture for daemon end-to-end tests -------------
 
 
@@ -60,10 +59,11 @@ def real_sqlite_env(tmp_path, monkeypatch):
     and seeds only what each test declares. No production code changes for this
     fixture — a shared fixture plus tests only.
     """
-    import cli_agent_orchestrator.clients.database as db_mod
-    from cli_agent_orchestrator.clients.database import Base
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+
+    import cli_agent_orchestrator.clients.database as db_mod
+    from cli_agent_orchestrator.clients.database import Base
 
     # A fresh DB is only half of a fresh environment: several services keep
     # process-global high-water/dedup caches that shadow DB columns and are
@@ -74,12 +74,9 @@ def real_sqlite_env(tmp_path, monkeypatch):
         delivery_service,
         doorbell_service,
         inbox_service,
-        teammate_push_service,
     )
 
     _shadow_caches = (
-        teammate_push_service._last_notified,
-        doorbell_service._last_doorbell_row_id,
         doorbell_service._last_warn_time,
         inbox_service._failure_streaks,
         delivery_service._health_warning_dedup,

@@ -14,9 +14,7 @@ class TestSupervisorPendingSentinel:
         """touch creates the sentinel file at CAO_HOME_DIR / supervisor-pending.flag."""
         from cli_agent_orchestrator.clients.database import _touch_supervisor_pending_flag
 
-        with patch(
-            "cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path
-        ):
+        with patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path):
             _touch_supervisor_pending_flag()
 
         assert (tmp_path / "supervisor-pending.flag").exists()
@@ -25,9 +23,7 @@ class TestSupervisorPendingSentinel:
         """Repeated touches don't raise."""
         from cli_agent_orchestrator.clients.database import _touch_supervisor_pending_flag
 
-        with patch(
-            "cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path
-        ):
+        with patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path):
             _touch_supervisor_pending_flag()
             _touch_supervisor_pending_flag()
 
@@ -39,9 +35,7 @@ class TestSupervisorPendingSentinel:
 
         # Point at a non-existent deep path so touch raises
         fake_dir = tmp_path / "no" / "such" / "dir"
-        with patch(
-            "cli_agent_orchestrator.constants.CAO_HOME_DIR", fake_dir
-        ):
+        with patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", fake_dir):
             # Should not raise
             _touch_supervisor_pending_flag()
 
@@ -51,9 +45,7 @@ class TestSupervisorPendingSentinel:
             _remove_supervisor_pending_flag_if_drained,
         )
 
-        with patch(
-            "cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path
-        ):
+        with patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path):
             # Should not raise, should not create the file
             _remove_supervisor_pending_flag_if_drained()
 
@@ -70,15 +62,17 @@ class TestSupervisorPendingSentinel:
 
         mock_db = MagicMock()
         # New query pattern: .filter(...).join(...).order_by(...).first()
-        mock_db.query.return_value.filter.return_value.join.return_value.order_by.return_value.first.return_value = None
+        mock_db.query.return_value.filter.return_value.join.return_value.order_by.return_value.first.return_value = (
+            None
+        )
         # Fallback path: .filter(...).order_by(...).first()
-        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
+            None
+        )
 
         with (
             patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path),
-            patch(
-                "cli_agent_orchestrator.clients.database.SessionLocal"
-            ) as mock_session_cls,
+            patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session_cls,
         ):
             mock_session_cls.return_value.__enter__ = MagicMock(return_value=mock_db)
             mock_session_cls.return_value.__exit__ = MagicMock(return_value=False)
@@ -106,9 +100,7 @@ class TestSupervisorPendingSentinel:
 
         with (
             patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path),
-            patch(
-                "cli_agent_orchestrator.clients.database.SessionLocal"
-            ) as mock_session_cls,
+            patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session_cls,
         ):
             mock_session_cls.return_value.__enter__ = MagicMock(return_value=mock_db)
             mock_session_cls.return_value.__exit__ = MagicMock(return_value=False)
@@ -161,7 +153,9 @@ class TestSupervisorPendingSentinel:
         assert (tmp_path / "supervisor-pending.flag").exists()
 
 
-@pytest.mark.xfail(reason="F136 retires legacy teammate_push structured logging (D1: single writer)")
+@pytest.mark.xfail(
+    reason="F136 retires legacy teammate_push structured logging (D1: single writer)"
+)
 class TestTeammatePushObservability:
     """Tests for structured logging in attempt_teammate_push."""
 
@@ -182,15 +176,8 @@ class TestTeammatePushObservability:
                 return_value=Path("/tmp/test-inbox"),
             ),
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service._get_last_notified_id",
-                return_value=0,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.teammate_push_service._write_inbox_entry",
                 return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._persist_last_notified_id",
             ),
             caplog.at_level(logging.INFO),
         ):
@@ -219,10 +206,6 @@ class TestTeammatePushObservability:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._resolve_inbox_path",
                 return_value=Path("/tmp/test-inbox"),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._get_last_notified_id",
-                return_value=0,
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._write_inbox_entry",
@@ -260,7 +243,5 @@ class TestTeammatePushObservability:
 
         assert result is False
         assert any("teammate_push_outcome" in r.message for r in caplog.records)
-        no_inbox_record = next(
-            r for r in caplog.records if "teammate_push_outcome" in r.message
-        )
+        no_inbox_record = next(r for r in caplog.records if "teammate_push_outcome" in r.message)
         assert no_inbox_record.event == "teammate_push_no_inbox"  # type: ignore[attr-defined]

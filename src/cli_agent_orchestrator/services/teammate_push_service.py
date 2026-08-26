@@ -23,9 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import (
     get_mailbox_consumption_cursor,
-    get_terminal_last_notified_inbox_id,
     get_terminal_metadata,
-    set_terminal_last_notified_inbox_id,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -53,8 +51,7 @@ _LOCK_BACKOFF_MIN_MS = 5
 _LOCK_BACKOFF_MAX_MS = 50
 _LOCK_STALE_SECONDS = 5.0
 
-# In-memory dedup high-water per terminal (legacy SHOULD-2 fallback).
-_last_notified: Dict[str, int] = {}
+# F476 D5: Legacy in-memory dedup high-water removed — wake dedup is server-side.
 
 
 # ---------------------------------------------------------------------------
@@ -256,9 +253,7 @@ def _acquire_lockfile_deadline(lock_path: Path, deadline_mono: float | None) -> 
                     except FileNotFoundError:
                         pass
                     try:
-                        fd = os.open(
-                            str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
-                        )
+                        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
                     except FileExistsError:
                         _backoff_deadline(deadline_mono)
                         continue
@@ -266,10 +261,7 @@ def _acquire_lockfile_deadline(lock_path: Path, deadline_mono: float | None) -> 
                     try:
                         fd_stat = os.fstat(fd)
                         path_stat = os.stat(str(lock_path))
-                        if (
-                            fd_stat.st_ino != path_stat.st_ino
-                            or fd_stat.st_dev != path_stat.st_dev
-                        ):
+                        if fd_stat.st_ino != path_stat.st_ino or fd_stat.st_dev != path_stat.st_dev:
                             os.close(fd)
                             _backoff_deadline(deadline_mono)
                             continue
@@ -393,30 +385,14 @@ def _derive_cc_team_inbox_path(working_directory: str) -> Optional[Path]:
         return None
 
 
-def _get_last_notified_id(terminal_id: str) -> int:
-    """Read last_notified_inbox_id from dedicated DB column (F175: clobber-proof).
-
-    Falls back to in-memory dict for hot-path speed when DB has no value yet.
-    """
-    try:
-        stored = get_terminal_last_notified_inbox_id(terminal_id)
-        if stored > 0:
-            return stored
-    except Exception:
-        pass
-    return _last_notified.get(terminal_id, 0)
-
-
-def _persist_last_notified_id(terminal_id: str, message_id: int) -> None:
-    """Persist last_notified_inbox_id in dedicated DB column (F175: clobber-proof)."""
-    _last_notified[terminal_id] = message_id
-    try:
-        set_terminal_last_notified_inbox_id(terminal_id, message_id)
-    except Exception as e:
-        logger.debug(f"teammate_push: best-effort persist failed for {terminal_id}: {e}")
-
-
-def _build_entry(worker_name: str, message_preview: str, msg_count: int, *, mailbox_id: str = "", first_row_id: int = 0) -> Dict[str, Any]:
+def _build_entry(
+    worker_name: str,
+    message_preview: str,
+    msg_count: int,
+    *,
+    mailbox_id: str = "",
+    first_row_id: int = 0,
+) -> Dict[str, Any]:
     """Build a CC inbox entry per the pinned schema (msgV:1).
 
     F175: msg_id is deterministic from (mailbox_id, first_row_id) when provided,
@@ -534,7 +510,9 @@ class PushOutcome:
     message_ids: tuple  # diagnostic only (N1)
 
 
-def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage], *, mailbox_id: str = "") -> PushOutcome:
+def attempt_teammate_push_reported(
+    terminal_id: str, messages: List[InboxMessage], *, mailbox_id: str = ""
+) -> PushOutcome:
     """Push a notification entry to the CC native inbox with structured outcome.
 
     Contains the body formerly in attempt_teammate_push, with each early return
@@ -546,10 +524,8 @@ def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage
     inbox_path = _resolve_inbox_path(terminal_id)
     if inbox_path is None:
         return PushOutcome(pushed=False, reason="no_inbox_path", message_ids=ids)
-    last_notified_id = _get_last_notified_id(terminal_id)
-    new_messages = [m for m in messages if m.id > last_notified_id]
-    if not new_messages:
-        return PushOutcome(pushed=False, reason="already_notified", message_ids=ids)
+    # F476 D5: legacy dedup removed — wake dedup is server-side.
+    new_messages = list(messages)
     # D3 (fx157): send-time recount against consumption cursor
     cursor = get_mailbox_consumption_cursor(terminal_id)
     if cursor is not None:
@@ -561,13 +537,14 @@ def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage
     message_preview = first_msg.message.split("\n", 1)[0] if first_msg.message else ""
     # F175: derive mailbox_id for deterministic msg_id when not explicitly passed
     _mbid = mailbox_id or getattr(first_msg, "logical_receiver_id", "") or ""
-    entry = _build_entry(worker_name, message_preview, len(new_messages),
-                         mailbox_id=_mbid, first_row_id=first_msg.id)
+    entry = _build_entry(
+        worker_name, message_preview, len(new_messages), mailbox_id=_mbid, first_row_id=first_msg.id
+    )
     success = _write_inbox_entry(inbox_path, entry)
     if success:
-        max_id = max(m.id for m in new_messages)
-        _persist_last_notified_id(terminal_id, max_id)
-        return PushOutcome(pushed=True, reason="pushed", message_ids=tuple(m.id for m in new_messages))
+        return PushOutcome(
+            pushed=True, reason="pushed", message_ids=tuple(m.id for m in new_messages)
+        )
     return PushOutcome(pushed=False, reason="write_failed", message_ids=ids)
 
 
@@ -621,10 +598,7 @@ def mark_cc_inbox_entries_read(
     inbox_path = inbox_path.resolve()
 
     # Build set of msg_ids to mark read
-    target_msg_ids = {
-        callback_notification_id(mailbox_id, row_id)
-        for row_id in acked_row_ids
-    }
+    target_msg_ids = {callback_notification_id(mailbox_id, row_id) for row_id in acked_row_ids}
 
     lock_path = Path(str(inbox_path) + ".lock")
     fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 2.0)

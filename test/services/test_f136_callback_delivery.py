@@ -117,7 +117,9 @@ class TestAC8Idempotency:
         msg2 = _msg(1, text="different version")
         # Use different created_at to create a content mismatch
         msg2 = InboxMessage(
-            id=1, sender_id="worker-01", receiver_id="sup-001",
+            id=1,
+            sender_id="worker-01",
+            receiver_id="sup-001",
             message="different version",
             orchestration_type=OrchestrationType.SEND_MESSAGE,
             status=MessageStatus.PENDING,
@@ -183,9 +185,7 @@ class TestAC9CrashDurability:
         """Injected reconfirm fsync failure advances no progress."""
         inbox = tmp_path / "inbox.json"
         msg = _msg(1)
-        write_supervisor_callback_notification(
-            inbox_path=inbox, mailbox_id="mb_test", message=msg
-        )
+        write_supervisor_callback_notification(inbox_path=inbox, mailbox_id="mb_test", message=msg)
 
         with patch(
             "cli_agent_orchestrator.services.teammate_push_service._fsync_path",
@@ -215,7 +215,9 @@ class TestAC11HardCaps:
             # Write with a very short deadline
             deadline = time.monotonic() + 0.01
             r = write_supervisor_callback_notification(
-                inbox_path=inbox, mailbox_id="mb_test", message=_msg(1),
+                inbox_path=inbox,
+                mailbox_id="mb_test",
+                message=_msg(1),
                 deadline_mono=deadline,
             )
             assert r.kind == "retryable_failure"
@@ -366,8 +368,13 @@ class TestAC15BackoffMissingPath:
         # A no_path result from get_supervisor_callback_batch
         # is already tested structurally — verify the constant exists
         result = CallbackBatchResult(
-            kind="no_path", rows=(), has_more=False, cursor=5,
-            inbox_path=None, path_version=0, bootstrap_mode=None,
+            kind="no_path",
+            rows=(),
+            has_more=False,
+            cursor=5,
+            inbox_path=None,
+            path_version=0,
+            bootstrap_mode=None,
             reason="no_inbox_path_configured",
         )
         assert result.kind == "no_path"
@@ -513,16 +520,16 @@ class TestMutationLedger:
 
     def test_m13_change_pinned_namespace_killed(self):
         """M13: Changing the pinned namespace breaks golden vector."""
-        assert callback_notification_id("mb_supervisor_main", 42) == \
-            "1c4526f7-c4e9-50e7-87c3-c6e1b8674bac"
+        assert (
+            callback_notification_id("mb_supervisor_main", 42)
+            == "1c4526f7-c4e9-50e7-87c3-c6e1b8674bac"
+        )
 
     def test_m14_remove_existing_entry_dedup_killed(self, tmp_path: Path):
         """M14: Without dedup, two writes would create two entries."""
         inbox = tmp_path / "inbox.json"
         msg = _msg(1)
-        write_supervisor_callback_notification(
-            inbox_path=inbox, mailbox_id="mb_test", message=msg
-        )
+        write_supervisor_callback_notification(inbox_path=inbox, mailbox_id="mb_test", message=msg)
         r = write_supervisor_callback_notification(
             inbox_path=inbox, mailbox_id="mb_test", message=msg
         )
@@ -533,9 +540,7 @@ class TestMutationLedger:
         """M15: Treating already_present as success without re-fsync is killed."""
         inbox = tmp_path / "inbox.json"
         msg = _msg(1)
-        write_supervisor_callback_notification(
-            inbox_path=inbox, mailbox_id="mb_test", message=msg
-        )
+        write_supervisor_callback_notification(inbox_path=inbox, mailbox_id="mb_test", message=msg)
         with patch(
             "cli_agent_orchestrator.services.teammate_push_service._fsync_path"
         ) as mock_fsync:
@@ -549,8 +554,12 @@ class TestMutationLedger:
         from cli_agent_orchestrator.clients.database import commit_supervisor_callback_progress
 
         r = commit_supervisor_callback_progress(
-            mailbox_id="mb_x", terminal_id="t", generation=1,
-            expected_cursor=10, new_cursor=5, expected_path_version=0,
+            mailbox_id="mb_x",
+            terminal_id="t",
+            generation=1,
+            expected_cursor=10,
+            new_cursor=5,
+            expected_path_version=0,
         )
         assert r.kind == "invalid_range"
 
@@ -566,7 +575,10 @@ class TestMutationLedger:
     def test_m22_admit_one_task_per_request_killed(self):
         """M22: Admitting one task per request is killed — O(1) admission."""
         from cli_agent_orchestrator.services.inbox_service import (
-            _delivery_seq_guard, _wake_states, request_delivery, inbox_service,
+            _delivery_seq_guard,
+            _wake_states,
+            request_delivery,
+            inbox_service,
         )
 
         terminal = "test-m22-" + uuid.uuid4().hex[:8]
@@ -587,7 +599,11 @@ class TestMutationLedger:
     def test_m23_fail_to_supersede_delayed_wake_killed(self):
         """M23: Failing to supersede delayed wake is killed."""
         from cli_agent_orchestrator.services.inbox_service import (
-            _WakeState, _delivery_seq_guard, _wake_states, request_delivery, inbox_service,
+            _WakeState,
+            _delivery_seq_guard,
+            _wake_states,
+            request_delivery,
+            inbox_service,
         )
 
         terminal = "test-m23-" + uuid.uuid4().hex[:8]
@@ -599,8 +615,10 @@ class TestMutationLedger:
             mock_handle = MagicMock()
             with _delivery_seq_guard:
                 _wake_states[terminal] = _WakeState(
-                    dirty_epoch=1, immediate_admitted=False,
-                    delayed_token=1, delayed_handle=mock_handle,
+                    dirty_epoch=1,
+                    immediate_admitted=False,
+                    delayed_token=1,
+                    delayed_handle=mock_handle,
                 )
             request_delivery(terminal)
             # Delayed handle must be cancelled
@@ -625,7 +643,10 @@ class TestMutationLedger:
         request_delivery never calls deliver_pending inline.
         """
         from cli_agent_orchestrator.services.inbox_service import (
-            _delivery_seq_guard, _wake_states, request_delivery, inbox_service,
+            _delivery_seq_guard,
+            _wake_states,
+            request_delivery,
+            inbox_service,
         )
 
         terminal = "test-m28-" + uuid.uuid4().hex[:8]
@@ -648,8 +669,10 @@ class TestMutationLedger:
 
         # With an invalid mailbox, it returns stale_authority not zero
         result = get_supervisor_callback_batch(
-            mailbox_id="mb_nonexist", terminal_id="t1",
-            generation=1, limit=10,
+            mailbox_id="mb_nonexist",
+            terminal_id="t1",
+            generation=1,
+            limit=10,
         )
         assert result.kind == "stale_authority"
 
@@ -692,23 +715,33 @@ def f136_db():
         cols = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
         col_names = {c["name"] for c in cols}
         if "callback_notified_through_id" not in col_names:
-            conn.execute(text("ALTER TABLE mailboxes ADD COLUMN callback_notified_through_id INTEGER"))
+            conn.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN callback_notified_through_id INTEGER")
+            )
         if "cc_inbox_path" not in col_names:
             conn.execute(text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT"))
         if "cc_inbox_path_version" not in col_names:
-            conn.execute(text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path_version INTEGER NOT NULL DEFAULT 0"))
-        tables = conn.execute(text(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'"
-        )).fetchall()
+            conn.execute(
+                text(
+                    "ALTER TABLE mailboxes ADD COLUMN cc_inbox_path_version INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+        tables = conn.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'"
+            )
+        ).fetchall()
         if not tables:
-            conn.execute(text(
-                "CREATE TABLE callback_replay_queue ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  mailbox_id TEXT NOT NULL,"
-                "  inbox_row_id INTEGER NOT NULL,"
-                "  queued_at DATETIME NOT NULL,"
-                "  UNIQUE(mailbox_id, inbox_row_id))"
-            ))
+            conn.execute(
+                text(
+                    "CREATE TABLE callback_replay_queue ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  mailbox_id TEXT NOT NULL,"
+                    "  inbox_row_id INTEGER NOT NULL,"
+                    "  queued_at DATETIME NOT NULL,"
+                    "  UNIQUE(mailbox_id, inbox_row_id))"
+                )
+            )
 
     return eng, Session
 
@@ -716,33 +749,60 @@ def f136_db():
 class TestDBBackedMutations:
     """Real SQLite integration tests for deferred mutation kills."""
 
-    def _seed_mailbox(self, session, mailbox_id="mb_sup", terminal_id="t1",
-                      generation=1, cursor=None, path="/tmp/inbox.json", path_version=0):
+    def _seed_mailbox(
+        self,
+        session,
+        mailbox_id="mb_sup",
+        terminal_id="t1",
+        generation=1,
+        cursor=None,
+        path="/tmp/inbox.json",
+        path_version=0,
+    ):
         from cli_agent_orchestrator.clients.database import MailboxModel
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
         mb = MailboxModel(
-            id=mailbox_id, session_name="test", role="supervisor",
-            current_terminal_id=terminal_id, generation=generation,
-            consumed_through_id=0, schema_version=1,
+            id=mailbox_id,
+            session_name="test",
+            role="supervisor",
+            current_terminal_id=terminal_id,
+            generation=generation,
+            consumed_through_id=0,
+            schema_version=1,
             callback_notified_through_id=cursor,
-            cc_inbox_path=path, cc_inbox_path_version=path_version,
-            created_at=now, updated_at=now,
+            cc_inbox_path=path,
+            cc_inbox_path_version=path_version,
+            created_at=now,
+            updated_at=now,
         )
         session.add(mb)
         session.flush()
         return mb
 
-    def _seed_inbox(self, session, row_id, mailbox_id="mb_sup", terminal_id="t1",
-                    generation=1, status="pending", logical=True):
+    def _seed_inbox(
+        self,
+        session,
+        row_id,
+        mailbox_id="mb_sup",
+        terminal_id="t1",
+        generation=1,
+        status="pending",
+        logical=True,
+    ):
         from cli_agent_orchestrator.clients.database import InboxModel
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
         row = InboxModel(
-            id=row_id, sender_id="worker-1", receiver_id=terminal_id,
+            id=row_id,
+            sender_id="worker-1",
+            receiver_id=terminal_id,
             logical_receiver_id=mailbox_id if logical else None,
             message=f"msg-{row_id}",
-            orchestration_type="send_message", status=status,
+            orchestration_type="send_message",
+            status=status,
             enqueue_generation=generation if logical else None,
             created_at=now,
         )
@@ -753,8 +813,10 @@ class TestDBBackedMutations:
     def test_m2_restore_legacy_pull_writer_random_id_killed(self, tmp_path):
         """M2: Legacy pull writer with random ID is killed — only deterministic writer exists."""
         from cli_agent_orchestrator.services.teammate_push_service import (
-            write_supervisor_callback_notification, callback_notification_id,
+            write_supervisor_callback_notification,
+            callback_notification_id,
         )
+
         inbox = tmp_path / "inbox.json"
         msg = _msg(1)
         write_supervisor_callback_notification(inbox_path=inbox, mailbox_id="mb_x", message=msg)
@@ -762,6 +824,7 @@ class TestDBBackedMutations:
         assert entries[0]["msg_id"] == callback_notification_id("mb_x", 1)
         # No random UUID4 in the written entry
         import uuid
+
         try:
             parsed = uuid.UUID(entries[0]["msg_id"])
             assert parsed.version == 5  # UUID5, not UUID4
@@ -775,6 +838,7 @@ class TestDBBackedMutations:
         from cli_agent_orchestrator.services.teammate_push_service import (
             write_supervisor_callback_notification,
         )
+
         inbox = tmp_path / "inbox.json"
         # No ConfigService mock needed — writer doesn't check any flag
         r = write_supervisor_callback_notification(
@@ -785,6 +849,7 @@ class TestDBBackedMutations:
     def test_m4_omit_id_gt_cursor_on_forward_stream_killed(self, f136_db):
         """M4: Forward stream without id > cursor would select already-notified rows."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=10)
@@ -797,101 +862,123 @@ class TestDBBackedMutations:
             db.commit()
 
             # Query forward rows manually
-            rows = db.execute(text(
-                "SELECT id FROM inbox WHERE logical_receiver_id = 'mb_sup' "
-                "AND receiver_id = 't1' AND enqueue_generation = 1 "
-                "AND status = 'pending' AND id > 10 ORDER BY id"
-            )).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT id FROM inbox WHERE logical_receiver_id = 'mb_sup' "
+                    "AND receiver_id = 't1' AND enqueue_generation = 1 "
+                    "AND status = 'pending' AND id > 10 ORDER BY id"
+                )
+            ).fetchall()
             assert [r[0] for r in rows] == [11, 15]
 
     def test_m5_omit_barrier_release_replay_enqueue_killed(self, f136_db):
         """M5: Barrier release without replay enqueue strands below-cursor rows."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=10)
             # Row 5 was HELD, now becomes PENDING below cursor
             self._seed_inbox(db, row_id=5, status="pending")
             # Simulate what cancel_callback_barrier does: enqueue replay
-            db.execute(text(
-                "INSERT OR IGNORE INTO callback_replay_queue "
-                "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
-            ))
+            db.execute(
+                text(
+                    "INSERT OR IGNORE INTO callback_replay_queue "
+                    "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
+                )
+            )
             db.commit()
             # Verify replay entry exists
-            count = db.execute(text(
-                "SELECT COUNT(*) FROM callback_replay_queue WHERE mailbox_id='mb_sup' AND inbox_row_id=5"
-            )).scalar()
+            count = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM callback_replay_queue WHERE mailbox_id='mb_sup' AND inbox_row_id=5"
+                )
+            ).scalar()
             assert count == 1
 
     def test_m6_omit_parked_reactivated_replay_enqueue_killed(self, f136_db):
         """M6: Parked row reactivated below cursor must enter replay."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=10)
             # Row 3 was PARKED, now reactivated to PENDING below cursor
             self._seed_inbox(db, row_id=3, status="pending")
-            db.execute(text(
-                "INSERT OR IGNORE INTO callback_replay_queue "
-                "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 3, datetime('now'))"
-            ))
+            db.execute(
+                text(
+                    "INSERT OR IGNORE INTO callback_replay_queue "
+                    "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 3, datetime('now'))"
+                )
+            )
             db.commit()
-            count = db.execute(text(
-                "SELECT COUNT(*) FROM callback_replay_queue WHERE inbox_row_id=3"
-            )).scalar()
+            count = db.execute(
+                text("SELECT COUNT(*) FROM callback_replay_queue WHERE inbox_row_id=3")
+            ).scalar()
             assert count == 1
 
     def test_m7_omit_path_change_replay_enqueue_killed(self, f136_db):
         """M7: Path change without replaying below-cursor rows is killed."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=10, path="/old/path")
             self._seed_inbox(db, row_id=7)
             self._seed_inbox(db, row_id=9)
             # Simulate path change: enqueue all current PENDING at/below cursor
-            below = db.execute(text(
-                "SELECT id FROM inbox WHERE logical_receiver_id='mb_sup' "
-                "AND status='pending' AND id <= 10"
-            )).fetchall()
+            below = db.execute(
+                text(
+                    "SELECT id FROM inbox WHERE logical_receiver_id='mb_sup' "
+                    "AND status='pending' AND id <= 10"
+                )
+            ).fetchall()
             for (rid,) in below:
-                db.execute(text(
-                    "INSERT OR IGNORE INTO callback_replay_queue "
-                    "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', :rid, datetime('now'))"
-                ), {"rid": rid})
+                db.execute(
+                    text(
+                        "INSERT OR IGNORE INTO callback_replay_queue "
+                        "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', :rid, datetime('now'))"
+                    ),
+                    {"rid": rid},
+                )
             db.commit()
-            count = db.execute(text(
-                "SELECT COUNT(*) FROM callback_replay_queue WHERE mailbox_id='mb_sup'"
-            )).scalar()
+            count = db.execute(
+                text("SELECT COUNT(*) FROM callback_replay_queue WHERE mailbox_id='mb_sup'")
+            ).scalar()
             assert count == 2  # Both rows 7 and 9
 
     def test_m8_allow_duplicate_replay_rows_killed(self, f136_db):
         """M8: Duplicate replay rows are rejected by UNIQUE constraint."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=10)
             self._seed_inbox(db, row_id=5)
-            db.execute(text(
-                "INSERT INTO callback_replay_queue "
-                "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
-            ))
+            db.execute(
+                text(
+                    "INSERT INTO callback_replay_queue "
+                    "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
+                )
+            )
             db.commit()
             # Second insert should be ignored (OR IGNORE)
-            db.execute(text(
-                "INSERT OR IGNORE INTO callback_replay_queue "
-                "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
-            ))
+            db.execute(
+                text(
+                    "INSERT OR IGNORE INTO callback_replay_queue "
+                    "(mailbox_id, inbox_row_id, queued_at) VALUES ('mb_sup', 5, datetime('now'))"
+                )
+            )
             db.commit()
-            count = db.execute(text(
-                "SELECT COUNT(*) FROM callback_replay_queue WHERE inbox_row_id=5"
-            )).scalar()
+            count = db.execute(
+                text("SELECT COUNT(*) FROM callback_replay_queue WHERE inbox_row_id=5")
+            ).scalar()
             assert count == 1
 
     def test_m9_bootstrap_across_stale_generations_killed(self, f136_db):
         """M9: Bootstrap must not select stale-generation rows."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             # Mailbox at generation 2, cursor NULL (needs bootstrap)
@@ -902,15 +989,18 @@ class TestDBBackedMutations:
             self._seed_inbox(db, row_id=5, generation=2)
             db.commit()
             # Bootstrap query: only gen=2 rows
-            min_id = db.execute(text(
-                "SELECT MIN(id) FROM inbox WHERE logical_receiver_id='mb_sup' "
-                "AND receiver_id='t1' AND enqueue_generation=2 AND status='pending'"
-            )).scalar()
+            min_id = db.execute(
+                text(
+                    "SELECT MIN(id) FROM inbox WHERE logical_receiver_id='mb_sup' "
+                    "AND receiver_id='t1' AND enqueue_generation=2 AND status='pending'"
+                )
+            ).scalar()
             assert min_id == 5  # Not 1 (stale gen)
 
     def test_m10_skip_legacy_raw_row_adoption_killed(self, f136_db):
         """M10: Legacy raw PENDING rows must be adopted into logical mailbox."""
         from sqlalchemy import text
+
         eng, Session = f136_db
         with Session() as db:
             self._seed_mailbox(db, cursor=0)
@@ -918,21 +1008,24 @@ class TestDBBackedMutations:
             self._seed_inbox(db, row_id=3, logical=False)
             db.commit()
             # Adoption: set logical_receiver_id
-            db.execute(text(
-                "UPDATE inbox SET logical_receiver_id='mb_sup', enqueue_generation=1 "
-                "WHERE id=3 AND logical_receiver_id IS NULL"
-            ))
+            db.execute(
+                text(
+                    "UPDATE inbox SET logical_receiver_id='mb_sup', enqueue_generation=1 "
+                    "WHERE id=3 AND logical_receiver_id IS NULL"
+                )
+            )
             db.commit()
-            adopted = db.execute(text(
-                "SELECT logical_receiver_id FROM inbox WHERE id=3"
-            )).scalar()
+            adopted = db.execute(text("SELECT logical_receiver_id FROM inbox WHERE id=3")).scalar()
             assert adopted == "mb_sup"
 
     def test_m11_leave_one_supervisor_producer_raw_killed(self):
         """M11: All supervisor producers must route logically."""
         # Verified by the routed helper existing and auto_responder/codex/watchdog using it
         from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
-        from cli_agent_orchestrator.services.teammate_push_service import attempt_teammate_push_on_insert
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            attempt_teammate_push_on_insert,
+        )
+
         # The retired function returns False — no raw supervisor writes
         assert attempt_teammate_push_on_insert("t1", [_msg(1)]) is False
 
@@ -956,11 +1049,16 @@ class TestDBBackedMutations:
     def test_m17_delete_replay_outside_atomic_progress_killed(self, f136_db):
         """M17: Replay deletion must be atomic with cursor advance."""
         from cli_agent_orchestrator.clients.database import commit_supervisor_callback_progress
+
         # commit_supervisor_callback_progress does both in one BEGIN IMMEDIATE
         # Testing: if the mailbox doesn't exist, NEITHER cursor nor replay changes
         result = commit_supervisor_callback_progress(
-            mailbox_id="mb_nonexist", terminal_id="t1", generation=1,
-            expected_cursor=5, new_cursor=10, expected_path_version=0,
+            mailbox_id="mb_nonexist",
+            terminal_id="t1",
+            generation=1,
+            expected_cursor=5,
+            new_cursor=10,
+            expected_path_version=0,
             replay_row_ids=(3, 4),
         )
         assert result.kind == "stale_authority"
@@ -969,12 +1067,18 @@ class TestDBBackedMutations:
     def test_m19_omit_path_version_cas_killed(self, f136_db):
         """M19: Stale path version must not advance cursor or drain replay."""
         from cli_agent_orchestrator.clients.database import (
-            commit_supervisor_callback_progress, MailboxModel, SessionLocal,
+            commit_supervisor_callback_progress,
+            MailboxModel,
+            SessionLocal,
         )
+
         # Use real DB through the module's engine
         result = commit_supervisor_callback_progress(
-            mailbox_id="mb_nonexist", terminal_id="t1", generation=1,
-            expected_cursor=5, new_cursor=10,
+            mailbox_id="mb_nonexist",
+            terminal_id="t1",
+            generation=1,
+            expected_cursor=5,
+            new_cursor=10,
             expected_path_version=99,  # Wrong version
         )
         # Fails on authority before reaching CAS, but the CAS is structurally present
@@ -983,9 +1087,13 @@ class TestDBBackedMutations:
     def test_m20_schedule_under_guard_killed(self):
         """M20: No scheduling occurs under _delivery_seq_guard."""
         from cli_agent_orchestrator.services.inbox_service import (
-            request_delivery, _delivery_seq_guard, _wake_states, inbox_service,
+            request_delivery,
+            _delivery_seq_guard,
+            _wake_states,
+            inbox_service,
         )
         from unittest.mock import MagicMock
+
         terminal = "test-m20-guard"
         mock_loop = MagicMock()
         mock_loop.is_closed.return_value = False
@@ -1004,8 +1112,11 @@ class TestDBBackedMutations:
     def test_m24_restore_lock_loser_sequence_increment_killed(self):
         """M24: Lock-loser does not mutate wake state — dirty_epoch handles it."""
         from cli_agent_orchestrator.services.inbox_service import (
-            _WakeState, _delivery_seq_guard, _wake_states,
+            _WakeState,
+            _delivery_seq_guard,
+            _wake_states,
         )
+
         terminal = "test-m24"
         with _delivery_seq_guard:
             _wake_states[terminal] = _WakeState(dirty_epoch=5, immediate_admitted=True)
@@ -1013,6 +1124,7 @@ class TestDBBackedMutations:
         # The holder will see the epoch mismatch and rerun
         from cli_agent_orchestrator.services.inbox_service import request_delivery, inbox_service
         from unittest.mock import MagicMock
+
         mock_loop = MagicMock()
         mock_loop.is_closed.return_value = False
         old_loop = inbox_service._delivery_loop
@@ -1035,6 +1147,7 @@ class TestDBBackedMutations:
         # The old code had: if wake_seq > captured_wake: return
         # F136 replaces this with dirty_epoch comparison in post-delivery
         from cli_agent_orchestrator.services.inbox_service import _WakeState
+
         state = _WakeState(dirty_epoch=10, holder_epoch=5)
         # dirty > holder means new work arrived — must rerun, not early-return
         assert state.dirty_epoch > state.holder_epoch
@@ -1046,7 +1159,9 @@ class TestDBBackedMutations:
         inbox = tmp_path / "inbox.json"
         # A very short deadline should cause lock_timeout
         r = write_supervisor_callback_notification(
-            inbox_path=inbox, mailbox_id="mb_test", message=_msg(1),
+            inbox_path=inbox,
+            mailbox_id="mb_test",
+            message=_msg(1),
             deadline_mono=0.0,  # Already expired
         )
         assert r.kind == "retryable_failure"
@@ -1073,18 +1188,19 @@ class TestForwardThroughput:
         assert len(entries) == 3
 
     def test_cursor_advances_through_gaps(self):
-        """The runner advances cursor through all forward rows regardless of gaps.
+        """F476: cursor advance is now atomic inside commit_wake, not per-row.
 
-        Structurally verified: inbox_service._f136_run_callback_delivery uses
-        `new_cursor = row.inbox_row_id` for every successful forward row.
+        Structurally verified: _f136_run_callback_delivery calls commit_wake
+        with through_id derived from the max forward row in the claim.
         """
         from cli_agent_orchestrator.services.inbox_service import InboxService
         import inspect
+
         src = inspect.getsource(InboxService._f136_run_callback_delivery)
-        # The fix: no `== new_cursor + 1` check
-        assert "new_cursor + 1" not in src
-        # The fix: unconditional advance
-        assert "new_cursor = row.inbox_row_id" in src
+        # F476: uses commit_wake for atomic cursor advance
+        assert "commit_wake(" in src
+        # F476: through_id computed from forward_high_water
+        assert "forward_high_water" in src
 
 
 # ===========================================================================
@@ -1101,16 +1217,23 @@ class TestProductionPathSmoke:
             create_logical_inbox_message,
             _create_logical_inbox_message_inner,
         )
+
         # Verify the wrapper delegates to the inner function via bytecode
         # (immune to source-file-on-disk races under xdist/worktree resets).
-        assert "_create_logical_inbox_message_inner" in create_logical_inbox_message.__code__.co_names
+        assert (
+            "_create_logical_inbox_message_inner" in create_logical_inbox_message.__code__.co_names
+        )
 
     def test_create_routed_inbox_message_importable(self):
         """create_routed_inbox_message is importable and callable."""
         from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+
         assert callable(create_routed_inbox_message)
 
     def test_set_supervisor_callback_inbox_path_importable(self):
         """set_supervisor_callback_inbox_path is importable."""
-        from cli_agent_orchestrator.services.mailbox_service import set_supervisor_callback_inbox_path
+        from cli_agent_orchestrator.services.mailbox_service import (
+            set_supervisor_callback_inbox_path,
+        )
+
         assert callable(set_supervisor_callback_inbox_path)

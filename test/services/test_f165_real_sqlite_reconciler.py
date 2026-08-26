@@ -86,10 +86,12 @@ class TestF165RealSqliteReconciler:
         # Patch ConfigService.get to enable the required flags
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-                "supervisor.teammate_push": True,
-            }.get(key, default)),
+            staticmethod(
+                lambda key, default=None, override=None: {
+                    "supervisor.mailbox_pull": True,
+                    "supervisor.teammate_push": True,
+                }.get(key, default)
+            ),
         )
 
         # Patch is_supervisor_mailbox_pull_terminal to return True for our terminal
@@ -107,16 +109,18 @@ class TestF165RealSqliteReconciler:
         # Patch get_terminal_metadata to return our seeded terminal
         monkeypatch.setattr(
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            lambda tid: {
-                "id": "sup00001",
-                "tmux_session": "test-sess",
-                "tmux_window": "win-sup",
-                "provider": "kiro_cli",
-                "agent_profile": "developer",
-                "metadata": {"cc_team_inbox_path": str(inbox_path)},
-            }
-            if tid == "sup00001"
-            else None,
+            lambda tid: (
+                {
+                    "id": "sup00001",
+                    "tmux_session": "test-sess",
+                    "tmux_window": "win-sup",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "metadata": {"cc_team_inbox_path": str(inbox_path)},
+                }
+                if tid == "sup00001"
+                else None
+            ),
         )
 
         # Patch _resolve_inbox_path directly for the push service
@@ -173,8 +177,6 @@ class TestF165RealSqliteReconciler:
             assert attempt.settled_at is not None
 
         # 3. Cursor was advanced (last_notified persisted in memory)
-        from cli_agent_orchestrator.services.teammate_push_service import _last_notified
 
-        # Note: in parallel test execution, _last_notified may be stale from
+        # Note: in parallel test execution may be stale from
         # other tests. The key assertion is that the inbox file was written.
-        # assert _last_notified.get("sup00001", 0) > 0

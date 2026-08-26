@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ===========================================================================
 # 1. Payload content: build_wake_payload carries actual message body
 # ===========================================================================
@@ -74,9 +73,7 @@ class TestF459PayloadContent:
 
         results = []
         for row_id in [10, 11, 12]:
-            p = build_wake_payload(
-                "w01", row_id, message_body=f"Message {row_id}"
-            )
+            p = build_wake_payload("w01", row_id, message_body=f"Message {row_id}")
             results.append(json.loads(p))
 
         # Each payload references its own row content
@@ -272,10 +269,6 @@ class TestF459MarkerSuppression:
                 return_value=True,
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._get_last_doorbell_row_id",
-                return_value=0,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
                 return_value=True,
             ),
@@ -284,14 +277,12 @@ class TestF459MarkerSuppression:
                 return_value="rang",
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._persist_last_doorbell_row_id",
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
             ) as mock_mark,
         ):
             result = ring_supervisor_doorbell(
-                "term-01", 100,
+                "term-01",
+                100,
                 written_count=1,
                 message_body="hello world",
                 sender_display_name="kiro_dev-abc123",
@@ -310,10 +301,6 @@ class TestF459MarkerSuppression:
                 return_value=True,
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._get_last_doorbell_row_id",
-                return_value=0,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
                 return_value=True,
             ),
@@ -322,14 +309,12 @@ class TestF459MarkerSuppression:
                 return_value="rang",
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._persist_last_doorbell_row_id",
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
             ) as mock_mark,
         ):
             result = ring_supervisor_doorbell(
-                "term-01", 100,
+                "term-01",
+                100,
                 written_count=1,
                 # No message_body — legacy call
             )
@@ -356,10 +341,6 @@ class TestF459Fallback:
                 return_value=True,
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._get_last_doorbell_row_id",
-                return_value=0,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
                 return_value=True,
             ),
@@ -376,14 +357,12 @@ class TestF459Fallback:
                 return_value="rang",
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._persist_last_doorbell_row_id",
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
             ) as mock_mark,
         ):
             result = ring_supervisor_doorbell(
-                "term-01", 100,
+                "term-01",
+                100,
                 written_count=1,
                 message_body="hello",
                 sender_display_name="dev-x",
@@ -404,10 +383,6 @@ class TestF459Fallback:
                 return_value=True,
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._get_last_doorbell_row_id",
-                return_value=0,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
                 return_value=True,
             ),
@@ -415,22 +390,21 @@ class TestF459Fallback:
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
             ) as mock_native,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._persist_last_doorbell_row_id",
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
             ),
         ):
             mock_native.return_value = "rang"
             ring_supervisor_doorbell(
-                "term-01", 100,
+                "term-01",
+                100,
                 written_count=1,
                 message_body="callback text here",
                 sender_display_name="kiro_dev-abc",
             )
 
         mock_native.assert_called_once_with(
-            "term-01", 100,
+            "term-01",
+            100,
             message_body="callback text here",
             sender_display_name="kiro_dev-abc",
         )

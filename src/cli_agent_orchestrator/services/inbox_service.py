@@ -802,15 +802,16 @@ class InboxService:
         task.add_done_callback(done)
 
     def _f136_run_callback_delivery(self, terminal_id: str) -> "CallbackRunOutcome":
-        """D13/D14: Bounded replay-first, cursor-second write protocol."""
+        """F476: Single wake cursor — claim → commit → emit protocol."""
         # F339: if already abandoned, exit immediately without DB queries.
         if self._f339_is_abandoned(terminal_id):
             return CallbackRunOutcome(reason="abandoned_no_terminal")
 
         from cli_agent_orchestrator.clients.database import (
-            CallbackBatchResult,
-            commit_supervisor_callback_progress,
-            get_supervisor_callback_batch,
+            WakeClaimResult,
+            WakeCommitResult,
+            claim_unnotified_wake,
+            commit_wake,
         )
         from cli_agent_orchestrator.services.mailbox_service import (
             get_mailbox_authority_lock,
@@ -842,130 +843,146 @@ class InboxService:
             generation = int(mailbox.generation)
             session_name = str(mailbox.session_name)
             role = str(mailbox.role)
+            inbox_path_str = mailbox.cc_inbox_path
 
         # F339: incarnation + mailbox found — reset ghost-terminal streak.
         self._f339_reset_not_found(terminal_id)
 
-        # D10: acquire delivery_lock then authority lock
+        # F150: no inbox path → self-heal
+        if not inbox_path_str:
+            healed = self._f150_self_heal_inbox_path(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+            )
+            if not healed:
+                return CallbackRunOutcome(
+                    reason="no_path",
+                    retry_delay_s=_get_backoff_delay(terminal_id),
+                    retryable_failure_count=1,
+                )
+            # Re-read inbox path after heal
+            with SessionLocal() as db:
+                mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+                inbox_path_str = mb.cc_inbox_path if mb else None
+            if not inbox_path_str:
+                return CallbackRunOutcome(
+                    reason="no_path",
+                    retry_delay_s=_get_backoff_delay(terminal_id),
+                    retryable_failure_count=1,
+                )
+
+        # D10: acquire delivery_lock (authority lock is inside claim/commit)
         delivery_lock = get_delivery_lock(terminal_id)
         if not delivery_lock.acquire(timeout=0.5):
             return CallbackRunOutcome(reason="delivery_lock_contention")
 
-        authority_lock = get_mailbox_authority_lock(session_name, role)
-        if not authority_lock.acquire(timeout=0.5):
-            delivery_lock.release()
-            return CallbackRunOutcome(reason="authority_lock_contention")
-
         try:
-            deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
-
-            # D9: Get batch
-            batch = get_supervisor_callback_batch(
+            # F476 D3: CLAIM — select wake-eligible rows and lease them
+            claim = claim_unnotified_wake(
                 mailbox_id=mailbox_id,
                 terminal_id=terminal_id,
                 generation=generation,
                 limit=MAX_ROWS_PER_RUN,
             )
 
-            if batch.kind == "stale_authority":
-                return CallbackRunOutcome(reason=f"stale: {batch.reason}")
-            if batch.kind == "retryable_failure":
+            if claim.kind == "stale_authority":
+                return CallbackRunOutcome(reason=f"stale: {claim.reason}")
+            if claim.kind == "authority_lock_contention":
                 return CallbackRunOutcome(
                     retryable_failure_count=1,
-                    reason=batch.reason,
+                    reason=claim.reason,
                     retry_delay_s=_get_backoff_delay(terminal_id),
                 )
-            if batch.kind == "no_path":
-                # F150: Self-heal — attempt to re-discover inbox path from
-                # terminal metadata before giving up.
-                healed = self._f150_self_heal_inbox_path(
-                    mailbox_id=mailbox_id,
-                    terminal_id=terminal_id,
-                    generation=generation,
-                )
-                if healed:
-                    # Re-fetch batch now that path is populated
-                    batch = get_supervisor_callback_batch(
-                        mailbox_id=mailbox_id,
-                        terminal_id=terminal_id,
-                        generation=generation,
-                        limit=MAX_ROWS_PER_RUN,
-                    )
-                    if batch.kind == "no_path":
-                        # Self-heal wrote a path but it didn't stick — give up
-                        return CallbackRunOutcome(
-                            cursor_before=batch.cursor,
-                            reason="no_path",
-                            retry_delay_s=_get_backoff_delay(terminal_id),
-                            retryable_failure_count=1,
-                        )
-                else:
-                    return CallbackRunOutcome(
-                        cursor_before=batch.cursor,
-                        reason="no_path",
-                        retry_delay_s=_get_backoff_delay(terminal_id),
-                        retryable_failure_count=1,
-                    )
-            if not batch.rows:
-                # Empty scan: reset failure streak
+            if claim.kind == "wake_exhausted":
+                _failure_streaks.pop(terminal_id, None)
+                return CallbackRunOutcome(reason="wake_exhausted")
+            if claim.kind == "lease_held":
+                _failure_streaks.pop(terminal_id, None)
+                return CallbackRunOutcome(reason="lease_held")
+            if not claim.rows:
                 _failure_streaks.pop(terminal_id, None)
                 return CallbackRunOutcome(
-                    cursor_before=batch.cursor,
-                    cursor_after=batch.cursor,
-                    bootstrap_mode=batch.bootstrap_mode,
+                    cursor_before=claim.claimed_high_water,
+                    cursor_after=claim.claimed_high_water,
                     reason="empty",
                 )
 
-            # fx168 FIX-2: Staleness-aware self-heal — if the batch's canonical
-            # inbox_path differs from the CURRENT terminal metadata cc_team_inbox_path,
-            # exit the lock scope and reconcile via set_supervisor_callback_inbox_path
-            # (which acquires its own locks, bumps version, re-kicks request_delivery).
-            # One attempt per run; the re-wake handles the actual write.
-            _fx168_stale_heal_needed: tuple[str, str] | None = None
-            if batch.inbox_path:
-                try:
-                    from cli_agent_orchestrator.clients.database import (
-                        get_terminal_metadata as _get_meta,
-                    )
+            # F476 D3: COMMIT — advance cursor BEFORE emit
+            replay_ids = tuple(r.inbox_row_id for r in claim.rows if r.tag == "replay")
+            forward_high_water = max(
+                (r.inbox_row_id for r in claim.rows if r.tag == "forward"),
+                default=0,
+            )
+            # through_id: advance to the highest forward row (or current cursor for replay-only)
+            through_id = forward_high_water if forward_high_water > 0 else claim.claimed_high_water
 
-                    _meta = _get_meta(terminal_id)
-                    _current_path = (
-                        (_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None
-                    )
-                    if _current_path and _current_path != batch.inbox_path:
-                        _fx168_stale_heal_needed = (batch.inbox_path, _current_path)
-                except Exception as _heal_exc:
-                    logger.debug(
-                        "fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc
-                    )
+            commit_result = commit_wake(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                through_id=through_id,
+                claimed_high_water=claim.claimed_high_water,
+                lease_epoch=claim.lease_epoch,
+                expected_path_version=claim.path_version,
+                replay_row_ids=replay_ids,
+            )
 
-            if _fx168_stale_heal_needed is not None:
-                # Cannot reconcile while holding locks (set_supervisor_callback_inbox_path
-                # acquires the same locks). Signal stale_path_detected; the reconcile
-                # happens in _f136_post_delivery after lock release.
-                _old_path, _new_path = _fx168_stale_heal_needed
+            if commit_result.kind == "superseded_by_ack":
+                _failure_streaks.pop(terminal_id, None)
+                return CallbackRunOutcome(reason="superseded_by_ack")
+            if commit_result.kind == "path_changed":
                 return CallbackRunOutcome(
-                    cursor_before=batch.cursor,
                     needs_immediate_wake=True,
-                    reason="stale_path_detected",
-                    _fx168_stale_heal=(mailbox_id, terminal_id, generation, _new_path),
+                    reason="path_changed_during_run",
+                )
+            if commit_result.kind == "lease_lost":
+                return CallbackRunOutcome(reason="lease_lost")
+            if commit_result.kind == "stale_authority":
+                return CallbackRunOutcome(reason=f"stale: {commit_result.reason}")
+            if commit_result.kind != "committed":
+                return CallbackRunOutcome(
+                    retryable_failure_count=1,
+                    reason=f"commit_failed: {commit_result.reason}",
+                    retry_delay_s=_get_backoff_delay(terminal_id),
                 )
 
-            inbox_path = Path(os.path.expanduser(batch.inbox_path))
-            cursor_before = batch.cursor
-            new_cursor = batch.cursor or 0
-            successful_replay_ids: list[int] = []
-            written = 0
-            already_present = 0
-            retryable_failures = 0
-            identity_conflicts = 0
-            processed = 0
-            _max_written_row_id = 0  # F168 D4: track highest row id written
-            _f459_last_body: str | None = None  # F459: last written message body
-            _f459_last_sender: str | None = None  # F459: last written sender_id
+            # fx168: stale-path detection — if terminal metadata says a different
+            # cc_team_inbox_path than the mailbox canonical path, do NOT emit.
+            _fx168_stale_heal: tuple[str, str, int, str] | None = None
+            try:
+                from cli_agent_orchestrator.clients.database import (
+                    get_terminal_metadata as _get_meta,
+                )
 
-            # D13: Process replay rows first, then forward rows
-            for row in batch.rows:
+                _meta = _get_meta(terminal_id)
+                _current_path = (
+                    (_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None
+                )
+                if _current_path and _current_path != inbox_path_str:
+                    _fx168_stale_heal = (mailbox_id, terminal_id, generation, _current_path)
+            except Exception as _heal_exc:
+                logger.debug(
+                    "fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc
+                )
+
+            if _fx168_stale_heal is not None:
+                return CallbackRunOutcome(
+                    cursor_before=claim.claimed_high_water,
+                    needs_immediate_wake=True,
+                    reason="stale_path_detected",
+                    _fx168_stale_heal=_fx168_stale_heal,
+                )
+
+            # F476 D3: EMIT — write CC inbox entries AFTER commit
+            inbox_path = Path(os.path.expanduser(inbox_path_str))
+            deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
+            written = 0
+            _max_written_row_id = 0
+            _f459_last_body: str | None = None
+            _f459_last_sender: str | None = None
+
+            for row in claim.rows:
                 if time.monotonic() >= deadline_mono:
                     break
 
@@ -984,99 +1001,40 @@ class InboxService:
                     message=msg,
                     deadline_mono=deadline_mono,
                 )
-                processed += 1
 
                 if result.kind == "written":
                     written += 1
                     if row.inbox_row_id > _max_written_row_id:
                         _max_written_row_id = row.inbox_row_id
-                    # F459: capture last written row's content for native bridge
                     _f459_last_body = row.message
                     _f459_last_sender = row.sender_id
                 elif result.kind == "already_present":
-                    already_present += 1
-                elif result.kind == "retryable_failure":
-                    retryable_failures += 1
-                    break  # Stop at first failure
-                elif result.kind == "identity_conflict":
-                    identity_conflicts += 1
-                    logger.error(
-                        "f136_identity_conflict mailbox=%s row=%s reason=%s",
-                        mailbox_id,
-                        row.inbox_row_id,
-                        result.reason,
-                    )
-                    break  # Stop at conflict
+                    written += 1  # Count as success for doorbell
+                    if row.inbox_row_id > _max_written_row_id:
+                        _max_written_row_id = row.inbox_row_id
 
-                # Track progress
-                if result.kind in ("written", "already_present"):
-                    if row.tag == "replay":
-                        successful_replay_ids.append(row.inbox_row_id)
-                    elif row.tag == "forward":
-                        # Forward rows are batch-ordered ascending; all are eligible.
-                        # Advance cursor through every successfully written row.
-                        new_cursor = row.inbox_row_id
-
-            # D13 step 5: commit progress once
-            if successful_replay_ids or new_cursor > (cursor_before or 0):
-                progress = commit_supervisor_callback_progress(
-                    mailbox_id=mailbox_id,
-                    terminal_id=terminal_id,
-                    generation=generation,
-                    expected_cursor=cursor_before or 0,
-                    new_cursor=new_cursor,
-                    expected_path_version=batch.path_version,
-                    replay_row_ids=tuple(successful_replay_ids),
-                )
-                if progress.kind == "advanced":
-                    _failure_streaks.pop(terminal_id, None)
-                elif progress.kind == "path_changed":
-                    return CallbackRunOutcome(
-                        selected=len(batch.rows),
-                        processed=processed,
-                        cursor_before=cursor_before,
-                        cursor_after=cursor_before,
-                        written=written,
-                        already_present=already_present,
-                        reason="path_changed_during_run",
-                        needs_immediate_wake=True,
-                    )
-                else:
-                    retryable_failures += 1
-            else:
-                _failure_streaks.pop(terminal_id, None)
-
-            replay_selected = sum(1 for r in batch.rows if r.tag == "replay")
-            needs_wake = batch.has_more or (retryable_failures == 0 and processed < len(batch.rows))
+            _failure_streaks.pop(terminal_id, None)
 
             return CallbackRunOutcome(
-                selected=len(batch.rows),
-                processed=processed,
-                cursor_before=cursor_before,
-                cursor_after=new_cursor if new_cursor > (cursor_before or 0) else cursor_before,
-                replay_selected=replay_selected,
-                replay_drained=len(successful_replay_ids),
+                selected=len(claim.rows),
+                processed=len(claim.rows),
+                cursor_before=claim.claimed_high_water,
+                cursor_after=through_id,
                 written=written,
-                already_present=already_present,
-                retryable_failure_count=retryable_failures,
-                identity_conflict_count=identity_conflicts,
-                bootstrap_mode=batch.bootstrap_mode,
-                needs_immediate_wake=needs_wake,
-                retry_delay_s=_get_backoff_delay(terminal_id) if retryable_failures else None,
+                needs_immediate_wake=False,
                 reason="ok",
                 max_written_row_id=_max_written_row_id,
                 _f459_message_body=_f459_last_body,
                 _f459_sender_display_name=_f459_last_sender,
             )
         except Exception as exc:
-            logger.exception("f136_delivery_run_error terminal=%s", terminal_id)
+            logger.exception("f476_delivery_run_error terminal=%s", terminal_id)
             return CallbackRunOutcome(
                 retryable_failure_count=1,
                 reason=f"exception: {exc}",
                 retry_delay_s=_get_backoff_delay(terminal_id),
             )
         finally:
-            authority_lock.release()
             delivery_lock.release()
 
     def _f150_self_heal_inbox_path(
@@ -1201,6 +1159,7 @@ class InboxService:
                 if _f459_display:
                     try:
                         from cli_agent_orchestrator.utils.terminal import display_name as _dn
+
                         _f459_display = _dn(_f459_display)
                     except Exception:
                         pass
@@ -3552,7 +3511,10 @@ class InboxService:
                             _last_msg = max(messages, key=lambda m: m.id)
                             _f459_body = _last_msg.message
                             try:
-                                from cli_agent_orchestrator.utils.terminal import display_name as _dn
+                                from cli_agent_orchestrator.utils.terminal import (
+                                    display_name as _dn,
+                                )
+
                                 _f459_sender = _dn(_last_msg.sender_id)
                             except Exception:
                                 _f459_sender = _last_msg.sender_id

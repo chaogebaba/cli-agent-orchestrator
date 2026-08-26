@@ -19,7 +19,6 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.teammate_push_service import (
     PushOutcome,
-    _last_notified,
     attempt_teammate_push_reported,
 )
 
@@ -191,7 +190,16 @@ class TestAC6OutcomeAttribution:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -230,7 +238,10 @@ class TestAC6OutcomeAttribution:
         settle_args = mock_settle.call_args
         # positional: (attempt_uuid, status, outcome=, reason=)
         assert settle_args[0][0] == "attempt-uuid-1"
-        assert settle_args[1].get("outcome") == expected_outcome or settle_args[0][2] == expected_outcome
+        assert (
+            settle_args[1].get("outcome") == expected_outcome
+            or settle_args[0][2] == expected_outcome
+        )
         assert settle_args[1].get("reason") == push_reason or settle_args[0][3] == push_reason
 
     def test_payload_hash_is_deterministic(self) -> None:
@@ -258,7 +269,16 @@ class TestAC6OutcomeAttribution:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
