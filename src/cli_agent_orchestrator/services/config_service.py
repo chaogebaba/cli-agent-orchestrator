@@ -247,6 +247,10 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     # F218-a: dead-supervisor safety config
     "CAO_LIVENESS_SESSION_CONFIRM_SAMPLES": ("liveness.session_confirm_samples", "int", 2),
     "CAO_LIVENESS_SCOPE_PROBE_TIMEOUT_S": ("liveness.scope_probe_timeout_s", "float", 5.0),
+    # F506/F507: pane-delta liveness fusion + question-marker durability
+    "CAO_LIVENESS_STABLE_SAMPLES": ("liveness.stable_samples", "int", 3),
+    "CAO_LIVENESS_PANE_DELTA_MAX_HOLD_S": ("liveness.pane_delta_max_hold_s", "float", 300.0),
+    "CAO_LIVENESS_QUESTION_MARKER_TTL_S": ("liveness.question_marker_ttl_s", "float", 300.0),
     "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
     "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
     "CAO_ALARM_DEGRADED_DISPLAY_MESSAGE": ("alarm.degraded_display_message", "bool", True),
