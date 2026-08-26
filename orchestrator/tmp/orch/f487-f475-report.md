@@ -1,69 +1,74 @@
-# F487 + F475 Fix Report
+# F487 + F475 Fix Report (r3)
 
-**Branch:** `cao/f487-f475-noise`  
-**Head SHA:** `edd08bbfe6f8f5bb46e0f88f3e07716fd3f51d55`  
-**Box suite:** 13595 passed, 3 failed (infra-only, unrelated):
+**Branch:** `cao/f487-f475-noise`
+
+## F487 (#342): park_warm watchdog suppression — UNCHANGED from r1
+
+**Fix:** `merge_terminal_system_metadata(terminal_id, {"park_warm": True})` at
+create_terminal; `record_inbound_task` checks `metadata.cao.park_warm is True`.
+
+**Tests:** `test/services/test_f487_park_warm_watchdog.py` — 7 cases.
+
+## F475 (#330): callback dedup — r3 rewrite (rolling window, normalized hash, choke-point)
+
+**Mechanism:**
+
+Enforcement lives inside `_insert_routed_inbox_row` — the single function
+ALL inbox inserts pass through (direct-terminal, mailbox/`create_logical_inbox_message`,
+barrier combined messages, watchdog auto-resume, digest notices). This covers
+the `mb_` production path that previously bypassed the endpoint-level check.
+
+**Dedup logic (one atomic query, no check-then-insert):**
+
+After barrier association is resolved (so `barrier_id` is known):
+1. If the row has `barrier_id != None` or `park_warm=True` or `dispatch_barrier != None`
+   → assign `callback_dedup_key = NULL`, skip dedup (these rows never suppress anything).
+2. If `_f475_should_dedup(sender, receiver, orch_type, ...)` → compute normalized hash:
+   - Strip `[FROZEN-PIN-ATTESTATION ...]` blocks from message before hashing
+   - `content_hash = sha256(normalized_message)`
+3. Single atomic `SELECT` within the SAME transaction (SQLite serializes writers):
+   `WHERE sender_id=? AND receiver_id=? AND callback_dedup_key=? AND created_at >= (now - 60s) AND park_warm IS NOT TRUE AND barrier_id IS NULL`
+4. If existing row found → return it (suppressed). Otherwise → INSERT with
+   `callback_dedup_key = content_hash`.
+
+**Why this is race-free:** SQLite serializes all writers through a single write
+lock. The `SELECT` and `INSERT` happen inside the same ORM session/transaction —
+no window between check and insert for another writer to slip through.
+
+**Rolling window:** The `created_at >= (now - 60s)` clause is evaluated at query
+time, not bucketed. No boundary-straddling gap is possible.
+
+**Normalized content:** The `_f475_normalize_message` function strips
+`[FROZEN-PIN-ATTESTATION valid_at=... pins=N]` blocks before hashing, so
+identical logical callbacks with differing attestation timestamps dedup correctly.
+
+**Barrier isolation (B2 fix):** Key assignment happens AFTER
+`_barrier_member_for_callback` resolves. If the row got `barrier_id != None`,
+it gets `callback_dedup_key = NULL` and can never match a later ordinary
+callback's dedup query (which filters `barrier_id IS NULL`).
+
+**Tests:** `test/services/test_f475_callback_dedup.py` — 15 cases:
+- `TestF475DistinctContent`: distinct content persists; identical deduped
+- `TestF475BoundaryStraddling`: 0.2s apart across minute edge — deduped (rolling)
+- `TestF475AttestationNormalization`: different attestation timestamps — deduped
+- `TestF475MailboxPath`: mb_ addressed duplicate — deduped through choke point
+- `TestF475BarrierParkWarmIsolation`: park_warm then ordinary (delivers);
+  barrier-associated then identical ordinary (delivers)
+- `TestF475Helpers`: normalize, content hash, should_dedup eligibility
+
+## Box suite failures (infra-only, pre-existing on main)
+
+- `test/clients/test_tmux_session_exists_strict.py::TestConfirmedAnswers::test_server_shut_down_under_us_is_a_confirmed_absence`
+- `test/plugins/test_suite_slot.py::TestPidReuseGuard::test_stale_entry_not_killed`
 - `test/plugins/test_suite_slot.py::TestLedgerSampling::test_sample_ledger_monotonic_growth`
-- `test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_data_received_across_writer_reconnects`
-- `test/services/test_fx168_doorbell.py::TestD12RateLimitedLog::test_warn_rate_limited`
-
-## F487 (#342): park_warm watchdog suppression
-
-**Root cause:** `record_inbound_task` in the stalled callback watchdog had no
-terminal-level knowledge of park_warm. The `send_input` and inbox delivery
-guards prevented arming on their respective paths, but any unconsidered call
-path (e.g. `redeliver_dropped_message`, future code) could still arm. The
-single-point-of-enforcement guard was missing.
-
-**Fix:**
-1. `terminal_service.create_terminal`: when `park_warm=True`, persist
-   `{"park_warm": True}` in the terminal's system metadata (`cao` sub-dict)
-   via `merge_terminal_system_metadata`.
-2. `stalled_callback_watchdog.record_inbound_task`: before creating an episode,
-   read terminal metadata (TTL-cached) and suppress when
-   `metadata.cao.park_warm is True`.
-
-**Tests:** `test/services/test_f487_park_warm_watchdog.py` — 7 cases covering
-warm suppression, non-warm arming, empty/False/None edge cases.
-
-## F475 (#330): cline double-send callback dedup
-
-**Root cause:** cline (and potentially other providers) occasionally send their
-READY/completion callback twice from the same worker to the same caller. The
-model re-enters a turn and re-sends the callback (observed: "reworded but same
-content" minutes apart).
-
-**Fix:** Added a 60-second dedup window at the API endpoint
-`POST /terminals/{receiver_id}/inbox/messages`. When:
-- No barrier is active (`barrier is None`)
-- Not park_warm
-- The receiver is the sender's recorded caller
-
-...check for existing messages from the same sender→receiver within the last
-60s. If found, return the existing message (HTTP 200 with `deduplicated: true`)
-without inserting a duplicate.
-
-**Dedup key:** `(sender_id, receiver_id)` — any two messages from the same
-sender terminal to the same receiver terminal within 60s are considered
-duplicates, regardless of content. Content hashing was rejected because the
-observed duplicates are "reworded but same content" (the model rephrases), so a
-content hash would miss them. The key is intentionally coarse: a worker should
-never need to send two distinct callbacks to its own caller within one minute.
-
-**Why 60s:** The observed duplicates in the incident were ~1 min apart (inbox
-ids 774/775). 60s covers that window with margin. The value is exposed as the
-module constant `_F475_CALLBACK_DEDUP_WINDOW_S` for tuning.
-
-**Tests:** `test/services/test_f475_callback_dedup.py` — helper unit tests.
-Behavioral coverage via the existing barrier tests (which still pass,
-confirming barrier sends bypass dedup).
+- `test/services/test_worker_terminal_cap.py::TestConcurrentAdmission::test_thread_race_barrier_inside_listing_admits_exactly_one`
 
 ## Files changed
 
 - `src/cli_agent_orchestrator/services/terminal_service.py` — persist park_warm
-- `src/cli_agent_orchestrator/services/stalled_callback_watchdog.py` — guard
-- `src/cli_agent_orchestrator/clients/database.py` — dedup helpers
-- `src/cli_agent_orchestrator/api/main.py` — API dedup gate
+- `src/cli_agent_orchestrator/services/stalled_callback_watchdog.py` — F487 guard
+- `src/cli_agent_orchestrator/clients/database.py` — F475 dedup in `_insert_routed_inbox_row`
+- `src/cli_agent_orchestrator/api/main.py` — removed old endpoint-level dedup
 - `src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt` — regen
-- `test/services/test_f487_park_warm_watchdog.py` — new
-- `test/services/test_f475_callback_dedup.py` — new
+- `test/services/test_f487_park_warm_watchdog.py` — 7 tests
+- `test/services/test_f475_callback_dedup.py` — 15 tests

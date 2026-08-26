@@ -7729,41 +7729,6 @@ async def create_inbox_message_endpoint(
             detail=f"Terminal '{receiver_id}' not found: {str(e)}",
         )
 
-    # F475: callback dedup — suppress duplicate worker callbacks within a 60s
-    # window. Only applies to non-barrier, non-park_warm sends where the
-    # receiver is the sender's recorded caller. This prevents cline (and other
-    # providers) from double-sending READY/completion callbacks.
-    if barrier is None and not park_warm:
-        from cli_agent_orchestrator.clients.database import (
-            _f475_get_recent_callback,
-            _f475_is_duplicate_callback,
-        )
-
-        sender_meta = get_terminal_metadata(sender_id)
-        if sender_meta is not None:
-            caller_targets = set()
-            if sender_meta.get("caller_id"):
-                caller_targets.add(sender_meta["caller_id"])
-            if sender_meta.get("caller_mailbox_id"):
-                caller_targets.add(sender_meta["caller_mailbox_id"])
-            if str(receiver_id) in caller_targets:
-                if _f475_is_duplicate_callback(sender_id, str(receiver_id)):
-                    existing = _f475_get_recent_callback(sender_id, str(receiver_id))
-                    if existing is not None:
-                        logger.info(
-                            "f475_callback_dedup sender=%s receiver=%s suppressed=true",
-                            sender_id,
-                            receiver_id,
-                        )
-                        return {
-                            "success": True,
-                            "message_id": existing.id,
-                            "sender_id": existing.sender_id,
-                            "receiver_id": existing.receiver_id,
-                            "created_at": existing.created_at.isoformat(),
-                            "deduplicated": True,
-                        }
-
     try:
         raw_kwargs: dict[str, Any] = {}
         if park_warm:
