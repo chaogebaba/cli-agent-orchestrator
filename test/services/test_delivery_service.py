@@ -207,10 +207,20 @@ def test_attempt_rung1_rang_is_delivered(tmp_path):
     inbox = tmp_path / "inbox" / "team-lead.json"
     inbox.parent.mkdir(parents=True)
     target = _live_target(cc_inbox_path=str(inbox))
-    with patch(
-        "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-        return_value="rang",
-    ) as ring:
+    with (
+        patch(
+            "cli_agent_orchestrator.services.config_service.ConfigService.get",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
+            return_value="rang",
+        ) as ring,
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
+            return_value=True,
+        ),
+    ):
         result = attempt_rung1(target, 42)
     ring.assert_called_once_with("sup1", 42)
     assert result.delivered is True
@@ -222,9 +232,19 @@ def test_attempt_rung1_non_rang_is_deferred(tmp_path):
     inbox = tmp_path / "inbox" / "team-lead.json"
     inbox.parent.mkdir(parents=True)
     target = _live_target(cc_inbox_path=str(inbox))
-    with patch(
-        "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-        return_value="wake_unverified",
+    with (
+        patch(
+            "cli_agent_orchestrator.services.config_service.ConfigService.get",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
+            return_value="wake_unverified",
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
+            return_value=True,
+        ),
     ):
         result = attempt_rung1(target, 42)
     assert result.delivered is False

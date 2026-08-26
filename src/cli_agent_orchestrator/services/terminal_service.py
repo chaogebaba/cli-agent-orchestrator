@@ -1965,8 +1965,9 @@ async def create_terminal(
         # useful when the native channel is active; deriving it when native is
         # disabled would leave a stale path that split-brain code could use.
         from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-        _native_wake_enabled = _CS.get("supervisor.wake.native", default=True)
+        _native_wake_enabled = _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT)
         if (
             provider == "claude_code"
             and _CS.get("supervisor.teammate_push", default=False)

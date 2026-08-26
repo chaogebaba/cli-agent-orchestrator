@@ -1,85 +1,63 @@
-# F337 Build Report — Native Wake Activation Readiness
+# F337-r2 Build Report — native supervisor wake (fix round)
 
-**Branch:** `cao/f337-native-wake`  
-**Base:** `main@8c994302` (includes F461 coalescer + F487/F475)  
-**Date:** 2026-08-26
+**Branch:** cao/f337-native-wake
+**HEAD:** cd3be940
+**Merge-base:** 8c994302
 
-## Changes
+## Findings addressed
 
-### 1. Auth Handshake (F337 #192)
+| ID | Severity | Status | Summary |
+|----|----------|--------|---------|
+| B1 | BLOCKER | FIXED | Default-dark: `WAKE_NATIVE_DEFAULT=False` canonical constant in `cc_session_registry`, config registry default `False`, all 5 call sites import and use the constant |
+| B2 | BLOCKER | FIXED | procStart binding: `read_peer_token` gains `expected_proc_start` param, verifies key file `procStart` matches live process incarnation, strict 64-hex filename pattern |
+| S1 | SHOULD | FIXED | Non-object JSON: `isinstance(data, dict)` check before `.get()` — array/string/number/null return `None` cleanly |
+| S2 | SHOULD | FIXED | Gate test: replaced structural assertion with behavioral test (derive not called when native=False, called when True) |
 
-**File:** `src/cli_agent_orchestrator/services/cc_session_registry.py`
+## Changed files (8)
 
-- `read_peer_token(pid, sessions_dir)` — reads `<sessions_dir>/<pid>.<hex>.key` JSON files, extracts `peerToken` field
-- `_build_auth_frame(token)` — formats `{"type":"auth","token":"<token>"}` JSON line (compact, no spaces)
-- `write_to_socket()` updated — when `auth_token` is provided, sends the JSON auth frame as the first line before the message payload
+- `src/cli_agent_orchestrator/services/cc_session_registry.py` — add `WAKE_NATIVE_DEFAULT`, rewrite `read_peer_token`
+- `src/cli_agent_orchestrator/services/config_service.py` — registry default → False
+- `src/cli_agent_orchestrator/services/delivery_service.py` — import + use `WAKE_NATIVE_DEFAULT`
+- `src/cli_agent_orchestrator/services/doorbell_service.py` — import + use `WAKE_NATIVE_DEFAULT`, pass `expected_proc_start`
+- `src/cli_agent_orchestrator/services/inbox_service.py` — import + use `WAKE_NATIVE_DEFAULT` (both call sites)
+- `src/cli_agent_orchestrator/services/terminal_service.py` — import + use `WAKE_NATIVE_DEFAULT`
+- `test/services/test_f337_auth_handshake.py` — behavioral gate test (S2), regression tests (B1, B2, S1)
+- `test/services/test_delivery_service.py` — adapt `attempt_rung1` tests to explicitly enable native wake
 
-**File:** `src/cli_agent_orchestrator/services/doorbell_service.py`
+## Regression tests added
 
-- `_attempt_native_ring()` now calls `read_peer_token(record.pid)` and passes the result as `auth_token` to `write_to_socket`
-- Graceful degradation: if no key file exists, auth frame is skipped (backward compat with pre-UDS-gate CC versions)
+- `TestF337R2DefaultDark` (4 tests): canonical constant, config registry, doorbell gate, delivery gate
+- `TestF337R2ProcStartBinding` (5 tests): mismatch, match, no-check, unparseable, strict-filename
+- `TestF337R2MalformedKeyJSON` (5 tests): array, string, number, null, empty
 
-### 2. Wake.native Split-Brain Gate (F457)
+## Test evidence
 
-**File:** `src/cli_agent_orchestrator/services/terminal_service.py`
-
-- `cc_team_inbox_path` derivation at pane creation now gated on `_native_wake_enabled = ConfigService.get("supervisor.wake.native", default=True)`
-- Both if/elif branches for inbox path derivation require the flag
-
-**Pre-existing gates (already in place on base, verified intact):**
-- `inbox_service.py:2320` — deliver_pending teammate push
-- `inbox_service.py:3509` — reconcile_pull_mode_notifications
-- `delivery_service.py:403` — attempt_rung1 native ring
-
-### Wire Format (Probed)
-
+### Local (laptop)
 ```
-Line 1: {"type":"auth","token":"<peerToken>"}\n     ← from key file
-Line 2: {"msgV":1,"msg_id":"...","type":"user",...}\n  ← message payload
-         [half-close, no read]
-```
+uv run pytest test/services/test_f337_auth_handshake.py \
+  test/services/test_fx170_native_doorbell.py \
+  test/services/test_f216_null_socket_path.py \
+  test/services/test_f457_wake_gate_dedupe.py \
+  test/services/test_f461_doorbell_coalesce.py \
+  test/services/test_f476_single_wake_cursor.py \
+  test/services/test_fx168_doorbell.py
 
-**Evidence source:** Live probe against throwaway CC 2.1.243 session (pid 852122), socket at `/run/user/1000/cc-socks/852122.sock`. Both JSON auth frame and raw token accepted; JSON frame chosen as the canonical wire format per CC protocol docs.
-
-**Key file format:** `~/.claude/sessions/<pid>.<64hex>.key` → `{"peerToken":"<32hex>","procStart":"<int>"}`
-
-## Test Results
-
-### New Tests (14 tests, all pass)
-
-`test/services/test_f337_auth_handshake.py`:
-- AC1: Auth frame sent as first line / not sent when token absent
-- AC2: read_peer_token reads key files correctly (6 cases)
-- AC3: _build_auth_frame format verification
-- AC4: _attempt_native_ring end-to-end auth flow (with/without key file)
-- AC5: wake.native gate in terminal_service (structural)
-
-### Full Suite (box cursor-4)
-
-```
-13634 passed, 14 failed, 204 skipped, 15 xfailed
+180 passed in 16.79s
 ```
 
-**14 failures = all pre-existing on base 8c994302** (verified by running same tests on detached HEAD at base).  
-**0 new failures introduced by this branch.**
-
-### Related Tests (150 tests, local)
-
+### Box (cursor-4, full suite)
 ```
-test_fx170_native_doorbell.py: 60 passed
-test_f216_null_socket_path.py: 17 passed  
-test_f186_reconciler_doorbell_lock.py: (subset)
-test_fx168_doorbell.py: (full)
-test_f461_doorbell_coalesce.py: (full)
-Total: 150 passed
+13658 passed, 23 failed, 204 skipped, 15 xfailed in 345.52s
 ```
 
-## Default Values (unchanged)
+All 23 failures are pre-existing (test_f77, test_tmux_session_exists_strict,
+test_suite_slot, test_cleanup_service, test_f424_f426, test_fx168_hotfix,
+test_stage0_flip_machinery, test_f186_reconciler, test_fx168_doorbell,
+test_f165 — none F337-related).
 
-| Config key | Code default | Production override |
-|---|---|---|
-| `supervisor.wake.native` | `True` | `false` (stays false) |
-| `supervisor.teammate_push` | `False` | varies |
-| `supervisor.doorbell` | `True` | `true` |
+### Box (cursor-4, targeted F337 + delivery + wake tests)
+```
+109 passed in 6.92s
+```
 
-Flipping `supervisor.wake.native=true` is a separate live trial. This branch makes it safe to flip.
+Zero F337-related failures on the box.

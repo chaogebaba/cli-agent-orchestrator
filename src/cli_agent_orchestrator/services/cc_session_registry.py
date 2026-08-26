@@ -53,6 +53,10 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 
+# F337 B1: canonical default for supervisor.wake.native — ship DARK (False).
+# All call sites and the config-registry entry MUST reference this constant.
+WAKE_NATIVE_DEFAULT = False
+
 
 # Registry base path — resolved per call through the injected provider plane, never
 # from Path.home() directly: cao-server runs OUTSIDE the worker's bwrap, so a literal
@@ -444,28 +448,58 @@ def build_wake_payload(
     return json.dumps(payload, separators=(",", ":"))
 
 
-def read_peer_token(pid: int, sessions_dir: Optional[Path] = None) -> Optional[str]:
+def read_peer_token(
+    pid: int,
+    sessions_dir: Optional[Path] = None,
+    *,
+    expected_proc_start: Optional[int] = None,
+) -> Optional[str]:
     """F337: Read the peerToken from the session key file for a given PID.
 
     Key files are at <sessions_dir>/<pid>.<64hex>.key and contain JSON:
     {"peerToken":"<hex>","procStart":"<int>"}.
 
-    Returns the peerToken string, or None if no key file exists or is unreadable.
+    F337-r2 B2: When expected_proc_start is provided, the key file's procStart
+    MUST match the live process incarnation. A mismatch means a stale key from
+    a recycled PID — returns None (clean fallback, no auth frame sent).
+
+    Returns the peerToken string, or None if no key file exists, is unreadable,
+    malformed, or the procStart identity check fails.
     """
     base = sessions_dir or _sessions_dir()
     if base is None or not base.is_dir():
         return None
-    # Key file pattern: <pid>.<64hex>.key
+    # F337-r2 B2: strict filename — <pid>.<64hex>.key only
+    _KEY_PATTERN = re.compile(rf"^{pid}\.[0-9a-fA-F]{{64}}\.key$")
     for entry in base.iterdir():
-        if not entry.name.startswith(f"{pid}.") or not entry.name.endswith(".key"):
+        if not _KEY_PATTERN.match(entry.name):
             continue
         try:
             data = json.loads(entry.read_text())
-            token = data.get("peerToken")
-            if token and isinstance(token, str):
-                return token
         except (OSError, json.JSONDecodeError, TypeError):
             continue
+        # F337-r2 S1: non-object JSON → malformed → skip
+        if not isinstance(data, dict):
+            continue
+        # F337-r2 B2: verify procStart matches the live process incarnation
+        if expected_proc_start is not None:
+            try:
+                key_proc_start = int(data.get("procStart", -1))
+            except (ValueError, TypeError):
+                # Unparseable procStart → treat as mismatch
+                continue
+            if key_proc_start != expected_proc_start:
+                logger.debug(
+                    "f337_peer_token_procstart_mismatch pid=%s "
+                    "key_procstart=%s expected=%s",
+                    pid,
+                    data.get("procStart"),
+                    expected_proc_start,
+                )
+                continue
+        token = data.get("peerToken")
+        if token and isinstance(token, str):
+            return token
     return None
 
 
