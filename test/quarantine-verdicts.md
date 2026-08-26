@@ -181,8 +181,8 @@ Format: nodeid heading, bucket tag, root cause, arm counts, fix commit or retire
 
 ## test_stale_entry_not_killed
 
-- **Bucket:** (c) global state corruption
-- **Root cause:** Test manipulates global suite_slot._ledger and _armed_pgid; concurrent xdist workers sharing the process can corrupt these.
+- **Bucket:** (b) xdist resource contention
+- **Root cause:** Process-timing sensitive: sentinel subprocess + /proc starttime read races under xdist load.
 - **Arm counts:** isolated 5/5 pass, full -n 2 flake observed 2026-08-26
 - **Retirement date:** 2026-08-26
 - **Re-quarantine trigger:** Any failure under `-n 2`.
