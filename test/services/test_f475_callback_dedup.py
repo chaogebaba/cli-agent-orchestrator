@@ -369,70 +369,106 @@ class TestB1DedupTransactionIsolation:
             )
 
     def test_unrelated_caller_write_persists_through_dedup_failure(self, _fresh_db):
-        """Flush an unrelated caller update, then force dedup lookup to fail.
+        """Flush an unrelated caller update, force dedup lookup to raise INSIDE
+        the SAVEPOINT, and verify the caller's flushed write persists.
 
-        The unrelated write MUST persist even when the dedup savepoint fails.
+        This mirrors the reviewer's probe topology: SQLite single-connection,
+        caller write flushed, then dedup lookup fails in-SAVEPOINT. The
+        savepoint rollback must NOT revert the caller's earlier flush.
         """
+        from unittest.mock import patch as _patch
+        from sqlalchemy import create_engine, event
         from sqlalchemy.orm import sessionmaker
 
-        SL = _db_mod.SessionLocal
+        import cli_agent_orchestrator.clients.database as db_mod
+        from cli_agent_orchestrator.clients.database import (
+            TerminalModel, InboxModel, _insert_routed_inbox_row,
+        )
 
-        with SL() as caller_db:
-            # Modify the sup-1 terminal (unrelated write)
-            from cli_agent_orchestrator.clients.database import TerminalModel
+        # Use :memory: with StaticPool to reproduce the shared-connection topology
+        from sqlalchemy.pool import StaticPool
+        mem_engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        db_mod.Base.metadata.create_all(bind=mem_engine)
+        MemSession = sessionmaker(bind=mem_engine)
 
+        # Seed terminals
+        with MemSession() as db:
+            db.add(TerminalModel(
+                id="worker-1", tmux_session="s", tmux_window="w1",
+                provider="mock", agent_profile="developer",
+                caller_id="sup-1", lifecycle="ephemeral", init_state="ready",
+            ))
+            db.add(TerminalModel(
+                id="sup-1", tmux_session="s", tmux_window="w0",
+                provider="mock", agent_profile="supervisor",
+                lifecycle="ephemeral", init_state="ready",
+            ))
+            db.commit()
+
+        with MemSession() as caller_db:
+            # Unrelated caller write: change sup-1's profile
             sup = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
-            sup.agent_profile = "pre_failure_value"
-            caller_db.flush()
+            sup.agent_profile = "changed_in_caller"
+            caller_db.flush()  # flushed but not committed
 
-            # Force the dedup savepoint to fail by injecting an exception
+            # Now inject a failure INSIDE the SAVEPOINT. The production code does:
+            #   nested = db.begin_nested()
+            #   try:
+            #       existing = db.query(InboxModel).filter(...).first()  <-- raise here
+            #   except: nested.rollback(); raise
+            # We patch InboxModel's query filter to raise ONLY during the
+            # savepoint (after begin_nested is called).
+            savepoint_entered = [False]
             orig_begin_nested = caller_db.begin_nested
 
-            call_count = [0]
+            def _tracking_nested():
+                savepoint_entered[0] = True
+                return orig_begin_nested()
 
-            def _failing_nested():
-                call_count[0] += 1
-                nested = orig_begin_nested()
-                # Inject a failure after savepoint creation by monkey-patching
-                # the session query to raise during the dedup lookup
-                return nested
+            orig_query = caller_db.query
 
-            caller_db.begin_nested = _failing_nested
+            def _failing_query_in_savepoint(model, *args, **kwargs):
+                q = orig_query(model, *args, **kwargs)
+                if model is InboxModel and savepoint_entered[0]:
+                    # Raise inside the savepoint to trigger rollback
+                    raise RuntimeError("forced in-SAVEPOINT failure")
+                return q
 
-            # Force a dedup-eligible path by patching _f475_should_dedup
-            with patch.object(
-                _db_mod,
-                "_f475_should_dedup",
-                return_value=True,
-            ), patch.object(
-                _db_mod,
-                "_f475_compute_content_hash",
-                side_effect=RuntimeError("forced dedup failure"),
-            ):
-                from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
+            caller_db.begin_nested = _tracking_nested
+            caller_db.query = _failing_query_in_savepoint
 
+            # Patch dedup eligibility so we enter the savepoint path
+            with _patch.object(db_mod, "_f475_should_dedup", return_value=True), \
+                 _patch.object(db_mod, "SessionLocal", return_value=MemSession()):
                 result = _insert_routed_inbox_row(
                     caller_db,
                     sender_id="worker-1",
                     receiver_id="sup-1",
                     logical_receiver_id=None,
-                    message="new-message-after-failure",
+                    message="msg-after-savepoint-failure",
                     orchestration_type=OrchestrationType.SEND_MESSAGE,
                 )
-                # Fail-open: row should be inserted normally
-                assert result.id is not None
+            # Fail-open: row inserted normally despite savepoint failure
+            assert result.id is not None
+            assert savepoint_entered[0], "SAVEPOINT was never entered"
 
-            # The unrelated write MUST still be visible
+            # Caller's unrelated write MUST still be visible
+            # Restore original query for verification
+            caller_db.query = orig_query
             sup_check = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
-            assert sup_check.agent_profile == "pre_failure_value"
+            assert sup_check.agent_profile == "changed_in_caller"
 
             caller_db.commit()
 
-        # Verify persistence
-        with SL() as verify_db:
+        # Verify durable persistence
+        with MemSession() as verify_db:
             sup_final = verify_db.query(TerminalModel).filter_by(id="sup-1").one()
-            assert sup_final.agent_profile == "pre_failure_value", (
-                "B1 REGRESSION: dedup failure reverted caller's unrelated flushed write"
+            assert sup_final.agent_profile == "changed_in_caller", (
+                "B1 REGRESSION: in-SAVEPOINT dedup failure reverted caller's flushed write"
             )
 
     def test_caller_refetch_failure_propagates(self, _fresh_db):

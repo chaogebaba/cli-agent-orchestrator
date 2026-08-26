@@ -100,7 +100,6 @@ class TestReaderThreadLifecycle:
         assert not thread.is_alive()
         assert not fifo_path.exists()
 
-    @pytest.mark.serial_only
     def test_data_received_across_writer_reconnects(self, tmp_path, monkeypatch):
         """Chunks written by successive writers (tmux re-attaching pipe-pane)
         are all published; writer disconnects must not kill the reader."""
