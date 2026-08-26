@@ -38,6 +38,11 @@
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
     },
+    "position": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "F497 composition axis: the position persona (positions/<pos>.md) this profile composes from. Resolver-internal; legacy profiles omit it."
+    },
     "lifecycle": {
       "type": "string",
       "enum": ["ephemeral", "sticky"]

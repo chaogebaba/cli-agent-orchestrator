@@ -73,6 +73,15 @@ class AgentProfile(BaseModel):
     name: str
     description: str
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
+    # F497 D6 — resolver-internal composition axis. `position` records which
+    # `positions/<pos>.md` persona composed this profile; it is set by the
+    # resolver, never a passthrough (the raw `position:` frontmatter key is a
+    # resolver INPUT directive consumed during composition — see D5). For a
+    # legacy profile that declares no `position:`, this stays None and the
+    # composed profile is byte-identical to today's direct parse (AC1). The
+    # composed profile's `.name` still stays the LEGACY concrete name (D6);
+    # `position`/`provider` are the resolver-internal axis fields.
+    position: Optional[str] = None
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
     protected: Optional[bool] = None  # Refuse MCP deletion unless force=true

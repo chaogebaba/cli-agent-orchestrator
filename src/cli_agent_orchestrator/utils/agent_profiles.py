@@ -289,6 +289,73 @@ def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProf
     return AgentProfile(**meta)
 
 
+# --- F497 position/provider decoupling resolver (D2/D5) --------------------
+#
+# The resolver sits ABOVE the provider layer (D2): it feeds the existing
+# ``load_agent_profile`` seam so ``profile.name`` composition is computed once,
+# not fanned into the four provider modules. Phase 1 (migration step 1) lands
+# the seam and the new model field ONLY — composition of ``positions/`` and
+# ``overlays/`` fragments is Phase 2. A legacy profile that declares no
+# composition keys resolves BYTE-IDENTICALLY to today's direct parse (AC1).
+
+# Frontmatter keys whose PRESENCE marks a profile as composition-bearing. A
+# profile carrying either one is refused by ``cao install`` on a resolver-less
+# server (AC2) and, until Phase 2 lands the merge engine, is refused at load
+# time here too rather than silently booting a worker with an empty persona
+# (the exact cross-release hazard the migration ordering closes).
+PROFILE_COMPOSITION_KEYS = ("extends", "position")
+
+# Resolver-owned meta-keys stripped from the merged dict before ``AgentProfile``
+# is constructed (D5). ``AgentProfile`` has no ``model_config`` forbidding extra
+# keys, so unknown keys are silently dropped — stripping is defence-in-depth so
+# a resolver input never masquerades as (or collides with) a model field. Note
+# ``position`` IS a resolver-internal model field (D6): the raw ``position:``
+# frontmatter DIRECTIVE is consumed here, and the resolver sets the field
+# programmatically from the resolved persona — the two are not the same thing.
+_RESOLVER_META_KEYS = ("extends", "_replace", "position", "providers")
+
+
+def profile_declares_composition(metadata: dict) -> bool:
+    """True when frontmatter carries any F497 composition key (``extends``/``position``).
+
+    Shared by the resolver and the ``cao install`` fail-closed guard (AC2) so
+    both agree on exactly which profiles are "new-style" and must not reach a
+    resolver-less server. A key present but empty/false still counts as
+    declared: an ``extends:`` with no value is a malformed composition profile,
+    not a legacy one, and must not slip through as byte-identical.
+    """
+    return any(key in metadata for key in PROFILE_COMPOSITION_KEYS)
+
+
+def resolve_agent_profile(resolved_text: str, profile_name: str) -> AgentProfile:
+    """Compose an ``AgentProfile`` from already-env-resolved markdown text.
+
+    This is the F497 resolver seam (D2). It is the single point above the
+    provider layer where a profile's persona/overlay composition happens.
+
+    Phase 1 contract:
+      * A profile declaring NO composition key resolves exactly as
+        ``parse_agent_profile_text`` does today — same code path, byte-identical
+        result (AC1). This is the whole corpus until Phase 2.
+      * A profile declaring ``extends:``/``position:`` is refused here with a
+        clear error. The merge engine (D5's six key-classes) is Phase 2; until
+        then, letting such a profile through would boot a worker with an empty
+        persona and no error — the hazard the migration ordering exists to
+        close. ``cao install`` refuses these upstream (AC2), so a well-run
+        deploy never reaches this raise; it is a fail-closed backstop.
+    """
+    metadata = frontmatter.loads(resolved_text).metadata
+    if profile_declares_composition(metadata):
+        declared = [k for k in PROFILE_COMPOSITION_KEYS if k in metadata]
+        raise ValueError(
+            f"Agent profile '{profile_name}' declares composition key(s) "
+            f"{declared} but profile composition is not available until F497 "
+            f"Phase 2. Phase 1 lands the resolver seam and model fields only; "
+            f"no profile should carry these keys yet."
+        )
+    return parse_agent_profile_text(resolved_text, profile_name)
+
+
 def read_agent_profile_source(agent_name: str) -> str:
     """Locate an agent profile across configured stores and return the raw text.
 
@@ -367,10 +434,17 @@ _read_agent_profile_source = read_agent_profile_source
 
 
 def load_agent_profile(agent_name: str) -> AgentProfile:
-    """Load an agent profile from the configured stores."""
+    """Load an agent profile from the configured stores.
+
+    Routes through the F497 resolver seam (``resolve_agent_profile``) so a
+    single point above the provider layer owns profile composition (D2). For
+    the whole legacy corpus this is byte-identical to the previous direct
+    ``parse_agent_profile_text`` call (AC1); composition-bearing profiles are
+    Phase 2.
+    """
     try:
         raw_text = read_agent_profile_source(agent_name)
-        return parse_agent_profile_text(resolve_env_vars(raw_text), agent_name)
+        return resolve_agent_profile(resolve_env_vars(raw_text), agent_name)
     except (FileNotFoundError, ValueError):
         raise
     except Exception as e:
