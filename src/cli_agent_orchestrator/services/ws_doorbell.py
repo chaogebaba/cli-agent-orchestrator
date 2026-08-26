@@ -98,16 +98,20 @@ def push_doorbell_frame_sync(
     message_id: int,
     sender_short: str,
     preview: str,
-) -> None:
+) -> bool:
     """Fire-and-forget doorbell push from synchronous code.
 
     Posts the coroutine to the running event loop. Best-effort: if the loop
     is unavailable, the frame is silently dropped (tier-2 still delivers).
+
+    F158: Returns True when a frame was posted to a live connection, False
+    when the WS plane is disabled, unarmed, or loop unavailable. Callers
+    use this to decide whether a fallback wake is needed.
     """
     if not is_ws_monitor_enabled():
-        return
+        return False
     if not is_armed(terminal_id):
-        return
+        return False
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -117,11 +121,12 @@ def push_doorbell_frame_sync(
 
             loop = inbox_service._delivery_loop
             if loop is None or loop.is_closed():
-                return
+                return False
         except Exception:
-            return
+            return False
 
     asyncio.run_coroutine_threadsafe(
         push_doorbell_frame(terminal_id, message_id, sender_short, preview),
         loop,
     )
+    return True

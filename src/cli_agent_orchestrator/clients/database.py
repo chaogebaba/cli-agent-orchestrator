@@ -613,13 +613,19 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
     if existing_obl is not None:
         _touch_supervisor_pending_flag()
         # D3: Stash doorbell even on idempotent hit
+        # F158: Use 4-tuple with receiver_id (terminal_id) to match after_commit format
         from sqlalchemy.orm import Session as _Session
 
         sess = _Session.object_session(target)
         if sess is not None:
             stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
             preview = (target.message or "").split("\n", 1)[0]
-            stash.append((logical_receiver_id, row_id, preview[:120]))
+            stash.append((
+                target.receiver_id,
+                row_id,
+                (target.sender_id or "")[:8],
+                preview[:120],
+            ))
         return
     connection.execute(
         insert(DeliveryObligationModel.__table__).values(
@@ -664,7 +670,13 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
 
 
 def _f413_after_commit(session: Any) -> None:
-    """D3: Drain doorbell stash after commit, with nested-tx guard."""
+    """D3: Drain doorbell stash after commit, with nested-tx guard.
+
+    F158: When the WS doorbell is not armed (connection lost or never
+    established), falls back to ring_supervisor_doorbell so pull-mode
+    supervisors are woken immediately instead of waiting for the periodic
+    reconciler.
+    """
     if session.in_nested_transaction():
         return
     stash = session.info.pop(_F413_DOORBELL_STASH_KEY, [])
@@ -672,13 +684,43 @@ def _f413_after_commit(session: Any) -> None:
     session.info.pop(_F413_DOORBELL_SNAPSHOT_KEY, None)
     if not stash:
         return
-    for terminal_id, row_id, sender_short, preview in stash:
+    for entry in stash:
+        # F158: tolerate both 3-tuple (legacy idempotent-hit path) and 4-tuple
+        if len(entry) == 4:
+            terminal_id, row_id, sender_short, preview = entry
+        elif len(entry) == 3:
+            # Legacy 3-tuple from idempotent-hit stash: (logical_receiver_id, row_id, preview)
+            # logical_receiver_id is a mailbox_id — resolve to terminal_id
+            terminal_id, row_id, preview = entry
+            sender_short = ""
+        else:
+            continue  # malformed — skip
+
+        ws_fired = False
         try:
             from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
 
-            push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
+            ws_fired = push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
         except Exception:
             pass  # advisory-only
+
+        # F158: When WS didn't fire, attempt native doorbell as immediate fallback.
+        # The after-commit hook does NOT hold delivery_lock, so G1 is safe to skip.
+        if not ws_fired:
+            try:
+                from cli_agent_orchestrator.services.doorbell_service import (
+                    ring_supervisor_doorbell,
+                )
+
+                ring_supervisor_doorbell(
+                    terminal_id,
+                    row_id,
+                    written_count=1,
+                    caller_holds_no_delivery_lock=True,
+                )
+            except Exception:
+                pass  # best-effort fallback
+
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
 
