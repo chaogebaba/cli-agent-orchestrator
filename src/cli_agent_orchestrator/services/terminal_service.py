@@ -4980,6 +4980,95 @@ async def _confirm_launch_health(terminal_id: str, provider) -> None:
     raise ProviderLaunchFailed(f"provider process tree is empty/dead for terminal {terminal_id}")
 
 
+# ---------------------------------------------------------------------------
+# F491: Wait for auto-responder-dismissable dialogs before send_input
+# ---------------------------------------------------------------------------
+_F491_DIALOG_CLEAR_POLL_INTERVAL = 0.5
+_F491_DIALOG_CLEAR_INITIAL_GRACE = 1.0
+
+
+async def _wait_for_auto_responder_dialog_clear(
+    terminal_id: str,
+    generation: str,
+    provider_instance: Any,
+    timeout: float = 12.0,
+) -> None:
+    """Wait for the auto-responder to dismiss any active whitelisted dialog.
+
+    During deferred init, a dialog (e.g. codex's resume-working-directory menu)
+    may appear after initialize() returns. The auto-responder fires its rule on
+    the next detection tick and sends dismiss keys, but send_input would race
+    ahead and fail if we don't give it time. This function polls the terminal's
+    status and the auto-responder's rule-fire state until either:
+      - The terminal is no longer WAITING_USER_ANSWER, OR
+      - The auto-responder's waiting_gate is not set (rule already fired or not needed), OR
+      - Timeout expires (we proceed anyway — the retry loop handles the failure).
+
+    Does NOT block indefinitely — bounded by timeout. A terminal that never
+    shows a dialog returns immediately (status != WAITING_USER_ANSWER on the
+    first poll).
+    """
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    # Quick pre-check: if status is already not WAITING_USER_ANSWER, return
+    # immediately without any grace sleep. This is the common case (no dialog).
+    current_status = status_monitor.get_status(terminal_id)
+    if current_status != TerminalStatus.WAITING_USER_ANSWER:
+        return
+
+    # Brief initial grace: give the TUI a moment to render a late dialog before
+    # concluding there isn't one. Without this, a dialog that appears 200ms after
+    # initialize() returns is missed on the first poll.
+    await asyncio.sleep(_F491_DIALOG_CLEAR_INITIAL_GRACE)
+
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        current_status = status_monitor.get_status(terminal_id)
+        if current_status != TerminalStatus.WAITING_USER_ANSWER:
+            logger.debug(
+                "f491_dialog_clear terminal=%s status=%s — no dialog blocking",
+                terminal_id,
+                current_status.value,
+            )
+            return
+
+        # Check if the auto-responder has a firing rule or a waiting gate
+        gate = auto_responder.waiting_gate(terminal_id)
+        if gate is not None:
+            # A wait_rule is active — the auto-responder deliberately holds this
+            # terminal. Don't wait for it to clear — let the caller handle it
+            # (TerminalInputBlockedError path).
+            logger.debug(
+                "f491_dialog_clear terminal=%s gate=%s — wait rule active, proceeding",
+                terminal_id,
+                gate,
+            )
+            return
+
+        # Force a detection tick to give the auto-responder a chance to fire.
+        # The dialog is static (no new output), so the normal quiescence-based
+        # detection won't re-trigger. Capture the screen and run detection.
+        try:
+            lines = status_monitor.get_rendered_screen(terminal_id)
+            if lines is not None:
+                auto_responder.on_screen(terminal_id, provider_instance, lines)
+        except Exception:
+            logger.debug(
+                "f491_dialog_clear terminal=%s — forced detection failed",
+                terminal_id,
+                exc_info=True,
+            )
+
+        await asyncio.sleep(_F491_DIALOG_CLEAR_POLL_INTERVAL)
+
+    logger.warning(
+        "f491_dialog_clear terminal=%s — timeout after %.1fs, proceeding with send_input",
+        terminal_id,
+        timeout,
+    )
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -5171,6 +5260,17 @@ def _schedule_deferred_init(
                 # so plugin events see it.
                 _DEFERRED_DELIVERY_MAX_RETRIES = 3
                 _DEFERRED_DELIVERY_RETRY_DELAY = 2.0
+                # F491: Wait for any auto-responder-dismissable dialog to clear
+                # before attempting send_input. During deferred init the resume-cwd
+                # or similar whitelisted dialog may appear after initialize() returns
+                # (which accepts WAITING_USER_ANSWER for the login-menu case). The
+                # auto-responder fires its rule on the next detection tick, but
+                # send_input would race ahead and fail with DeliveryDeferredError
+                # before the dialog is dismissed. Give the auto-responder time to
+                # handle it.
+                await _wait_for_auto_responder_dialog_clear(
+                    terminal_id, generation, provider_instance, timeout=12.0
+                )
                 for _attempt in range(_DEFERRED_DELIVERY_MAX_RETRIES):
                     try:
                         await _tracked_blocking(
@@ -5192,6 +5292,12 @@ def _schedule_deferred_init(
                             terminal_id,
                             _attempt + 1,
                             _DEFERRED_DELIVERY_MAX_RETRIES,
+                        )
+                        # F491: Before retrying, check if a dialog appeared that
+                        # the auto-responder can dismiss — wait for it to clear
+                        # rather than blindly retrying into the same failure.
+                        await _wait_for_auto_responder_dialog_clear(
+                            terminal_id, generation, provider_instance, timeout=8.0
                         )
                         await asyncio.sleep(_DEFERRED_DELIVERY_RETRY_DELAY)
                 started = await _confirm_worker_started_or_resubmit(

@@ -3333,6 +3333,54 @@ class CodexProvider(BaseProvider):
         # Rollout poll exhausted without confirmation. Check if stuck.
         # Recovery Enter fires ONLY if pane shows a stuck owned chip AND
         # a final rollout re-check still shows no match.
+        #
+        # F491: Before entering the recovery loop, check if a blocking dialog
+        # appeared (e.g. resume-cwd) that the auto-responder can dismiss. If
+        # the terminal is in WAITING_USER_ANSWER, the paste never submitted
+        # because the dialog absorbed the Enter. Don't retry blindly — let the
+        # auto-responder handle it or raise to the deferred init retry.
+        try:
+            from cli_agent_orchestrator.services.auto_responder import auto_responder
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            _f491_status = status_monitor.get_status(self.terminal_id)
+            if _f491_status == TerminalStatus.WAITING_USER_ANSWER:
+                # A dialog is blocking. Give auto-responder one more chance to
+                # fire by forcing a screen evaluation.
+                _f491_lines = status_monitor.get_rendered_screen(self.terminal_id)
+                if _f491_lines is not None:
+                    _f491_provider = self
+                    auto_responder.on_screen(self.terminal_id, _f491_provider, _f491_lines)
+                # Brief wait for auto-responder dismiss + TUI redraw
+                time.sleep(1.5)
+                _f491_recheck = status_monitor.get_status(self.terminal_id)
+                if _f491_recheck == TerminalStatus.WAITING_USER_ANSWER:
+                    logger.warning(
+                        "F435/F491 submit-verify: terminal %s has active dialog "
+                        "(status WAITING_USER_ANSWER); cannot recover with Enter",
+                        self.terminal_id,
+                    )
+                    raise CodexSubmitStuckError(
+                        f"Codex terminal {self.terminal_id} has an active dialog "
+                        f"blocking submission (WAITING_USER_ANSWER); the paste "
+                        f"never submitted. Auto-responder dismiss pending."
+                    )
+                logger.info(
+                    "F435/F491 submit-verify: terminal %s dialog cleared by "
+                    "auto-responder; rechecking rollout",
+                    self.terminal_id,
+                )
+                if _rollout_confirms():
+                    return
+        except CodexSubmitStuckError:
+            raise
+        except Exception:
+            logger.debug(
+                "F435/F491 dialog pre-check failed for %s; proceeding with retry",
+                self.terminal_id,
+                exc_info=True,
+            )
+
         for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
             if not _pane_shows_stuck_chip():
                 # No stuck chip visible — cannot recover with Enter. The task

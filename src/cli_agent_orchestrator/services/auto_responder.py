@@ -92,6 +92,12 @@ SEED_RULES: Dict[str, str] = {
   question: "Do you trust the contents of this directory?"
   options: ["Yes, continue", "No, quit"]
   answer: ["Enter"]
+- name: codex-resume-working-directory
+  enabled: true
+  match_mode: contains
+  question: "Choose working directory to resume this session"
+  options: ["Press enter"]
+  answer: ["Enter"]
 """,
 }
 
@@ -376,11 +382,13 @@ class AutoResponder:
         # Layer B (F115): suppress all on_screen effects after exit.
         with self._lock:
             if terminal_id in self._exit_suppressed:
+                self._log_decision(terminal_id, "not_running", "exit_suppressed")
                 return None
 
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             self._clear_wait_rule(terminal_id)
+            self._log_decision(terminal_id, "not_running", "no_metadata")
             return None
 
         # Per-terminal opt-out via ``cao launch --env CAO_AUTO_ANSWER=false``.
@@ -391,17 +399,20 @@ class AutoResponder:
         session_env = get_session_env(metadata["tmux_session"])
         if session_env.get("CAO_AUTO_ANSWER", "true").lower() == "false":
             self._clear_wait_rule(terminal_id)
+            self._log_decision(terminal_id, "not_running", "auto_answer_disabled")
             return None
 
         if self._find_supervisor(metadata["tmux_session"]) == terminal_id:
             self._clear_wait_rule(terminal_id)
             logger.debug("auto-responder: skipping supervisor terminal %s", terminal_id)
+            self._log_decision(terminal_id, "not_running", "is_supervisor")
             return None
 
         provider_name = metadata["provider"]
         region = dialog_region(lines)
         if not region.normalized:
             self._clear_wait_rule(terminal_id)
+            self._log_decision(terminal_id, "not_running", "empty_region")
             return None
         supplied_status = self._classify_region(terminal_id, provider, region)
         incarnation = self._snapshot_incarnation(terminal_id, metadata)
@@ -412,21 +423,31 @@ class AutoResponder:
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
                 if fresh is None:
+                    self._log_decision(terminal_id, "no_match", "wait_rule_capture_failed", rule.name)
                     return None
                 fresh_region = self._region_from_capture(fresh)
                 if not rule.matches(fresh_region.normalized):
+                    self._log_decision(terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name)
                     return None
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
+                self._log_decision(terminal_id, "matched", "wait_rule_active", rule.name)
                 return TerminalStatus.WAITING_USER_ANSWER
             if self._busy_veto(supplied_status):
+                self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
                 continue
             if not self._corroborates_fire(region, supplied_status):
+                self._log_decision(
+                    terminal_id, "no_match", "corroboration_failed", rule.name,
+                    extra=f"status={supplied_status.value if supplied_status else 'None'}",
+                )
                 continue
             self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name)
             if time.monotonic() < state.cooldown_until:
+                self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
+            self._log_decision(terminal_id, "matched", "firing", rule.name)
             self._fire(
                 terminal_id,
                 metadata,
@@ -439,6 +460,7 @@ class AutoResponder:
             return None
 
         self._clear_wait_rule(terminal_id)
+        self._log_decision(terminal_id, "no_match", "no_rule_matched")
         return self._check_unknown(
             terminal_id,
             metadata,
@@ -560,6 +582,35 @@ class AutoResponder:
                 f.write(f"{ts} rule={rule.name} event={event} dialog={excerpt!r}\n")
         except OSError:
             logger.exception("auto-responder: failed to write log for %s", terminal_id)
+
+    @staticmethod
+    def _log_decision(
+        terminal_id: str,
+        outcome: str,
+        reason: str,
+        rule_name: str | None = None,
+        *,
+        extra: str | None = None,
+    ) -> None:
+        """F491: Log every on_screen evaluation decision for diagnosability.
+
+        Outcomes: 'matched' (rule fired or wait activated), 'no_match' (rule
+        present but conditions not met), 'not_running' (early exit before rule eval).
+        """
+        AUTO_ANSWER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = AUTO_ANSWER_LOG_DIR / f"{terminal_id}.decisions.log"
+        ts = datetime.now(timezone.utc).isoformat()
+        parts = [f"{ts} outcome={outcome} reason={reason}"]
+        if rule_name:
+            parts.append(f"rule={rule_name}")
+        if extra:
+            parts.append(extra)
+        line = " ".join(parts) + "\n"
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass  # best-effort — never crash on decision logging
 
     def _surface_retry_exhausted(
         self,
