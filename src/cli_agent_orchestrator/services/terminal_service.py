@@ -6822,6 +6822,7 @@ def _delete_terminal_inner(
                     require_confirmed_death=True,
                     quarantine_session_uuid=by_id.get(node_id, {}).get("provider_session_id"),
                     reparent_target_id=target_id,
+                    force=force,
                 )
             finally:
                 release_rebind_lease(token)
@@ -6952,6 +6953,7 @@ def _delete_terminal_under_lease(
     uuid_lease_token=None,
     persona_retention_intent=None,
     reparent_target_id: str | None = None,
+    force: bool = False,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
     # Layer C (F115): early auto_responder.clear_terminal at start of delete.
@@ -7184,18 +7186,24 @@ def _delete_terminal_under_lease(
         # inspected/stopped.  Keep both the provider mapping and DB metadata so
         # a subsequent DELETE can retry; reporting success here would turn a
         # temporary process race into a permanent private-home leak.
-        if provider_manager.cleanup_provider(terminal_id) is False:
+        cleanup_result = provider_manager.cleanup_provider(terminal_id)
+        if cleanup_result is False:
+            if not force:
+                logger.warning(
+                    "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+                )
+                return {
+                    "terminal_deleted": False,
+                    "intent_deleted": False,
+                    "intent_error": None,
+                    "intent_retain_reason": "cleanup_deferred",
+                    "rollback_kill_uncertain": False,
+                    "cleanup_deferred": True,
+                }
             logger.warning(
-                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+                "Terminal %s cleanup_provider deferred but force=True; proceeding with deletion",
+                terminal_id,
             )
-            return {
-                "terminal_deleted": False,
-                "intent_deleted": False,
-                "intent_error": None,
-                "intent_retain_reason": "cleanup_deferred",
-                "rollback_kill_uncertain": False,
-                "cleanup_deferred": True,
-            }
         from cli_agent_orchestrator.utils.persona_context import cleanup_persona
 
         cleanup_persona(terminal_id)
