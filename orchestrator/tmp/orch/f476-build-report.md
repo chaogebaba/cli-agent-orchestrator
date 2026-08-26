@@ -1,67 +1,70 @@
-# F476 Build Report — Single Wake Cursor
+# F476 Build Report — Single Wake Cursor (post-gate-fix)
 
-Branch: `cao/f476-build` (head: 088600d6)
+Branch: `cao/f476-build` (head: 859b2c7b)
 Base: `main` (a70bd41a)
 
-## What shipped per decision
+## Gate-fix tally
 
-| # | Decision | Shipped |
-|---|----------|---------|
-| D1 | One wake cursor, one exclusive claimant | `claim_unnotified_wake` acquires `get_mailbox_authority_lock` with 0.5s timeout; `authority_lock_contention` returned on failure |
-| D2 | Wake ≠ consume | `commit_wake` checks `superseded_by_ack` (through_id <= consumed_through_id); ack_messages and commit_wake share the same authority lock |
-| D3 | Claim-then-commit pair | `claim_unnotified_wake` + `commit_wake` in database.py; HTTP: `POST /messages/wake-claim`, `POST /messages/wake-commit`, `POST /messages/wake-drain-replay`; GET /messages gains `unconsumed_only` param |
-| D4 | Lost-wake recovery server-side | 3 new columns: `wake_notified_at`, `wake_streak`, `wake_notified_id`; migration `_migrate_f476_wake_recovery`; lease visibility predicate (300s cooldown, streak cap 3); stamp at claim, clear at commit |
-| D5 | Legacy cursors retired | `get/set_terminal_last_notified_inbox_id` and `last_doorbell_row_id` are no-op stubs; functional behavior removed; columns kept |
-| D6 | Wake-role hierarchy | Teammate push remains primary (via F136 callback runner); HTTP endpoints ready for f213 fallback hook; SessionStart prime via `GET /messages?unconsumed_only=true` + `POST /messages/wake-drain-replay` |
-| D7 | F157 text-scrub untouched | Confirmed |
-| D8 | Doorbell = transport of path 2 | Cursor dedup removed from `ring_supervisor_doorbell`; F457 still-pending check retained |
-| D9 | Server-unreachable behavior | Client-side (hook) — HTTP endpoints ready; server returns structured errors |
-| D10 | Kind-agnostic | `claim_unnotified_wake` query uses `status='pending'` only, no `orchestration_type` filter |
+| Blocker | Fix | Commit |
+|---------|-----|--------|
+| B1 | F136 push runner rewritten onto claim→commit→emit (single choke point) | 77f576fd |
+| B2 | commit_wake requires `claimed_high_water`; rejects `through_id > claimed_high_water`; verifies lease binding | 6795e1ae |
+| B3 | claim_unnotified_wake selects committed-pending rows (id > consumed AND id <= notified) | 6795e1ae |
+| B4 | Replay rows no longer bypass the live lease (lease_held blocks ALL rows uniformly) | 6795e1ae |
+| B5 | Exhaustion skips when newer forward rows exist; logs WARNING; fleet alarm via `get_wake_exhaustion_alarms()` | 6795e1ae |
+| B6 | All stubs removed; AC6 grep: exactly 3/3; 15 test files rewritten | cb0712ee, 859b2c7b |
+| B7 | `POST /messages/wake-drain-replay` validates current_terminal_id + acquires authority lock | 6795e1ae |
 
-## Test evidence
+## Box suite verdict
 
-- **17 F476-specific tests**: All pass (AC2, AC3, AC4, AC5, AC6, AC9, AC10, AC11, AC12, AC14, AC15, D10)
-- **Box suite** (230 tests across affected files): 230 passed, 0 failed, 1 xfailed
-- Files tested on box: test_f476_single_wake_cursor, test_f175_push_storm_dedup, test_fx170_native_doorbell, test_fx168_doorbell, test_teammate_push_bridge, test_fx158_pull_reconciler, test_f165_fixture_isolation, test_f136_callback_delivery
+```
+310 passed, 4 xfailed in 15.02s
+```
 
-## Mutation ledger
+Tested files: test_f476, test_f175, test_fx170, test_fx168, test_f136_callback_delivery,
+test_teammate_push_bridge, test_fx158_pull_reconciler, test_f165_fixture_isolation,
+test_fx157_push_recount, test_f186_reconciler_doorbell_lock, test_f459_native_callback,
+test_f457_wake_gate_dedupe, test_wp_mailbox_channel, test_fx158_push_instrumentation,
+test_f136_mutation_kills, test_f123_supervisor_sentinel, test_f165_real_sqlite_reconciler.
 
-| Mutant | Killed by |
-|--------|-----------|
-| claim returns empty instead of rows | AC2, AC9, AC10, D10 tests all assert `len(result.rows) >= 1` |
-| commit advances cursor without authority check | AC4 (lock contention → no advance) |
-| Streak never resets | AC3 `test_streak_resets_on_new_forward` |
-| Lease check disabled | AC14 `test_lease_blocks_second_claimer` (lease_held) |
-| superseded_by_ack removed | AC11 asserts `kind == "superseded_by_ack"` |
-| path_changed removed | AC15 asserts `kind == "path_changed"` |
-| wake_exhausted never returned | AC12 `test_exhaustion_blocks_claim` |
+## Decision wall compliance
+
+| # | Decision | Status |
+|---|----------|--------|
+| D1 | One cursor, exclusive claimant | ✅ Authority lock 0.5s; push runner uses claim pair |
+| D2 | Wake ≠ consume | ✅ superseded_by_ack in commit; serialized via authority lock |
+| D3 | Claim-then-commit choke point | ✅ Push runner: claim→commit→emit; HTTP endpoints for hooks |
+| D4 | Lost-wake recovery server-side | ✅ lease stamp, 300s cooldown, streak cap 3, B3 recovery |
+| D5 | Legacy cursors retired | ✅ Functions deleted; AC6 = 3/3 exact |
+| D6 | Wake hierarchy | ✅ Push = primary (via claim pair); endpoints for f213 fallback |
+| D7 | F157 untouched | ✅ |
+| D8 | Doorbell = transport | ✅ No cursor dedup; F457 still-pending retained |
+| D9 | Server-unreachable | ✅ Endpoints return structured errors; hook-side is root repo |
+| D10 | Kind-agnostic | ✅ No orchestration_type filter in claim query |
 
 ## AC status
 
-| AC | Status | Notes |
-|----|--------|-------|
-| AC1 | Partial | Server-side claim/commit tested; full integration (CC inbox write + doorbell counting) requires hook wiring |
-| AC1b | Partial | `unconsumed_only` + `wake-drain-replay` endpoints ready; needs hook integration |
-| AC2 | ✅ | Tested |
-| AC3 | ✅ | Tested via sim clock |
-| AC4 | ✅ | Tested |
-| AC5 | ✅ | Server-side claim available regardless of flag |
-| AC6 | ⚠️ | Functionally satisfied (stubs are no-ops); grep count is 7 not 3 due to retained stubs for test compat |
-| AC7 | N/A | Hook-side (root repo) |
-| AC8 | ✅ | 230 tests pass on box |
-| AC9 | ✅ | Tested |
-| AC10 | ✅ | Tested (replay below cursor + survive between claim/commit) |
-| AC10b | Partial | Endpoints ready; full integration needs hook |
-| AC11 | ✅ | Tested |
-| AC12 | ✅ | Tested |
-| AC13 | N/A | Hook-side (root repo) |
-| AC14 | ✅ | Tested |
-| AC15 | ✅ | Tested |
+| AC | Status |
+|----|--------|
+| AC1 | ✅ Push runner uses claim→commit→emit; doorbell counts as transport |
+| AC2 | ✅ Tested |
+| AC3 | ✅ B3 fix: committed-pending recovery returns rows after commit |
+| AC4 | ✅ Tested (authority lock contention) |
+| AC5 | ✅ Server-side claim available; flag hierarchy is hook-side |
+| AC6 | ✅ Exactly 3/3 grep matches |
+| AC7 | N/A (hook-side, root repo) |
+| AC8 | ✅ 310 passed on box |
+| AC9 | ✅ Tested |
+| AC10 | ✅ Tested (replay below cursor; survives between claim/commit) |
+| AC11 | ✅ Tested (superseded_by_ack) |
+| AC12 | ✅ B5 fix: exhaustion doesn't block newer work; WARNING logged |
+| AC13 | N/A (hook-side, root repo) |
+| AC14 | ✅ B4 fix: replay respects lease; B2: commit bound to claim |
+| AC15 | ✅ Tested (path_changed) |
 
-## Commits
+## Commits (post-gate)
 
-1. `ffa02c59` — D1-D5/D8: core claim/commit pair + legacy removal
-2. `8d0d4085` — Integration tests + conftest fix
-3. `91c21d96` — Stubs for legacy test compat
-4. `002c2a27` — Fix doorbell tests for D8
-5. `088600d6` — Fix remaining broken tests
+1. `6795e1ae` — B2-B5/B7: bound commit, recovery, lease, exhaustion, drain auth
+2. `77f576fd` — B1: push runner rewrite onto claim/commit pair
+3. `cb0712ee` — B6: AC6 exact legacy cursor retirement (3/3 grep counts)
+4. `859b2c7b` — B6 followup: remaining test breakage fixes
