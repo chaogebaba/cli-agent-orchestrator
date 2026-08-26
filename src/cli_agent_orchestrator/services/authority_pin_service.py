@@ -347,6 +347,56 @@ def register_frozen_pins(
     return results
 
 
+def rotate_frozen_pins(
+    db: Any,
+    task_key: str,
+    authority_files: Sequence[Mapping[str, Any]],
+    registered_by: str,
+) -> list[dict[str, Any]]:
+    """Atomically supersede all existing frozen pins for a warm-reused terminal.
+
+    F495: When a warm reviewer is re-dispatched with new authority_files, the
+    old frozen pins must be replaced so that validate_frozen_pins checks the
+    CURRENT artifact, not a stale one from the previous dispatch.
+
+    Semantics:
+      1. Delete ALL existing frozen pins for this task_key (any file_path).
+      2. Register new frozen pins at version=1 (fresh chain).
+      3. Validate new files against caller-supplied sha256 (same as register).
+
+    Must be called INSIDE the same transaction that dispatches the new task.
+    Raises AuthorityPinError on validation/hash failure (caller should ROLLBACK).
+    """
+    validated = _validate_pins(authority_files)
+
+    # Step 1: Remove all prior frozen pins for this terminal
+    db.query(dbmod.AuthorityPinModel).filter_by(
+        task_key=task_key, frozen=True
+    ).delete(synchronize_session=False)
+
+    # Step 2: Register new frozen pins
+    results: list[dict[str, Any]] = []
+    for file_path, expected_sha in validated:
+        observed, reason = _hash_file(file_path)
+        if reason is not None:
+            raise AuthorityPinError("authority_hash_mismatch")
+        if observed != expected_sha:
+            raise AuthorityPinError("authority_hash_mismatch")
+        db.add(
+            dbmod.AuthorityPinModel(
+                task_key=task_key,
+                file_path=file_path,
+                sha256=expected_sha,
+                version=1,
+                registered_by=registered_by,
+                frozen=True,
+            )
+        )
+        results.append({"file_path": file_path, "sha256": expected_sha, "version": 1})
+    db.flush()
+    return results
+
+
 def validate_frozen_pins(db: Any, sender_id: str) -> FrozenPinValidation:
     """Validate all frozen pins for a sender BEFORE inbox row creation.
 

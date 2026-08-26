@@ -3116,18 +3116,33 @@ def create_terminal(
                 profile_name=agent_profile,
                 dispatch_barrier=dispatch_barrier,
             )
-        # F129: Register frozen authority pins in the SAME transaction
+        # F129/F495: Register frozen authority pins in the SAME transaction
+        # F495: If pins already exist (warm-reuse), rotate instead of failing
         if authority_files:
             from cli_agent_orchestrator.services.authority_pin_service import (
                 register_frozen_pins,
+                rotate_frozen_pins,
             )
 
-            register_frozen_pins(
-                db,
-                task_key=terminal_id,
-                authority_files=authority_files,
-                registered_by=caller_id or "unknown",
+            existing_pin = (
+                db.query(AuthorityPinModel.id)
+                .filter_by(task_key=terminal_id, frozen=True)
+                .first()
             )
+            if existing_pin is not None:
+                rotate_frozen_pins(
+                    db,
+                    task_key=terminal_id,
+                    authority_files=authority_files,
+                    registered_by=caller_id or "unknown",
+                )
+            else:
+                register_frozen_pins(
+                    db,
+                    task_key=terminal_id,
+                    authority_files=authority_files,
+                    registered_by=caller_id or "unknown",
+                )
         db.commit()
         invalidate_terminal_metadata_cache(terminal.id)
         return {
@@ -3246,18 +3261,33 @@ def create_terminal_with_warm_intent(
                 profile_name=agent_profile,
                 dispatch_barrier=dispatch_barrier,
             )
-        # F129: Register frozen authority pins in the SAME transaction
+        # F129/F495: Register frozen authority pins in the SAME transaction
+        # F495: If pins already exist (warm-reuse), rotate instead of failing
         if authority_files:
             from cli_agent_orchestrator.services.authority_pin_service import (
                 register_frozen_pins,
+                rotate_frozen_pins,
             )
 
-            register_frozen_pins(
-                db,
-                task_key=terminal_id,
-                authority_files=authority_files,
-                registered_by=caller_id or "unknown",
+            existing_pin = (
+                db.query(AuthorityPinModel.id)
+                .filter_by(task_key=terminal_id, frozen=True)
+                .first()
             )
+            if existing_pin is not None:
+                rotate_frozen_pins(
+                    db,
+                    task_key=terminal_id,
+                    authority_files=authority_files,
+                    registered_by=caller_id or "unknown",
+                )
+            else:
+                register_frozen_pins(
+                    db,
+                    task_key=terminal_id,
+                    authority_files=authority_files,
+                    registered_by=caller_id or "unknown",
+                )
         if fork_mode == "fork" and parent_base_name and agent_profile:
             # (frozen pins already registered above)
             claimed = False
