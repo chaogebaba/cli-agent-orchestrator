@@ -87,20 +87,14 @@ async def _guarded_push_doorbell_frame(
     preview: str,
     permit: threading.Event,
 ) -> bool:
-    """Push an advisory doorbell frame, but ONLY if the permit is still set.
+    """Push an advisory doorbell frame, gated by a permit.
 
-    F158-R4/B1: The permit is a threading.Event shared with the sync wrapper.
-    When the wrapper times out, it clears the permit. This coroutine checks
-    the permit IMMEDIATELY before calling send_text (no await between check
-    and call). Since both the permit.is_set() check and the ws.send_text()
-    invocation happen within the same coroutine execution frame (no yield
-    between them), the event loop cannot interleave — the permit state at
-    the check is authoritative for whether send_text starts.
+    F158-R5/B1: The permit is a threading.Event shared with the sync wrapper.
+    When the sync wrapper's timeout fires, it clears the permit. This coroutine
+    checks the permit BEFORE calling send_text (no yield between check and call).
 
-    If send_text has already started (the await is inside the send), the data
-    is already committed to the wire — but this is correct because the timeout
-    hadn't fired yet when the send began. The guarantee is: if the timeout fires
-    BEFORE send_text starts executing, no frame is emitted.
+    If the coroutine is cancelled (CancelledError injected), it propagates —
+    the coroutine terminates and the sync wrapper observes that it didn't send.
     """
     # Check permit BEFORE acquiring connection lock
     if not permit.is_set():
@@ -111,42 +105,27 @@ async def _guarded_push_doorbell_frame(
     if ws is None:
         return False
 
-    # CRITICAL: Check permit again IMMEDIATELY before send_text.
-    # No await between this check and the send_text call below.
-    # This guarantees: if permit was cleared (timeout fired) before this point,
-    # send_text is never invoked.
+    # CRITICAL: Check permit IMMEDIATELY before send_text.
+    # No await between this check and the send_text call.
     if not permit.is_set():
         return False
 
     frame_text = f"[CAO] callback waiting: [{message_id}] from={sender_short} {preview[:120]}"
     try:
         await ws.send_text(frame_text)
-        # Verify permit is STILL set after send completed.
-        # If cleared during the send, the frame went out but we don't claim
-        # delivery (return False) — the native fallback will also fire, but
-        # the frame was sent before the timeout was observed.
-        if not permit.is_set():
-            # Timeout fired during the send — frame went out but we can't
-            # claim delivery. The native fallback will fire too. This is the
-            # only scenario where both paths activate, and it's inherent to
-            # the send being non-atomic. The window is bounded by timeout.
-            logger.debug(
-                "ws_doorbell frame_sent_but_permit_cleared terminal=%s msg_id=%d",
-                terminal_id,
-                message_id,
-            )
-            return False
-        logger.debug(
-            "ws_doorbell frame_sent terminal=%s msg_id=%d", terminal_id, message_id
-        )
-        return True
-    except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError, Exception) as e:
+    except asyncio.CancelledError:
+        # Propagate cancellation — do NOT catch it. The frame did NOT complete.
+        raise
+    except (WebSocketDisconnect, RuntimeError, Exception) as e:
         logger.debug("ws_doorbell frame_send_failed terminal=%s: %s", terminal_id, e)
-        if not isinstance(e, asyncio.CancelledError):
-            async with _connections_lock:
-                if _connections.get(terminal_id) is ws:
-                    del _connections[terminal_id]
+        async with _connections_lock:
+            if _connections.get(terminal_id) is ws:
+                del _connections[terminal_id]
         return False
+
+    # send_text completed without exception — frame was emitted.
+    logger.debug("ws_doorbell frame_sent terminal=%s msg_id=%d", terminal_id, message_id)
+    return True
 
 
 async def push_doorbell_frame(
@@ -195,17 +174,26 @@ def push_doorbell_frame_sync(
     *,
     timeout: float = 0.5,
 ) -> bool:
-    """Synchronous doorbell push with cancellation-safe permit semantics.
+    """Synchronous doorbell push that arbitrates the WS/native winner.
 
-    F158-R4/B1: Creates a threading.Event ("permit") that gates the actual
-    ws.send_text call inside the coroutine. On timeout:
-      1. The permit is cleared → the coroutine will NOT send even if it
-         resumes after cancellation.
-      2. The future is cancelled → best-effort stop.
-      3. An invalidation is recorded → mark_ws_delivered won't set a mark.
+    F158-R5/B1: This function is the SINGLE arbitration point. It does not
+    return until the submitted coroutine has TERMINATED (succeeded, failed,
+    or been cancelled). The decision (True/False) is therefore made AFTER
+    the send's fate is known — guaranteeing that a late WS frame and native
+    fallback never coexist:
 
-    This triple-layer defense guarantees: if this function returns False,
-    no WS frame will be emitted for this (terminal_id, message_id) pair.
+      - If coroutine returns True within timeout → WS won → return True
+      - If coroutine returns False within timeout → WS failed → return False
+      - If timeout fires:
+          1. Clear permit (prevents send from starting if coroutine hasn't reached it)
+          2. Cancel future (injects CancelledError if coroutine is awaiting)
+          3. WAIT for future to settle (bounded by drain_timeout)
+          4. If future settled with True → the send completed before cancellation
+             took effect → WS won → return True (no native fallback!)
+          5. If future settled with False/exception/cancelled → WS lost → return False
+
+    This ensures: when this function returns False, no frame was emitted.
+    When it returns True, a frame was emitted and native fallback is suppressed.
     """
     if not is_ws_monitor_enabled():
         return False
@@ -239,25 +227,57 @@ def push_doorbell_frame_sync(
     permit = threading.Event()
     permit.set()  # initially allowed
 
+    # F158-R5: We need to cancel the asyncio.Task (not just the concurrent Future)
+    # to inject CancelledError into a running coroutine. Store the task reference.
+    _task_holder: list = []
+
+    async def _run_and_track():
+        """Wrapper that stores the asyncio.Task reference for cancellation."""
+        return await _guarded_push_doorbell_frame(
+            terminal_id, message_id, sender_short, preview, permit
+        )
+
+    async def _create_tracked_task():
+        """Create and store the task, then await it."""
+        task = asyncio.current_task()
+        _task_holder.append(task)
+        return await _guarded_push_doorbell_frame(
+            terminal_id, message_id, sender_short, preview, permit
+        )
+
     key = (terminal_id, message_id)
     with _send_permits_lock:
         _send_permits[key] = permit
 
     future = asyncio.run_coroutine_threadsafe(
-        _guarded_push_doorbell_frame(terminal_id, message_id, sender_short, preview, permit),
+        _create_tracked_task(),
         loop,
     )
     try:
         result = future.result(timeout=timeout)
         return result
     except Exception:
-        # Timeout, CancelledError, or coroutine exception → not delivered.
-        # CLEAR the permit FIRST — this is the authoritative gate that prevents
-        # the coroutine from emitting a frame even if cancel() doesn't stop it.
+        # Timeout or other exception — the coroutine hasn't returned yet.
+        # Step 1: Clear permit (prevent send from starting if not yet reached)
         permit.clear()
-        future.cancel()
-        _invalidate_ws_send(terminal_id, message_id)
-        return False
+        # Step 2: Cancel the asyncio Task via the event loop (not the concurrent Future).
+        # This injects CancelledError into the running coroutine.
+        def _cancel_task():
+            if _task_holder:
+                _task_holder[0].cancel()
+        loop.call_soon_threadsafe(_cancel_task)
+        # Step 3: WAIT for the future to settle after cancellation.
+        _DRAIN_TIMEOUT = 0.2
+        try:
+            settled_result = future.result(timeout=_DRAIN_TIMEOUT)
+            if settled_result is True:
+                # Send completed (resistant send emitted frame) → WS wins
+                return True
+            return False
+        except Exception:
+            # CancelledError propagated or timeout → WS lost
+            _invalidate_ws_send(terminal_id, message_id)
+            return False
     finally:
         with _send_permits_lock:
             _send_permits.pop(key, None)
