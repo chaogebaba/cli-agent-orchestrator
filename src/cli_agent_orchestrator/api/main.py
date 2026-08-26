@@ -614,6 +614,13 @@ class RunStepRequest(BaseModel):
             "would change the verdict (SR-6)."
         ),
     )
+    task_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "F483: Optional short label (max 40 chars) written to fleet-labels.tsv "
+            "while the step runs. Removed on teardown."
+        ),
+    )
 
     @field_validator("env_vars")
     @classmethod
@@ -5039,6 +5046,7 @@ async def run_step(
             on_step_terminal_ready=on_step_terminal_ready,
             model=body.model,
             use_worktree=body.use_worktree,
+            task_label=body.task_label,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
