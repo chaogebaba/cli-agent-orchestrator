@@ -672,10 +672,15 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
 def _f413_after_commit(session: Any) -> None:
     """D3: Drain doorbell stash after commit, with nested-tx guard.
 
-    F158: When the WS doorbell is not armed (connection lost or never
-    established), falls back to ring_supervisor_doorbell so pull-mode
-    supervisors are woken immediately instead of waiting for the periodic
-    reconciler.
+    F158-R2: The after-commit hook is the FIRST point where the inbox row is
+    durable. Two wake paths:
+      1. WS armed AND send succeeds → advisory frame wakes supervisor; record
+         in _f158_ws_delivered so F136 post-write skips the native ring (no dup).
+      2. WS unarmed/failed → request_delivery fires the F136 runner which writes
+         the callback file and rings ONCE post-write (single native ring owner).
+
+    The hook NEVER calls ring_supervisor_doorbell directly — that violates the
+    write-before-wake contract (supervisor wakes before callback file exists).
     """
     if session.in_nested_transaction():
         return
@@ -704,23 +709,21 @@ def _f413_after_commit(session: Any) -> None:
         except Exception:
             pass  # advisory-only
 
-        # F158: When WS didn't fire, attempt native doorbell as immediate fallback.
-        # The after-commit hook does NOT hold delivery_lock, so G1 is safe to skip.
-        if not ws_fired:
+        # F158-R2: If WS delivered, record it so F136 post-write skips the
+        # redundant native ring. No direct ring_supervisor_doorbell here —
+        # that would violate write-before-wake (B2).
+        if ws_fired:
             try:
-                from cli_agent_orchestrator.services.doorbell_service import (
-                    ring_supervisor_doorbell,
+                from cli_agent_orchestrator.services.ws_doorbell import (
+                    mark_ws_delivered,
                 )
 
-                ring_supervisor_doorbell(
-                    terminal_id,
-                    row_id,
-                    written_count=1,
-                    caller_holds_no_delivery_lock=True,
-                )
+                mark_ws_delivered(terminal_id, row_id)
             except Exception:
-                pass  # best-effort fallback
+                pass
 
+        # Always signal delivery — the F136 runner writes the callback file.
+        # When WS failed/unarmed, F136 post-write rings the native doorbell.
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
 

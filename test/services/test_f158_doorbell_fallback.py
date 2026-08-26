@@ -1,17 +1,20 @@
 """F158: Doorbell fallback — when WS is unarmed, ring_supervisor_doorbell fires.
 
 AC1: 4-tuple stash entry: push_doorbell_frame_sync called; when it returns False,
-     ring_supervisor_doorbell fires as fallback.
-AC2: 4-tuple stash entry: push_doorbell_frame_sync returns True → no fallback ring.
+     request_delivery fires (F136 post-write is the ring owner). No direct ring
+     from the after-commit hook (R2 fix: write-before-wake contract).
+AC2: 4-tuple stash entry: push_doorbell_frame_sync returns True → mark_ws_delivered
+     called, request_delivery still fires (inbox processing needed).
 AC3: 3-tuple stash entry (legacy idempotent-hit path): handled without crash,
-     falls back to ring_supervisor_doorbell.
-AC4: push_doorbell_frame_sync signature change — returns bool.
+     falls back to request_delivery.
+AC4: push_doorbell_frame_sync signature change — returns bool (R2: bounded wait).
 AC5: request_delivery still called regardless of WS outcome.
 AC6: Idempotent-hit stash path stashes 4-tuple with receiver_id (not 3-tuple).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,29 +39,30 @@ class TestF158AfterCommitFallback:
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
     @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
     def test_ac1_ws_unarmed_triggers_fallback(self, mock_ws, mock_ring, mock_req):
-        """AC1: WS unarmed → ring_supervisor_doorbell fires."""
+        """AC1: WS unarmed → request_delivery fires (F136 owns the ring). No direct ring."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session([("term123", 42, "sender", "hello")])
         _f413_after_commit(session)
 
         mock_ws.assert_called_once_with("term123", 42, "sender", "hello")
-        mock_ring.assert_called_once_with(
-            "term123", 42, written_count=1, caller_holds_no_delivery_lock=True
-        )
+        # R2: No direct ring from hook — F136 post-write is the single ring owner
+        mock_ring.assert_not_called()
         mock_req.assert_called_once_with("term123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
+    @patch("cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered")
     @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=True)
-    def test_ac2_ws_armed_no_fallback(self, mock_ws, mock_ring, mock_req):
-        """AC2: WS armed and fires → no fallback ring."""
+    def test_ac2_ws_armed_no_fallback(self, mock_ws, mock_mark, mock_ring, mock_req):
+        """AC2: WS armed and fires → mark_ws_delivered called, no direct ring."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session([("term123", 42, "sender", "hello")])
         _f413_after_commit(session)
 
         mock_ws.assert_called_once_with("term123", 42, "sender", "hello")
+        mock_mark.assert_called_once_with("term123", 42)
         mock_ring.assert_not_called()
         mock_req.assert_called_once_with("term123")
 
@@ -66,7 +70,7 @@ class TestF158AfterCommitFallback:
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
     @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
     def test_ac3_3tuple_handled_gracefully(self, mock_ws, mock_ring, mock_req):
-        """AC3: Legacy 3-tuple stash entry doesn't crash, falls back to doorbell."""
+        """AC3: Legacy 3-tuple stash entry doesn't crash, falls back to request_delivery."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         # 3-tuple: (logical_receiver_id/terminal_id, row_id, preview)
@@ -75,10 +79,8 @@ class TestF158AfterCommitFallback:
 
         # Uses the mailbox ID as terminal_id (best effort) — WS won't find it
         mock_ws.assert_called_once_with("mb_abc123", 99, "", "preview text")
-        # Fallback ring fires
-        mock_ring.assert_called_once_with(
-            "mb_abc123", 99, written_count=1, caller_holds_no_delivery_lock=True
-        )
+        # R2: No direct ring from hook
+        mock_ring.assert_not_called()
         mock_req.assert_called_once_with("mb_abc123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
@@ -95,7 +97,8 @@ class TestF158AfterCommitFallback:
         _f413_after_commit(session)
 
         assert mock_ws.call_count == 2
-        assert mock_ring.call_count == 2
+        # R2: No direct ring from hook
+        mock_ring.assert_not_called()
         assert mock_req.call_count == 2
         mock_req.assert_any_call("term1")
         mock_req.assert_any_call("term2")
@@ -163,6 +166,10 @@ class TestF158PushDoorbellFrameSyncReturnType:
             ), patch(
                 "asyncio.run_coroutine_threadsafe",
             ) as mock_run:
+                # R2: push_doorbell_frame_sync now waits on future.result()
+                future = concurrent.futures.Future()
+                future.set_result(True)
+                mock_run.return_value = future
                 result = push_doorbell_frame_sync("term1", 1, "s", "p")
                 assert result is True
                 mock_run.assert_called_once()

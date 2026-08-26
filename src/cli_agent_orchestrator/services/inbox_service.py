@@ -1149,34 +1149,47 @@ class InboxService:
         # F168 D2 / F461: ring the doorbell before entering _delivery_seq_guard.
         # F461: route through coalesce service to merge near-simultaneous callbacks.
         # D3: best-effort, isolated — exceptions never propagate.
+        # F158-R2: Skip native ring when WS advisory already delivered for this row
+        # (consume_ws_delivered returns True → WS woke the supervisor, no dup ring).
         if outcome.written > 0 and outcome.max_written_row_id > 0:
+            _f158_ws_already_delivered = False
             try:
-                # F459: resolve worker display name for from-name in native bridge
-                _f459_display = outcome._f459_sender_display_name
-                if _f459_display:
-                    try:
-                        from cli_agent_orchestrator.utils.terminal import display_name as _dn
+                from cli_agent_orchestrator.services.ws_doorbell import consume_ws_delivered
 
-                        _f459_display = _dn(_f459_display)
-                    except Exception:
-                        pass
+                _f158_ws_already_delivered = consume_ws_delivered(
+                    terminal_id, outcome.max_written_row_id
+                )
+            except Exception:
+                pass
 
-                # F461: submit to coalesce buffer instead of ringing directly
-                from cli_agent_orchestrator.services.doorbell_coalesce import (
-                    doorbell_coalesce_service,
-                )
+            if not _f158_ws_already_delivered:
+                try:
+                    # F459: resolve worker display name for from-name in native bridge
+                    _f459_display = outcome._f459_sender_display_name
+                    if _f459_display:
+                        try:
+                            from cli_agent_orchestrator.utils.terminal import display_name as _dn
 
-                doorbell_coalesce_service.submit(
-                    terminal_id,
-                    outcome.max_written_row_id,
-                    written_count=outcome.written,
-                    message_body=outcome._f459_message_body,
-                    sender_display_name=_f459_display,
-                )
-            except Exception as _bell_exc:
-                logger.debug(
-                    "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
-                )
+                            _f459_display = _dn(_f459_display)
+                        except Exception:
+                            pass
+
+                    # F461: submit to coalesce buffer instead of ringing directly
+                    from cli_agent_orchestrator.services.doorbell_coalesce import (
+                        doorbell_coalesce_service,
+                    )
+
+                    doorbell_coalesce_service.submit(
+                        terminal_id,
+                        outcome.max_written_row_id,
+                        written_count=outcome.written,
+                        message_body=outcome._f459_message_body,
+                        sender_display_name=_f459_display,
+                    )
+                except Exception as _bell_exc:
+                    logger.debug(
+                        "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
+                    )
 
         post_immediate = False
         arm_delayed: float | None = None

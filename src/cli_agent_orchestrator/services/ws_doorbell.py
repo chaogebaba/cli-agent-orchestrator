@@ -98,15 +98,20 @@ def push_doorbell_frame_sync(
     message_id: int,
     sender_short: str,
     preview: str,
+    *,
+    timeout: float = 0.5,
 ) -> bool:
-    """Fire-and-forget doorbell push from synchronous code.
+    """Synchronous doorbell push that observes the actual send result.
 
-    Posts the coroutine to the running event loop. Best-effort: if the loop
-    is unavailable, the frame is silently dropped (tier-2 still delivers).
+    Posts the coroutine to the running event loop and waits up to *timeout*
+    seconds for the real ws.send_text outcome. Returns True ONLY when the
+    frame was actually delivered over the WebSocket. Returns False when the
+    WS plane is disabled, unarmed, the loop is unavailable, the send raised,
+    or the timeout expired.
 
-    F158: Returns True when a frame was posted to a live connection, False
-    when the WS plane is disabled, unarmed, or loop unavailable. Callers
-    use this to decide whether a fallback wake is needed.
+    F158-R2: The bounded wait makes transport-drop failures observable to
+    the fallback decision in _f413_after_commit — a drop after the armed
+    check now correctly returns False so the native fallback fires.
     """
     if not is_ws_monitor_enabled():
         return False
@@ -125,8 +130,57 @@ def push_doorbell_frame_sync(
         except Exception:
             return False
 
-    asyncio.run_coroutine_threadsafe(
+    future = asyncio.run_coroutine_threadsafe(
         push_doorbell_frame(terminal_id, message_id, sender_short, preview),
         loop,
     )
-    return True
+    try:
+        return future.result(timeout=timeout)
+    except Exception:
+        # Timeout, CancelledError, or coroutine exception → not delivered
+        return False
+
+
+# ---------------------------------------------------------------------------
+# F158-R2: WS-delivered dedup state
+#
+# After _f413_after_commit successfully delivers a WS frame, it marks the
+# (terminal_id, row_id) pair here. The F136 post-delivery doorbell checks
+# and consumes this mark to suppress the redundant native ring.
+# Thread-safe: accessed from the ORM after-commit thread and the async
+# delivery loop.
+# ---------------------------------------------------------------------------
+import threading
+
+_ws_delivered_lock = threading.Lock()
+_ws_delivered: set[tuple[str, int]] = set()
+
+# Limit max entries to prevent unbounded growth (entries are consumed quickly)
+_WS_DELIVERED_MAX = 4096
+
+
+def mark_ws_delivered(terminal_id: str, row_id: int) -> None:
+    """Record that a WS advisory frame was delivered for this row.
+
+    Called by _f413_after_commit when push_doorbell_frame_sync returns True.
+    """
+    with _ws_delivered_lock:
+        if len(_ws_delivered) >= _WS_DELIVERED_MAX:
+            # Evict oldest half (unordered — just clear; delivery is fast enough)
+            _ws_delivered.clear()
+        _ws_delivered.add((terminal_id, row_id))
+
+
+def consume_ws_delivered(terminal_id: str, row_id: int) -> bool:
+    """Check and consume a WS-delivered mark.
+
+    Returns True if the mark existed (WS already woke the supervisor for this
+    row) — the caller should skip the native ring. The mark is consumed (removed)
+    on True to prevent memory growth.
+    """
+    key = (terminal_id, row_id)
+    with _ws_delivered_lock:
+        if key in _ws_delivered:
+            _ws_delivered.discard(key)
+            return True
+    return False
