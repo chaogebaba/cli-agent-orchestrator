@@ -109,6 +109,7 @@ class TestFix2StalePathSelfHeal:
             sender_id: str = _SENDER_ID
             message: str = "done"
             created_at: datetime = _NOW
+            tag: str = "forward"
 
         @dataclass
         class FakeBatch:
@@ -132,6 +133,7 @@ class TestFix2StalePathSelfHeal:
             generation: int = 56
             session_name: str = "cao-test"
             role: str = "supervisor"
+            cc_inbox_path: str | None = _STALE_PATH
 
         with (
             patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,
@@ -140,8 +142,11 @@ class TestFix2StalePathSelfHeal:
             ) as mock_al,
             patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session,
             patch(
-                "cli_agent_orchestrator.clients.database.get_supervisor_callback_batch"
-            ) as mock_batch,
+                "cli_agent_orchestrator.clients.database.claim_unnotified_wake"
+            ) as mock_claim,
+            patch(
+                "cli_agent_orchestrator.clients.database.commit_wake"
+            ) as mock_commit,
             patch(
                 "cli_agent_orchestrator.clients.database.get_terminal_metadata"
             ) as mock_meta,
@@ -161,10 +166,21 @@ class TestFix2StalePathSelfHeal:
                 FakeMailbox(),  # MailboxModel query
             ]
 
-            # Batch has stale path and one row
-            mock_batch.return_value = FakeBatch(rows=(FakeBatchRow(),))
+            # F476: claim returns rows with the stale inbox_path
+            from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
+            mock_claim.return_value = WakeClaimResult(
+                kind="claimed",
+                rows=(FakeBatchRow(),),
+                claimed_high_water=5328,
+                path_version=1,
+                reason="ok",
+            )
+            mock_commit.return_value = WakeCommitResult(
+                kind="committed",
+                reason="ok",
+            )
 
-            # Terminal metadata has fresh path
+            # Terminal metadata has fresh path (different from mailbox cc_inbox_path)
             mock_meta.return_value = {
                 "metadata": {"cc_team_inbox_path": _FRESH_PATH},
             }
@@ -222,6 +238,7 @@ class TestFix2StalePathSelfHeal:
             sender_id: str = _SENDER_ID
             message: str = "done"
             created_at: datetime = _NOW
+            tag: str = "forward"
 
         @dataclass
         class FakeBatch:
@@ -245,6 +262,7 @@ class TestFix2StalePathSelfHeal:
             generation: int = 56
             session_name: str = "cao-test"
             role: str = "supervisor"
+            cc_inbox_path: str | None = _STALE_PATH
 
         with (
             patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,

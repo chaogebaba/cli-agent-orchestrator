@@ -1023,6 +1023,7 @@ class TestPidReuseGuard:
     The watchdog must NOT signal it.
     """
 
+    @pytest.mark.serial_only
     def test_stale_entry_not_killed(self, tmp_path: Path) -> None:
         """A ledger entry whose starttime no longer matches is never signaled."""
         import unittest.mock

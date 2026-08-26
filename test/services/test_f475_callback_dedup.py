@@ -301,3 +301,266 @@ class TestF475Helpers:
             assert _f475_should_dedup(
                 "worker-1", "mb_sup1", OrchestrationType.SEND_MESSAGE, False, None
             )
+
+
+
+# ---------------------------------------------------------------------------
+# B1 regression: dedup savepoint MUST NOT corrupt caller's pending writes
+# ---------------------------------------------------------------------------
+
+
+class TestB1DedupTransactionIsolation:
+    """B1: Prove dedup lookup (hit or failure) never reverts caller's flushed work.
+
+    The old code used a separate SessionLocal() which, on SQLite :memory:,
+    shared the thread-local DBAPI connection — a dedup rollback reverted
+    unrelated caller writes. The fix uses a SAVEPOINT on the caller's
+    session, ensuring rollback scope is confined to the savepoint.
+    """
+
+    def test_unrelated_caller_write_persists_through_dedup_hit(self, _fresh_db):
+        """Flush an unrelated caller update, then trigger dedup hit.
+
+        The unrelated write MUST persist after the dedup returns the existing row.
+        """
+        from sqlalchemy.orm import sessionmaker
+
+        SL = _db_mod.SessionLocal
+        # Insert a first message (will be the dedup target)
+        msg1 = create_inbox_message("worker-1", "sup-1", "result-1")
+        assert msg1.id is not None
+
+        # Now use _insert_routed_inbox_row directly with a caller session
+        # that has an unrelated flushed write
+        with SL() as caller_db:
+            # Modify the sup-1 terminal's agent_profile (unrelated write)
+            from cli_agent_orchestrator.clients.database import TerminalModel
+
+            sup = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
+            sup.agent_profile = "changed_profile"
+            caller_db.flush()  # flushed but not committed
+
+            # Now trigger dedup on the same content via _insert_routed_inbox_row
+            from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
+
+            result = _insert_routed_inbox_row(
+                caller_db,
+                sender_id="worker-1",
+                receiver_id="sup-1",
+                logical_receiver_id=None,
+                message="result-1",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+            # Should return existing row (dedup hit)
+            assert result.id == msg1.id
+
+            # The unrelated write MUST still be visible in caller's session
+            sup_check = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
+            assert sup_check.agent_profile == "changed_profile"
+
+            # Commit the caller's transaction
+            caller_db.commit()
+
+        # Verify persistence after commit
+        with SL() as verify_db:
+            sup_final = verify_db.query(TerminalModel).filter_by(id="sup-1").one()
+            assert sup_final.agent_profile == "changed_profile", (
+                "B1 REGRESSION: dedup hit reverted caller's unrelated flushed write"
+            )
+
+    def test_unrelated_caller_write_persists_through_dedup_failure(self, _fresh_db):
+        """Flush an unrelated caller update, then force dedup lookup to fail.
+
+        The unrelated write MUST persist even when the dedup savepoint fails.
+        """
+        from sqlalchemy.orm import sessionmaker
+
+        SL = _db_mod.SessionLocal
+
+        with SL() as caller_db:
+            # Modify the sup-1 terminal (unrelated write)
+            from cli_agent_orchestrator.clients.database import TerminalModel
+
+            sup = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
+            sup.agent_profile = "pre_failure_value"
+            caller_db.flush()
+
+            # Force the dedup savepoint to fail by injecting an exception
+            orig_begin_nested = caller_db.begin_nested
+
+            call_count = [0]
+
+            def _failing_nested():
+                call_count[0] += 1
+                nested = orig_begin_nested()
+                # Inject a failure after savepoint creation by monkey-patching
+                # the session query to raise during the dedup lookup
+                return nested
+
+            caller_db.begin_nested = _failing_nested
+
+            # Force a dedup-eligible path by patching _f475_should_dedup
+            with patch.object(
+                _db_mod,
+                "_f475_should_dedup",
+                return_value=True,
+            ), patch.object(
+                _db_mod,
+                "_f475_compute_content_hash",
+                side_effect=RuntimeError("forced dedup failure"),
+            ):
+                from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
+
+                result = _insert_routed_inbox_row(
+                    caller_db,
+                    sender_id="worker-1",
+                    receiver_id="sup-1",
+                    logical_receiver_id=None,
+                    message="new-message-after-failure",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                )
+                # Fail-open: row should be inserted normally
+                assert result.id is not None
+
+            # The unrelated write MUST still be visible
+            sup_check = caller_db.query(TerminalModel).filter_by(id="sup-1").one()
+            assert sup_check.agent_profile == "pre_failure_value"
+
+            caller_db.commit()
+
+        # Verify persistence
+        with SL() as verify_db:
+            sup_final = verify_db.query(TerminalModel).filter_by(id="sup-1").one()
+            assert sup_final.agent_profile == "pre_failure_value", (
+                "B1 REGRESSION: dedup failure reverted caller's unrelated flushed write"
+            )
+
+    def test_caller_refetch_failure_propagates(self, _fresh_db):
+        """When the caller-session re-fetch after a dedup hit raises, it MUST propagate.
+
+        The fail-open handler must NOT catch this — a broken caller session means
+        we cannot safely proceed to insert.
+        """
+        from sqlalchemy.orm import Query
+        from unittest.mock import MagicMock
+
+        SL = _db_mod.SessionLocal
+        # Insert first message to create a dedup target
+        msg1 = create_inbox_message("worker-1", "sup-1", "refetch-test")
+
+        with SL() as caller_db:
+            from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
+
+            # After the savepoint dedup lookup succeeds (finds existing_id),
+            # the code does: db.query(InboxModel).filter(InboxModel.id == existing_id).one()
+            # We need this re-fetch to fail. We'll patch it at the right level.
+            orig_query = caller_db.query
+            refetch_attempted = [False]
+
+            def _intercepting_query(model, *args, **kwargs):
+                result = orig_query(model, *args, **kwargs)
+                # After the savepoint commits and we have a hit, the next
+                # query outside the savepoint is the re-fetch
+                if model is InboxModel and refetch_attempted[0] is False:
+                    # Let the savepoint query pass (first InboxModel query)
+                    return result
+                elif model is InboxModel:
+                    # Second InboxModel query = the re-fetch; make it fail
+                    mock_q = MagicMock()
+                    mock_q.filter.return_value.one.side_effect = RuntimeError(
+                        "caller session re-fetch broken"
+                    )
+                    return mock_q
+                return result
+
+            # We need the savepoint dedup to find the existing row, then the
+            # refetch to break. Track query calls to InboxModel.
+            query_count = [0]
+
+            def _counting_query(model, *args, **kwargs):
+                result = orig_query(model, *args, **kwargs)
+                if model is InboxModel:
+                    query_count[0] += 1
+                    if query_count[0] >= 2:
+                        # This is the re-fetch query
+                        mock_q = MagicMock()
+                        mock_q.filter.return_value.one.side_effect = RuntimeError(
+                            "caller session re-fetch broken"
+                        )
+                        return mock_q
+                return result
+
+            caller_db.query = _counting_query
+
+            with pytest.raises(RuntimeError, match="caller session re-fetch broken"):
+                _insert_routed_inbox_row(
+                    caller_db,
+                    sender_id="worker-1",
+                    receiver_id="sup-1",
+                    logical_receiver_id=None,
+                    message="refetch-test",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                )
+
+
+# ---------------------------------------------------------------------------
+# S1: internal prefix exclusion coverage
+# ---------------------------------------------------------------------------
+
+
+class TestS1CanonicalPrefixExclusion:
+    """S1: Every canonical _BARRIER_INTERNAL_PREFIXES entry must be excluded from dedup."""
+
+    @pytest.mark.parametrize("prefix", _db_mod._BARRIER_INTERNAL_PREFIXES)
+    def test_should_dedup_false_for_internal_prefix(self, prefix):
+        """_f475_should_dedup returns False for every canonical internal prefix."""
+        sender = f"{prefix}test-sender"
+        with patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"caller_id": "sup-1", "caller_mailbox_id": None},
+        ):
+            assert not _f475_should_dedup(
+                sender, "sup-1", OrchestrationType.SEND_MESSAGE, False, None
+            ), f"Prefix {prefix!r} was NOT excluded from dedup"
+
+    @pytest.mark.parametrize("prefix", _db_mod._BARRIER_INTERNAL_PREFIXES)
+    def test_insert_guard_excludes_internal_prefix(self, prefix):
+        """The inline guard at _insert_routed_inbox_row also excludes all canonical prefixes."""
+        sender = f"{prefix}inline-guard-test"
+        # If the sender matches a canonical prefix, the dedup path is never entered.
+        # We verify by checking that _f475_should_dedup is never called.
+        with patch.object(
+            _db_mod, "_f475_should_dedup", wraps=_db_mod._f475_should_dedup
+        ) as spy:
+            from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row, SessionLocal
+
+            with SessionLocal() as db:
+                # Create a terminal for the sender to avoid lookup errors
+                from cli_agent_orchestrator.clients.database import TerminalModel
+
+                existing = db.query(TerminalModel).filter_by(id=sender).first()
+                if not existing:
+                    db.add(
+                        TerminalModel(
+                            id=sender,
+                            tmux_session="s",
+                            tmux_window="w",
+                            provider="mock",
+                            agent_profile="internal",
+                            lifecycle="ephemeral",
+                            init_state="ready",
+                        )
+                    )
+                    db.commit()
+
+                result = _insert_routed_inbox_row(
+                    db,
+                    sender_id=sender,
+                    receiver_id="sup-1",
+                    logical_receiver_id=None,
+                    message="internal message",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                )
+                db.commit()
+            # The inline guard skips dedup entirely for internal prefixes
+            spy.assert_not_called()

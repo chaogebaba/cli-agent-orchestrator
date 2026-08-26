@@ -250,6 +250,7 @@ class TestConfirmedAnswers:
 
         assert _client_on(tmux_socket).session_exists_strict("cao-anything") is False
 
+    @pytest.mark.serial_only
     def test_server_shut_down_under_us_is_a_confirmed_absence(self, tmux_socket):
         """Same, via the other message tmux uses ("no server running on ...").
 
