@@ -651,8 +651,9 @@ class BaseProvider(ABC):
         ``_task_dispatched`` (set by mark_input_received()) disambiguates.
         COMPLETED ("done") and IDLE-post-dispatch both wait 10s from first
         detection for the pane buffer to flush before reporting COMPLETED, so
-        extract_last_message sees settled output; the idle path gives up
-        (reports COMPLETED) 300s after dispatch.
+        extract_last_message sees settled output; the idle path likewise gives
+        up (reports COMPLETED) 10s after first detection — there is no 300s
+        path in this function (both branches use ``elapsed >= 10.0``).
 
         Args:
             buffer: Unused; retained so existing call sites (``self.
