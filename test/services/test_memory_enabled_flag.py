@@ -88,15 +88,19 @@ def settings_file(tmp_path: Path) -> Any:
 
 
 class TestIsMemoryEnabledFlag:
-    def test_defaults_to_true_when_absent(self, settings_file: Path) -> None:
+    def test_defaults_to_false_when_absent(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
+        # F488: remove env override from conftest autouse fixture to test pure default
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
         assert not settings_file.exists()
-        assert is_memory_enabled() is True
+        assert is_memory_enabled() is False
 
-    def test_returns_false_when_explicitly_disabled(self, settings_file: Path) -> None:
+    def test_returns_false_when_explicitly_disabled(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
+        # F488: remove env override so file setting is respected
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
         settings_file.write_text(json.dumps({"memory": {"enabled": False}}))
         assert is_memory_enabled() is False
 
@@ -106,12 +110,15 @@ class TestIsMemoryEnabledFlag:
         settings_file.write_text(json.dumps({"memory": {"enabled": True}}))
         assert is_memory_enabled() is True
 
-    def test_set_memory_setting_enabled_roundtrip(self, settings_file: Path) -> None:
+    def test_set_memory_setting_enabled_roundtrip(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import (
             get_memory_settings,
             is_memory_enabled,
             set_memory_setting,
         )
+
+        # F488: remove env override so file setting is respected
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
 
         set_memory_setting("enabled", False)
         assert is_memory_enabled() is False
@@ -267,13 +274,13 @@ def test_enabled_default_preserves_round_trip(tmp_path: Path) -> None:
             )
         )
 
-    recalled_keys = {m.key for m in recalled}
-    assert (
-        "rt-01" in recalled_keys
-    ), f"enabled-path round-trip failed: rt-01 not recalled from {recalled_keys}"
+        recalled_keys = {m.key for m in recalled}
+        assert (
+            "rt-01" in recalled_keys
+        ), f"enabled-path round-trip failed: rt-01 not recalled from {recalled_keys}"
 
-    block = svc.get_memory_context_for_terminal("term-u5", budget_chars=10_000)
-    assert "rt-01" in block
+        block = svc.get_memory_context_for_terminal("term-u5", budget_chars=10_000)
+        assert "rt-01" in block
 
 
 # ---------------------------------------------------------------------------
