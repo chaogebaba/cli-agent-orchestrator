@@ -399,8 +399,9 @@ def attempt_rung1(
     # (mirrors ring_supervisor_doorbell's config check; inline because the doorbell's
     # cursor-dedup logic structurally conflicts with convergence_tick retry semantics).
     from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-    if not _CS.get("supervisor.wake.native", default=True):
+    if not _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT):
         return LadderResult(
             delivered=False,
             phase="transport_attempt",

@@ -962,7 +962,8 @@ def test_reconcile_pull_mode_push_selects_only_own_mailbox_rows(f424_db, monkeyp
     )
 
     def _cfg(path, default=None, **_kw):
-        if path in {"supervisor.mailbox_pull", "supervisor.teammate_push"}:
+        if path in {"supervisor.mailbox_pull", "supervisor.teammate_push",
+                    "supervisor.wake.native"}:
             return True
         return default
 

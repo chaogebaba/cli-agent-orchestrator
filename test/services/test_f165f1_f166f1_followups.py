@@ -99,6 +99,7 @@ class TestF165F1D9ProgrammingErrorSurface:
             staticmethod(lambda key, default=None, override=None: {
                 "supervisor.mailbox_pull": True,
                 "supervisor.teammate_push": True,
+                "supervisor.wake.native": True,
             }.get(key, default)),
         )
         monkeypatch.setattr(
@@ -246,6 +247,7 @@ class TestF165F1D9ProgrammingErrorSurface:
             staticmethod(lambda key, default=None, override=None: {
                 "supervisor.mailbox_pull": True,
                 "supervisor.teammate_push": True,
+                "supervisor.wake.native": True,
             }.get(key, default)),
         )
         monkeypatch.setattr(

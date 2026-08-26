@@ -2314,10 +2314,11 @@ class InboxService:
                     attempt_teammate_push,
                 )
                 from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
                 # F457: unified gate — wake.native=false suppresses teammate push
                 # (same gate the doorbell native ring honors).
-                if not _CS.get("supervisor.wake.native", default=True):
+                if not _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT):
                     logger.debug(
                         "f457_push_suppressed terminal=%s reason=wake_native_disabled",
                         terminal_id,
@@ -3506,7 +3507,9 @@ class InboxService:
 
                 # F457-r2 B1: unified gate — wake.native=false suppresses reconciler push
                 # (mirrors the deliver_pending gate at :2315).
-                if not ConfigService.get("supervisor.wake.native", default=True):
+                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT as _WND
+
+                if not ConfigService.get("supervisor.wake.native", default=_WND):
                     logger.debug(
                         "f457_reconciler_push_suppressed terminal=%s "
                         "reason=wake_native_disabled",

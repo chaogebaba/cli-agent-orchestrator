@@ -437,6 +437,7 @@ class TestF165MigratedFx158:
             staticmethod(lambda key, default=None, override=None: {
                 "supervisor.mailbox_pull": True,
                 "supervisor.teammate_push": True,
+                "supervisor.wake.native": True,
             }.get(key, default)),
         )
         monkeypatch.setattr(

@@ -1463,6 +1463,62 @@ def _enforce_worker_terminal_cap(session_name: str, supervisor_id: Optional[str]
         raise TerminalCapExceeded(current_count=count, cap=cap, reap_candidates=reap_candidates)
 
 
+def _maybe_derive_cc_team_inbox_path(
+    provider: str,
+    metadata: Optional[Dict[str, Any]],
+    working_directory: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """F337 gate: derive cc_team_inbox_path only when native wake is enabled.
+
+    Extracted from create_terminal for testability. Returns the (possibly mutated)
+    metadata dict. The gate requires:
+      - provider == "claude_code"
+      - supervisor.teammate_push == True
+      - supervisor.wake.native == True (the F337 default-dark guard)
+      - metadata is None or doesn't already contain cc_team_inbox_path
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
+
+    _native_wake_enabled = _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT)
+    if (
+        provider == "claude_code"
+        and _CS.get("supervisor.teammate_push", default=False)
+        and _native_wake_enabled
+        and not metadata
+    ):
+        _wd = working_directory or os.getcwd()
+        try:
+            from cli_agent_orchestrator.services.teammate_push_service import (
+                _derive_cc_team_inbox_path,
+            )
+
+            _inbox_path = _derive_cc_team_inbox_path(_wd)
+            if _inbox_path is not None:
+                metadata = {"cc_team_inbox_path": str(_inbox_path)}
+        except Exception:
+            pass
+    elif (
+        provider == "claude_code"
+        and _CS.get("supervisor.teammate_push", default=False)
+        and _native_wake_enabled
+        and metadata is not None
+        and "cc_team_inbox_path" not in metadata
+    ):
+        _wd = working_directory or os.getcwd()
+        try:
+            from cli_agent_orchestrator.services.teammate_push_service import (
+                _derive_cc_team_inbox_path,
+            )
+
+            _inbox_path = _derive_cc_team_inbox_path(_wd)
+            if _inbox_path is not None:
+                metadata["cc_team_inbox_path"] = str(_inbox_path)
+        except Exception:
+            pass
+    return metadata
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1961,41 +2017,12 @@ async def create_terminal(
 
         # WPDT W3 (F152): Derive and set cc_team_inbox_path at pane creation
         # for claude_code supervisor terminals with teammate_push enabled.
-        from cli_agent_orchestrator.services.config_service import ConfigService as _CS
-
-        if (
-            provider == "claude_code"
-            and _CS.get("supervisor.teammate_push", default=False)
-            and not metadata
-        ):
-            _wd = working_directory or os.getcwd()
-            try:
-                from cli_agent_orchestrator.services.teammate_push_service import (
-                    _derive_cc_team_inbox_path,
-                )
-
-                _inbox_path = _derive_cc_team_inbox_path(_wd)
-                if _inbox_path is not None:
-                    metadata = {"cc_team_inbox_path": str(_inbox_path)}
-            except Exception:
-                pass
-        elif (
-            provider == "claude_code"
-            and _CS.get("supervisor.teammate_push", default=False)
-            and metadata is not None
-            and "cc_team_inbox_path" not in metadata
-        ):
-            _wd = working_directory or os.getcwd()
-            try:
-                from cli_agent_orchestrator.services.teammate_push_service import (
-                    _derive_cc_team_inbox_path,
-                )
-
-                _inbox_path = _derive_cc_team_inbox_path(_wd)
-                if _inbox_path is not None:
-                    metadata["cc_team_inbox_path"] = str(_inbox_path)
-            except Exception:
-                pass
+        # F337: Also require wake.native=true — the cc_team_inbox_path is only
+        # useful when the native channel is active; deriving it when native is
+        # disabled would leave a stale path that split-brain code could use.
+        metadata = _maybe_derive_cc_team_inbox_path(
+            provider, metadata, working_directory
+        )
 
         window_name = generate_window_name(agent_profile, terminal_id)
 

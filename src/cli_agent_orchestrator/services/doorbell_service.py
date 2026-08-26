@@ -173,7 +173,9 @@ def ring_supervisor_doorbell(
         return "skipped_acked"
 
     # FX170 D1: attempt native socket ring first (D2: no _should_teammate_push gate).
-    native_enabled = ConfigService.get("supervisor.wake.native", default=True)
+    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
+
+    native_enabled = ConfigService.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT)
     if native_enabled:
         try:
             decision = _attempt_native_ring(
@@ -269,6 +271,7 @@ def _attempt_native_ring(
         ResolveResult,
         build_wake_payload,
         check_version_guard,
+        read_peer_token,
         resolve_target,
         verify_wake,
         write_to_socket,
@@ -336,8 +339,12 @@ def _attempt_native_ring(
         )
         return "socket_unpublished"
 
-    # D5: socket write
-    write_err = write_to_socket(record.messaging_socket_path, payload)
+    # F337: read auth token from per-session key file
+    # F337-r2 B2: bind to the resolved process incarnation
+    auth_token = read_peer_token(record.pid, expected_proc_start=record.proc_start)
+
+    # D5: socket write (F337: auth handshake first line when token available)
+    write_err = write_to_socket(record.messaging_socket_path, payload, auth_token=auth_token)
     if write_err:
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "

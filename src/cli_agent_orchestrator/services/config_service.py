@@ -204,7 +204,10 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", False),
     "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", True),
     # FX170: native wake config paths (D11)
-    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", True),
+    # F337-r2 B1: default MUST be False (ship dark) — canonical source is
+    # cc_session_registry.WAKE_NATIVE_DEFAULT; duplicated here because the
+    # registry dict is evaluated at import-time before service imports resolve.
+    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", False),
     "CAO_SUPERVISOR_WAKE_MIN_VERSION": ("supervisor.wake.min_version", "str", "2.1.0"),
     "CAO_SUPERVISOR_WAKE_MAX_VERSION": ("supervisor.wake.max_version", "str", "2.2.0"),
     "CAO_SUPERVISOR_WAKE_PRIORITY": ("supervisor.wake.priority", "str", "next"),
