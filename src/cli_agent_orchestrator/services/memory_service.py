@@ -77,15 +77,15 @@ def _is_memory_enabled() -> bool:
     """Module-level guard for memory entry points.
 
     Imported lazily to avoid a settings → memory_service circular import at
-    module load time. Defaults to True if the import or read fails so a
-    broken settings file never silently disables memory.
+    module load time. Defaults to False (fail closed) if the import or read
+    fails — a broken settings file must never silently enable memory.
     """
     try:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
         return is_memory_enabled()
     except Exception:
-        return True
+        return False
 
 
 # Per-curator dispatch locks. A worker that fails to acquire its session's

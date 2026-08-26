@@ -149,9 +149,9 @@ def _is_memory_enabled_safe() -> bool:
 
         return bool(is_memory_enabled())
     except Exception:
-        # Conservative — if the setting is unreadable, fall back to True so
-        # we don't silently lose forensic events on misconfiguration.
-        return True
+        # Fail closed — if the setting is unreadable, memory stays off.
+        # A broken config must never silently enable the subsystem.
+        return False
 
 
 # -----------------------------------------------------------------------------

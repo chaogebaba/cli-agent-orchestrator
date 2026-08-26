@@ -222,6 +222,16 @@ def _no_llm_compile_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _enable_memory_in_tests(monkeypatch):
+    """F488: memory defaults OFF at install, but tests assume it's on.
+
+    Production default is now False (opt-in) to avoid spending Claude quota.
+    Tests that exercise the disabled path override via their own monkeypatch.
+    """
+    monkeypatch.setenv("CAO_MEMORY_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
     from cli_agent_orchestrator.backends import registry

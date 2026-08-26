@@ -68,6 +68,8 @@ def audit_base(tmp_path, monkeypatch):
     base = tmp_path / "audit-base"
     base.mkdir()
     monkeypatch.setattr(audit_log, "MEMORY_BASE_DIR", base)
+    # F488: memory defaults OFF now — enable for audit tests that exercise writes
+    monkeypatch.setattr(audit_log, "_is_memory_enabled_safe", lambda: True)
     return base
 
 
@@ -657,6 +659,12 @@ class TestU75PlanCases:
         )
         Base.metadata.create_all(bind=engine)
         svc = MemoryService(base_dir=tmp_path / "msvc-fail", db_engine=engine)
+
+        # F488: memory defaults OFF — enable for this test
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.memory_service._is_memory_enabled",
+            lambda: True,
+        )
 
         # Force write_audit_nowait to raise. The wiring sites wrap in
         # try/except logger.debug — the explosion must NOT propagate to

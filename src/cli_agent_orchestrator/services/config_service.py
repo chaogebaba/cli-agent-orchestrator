@@ -61,7 +61,7 @@ class ServerConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -187,7 +187,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
-    "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
@@ -594,7 +594,7 @@ class ConfigService:
                 ),
             ),
             memory=MemoryConfig(
-                enabled=_get_value("memory.enabled", default=True),
+                enabled=_get_value("memory.enabled", default=False),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),

@@ -378,13 +378,13 @@ def get_memory_settings() -> Dict[str, Any]:
     ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
     false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
 
-    ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
-    behavior. Setting it to ``False`` disables all memory subsystem
+    ``enabled`` defaults to ``False`` (opt-in) to avoid spending Claude quota.
+    Setting it to ``True`` enables all memory subsystem
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
     defaults: Dict[str, Any] = {
-        "enabled": True,
+        "enabled": False,
         "flush_threshold": 0.85,
         "lint_enabled": True,
         "learning_enabled": False,
@@ -396,6 +396,18 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+
+    # Validate persisted memory.enabled: only literal JSON boolean true opts in.
+    # Any other type (string "false", "0", int 1, dict, list, etc.) is invalid
+    # and resolves to False (fail-closed). Env-var overlay below may still override.
+    persisted_enabled = result["enabled"]
+    if persisted_enabled is not True and persisted_enabled is not False:
+        logger.warning(
+            "Invalid memory.enabled=%r (expected JSON boolean); "
+            "treating as False (fail-closed)",
+            persisted_enabled,
+        )
+        result["enabled"] = False
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -488,14 +500,18 @@ def is_memory_enabled() -> bool:
     """Return True when the memory subsystem is enabled.
 
     Precedence: CAO_MEMORY_ENABLED env var > memory.enabled in settings.json
-    > default (True).
+    > default (False — memory is opt-in to avoid spending Claude quota).
+
+    Only literal boolean True enables memory (fail-closed). The validation in
+    get_memory_settings() normalizes invalid types to False, so this identity
+    check is defense-in-depth.
     """
     try:
-        value = get_memory_settings().get("enabled", True)
+        value = get_memory_settings().get("enabled", False)
     except Exception as e:
-        logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
-        return True
-    return bool(value)
+        logger.warning(f"Failed to read memory.enabled, defaulting to False: {e}")
+        return False
+    return value is True
 
 
 def is_learning_enabled() -> bool:
@@ -511,7 +527,7 @@ def is_learning_enabled() -> bool:
     """
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+        return bool(settings.get("enabled", False)) and bool(settings.get("learning_enabled", False))
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
         return False

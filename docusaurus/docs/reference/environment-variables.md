@@ -17,7 +17,7 @@ These variables map 1:1 to a `settings.json` key. Setting either the env var or 
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool | `false` |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str | `null` |
 | `CAO_LOG_LEVEL` | `logging.level` | str | `"INFO"` |
-| `CAO_MEMORY_ENABLED` | `memory.enabled` | bool | `true` |
+| `CAO_MEMORY_ENABLED` | `memory.enabled` | bool | `false` |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str | `"llm"` |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float | `0.85` |
 | `CAO_MEMORY_LINT_ENABLED` | `memory.lint_enabled` | bool | `true` |
