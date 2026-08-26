@@ -353,6 +353,7 @@ async def run_agent_step(
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
     use_worktree: Optional[bool] = None,
+    task_label: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -579,6 +580,12 @@ async def run_agent_step(
         )
         terminal_id = terminal.id
 
+        # F483: Write fleet-labels.tsv row while the step runs (best-effort).
+        if task_label and terminal_id:
+            from cli_agent_orchestrator.services.fleet_labels import upsert_label
+
+            upsert_label(terminal_id, task_label)
+
         # BR-31: make the terminal this call just made visible to U4's orphan
         # sweep, and (issue #583, BR-3) write its durable ``running`` row, BEFORE
         # the readiness wait / input send — the dangerous edge is a subprocess
@@ -753,3 +760,8 @@ async def run_agent_step(
             cleanup = True
         if cleanup and teardown and created_here:
             await _teardown_terminal(terminal_id, registry)
+        # F483: Remove fleet-labels.tsv row on teardown (best-effort).
+        if task_label and terminal_id and created_here:
+            from cli_agent_orchestrator.services.fleet_labels import remove_label
+
+            remove_label(terminal_id)

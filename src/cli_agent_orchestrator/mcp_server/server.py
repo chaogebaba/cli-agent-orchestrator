@@ -1181,6 +1181,7 @@ async def _handoff_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: Optional[bool] = None,
+    task_label: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -1261,6 +1262,8 @@ async def _handoff_impl(
             payload["engine"] = engine
         if model and model.strip():
             payload["model"] = model
+        if task_label:
+            payload["task_label"] = task_label
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
@@ -1493,6 +1496,13 @@ async def handoff(
             "sharing the supervisor's working directory. Default false; omit to use the profile's default_use_worktree setting."
         ),
     ),
+    task_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional short task label (max 40 chars) written to fleet-labels.tsv "
+            "for fleet TUI display. Removed automatically when the handoff completes."
+        ),
+    ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1552,7 +1562,8 @@ async def handoff(
         HandoffResult with success status, message, and agent output
     """
     return await _handoff_impl(
-        agent_profile, message, timeout, working_directory, model=model, use_worktree=use_worktree
+        agent_profile, message, timeout, working_directory, model=model, use_worktree=use_worktree,
+        task_label=task_label,
     )
 
 
@@ -1596,6 +1607,7 @@ def _assign_impl(
     engine: Optional[str] = None,
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    task_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1831,6 +1843,11 @@ def _assign_impl(
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
                 for af in authority_files
             ]
+        # F483: Write fleet-labels.tsv row (never fails the assign)
+        if task_label and terminal_id:
+            from cli_agent_orchestrator.services.fleet_labels import upsert_label
+
+            upsert_label(terminal_id, task_label)
         return result
 
     except requests.HTTPError as exc:
@@ -2009,6 +2026,13 @@ async def assign(
             "and the terminal is unwound if pinning fails."
         ),
     ),
+    task_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional short task label (max 40 chars) written to fleet-labels.tsv "
+            "for fleet TUI display. Removed automatically on delete_terminal."
+        ),
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -2025,6 +2049,7 @@ async def assign(
         engine=engine,
         use_worktree=use_worktree,
         authority_files=authority_files,
+        task_label=task_label,
     )
 
 
@@ -2807,6 +2832,18 @@ def delete_terminal(
                     "after the Grok process exits."
                 ),
             }
+        # F483: Remove fleet-labels.tsv rows for all reaped terminals.
+        from cli_agent_orchestrator.services.fleet_labels import remove_label
+
+        reaped = payload.get("reaped", [])
+        if reaped:
+            for entry in reaped:
+                reaped_id = entry.get("id") if isinstance(entry, dict) else None
+                if reaped_id:
+                    remove_label(reaped_id)
+        else:
+            # Single-terminal delete without cascade info
+            remove_label(terminal_id)
         return payload
     except ValueError as ve:
         return {"success": False, "message": str(ve)}
@@ -3055,6 +3092,28 @@ async def update_metadata(
     inter-agent message, not as private state.
     """
     return _update_metadata_impl(metadata)
+
+
+@mcp.tool()
+async def update_task_label(
+    terminal_id: str = Field(
+        description="Terminal ID to update the label for (defaults to caller's own terminal)"
+    ),
+    task_label: str = Field(
+        description="New task label (max 40 chars) for the fleet TUI display"
+    ),
+) -> Dict[str, Any]:
+    """Update the fleet-labels.tsv entry for a terminal.
+
+    Use this to change the label shown in the fleet TUI's TASK column for a
+    running terminal. The label is automatically removed when delete_terminal
+    is called.
+    """
+    from cli_agent_orchestrator.services.fleet_labels import upsert_label
+
+    resolved_id = _resolve_input_terminal_id(terminal_id)
+    upsert_label(resolved_id, task_label)
+    return {"success": True, "terminal_id": resolved_id, "task_label": task_label[:40]}
 
 
 # =============================================================================
