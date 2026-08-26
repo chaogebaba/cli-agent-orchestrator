@@ -1,54 +1,43 @@
-# F337-r3 Build Report — native supervisor wake (fix round 3)
+# F337-r4 Build Report — native supervisor wake (fix round 4)
 
 **Branch:** cao/f337-native-wake
-**HEAD:** bbeebfae
-**Merge-base:** 8c994302
+**HEAD:** (self — the commit adding this file)
+**Merge-base:** 01d47baf
 
 ## Findings addressed
 
 | ID | Severity | Status | Summary |
 |----|----------|--------|---------|
-| B1 | BLOCKER | FIXED | Ambiguity: `read_peer_token` collects ALL valid candidates, requires exactly one; multiple valid keys → None before `write_to_socket` |
-| B2 | BLOCKER | FIXED | 3 branch-only test failures: added `"supervisor.wake.native": True` to config maps in reconciler/pull-mode tests that require native push |
-| S1 | SHOULD | FIXED | `base.iterdir()` wrapped in `try/except OSError` — unreadable directory returns None cleanly |
-| S2 | SHOULD | FIXED | Gate test exercises production code path via `ConfigService.get` monkeypatch; a mutant `_native_wake_enabled = True` would cause `mock_derive` assertion failure |
-| N1 | NIT | FIXED | Report HEAD is the actual pinned commit SHA |
+| B2a | BLOCKER | FIXED | `test_f165f1_f166f1_followups.py` fixture: added `supervisor.wake.native: True` to both config map occurrences |
+| B2b | BLOCKER | FIXED | Trace manifest regenerated at final SHA via `generate_manifest()` — 39 lines, byte-exact |
+| S2 | SHOULD | FIXED | Gate test calls production helper `_maybe_derive_cc_team_inbox_path` (extracted from `create_terminal`); mutant `_native_wake_enabled = True` now fails the test |
+| N1 | NIT | FIXED | Report uses "(self)" convention for HEAD; merge-base is the verified rebase onto |
 
-## Changed files
+## Changed files (4)
 
-- `src/cli_agent_orchestrator/services/cc_session_registry.py` — collect-all-then-select-one logic, iterdir guard
-- `test/services/test_f337_auth_handshake.py` — S2 production gate test, B1 ambiguity + S1 iterdir regressions
-- `test/services/test_f424_f426_inbox_mutation_kills.py` — B2: add `supervisor.wake.native: True` to config
-- `test/services/test_f165_f166_real_sqlite_daemons.py` — B2: add `supervisor.wake.native: True` to config
-- `test/services/test_f165_real_sqlite_reconciler.py` — B2: add `supervisor.wake.native: True` to config
-
-## Regression tests added (r3)
-
-- `TestF337R3Ambiguity` (4 tests): two-valid-keys, identical-token, one-valid-one-mismatch, single-key
-- `TestF337R3IterdirError` (2 tests): OSError, PermissionError on iterdir
+- `src/cli_agent_orchestrator/services/terminal_service.py` — extract `_maybe_derive_cc_team_inbox_path` helper; `create_terminal` delegates to it
+- `src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt` — regenerated
+- `test/services/test_f337_auth_handshake.py` — S2: tests call production `_maybe_derive_cc_team_inbox_path`
+- `test/services/test_f165f1_f166f1_followups.py` — B2a: add `supervisor.wake.native: True` to config maps
 
 ## Test evidence
 
-### Local targeted (F337 + doorbell + delivery + reconciler + fx168)
+### Named failures from gate report (box@cursor-3, detached worktree at 41d4058b)
 ```
-230 passed, 6 failed (pre-existing _FakeMailbox.cc_inbox_path)
-```
-
-### 3 named previously-failing tests
-```
+TestF165F1D9ProgrammingErrorSurface::test_detached_instance_error_produces_durable_attempt_row: PASSED
+test_trace_manifest_is_byte_exact_and_has_36_hits: PASSED
 test_reconcile_pull_mode_push_selects_only_own_mailbox_rows: PASSED
 TestF165MigratedFx158::test_pull_mode_push_delivered_on_shared_fixture: PASSED
 TestF165RealSqliteReconciler::test_pull_mode_push_delivered_end_to_end: PASSED
++ 35 F337 auth/gate tests: ALL PASSED
+= 40 passed, 0 failed
 ```
 
-### Box (cursor-3, full suite)
+### Box full suite (cursor-3, detached worktree at 41d4058b, copied venv)
 ```
-13667 passed, 20 failed (pre-existing), 204 skipped, 15 xfailed in 330.64s
+13653 passed, 53 failed, 214 skipped, 15 xfailed, 2 errors in 313.42s
 ```
-
-### Box (cursor-3, 3 named + F337 targeted)
-```
-38 passed in 4.38s
-```
-
-All 3 named B2 tests pass. Zero F337-related failures.
+Failures are environment-artifact (test_memory_enabled_flag × 7, ImportError × 2,
+plus base-level flakes). Neither named B2 test appears in failures. The two
+prior named branch-only regressions (F165F1 fixture, trace manifest) are
+confirmed fixed.

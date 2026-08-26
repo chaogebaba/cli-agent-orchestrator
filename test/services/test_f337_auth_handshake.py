@@ -402,23 +402,17 @@ class TestAC4NativeRingPassesAuth:
 
 
 class TestAC5WakeNativeGateTerminalService:
-    """S2 r3: exercises the REAL production gate path in create_terminal.
-
-    The gate is at terminal_service.py ~line 1907:
-        _native_wake_enabled = _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT)
-        if provider == "claude_code" and _CS.get(...) and _native_wake_enabled and not metadata:
-            _derive_cc_team_inbox_path(...)
-
-    We import the module and exercise the gate by calling the production code
-    with ConfigService.get mocked. A mutant `_native_wake_enabled = True` would
-    cause _derive to be called when it shouldn't be.
-    """
+    """S2 r4: exercises the REAL production helper _maybe_derive_cc_team_inbox_path
+    from terminal_service.py. A mutant `_native_wake_enabled = True` in production
+    code would cause the derive mock to be called when it shouldn't be."""
 
     def test_inbox_path_not_derived_when_native_disabled(self, monkeypatch):
-        """create_terminal gate: wake.native=false → _derive NOT called."""
+        """Production helper: wake.native=false → _derive NOT called."""
         from unittest.mock import MagicMock
         from cli_agent_orchestrator.services.config_service import ConfigService
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
+        from cli_agent_orchestrator.services.terminal_service import (
+            _maybe_derive_cc_team_inbox_path,
+        )
 
         mock_derive = MagicMock(return_value=Path("/fake/inbox"))
 
@@ -426,8 +420,6 @@ class TestAC5WakeNativeGateTerminalService:
             "supervisor.teammate_push": True,
             "supervisor.wake.native": False,
         }
-
-        original_get = ConfigService.get
 
         @staticmethod
         def mock_get(key, default=None, **_kw):
@@ -441,34 +433,20 @@ class TestAC5WakeNativeGateTerminalService:
             mock_derive,
         )
 
-        # Exercise the PRODUCTION gate logic — inline imports use the patched ConfigService
-        from cli_agent_orchestrator.services.config_service import ConfigService as _CS
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT as _WND
-
-        # Reproduce the production gate conditions (same code as terminal_service.py)
-        provider = "claude_code"
-        metadata = None
-        working_directory = "/tmp"
-
-        _native_wake_enabled = _CS.get("supervisor.wake.native", default=_WND)
-        if (
-            provider == "claude_code"
-            and _CS.get("supervisor.teammate_push", default=False)
-            and _native_wake_enabled
-            and not metadata
-        ):
-            from cli_agent_orchestrator.services.teammate_push_service import (
-                _derive_cc_team_inbox_path,
-            )
-            _inbox_path = _derive_cc_team_inbox_path(working_directory)
+        # Call the PRODUCTION gate helper
+        result = _maybe_derive_cc_team_inbox_path("claude_code", None, "/tmp")
 
         # Gate must suppress derivation when native=False
         mock_derive.assert_not_called()
+        assert result is None
 
     def test_inbox_path_derived_when_native_enabled(self, monkeypatch):
-        """create_terminal gate: wake.native=true → _derive IS called."""
+        """Production helper: wake.native=true → _derive IS called."""
         from unittest.mock import MagicMock
         from cli_agent_orchestrator.services.config_service import ConfigService
+        from cli_agent_orchestrator.services.terminal_service import (
+            _maybe_derive_cc_team_inbox_path,
+        )
 
         mock_derive = MagicMock(return_value=Path("/fake/inbox"))
 
@@ -489,28 +467,12 @@ class TestAC5WakeNativeGateTerminalService:
             mock_derive,
         )
 
-        # Exercise the PRODUCTION gate logic
-        from cli_agent_orchestrator.services.config_service import ConfigService as _CS
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT as _WND
-
-        provider = "claude_code"
-        metadata = None
-        working_directory = "/tmp"
-
-        _native_wake_enabled = _CS.get("supervisor.wake.native", default=_WND)
-        if (
-            provider == "claude_code"
-            and _CS.get("supervisor.teammate_push", default=False)
-            and _native_wake_enabled
-            and not metadata
-        ):
-            from cli_agent_orchestrator.services.teammate_push_service import (
-                _derive_cc_team_inbox_path,
-            )
-            _derive_cc_team_inbox_path(working_directory)
+        # Call the PRODUCTION gate helper
+        result = _maybe_derive_cc_team_inbox_path("claude_code", None, "/tmp")
 
         # Gate must allow derivation when native=True
         mock_derive.assert_called_once()
+        assert result == {"cc_team_inbox_path": "/fake/inbox"}
 
 
 # ===========================================================================
