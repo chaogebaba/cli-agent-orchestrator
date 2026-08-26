@@ -35,13 +35,18 @@ class TestF158R2_ArmedButSendFails:
             # Inject it into _connections
             ws_doorbell._connections["term_test"] = mock_ws
 
+            # R3: Set inbox_service._delivery_loop to our background loop
+            from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
+            orig_loop = inbox_mod.inbox_service._delivery_loop
+            inbox_mod.inbox_service._delivery_loop = loop
+
             with patch.object(ws_doorbell, "is_ws_monitor_enabled", return_value=True):
-                # Patch get_running_loop to return our loop directly (simulates
-                # being called from a thread with access to the running loop)
-                with patch("asyncio.get_running_loop", return_value=loop):
-                    result = ws_doorbell.push_doorbell_frame_sync(
-                        "term_test", 42, "sender", "hello", timeout=2.0
-                    )
+                result = ws_doorbell.push_doorbell_frame_sync(
+                    "term_test", 42, "sender", "hello", timeout=2.0
+                )
+
+            inbox_mod.inbox_service._delivery_loop = orig_loop
 
             assert result is False, "Expected False when send_text raises"
         finally:
@@ -68,11 +73,18 @@ class TestF158R2_ArmedButSendFails:
 
             ws_doorbell._connections["term_hang"] = mock_ws
 
+            # R3: Set inbox_service._delivery_loop to our background loop
+            from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
+            orig_loop = inbox_mod.inbox_service._delivery_loop
+            inbox_mod.inbox_service._delivery_loop = loop
+
             with patch.object(ws_doorbell, "is_ws_monitor_enabled", return_value=True):
-                with patch("asyncio.get_running_loop", return_value=loop):
-                    result = ws_doorbell.push_doorbell_frame_sync(
-                        "term_hang", 99, "s", "msg", timeout=0.1
-                    )
+                result = ws_doorbell.push_doorbell_frame_sync(
+                    "term_hang", 99, "s", "msg", timeout=0.1
+                )
+
+            inbox_mod.inbox_service._delivery_loop = orig_loop
 
             assert result is False, "Expected False on timeout"
         finally:
@@ -179,7 +191,7 @@ class TestF158R2_UnarmedFlowSingleRing:
 
         # Ensure no mark exists
         with _ws_delivered_lock:
-            _ws_delivered.discard(("term_ring", 60))
+            _ws_delivered.pop(("term_ring", 60), None)
 
         assert consume_ws_delivered("term_ring", 60) is False
 
@@ -259,7 +271,7 @@ class TestF158R2_WsDeliveredNoDuplicateRing:
 
         # Clean state
         with _ws_delivered_lock:
-            _ws_delivered.discard(("term_c", 300))
+            _ws_delivered.pop(("term_c", 300), None)
 
         mark_ws_delivered("term_c", 300)
         assert consume_ws_delivered("term_c", 300) is True
@@ -326,11 +338,18 @@ class TestF158R2_PushDoorbellFrameSyncObservability:
 
             ws_doorbell._connections["term_good"] = mock_ws
 
+            # R3: Set inbox_service._delivery_loop to our background loop
+            from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
+            orig_loop = inbox_mod.inbox_service._delivery_loop
+            inbox_mod.inbox_service._delivery_loop = loop
+
             with patch.object(ws_doorbell, "is_ws_monitor_enabled", return_value=True):
-                with patch("asyncio.get_running_loop", return_value=loop):
-                    result = ws_doorbell.push_doorbell_frame_sync(
-                        "term_good", 10, "s", "p", timeout=2.0
-                    )
+                result = ws_doorbell.push_doorbell_frame_sync(
+                    "term_good", 10, "s", "p", timeout=2.0
+                )
+
+            inbox_mod.inbox_service._delivery_loop = orig_loop
 
             assert result is True
         finally:

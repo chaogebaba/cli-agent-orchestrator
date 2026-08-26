@@ -149,20 +149,26 @@ class TestF158PushDoorbellFrameSyncReturnType:
 
     def test_returns_true_when_armed_and_loop_available(self):
         import asyncio
+        import threading
 
         from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
 
         loop = asyncio.new_event_loop()
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
         try:
+            # R3: Set inbox_service._delivery_loop to our background loop
+            from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
+            orig_loop = inbox_mod.inbox_service._delivery_loop
+            inbox_mod.inbox_service._delivery_loop = loop
+
             with patch(
                 "cli_agent_orchestrator.services.ws_doorbell.is_ws_monitor_enabled",
                 return_value=True,
             ), patch(
                 "cli_agent_orchestrator.services.ws_doorbell.is_armed",
                 return_value=True,
-            ), patch(
-                "asyncio.get_running_loop",
-                return_value=loop,
             ), patch(
                 "asyncio.run_coroutine_threadsafe",
             ) as mock_run:
@@ -173,7 +179,11 @@ class TestF158PushDoorbellFrameSyncReturnType:
                 result = push_doorbell_frame_sync("term1", 1, "s", "p")
                 assert result is True
                 mock_run.assert_called_once()
+
+            inbox_mod.inbox_service._delivery_loop = orig_loop
         finally:
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=2)
             loop.close()
 
 

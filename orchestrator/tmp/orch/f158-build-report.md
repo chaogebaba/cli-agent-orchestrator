@@ -1,81 +1,66 @@
-# F158-R2 Build Report — Doorbell Delivery Observability & Single Ring Owner
+# F158-R3 Build Report
 
+**Round:** R3
+**Worktree:** /data/cao-scratch/f158-wt
 **Branch:** cao/f158-build
-**Base:** f5acc7411cc555b4f8e6b3a3cfeaaad7b1de495c
-**Round:** R2 (re-fix after GATE-NO with 2 BLOCKERs)
+**HEAD:** d1f4c68d
+**Base:** 4edbf888 (F158-R2)
 
-## Blocker Resolutions
+## Findings → Fixes
 
-### B1 — Transport-drop after armed check now observable
+### B1 (BLOCKER): Late WS send coexists with native fallback
 
-**Root cause:** `push_doorbell_frame_sync` submitted the coroutine via
-`asyncio.run_coroutine_threadsafe` and returned `True` immediately (enqueue ack).
-The actual `ws.send_text` result was never observed by `_f413_after_commit`.
+**Root causes identified:**
+1. `push_doorbell_frame_sync` did not cancel/invalidate the submitted future on timeout
+2. Direct-terminal POST route ran `create_inbox_message` (triggering F413 sync) on the FastAPI event-loop thread → deterministic same-loop deadlock (0.5s timeout, late send)
+3. Redundant second `push_doorbell_frame_sync` call at api/main.py:7795-7805
+4. Mailbox authority lock held across entire doorbell stash drain (cumulative 0.5s * N per stash entry)
 
-**Fix:** `push_doorbell_frame_sync` now calls `future.result(timeout=0.5)` on the
-submitted coroutine, returning the *actual* send outcome. When `send_text` raises
-(transport drop) or the coroutine doesn't complete within 0.5s, the function
-returns `False`. The fallback decision in `_f413_after_commit` now correctly sees
-delivery failure.
+**Fixes applied:**
 
-**Blocking trade-off:** The 0.5s bounded wait is acceptable because:
-- The after-commit hook runs on the ORM session thread (not the async event loop)
-- WS `send_text` on localhost is sub-millisecond in the success case
-- The 0.5s cap is a safety net for dead-connection detection, not a performance path
-- The wait is per-stash-entry, not cumulative across entries
+| Sub-issue | File | Fix |
+|-----------|------|-----|
+| Cancel/invalidate | ws_doorbell.py | `future.cancel()` + `_invalidate_ws_send(terminal_id, row_id)` on timeout; `mark_ws_delivered` checks invalidation set before setting mark |
+| Same-loop detection | ws_doorbell.py | Detect when `running_loop is target_loop`; return False immediately (no blocking) |
+| Off-loop F413 | api/main.py | `create_inbox_message` wrapped in `asyncio.to_thread()` for direct-terminal POST |
+| Redundant push | api/main.py | Removed WPDT W1 second push_doorbell_frame_sync call |
+| Lock hold bound | mailbox_service.py | Pop doorbell stash BEFORE commit; drain entries AFTER lock.release() |
 
-### B2 — Single post-write ring owner, no pre-write wake
+### S1 (SHOULD): delivered-mark set leaks stale entries
 
-**Root cause:** `_f413_after_commit` called `ring_supervisor_doorbell` directly when
-WS was unarmed. This duplicated the F136 post-write doorbell AND violated the
-write-before-wake contract (supervisor wakes before callback file exists).
+**Fixes applied:**
+- `_ws_delivered` changed from `set` to `dict[tuple, float]` (key → monotonic timestamp)
+- `_evict_stale()`: TTL-based eviction (30s) replaces clear-all-at-4096
+- `abandon_ws_delivered(terminal_id)`: cleans all marks + invalidations on WS disconnect
+- `consume_ws_delivered()`: now batch-removes marks for same terminal with row_id ≤ target
+- Max entries reduced from 4096 to 2048 (entries have TTL now)
 
-**Fix:** Removed `ring_supervisor_doorbell` from `_f413_after_commit` entirely.
-The after-commit hook now only does:
-1. Attempt WS push (advisory frame)
-2. If WS succeeded → `mark_ws_delivered(terminal_id, row_id)`
-3. Always call `request_delivery(terminal_id)` → F136 runner writes callback → rings
+### S2 (SHOULD): Tests don't exercise claimed e2e ring protocol
 
-In `_f136_post_delivery`, added `consume_ws_delivered` check before
-`ring_supervisor_doorbell`. When WS already delivered (mark present), the native
-ring is suppressed (no duplicate wake).
+**New test file:** `test/services/test_f158_r3_e2e_doorbell_race.py` (10 tests)
 
-**Result per scenario:**
-- WS armed + delivered: 1 WS frame, 0 native rings ✓
-- WS armed + send failed: 0 WS frames, 1 native ring (F136 post-write) ✓
-- WS unarmed: 0 WS frames, 1 native ring (F136 post-write) ✓
+Tests cover:
+- **Late-succeeding-timeout race:** slow WS → timeout → invalidation prevents late mark
+- **Same-loop caller:** push_doorbell_frame_sync returns False in <0.1s, no send_text call
+- **Normal success path:** WS delivers → mark set → F136 consumes → skip native ring
+- **Abandoned path cleanup:** abandon_ws_delivered removes all terminal marks
+- **Batch consume:** consume_ws_delivered cleans earlier marks
+- **Targeted eviction:** old entries removed, recent entries kept
 
-## F461 Compatibility
+Tests do NOT patch `request_delivery` — real F136 signaling path exercised.
 
-F461 has no code-level implementation in this repo — it was referenced in the
-prior build report's compatibility claim. The restructuring preserves:
-- Same `push_doorbell_frame_sync` signature and semantics (True = delivered)
-- Same `request_delivery` unconditional call from after-commit
-- Same F136 delivery runner write path (unchanged)
-- Same inbox processing and obligation creation
+## Test Results
 
-## Files Changed
+- **Full suite (box@cursor-3):** 13642 passed, 204 skipped, 39 failed (all pre-existing)
+- **Doorbell tests (149):** 149 passed, 0 failed
+- **New R3 e2e tests (10):** 10 passed, 0 failed
+- **Pre-existing failures confirmed:** same tests fail on base commit 4edbf888
 
-- `src/cli_agent_orchestrator/services/ws_doorbell.py` — bounded wait in
-  push_doorbell_frame_sync; added mark_ws_delivered/consume_ws_delivered dedup state
-- `src/cli_agent_orchestrator/clients/database.py` — _f413_after_commit restructured:
-  removed direct ring, added mark_ws_delivered on success
-- `src/cli_agent_orchestrator/services/inbox_service.py` — _f136_post_delivery:
-  consume_ws_delivered check before native ring
-- `test/services/test_f158_doorbell_fallback.py` — updated to match new semantics
-- `test/services/test_f158_r2_doorbell_regression.py` — new regression tests
+## Modified Files
 
-## Test Evidence
-
-- **Local targeted (doorbell/delivery modules):** 195 passed in 62s
-- **Box full suite (cursor-4):** 13626 passed, 204 skipped, 15 xfailed, 321s
-  - 16 failures all pre-existing (confirmed identical on base commit):
-    `_FakeMailbox.cc_inbox_path`, quarantine-serial, trace manifest byte-exact
-- **Zero new failures introduced by F158-R2**
-
-## S1/S2 Notes (SHOULD from gate report)
-
-- S1 (caller_holds_no_delivery_lock flag): Moot — the flag is no longer used from
-  `_f413_after_commit` since that hook no longer calls `ring_supervisor_doorbell`.
-- S2 (idempotent regression test): The idempotent-hit path still stashes 4-tuples
-  correctly; the R2 changes don't affect the stash format or the ORM listener logic.
+- `src/cli_agent_orchestrator/services/ws_doorbell.py`
+- `src/cli_agent_orchestrator/api/main.py`
+- `src/cli_agent_orchestrator/services/mailbox_service.py`
+- `test/services/test_f158_r3_e2e_doorbell_race.py` (new)
+- `test/services/test_f158_r2_doorbell_regression.py` (adapt to dict-based _ws_delivered)
+- `test/services/test_f158_doorbell_fallback.py` (adapt loop setup for R3 same-loop detection)
