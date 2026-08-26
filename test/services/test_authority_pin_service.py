@@ -600,3 +600,310 @@ class TestUpdatePinFrozenGuard:
         new_sha = hashlib.sha256(b"v2").hexdigest()
         result = service.update_pin("bbbbbbbb", str(authority), new_sha)
         assert result["current_version"] == 2
+
+
+
+# ─── F495: Frozen-pin rotation tests ────────────────────────────────────────
+
+
+class TestRotateFrozenPins:
+    """Tests for rotate_frozen_pins (F495: warm-reuse pin rotation)."""
+
+    def test_rotation_replaces_old_pins_with_new(self, pin_db, tmp_path):
+        """rotate_frozen_pins deletes old frozen pins and registers new ones."""
+        old_authority = tmp_path / "old-blueprint.md"
+        old_authority.write_text("old content")
+        old_sha = _sha(old_authority)
+
+        new_authority = tmp_path / "new-blueprint.md"
+        new_authority.write_text("new content")
+        new_sha = _sha(new_authority)
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            register_frozen_pins,
+            rotate_frozen_pins,
+        )
+
+        # First dispatch: register old pin
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(old_authority), "sha256": old_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # Second dispatch (warm-reuse): rotate to new pin
+        with pin_db.begin() as db:
+            results = rotate_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(new_authority), "sha256": new_sha}],
+                registered_by="aaaaaaaa",
+            )
+            assert len(results) == 1
+            assert results[0]["file_path"] == str(new_authority)
+            assert results[0]["sha256"] == new_sha
+            assert results[0]["version"] == 1
+
+        # Verify old pin is gone, new pin exists
+        with pin_db() as db:
+            old_rows = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(old_authority))
+                .all()
+            )
+            assert old_rows == []
+            new_rows = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(new_authority))
+                .all()
+            )
+            assert len(new_rows) == 1
+            assert new_rows[0].frozen is True
+            assert new_rows[0].version == 1
+            assert new_rows[0].sha256 == new_sha
+
+    def test_rotation_preserves_mutable_pins(self, pin_db, tmp_path):
+        """rotate_frozen_pins only deletes frozen=True rows, not mutable ones."""
+        frozen_file = tmp_path / "frozen.md"
+        frozen_file.write_text("frozen")
+        frozen_sha = _sha(frozen_file)
+
+        mutable_file = tmp_path / "mutable.md"
+        mutable_file.write_text("mutable")
+        mutable_sha = _sha(mutable_file)
+
+        new_file = tmp_path / "new.md"
+        new_file.write_text("new")
+        new_sha = _sha(new_file)
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            register_frozen_pins,
+            rotate_frozen_pins,
+        )
+
+        # Register one frozen pin and one mutable pin
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(frozen_file), "sha256": frozen_sha}],
+                registered_by="aaaaaaaa",
+            )
+        service.pin_authority("bbbbbbbb", [{"file_path": str(mutable_file), "sha256": mutable_sha}])
+
+        # Rotate: should only delete the frozen pin
+        with pin_db.begin() as db:
+            rotate_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(new_file), "sha256": new_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        with pin_db() as db:
+            # Mutable pin still exists
+            mutable_rows = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(mutable_file))
+                .all()
+            )
+            assert len(mutable_rows) == 1
+            assert mutable_rows[0].frozen is False
+
+            # Old frozen pin gone
+            old_frozen = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(frozen_file))
+                .all()
+            )
+            assert old_frozen == []
+
+            # New frozen pin exists
+            new_frozen = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(new_file))
+                .all()
+            )
+            assert len(new_frozen) == 1
+            assert new_frozen[0].frozen is True
+
+    def test_rotation_validates_hash(self, pin_db, tmp_path):
+        """rotate_frozen_pins rejects mismatched hashes like register does."""
+        old_file = tmp_path / "old.md"
+        old_file.write_text("old")
+        old_sha = _sha(old_file)
+
+        new_file = tmp_path / "new.md"
+        new_file.write_text("new content")
+        wrong_sha = hashlib.sha256(b"wrong").hexdigest()
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            register_frozen_pins,
+            rotate_frozen_pins,
+        )
+
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(old_file), "sha256": old_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        with pin_db() as db:
+            with pytest.raises(service.AuthorityPinError, match="authority_hash_mismatch"):
+                rotate_frozen_pins(
+                    db,
+                    task_key="bbbbbbbb",
+                    authority_files=[{"file_path": str(new_file), "sha256": wrong_sha}],
+                    registered_by="aaaaaaaa",
+                )
+
+    def test_rotation_same_file_different_content(self, pin_db, tmp_path):
+        """Rotation on the same file path with updated content succeeds."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("v1 content")
+        v1_sha = _sha(authority)
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            register_frozen_pins,
+            rotate_frozen_pins,
+        )
+
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(authority), "sha256": v1_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # File is rewritten (r2->r3 scenario)
+        authority.write_text("v2 content")
+        v2_sha = _sha(authority)
+
+        with pin_db.begin() as db:
+            results = rotate_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(authority), "sha256": v2_sha}],
+                registered_by="aaaaaaaa",
+            )
+            assert results[0]["sha256"] == v2_sha
+
+        # Validate: should see VALID (not DRIFT)
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            validation = validate_frozen_pins(db, "bbbbbbbb")
+            assert validation.outcome == "valid"
+            assert validation.all_results[0].verdict == "VALID"
+
+
+class TestF495RegressionSuppressedValidVerdict:
+    """Regression test for the exact live incident: warm reviewer's valid
+    verdict suppressed as FROZEN-PIN-DRIFT because old pin cited stale hash.
+
+    Scenario:
+      1. Reviewer terminal R dispatched with authority_files=[blueprint v1]
+      2. Builder overwrites blueprint to v2 (legitimate r2->r3)
+      3. Supervisor re-dispatches R with authority_files=[blueprint v2]
+      4. R completes review, sends callback
+      5. validate_frozen_pins should see VALID (blueprint matches v2 pin)
+      6. Before fix: validate saw DRIFT (old v1 pin vs v2 file) → callback suppressed
+    """
+
+    def test_warm_reviewer_re_pinned_attests_current_artifact(self, pin_db, tmp_path):
+        """After rotation, validate_frozen_pins attests the CURRENT artifact."""
+        blueprint = tmp_path / "f158-build-report.md"
+        blueprint.write_text("round 2 report content")
+        r2_sha = _sha(blueprint)
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            register_frozen_pins,
+            rotate_frozen_pins,
+            validate_frozen_pins,
+            build_attestation,
+        )
+
+        # Step 1: First dispatch — pin to r2 content
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(blueprint), "sha256": r2_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # Step 2: Builder rewrites blueprint for r3
+        blueprint.write_text("round 3 report content")
+        r3_sha = _sha(blueprint)
+
+        # Verify: OLD pin would trigger drift (the bug)
+        with pin_db() as db:
+            old_validation = validate_frozen_pins(db, "bbbbbbbb")
+            assert old_validation.outcome == "drift"  # This was the bug
+
+        # Step 3: Supervisor re-dispatches with new authority_files (the fix)
+        with pin_db.begin() as db:
+            rotate_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(blueprint), "sha256": r3_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # Step 4: Reviewer sends callback — validation should PASS
+        with pin_db() as db:
+            new_validation = validate_frozen_pins(db, "bbbbbbbb")
+            assert new_validation.outcome == "valid"
+            assert new_validation.all_results[0].verdict == "VALID"
+            assert new_validation.all_results[0].expected == r3_sha
+
+            # Attestation references the CURRENT (r3) hash
+            attestation = build_attestation(new_validation)
+            assert r3_sha in attestation
+            assert r2_sha not in attestation
+
+    def test_genuine_drift_still_detected_after_rotation(self, pin_db, tmp_path):
+        """Post-dispatch mutation of pinned file still triggers DRIFT."""
+        blueprint = tmp_path / "f337-build-report.md"
+        blueprint.write_text("dispatched content")
+        dispatch_sha = _sha(blueprint)
+
+        from cli_agent_orchestrator.services.authority_pin_service import (
+            rotate_frozen_pins,
+            register_frozen_pins,
+            validate_frozen_pins,
+        )
+
+        # First dispatch
+        with pin_db.begin() as db:
+            register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(blueprint), "sha256": dispatch_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # Rotate to new pin (simulating warm-reuse re-dispatch)
+        blueprint.write_text("re-dispatched content")
+        redispatch_sha = _sha(blueprint)
+        with pin_db.begin() as db:
+            rotate_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(blueprint), "sha256": redispatch_sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # GENUINE post-dispatch mutation (not a legitimate re-dispatch)
+        blueprint.write_text("tampered content")
+
+        with pin_db() as db:
+            validation = validate_frozen_pins(db, "bbbbbbbb")
+            assert validation.outcome == "drift"
+            assert validation.drifted[0].reason == "content"
+            assert validation.drifted[0].expected == redispatch_sha
