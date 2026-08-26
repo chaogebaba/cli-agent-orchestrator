@@ -378,13 +378,13 @@ def get_memory_settings() -> Dict[str, Any]:
     ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
     false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
 
-    ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
-    behavior. Setting it to ``False`` disables all memory subsystem
+    ``enabled`` defaults to ``False`` (opt-in) to avoid spending Claude quota.
+    Setting it to ``True`` enables all memory subsystem
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
     defaults: Dict[str, Any] = {
-        "enabled": True,
+        "enabled": False,
         "flush_threshold": 0.85,
         "lint_enabled": True,
         "learning_enabled": False,
@@ -396,6 +396,18 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+
+    # Validate persisted memory.enabled: only literal JSON boolean true opts in.
+    # Any other type (string "false", "0", int 1, dict, list, etc.) is invalid
+    # and resolves to False (fail-closed). Env-var overlay below may still override.
+    persisted_enabled = result["enabled"]
+    if persisted_enabled is not True and persisted_enabled is not False:
+        logger.warning(
+            "Invalid memory.enabled=%r (expected JSON boolean); "
+            "treating as False (fail-closed)",
+            persisted_enabled,
+        )
+        result["enabled"] = False
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -488,14 +500,18 @@ def is_memory_enabled() -> bool:
     """Return True when the memory subsystem is enabled.
 
     Precedence: CAO_MEMORY_ENABLED env var > memory.enabled in settings.json
-    > default (True).
+    > default (False — memory is opt-in to avoid spending Claude quota).
+
+    Only literal boolean True enables memory (fail-closed). The validation in
+    get_memory_settings() normalizes invalid types to False, so this identity
+    check is defense-in-depth.
     """
     try:
-        value = get_memory_settings().get("enabled", True)
+        value = get_memory_settings().get("enabled", False)
     except Exception as e:
-        logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
-        return True
-    return bool(value)
+        logger.warning(f"Failed to read memory.enabled, defaulting to False: {e}")
+        return False
+    return value is True
 
 
 def is_learning_enabled() -> bool:
@@ -511,7 +527,7 @@ def is_learning_enabled() -> bool:
     """
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+        return bool(settings.get("enabled", False)) and bool(settings.get("learning_enabled", False))
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
         return False
@@ -763,3 +779,73 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     settings["extra_skill_dirs"] = extra_skill_dirs
     _save(settings)
     return extra_skill_dirs
+
+
+
+# --- TUI settings (F489) ---
+
+_TUI_DEFAULTS: Dict[str, Any] = {
+    "autostart": True,
+    "ensure_script": "/home/chao/VScode_projects/cli-subagents/scripts/fleet-tui-ensure.sh",
+}
+
+_TUI_ENV_VARS: Dict[str, str] = {
+    "autostart": "CAO_TUI_AUTOSTART",
+    "ensure_script": "CAO_TUI_ENSURE_SCRIPT",
+}
+
+
+def get_tui_settings() -> Dict[str, Any]:
+    """Return TUI settings from settings.json ``tui`` section.
+
+    Precedence per key: CAO_TUI_* env var > tui.* in settings.json > default.
+    """
+    settings = _load()
+    saved = settings.get("tui", {})
+    if not isinstance(saved, dict):
+        saved = {}
+    result = dict(_TUI_DEFAULTS)
+    result.update({k: v for k, v in saved.items() if k in _TUI_DEFAULTS})
+
+    # Env-var overlay
+    for key, env_name in _TUI_ENV_VARS.items():
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if key == "autostart":
+            if raw.lower() in _BOOL_TRUE_VALUES:
+                result[key] = True
+            elif raw.lower() in _BOOL_FALSE_VALUES:
+                result[key] = False
+        elif key == "ensure_script":
+            if raw:
+                result[key] = raw
+
+    return result
+
+
+def is_tui_autostart_enabled() -> bool:
+    """Return True when fleet TUI auto-start on dispatch is enabled.
+
+    Precedence: CAO_TUI_AUTOSTART env var > tui.autostart in settings.json
+    > default (True).
+    """
+    try:
+        return bool(get_tui_settings().get("autostart", True))
+    except Exception as e:
+        logger.warning(f"Failed to read tui.autostart, defaulting to True: {e}")
+        return True
+
+
+def get_tui_ensure_script() -> str:
+    """Return the absolute path to the fleet-tui-ensure.sh script.
+
+    Precedence: CAO_TUI_ENSURE_SCRIPT env var > tui.ensure_script in settings.json
+    > default.
+    """
+    try:
+        return str(get_tui_settings().get("ensure_script", _TUI_DEFAULTS["ensure_script"]))
+    except Exception as e:
+        logger.warning(f"Failed to read tui.ensure_script, using default: {e}")
+        return _TUI_DEFAULTS["ensure_script"]

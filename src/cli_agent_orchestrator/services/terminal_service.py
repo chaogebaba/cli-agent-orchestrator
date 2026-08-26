@@ -262,6 +262,68 @@ class _LegacyWarmTerminalPublisher(Protocol):
 # response size to a fixed, predictable amount regardless of on-disk log size.
 TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 
+
+# --- F489: Fleet TUI ensure-on-dispatch ---
+# Module-level flag ensures we only attempt one fire-and-forget per process
+# lifetime (the ensure script itself is idempotent, but there's no point
+# spawning a subprocess every single terminal creation).
+_fleet_tui_ensure_attempted: bool = False
+_fleet_tui_ensure_lock = threading.Lock()
+
+
+def _maybe_ensure_fleet_tui(session_name: Optional[str] = None) -> None:
+    """Fire-and-forget the fleet TUI ensure script, at most once per process.
+
+    Gated behind settings flag ``tui.autostart`` (default True). Never blocks,
+    never raises — wraps everything in try/except with a log-only warning.
+    """
+    global _fleet_tui_ensure_attempted
+
+    # Fast path: already attempted this process lifetime
+    if _fleet_tui_ensure_attempted:
+        return
+
+    with _fleet_tui_ensure_lock:
+        if _fleet_tui_ensure_attempted:
+            return
+        _fleet_tui_ensure_attempted = True
+
+    try:
+        from cli_agent_orchestrator.services.settings_service import (
+            get_tui_ensure_script,
+            is_tui_autostart_enabled,
+        )
+
+        if not is_tui_autostart_enabled():
+            return
+
+        script_path = get_tui_ensure_script()
+        if not os.path.isfile(script_path):
+            logger.debug(
+                "fleet-tui-ensure: script not found at %s, skipping", script_path
+            )
+            return
+
+        # Build args: pass session name if known
+        args = [script_path]
+        if session_name:
+            args.append(session_name)
+
+        import subprocess
+
+        subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        logger.debug("fleet-tui-ensure: fired ensure script (session=%s)", session_name)
+    except Exception as exc:
+        logger.warning("fleet-tui-ensure: failed to fire ensure script: %s", exc)
+
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -2718,6 +2780,11 @@ async def create_terminal(
                 provider=provider,
             ),
         )
+
+        # F489: Fire-and-forget fleet TUI ensure on worker dispatch.
+        # Idempotent: the ensure script exits fast if TUI is already alive.
+        # Never blocks or fails terminal creation.
+        _maybe_ensure_fleet_tui(session_name)
 
         # Register with herdr inbox service for message delivery
         svc = get_herdr_inbox_service()

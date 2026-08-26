@@ -44,17 +44,18 @@ every child off regardless of the child's setting.
 
 | Setting (settings.json `memory` section) | Default | Env override | Gates |
 |---|---|---|---|
-| `enabled` | `true` | `CAO_MEMORY_ENABLED` | the whole memory subsystem |
+| `enabled` | **`false`** | `CAO_MEMORY_ENABLED` | the whole memory subsystem |
 | `learning_enabled` | **`false`** | `CAO_MEMORY_LEARNING_ENABLED` | outcome capture (`report_outcome`, `/outcomes`) |
 | `instruction_promotion_enabled` | **`false`** | `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED` | profile mutation (`cao memory promote --apply`) |
 
 Enable learning:
 
 ```bash
-# settings.json
-{ "memory": { "learning_enabled": true } }
+# settings.json — both memory and learning must be explicitly enabled
+{ "memory": { "enabled": true, "learning_enabled": true } }
 
-# or per-process
+# or per-process (both required)
+export CAO_MEMORY_ENABLED=true
 export CAO_MEMORY_LEARNING_ENABLED=true
 ```
 
@@ -66,9 +67,8 @@ Disabled behavior (mirrors the memory subsystem's idiom):
 - **Reads fail silent** — `list_outcomes()` returns `[]`; `GET /outcomes`
   and `POST /outcomes` return 404; the `report_outcome` MCP tool returns a
   `{"disabled": true}` payload the agent can surface and move on from.
-- **Errors fail closed** — an unreadable settings file leaves both learning
-  flags `false` (opt-in features fail closed; deliberately opposite to
-  `memory.enabled`, which fails open because it is opt-out).
+- **Errors fail closed** — an unreadable settings file leaves all memory
+  flags `false` (the entire stack is opt-in and fails closed).
 
 ## Phase 1 — outcome capture
 

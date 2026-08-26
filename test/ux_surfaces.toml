@@ -76,8 +76,8 @@ obligation = "ECS"
 
 [[surface]]
 id = "S11"
-name = "list_siblings / peek_terminal / update_metadata / delete_terminal / interrupt_terminal"
-mcp_tools = ["list_siblings", "peek_terminal", "update_metadata", "delete_terminal", "interrupt_terminal"]
+name = "list_siblings / peek_terminal / update_metadata / update_task_label / delete_terminal / interrupt_terminal"
+mcp_tools = ["list_siblings", "peek_terminal", "update_metadata", "update_task_label", "delete_terminal", "interrupt_terminal"]
 invariants = ["UX-6"]
 obligation = "ECS"
 

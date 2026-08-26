@@ -53,7 +53,8 @@ class TestIsLearningEnabledFlag:
     def test_returns_true_when_explicitly_enabled(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        # F488: memory.enabled must also be True for learning to work
+        settings_file.write_text(json.dumps({"memory": {"enabled": True, "learning_enabled": True}}))
         assert is_learning_enabled() is True
 
     def test_returns_false_when_explicitly_disabled(self, settings_file: Path) -> None:
@@ -75,9 +76,11 @@ class TestIsLearningEnabledFlag:
 
 
 class TestLearningRequiresMemory:
-    def test_disabled_memory_forces_learning_off(self, settings_file: Path) -> None:
+    def test_disabled_memory_forces_learning_off(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
+        # F488: remove env override so file's enabled=False is respected
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
         settings_file.write_text(
             json.dumps({"memory": {"enabled": False, "learning_enabled": True}})
         )
@@ -94,7 +97,8 @@ class TestLearningRequiresMemory:
     def test_memory_env_disable_forces_learning_off(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        # F488: explicitly enable memory in file so the env override is what disables it
+        settings_file.write_text(json.dumps({"memory": {"enabled": True, "learning_enabled": True}}))
         with patch.dict("os.environ", {"CAO_MEMORY_ENABLED": "false"}):
             assert is_learning_enabled() is False
 
@@ -108,27 +112,39 @@ class TestLearningEnvOverride:
     def test_env_true_beats_file_absent(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-        with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": "true"}):
+        # F488: learning requires memory.enabled=True; env override alone is not enough
+        with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": "true", "CAO_MEMORY_ENABLED": "true"}):
             assert is_learning_enabled() is True
+
+    def test_env_learning_without_memory_enabled_is_false(self, settings_file: Path, monkeypatch) -> None:
+        """F488: learning env=true but memory default off → learning off."""
+        from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+        # Remove conftest's CAO_MEMORY_ENABLED=true to test pure default (off)
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": "true"}):
+            assert is_learning_enabled() is False
 
     def test_env_false_beats_file_true(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        settings_file.write_text(json.dumps({"memory": {"enabled": True, "learning_enabled": True}}))
         with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": "0"}):
             assert is_learning_enabled() is False
 
     def test_env_accepts_1_yes_true(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
+        # F488: memory must also be enabled for learning to work
         for raw in ("1", "true", "yes", "TRUE", "Yes"):
-            with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": raw}):
+            with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": raw, "CAO_MEMORY_ENABLED": "true"}):
                 assert is_learning_enabled() is True, f"env value {raw!r} should enable"
 
     def test_env_blank_falls_through_to_file(self, settings_file: Path) -> None:
         from cli_agent_orchestrator.services.settings_service import is_learning_enabled
 
-        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        # F488: need enabled=True in file for learning to work
+        settings_file.write_text(json.dumps({"memory": {"enabled": True, "learning_enabled": True}}))
         with patch.dict("os.environ", {"CAO_MEMORY_LEARNING_ENABLED": "  "}):
             assert is_learning_enabled() is True
 
@@ -147,6 +163,8 @@ class TestSetLearningEnabled:
         )
 
         set_memory_setting("learning_enabled", True)
+        # F488: memory.enabled must also be True for learning to be on
+        set_memory_setting("enabled", True)
         assert is_learning_enabled() is True
         assert get_memory_settings()["learning_enabled"] is True
 
@@ -200,11 +218,13 @@ class TestInstructionPromotionFlag:
         )
         assert is_instruction_promotion_enabled() is True
 
-    def test_memory_off_forces_promotion_off(self, settings_file: Path) -> None:
+    def test_memory_off_forces_promotion_off(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import (
             is_instruction_promotion_enabled,
         )
 
+        # F488: remove env override so file's enabled=False is respected
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
         settings_file.write_text(
             json.dumps(
                 {
@@ -223,7 +243,8 @@ class TestInstructionPromotionFlag:
             is_instruction_promotion_enabled,
         )
 
-        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        # F488: memory.enabled must be True for the full chain to work
+        settings_file.write_text(json.dumps({"memory": {"enabled": True, "learning_enabled": True}}))
         with patch.dict("os.environ", {"CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED": "true"}):
             assert is_instruction_promotion_enabled() is True
 

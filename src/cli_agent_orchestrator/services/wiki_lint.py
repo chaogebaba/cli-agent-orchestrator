@@ -975,13 +975,14 @@ async def run_lint(
     }
 
     # Memory-disabled short-circuit (mirrors the memory kill switch).
+    # Fail closed: if resolution raises, treat memory as disabled.
     try:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
         if not is_memory_enabled():
             return []
     except Exception:
-        pass
+        return []
 
     repo_root_resolved = os.path.realpath(repo_root or os.getcwd())
 
