@@ -5011,6 +5011,12 @@ async def _wait_for_auto_responder_dialog_clear(
     from cli_agent_orchestrator.services.auto_responder import auto_responder
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+    # Quick pre-check: if status is already not WAITING_USER_ANSWER, return
+    # immediately without any grace sleep. This is the common case (no dialog).
+    current_status = status_monitor.get_status(terminal_id)
+    if current_status != TerminalStatus.WAITING_USER_ANSWER:
+        return
+
     # Brief initial grace: give the TUI a moment to render a late dialog before
     # concluding there isn't one. Without this, a dialog that appears 200ms after
     # initialize() returns is missed on the first poll.

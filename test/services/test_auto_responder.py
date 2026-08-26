@@ -1302,8 +1302,8 @@ class TestF491DeferredInitDialogWait:
         monkeypatch.setattr(asyncio, "sleep", mock_sleep)
 
         await _wait_for_auto_responder_dialog_clear("term1", "gen1", None, timeout=5.0)
-        # Only the initial grace sleep should have happened
-        assert len(sleep_calls) == 1  # _F491_DIALOG_CLEAR_INITIAL_GRACE
+        # No sleep at all — returned immediately on pre-check
+        assert len(sleep_calls) == 0
 
     @pytest.mark.asyncio
     async def test_waits_and_clears_when_dialog_dismissed(self, monkeypatch):
