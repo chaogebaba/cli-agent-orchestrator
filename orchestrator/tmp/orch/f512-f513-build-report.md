@@ -168,3 +168,58 @@ I've stopped here per the stop-and-ask directive rather than pick one.
 - Temp files on boxes: none.
 - Deviations: full suite not run because all allowed boxes are down — reported
   above as a blocker rather than run on the laptop.
+
+
+---
+
+## Addendum — full-suite result + F72 test reconciliation (post-gate iteration)
+
+Full suite executed on **box@cursor-2** (queued behind `f497-p1-suite`, then
+acquired; suite collected 13800+ tests from a `git checkout -B cao/49124f29
+origin/cao/49124f29` of the pushed branch):
+
+```
+2 failed, 13802 passed, 51 skipped, 14 xfailed, 1 xpassed in 367.24s
+```
+
+### Failure 1 (REAL, now fixed) — test_f72_fleet_lifecycle
+`test/services/test_f72_fleet_lifecycle.py::test_collision_quiesces_first_refuses_once_and_deletes_nothing`
+
+This pre-existing test monkeypatches `acquire_session_lifecycle_exclusive` and
+asserted it is called **exactly once** (`events == ["quiesce","acquire"]`,
+`calls == 1`) with an *instant* `resume_in_progress` refuse. My F513 bounded-wait
+now polls that acquire repeatedly across the wait window (~21×/5s), so the
+one-shot assertion broke. The test's **substantive invariants still held on my
+branch** — the delete still raises `resume_in_progress`, deletes nothing
+(`terminal_exists` stays True), performs no kills (`backend.kills == []`).
+
+**Fix (option B, supervisor-approved):** in that single test, patch
+`ConfigService.get` so `delete.lifecycle_lease_wait_s` returns `0.0` (all other
+keys delegate to the real value via the caller-supplied default). With a
+zero-wait budget the bounded acquire makes exactly one attempt, so the test
+keeps asserting the original one-shot instant-refuse contract. The default-5s
+bounded-wait behaviour is owned by
+`test/services/test_f512_f513_lease_and_passthrough.py`. No production-code
+change — a 1-test edit.
+
+Local re-verification (targeted):
+```
+uv run pytest \
+  test/services/test_f72_fleet_lifecycle.py::test_collision_quiesces_first_refuses_once_and_deletes_nothing \
+  test/services/test_f512_f513_lease_and_passthrough.py -q
+=> 28 passed
+uv run pytest test/services/test_f72_fleet_lifecycle.py -q
+=> 36 passed   (whole F72 file, confirms the ConfigService patch disturbs no sibling test)
+```
+
+### Failure 2 (ACCEPTED as environmental, not mine) — test_suite_slot
+`test/plugins/test_suite_slot.py::TestLedgerSampling::test_sample_ledger_monotonic_growth`
+
+The box-run slot-lock ledger sampler; timing-sensitive and unrelated to
+F512/F513 code. **Passes locally on my branch.** Supervisor is tracking it
+separately as a flaky/environmental item; no change made here.
+
+### Net after fix
+Expected full-suite delta: the 1 real failure is resolved; the remaining
+`test_suite_slot` flake is environmental. F512/F513 production changes are
+unchanged from HEAD `73e2d923` — this iteration is test-only.
