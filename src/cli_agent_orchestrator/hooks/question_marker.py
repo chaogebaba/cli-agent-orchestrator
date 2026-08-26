@@ -41,6 +41,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -143,7 +144,7 @@ def _deadletter(terminal_id: str, event_source: str, error_class: str, error: ob
             os.close(lock_fd)
 
 
-def _classify(event: dict) -> tuple[str, str | None] | None:
+def _classify(event: dict[str, Any]) -> tuple[str, str | None] | None:
     """Map one CC hook event to ``(kind, tool_name)`` or ``None`` to drop it.
 
     ``kind`` is ``"question_open"`` or ``"question_clear"``. Returns ``None``
@@ -228,7 +229,7 @@ def main() -> int:
             or os.environ.get("CAO_API_BASE_URL")
             or resolve_endpoint()
         ).rstrip("/")
-        payload: dict = {
+        payload: dict[str, Any] = {
             "terminal_id": terminal_id,
             "kind": kind,
             "source": event.get("source", "") or event_source,

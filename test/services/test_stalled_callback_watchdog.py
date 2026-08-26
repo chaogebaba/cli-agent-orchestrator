@@ -1550,3 +1550,54 @@ class TestF128DeleteBeforeCallbackGuard:
         assert results[0] is not None  # w1: open
         assert results[1] is None       # w2: callback_seen
         assert results[2] is not None  # w3: open
+
+
+
+def test_forkA_widen_samples_live_terminal_with_no_armed_episode():
+    """F506 Fork-A (AC17 / #361 shape) BITING test at the WATCHDOG level.
+
+    A LIVE terminal that has NO armed episode must still be sampled by
+    refresh_screen_fingerprints — this is the #361 false-idle shape (no episode
+    armed). The live terminal id is DISTINCT from any episode, so it is present
+    ONLY via the Fork-A live_ids union.
+
+    BITES: revert the widen in stalled_callback_watchdog.refresh_screen_
+    fingerprints to `sample_ids = list(armed_episode_ids)` (drop the live_ids
+    union) and this fails — the episode-free live terminal is never sampled.
+    """
+    from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+    pane_liveness._state.clear()
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    # NO episodes at all — self._episodes is empty (the #361 incident shape).
+    assert not svc._episodes
+
+    live_meta = {"id": "live0001", "tmux_session": "cao-test", "tmux_window": "w-live"}
+    backend = MagicMock()
+    backend.get_history.return_value = "live pane content"
+    try:
+        with (
+            patch(
+                "cli_agent_orchestrator.clients.database.list_all_terminals",
+                return_value=[live_meta],
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value=live_meta,
+            ),
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+                return_value=None,
+            ),
+        ):
+            svc.refresh_screen_fingerprints(now=10.0)
+
+        # The episode-free live terminal WAS sampled (Fork-A widen).
+        assert "live0001" in pane_liveness._state
+        assert pane_liveness.peek("live0001", now=10.0) is not None
+    finally:
+        pane_liveness._state.clear()

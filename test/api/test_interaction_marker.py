@@ -76,6 +76,30 @@ class TestInteractionMarkerEndpoint:
             )
         assert response.status_code == 422
 
+    def test_malformed_terminal_id_path_param_rejected_422(self, client):
+        """B1/E-MUT-C: the route param is TerminalId (^[a-f0-9]{8}$). A malformed
+        id is rejected with 422 BEFORE any handler logic — so metadata is never
+        looked up and no marker is stored.
+
+        BITES: relax the endpoint signature `terminal_id: TerminalId` -> `str`
+        and this returns 200/404 instead of 422.
+        """
+        from cli_agent_orchestrator.services.question_state import question_state
+
+        for bad_id in ("codexterm", "ABCD1234", "abcd123", "abcd12345", "zzzzzzzz"):
+            with patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata"
+            ) as metadata:
+                response = client.post(
+                    f"/terminals/{bad_id}/interaction-marker",
+                    json={"terminal_id": bad_id, "kind": "question_open"},
+                )
+            assert response.status_code == 422, f"{bad_id!r} should be 422, got {response.status_code}"
+            # 422 is raised by route-param validation before the handler body,
+            # so metadata is never consulted and nothing is stored.
+            metadata.assert_not_called()
+            assert question_state.is_open(bad_id) is False
+
     def test_clear_marker(self, client):
         question_state.forget("abcd1234")
         question_state.push_marker("abcd1234", "question_open")

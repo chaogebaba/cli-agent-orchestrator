@@ -1007,3 +1007,97 @@ def test_wpq8_lifecycle_increments_run_under_delivery_lock():
     assert "delivery_lock = get_delivery_lock(terminal_id)" in mailbox_source
     assert "await guard.acquire()" in rebind_source
     assert "settle_terminal_rebound(terminal_id" in rebind_source
+
+
+
+def test_f506_d13_claude_eager_excludes_waiting(wpq8_db):
+    """F506 D13 BITING test (E-MUT-B): the claude s4_initial eager hatch clause
+    excludes ANY WAITING_USER_ANSWER status.
+
+    The D13 decision is extracted to the pure ``_claude_eager_eligible`` helper
+    that deliver_pending calls at the hatch. This pins its full truth table:
+    s4_initial + non-WAITING ⇒ eligible; s4_initial + WAITING ⇒ NOT eligible
+    (the §1 exclusion, marker-raised or provider-published alike); any other
+    admission_kind ⇒ not eligible.
+
+    BITES: drop ``and status is not TerminalStatus.WAITING_USER_ANSWER`` from
+    _claude_eager_eligible and the WAITING rows below flip to True → fail.
+    """
+    from cli_agent_orchestrator.services.inbox_service import _claude_eager_eligible
+
+    # Eligible: the ONLY True case — s4_initial over a ready/processing status.
+    assert _claude_eager_eligible("s4_initial", TerminalStatus.IDLE) is True
+    assert _claude_eager_eligible("s4_initial", TerminalStatus.COMPLETED) is True
+    assert _claude_eager_eligible("s4_initial", TerminalStatus.PROCESSING) is True
+
+    # D13 exclusion: s4_initial + WAITING must NOT open the hatch.
+    assert _claude_eager_eligible("s4_initial", TerminalStatus.WAITING_USER_ANSWER) is False
+
+    # Non-s4 admission kinds are never eager-eligible on the claude branch.
+    assert _claude_eager_eligible("ordinary", TerminalStatus.IDLE) is False
+    assert _claude_eager_eligible("corrective", TerminalStatus.IDLE) is False
+    assert _claude_eager_eligible(None, TerminalStatus.IDLE) is False
+
+
+def test_f506_d13_s4_initial_hatch_withholds_on_waiting(wpq8_db):
+    """F506 D13 integration corroboration: with a claude terminal at s4_initial
+    inputs and a WAITING fused status, deliver_pending opens NO delivery attempt.
+
+    This exercises the real deliver_pending path (mirrors the wpq8
+    ``claude_s4_initial`` case but with a WAITING probe result). It corroborates
+    the pure-helper biting test above end-to-end: WAITING never reaches an open
+    attempt. Note multiple layers (D13 hatch AND _inject_safe hazard) each
+    independently refuse a WAITING paste — the pure-helper test isolates D13's
+    own contribution as the biting probe."""
+    database.create_terminal("worker", "session", "window", "claude_code")
+    message = database.create_inbox_message("sender", "worker", "payload")
+    deferred = database.begin_delivery_attempt([message], "worker", "claude_code", "deferred", 8)
+    assert database.settle_delivery_attempt(
+        deferred,
+        MessageStatus.PENDING,
+        "deferred",
+        reason="delivery_deferred",
+        evidence="{}",
+    )
+
+    waiting = TerminalStatus.WAITING_USER_ANSWER
+    observation = BoundaryObservation("epoch", TerminalStatus.PROCESSING, 1, 1, 1, None, 1)
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = observation
+    monitor.get_status.return_value = TerminalStatus.PROCESSING
+    monitor.get_input_gen.return_value = 1
+    monitor.get_status_gen.return_value = 1
+    monitor.probe_screen_status.side_effect = lambda _terminal: (waiting, _probe_meta(waiting.value))
+    provider = MagicMock(capabilities=ProviderCapabilities(accepts_input_while_processing=True))
+    provider.read_composer_draft_state.return_value = "empty"
+    service = InboxService()
+    opened_kinds: list[str] = []
+
+    def attempt_open(*_args, **kwargs):
+        opened_kinds.append(kwargs["admission_proof"].kind)
+        return database.AttemptOpenResult("busy_aborted")
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt_if_no_other_delivering",
+            side_effect=attempt_open,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+            return_value=None,
+        ),
+        patch.object(service, "_handle_wpm1_gate", return_value=("normal", None)),
+        patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True),
+    ):
+        service.deliver_pending("worker")
+
+    assert opened_kinds == [], "a WAITING status reached an open delivery attempt"

@@ -1085,3 +1085,40 @@ def test_ac14_cascade_parent_with_n_children_leaves_zero_held_rows(f72_env):
             assert row.receiver_id == "11111111"
             assert row.logical_receiver_id == "mb_11111111"
             assert row.status == MessageStatus.PENDING.value
+
+
+
+def test_delete_terminal_forgets_pane_liveness_and_question_state(f72_env):
+    """F506/F507 B2+N1: the universal delete path drops pane_liveness sampler
+    state AND question_state marker state for the deleted terminal — provider-
+    agnostic, so no per-terminal-lifecycle leak.
+
+    BITES: remove the pane_liveness.forget / question_state.forget calls from
+    terminal_service._delete_terminal_inner and this test fails (the seeded
+    entries survive the delete).
+    """
+    from cli_agent_orchestrator.services.pane_liveness import _PaneState, pane_liveness
+    from cli_agent_orchestrator.services.question_state import question_state
+
+    _sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    add_terminal(backend, "22222222", "11111111")
+
+    # Seed both singletons as if the terminal had been sampled + opened a marker.
+    pane_liveness._state["22222222"] = _PaneState(fp="seed", unchanged_count=1)
+    question_state.push_marker("22222222", "question_open")
+    assert "22222222" in pane_liveness._state
+    assert question_state.is_open("22222222") is True
+
+    try:
+        terminal_service.delete_terminal("22222222", caller_id="11111111")
+
+        assert "22222222" not in pane_liveness._state, (
+            "pane_liveness._state leaked after delete — pane_liveness.forget uncalled"
+        )
+        assert question_state.is_open("22222222") is False, (
+            "question_state marker leaked after delete — question_state.forget uncalled"
+        )
+    finally:
+        pane_liveness.forget("22222222")
+        question_state.forget("22222222")

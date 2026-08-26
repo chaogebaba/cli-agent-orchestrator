@@ -7346,6 +7346,24 @@ def _delete_terminal_under_lease(
                 logger.warning(f"Failed to emit pre-delete notice for {terminal_id}: {e}")
             stalled_callback_watchdog.clear_terminal(terminal_id)
             clear_terminal_delivery_state(terminal_id)
+            # F506/F507 (B2/N1): provider-agnostic sampler + marker teardown.
+            # pane_liveness.forget drops the _PaneState entry so a deleted
+            # terminal's per-lifecycle sampler state does not leak; question_state
+            # here (not only in claude_code.cleanup) makes the marker teardown
+            # provider-agnostic — a codex/other terminal that opened a marker is
+            # cleaned up on the same universal delete path (AC11 is agnostic).
+            try:
+                from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+                pane_liveness.forget(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear pane_liveness for {terminal_id}: {e}")
+            try:
+                from cli_agent_orchestrator.services.question_state import question_state
+
+                question_state.forget(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear question_state for {terminal_id}: {e}")
             try:
                 from cli_agent_orchestrator.services.auto_responder import auto_responder
 

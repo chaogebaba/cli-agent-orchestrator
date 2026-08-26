@@ -41,7 +41,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -138,7 +138,9 @@ class QuestionStateService:
             self._markers.pop(terminal_id, None)
 
     # ---- level input (watchdog tick) -------------------------------------
-    def reconcile(self, terminal_id: str, metadata: dict, *, now: float | None = None) -> None:
+    def reconcile(
+        self, terminal_id: str, metadata: dict[str, Any], *, now: float | None = None
+    ) -> None:
         """Level-triggered reconcile from the current transcript + TTL backstop.
 
         Runs on the watchdog tick for terminals holding an open marker or
@@ -187,7 +189,7 @@ class QuestionStateService:
                     )
 
     # ---- layer-2 parse ----------------------------------------------------
-    def _parse_transcript(self, metadata: dict) -> Literal["open", "closed"] | None:
+    def _parse_transcript(self, metadata: dict[str, Any]) -> Literal["open", "closed"] | None:
         """Return "open"/"closed" from the bound transcript, or None if unreadable.
 
         AC15: pairing is by ``tool_use`` id, NOT position. Open iff the newest
@@ -211,7 +213,7 @@ class QuestionStateService:
             return None
 
     @staticmethod
-    def _iter_content_blocks(record: dict):
+    def _iter_content_blocks(record: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Yield content blocks from a CC transcript record.
 
         CC transcript entries carry the model turn under ``message.content``
