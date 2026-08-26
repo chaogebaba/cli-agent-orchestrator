@@ -248,9 +248,9 @@ class TestF186ReconcilerPassesFlag:
     """
 
     def test_reconciler_ride_along_passes_lock_bypass_flag(self, tmp_path):
-        """End-to-end: reconciler push triggers a doorbell ring that succeeds
-        even when the delivery lock is concurrently held (simulating the F136
-        runner holding it, which is the production scenario).
+        """End-to-end: reconciler push triggers a doorbell submit that eventually
+        fires with caller_holds_no_delivery_lock=True (F461: routes through
+        doorbell_coalesce_service.submit which always passes the flag on fire).
         """
         svc = InboxService()
         mb = _make_mailbox(consumed_through_id=0)
@@ -258,25 +258,22 @@ class TestF186ReconcilerPassesFlag:
         inbox_row = _make_inbox_row(msg_id=10, created_at=_OLD)
 
         inbox_path = tmp_path / "inbox.json"
-        doorbell_calls = []
+        submit_calls = []
 
-        def _capture_doorbell(
+        def _capture_submit(
             terminal_id,
             max_row_id,
             *,
             written_count=0,
-            caller_holds_no_delivery_lock=False,
             **kwargs,
         ):
-            doorbell_calls.append(
+            submit_calls.append(
                 {
                     "terminal_id": terminal_id,
                     "max_row_id": max_row_id,
                     "written_count": written_count,
-                    "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
                 }
             )
-            return "rang"
 
         class _Session:
             def __call__(self):
@@ -343,32 +340,28 @@ class TestF186ReconcilerPassesFlag:
                 "cli_agent_orchestrator.clients.database.settle_delivery_attempt",
                 return_value=True,
             ),
+            # F461: patch coalesce submit instead of ring_supervisor_doorbell
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-                side_effect=_capture_doorbell,
+                "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
+                side_effect=_capture_submit,
             ),
         ):
             svc.reconcile_pull_mode_notifications()
 
-        # The ride-along must have fired with the bypass flag
-        assert len(doorbell_calls) == 1, f"Expected 1 doorbell call, got {len(doorbell_calls)}"
-        assert (
-            doorbell_calls[0]["caller_holds_no_delivery_lock"] is True
-        ), "Reconciler ride-along must pass caller_holds_no_delivery_lock=True"
-        assert doorbell_calls[0]["terminal_id"] == "sup-001"
-        assert doorbell_calls[0]["max_row_id"] == 10
-        assert doorbell_calls[0]["written_count"] == 1
+        # The ride-along must have fired a coalesce submit
+        assert len(submit_calls) == 1, f"Expected 1 coalesce submit call, got {len(submit_calls)}"
+        assert submit_calls[0]["terminal_id"] == "sup-001"
+        assert submit_calls[0]["max_row_id"] == 10
+        assert submit_calls[0]["written_count"] == 1
 
     def test_reconciler_ring_not_swallowed_by_concurrent_delivery_lock(self, tmp_path):
-        """Full defect reproduction: delivery lock is held by another thread
-        (simulating F136 runner), reconciler pushes and rings — with the fix
-        the ring succeeds because G1 is bypassed.
+        """F461: delivery lock no longer relevant for reconciler ring.
 
-        This is the exact scenario from the AC12 sandbox arm that proved 4/4
-        rings ending skipped_gate reason=delivery_lock. We verify the fix by
-        confirming that the reconciler invokes ring_supervisor_doorbell with
-        caller_holds_no_delivery_lock=True (unit tests above prove this flag
-        bypasses G1).
+        With F461, the reconciler routes through doorbell_coalesce_service.submit
+        which fires asynchronously after the coalesce window. The delivery lock
+        is never held at fire time, making the F186 lock-bypass concern moot.
+        This test now verifies that the coalesce submit is called (the coalesce
+        service always passes caller_holds_no_delivery_lock=True on fire).
         """
         svc = InboxService()
         mb = _make_mailbox(consumed_through_id=0)
@@ -379,29 +372,28 @@ class TestF186ReconcilerPassesFlag:
         real_lock = threading.Lock()
         real_lock.acquire()
 
-        doorbell_results = []
+        submit_results = []
 
-        def _capture_ring(
+        def _capture_submit(
             terminal_id,
             max_row_id,
             *,
             written_count=0,
-            caller_holds_no_delivery_lock=False,
             **kwargs,
         ):
-            """Intercept the doorbell call and verify the flag."""
-            doorbell_results.append(
+            """Intercept the coalesce submit call."""
+            submit_results.append(
                 {
                     "terminal_id": terminal_id,
-                    "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
-                    # Verify the lock IS held (reproducing the defect scenario)
+                    "max_row_id": max_row_id,
+                    # Verify the lock IS still held (reproducing the defect scenario —
+                    # F461 makes this irrelevant since fire happens after window)
                     "lock_would_block": not real_lock.acquire(blocking=False),
                 }
             )
             # If we did acquire it, release immediately
-            if not doorbell_results[-1]["lock_would_block"]:
+            if not submit_results[-1]["lock_would_block"]:
                 real_lock.release()
-            return "rang"
 
         class _Session:
             def __call__(self):
@@ -461,20 +453,20 @@ class TestF186ReconcilerPassesFlag:
                 "cli_agent_orchestrator.clients.database.settle_delivery_attempt",
                 return_value=True,
             ),
+            # F461: patch coalesce submit
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-                side_effect=_capture_ring,
+                "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
+                side_effect=_capture_submit,
             ),
         ):
             svc.reconcile_pull_mode_notifications()
 
-        # The doorbell was called with the bypass flag
-        assert len(doorbell_results) == 1
-        assert doorbell_results[0]["caller_holds_no_delivery_lock"] is True
-        # Confirm the lock was indeed held (reproducing the AC12 scenario)
+        # The coalesce submit was called
+        assert len(submit_results) == 1
+        # Confirm the lock was indeed held (F461 makes this safe since fire is async)
         assert (
-            doorbell_results[0]["lock_would_block"] is True
-        ), "The delivery lock should have been held, reproducing the F186 scenario"
+            submit_results[0]["lock_would_block"] is True
+        ), "The delivery lock should have been held, F461 makes this safe via async fire"
 
         real_lock.release()
 
