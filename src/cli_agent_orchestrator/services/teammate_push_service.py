@@ -318,14 +318,28 @@ _LOCK_BACKOFF_MAX_MS_LEGACY = 100
 
 
 def _should_teammate_push(terminal_id: str) -> bool:
-    """Return True if both the feature flag and inbox path are configured."""
+    """Return True if the feature flag is on and an inbox path is resolvable.
+
+    F514: the pane-nudge fallback is the last-resort safety net for the
+    supervisor wake path, and it MUST survive a cao-server restart. When the
+    server is bounced, the terminal row can be recreated without its
+    ``cc_team_inbox_path`` metadata (observed: "Terminal metadata not found"
+    then a fresh row with no inbox path). The old gate checked the raw metadata
+    key and returned False on that loss, silently killing the fallback until a
+    full re-registration.
+
+    We now route the gate through ``_resolve_inbox_path``, which self-heals by
+    re-deriving the path from the persisted ``working_directory`` + provider
+    (the F152 lazy-derive) and persists it back to metadata for future calls.
+    This is deliberately INDEPENDENT of ``supervisor.wake.native`` — the
+    fallback is the net that has to work regardless of the native flip state.
+    It does NOT touch the F337 create-time derivation gate
+    (``_maybe_derive_cc_team_inbox_path`` in terminal_service.py), which stays
+    gated on ``wake.native`` as blueprint-frozen.
+    """
     if not ConfigService.get("supervisor.teammate_push"):
         return False
-    metadata = get_terminal_metadata(terminal_id)
-    if not metadata:
-        return False
-    md = metadata.get("metadata") or {}
-    return bool(md.get("cc_team_inbox_path"))
+    return _resolve_inbox_path(terminal_id) is not None
 
 
 def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
