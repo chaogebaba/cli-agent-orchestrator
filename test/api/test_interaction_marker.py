@@ -16,23 +16,23 @@ class TestInteractionMarkerEndpoint:
 
     def test_ac11_provider_agnostic_codex_no_claude_field(self, client):
         """AC11: endpoint accepts + stores a marker for a codex terminal."""
-        question_state.forget("codexterm")
+        question_state.forget("c0de1234")
         with patch(
             "cli_agent_orchestrator.api.main.get_terminal_metadata",
-            return_value={"id": "codexterm", "provider": "codex"},
+            return_value={"id": "c0de1234", "provider": "codex"},
         ):
             response = client.post(
-                "/terminals/codexterm/interaction-marker",
+                "/terminals/c0de1234/interaction-marker",
                 json={
-                    "terminal_id": "codexterm",
+                    "terminal_id": "c0de1234",
                     "kind": "question_open",
                     "source": "PreToolUse",
                     "event": "PreToolUse",
                 },
             )
         assert response.status_code == 200
-        assert question_state.is_open("codexterm") is True
-        question_state.forget("codexterm")
+        assert question_state.is_open("c0de1234") is True
+        question_state.forget("c0de1234")
 
     def test_ac14_pre_transcript_marker_returns_200_not_400(self, client):
         """AC14: an A1 marker for a terminal with no transcript binding ⇒ 200."""
