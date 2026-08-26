@@ -39,6 +39,11 @@ Pre-existing failure: test/plugins/test_suite_slot.py::TestPidReuseGuard::test_s
 F483-specific tests: 29 passed (23 fleet_labels + 6 MCP integration)
 ```
 
+### Gate R1 Fixes
+- B1: Added `update_task_label` to S11 surface in `test/ux_surfaces.toml`
+- B2: Regenerated trace manifest via `cao verify manifest --regen` (36→39 hits)
+- Both blocker tests now pass locally.
+
 ## Branch
 - Branch: `cao/f483-build`
 - Base: `main` @ `ceae95da`
