@@ -7771,7 +7771,11 @@ async def create_inbox_message_endpoint(
                 "timeout_seconds": barrier_timeout_seconds,
                 "member_key": barrier_member_key,
             }
-        inbox_msg = create_inbox_message(
+        # F158-R3: Move create_inbox_message off the event-loop thread.
+        # The after-commit ORM hook (F413) calls push_doorbell_frame_sync which
+        # schedules a coroutine on this same loop and blocks — deadlock if inline.
+        inbox_msg = await asyncio.to_thread(
+            create_inbox_message,
             sender_id,
             receiver_id,
             message,
@@ -7800,19 +7804,11 @@ async def create_inbox_message_endpoint(
     except Exception:
         pass  # best-effort; deliver_pending below is the fallback
 
-    # WPDT W1: Push advisory doorbell frame via WS if armed
-    try:
-        from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
-
-        preview = message.split("\n", 1)[0] if message else ""
-        push_doorbell_frame_sync(
-            inbox_msg.receiver_id,
-            inbox_msg.id,
-            sender_id[:8],
-            preview,
-        )
-    except Exception:
-        pass  # advisory-only, never blocks
+    # F158-R3: Removed redundant WPDT W1 push_doorbell_frame_sync call.
+    # The F413 after-commit hook already handles WS doorbell push for this row;
+    # a second push here would fire a duplicate frame and the same-loop deadlock
+    # (the hook runs inside asyncio.to_thread now, so it correctly uses the
+    # server's event loop without blocking it).
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.

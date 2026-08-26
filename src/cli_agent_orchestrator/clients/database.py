@@ -613,13 +613,19 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
     if existing_obl is not None:
         _touch_supervisor_pending_flag()
         # D3: Stash doorbell even on idempotent hit
+        # F158: Use 4-tuple with receiver_id (terminal_id) to match after_commit format
         from sqlalchemy.orm import Session as _Session
 
         sess = _Session.object_session(target)
         if sess is not None:
             stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
             preview = (target.message or "").split("\n", 1)[0]
-            stash.append((logical_receiver_id, row_id, preview[:120]))
+            stash.append((
+                target.receiver_id,
+                row_id,
+                (target.sender_id or "")[:8],
+                preview[:120],
+            ))
         return
     connection.execute(
         insert(DeliveryObligationModel.__table__).values(
@@ -664,7 +670,18 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
 
 
 def _f413_after_commit(session: Any) -> None:
-    """D3: Drain doorbell stash after commit, with nested-tx guard."""
+    """D3: Drain doorbell stash after commit, with nested-tx guard.
+
+    F158-R2: The after-commit hook is the FIRST point where the inbox row is
+    durable. Two wake paths:
+      1. WS armed AND send succeeds → advisory frame wakes supervisor; record
+         in _f158_ws_delivered so F136 post-write skips the native ring (no dup).
+      2. WS unarmed/failed → request_delivery fires the F136 runner which writes
+         the callback file and rings ONCE post-write (single native ring owner).
+
+    The hook NEVER calls ring_supervisor_doorbell directly — that violates the
+    write-before-wake contract (supervisor wakes before callback file exists).
+    """
     if session.in_nested_transaction():
         return
     stash = session.info.pop(_F413_DOORBELL_STASH_KEY, [])
@@ -672,13 +689,41 @@ def _f413_after_commit(session: Any) -> None:
     session.info.pop(_F413_DOORBELL_SNAPSHOT_KEY, None)
     if not stash:
         return
-    for terminal_id, row_id, sender_short, preview in stash:
+    for entry in stash:
+        # F158: tolerate both 3-tuple (legacy idempotent-hit path) and 4-tuple
+        if len(entry) == 4:
+            terminal_id, row_id, sender_short, preview = entry
+        elif len(entry) == 3:
+            # Legacy 3-tuple from idempotent-hit stash: (logical_receiver_id, row_id, preview)
+            # logical_receiver_id is a mailbox_id — resolve to terminal_id
+            terminal_id, row_id, preview = entry
+            sender_short = ""
+        else:
+            continue  # malformed — skip
+
+        ws_fired = False
         try:
             from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
 
-            push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
+            ws_fired = push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
         except Exception:
             pass  # advisory-only
+
+        # F158-R2: If WS delivered, record it so F136 post-write skips the
+        # redundant native ring. No direct ring_supervisor_doorbell here —
+        # that would violate write-before-wake (B2).
+        if ws_fired:
+            try:
+                from cli_agent_orchestrator.services.ws_doorbell import (
+                    mark_ws_delivered,
+                )
+
+                mark_ws_delivered(terminal_id, row_id)
+            except Exception:
+                pass
+
+        # Always signal delivery — the F136 runner writes the callback file.
+        # When WS failed/unarmed, F136 post-write rings the native doorbell.
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
 

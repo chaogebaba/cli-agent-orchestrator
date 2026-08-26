@@ -563,7 +563,13 @@ def _create_logical_inbox_message_inner(
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
 ) -> tuple[InboxMessage, str | None]:
-    """Holder (d): resolve, guard, and insert one logical row under one authority."""
+    """Holder (d): resolve, guard, and insert one logical row under one authority.
+
+    F158-R3: The mailbox authority lock is released BEFORE doorbell signaling
+    runs. The after-commit hook's push_doorbell_frame_sync (up to 0.5s timeout)
+    no longer executes under the lock, bounding cumulative lock hold time to
+    the DB transaction duration only.
+    """
     with SessionLocal() as db:
         mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
         if mailbox is None:
@@ -571,6 +577,7 @@ def _create_logical_inbox_message_inner(
         key = (mailbox.session_name, mailbox.role)
     lock = get_mailbox_authority_lock(*key)
     _acquire(lock)
+    _deferred_stash: list = []
     try:
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             stalled_callback_watchdog,
@@ -599,15 +606,19 @@ def _create_logical_inbox_message_inner(
                     park_warm=park_warm,
                 )
                 db.flush()  # ensure row.id is assigned before obligation
-                # F192: obligation creation moved to the choke point
-                # (_create_inbox_message_unfenced in database.py) — removed
-                # from here to guarantee exactly one creation site.
+
+                # F158-R3: Pop the doorbell stash BEFORE commit so after_commit
+                # does NOT process it under this lock. We'll drain it after unlock.
+                from cli_agent_orchestrator.clients.database import _F413_DOORBELL_STASH_KEY
+
+                _pre_commit_stash = db.info.get(_F413_DOORBELL_STASH_KEY, [])
+                # Snapshot what's there now; after commit the hook will find empty
+                _deferred_stash = list(_pre_commit_stash)
+                _pre_commit_stash.clear()
+
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
-
-                # F136-D7: signal delivery after commit (replaces F123-P0 direct append).
-                # The callback runner handles actual file writes.
 
                 if result.barrier_id is not None and result.barrier_member_key is not None:
                     stalled_callback_watchdog.record_callback_if_to_caller(
@@ -618,9 +629,42 @@ def _create_logical_inbox_message_inner(
                     if (receiver_cache and not receiver_cache.startswith("mb_"))
                     else None
                 )
-                return result, _signal_terminal
     finally:
         lock.release()
+
+    # F158-R3: Drain deferred doorbell stash OUTSIDE the lock.
+    # This mirrors _f413_after_commit's logic but runs without the authority lock.
+    if _deferred_stash:
+        from cli_agent_orchestrator.services.ws_doorbell import (
+            mark_ws_delivered,
+            push_doorbell_frame_sync,
+        )
+        from cli_agent_orchestrator.services.inbox_service import request_delivery as _req_del
+
+        for entry in _deferred_stash:
+            if len(entry) == 4:
+                _tid, _rid, _sender, _prev = entry
+            elif len(entry) == 3:
+                _tid, _rid, _prev = entry
+                _sender = ""
+            else:
+                continue
+            ws_fired = False
+            try:
+                ws_fired = push_doorbell_frame_sync(_tid, _rid, _sender, _prev)
+            except Exception:
+                pass
+            if ws_fired:
+                try:
+                    mark_ws_delivered(_tid, _rid)
+                except Exception:
+                    pass
+            try:
+                _req_del(_tid)
+            except Exception:
+                pass
+
+    return result, _signal_terminal
 
 
 def create_logical_inbox_message(
