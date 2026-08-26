@@ -35,6 +35,12 @@ class _StatusMonitor(Protocol):
 
     def get_raw_status(self, terminal_id: str, provider_override: Any = None) -> TerminalStatus: ...
 
+    def get_published_status(self, terminal_id: str) -> TerminalStatus | None: ...
+
+    def fuse_status(
+        self, terminal_id: str, status: TerminalStatus | None
+    ) -> tuple[TerminalStatus | None, str | None]: ...
+
     def probe_screen_status(self, terminal_id: str) -> "ProbeResult": ...
 
     def prove_terminal_identity(self, terminal_id: str, depth: str = "live") -> Any: ...
@@ -155,10 +161,21 @@ def resolve_rs_answer(
     """Resolve the complete receiver-state answer independently of activation."""
 
     monitor = _monitor() if monitor is None else monitor
+
+    def _fuse(answer: TerminalStatus | None) -> TerminalStatus | None:
+        # F506 (gate r1 B2): fuse every resolve_rs_answer egress so both
+        # view_from_legacy return paths carry the fused value at the
+        # delivery.admission_status seam. Idempotent by re-derivation: the
+        # getter-sourced answers (get_raw_status/get_status) are already fused
+        # and a second pass reproduces them; the store-sourced latched_status is
+        # fused here for the first time. None passes through (R4-S1).
+        fused, _reason = monitor.fuse_status(terminal_id, answer)
+        return fused
+
     try:
         metadata = get_terminal_metadata(terminal_id)
     except Exception:
-        return ResolvedRSAnswer(monitor.get_raw_status(terminal_id), False)
+        return ResolvedRSAnswer(_fuse(monitor.get_raw_status(terminal_id)), False)
     if metadata is None:
         status = None
         rs_sourced = False
@@ -232,16 +249,16 @@ def resolve_rs_answer(
             status = refreshed.latched_status
 
     if status is not None:
-        return ResolvedRSAnswer(status, rs_sourced)
+        return ResolvedRSAnswer(_fuse(status), rs_sourced)
     if none_behavior == "watchdog":
         try:
             monitor.probe_screen_status(terminal_id)
         except Exception:
             logger.debug("Receiver-state watchdog probe failed for %s", terminal_id, exc_info=True)
-        return ResolvedRSAnswer(monitor.get_status(terminal_id), False)
+        return ResolvedRSAnswer(_fuse(monitor.get_status(terminal_id)), False)
     if none_behavior == "legacy":
-        return ResolvedRSAnswer(monitor.get_status(terminal_id), False)
-    return ResolvedRSAnswer(None, False)
+        return ResolvedRSAnswer(_fuse(monitor.get_status(terminal_id)), False)
+    return ResolvedRSAnswer(_fuse(None), False)
 
 
 def _event_inbox_bypass(terminal_id: str) -> bool:

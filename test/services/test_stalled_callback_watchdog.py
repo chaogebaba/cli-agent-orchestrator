@@ -39,6 +39,18 @@ def _mark_screen_sampled(svc, terminal_id="worker1"):
     svc._episodes[terminal_id].last_screen_fp = "sample"
 
 
+@pytest.fixture(autouse=True)
+def _reset_pane_liveness():
+    """F506: the sampler is a module singleton; clear its per-terminal state
+    between tests so a reused terminal id ("worker1") never inherits a stale
+    fingerprint / debounce count from a prior test."""
+    from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+    pane_liveness._state.clear()
+    yield
+    pane_liveness._state.clear()
+
+
 def _notice(
     message: str, idle_reason: str | None = None, source_generation: int = 1
 ) -> WatchdogNotice:
@@ -184,6 +196,14 @@ def test_watchdog_screen_fingerprint_change_resets_idle_timer_then_static_fires(
             return_value=metadata,
         ),
         patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.list_all_terminals",
+            return_value=[metadata],
+        ),
+        patch(
             "cli_agent_orchestrator.backends.registry.get_backend",
             return_value=backend,
         ),
@@ -240,6 +260,14 @@ def test_watchdog_excludes_rotating_codex_prompt_from_liveness_fingerprint():
             return_value=metadata,
         ),
         patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.list_all_terminals",
+            return_value=[metadata],
+        ),
+        patch(
             "cli_agent_orchestrator.backends.registry.get_backend",
             return_value=backend,
         ),
@@ -273,6 +301,14 @@ def test_watchdog_keeps_spinner_ticks_as_liveness_signal():
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
             return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.list_all_terminals",
+            return_value=[metadata],
         ),
         patch(
             "cli_agent_orchestrator.backends.registry.get_backend",

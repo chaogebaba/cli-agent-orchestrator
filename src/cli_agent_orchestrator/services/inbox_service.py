@@ -2483,7 +2483,19 @@ class InboxService:
                             if metadata.get("provider") == "claude_code":
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
-                                eager_eligible = admission_kind == "s4_initial"
+                                # F506 D13: exclude ANY fused-path WAITING from the
+                                # claude s4_initial eager hatch. Unamended, the
+                                # hatch fires BECAUSE status is not IDLE/COMPLETED
+                                # and pastes into the open dialog on the
+                                # repeat-defer path — the exact §1 shape. Applies
+                                # to marker-raised AND provider-published WAITING
+                                # (option (c) rejected). :2482 is the shared status
+                                # check — editing there would leak D13 into the
+                                # non-claude arm.
+                                eager_eligible = (
+                                    admission_kind == "s4_initial"
+                                    and status is not TerminalStatus.WAITING_USER_ANSWER
+                                )
                             elif EAGER_INBOX_DELIVERY and status == TerminalStatus.PROCESSING:
                                 # F354: WAITING_USER_ANSWER is deliberately NOT
                                 # eager-admissible. A blocking dialog means the

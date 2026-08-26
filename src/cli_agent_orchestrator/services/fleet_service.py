@@ -172,6 +172,13 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         orphan = bool(parent_id and (parent is None or parent_dead))
         observation = status_monitor.get_boundary_observation(row["id"])
         status = observation.status
+        # F506 §8: surface the fusion evidence so the fleet TUI renders <status>*
+        # when the fused status differs from what the provider published, and the
+        # reason in the row detail. fusion_changed is captured BEFORE the ERROR
+        # overrides below so the operator sees "the fusion demoted this", not the
+        # quarantine projection.
+        fusion_changed = bool(getattr(observation, "fusion_changed", False))
+        fusion_reason = getattr(observation, "fusion_reason", None)
         if row.get("recovery_state") not in (None, "rebound"):
             status = TerminalStatus.ERROR
         if has_native_inventory and row["tmux_window"] not in windows:
@@ -202,6 +209,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "depth": depths[row["id"]],
                 "orphan": orphan,
                 "status": status.value,
+                # F506 §8: the fleet TUI status cell renders `<status>*` when
+                # fusion_changed is True (the fused status differs from the
+                # provider-published one); fusion_reason shows in the row detail.
+                "fusion_changed": fusion_changed,
+                "fusion_reason": fusion_reason,
                 "init_state": row.get("init_state"),
                 "init_health": init_health,
                 "since_last_input": since_last_input,

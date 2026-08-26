@@ -189,6 +189,10 @@ def _fake_monitor(store: object) -> SimpleNamespace:
         get_status=MagicMock(return_value=TerminalStatus.COMPLETED),
         get_raw_status=MagicMock(return_value=TerminalStatus.PROCESSING),
         probe_screen_status=MagicMock(return_value=(TerminalStatus.IDLE, {})),
+        # F506: _StatusMonitor Protocol gained these (R3-S5). Identity fusion —
+        # no liveness/marker evidence in this flip-machinery fixture.
+        get_published_status=MagicMock(return_value=TerminalStatus.PROCESSING),
+        fuse_status=MagicMock(side_effect=lambda _tid, status: (status, None)),
     )
 
 

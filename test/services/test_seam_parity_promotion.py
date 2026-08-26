@@ -80,6 +80,13 @@ def _monitor(rs_status: TerminalStatus | None, legacy: TerminalStatus):
         get_status=MagicMock(return_value=legacy),
         get_raw_status=MagicMock(return_value=legacy),
         probe_screen_status=MagicMock(),
+        # F506: the _StatusMonitor Protocol gained fuse_status/get_published_status
+        # (R3-S5). This double applies IDENTITY fusion (no liveness/marker
+        # evidence in these parity fixtures) — fusing both parity arms with the
+        # same identity keeps them same-sided, so a fusion-only difference records
+        # zero mismatch (AC18).
+        get_published_status=MagicMock(return_value=legacy),
+        fuse_status=MagicMock(side_effect=lambda _tid, status: (status, None)),
     )
 
 

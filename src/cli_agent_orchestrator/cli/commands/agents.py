@@ -58,12 +58,18 @@ def _render_fleet(payload: dict[str, Any]) -> None:
             or terminal["orphan"]
             or terminal["reparented_from"] is not None
         )
+        # F506 §8: render `<status>*` when the fusion changed the status the
+        # provider published, so `complete · idle 0s` can never again be shown
+        # for a terminal the fusion demoted. The reason shows in the row detail.
+        status_cell = terminal["status"]
+        if terminal.get("fusion_changed"):
+            status_cell = f"{status_cell}*"
         rows.append(
             (
                 str(terminal["window_index"]) if terminal["window_index"] is not None else _MISSING,
                 terminal["id"],
                 terminal["profile"] or _MISSING,
-                terminal["status"],
+                status_cell,
                 _format_age(terminal["since_last_input"]),
                 terminal["parent_id"] or _MISSING,
                 terminal["window_name"] or _MISSING,
