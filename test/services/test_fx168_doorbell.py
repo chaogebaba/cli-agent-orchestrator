@@ -284,17 +284,12 @@ class TestAC6ReplayRowRings:
             _delivery_seq_guard,
         )
 
-        # Track doorbell calls
-        doorbell_calls = []
-        original_ring = (
-            ring_supervisor_doorbell.__wrapped__
-            if hasattr(ring_supervisor_doorbell, "__wrapped__")
-            else None
-        )
+        # Track coalesce submit calls (F461: _f136_post_delivery now routes
+        # through doorbell_coalesce_service.submit instead of ring directly)
+        submit_calls = []
 
-        def tracking_ring(tid, max_row_id, *, written_count=0, **kwargs):
-            doorbell_calls.append((tid, max_row_id, written_count))
-            return "rang"
+        def tracking_submit(tid, max_row_id, *, written_count=0, **kwargs):
+            submit_calls.append((tid, max_row_id, written_count))
 
         # Replay-only outcome: written=1, cursor unchanged, max_written_row_id set
         replay_outcome = CallbackRunOutcome(
@@ -318,25 +313,20 @@ class TestAC6ReplayRowRings:
 
         svc = InboxService()
 
+        # F461: patch the coalesce service submit instead of ring_supervisor_doorbell
         with patch(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-            tracking_ring,
+            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
+            tracking_submit,
         ):
-            # Patch at the import site inside _f136_post_delivery
-            with patch(
-                "cli_agent_orchestrator.services.inbox_service.ring_supervisor_doorbell",
-                tracking_ring,
-                create=True,
-            ):
-                svc._f136_post_delivery("term-replay", replay_outcome)
+            svc._f136_post_delivery("term-replay", replay_outcome)
 
         # Clean up
         with _delivery_seq_guard:
             _wake_states.pop("term-replay", None)
 
-        # Assert doorbell was called with correct args
-        assert len(doorbell_calls) == 1, f"Expected 1 doorbell call, got {len(doorbell_calls)}"
-        assert doorbell_calls[0] == ("term-replay", 42, 1)
+        # Assert coalesce submit was called with correct args
+        assert len(submit_calls) == 1, f"Expected 1 coalesce submit call, got {len(submit_calls)}"
+        assert submit_calls[0] == ("term-replay", 42, 1)
 
 
 # ===========================================================================
@@ -577,14 +567,14 @@ class TestAC14ConfigFlags:
 
 
 class TestAC15CallSiteInventory:
-    """ring_supervisor_doorbell has exactly its three callers."""
+    """ring_supervisor_doorbell call sites tracked after F461 coalesce refactor."""
 
     def test_three_call_sites_in_inbox_service(self):
-        """Verify that inbox_service.py imports ring_supervisor_doorbell at exactly 2 sites.
+        """Verify that inbox_service.py imports ring_supervisor_doorbell at exactly 1 site.
 
-        fx168 FIX-4: The D9 call site in deliver_pending was removed (lock reentrance
-        made it structurally dead). Remaining sites: _f136_post_delivery and the
-        fx158 pull-mode reconciler.
+        F461: both direct call sites (_f136_post_delivery and fx158 reconciler) were
+        replaced with doorbell_coalesce_service.submit. The remaining import is at the
+        coalesce service bind site (passing ring_supervisor_doorbell as the fire_fn).
         """
         import ast as _ast
         import cli_agent_orchestrator.services.inbox_service as mod
@@ -600,11 +590,15 @@ class TestAC15CallSiteInventory:
             and node.module == "cli_agent_orchestrator.services.doorbell_service"
             and any(alias.name == "ring_supervisor_doorbell" for alias in node.names)
         )
-        call_count = source.count("ring_supervisor_doorbell(")
-        # 2 import sites (fx168 FIX-4: removed the dead D9 site in deliver_pending)
-        assert import_count == 2, f"Expected 2 import sites, got {import_count}"
-        # 2 call sites
-        assert call_count == 2, f"Expected 2 call sites, got {call_count}"
+        # F461: 1 import site (bind in start), 0 direct call sites
+        # The identifier appears as a function reference in the bind call but not as a call
+        assert import_count == 1, f"Expected 1 import site, got {import_count}"
+
+        # F461: doorbell_coalesce_service.submit replaces direct calls
+        coalesce_submit_count = source.count("doorbell_coalesce_service.submit(")
+        assert coalesce_submit_count == 2, (
+            f"Expected 2 coalesce submit sites, got {coalesce_submit_count}"
+        )
 
 
 # ===========================================================================
@@ -772,15 +766,18 @@ class TestFx168ReconcilerRealSqlite:
         # Patch dependencies
         doorbell_calls = []
 
-        def mock_ring(
-            tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs
+        def mock_submit(
+            tid, max_id, *, written_count=0, **kwargs
         ):
             doorbell_calls.append((tid, max_id, written_count))
-            return "rang"
+
+        # F461: reconciler now routes through doorbell_coalesce_service.submit
+        from cli_agent_orchestrator.services.doorbell_coalesce import doorbell_coalesce_service
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-            mock_ring,
+            doorbell_coalesce_service,
+            "submit",
+            mock_submit,
         )
 
         # Patch is_supervisor_mailbox_pull_terminal to return True

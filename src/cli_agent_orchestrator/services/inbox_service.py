@@ -1146,14 +1146,11 @@ class InboxService:
                     _heal_exc,
                 )
 
-        # F168 D2: ring the doorbell before entering _delivery_seq_guard.
+        # F168 D2 / F461: ring the doorbell before entering _delivery_seq_guard.
+        # F461: route through coalesce service to merge near-simultaneous callbacks.
         # D3: best-effort, isolated — exceptions never propagate.
         if outcome.written > 0 and outcome.max_written_row_id > 0:
             try:
-                from cli_agent_orchestrator.services.doorbell_service import (
-                    ring_supervisor_doorbell,
-                )
-
                 # F459: resolve worker display name for from-name in native bridge
                 _f459_display = outcome._f459_sender_display_name
                 if _f459_display:
@@ -1164,7 +1161,12 @@ class InboxService:
                     except Exception:
                         pass
 
-                ring_supervisor_doorbell(
+                # F461: submit to coalesce buffer instead of ringing directly
+                from cli_agent_orchestrator.services.doorbell_coalesce import (
+                    doorbell_coalesce_service,
+                )
+
+                doorbell_coalesce_service.submit(
                     terminal_id,
                     outcome.max_written_row_id,
                     written_count=outcome.written,
@@ -1173,7 +1175,7 @@ class InboxService:
                 )
             except Exception as _bell_exc:
                 logger.debug(
-                    "f168_doorbell_post_delivery_error terminal=%s: %s", terminal_id, _bell_exc
+                    "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
                 )
 
         post_immediate = False
@@ -2046,6 +2048,20 @@ class InboxService:
             self._delivery_loop = asyncio.get_running_loop()
             self._delivery_registry = registry
             self._prestart_wake_logged = False
+
+        # F461: bind coalesce service to this event loop + real ring function
+        try:
+            from cli_agent_orchestrator.services.doorbell_coalesce import (
+                doorbell_coalesce_service,
+            )
+            from cli_agent_orchestrator.services.doorbell_service import (
+                ring_supervisor_doorbell,
+            )
+
+            doorbell_coalesce_service.bind(self._delivery_loop, ring_supervisor_doorbell)
+        except Exception:
+            logger.debug("f461_coalesce_bind_failed", exc_info=True)
+
         logger.info("InboxService started")
 
         try:
@@ -2064,6 +2080,16 @@ class InboxService:
                 except Exception as e:
                     logger.error(f"Error in InboxService: {e}")
         finally:
+            # F461: flush any pending coalesced doorbells before shutdown
+            try:
+                from cli_agent_orchestrator.services.doorbell_coalesce import (
+                    doorbell_coalesce_service,
+                )
+
+                doorbell_coalesce_service.flush_all()
+            except Exception:
+                pass
+
             with _delivery_seq_guard:
                 self._delivery_loop = None
                 self._delivery_registry = None
@@ -3493,16 +3519,12 @@ class InboxService:
                     mb.current_terminal_id, messages
                 )
 
-                # F168 D9: ring doorbell after reconciler push write.
+                # F168 D9 / F461: ring doorbell after reconciler push write.
                 # F186: pass caller_holds_no_delivery_lock=True — the reconciler
                 # does NOT hold delivery_lock, so G1 must be skipped to avoid the
                 # systematic contention that fx168 FIX-4 identified at the primary site.
                 if outcome.pushed and outcome.message_ids:
                     try:
-                        from cli_agent_orchestrator.services.doorbell_service import (
-                            ring_supervisor_doorbell,
-                        )
-
                         max_id = max(outcome.message_ids)
                         # F459: pass last message content and sender display name
                         _f459_body = None
@@ -3518,11 +3540,16 @@ class InboxService:
                                 _f459_sender = _dn(_last_msg.sender_id)
                             except Exception:
                                 _f459_sender = _last_msg.sender_id
-                        ring_supervisor_doorbell(
+
+                        # F461: route through coalesce service
+                        from cli_agent_orchestrator.services.doorbell_coalesce import (
+                            doorbell_coalesce_service,
+                        )
+
+                        doorbell_coalesce_service.submit(
                             mb.current_terminal_id,
                             max_id,
                             written_count=1,
-                            caller_holds_no_delivery_lock=True,
                             message_body=_f459_body,
                             sender_display_name=_f459_sender,
                         )
