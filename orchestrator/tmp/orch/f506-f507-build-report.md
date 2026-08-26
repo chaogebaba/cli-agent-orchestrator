@@ -132,3 +132,48 @@ New commit chain (on top of `b9be7a87`):
 - trace_manifest: current (hits=39, no regen needed).
 
 NEW HEAD post-rebase: `72364b15` (pin commit adds the pinned report copy on top).
+
+
+
+---
+
+## Fix-round addendum (gate CHANGES-REQUESTED → resolved)
+
+Gate ruling: 1 BLOCKER / 2 SHOULD / 1 NIT + 1 process WALL. All addressed on `cao/f2f0797c` in fix commit `dc7e55d9`.
+
+**Correction to the earlier central claim.** The pre-fix report asserted "22/22 ACs covered by passing tests" and implied every mechanism was test-guarded. The gate's mutation probes falsified that for THREE mechanisms: reverting the D13 clause, the endpoint `TerminalId` validation, and the Fork-A widen each left the full targeted battery green. That claim was **wrong as stated** — the ACs had *coverage* but three lacked a *biting* test. Fixed below; the AC table row wording is corrected accordingly.
+
+### B1 (BLOCKER) — three biting tests added; each verified to FAIL under its mutation
+
+| mechanism | biting test | mutation that makes it FAIL (verified) |
+|---|---|---|
+| D13 s4_initial hatch excludes WAITING | `test_wpq8_inject_safety.py::test_f506_d13_claude_eager_excludes_waiting` | drop `and status is not TerminalStatus.WAITING_USER_ANSWER` from `_claude_eager_eligible` → WAITING rows assert True≠False (observed FAIL) |
+| endpoint rejects malformed terminal_id (422) | `test_interaction_marker.py::test_malformed_terminal_id_path_param_rejected_422` | relax route param `TerminalId` → `str` → `codexterm` returns 200 not 422 (observed FAIL) |
+| Fork-A widen samples episode-free live terminal | `test_stalled_callback_watchdog.py::test_forkA_widen_samples_live_terminal_with_no_armed_episode` | revert `sample_ids` to `list(armed_episode_ids)` → `live0001` never sampled, `_state` empty (observed FAIL) |
+
+The D13 clause was **extracted to a pure module-level helper `_claude_eager_eligible(admission_kind, status)`** in `inbox_service.py` so the decision is unit-testable in isolation (the reviewer's E-MUT-B correctly noted the full `deliver_pending` path has multiple independent WAITING defenses — `_inject_safe` hazard AND the D13 hatch — which masks a single-mutation bite end-to-end; the helper isolates D13's own contribution). An integration corroboration (`test_f506_d13_s4_initial_hatch_withholds_on_waiting`) additionally asserts no attempt opens through the real path.
+
+### B2 (SHOULD) + N1 (NIT) — provider-agnostic sampler/marker teardown
+
+`pane_liveness.forget(terminal_id)` and `question_state.forget(terminal_id)` are now called from the **provider-agnostic** `terminal_service._delete_terminal_inner` teardown (immediately after `clear_terminal_delivery_state`), closing the per-terminal-lifecycle `_PaneState` leak (B2) and making marker teardown agnostic — a codex/other-provider terminal that opened a marker is cleaned on the universal delete path (N1). `claude_code.cleanup()` retains both forgets (defense-in-depth; idempotent). Biting test: `test_f72_fleet_lifecycle.py::test_delete_terminal_forgets_pane_liveness_and_question_state` — FAILS (observed) when the forget calls are removed from the delete path.
+
+### B3 (SHOULD) — mypy `--strict` now literally clean
+
+The pre-fix report's "`mypy --strict` … Success" wording was inaccurate: a *true* `--strict` yielded 6 errors (5× `type-arg` bare `dict`, 1× `no-untyped-def`) in `question_state.py` / `question_marker.py`, while the ENFORCED gate (`mypy.ini`, `disallow_untyped_defs=False`) was clean — so functional impact was nil, but the wording overclaimed. Fixed the 6 (parametrized the bare `dict`s to `dict[str, Any]`; added the `Iterator[dict[str, Any]]` return annotation). **Both invocations now report Success:**
+- `mypy --strict <4 new modules>` → Success, no issues.
+- `mypy --config-file mypy.ini <4 new modules>` → Success, no issues.
+Flag difference of record: the project profile sets `disallow_untyped_defs=False` (and does not force `disallow_any_generics`), which is why the bare-`dict` type-args and the missing return annotation were silent under the enforced gate but surfaced under raw `--strict`.
+
+### W1 (process WALL) — blueprint path
+
+The FROZEN blueprint IS present in the ROOT repo at `orchestrator/blueprints/f506-f507-status-truth.md` (the reviewer searched the lane tree and an incorrect dispatch filename `f506-f507-wake-fusion.md`; the supervisor has since confirmed the correct path). Not a code defect; the AC-vs-blueprint audit can run against that path.
+
+### Fix-round re-verification (worktree, laptop targeted)
+
+- Full targeted battery + `f72_fleet_lifecycle` + `inbox_service` + `wpm2_delivery_soundness` + `wpq8_inject_safety`: **562 passed** (after manifest regen; see below).
+- `stage0_flip_machinery` + `cli_verify` (manifest): **46 passed**.
+- The 4 new/strengthened biting tests: all pass with the fix in place; all verified to FAIL under their respective single-line mutation (probes applied then reverted; `grep MUTATION-PROBE src/` → none remain).
+- mypy: both `--strict` and `mypy.ini` clean on the 4 new modules.
+- `cao verify manifest --regen` after the `_claude_eager_eligible` extraction: `hits=39 files_touched=1 changed=yes` → committed; re-run reports `changed=no`.
+
+No new deviations. No reviewer contacted.
