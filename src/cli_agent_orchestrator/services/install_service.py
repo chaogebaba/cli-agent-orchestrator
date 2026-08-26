@@ -27,8 +27,10 @@ from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
+    PROFILE_COMPOSITION_KEYS,
     _read_agent_profile_source,
     parse_agent_profile_text,
+    profile_declares_composition,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.grok_config import ensure_grok_mcp_servers
@@ -41,7 +43,13 @@ from cli_agent_orchestrator.utils.opencode_config import (
     upsert_agent_tools,
     upsert_mcp_server,
 )
-from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
+from cli_agent_orchestrator.utils.opencode_permissions import (
+    cao_tools_to_opencode_permission,
+)
+from cli_agent_orchestrator.utils.resolver_probe import (
+    resolver_probe_skipped,
+    server_supports_resolver,
+)
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -337,6 +345,41 @@ def install_agent(
 
         raw_content = _read_agent_profile_source(agent_name)
         resolved_content = resolve_env_vars(raw_content)
+
+        # F497 AC2 (fail-closed install guard): a composition-bearing profile
+        # (declares extends:/position:) must not be installed against a running
+        # cao-server that cannot compose it — composition is server-side at
+        # spawn, so a resolver-less server would boot a worker with an empty
+        # persona and no error. Refuse UNLESS the live server advertises
+        # resolver support; an unreachable/cold server counts as no support and
+        # refuses (fail-closed). CAO_SKIP_RESOLVER_PROBE=1 covers no-server
+        # environments by design. Legacy profiles (no composition key) skip the
+        # probe entirely and install exactly as before.
+        _install_meta = frontmatter.loads(resolved_content).metadata
+        if profile_declares_composition(_install_meta):
+            if resolver_probe_skipped():
+                logger.warning(
+                    "Agent profile '%s' declares composition keys; "
+                    "%s is set, skipping the live resolver-support probe.",
+                    agent_name,
+                    "CAO_SKIP_RESOLVER_PROBE",
+                )
+            elif not server_supports_resolver():
+                declared = [k for k in PROFILE_COMPOSITION_KEYS if k in _install_meta]
+                return InstallResult(
+                    success=False,
+                    message=(
+                        f"Agent profile '{agent_name}' declares composition "
+                        f"key(s) {declared}, but the running cao-server does not "
+                        f"report resolver support (it may be an older build, "
+                        f"still restarting, or not running). Refusing to install "
+                        f"a profile the live server cannot compose. Restart the "
+                        f"cao-server on a build with F497 resolver support and "
+                        f"retry, or set CAO_SKIP_RESOLVER_PROBE=1 for an "
+                        f"environment with no server by design."
+                    ),
+                )
+
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
         # No explicit provider — honour the profile's frontmatter ``provider:``
@@ -441,9 +484,7 @@ def install_agent(
                 # cancel long handoff RPCs client-side (see helper docstring).
                 # F118: inject ${VAR} identity env into every MCP entry so
                 # kiro-cli expands CAO_TERMINAL_ID et al from its pane env.
-                mcpServers=_inject_kiro_identity_env(
-                    _inject_kiro_mcp_timeout(profile.mcpServers)
-                ),
+                mcpServers=_inject_kiro_identity_env(_inject_kiro_mcp_timeout(profile.mcpServers)),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,

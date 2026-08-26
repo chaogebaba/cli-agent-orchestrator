@@ -2065,6 +2065,15 @@ async def health_check():
             "herdr": _probe("herdr"),
             "claude": _probe("claude"),
         },
+        # F497 AC2: advertise resolver support so `cao install` can refuse
+        # composition-bearing (extends:/position:) profiles until the RUNNING
+        # server can compose them. A server old enough to lack this key reports
+        # nothing here; the install probe treats a missing/false capability as
+        # "no resolver support" and fails closed. Phase 1 ships the resolver
+        # seam, so this build reports True.
+        "capabilities": {
+            "profile_resolver": True,
+        },
     }
     if is_sandbox():
         from cli_agent_orchestrator.sandbox_bootstrap import (
