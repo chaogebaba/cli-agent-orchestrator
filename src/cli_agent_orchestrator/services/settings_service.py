@@ -397,6 +397,18 @@ def get_memory_settings() -> Dict[str, Any]:
     result = dict(defaults)
     result.update(saved)
 
+    # Validate persisted memory.enabled: only literal JSON boolean true opts in.
+    # Any other type (string "false", "0", int 1, dict, list, etc.) is invalid
+    # and resolves to False (fail-closed). Env-var overlay below may still override.
+    persisted_enabled = result["enabled"]
+    if persisted_enabled is not True and persisted_enabled is not False:
+        logger.warning(
+            "Invalid memory.enabled=%r (expected JSON boolean); "
+            "treating as False (fail-closed)",
+            persisted_enabled,
+        )
+        result["enabled"] = False
+
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
     if env_enabled is not None and env_enabled.strip() != "":
@@ -489,13 +501,17 @@ def is_memory_enabled() -> bool:
 
     Precedence: CAO_MEMORY_ENABLED env var > memory.enabled in settings.json
     > default (False — memory is opt-in to avoid spending Claude quota).
+
+    Only literal boolean True enables memory (fail-closed). The validation in
+    get_memory_settings() normalizes invalid types to False, so this identity
+    check is defense-in-depth.
     """
     try:
         value = get_memory_settings().get("enabled", False)
     except Exception as e:
         logger.warning(f"Failed to read memory.enabled, defaulting to False: {e}")
         return False
-    return bool(value)
+    return value is True
 
 
 def is_learning_enabled() -> bool:

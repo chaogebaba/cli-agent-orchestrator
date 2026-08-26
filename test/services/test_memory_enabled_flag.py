@@ -479,3 +479,78 @@ class TestFailClosedGuards:
 
             result = asyncio.run(run_lint("test-hash", repo_root=str(tmp_path)))
             assert result == []
+
+
+
+# ---------------------------------------------------------------------------
+# AC8 — Malformed persisted memory.enabled values fail closed (F488-r3)
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedPersistedEnabledFailsClosed:
+    """Regression for r2 BLOCKER: only literal JSON boolean true enables memory.
+
+    Any non-boolean persisted value must resolve to False (fail-closed).
+    The env-var path is unaffected — it has its own explicit coercion.
+    """
+
+    @pytest.mark.parametrize(
+        "persisted_value,expected",
+        [
+            pytest.param(True, True, id="bool-true"),
+            pytest.param(False, False, id="bool-false"),
+            pytest.param("false", False, id="string-false"),
+            pytest.param("0", False, id="string-zero"),
+            pytest.param(0, False, id="int-zero"),
+            pytest.param(1, False, id="int-one"),
+            pytest.param("true", False, id="string-true"),
+            pytest.param(None, False, id="null"),
+            pytest.param({}, False, id="empty-dict"),
+            pytest.param([], False, id="empty-list"),
+        ],
+    )
+    def test_is_memory_enabled_persisted_validation(
+        self, settings_file: Path, monkeypatch, persisted_value: Any, expected: bool
+    ) -> None:
+        """Table-driven: only literal bool True enables memory from settings."""
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        settings_file.write_text(json.dumps({"memory": {"enabled": persisted_value}}))
+        assert is_memory_enabled() is expected
+
+    def test_missing_key_defaults_to_false(
+        self, settings_file: Path, monkeypatch
+    ) -> None:
+        """When memory.enabled key is absent, defaults to False."""
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        settings_file.write_text(json.dumps({"memory": {}}))
+        assert is_memory_enabled() is False
+
+    @pytest.mark.parametrize(
+        "persisted_value",
+        [
+            pytest.param("false", id="string-false"),
+            pytest.param("0", id="string-zero"),
+            pytest.param(1, id="int-one"),
+            pytest.param({"bad": "value"}, id="dict-with-value"),
+            pytest.param(["bad"], id="list-with-value"),
+        ],
+    )
+    def test_invalid_types_log_warning(
+        self, settings_file: Path, monkeypatch, persisted_value: Any, caplog
+    ) -> None:
+        """Invalid types trigger a warning log."""
+        import logging
+
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        settings_file.write_text(json.dumps({"memory": {"enabled": persisted_value}}))
+        with caplog.at_level(logging.WARNING):
+            result = is_memory_enabled()
+        assert result is False
+        assert "Invalid memory.enabled" in caplog.text
+        assert "fail-closed" in caplog.text
