@@ -6224,7 +6224,7 @@ def _insert_routed_inbox_row(
         and not park_warm
         and dispatch_barrier is None
         and orchestration_type == OrchestrationType.SEND_MESSAGE
-        and not sender_id.startswith(("watchdog:", "cao-"))
+        and not sender_id.startswith(("watchdog:", "cao-", "barrier:"))
     ):
         try:
             if _f475_should_dedup(
@@ -6236,29 +6236,36 @@ def _insert_routed_inbox_row(
             ):
                 content_hash = _f475_compute_content_hash(_f475_normalize_message(message))
                 effective_receiver = logical_receiver_id or receiver_id
-                # Check for existing identical row within rolling 60s window
+                # Check for existing identical row within rolling 60s window.
+                # Use a SEPARATE session so any query failure (e.g. datetime
+                # comparison mismatch in test fixtures) cannot corrupt the
+                # caller's transaction.
                 cutoff = _utcnow() - __import__("datetime").timedelta(
                     seconds=_F475_CALLBACK_DEDUP_WINDOW_S
                 )
-                existing = (
-                    db.query(InboxModel)
-                    .filter(
-                        InboxModel.sender_id == sender_id,
-                        InboxModel.receiver_id == receiver_id,
-                        InboxModel.callback_dedup_key == content_hash,
-                        InboxModel.created_at >= cutoff,
-                        InboxModel.park_warm.isnot(True),
-                        InboxModel.barrier_id.is_(None),
+                with SessionLocal() as dedup_db:
+                    existing = (
+                        dedup_db.query(InboxModel)
+                        .filter(
+                            InboxModel.sender_id == sender_id,
+                            InboxModel.receiver_id == receiver_id,
+                            InboxModel.callback_dedup_key == content_hash,
+                            InboxModel.created_at >= cutoff,
+                            InboxModel.park_warm.isnot(True),
+                            InboxModel.barrier_id.is_(None),
+                        )
+                        .first()
                     )
-                    .first()
-                )
-                if existing is not None:
+                    existing_id = existing.id if existing is not None else None
+                if existing_id is not None:
                     logger.info(
                         "f475_callback_dedup sender=%s receiver=%s suppressed=true",
                         sender_id,
                         effective_receiver,
                     )
-                    return existing
+                    # Re-fetch from the CALLER's session so the returned object
+                    # is properly bound and callers can access attributes.
+                    return db.query(InboxModel).filter(InboxModel.id == existing_id).one()
         except Exception:
             # Dedup check failed — proceed with insert (fail-open)
             logger.debug("f475_dedup_check_failed", exc_info=True)
@@ -6661,7 +6668,7 @@ def _f475_should_dedup(
         return False
     if dispatch_barrier is not None:
         return False
-    if sender_id.startswith("watchdog:") or sender_id.startswith("cao-"):
+    if sender_id.startswith(("watchdog:", "cao-", "barrier:")):
         return False
     try:
         meta = get_terminal_metadata(sender_id)
