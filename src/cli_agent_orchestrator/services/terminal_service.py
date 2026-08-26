@@ -6862,7 +6862,7 @@ def _delete_terminal_inner(
         release_rebind_lease,
     )
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_exclusive,
+        acquire_session_lifecycle_exclusive_blocking,
         release_session_lifecycle_lease,
     )
     from cli_agent_orchestrator.services.terminal_guard_service import (
@@ -6873,7 +6873,21 @@ def _delete_terminal_inner(
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
 
-    lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+    # F513 (#368): the exclusive lifecycle lease is session-scoped, so a
+    # delete of THIS terminal is transiently blocked whenever an UNRELATED
+    # terminal on the same session holds a shared lease — most commonly a
+    # concurrent create's deferred-init background task, which holds it for
+    # the whole of provider.initialize(). That contention is normally
+    # short-lived, so wait a bounded interval before surfacing the 409 rather
+    # than failing instantly. Configurable; defaults to a few seconds, which
+    # covers ordinary sibling-create churn without letting a genuinely wedged
+    # init (up to the F509 watchdog) pin the delete indefinitely.
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    _lease_wait_s = float(ConfigService.get("delete.lifecycle_lease_wait_s", 5.0))
+    lifecycle_lease = acquire_session_lifecycle_exclusive_blocking(
+        session_name, timeout_s=_lease_wait_s
+    )
     if lifecycle_lease is None:
         raise RuntimeError("resume_in_progress")
     try:
