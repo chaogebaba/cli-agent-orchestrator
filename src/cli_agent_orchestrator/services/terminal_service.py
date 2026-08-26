@@ -1961,11 +1961,16 @@ async def create_terminal(
 
         # WPDT W3 (F152): Derive and set cc_team_inbox_path at pane creation
         # for claude_code supervisor terminals with teammate_push enabled.
+        # F337: Also require wake.native=true — the cc_team_inbox_path is only
+        # useful when the native channel is active; deriving it when native is
+        # disabled would leave a stale path that split-brain code could use.
         from cli_agent_orchestrator.services.config_service import ConfigService as _CS
 
+        _native_wake_enabled = _CS.get("supervisor.wake.native", default=True)
         if (
             provider == "claude_code"
             and _CS.get("supervisor.teammate_push", default=False)
+            and _native_wake_enabled
             and not metadata
         ):
             _wd = working_directory or os.getcwd()
@@ -1982,6 +1987,7 @@ async def create_terminal(
         elif (
             provider == "claude_code"
             and _CS.get("supervisor.teammate_push", default=False)
+            and _native_wake_enabled
             and metadata is not None
             and "cc_team_inbox_path" not in metadata
         ):

@@ -444,6 +444,41 @@ def build_wake_payload(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def read_peer_token(pid: int, sessions_dir: Optional[Path] = None) -> Optional[str]:
+    """F337: Read the peerToken from the session key file for a given PID.
+
+    Key files are at <sessions_dir>/<pid>.<64hex>.key and contain JSON:
+    {"peerToken":"<hex>","procStart":"<int>"}.
+
+    Returns the peerToken string, or None if no key file exists or is unreadable.
+    """
+    base = sessions_dir or _sessions_dir()
+    if base is None or not base.is_dir():
+        return None
+    # Key file pattern: <pid>.<64hex>.key
+    for entry in base.iterdir():
+        if not entry.name.startswith(f"{pid}.") or not entry.name.endswith(".key"):
+            continue
+        try:
+            data = json.loads(entry.read_text())
+            token = data.get("peerToken")
+            if token and isinstance(token, str):
+                return token
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def _build_auth_frame(token: str) -> str:
+    """F337: Build the JSON auth handshake line for CC messaging UDS.
+
+    Wire format (probed against CC 2.1.246):
+      {"type":"auth","token":"<peerToken>"}\n
+    Sent as the first line before the message payload.
+    """
+    return json.dumps({"type": "auth", "token": token}, separators=(",", ":"))
+
+
 def write_to_socket(
     socket_path: str,
     payload_line: str,
@@ -453,8 +488,10 @@ def write_to_socket(
 ) -> Optional[str]:
     """Write one JSON line to the CC session socket and half-close. No read.
 
-    F337: When auth_token is provided, sends it as the first line before the
-    payload (correct on the day the UDS gate flips; harmless now while gate is off).
+    F337: When auth_token is provided, sends a JSON auth frame as the first line
+    before the payload: {"type":"auth","token":"<token>"}\n
+    This authenticates the connection using the per-session peerToken from the
+    key file at ~/.claude/sessions/<pid>.<hex>.key.
 
     Returns None on success, or an error reason string on failure.
     """
@@ -466,10 +503,10 @@ def write_to_socket(
     sock.settimeout(connect_timeout_s)
     try:
         sock.connect(socket_path)
-        # F337: Optional auth first-line
+        # F337: Auth handshake — JSON frame as first line
         if auth_token:
-            auth_data = (auth_token + "\n").encode("utf-8")
-            sock.sendall(auth_data)
+            auth_frame = _build_auth_frame(auth_token) + "\n"
+            sock.sendall(auth_frame.encode("utf-8"))
         # Write the line + newline, then half-close (D5: no response read)
         data = (payload_line + "\n").encode("utf-8")
         sock.sendall(data)

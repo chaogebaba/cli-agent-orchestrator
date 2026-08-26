@@ -269,6 +269,7 @@ def _attempt_native_ring(
         ResolveResult,
         build_wake_payload,
         check_version_guard,
+        read_peer_token,
         resolve_target,
         verify_wake,
         write_to_socket,
@@ -336,8 +337,11 @@ def _attempt_native_ring(
         )
         return "socket_unpublished"
 
-    # D5: socket write
-    write_err = write_to_socket(record.messaging_socket_path, payload)
+    # F337: read auth token from per-session key file
+    auth_token = read_peer_token(record.pid)
+
+    # D5: socket write (F337: auth handshake first line when token available)
+    write_err = write_to_socket(record.messaging_socket_path, payload, auth_token=auth_token)
     if write_err:
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "
