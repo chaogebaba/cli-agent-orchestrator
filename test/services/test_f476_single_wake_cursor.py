@@ -202,29 +202,30 @@ class TestAC3LostWakeRecovery:
                 generation=_GENERATION,
                 through_id=r1.claimed_high_water,
                 claimed_high_water=r1.claimed_high_water,
+                lease_epoch=r1.lease_epoch,
                 expected_path_version=r1.path_version,
             )
             assert c1.kind == "committed"
 
-            # After commit, lease is cleared. Cursor is now at 5.
-            # B3: Row 5 is still pending; committed-pending recovery returns it.
+            # B3-r2: After commit, wake_notified_at is re-stamped. The committed-pending
+            # row is NOT reclaimable for 300s (visibility interval).
             r2 = claim_unnotified_wake(
                 mailbox_id=_MAILBOX_ID,
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
             )
-            assert r2.kind == "claimed"
-            assert len(r2.rows) == 1  # B3 recovery finds committed-pending row 5
-            assert r2.rows[0].inbox_row_id == 5
+            assert r2.kind == "lease_held"  # B3-r2: 300s visibility cooldown
 
-            # Second claim within cooldown → lease_held (stamped by r2's claim)
-            clock.advance(100)
+            # After 300s, recovery returns the still-pending row
+            clock.advance(310)
             r3 = claim_unnotified_wake(
                 mailbox_id=_MAILBOX_ID,
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
             )
-            assert r3.kind == "lease_held"
+            assert r3.kind == "claimed"
+            assert len(r3.rows) == 1
+            assert r3.rows[0].inbox_row_id == 5
 
     def test_streak_resets_on_new_forward(self, f476_db: Any) -> None:
         """Streak resets when a strictly newer forward id is committed."""
@@ -248,6 +249,7 @@ class TestAC3LostWakeRecovery:
             generation=_GENERATION,
             through_id=5,
             claimed_high_water=r1.claimed_high_water,
+            lease_epoch=r1.lease_epoch,
             expected_path_version=r1.path_version,
         )
         assert c1.kind == "committed"
@@ -271,6 +273,7 @@ class TestAC3LostWakeRecovery:
             generation=_GENERATION,
             through_id=10,
             claimed_high_water=10,
+            lease_epoch=r2.lease_epoch,
             expected_path_version=r2.path_version,
         )
         assert c2.kind == "committed"
@@ -370,6 +373,7 @@ class TestAC10ReplayEntries:
             generation=_GENERATION,
             through_id=result.claimed_high_water,
             claimed_high_water=result.claimed_high_water,
+            lease_epoch=result.lease_epoch,
             expected_path_version=result.path_version,
             replay_row_ids=(5,),
         )
@@ -412,6 +416,7 @@ class TestAC10ReplayEntries:
             generation=_GENERATION,
             through_id=result.claimed_high_water,
             claimed_high_water=result.claimed_high_water,
+            lease_epoch=result.lease_epoch,
             expected_path_version=result.path_version,
             replay_row_ids=(5,),
         )
@@ -458,6 +463,7 @@ class TestAC11SupersededByAck:
             generation=_GENERATION,
             through_id=5,
             claimed_high_water=5,
+            lease_epoch=result.lease_epoch,
             expected_path_version=result.path_version,
         )
         assert c.kind == "superseded_by_ack"
@@ -524,58 +530,65 @@ class TestAC12Exhaustion:
 
     def test_streak_increments_on_same_highwater_commit(self, f476_db: Any) -> None:
         """Committing with same through_id increments streak; new forward resets it."""
-        with _get_session() as db:
-            _seed_mailbox(db, cursor=0)
-            _insert_pending_row(db, 5)
+        clock = SimClock(initial_wall=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        with install_clock(clock):
+            with _get_session() as db:
+                _seed_mailbox(db, cursor=0)
+                _insert_pending_row(db, 5)
 
-        # First claim + commit: through_id=5 > wake_notified_id=0 → streak=0
-        r1 = claim_unnotified_wake(
-            mailbox_id=_MAILBOX_ID,
-            terminal_id=_TERMINAL_ID,
-            generation=_GENERATION,
-        )
-        c1 = commit_wake(
-            mailbox_id=_MAILBOX_ID,
-            terminal_id=_TERMINAL_ID,
-            generation=_GENERATION,
-            through_id=5,
-            claimed_high_water=5,
-            expected_path_version=r1.path_version,
-        )
-        assert c1.kind == "committed"
+            # First claim + commit: through_id=5 > cursor=0 → streak=0
+            r1 = claim_unnotified_wake(
+                mailbox_id=_MAILBOX_ID,
+                terminal_id=_TERMINAL_ID,
+                generation=_GENERATION,
+            )
+            c1 = commit_wake(
+                mailbox_id=_MAILBOX_ID,
+                terminal_id=_TERMINAL_ID,
+                generation=_GENERATION,
+                through_id=5,
+                claimed_high_water=5,
+                lease_epoch=r1.lease_epoch,
+                expected_path_version=r1.path_version,
+            )
+            assert c1.kind == "committed"
 
-        with _get_session() as db:
-            mb = db.query(MailboxModel).filter_by(id=_MAILBOX_ID).one()
-            assert int(mb.wake_streak) == 0  # reset because 5 > 0
+            with _get_session() as db:
+                mb = db.query(MailboxModel).filter_by(id=_MAILBOX_ID).one()
+                assert int(mb.wake_streak) == 0
 
-        # Add replay entry for same row and commit with replay only
-        with _get_session() as db:
-            enqueue_callback_replay(db, mailbox_id=_MAILBOX_ID, inbox_row_ids=[5])
-            db.commit()
+            # Add replay entry and advance past cooldown
+            with _get_session() as db:
+                enqueue_callback_replay(db, mailbox_id=_MAILBOX_ID, inbox_row_ids=[5])
+                db.commit()
 
-        # Claim replay row (cursor=5, replay for id=5 is returned)
-        r2 = claim_unnotified_wake(
-            mailbox_id=_MAILBOX_ID,
-            terminal_id=_TERMINAL_ID,
-            generation=_GENERATION,
-        )
-        assert r2.kind == "claimed"
-        assert any(r.tag == "replay" for r in r2.rows)
+            clock.advance(310)  # past cooldown
 
-        # Replay-only commit: through_id == current_cursor → streak + 1
-        c2 = commit_wake(
-            mailbox_id=_MAILBOX_ID,
-            terminal_id=_TERMINAL_ID,
-            generation=_GENERATION,
-            through_id=5,  # same as cursor
-            claimed_high_water=5,
-            expected_path_version=r2.path_version,
-            replay_row_ids=(5,),
-        )
-        assert c2.kind == "committed"
+            # Claim replay row
+            r2 = claim_unnotified_wake(
+                mailbox_id=_MAILBOX_ID,
+                terminal_id=_TERMINAL_ID,
+                generation=_GENERATION,
+            )
+            assert r2.kind == "claimed"
+            assert any(r.tag == "replay" for r in r2.rows)
 
-        with _get_session() as db:
-            mb = db.query(MailboxModel).filter_by(id=_MAILBOX_ID).one()
+            # Replay-only commit: through_id == cursor → streak + 1
+            c2 = commit_wake(
+                mailbox_id=_MAILBOX_ID,
+                terminal_id=_TERMINAL_ID,
+                generation=_GENERATION,
+                through_id=5,
+                claimed_high_water=5,
+                lease_epoch=r2.lease_epoch,
+                expected_path_version=r2.path_version,
+                replay_row_ids=(5,),
+            )
+            assert c2.kind == "committed"
+
+            with _get_session() as db:
+                mb = db.query(MailboxModel).filter_by(id=_MAILBOX_ID).one()
+                assert int(mb.wake_streak) == 1
             assert int(mb.wake_streak) == 1
 
 
@@ -660,6 +673,7 @@ class TestAC14LeaseExclusivity:
                 generation=_GENERATION,
                 through_id=10,
                 claimed_high_water=10,
+                lease_epoch=r2.lease_epoch,
                 expected_path_version=r2.path_version,
             )
             assert c2.kind == "committed"
@@ -671,14 +685,11 @@ class TestAC14LeaseExclusivity:
                 generation=_GENERATION,
                 through_id=10,
                 claimed_high_water=10,
+                lease_epoch=1,
                 expected_path_version=r1.path_version,
             )
-            # through_id (10) == current_cursor (10) so this won't advance
-            # Actually through_id > current_cursor check: 10 > 10 is False
-            # So the lease_lost check (wake_notified_at is None AND through_id > current_cursor)
-            # won't fire. The commit is essentially a no-op.
-            # This is correct: the cursor already advanced, nothing to do.
-            assert c1.kind == "committed"  # No-op commit (cursor already there)
+            # B2-r2: stale epoch (1) != current epoch (2) → lease_lost
+            assert c1.kind == "lease_lost"
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +730,7 @@ class TestAC15PathChanged:
             generation=_GENERATION,
             through_id=r.claimed_high_water,
             claimed_high_water=r.claimed_high_water,
+            lease_epoch=r.lease_epoch,
             expected_path_version=r.path_version,  # stale
         )
         assert c.kind == "path_changed"

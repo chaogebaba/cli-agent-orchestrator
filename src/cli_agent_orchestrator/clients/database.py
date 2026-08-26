@@ -300,6 +300,7 @@ class MailboxModel(Base):
     wake_notified_at = Column(DateTime(timezone=True), nullable=True)
     wake_streak = Column(Integer, nullable=False, default=0, server_default="0")
     wake_notified_id = Column(Integer, nullable=False, default=0, server_default="0")
+    wake_lease_epoch = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
@@ -1651,6 +1652,10 @@ def _migrate_f476_wake_recovery() -> None:
         if "wake_notified_id" not in col_names:
             connection.execute(
                 text("ALTER TABLE mailboxes ADD COLUMN wake_notified_id INTEGER NOT NULL DEFAULT 0")
+            )
+        if "wake_lease_epoch" not in col_names:
+            connection.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN wake_lease_epoch INTEGER NOT NULL DEFAULT 0")
             )
 
 
@@ -9538,6 +9543,8 @@ def commit_supervisor_callback_progress(
 # Constants (matching f213's proven values)
 _WAKE_COOLDOWN_SECONDS = 300.0
 _WAKE_STREAK_CAP = 3
+# B5-r2: once-per-episode exhaustion warning tracking
+_wake_exhaustion_warned: set[str] = set()  # mailbox_ids that have been warned
 
 
 @dataclass(frozen=True)
@@ -9551,6 +9558,7 @@ class WakeClaimResult:
     claimed_high_water: int
     path_version: int
     reason: str
+    lease_epoch: int = 0
     exhausted_id: int | None = None  # only set when kind == "wake_exhausted"
 
 
@@ -9617,6 +9625,67 @@ def claim_unnotified_wake(
         )
 
     try:
+        # F351: cheap-emptiness fast path — read-only pre-check without BEGIN IMMEDIATE
+        with SessionLocal() as db:
+            _pre = (
+                db.query(
+                    MailboxModel.callback_notified_through_id,
+                    MailboxModel.consumed_through_id,
+                    MailboxModel.current_terminal_id,
+                    MailboxModel.generation,
+                    MailboxModel.cc_inbox_path_version,
+                    MailboxModel.wake_notified_at,
+                    MailboxModel.wake_streak,
+                    MailboxModel.wake_notified_id,
+                )
+                .filter_by(id=mailbox_id)
+                .one_or_none()
+            )
+            if _pre is not None:
+                if _pre.current_terminal_id == terminal_id and int(_pre.generation) == generation:
+                    _notified = int(_pre.callback_notified_through_id or 0)
+                    _consumed = int(_pre.consumed_through_id or 0)
+                    _effective = max(_notified, _consumed)
+                    # Check if any work exists (forward, recovery, or replay)
+                    _has_forward = db.query(
+                        db.query(InboxModel.id)
+                        .filter(
+                            InboxModel.logical_receiver_id == mailbox_id,
+                            InboxModel.enqueue_generation == generation,
+                            InboxModel.id > _effective,
+                            InboxModel.status == MessageStatus.PENDING.value,
+                        )
+                        .exists()
+                    ).scalar()
+                    if not _has_forward:
+                        _has_recovery = False
+                        if _notified > _consumed:
+                            _has_recovery = db.query(
+                                db.query(InboxModel.id)
+                                .filter(
+                                    InboxModel.logical_receiver_id == mailbox_id,
+                                    InboxModel.enqueue_generation == generation,
+                                    InboxModel.id > _consumed,
+                                    InboxModel.id <= _notified,
+                                    InboxModel.status == MessageStatus.PENDING.value,
+                                )
+                                .exists()
+                            ).scalar()
+                        if not _has_recovery:
+                            _has_replay = db.query(
+                                db.query(CallbackReplayQueueModel.id)
+                                .filter(CallbackReplayQueueModel.mailbox_id == mailbox_id)
+                                .exists()
+                            ).scalar()
+                            if not _has_replay:
+                                return WakeClaimResult(
+                                    kind="claimed",
+                                    rows=(),
+                                    claimed_high_water=_notified,
+                                    path_version=int(_pre.cc_inbox_path_version),
+                                    reason="empty",
+                                )
+
         with SessionLocal() as db:
             db.execute(text("BEGIN IMMEDIATE"))
 
@@ -9674,14 +9743,16 @@ def claim_unnotified_wake(
                         },
                     ).fetchone()
                     if not has_newer:
-                        # B5: log WARNING once per exhaustion episode
-                        logger.warning(
-                            "f476_wake_exhausted mailbox=%s wake_notified_id=%d streak=%d"
-                            " — row stuck; supervisor may need manual intervention",
-                            mailbox_id,
-                            wake_notified_id,
-                            wake_streak,
-                        )
+                        # B5-r2: log WARNING once per exhaustion episode (dedupe)
+                        if mailbox_id not in _wake_exhaustion_warned:
+                            _wake_exhaustion_warned.add(mailbox_id)
+                            logger.warning(
+                                "f476_wake_exhausted mailbox=%s wake_notified_id=%d streak=%d"
+                                " — row stuck; supervisor may need manual intervention",
+                                mailbox_id,
+                                wake_notified_id,
+                                wake_streak,
+                            )
                         db.commit()
                         return WakeClaimResult(
                             kind="wake_exhausted",
@@ -9839,8 +9910,11 @@ def claim_unnotified_wake(
                 )
 
             # Stamp the lease (D4): wake_notified_at = now, wake_notified_id = claimed_high_water
+            # B2-r2: increment wake_lease_epoch for claim identity
+            new_epoch = int(mailbox.wake_lease_epoch or 0) + 1
             mailbox.wake_notified_at = now
             mailbox.wake_notified_id = claimed_high_water
+            mailbox.wake_lease_epoch = new_epoch
             mailbox.updated_at = now
             db.commit()
 
@@ -9849,6 +9923,7 @@ def claim_unnotified_wake(
                 rows=all_rows,
                 claimed_high_water=claimed_high_water,
                 path_version=path_version,
+                lease_epoch=new_epoch,
                 reason="ok",
             )
     except OperationalError as exc:
@@ -9871,6 +9946,7 @@ def commit_wake(
     generation: int,
     through_id: int,
     claimed_high_water: int,
+    lease_epoch: int,
     expected_path_version: int,
     replay_row_ids: tuple[int, ...] = (),
 ) -> WakeCommitResult:
@@ -9879,6 +9955,7 @@ def commit_wake(
     Must be called AFTER claim and BEFORE emit. Returns the commit verdict.
     Runs under the mailbox authority lock (D1).
     through_id must be <= claimed_high_water (B2: bound to claim).
+    lease_epoch must match the claim's epoch (B2-r2: identifies claim incarnation).
     """
     from cli_agent_orchestrator.services.mailbox_service import get_mailbox_authority_lock
 
@@ -9932,15 +10009,17 @@ def commit_wake(
             # Replay-only commit: through_id == current_cursor, non-empty replay_row_ids
             # is never superseded (its rows are pending by construction).
 
-            # Lease check: verify the lease is still ours
+            # Lease check: verify the lease epoch matches (B2-r2)
+            current_epoch = int(mailbox.wake_lease_epoch or 0)
+            if current_epoch != lease_epoch:
+                # A different claim incremented the epoch — lease superseded
+                db.commit()
+                return WakeCommitResult(kind="lease_lost", reason="epoch_mismatch")
+
             wake_notified_id = int(mailbox.wake_notified_id or 0)
-            wake_notified_at = mailbox.wake_notified_at
-            if wake_notified_at is None and through_id > current_cursor:
-                # Another commit already cleared the lease
-                return WakeCommitResult(kind="lease_lost", reason="lease_already_cleared")
             # B2: verify claimed_high_water matches what the lease stamped
             if wake_notified_id != 0 and claimed_high_water != wake_notified_id:
-                # A different claim stamped a different high-water
+                db.commit()
                 return WakeCommitResult(kind="lease_lost", reason="claim_mismatch")
 
             now = _utcnow()
@@ -9953,14 +10032,23 @@ def commit_wake(
                 # Reset streak when through_id advances the cursor (new forward content)
                 if through_id > current_cursor:
                     mailbox.wake_streak = 0
+                    # B5-r2: clear exhaustion warning when new content supersedes
+                    _wake_exhaustion_warned.discard(mailbox_id)
                 else:
                     mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
             elif replay_row_ids:
                 # Replay-only: increment streak (same high-water)
                 mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
+            else:
+                # B5-r2: committed-pending recovery with no cursor advance and no replay
+                # — increment streak (same high-water re-wake)
+                mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
 
-            # Clear the lease
-            mailbox.wake_notified_at = None
+            # B3-r2: Re-stamp wake_notified_at at commit time (NOT clear it).
+            # This preserves the 300s visibility cooldown for committed-pending recovery.
+            # Set wake_notified_id to through_id so newer forward rows can supersede.
+            mailbox.wake_notified_at = now
+            mailbox.wake_notified_id = through_id
             mailbox.updated_at = now
 
             # Drain replay entries

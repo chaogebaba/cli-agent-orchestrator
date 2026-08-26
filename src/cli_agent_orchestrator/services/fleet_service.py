@@ -214,7 +214,13 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "wedge_suspect": _is_wedge_suspect(row),
             }
         )
-    return {"session_name": session_name, "terminals": projected}
+    # F476 B5-r2: include wake-exhaustion alarms in fleet projection
+    wake_alarms = get_wake_exhaustion_alarms()
+    return {
+        "session_name": session_name,
+        "terminals": projected,
+        "wake_exhaustion_alarms": wake_alarms,
+    }
 
 
 def get_wake_exhaustion_alarms() -> list[dict[str, Any]]:

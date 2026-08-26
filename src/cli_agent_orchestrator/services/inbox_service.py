@@ -923,6 +923,7 @@ class InboxService:
                 generation=generation,
                 through_id=through_id,
                 claimed_high_water=claim.claimed_high_water,
+                lease_epoch=claim.lease_epoch,
                 expected_path_version=claim.path_version,
                 replay_row_ids=replay_ids,
             )
@@ -944,6 +945,33 @@ class InboxService:
                     retryable_failure_count=1,
                     reason=f"commit_failed: {commit_result.reason}",
                     retry_delay_s=_get_backoff_delay(terminal_id),
+                )
+
+            # fx168: stale-path detection — if terminal metadata says a different
+            # cc_team_inbox_path than the mailbox canonical path, do NOT emit.
+            _fx168_stale_heal: tuple[str, str, int, str] | None = None
+            try:
+                from cli_agent_orchestrator.clients.database import (
+                    get_terminal_metadata as _get_meta,
+                )
+
+                _meta = _get_meta(terminal_id)
+                _current_path = (
+                    (_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None
+                )
+                if _current_path and _current_path != inbox_path_str:
+                    _fx168_stale_heal = (mailbox_id, terminal_id, generation, _current_path)
+            except Exception as _heal_exc:
+                logger.debug(
+                    "fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc
+                )
+
+            if _fx168_stale_heal is not None:
+                return CallbackRunOutcome(
+                    cursor_before=claim.claimed_high_water,
+                    needs_immediate_wake=True,
+                    reason="stale_path_detected",
+                    _fx168_stale_heal=_fx168_stale_heal,
                 )
 
             # F476 D3: EMIT — write CC inbox entries AFTER commit

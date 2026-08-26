@@ -1374,6 +1374,7 @@ class WakeCommitRequest(BaseModel):
     to: str = Field(pattern=r"^[a-f0-9]{8}$")
     through_id: int = Field(ge=0)
     claimed_high_water: int = Field(ge=0)
+    lease_epoch: int = Field(ge=0)
     expected_path_version: int = Field(ge=0)
     replay_row_ids: List[int] = Field(default_factory=list)
 
@@ -8103,6 +8104,7 @@ async def wake_claim_endpoint(
             "rows": rows_out,
             "claimed_high_water": result.claimed_high_water,
             "path_version": result.path_version,
+            "lease_epoch": result.lease_epoch,
             "reason": result.reason,
         }
         if result.exhausted_id is not None:
@@ -8142,6 +8144,7 @@ async def wake_commit_endpoint(
             generation=generation,
             through_id=body.through_id,
             claimed_high_water=body.claimed_high_water,
+            lease_epoch=body.lease_epoch,
             expected_path_version=body.expected_path_version,
             replay_row_ids=tuple(body.replay_row_ids),
         )
