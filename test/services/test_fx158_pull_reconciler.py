@@ -18,7 +18,6 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.teammate_push_service import (
     PushOutcome,
-    _last_notified,
     attempt_teammate_push,
     attempt_teammate_push_reported,
 )
@@ -216,7 +215,6 @@ class TestAC1ReconcilerBypassesDeliverPending:
     def test_push_written_without_deliver_pending(self, tmp_path: Path) -> None:
         """With deliver_pending patched to raise, the reconciler still pushes."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         svc = InboxService()
 
         mb = _make_mailbox(consumed_through_id=0)
@@ -259,9 +257,6 @@ class TestAC1ReconcilerBypassesDeliverPending:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=0,
@@ -417,7 +412,6 @@ class TestAC2GraceWindow:
     def test_old_row_pushed_on_later_tick(self, tmp_path: Path) -> None:
         """Once the row ages past grace, it is pushed."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         svc = InboxService()
         mb = _make_mailbox(consumed_through_id=0)
         terminal = _make_terminal()
@@ -454,9 +448,6 @@ class TestAC2GraceWindow:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=0,
@@ -542,7 +533,6 @@ class TestAC3CursorConsumed:
 
     def test_fx157_d3_recount_yields_consumed_reason(self, tmp_path: Path) -> None:
         """When selection is bypassed, fx157 D3's recount yields consumed."""
-        _last_notified.clear()
         inbox_path = tmp_path / "inbox.json"
         messages = [_make_message(msg_id=5)]
 
@@ -550,9 +540,6 @@ class TestAC3CursorConsumed:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=10,
@@ -758,18 +745,14 @@ class TestAC8NotifyCursorSemantics:
     """Successful push advances last_notified; suppressed leaves it."""
 
     def test_successful_push_advances_cursor(self, tmp_path: Path) -> None:
-        """F476: push succeeds; _last_notified no longer tracked client-side."""
+        """F476: push succeeds; dedup is now server-side."""
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=10), _make_message(msg_id=15)]
 
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ) as mock_update,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=0,
@@ -779,20 +762,16 @@ class TestAC8NotifyCursorSemantics:
             outcome = attempt_teammate_push_reported("sup-001", messages)
 
         assert outcome.pushed is True
-        # F476: _last_notified is a stub, no longer populated by push path
+        # F476: dedup is now server-side
 
     def test_suppressed_push_does_not_advance_cursor(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=5)]
 
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ) as mock_update,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
                 return_value=10,
@@ -803,7 +782,6 @@ class TestAC8NotifyCursorSemantics:
 
         assert outcome.pushed is False
         assert outcome.reason == "consumed"
-        assert _last_notified.get("sup-001") is None
         mock_update.assert_not_called()
 
 
@@ -975,16 +953,12 @@ class TestAC14SingleCursorRead:
 
     def test_single_cursor_read(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
-        _last_notified.clear()
         messages = [_make_message(msg_id=10)]
 
         with (
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
             ) as mock_cursor,

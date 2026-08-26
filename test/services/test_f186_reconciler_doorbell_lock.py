@@ -24,7 +24,6 @@ from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doo
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.teammate_push_service import PushOutcome
 
-
 _NOW = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
 _OLD = _NOW - timedelta(seconds=60)
 
@@ -33,10 +32,9 @@ _OLD = _NOW - timedelta(seconds=60)
 def _reset_doorbell_state():
     """Reset doorbell module state between tests."""
     import cli_agent_orchestrator.services.doorbell_service as ds
-    ds._last_doorbell_row_id.clear()
+
     ds._last_warn_time.clear()
     yield
-    ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
 
 
@@ -97,6 +95,7 @@ def _make_inbox_row(
     status="pending",
 ):
     from cli_agent_orchestrator.models.inbox import OrchestrationType
+
     return SimpleNamespace(
         id=msg_id,
         sender_id=sender_id,
@@ -130,9 +129,7 @@ class TestF186CallerHoldsNoLockBypassesG1:
         real_lock.acquire()  # simulates F136 runner holding it
 
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
-            ) as mock_config,
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
                 return_value=True,
@@ -140,9 +137,6 @@ class TestF186CallerHoldsNoLockBypassesG1:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
                 return_value={"metadata": {}},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
@@ -169,27 +163,32 @@ class TestF186CallerHoldsNoLockBypassesG1:
                 if path == "supervisor.doorbell":
                     return True
                 return True
+
             mock_config.get.side_effect = _cfg
 
             # Probe returns IDLE
             from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
             probe = MagicMock()
             probe.status = TerminalStatus.IDLE
             probe.meta = {}
             mock_probe.return_value = probe
 
             from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
             mock_inject.return_value = InjectSafetyResult("safe")
 
             # Call with the F186 fix flag
             result = ring_supervisor_doorbell(
-                "sup-001", 42, written_count=1,
+                "sup-001",
+                42,
+                written_count=1,
                 caller_holds_no_delivery_lock=True,
             )
 
-            assert result == "rang", (
-                f"Expected 'rang' but got '{result}' — the delivery lock bypass failed"
-            )
+            assert (
+                result == "rang"
+            ), f"Expected 'rang' but got '{result}' — the delivery lock bypass failed"
             mock_send.assert_called_once()
 
         # Release the lock we held to simulate contention
@@ -201,9 +200,7 @@ class TestF186CallerHoldsNoLockBypassesG1:
         real_lock.acquire()
 
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
-            ) as mock_config,
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
                 return_value=True,
@@ -217,17 +214,21 @@ class TestF186CallerHoldsNoLockBypassesG1:
                 return_value=real_lock,
             ),
         ):
+
             def _cfg(path, default=None, override=None):
                 if path == "supervisor.wake.native":
                     return False
                 if path == "supervisor.doorbell":
                     return True
                 return True
+
             mock_config.get.side_effect = _cfg
 
             # Without the flag, should still skip
             result = ring_supervisor_doorbell(
-                "sup-001", 42, written_count=1,
+                "sup-001",
+                42,
+                written_count=1,
                 caller_holds_no_delivery_lock=False,
             )
 
@@ -259,22 +260,34 @@ class TestF186ReconcilerPassesFlag:
         inbox_path = tmp_path / "inbox.json"
         doorbell_calls = []
 
-        def _capture_doorbell(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
-            doorbell_calls.append({
-                "terminal_id": terminal_id,
-                "max_row_id": max_row_id,
-                "written_count": written_count,
-                "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
-            })
+        def _capture_doorbell(
+            terminal_id,
+            max_row_id,
+            *,
+            written_count=0,
+            caller_holds_no_delivery_lock=False,
+            **kwargs,
+        ):
+            doorbell_calls.append(
+                {
+                    "terminal_id": terminal_id,
+                    "max_row_id": max_row_id,
+                    "written_count": written_count,
+                    "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
+                }
+            )
             return "rang"
 
         class _Session:
             def __call__(self):
                 return self
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 pass
+
             def query(self, model):
                 name = getattr(model, "__tablename__", str(model))
                 if "mailbox" in name.lower():
@@ -288,10 +301,16 @@ class TestF186ReconcilerPassesFlag:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in (
-                    "supervisor.mailbox_pull", "supervisor.teammate_push",
-                    "supervisor.wake.native",
-                ) else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -307,9 +326,6 @@ class TestF186ReconcilerPassesFlag:
                     "id": "sup-001",
                     "metadata": {"cc_team_inbox_path": str(inbox_path)},
                 },
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -335,12 +351,10 @@ class TestF186ReconcilerPassesFlag:
             svc.reconcile_pull_mode_notifications()
 
         # The ride-along must have fired with the bypass flag
-        assert len(doorbell_calls) == 1, (
-            f"Expected 1 doorbell call, got {len(doorbell_calls)}"
-        )
-        assert doorbell_calls[0]["caller_holds_no_delivery_lock"] is True, (
-            "Reconciler ride-along must pass caller_holds_no_delivery_lock=True"
-        )
+        assert len(doorbell_calls) == 1, f"Expected 1 doorbell call, got {len(doorbell_calls)}"
+        assert (
+            doorbell_calls[0]["caller_holds_no_delivery_lock"] is True
+        ), "Reconciler ride-along must pass caller_holds_no_delivery_lock=True"
         assert doorbell_calls[0]["terminal_id"] == "sup-001"
         assert doorbell_calls[0]["max_row_id"] == 10
         assert doorbell_calls[0]["written_count"] == 1
@@ -367,14 +381,23 @@ class TestF186ReconcilerPassesFlag:
 
         doorbell_results = []
 
-        def _capture_ring(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
+        def _capture_ring(
+            terminal_id,
+            max_row_id,
+            *,
+            written_count=0,
+            caller_holds_no_delivery_lock=False,
+            **kwargs,
+        ):
             """Intercept the doorbell call and verify the flag."""
-            doorbell_results.append({
-                "terminal_id": terminal_id,
-                "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
-                # Verify the lock IS held (reproducing the defect scenario)
-                "lock_would_block": not real_lock.acquire(blocking=False),
-            })
+            doorbell_results.append(
+                {
+                    "terminal_id": terminal_id,
+                    "caller_holds_no_delivery_lock": caller_holds_no_delivery_lock,
+                    # Verify the lock IS held (reproducing the defect scenario)
+                    "lock_would_block": not real_lock.acquire(blocking=False),
+                }
+            )
             # If we did acquire it, release immediately
             if not doorbell_results[-1]["lock_would_block"]:
                 real_lock.release()
@@ -383,10 +406,13 @@ class TestF186ReconcilerPassesFlag:
         class _Session:
             def __call__(self):
                 return self
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 pass
+
             def query(self, model):
                 name = getattr(model, "__tablename__", str(model))
                 if "mailbox" in name.lower():
@@ -400,10 +426,16 @@ class TestF186ReconcilerPassesFlag:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in (
-                    "supervisor.mailbox_pull", "supervisor.teammate_push",
-                    "supervisor.wake.native",
-                ) else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -440,12 +472,11 @@ class TestF186ReconcilerPassesFlag:
         assert len(doorbell_results) == 1
         assert doorbell_results[0]["caller_holds_no_delivery_lock"] is True
         # Confirm the lock was indeed held (reproducing the AC12 scenario)
-        assert doorbell_results[0]["lock_would_block"] is True, (
-            "The delivery lock should have been held, reproducing the F186 scenario"
-        )
+        assert (
+            doorbell_results[0]["lock_would_block"] is True
+        ), "The delivery lock should have been held, reproducing the F186 scenario"
 
         real_lock.release()
-
 
 
 # ===========================================================================
@@ -472,9 +503,7 @@ class TestF186GateFoldS1M2:
         — proving G2+ stays active under the flag.
         """
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
-            ) as mock_config,
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
                 return_value=True,
@@ -482,9 +511,6 @@ class TestF186GateFoldS1M2:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
                 return_value={"metadata": {"recovery_state": "rebinding"}},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.receiver_state_view.native_probe",
@@ -507,10 +533,12 @@ class TestF186GateFoldS1M2:
                 if path == "supervisor.doorbell":
                     return True
                 return True
+
             mock_config.get.side_effect = _cfg
 
             # G4-G6: Probe returns IDLE (would pass if G2 didn't stop it)
             from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
             probe = MagicMock()
             probe.status = TerminalStatus.IDLE
             probe.meta = {}
@@ -518,10 +546,13 @@ class TestF186GateFoldS1M2:
 
             # G5: inject_safe returns safe (would pass if G2 didn't stop it)
             from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
             mock_inject.return_value = InjectSafetyResult("safe")
 
             result = ring_supervisor_doorbell(
-                "sup-001", 42, written_count=1,
+                "sup-001",
+                42,
+                written_count=1,
                 caller_holds_no_delivery_lock=True,
             )
 
@@ -548,9 +579,7 @@ class TestF186GateFoldS2M4:
         mock_lock.acquire.return_value = True  # lock acquired successfully
 
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
-            ) as mock_config,
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
                 return_value=True,
@@ -558,9 +587,6 @@ class TestF186GateFoldS2M4:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
                 return_value={"metadata": {}},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
@@ -580,26 +606,32 @@ class TestF186GateFoldS2M4:
                 "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
             ),
         ):
+
             def _cfg(path, default=None, override=None):
                 if path == "supervisor.wake.native":
                     return False
                 if path == "supervisor.doorbell":
                     return True
                 return True
+
             mock_config.get.side_effect = _cfg
 
             # Probe returns IDLE
             from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
             probe = MagicMock()
             probe.status = TerminalStatus.IDLE
             probe.meta = {}
             mock_probe.return_value = probe
 
             from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
             mock_inject.return_value = InjectSafetyResult("safe")
 
             result = ring_supervisor_doorbell(
-                "sup-001", 42, written_count=1,
+                "sup-001",
+                42,
+                written_count=1,
                 caller_holds_no_delivery_lock=False,
             )
 

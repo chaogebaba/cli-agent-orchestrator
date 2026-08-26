@@ -53,10 +53,8 @@ def _reset_doorbell_state():
     """Reset doorbell module state between tests."""
     import cli_agent_orchestrator.services.doorbell_service as ds
 
-    ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
     yield
-    ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
 
 
@@ -72,9 +70,6 @@ def mock_gates():
         patch(
             "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
         ) as mock_meta,
-        patch(
-            "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-        ) as mock_update,
         patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
         patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_probe,
         patch(
@@ -103,7 +98,6 @@ def mock_gates():
         mock_config._cfg_overrides = _cfg_overrides
         mock_should.return_value = True  # registered
         mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
-        mock_update.return_value = None
 
         mock_lock = MagicMock()
         mock_lock.acquire.return_value = True
@@ -134,7 +128,6 @@ def mock_gates():
             "config": mock_config,
             "should_push": mock_should,
             "meta": mock_meta,
-            "update_meta": mock_update,
             "lock_fn": mock_lock_fn,
             "lock": mock_lock,
             "probe": mock_probe,
@@ -247,16 +240,12 @@ class TestAC5RefusedLeavesCursorUnchanged:
     """A gate-refused nudge leaves last_doorbell_row_id unchanged."""
 
     def test_gate_refusal_preserves_cursor(self, mock_gates):
-        from cli_agent_orchestrator.services.doorbell_service import (
-            ring_supervisor_doorbell,
-            _get_last_doorbell_row_id,
-        )
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
 
         # Make the lock refuse (G1 failure)
         mock_gates["lock"].acquire.return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
-        assert _get_last_doorbell_row_id("term-01") == 0
         # Now allow it — should ring at 100 since cursor not advanced
         mock_gates["lock"].acquire.return_value = True
         result2 = ring_supervisor_doorbell("term-01", 100, written_count=1)
@@ -1048,9 +1037,6 @@ class TestFix5TmuxFallback:
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ) as mock_update,
-            patch(
                 "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
             ) as mock_lock_fn,
             patch(
@@ -1074,7 +1060,6 @@ class TestFix5TmuxFallback:
             )
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
-            mock_update.return_value = None
 
             mock_lock = MagicMock()
             mock_lock.acquire.return_value = True
@@ -1112,9 +1097,6 @@ class TestFix5TmuxFallback:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
             ) as mock_lock_fn,
@@ -1167,9 +1149,6 @@ class TestFix5TmuxFallback:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
             ) as mock_lock_fn,

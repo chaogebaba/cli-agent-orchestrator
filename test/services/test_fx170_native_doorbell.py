@@ -167,10 +167,8 @@ def _reset_doorbell_state():
     """Reset doorbell module state between tests."""
     import cli_agent_orchestrator.services.doorbell_service as ds
 
-    ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
     yield
-    ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
 
 
@@ -655,9 +653,6 @@ class TestAC7NativeRingIndependentOfTeammatePush:
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="rang",
             ) as mock_native,
@@ -1031,9 +1026,6 @@ class TestAC12FallbackFanIn:
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value=native_reason,
             ),
@@ -1133,9 +1125,6 @@ class TestAC14Dedup:
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="rang",
             ),
@@ -1161,9 +1150,6 @@ class TestAC14Dedup:
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
-            patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="rang",
             ) as mock_native,
@@ -1184,9 +1170,6 @@ class TestAC14Dedup:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="version_out_of_band",
@@ -1221,9 +1204,6 @@ class TestAC14Dedup:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="rang",
@@ -1262,9 +1242,6 @@ class TestAC15ConfigMatrix:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
             ) as mock_native,
@@ -1305,9 +1282,6 @@ class TestAC15ConfigMatrix:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
             ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
-            ),
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
             ) as mock_native,

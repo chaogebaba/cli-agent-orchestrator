@@ -21,9 +21,7 @@ import time
 from typing import Optional
 
 from cli_agent_orchestrator.clients.database import (
-    get_terminal_last_doorbell_row_id,
     get_terminal_metadata,
-    set_terminal_last_doorbell_row_id,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -35,23 +33,6 @@ DOORBELL_NUDGE_TEXT = "[cao] You have new callback message(s). Run any command t
 # D12: rate-limited WARN — one per terminal per 60s.
 _last_warn_time: dict[str, float] = {}
 _WARN_INTERVAL_S = 60.0
-
-
-# F476 D8: Stubs for removed cursor functions — retained as patch targets.
-_last_doorbell_row_id: dict[str, int] = {}
-_last_doorbell_lock = threading.Lock()
-
-
-def _get_last_doorbell_row_id(terminal_id: str) -> int:  # pragma: no cover — stub
-    """F476: STUB — returns 0. Retained as patch target for legacy tests."""
-    with _last_doorbell_lock:
-        return _last_doorbell_row_id.get(terminal_id, 0)
-
-
-def _persist_last_doorbell_row_id(terminal_id: str, row_id: int) -> None:  # pragma: no cover
-    """F476: STUB — no-op. Retained as patch target for legacy tests."""
-    with _last_doorbell_lock:
-        _last_doorbell_row_id[terminal_id] = row_id
 
 
 def _rate_limited_warn(terminal_id: str, reason: str, row_id: int) -> None:

@@ -187,24 +187,3 @@ class TestFileLevelDedup:
 # ---------------------------------------------------------------------------
 # Test 5: Doorbell dedup column isolation
 # ---------------------------------------------------------------------------
-
-
-class TestDoorbellColumnIsolation:
-    """F476: Doorbell dedup is now server-side; stubs use in-memory dict only."""
-
-    def test_persist_and_read_doorbell_row_id(self):
-        """Stubs use in-memory dict (no DB interaction per F476 D8)."""
-        from cli_agent_orchestrator.services.doorbell_service import (
-            _get_last_doorbell_row_id,
-            _last_doorbell_row_id,
-            _persist_last_doorbell_row_id,
-        )
-
-        tid = "doorbell-test-01"
-        _last_doorbell_row_id.pop(tid, None)
-
-        assert _get_last_doorbell_row_id(tid) == 0
-        _persist_last_doorbell_row_id(tid, 999)
-        assert _last_doorbell_row_id[tid] == 999
-
-        _last_doorbell_row_id.pop(tid, None)

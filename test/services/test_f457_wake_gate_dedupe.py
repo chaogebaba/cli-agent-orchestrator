@@ -18,7 +18,6 @@ import pytest
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
-
 _NOW = datetime(2026, 8, 25, 12, 0, 0, tzinfo=timezone.utc)
 _TERMINAL_ID = "f457t001"
 _SENDER_ID = "f457s001"
@@ -64,9 +63,7 @@ def _deliver_with_patches(
         patch(
             "cli_agent_orchestrator.services.config_service.ConfigService.get"
         ) as mock_config_get,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}
-        ),
+        patch("cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}),
         patch(
             "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
             MagicMock(),
@@ -91,6 +88,7 @@ def _deliver_with_patches(
             if key == "supervisor.teammate_push":
                 return True
             return default
+
         mock_config_get.side_effect = _config_get
 
         # Dedupe re-check
@@ -138,10 +136,12 @@ class TestAC2AckedRowNoWake:
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
-            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
-            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
-            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_last_doorbell_row_id", return_value=0),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
+            ) as mock_native,
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending"
             ) as mock_row_pending,
