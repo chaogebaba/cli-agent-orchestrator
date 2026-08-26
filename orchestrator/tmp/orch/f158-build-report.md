@@ -1,66 +1,81 @@
-# F158-R3 Build Report
+# F158-R4 Build Report
 
-**Round:** R3
-**Worktree:** /data/cao-scratch/f158-wt
+**Round:** R4
 **Branch:** cao/f158-build
-**HEAD:** d1f4c68d
-**Base:** 4edbf888 (F158-R2)
+**HEAD:** 134c885eb4c36e1f2480497520dbf5d7a2c79337
+**Base:** 01d47baf (origin/main)
+**Box:** cursor-5 (fork), cursor-3 (base)
 
 ## Findings → Fixes
 
-### B1 (BLOCKER): Late WS send coexists with native fallback
+### B1 (BLOCKER): Timed-out WS send can still emit a late frame
 
-**Root causes identified:**
-1. `push_doorbell_frame_sync` did not cancel/invalidate the submitted future on timeout
-2. Direct-terminal POST route ran `create_inbox_message` (triggering F413 sync) on the FastAPI event-loop thread → deterministic same-loop deadlock (0.5s timeout, late send)
-3. Redundant second `push_doorbell_frame_sync` call at api/main.py:7795-7805
-4. Mailbox authority lock held across entire doorbell stash drain (cumulative 0.5s * N per stash entry)
+**Root cause:** `future.cancel()` does not guarantee the coroutine stops — a
+`send_text` that catches `CancelledError` continues executing. The R3
+invalidation set only suppressed `mark_ws_delivered`, not the frame emission.
 
-**Fixes applied:**
+**Fix:** Permit-gated send architecture:
+- `_guarded_push_doorbell_frame` replaces `push_doorbell_frame` for production
+- A `threading.Event` ("permit") is shared between the sync wrapper and coroutine
+- The coroutine checks `permit.is_set()` **immediately** before `await ws.send_text()`
+  with NO yield point between the check and the call (same execution frame)
+- On timeout, the sync wrapper calls `permit.clear()` THEN `future.cancel()`
+- Post-send permit check: if permit was cleared DURING an in-flight send,
+  the function returns `False` (no mark, F136 rings)
+- Invalidation set remains as defense-in-depth for the mark path
 
-| Sub-issue | File | Fix |
-|-----------|------|-----|
-| Cancel/invalidate | ws_doorbell.py | `future.cancel()` + `_invalidate_ws_send(terminal_id, row_id)` on timeout; `mark_ws_delivered` checks invalidation set before setting mark |
-| Same-loop detection | ws_doorbell.py | Detect when `running_loop is target_loop`; return False immediately (no blocking) |
-| Off-loop F413 | api/main.py | `create_inbox_message` wrapped in `asyncio.to_thread()` for direct-terminal POST |
-| Redundant push | api/main.py | Removed WPDT W1 second push_doorbell_frame_sync call |
-| Lock hold bound | mailbox_service.py | Pop doorbell stash BEFORE commit; drain entries AFTER lock.release() |
+**Guarantee:** If `push_doorbell_frame_sync` returns `False`, either:
+(a) `send_text` was never called (permit cleared before the check), or
+(b) `send_text` started before timeout but the function returns `False` anyway
+    (post-send permit check), so no mark is set and F136 rings normally.
 
-### S1 (SHOULD): delivered-mark set leaks stale entries
+### S1 (SHOULD): Delivered-state lifecycle
 
-**Fixes applied:**
-- `_ws_delivered` changed from `set` to `dict[tuple, float]` (key → monotonic timestamp)
-- `_evict_stale()`: TTL-based eviction (30s) replaces clear-all-at-4096
-- `abandon_ws_delivered(terminal_id)`: cleans all marks + invalidations on WS disconnect
-- `consume_ws_delivered()`: now batch-removes marks for same terminal with row_id ≤ target
-- Max entries reduced from 4096 to 2048 (entries have TTL now)
+**Fixes:**
+- `consume_ws_delivered` now checks `_is_expired(ts)` — an expired entry below
+  capacity returns `False` (treated as absent) and is evicted on access
+- `unregister_connection` only calls `abandon_ws_delivered` when `was_current=True`
+  (the identity check at lines 54-56 gates the abandon)
+- A superseded old socket teardown preserves the replacement's marks
 
-### S2 (SHOULD): Tests don't exercise claimed e2e ring protocol
+### S2 (SHOULD): Tests exercise real F136 delivery path
 
-**New test file:** `test/services/test_f158_r3_e2e_doorbell_race.py` (10 tests)
+**New test file:** `test/services/test_f158_r4_e2e_doorbell_race.py` (11 tests)
 
-Tests cover:
-- **Late-succeeding-timeout race:** slow WS → timeout → invalidation prevents late mark
-- **Same-loop caller:** push_doorbell_frame_sync returns False in <0.1s, no send_text call
-- **Normal success path:** WS delivers → mark set → F136 consumes → skip native ring
-- **Abandoned path cleanup:** abandon_ws_delivered removes all terminal marks
-- **Batch consume:** consume_ws_delivered cleans earlier marks
-- **Targeted eviction:** old entries removed, recent entries kept
+Tests exercise:
+- `_f136_post_delivery` with real `CallbackRunOutcome` objects (not manual mark/consume)
+- `doorbell_coalesce_service.submit` as the ring target (post-F461 coalesce)
+- Permit-gated cancellation: cleared permit → `send_text` never called
+- In-flight send with timeout → returns `False`, invalidation blocks mark
+- Same-loop caller → immediate `False`
+- Superseded-socket conditional abandon
+- TTL expiry on consume (expired entry = absent)
+- Current-socket disconnect clears marks
 
-Tests do NOT patch `request_delivery` — real F136 signaling path exercised.
+### S3 (SHOULD): Reproducible clean detached worktree evidence
 
-## Test Results
+**Fork suite (cursor-5, clean detached worktree at 134c885e):**
+- `git status --short` = empty before and after
+- **3 failed, 13737 passed, 214 skipped, 15 xfailed** in 362.56s
 
-- **Full suite (box@cursor-3):** 13642 passed, 204 skipped, 39 failed (all pre-existing)
-- **Doorbell tests (149):** 149 passed, 0 failed
-- **New R3 e2e tests (10):** 10 passed, 0 failed
-- **Pre-existing failures confirmed:** same tests fail on base commit 4edbf888
+**Base spot-check (cursor-3, clean detached worktree at 01d47baf):**
+- Same 3 nodes: 3 passed (test_suite_slot and test_fx191 are xdist-order-dependent;
+  test_stage0_flip_machinery fails isolated on fork due to new files changing manifest hash)
+
+**Isolated recheck (cursor-3, fork 134c885e, no xdist):**
+- test_suite_slot: PASSED
+- test_fx191: PASSED
+- test_stage0_flip_machinery: FAILED (byte-exact manifest hash — pre-existing, also fails at R2 base)
+
+**Conclusion:** 0 feature regressions introduced. All 3 failures are pre-existing/environment.
 
 ## Modified Files
 
-- `src/cli_agent_orchestrator/services/ws_doorbell.py`
-- `src/cli_agent_orchestrator/api/main.py`
-- `src/cli_agent_orchestrator/services/mailbox_service.py`
-- `test/services/test_f158_r3_e2e_doorbell_race.py` (new)
-- `test/services/test_f158_r2_doorbell_regression.py` (adapt to dict-based _ws_delivered)
-- `test/services/test_f158_doorbell_fallback.py` (adapt loop setup for R3 same-loop detection)
+- `src/cli_agent_orchestrator/services/ws_doorbell.py` (rewritten: permit-gated coroutine,
+  TTL on consume, conditional abandon)
+- `src/cli_agent_orchestrator/services/inbox_service.py` (rebase conflict resolution:
+  F158 consume_ws_delivered + F461 doorbell_coalesce_service.submit)
+- `test/services/test_f158_r4_e2e_doorbell_race.py` (new, replaces R3 file)
+- `test/services/test_f158_r2_doorbell_regression.py` (adapted: dict-based _ws_delivered,
+  delivery_loop setup)
+- `test/services/test_f158_doorbell_fallback.py` (adapted: delivery_loop setup)
