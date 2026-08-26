@@ -1141,6 +1141,9 @@ class TestF491ResumeWorkingDirectoryRule:
             ],
         )
 
+        # Set fresh screen for the effect barrier confirmation
+        _set_fresh_screen(monkeypatch, engine, self.RESUME_CWD_SCREEN)
+
         result = engine.on_screen("term1", FakeProvider(), self.RESUME_CWD_SCREEN)
         # Rule fires (returns None, not an override status)
         assert result is None
@@ -1286,12 +1289,8 @@ class TestF491DeferredInitDialogWait:
                 return None
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.terminal_service.status_monitor",
+            "cli_agent_orchestrator.services.status_monitor.status_monitor",
             FakeStatusMonitor(),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.auto_responder.auto_responder",
-            ar.AutoResponder(),
         )
 
         # Patch asyncio.sleep to avoid real delays
@@ -1336,7 +1335,7 @@ class TestF491DeferredInitDialogWait:
                 return None
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.terminal_service.status_monitor",
+            "cli_agent_orchestrator.services.status_monitor.status_monitor",
             FakeStatusMonitor(),
         )
         monkeypatch.setattr(
