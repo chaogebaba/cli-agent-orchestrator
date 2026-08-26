@@ -41,7 +41,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -71,7 +71,7 @@ class _MarkerState:
 class QuestionStateService:
     """Owns question-open truth for all terminals; process singleton."""
 
-    _clock: "callable" = time.monotonic
+    _clock: Callable[[], float] = time.monotonic
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _markers: dict[str, _MarkerState] = field(default_factory=dict)
 

@@ -43,7 +43,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -98,7 +98,7 @@ class _PaneState:
 class PaneLivenessService:
     """The single liveness sampler; process singleton."""
 
-    _clock: "callable" = time.monotonic
+    _clock: Callable[[], float] = time.monotonic
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _state: dict[str, _PaneState] = field(default_factory=dict)
 
@@ -277,9 +277,12 @@ class PaneLivenessService:
                 return False
         except Exception:
             pass
-        if monitor is None:
-            from cli_agent_orchestrator.services.status_monitor import status_monitor as monitor  # type: ignore[assignment]
-        published = monitor.get_published_status(terminal_id)
+        resolved_monitor = monitor
+        if resolved_monitor is None:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            resolved_monitor = status_monitor
+        published = resolved_monitor.get_published_status(terminal_id)
         return published in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
     # ---- eviction ---------------------------------------------------------
