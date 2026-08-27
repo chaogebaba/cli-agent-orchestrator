@@ -195,3 +195,28 @@ def test_ac2b_delivery_arm_scrolling_banner_does_not_raise_dialog_open_error(mon
     )
     dg._consult_dialog_before_send("term-banner", _NoHazard())
     auto_responder.clear_terminal("term-banner")
+
+
+
+def test_no_history_hold_requests_exactly_one_retry(monkeypatch, tmp_path):
+    """F516 D6 (GATE-NO BLOCKER-1 fix): the no-history HOLD branch
+    (auto_responder no_history_hold arm) MUST request exactly one D4
+    detection retry — the second capture is what decides the held dialog. This
+    is the coverage that the c4-staged test_no_history_hold_requests_a_retry
+    asserted before D6 existed; it belongs here in the c6-staged file where the
+    HOLD mechanism actually lands. Mutation guard: deleting the
+    self._request_detection_retry(terminal_id) call in the no-history HOLD branch
+    makes this test fail (assert [] == ['term1'])."""
+    screen = DialogReplay("resume-chooser-61e1b848").final_rows()
+    metadata = _metadata()
+    backend = _backend(screen)
+    retries: list[str] = []
+    _wire(monkeypatch, metadata, backend, retries)
+    monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+    engine = AutoResponder()
+    provider = _StatusProvider(TerminalStatus.IDLE)  # uncorroborated → HOLD
+
+    # Eval 1: no history yet → HOLD, no keys, EXACTLY one retry requested.
+    assert engine.on_screen("term1", provider, screen) is None
+    backend.send_special_key.assert_not_called()
+    assert retries == ["term1"]

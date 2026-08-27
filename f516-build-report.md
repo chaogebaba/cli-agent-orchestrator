@@ -85,7 +85,43 @@ sweep at HEAD: **243 passed** (1 skipped, 2 xfailed), 0 failed.
 
 **None from the blueprint's decisions, §6 wall, or 8-commit staging.**
 
-### Restage note (F524 #379 — supervisor-side late-delivery defect)
+### GATE-NO BLOCKER-1 fix (additive commit, recorded deviation)
+
+The diff gate returned GATE-NO with one blocking, test-only finding (production
+code not in question): the c4→c6 relocation of the no-history-HOLD retry-request
+coverage was incomplete. My earlier "subsumed elsewhere" conclusion was wrong —
+mutation testing proved the HOLD-branch retry call (`auto_responder.py`, the
+`not had_history` arm → `self._request_detection_retry(terminal_id)`) had ZERO
+tests behind it: deleting that call left 100 F516/pinned tests green, while the
+busy_veto control mutation was caught. A live production call with no test is a
+genuine coverage regression; "cannot be staged in the c4 file" (true under
+option-B staging, since the HOLD does not exist until c6) does NOT imply "already
+covered."
+
+FIX (test-only, no production change): added
+`test_auto_responder_f516_d6::test_no_history_hold_requests_exactly_one_retry`
+to the c6-staged file (where the HOLD mechanism lands), asserting the eval-1 HOLD
+requests exactly one `schedule_detection_retry`.
+
+**RECORDED DEVIATION (supervisor-authorized):** this fix lands as an ADDITIVE
+commit ON TOP OF the c8 chain (after `98063608`), not inside c6. The supervisor
+explicitly accepted this deviation from blueprint staging purity over the risk of
+a third full-chain rebase (history rewrites had already cost two rounds and hand
+the reviewer a moving target). So the HOLD-retry assertion arrives after c8 rather
+than at c6; every other commit (c1-c8) is byte-unchanged.
+
+MUTATION-PROBE RESULT (reproduced on a scratch mutation of HEAD, then restored):
+deleting the no-history-HOLD `_request_detection_retry` call makes the new test
+FAIL with `assert [] == ['term1']` (the same signature as the reviewer's sound
+busy_veto control); the busy_veto control test still passes under that mutation,
+confirming the new test covers the HOLD edge specifically. Production source was
+restored byte-identical after the probe.
+
+AC7 red-window UNDISTURBED: an additive tip commit does not alter the immutable
+commit objects c3 (`fdf3267c`) … c8 (`01b38113`), so test_m3 remains RED at
+c3-c5 and GREEN from c6 by construction (independently re-verified this round).
+
+
 
 This branch was built TWICE in good faith due to a delivery defect on the
 supervisor side (filed F524 #379, P0): the "take (B)" ruling (inbox msg 1210,
