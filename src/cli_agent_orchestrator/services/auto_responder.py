@@ -129,6 +129,32 @@ class DialogRegion:
     normalized: str
 
 
+def _digest_normalized(normalized: str) -> str:
+    """Stable digest over the whitespace-collapsed region string.
+
+    F516 D2(i) digest-domain rule (r5-B1): digests are ALWAYS computed over
+    ``DialogRegion.normalized`` (the flattened string), never over ``rows`` —
+    the pyte-composite and tmux-viewport capture paths pad rows differently, so
+    a rows-domain digest never matches on a static pane.
+    """
+    import hashlib
+
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RuleMatchVerdict:
+    """F516 D3p: result of ``AutoResponder.match_verdict`` for a consult caller.
+
+    Metadata-free and privates-free so it can cross the draft_guard / wait-site
+    boundary without leaking responder internals.
+    """
+
+    rule_name: str
+    region_digest: str  # normalized-domain digest (D2(i) rule)
+    matched_region_rows: tuple[str, ...]
+
+
 def dialog_region(screen: List[str]) -> DialogRegion:
     """Return the rendered dialog-bearing tail without normalizing provider input."""
     end = len(screen)
@@ -296,6 +322,37 @@ class AutoResponder:
     def waiting_gate(self, terminal_id: str) -> str | tuple[str, str] | None:
         with self._lock:
             return self._waiting_gate_locked(terminal_id)
+
+    def match_verdict(
+        self, provider_name: str, lines: List[str]
+    ) -> "RuleMatchVerdict | None":
+        """F516 D3p: whitelist text-match verdict for a consult caller.
+
+        Handed pre-captured ``lines`` (this never captures itself). Computes the
+        dialog region and the normalized whitelist match against the provider's
+        rules and returns a metadata-free ``RuleMatchVerdict`` for the first
+        matching non-wait rule, or ``None`` when nothing matches. Provider dialog
+        classification is a SEPARATE consult (consult (a)) — this never calls
+        ``_classify_region``. Wait-rules (human-gated) are treated as a match for
+        deferral purposes: a wait dialog on screen must also defer a paste.
+
+        The D6 still-moving banner-mark suppression (returning ``None`` for a
+        scrolling banner) is wired in commit 6 once the per-terminal pre-filter
+        verdict cache exists; between commit 2 and commit 6 every match on the
+        consult path defers (ACCEPTED INTERIM, blueprint r8-S2).
+        """
+        region = dialog_region(lines)
+        if not region.normalized:
+            return None
+        for rule in _store.get_rules(provider_name):
+            if not rule.matches(region.normalized):
+                continue
+            return RuleMatchVerdict(
+                rule_name=rule.name,
+                region_digest=_digest_normalized(region.normalized),
+                matched_region_rows=region.rows,
+            )
+        return None
 
     def record_published_status(self, terminal_id: str, status: TerminalStatus) -> None:
         try:

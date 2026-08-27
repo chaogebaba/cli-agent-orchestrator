@@ -104,7 +104,7 @@ def test_all_rule_match_call_sites_receive_a_dialog_region_normalized_value():
         and node.func.attr == "matches"
     ]
 
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert all(
         len(call.args) == 1
         and isinstance(call.args[0], ast.Attribute)

@@ -41,7 +41,7 @@ INCIDENTS = {
 
 def main() -> None:
     sources_lines = ["# F516 fixture sources (commit 1)\n"]
-    sums_lines = []
+    new_sums = {}  # fname -> digest
     for incident, (log_id, cuts) in INCIDENTS.items():
         raw = (LOG_DIR / f"{log_id}.log").read_text(encoding="utf-8", errors="replace")
         frames = []
@@ -50,21 +50,35 @@ def main() -> None:
             prefix = raw[:end]
             fname = f"{incident}-frame-{idx:02d}.ansi.txt"
             (OUT / fname).write_text(prefix, encoding="utf-8")
-            digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
-            sums_lines.append(f"{digest}  {fname}")
+            new_sums[fname] = hashlib.sha256(prefix.encode("utf-8")).hexdigest()
             frames.append({"file": fname, "offset_s": offset_s})
         manifest = {"incident": incident, "cols": COLS, "rows": ROWS, "frames": frames}
         (OUT / f"{incident}-manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         final_rows = compose_ansi_to_lines(raw[: int(len(raw) * cuts[-1][0])], COLS, ROWS)
-        preview = next((l.strip() for l in final_rows if l.strip()), "")
+        preview = next((line.strip() for line in final_rows if line.strip()), "")
         sources_lines.append(
             f"- {incident}: from logs/terminal/{log_id}.log "
             f"(reaped 2026-08-26); final-frame first-row: {preview[:70]!r}\n"
         )
     (OUT / "FIXTURE-SOURCES.md").write_text("".join(sources_lines), encoding="utf-8")
-    (OUT / "SHA256SUMS.f516").write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
+
+    # Merge into the single SHA256SUMS the existing test_codex_dialog_screens
+    # manifest-hash test validates against ALL *.ansi.txt in this dir. Preserve
+    # pre-existing (non-F516) entries; overwrite/add the F516 frame hashes.
+    sums_path = OUT / "SHA256SUMS"
+    existing = {}
+    if sums_path.exists():
+        for line in sums_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            digest, name = line.split(maxsplit=1)
+            existing[name] = digest
+    existing.update(new_sums)
+    merged = "\n".join(f"{existing[name]}  {name}" for name in sorted(existing)) + "\n"
+    sums_path.write_text(merged, encoding="utf-8")
     print("wrote", len(INCIDENTS), "incident frame-sequences")
 
 
