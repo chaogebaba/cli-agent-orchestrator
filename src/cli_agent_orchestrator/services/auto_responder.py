@@ -313,6 +313,20 @@ class _UnknownDialogState:
     last_push_at: float = field(default=-UNKNOWN_DIALOG_PUSH_FLOOR_S)
 
 
+VETO_STREAK_THRESHOLD = 5
+VETO_STREAK_PUSH_FLOOR_S = 300.0
+
+
+@dataclass
+class _VetoStreakState:
+    """F516 D6: consecutive match-but-vetoed eval counter with its own push
+    floor. Reset edges: fire, pane output, episode close."""
+
+    count: int = 0
+    episode_open: bool = False
+    last_push_at: float = field(default=-VETO_STREAK_PUSH_FLOOR_S)
+
+
 class AutoResponder:
     """Whitelist-only engine: fires ``answer`` keys for matched rules,
     surfaces everything else as WAITING_USER_ANSWER.
@@ -331,6 +345,12 @@ class AutoResponder:
         # confirms the dialog cleared; the barrier refuses to re-fire a digest
         # already consumed. Purged in clear_terminal by terminal prefix.
         self._consumed_digests: Dict[tuple, str] = {}
+        # F516 D6: last-2 DialogRegion captures per terminal (scroll-exclusion
+        # history), the per-terminal cached banner verdict for the current eval,
+        # and the veto-streak state. All purged in clear_terminal.
+        self._region_history: Dict[str, list[DialogRegion]] = {}
+        self._prefilter_verdict: Dict[str, bool] = {}
+        self._veto_streak: Dict[str, _VetoStreakState] = {}
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -360,7 +380,7 @@ class AutoResponder:
             return self._waiting_gate_locked(terminal_id)
 
     def match_verdict(
-        self, provider_name: str, lines: List[str]
+        self, provider_name: str, lines: List[str], terminal_id: str | None = None
     ) -> "RuleMatchVerdict | None":
         """F516 D3p: whitelist text-match verdict for a consult caller.
 
@@ -369,20 +389,41 @@ class AutoResponder:
         rules and returns a metadata-free ``RuleMatchVerdict`` for the first
         matching non-wait rule, or ``None`` when nothing matches. Provider dialog
         classification is a SEPARATE consult (consult (a)) — this never calls
-        ``_classify_region``. Wait-rules (human-gated) are treated as a match for
-        deferral purposes: a wait dialog on screen must also defer a paste.
+        ``_classify_region``.
 
-        The D6 still-moving banner-mark suppression (returning ``None`` for a
-        scrolling banner) is wired in commit 6 once the per-terminal pre-filter
-        verdict cache exists; between commit 2 and commit 6 every match on the
-        consult path defers (ACCEPTED INTERIM, blueprint r8-S2).
+        ``terminal_id`` (optional) enables the D6 banner path: the cached
+        scroll-exclusion mark is honored ONLY while this consult's fresh region
+        still differs from the newest history entry (a still-scrolling banner),
+        in which case ``None`` is returned so the consult does NOT defer (C4).
         """
+        terminal_id_key = terminal_id
         region = dialog_region(lines)
         if not region.normalized:
             return None
         for rule in _store.get_rules(provider_name):
             if not rule.matches(region.normalized):
                 continue
+            # D6 banner path (r8-B/r9-S1): the cached banner-mark is HONORED ONLY
+            # WHILE THE REGION IS STILL MOVING — this consult's fresh region
+            # still differs from the newest history entry, compared in the
+            # NORMALIZED domain. A STATIC region is dialog-eligible whatever the
+            # mark → return the verdict and let the consult DEFER.
+            #   static + match            → defer (return verdict)
+            #   moving + banner-mark      → None  (C4: don't stall on a banner)
+            #   moving + no-mark/no-cache → defer (return verdict)
+            with self._lock:
+                banner_mark = self._prefilter_verdict.get(terminal_id_key)
+                history = (
+                    self._region_history.get(terminal_id_key, []) if terminal_id_key else []
+                )
+                newest = history[-1] if history else None
+            still_moving = (
+                newest is not None
+                and _digest_normalized(newest.normalized)
+                != _digest_normalized(region.normalized)
+            )
+            if banner_mark and still_moving:
+                return None
             return RuleMatchVerdict(
                 rule_name=rule.name,
                 region_digest=_digest_normalized(region.normalized),
@@ -418,6 +459,9 @@ class AutoResponder:
             self._retry_exhausted.discard(terminal_id)
             self._unknown_state.pop(terminal_id, None)
             self._exit_suppressed.discard(terminal_id)
+            self._region_history.pop(terminal_id, None)
+            self._prefilter_verdict.pop(terminal_id, None)
+            self._veto_streak.pop(terminal_id, None)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
             for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
@@ -517,6 +561,13 @@ class AutoResponder:
             return None
         supplied_status = self._classify_region(terminal_id, provider, region)
         incarnation = self._snapshot_incarnation(terminal_id, metadata)
+        # D6 (r4-B1): push the eval-entry region into the last-2 history EXACTLY
+        # ONCE per eval and compute this eval's scroll-exclusion (banner) verdict,
+        # cached per-terminal for D3's match_verdict. had_history reflects the
+        # state BEFORE this push (the no-history HOLD needs the prior state).
+        with self._lock:
+            had_history = bool(self._region_history.get(terminal_id))
+        banner_marked = self._push_region_history(terminal_id, region)
 
         for rule in _store.get_rules(provider_name):
             if not rule.matches(region.normalized):
@@ -539,25 +590,40 @@ class AutoResponder:
             if self._busy_veto(supplied_status):
                 self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
                 # D4: a busy-veto on a MATCHED rule is a vetoed eval — request a
-                # retry (r3-B4; it counts toward D6's veto streak in c6).
+                # retry (r3-B4). D6: it also counts toward the veto streak.
+                self._note_veto_streak(terminal_id, metadata, incarnation)
                 self._request_detection_retry(terminal_id)
                 continue
-            # D2: classifier status is a fast-path corroborator only, NEVER a
-            # veto. The ONE retained exception is _busy_veto (PROCESSING),
-            # unchanged — the proven M1/F55 quoted-prose suppressor. The old
-            # _corroborates_fire veto (WAITING or dialog-proximity) is gone from
-            # the fire path; _has_dialog_proximity is retained but no longer
-            # consulted here (r5-S3). Region discipline + settle now gate the
-            # fire, both inside _effect_barrier. The D6 no-history HOLD /
-            # scroll-exclusion is added in commit 6; until then an uncorroborated
-            # match traverses the barrier and fires (AC7 test_m3 is expected RED
-            # for commits 3-5, green from commit 6 via D6's no-history HOLD).
+            # D6 fire-path decision for an UNCORROBORATED match (classifier not
+            # WAITING). The D2 classifier fast-path DISCHARGES all of this: a
+            # WAITING classification makes the match eligible on the FIRST eval.
+            #   - no history (first eval of a fresh region): HOLD, request one
+            #     D4 retry — the second capture decides (r3-B5).
+            #   - has history + banner-marked (region still moving = a scrolled
+            #     banner): SUPPRESS (C4 structural fix) — no keys, count a veto.
+            #   - has history + not banner-marked (static real dialog): eligible
+            #     → fall through and fire.
+            if supplied_status != TerminalStatus.WAITING_USER_ANSWER:
+                if not had_history:
+                    self._log_decision(terminal_id, "no_match", "no_history_hold", rule.name)
+                    self._clear_wait_rule(terminal_id)
+                    self._note_veto_streak(terminal_id, metadata, incarnation)
+                    self._request_detection_retry(terminal_id)
+                    return None
+                if banner_marked:
+                    self._log_decision(terminal_id, "no_match", "scroll_excluded", rule.name)
+                    self._clear_wait_rule(terminal_id)
+                    self._note_veto_streak(terminal_id, metadata, incarnation)
+                    self._request_detection_retry(terminal_id)
+                    return None
             self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name, rule.body_hash)
             if time.monotonic() < state.cooldown_until:
                 self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
             self._log_decision(terminal_id, "matched", "firing", rule.name)
+            # A real fire resets the veto streak for this terminal (r2-S5 edges).
+            self._reset_veto_streak(terminal_id)
             # D2(i)/D5: seed the pending-fire record's two digests, both over the
             # normalized-domain rule-loop region (r5-B1).
             match_digest = _digest_normalized(region.normalized)
@@ -1111,6 +1177,90 @@ class AutoResponder:
     @staticmethod
     def _busy_veto(status: TerminalStatus | None) -> bool:
         return status == TerminalStatus.PROCESSING
+
+    @staticmethod
+    def _scroll_excluded(old_rows: tuple[str, ...], new_rows: tuple[str, ...]) -> bool:
+        """F516 D6: is the newer region a SCROLLED banner rather than a dialog?
+
+        "Scrolled" (r3-S7): a maximal line-block present in BOTH captures' rows,
+        offset-independent, with ≥1 new non-empty row BELOW the block in the
+        newer capture. stdlib difflib.SequenceMatcher.get_matching_blocks — no
+        hand-rolled diff. The new-row-below test applies at the newer block end.
+        """
+        import difflib
+
+        if not old_rows or not new_rows:
+            return False
+        blocks = [
+            b
+            for b in difflib.SequenceMatcher(
+                None, list(old_rows), list(new_rows)
+            ).get_matching_blocks()
+            if b.size > 0
+        ]
+        if not blocks:
+            return False
+        largest = max(blocks, key=lambda b: b.size)
+        end_new = largest.b + largest.size
+        return any(row.strip() for row in new_rows[end_new:])
+
+    def _push_region_history(self, terminal_id: str, region: DialogRegion) -> bool:
+        """F516 D6: append the eval-entry region to the last-2 history and return
+        this eval's scroll-exclusion (banner) verdict, cached per-terminal for
+        D3's match_verdict. Called EXACTLY ONCE per eval from the rule-loop entry
+        capture (r4-B1) — never from barrier/retry captures."""
+        with self._lock:
+            history = self._region_history.get(terminal_id, [])
+            prev = history[-1] if history else None
+            banner = self._scroll_excluded(prev.rows, region.rows) if prev is not None else False
+            history.append(region)
+            del history[:-2]
+            self._region_history[terminal_id] = history
+            self._prefilter_verdict[terminal_id] = banner
+        return banner
+
+    def _reset_veto_streak(self, terminal_id: str) -> None:
+        """F516 D6: reset edges are fire, pane output, and episode close."""
+        with self._lock:
+            state = self._veto_streak.get(terminal_id)
+            if state is not None:
+                state.count = 0
+                state.episode_open = False
+
+    def _note_veto_streak(
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        incarnation: TerminalIncarnation,
+    ) -> None:
+        """F516 D6: count one match-but-vetoed eval; at the ≥5 threshold emit
+        exactly one supervisor push per episode through its OWN 300s floor (NOT
+        the unknown-dialog floor, r2-S5). ~15s bound with D4's chain."""
+        now = time.monotonic()
+        should_push = False
+        with self._lock:
+            state = self._veto_streak.get(terminal_id)
+            if state is None:
+                state = _VetoStreakState()
+                self._veto_streak[terminal_id] = state
+            state.count += 1
+            if (
+                state.count >= VETO_STREAK_THRESHOLD
+                and not state.episode_open
+                and now - state.last_push_at >= VETO_STREAK_PUSH_FLOOR_S
+            ):
+                state.episode_open = True
+                state.last_push_at = now
+                should_push = True
+        if should_push:
+            self._push(
+                terminal_id,
+                metadata,
+                f"[auto-responder] {_ar_display_name(terminal_id, metadata)} has a rule that "
+                f"matched but was vetoed {VETO_STREAK_THRESHOLD}+ evals in a row (dialog may be "
+                "stuck behind a busy classifier). Manual attention may be needed.",
+                incarnation,
+            )
 
     def _request_detection_retry(self, terminal_id: str) -> None:
         """F516 D4: ask status_monitor to re-arm a detection tick after this eval

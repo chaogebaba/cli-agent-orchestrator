@@ -74,7 +74,7 @@ def _consult_dialog_before_send(terminal_id: str, provider: Any) -> None:
     try:
         from cli_agent_orchestrator.services.auto_responder import auto_responder
 
-        verdict = auto_responder.match_verdict(provider_name, lines)
+        verdict = auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id)
     except Exception:
         verdict = None
     if verdict is not None:

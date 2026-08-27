@@ -5025,7 +5025,7 @@ async def _wait_for_auto_responder_dialog_clear(
             provider_name = meta.get("provider") if meta else None
             if not provider_name:
                 return False
-            return auto_responder.match_verdict(provider_name, lines) is not None
+            return auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id) is not None
         except Exception:
             return False
 
