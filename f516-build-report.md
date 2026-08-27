@@ -85,15 +85,55 @@ sweep at HEAD: **243 passed** (1 skipped, 2 xfailed), 0 failed.
 
 **None from the blueprint's decisions, §6 wall, or 8-commit staging.**
 
-Sole staging note (blueprint-mandated, not a deviation): `test_m3` is RED for
-commits 3–5 and green from commit 6, per AC7's BEHAVIOR-CHANGED-BUT-GREEN clause
-(the D6 no-history HOLD is what keeps it green, and D6 lands in c6). This build
-initially took an option-A reconciliation (bringing the HOLD forward to c3 to
-keep a supervisor per-commit-green overlay); the supervisor RULING reversed that
-to option B — honor the frozen blueprint's exact staging, accept the test_m3
-red-window — and the history was rebuilt from c2 to remove the early HOLD. The
-D1 codex lever is the existing `--yolo` launch flag (approval_policy=never +
-trusted workspace); no new/conflicting `-c` override was added.
+### Restage note (F524 #379 — supervisor-side late-delivery defect)
+
+This branch was built TWICE in good faith due to a delivery defect on the
+supervisor side (filed F524 #379, P0): the "take (B)" ruling (inbox msg 1210,
+00:54Z) sat in `pending` ~68 min and was delivered only after the option-A build
+had already reported COMPLETE at 02:00Z. Acting on the last instruction received,
+this worker rewound `cao/3ff35106` from the option-A HEAD `3c2019a6` to `c2` and
+restaged as option B. The supervisor preserved the full option-A chain as branch
+**`cao/f516-optionA-preserved`** at `3c2019a68fd0456cf98ae10efd9d06c46c415e69`
+(do not delete). The supervisor then confirmed: **continue option B** (blueprint-
+exact staging removes the DEV-1 equivalence question from the gate by
+construction).
+
+### Intended relationship to `cao/f516-optionA-preserved`
+
+`git diff cao/f516-optionA-preserved..HEAD` is **NOT empty**, but every
+difference is non-behavioral. Reported honestly per supervisor request:
+
+- **Production code — behaviorally identical.** `codex.py`, `draft_guard.py`,
+  `terminal_service.py`, the fixtures, and the replay harness are BYTE-IDENTICAL
+  between the two chains. `status_monitor.py` differs only in comment wording
+  (zero code change). `auto_responder.py` differs only in (a) comment wording,
+  (b) helper placement, (c) one `_log_decision("firing")` line moved two lines
+  earlier, and (d) **option-A retains a now-DEAD `_no_history_hold` helper method
+  that option-B removed** — option-A introduced it in its c3 early-HOLD arm and
+  never deleted it once the inline `had_history` logic superseded it; option-B
+  never created it. The live fire-path decision block is byte-identical between
+  the chains, so runtime behavior is the same. The dead-method removal is the
+  single substantive tree difference and is an improvement (no dead code).
+- **Tests — coverage-equivalent, different authoring.** `test_f516_d4`,
+  `test_auto_responder_f516_d1/d5/d6` have identical test sets. `test_f516_d2`
+  drops option-A's `test_d2_no_history_hold_uncorroborated_match_does_not_fire`
+  (which asserted a c3-transient behavior that cannot be green across the
+  option-B c3-c5 red-window) in favor of three staging-stable assertions.
+  `test_f516_d4_wiring` swaps option-A's `test_no_history_hold_requests_a_retry`
+  for `test_unknown_dialog_episode_requests_a_retry`. Both suites are green at
+  their respective HEADs.
+- **Regenerated/doc artifacts.** `trace_manifest.txt` (regenerated on both
+  chains — line-shift only), `docs/f516-d1-…` (one comment line), and this build
+  report (rewritten for option B) differ as expected.
+
+Conclusion: the non-empty diff does NOT indicate a bug in either chain. It is the
+expected residue of two independent authoring passes plus the intended
+dead-helper removal. Both chains implement the same runtime behavior; option B is
+the one whose COMMIT STAGING matches the frozen blueprint (test_m3 red c3-c5,
+green from c6), which is the property the gate will read.
+
+The D1 codex lever is the existing `--yolo` launch flag; no new/conflicting `-c`
+override was added.
 
 F522 lock-order Do-NOT honored: `schedule_detection_retry` arms its timer under
 the monitor lock only, as a LEAF, with no responder lock held across it and no
