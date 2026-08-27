@@ -32,6 +32,57 @@ class DeliveryDeferredError(Exception):
     """Raised when transient terminal state makes delivery unsafe to attempt."""
 
 
+class DialogOpenError(DeliveryDeferredError):
+    """F516 D3: an open dialog (whitelisted match or provider-classified) is on
+    screen, so a composer paste would type into it (the C2 hazard). A subtype of
+    DeliveryDeferredError so all six existing catch sites handle it unchanged."""
+
+
+def _consult_dialog_before_send(terminal_id: str, provider: Any) -> None:
+    """F516 D3: unconditional dialog consult before any capture or key.
+
+    Runs at the top of every draft_guard public entry. Obtains metadata-free
+    ``lines`` from status_monitor.get_rendered_screen (matching _read_screen_lines's
+    first branch); on None the consult is SKIPPED and existing behavior stands
+    (fail-open). Consults (a) provider dialog classification via
+    classify_injection_hazard and (b) the responder's D3p match_verdict. Either
+    saying "dialog" raises DialogOpenError so the caller defers instead of
+    pasting into a live dialog.
+    """
+    lines = status_monitor.get_rendered_screen(terminal_id)
+    if lines is None:
+        return  # fail-open: capture unavailable, existing behavior stands
+    # Consult (a): provider dialog classification (provider-blind; base → None).
+    try:
+        hazard = provider.classify_injection_hazard(lines) if provider is not None else None
+    except Exception:
+        hazard = None
+    if hazard is not None:
+        raise DialogOpenError(f"Provider-classified dialog on screen for terminal {terminal_id}")
+    # Consult (b): responder whitelist match primitive. The rule-file key is the
+    # authoritative provider name from terminal metadata (the same key the
+    # responder's rule store uses); fail-open if metadata is unavailable.
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        meta = get_terminal_metadata(terminal_id)
+        provider_name = meta.get("provider") if meta else None
+    except Exception:
+        provider_name = None
+    if not provider_name:
+        return  # fail-open: cannot resolve rule set
+    try:
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        verdict = auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id)
+    except Exception:
+        verdict = None
+    if verdict is not None:
+        raise DialogOpenError(
+            f"Whitelisted dialog '{verdict.rule_name}' on screen for terminal {terminal_id}"
+        )
+
+
 @dataclass
 class PreservedDraft:
     terminal_id: str
@@ -82,6 +133,7 @@ def prepare_native_stash_before_send(
     defer_on_dialog: bool = False,
 ) -> PreparedNativeStash:
     """Authorize only a stable empty native composer without emitting keys."""
+    _consult_dialog_before_send(terminal_id, provider)
     authority_reader = getattr(provider, "read_composer_draft_authority", None)
     state_reader = getattr(provider, "read_composer_draft_state", None)
     if callable(authority_reader) and callable(
@@ -100,7 +152,7 @@ def prepare_native_stash_before_send(
     else:
         raise DeliveryDeferredError(f"Composer state is unreadable for terminal {terminal_id}")
     if state == "dialog":
-        raise DeliveryDeferredError("Claude dialog is active")
+        raise DialogOpenError("Claude dialog is active")
     if state != "empty":
         raise DeliveryDeferredError(
             f"Composer state is {state or 'unresolved'} for terminal {terminal_id}"
@@ -120,6 +172,7 @@ def stash_draft_before_send(
     defer_on_dialog: bool = False,
 ) -> bool:
     """Apply native stash; return whether a chip is present for the paste."""
+    _consult_dialog_before_send(terminal_id, provider)
     if not isinstance(getattr(provider, "composer_stash_keys", None), list):
         return False
 
@@ -208,7 +261,7 @@ def _read_stash_snapshot(
                 return None
     match_capture = strip_terminal_escapes(captured)
     if defer_on_dialog and CLAUDE_DIALOG_PATTERN.search(match_capture):
-        raise DeliveryDeferredError("Claude dialog is active")
+        raise DialogOpenError("Claude dialog is active")
     try:
         lines = captured.splitlines()
         draft = provider.read_composer_draft(lines)
@@ -261,6 +314,8 @@ def preserve_draft_before_send(
     """
     if getattr(provider, "supports_draft_preservation", False) is not True:
         return None
+
+    _consult_dialog_before_send(terminal_id, provider)
 
     draft = _read_provider_draft(terminal_id, metadata, provider)
     if draft is None:

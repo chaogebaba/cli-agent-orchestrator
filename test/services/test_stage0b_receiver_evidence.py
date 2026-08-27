@@ -542,12 +542,14 @@ def test_d6_auto_responder_publishes_full_frame_then_reclassifies_region(
     monkeypatch.setattr(ar.threading, "Thread", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(engine, "_log", lambda *_args: None)
 
+    _fire_region = ar.dialog_region(["1. Proceed", "Press enter"])
+    _fire_digest = ar._digest_normalized(_fire_region.normalized)
     fired = engine._fire(
         "terminal",
         metadata,
         provider,
         rule,
-        "1. Proceed Press enter",
+        _fire_region.with_digests(settle=_fire_digest, consume=_fire_digest),
         engine._state_for("terminal", rule.name),
         engine._snapshot_incarnation("terminal", metadata),
     )

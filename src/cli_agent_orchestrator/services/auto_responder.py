@@ -39,6 +39,12 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+# F516 commit 1: injectable monotonic clock seam (precedent: question_state.py
+# ``_clock``). Deterministic tests patch ``auto_responder._clock``; production
+# reads the real monotonic clock. New D4/D5 code paths read through this seam so
+# the 1/2/4/8s backoff is observable without wall-clock sleeps.
+_clock: Callable[[], float] = time.monotonic
+
 
 def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
     """F172: Return display form for auto-responder messages."""
@@ -121,6 +127,48 @@ def normalize_screen(lines: List[str]) -> str:
 class DialogRegion:
     rows: tuple[str, ...]
     normalized: str
+    # F516 D2(i)/D5: pending-fire digests, both normalized-domain (r5-B1) and
+    # BOTH defaulted so the existing two-positional construction keeps working
+    # (r5-S1, r4-B2 split). ``settle_digest`` is what D2(i)'s settle compares and
+    # is re-seeded each _verify_and_retry iteration; ``consume_digest`` is set
+    # once at match time, never re-seeded, and is what D5's consume gate reads.
+    settle_digest: str = ""
+    consume_digest: str = ""
+
+    def with_digests(self, settle: str, consume: str) -> "DialogRegion":
+        """Return a copy carrying the two pending-fire digests."""
+        return DialogRegion(
+            rows=self.rows,
+            normalized=self.normalized,
+            settle_digest=settle,
+            consume_digest=consume,
+        )
+
+
+def _digest_normalized(normalized: str) -> str:
+    """Stable digest over the whitespace-collapsed region string.
+
+    F516 D2(i) digest-domain rule (r5-B1): digests are ALWAYS computed over
+    ``DialogRegion.normalized`` (the flattened string), never over ``rows`` —
+    the pyte-composite and tmux-viewport capture paths pad rows differently, so
+    a rows-domain digest never matches on a static pane.
+    """
+    import hashlib
+
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RuleMatchVerdict:
+    """F516 D3p: result of ``AutoResponder.match_verdict`` for a consult caller.
+
+    Metadata-free and privates-free so it can cross the draft_guard / wait-site
+    boundary without leaking responder internals.
+    """
+
+    rule_name: str
+    region_digest: str  # normalized-domain digest (D2(i) rule)
+    matched_region_rows: tuple[str, ...]
 
 
 def dialog_region(screen: List[str]) -> DialogRegion:
@@ -160,6 +208,21 @@ class Rule:
     @property
     def is_wait(self) -> bool:
         return self.answer == "wait"
+
+    @property
+    def body_hash(self) -> str:
+        """F516 D5: stable hash over question+options+answer+match_mode (NOT
+        ``enabled``). Keys the consume-digest and cooldown state so a changed
+        rule body resets both; toggling ``enabled`` alone does not."""
+        import hashlib
+        import json
+
+        payload = json.dumps(
+            [self.match_mode, self.question, list(self.options), self.answer],
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def matches(self, normalized: str) -> bool:
         if not self.enabled:
@@ -250,6 +313,20 @@ class _UnknownDialogState:
     last_push_at: float = field(default=-UNKNOWN_DIALOG_PUSH_FLOOR_S)
 
 
+VETO_STREAK_THRESHOLD = 5
+VETO_STREAK_PUSH_FLOOR_S = 300.0
+
+
+@dataclass
+class _VetoStreakState:
+    """F516 D6: consecutive match-but-vetoed eval counter with its own push
+    floor. Reset edges: fire, pane output, episode close."""
+
+    count: int = 0
+    episode_open: bool = False
+    last_push_at: float = field(default=-VETO_STREAK_PUSH_FLOOR_S)
+
+
 class AutoResponder:
     """Whitelist-only engine: fires ``answer`` keys for matched rules,
     surfaces everything else as WAITING_USER_ANSWER.
@@ -263,6 +340,17 @@ class AutoResponder:
         self._retry_exhausted: set[str] = set()
         self._terminal_generation: Dict[str, int] = {}
         self._exit_suppressed: set[str] = set()
+        # F516 D5: consumed pre-fire region digests, keyed
+        # (terminal, rule-name, rule-body-hash). Recorded AFTER _verify_and_retry
+        # confirms the dialog cleared; the barrier refuses to re-fire a digest
+        # already consumed. Purged in clear_terminal by terminal prefix.
+        self._consumed_digests: Dict[tuple, str] = {}
+        # F516 D6: last-2 DialogRegion captures per terminal (scroll-exclusion
+        # history), the per-terminal cached banner verdict for the current eval,
+        # and the veto-streak state. All purged in clear_terminal.
+        self._region_history: Dict[str, list[DialogRegion]] = {}
+        self._prefilter_verdict: Dict[str, bool] = {}
+        self._veto_streak: Dict[str, _VetoStreakState] = {}
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -290,6 +378,58 @@ class AutoResponder:
     def waiting_gate(self, terminal_id: str) -> str | tuple[str, str] | None:
         with self._lock:
             return self._waiting_gate_locked(terminal_id)
+
+    def match_verdict(
+        self, provider_name: str, lines: List[str], terminal_id: str | None = None
+    ) -> "RuleMatchVerdict | None":
+        """F516 D3p: whitelist text-match verdict for a consult caller.
+
+        Handed pre-captured ``lines`` (this never captures itself). Computes the
+        dialog region and the normalized whitelist match against the provider's
+        rules and returns a metadata-free ``RuleMatchVerdict`` for the first
+        matching non-wait rule, or ``None`` when nothing matches. Provider dialog
+        classification is a SEPARATE consult (consult (a)) — this never calls
+        ``_classify_region``.
+
+        ``terminal_id`` (optional) enables the D6 banner path: the cached
+        scroll-exclusion mark is honored ONLY while this consult's fresh region
+        still differs from the newest history entry (a still-scrolling banner),
+        in which case ``None`` is returned so the consult does NOT defer (C4).
+        """
+        terminal_id_key = terminal_id
+        region = dialog_region(lines)
+        if not region.normalized:
+            return None
+        for rule in _store.get_rules(provider_name):
+            if not rule.matches(region.normalized):
+                continue
+            # D6 banner path (r8-B/r9-S1): the cached banner-mark is HONORED ONLY
+            # WHILE THE REGION IS STILL MOVING — this consult's fresh region
+            # still differs from the newest history entry, compared in the
+            # NORMALIZED domain. A STATIC region is dialog-eligible whatever the
+            # mark → return the verdict and let the consult DEFER.
+            #   static + match            → defer (return verdict)
+            #   moving + banner-mark      → None  (C4: don't stall on a banner)
+            #   moving + no-mark/no-cache → defer (return verdict)
+            with self._lock:
+                banner_mark = self._prefilter_verdict.get(terminal_id_key)
+                history = (
+                    self._region_history.get(terminal_id_key, []) if terminal_id_key else []
+                )
+                newest = history[-1] if history else None
+            still_moving = (
+                newest is not None
+                and _digest_normalized(newest.normalized)
+                != _digest_normalized(region.normalized)
+            )
+            if banner_mark and still_moving:
+                return None
+            return RuleMatchVerdict(
+                rule_name=rule.name,
+                region_digest=_digest_normalized(region.normalized),
+                matched_region_rows=region.rows,
+            )
+        return None
 
     def record_published_status(self, terminal_id: str, status: TerminalStatus) -> None:
         try:
@@ -319,8 +459,13 @@ class AutoResponder:
             self._retry_exhausted.discard(terminal_id)
             self._unknown_state.pop(terminal_id, None)
             self._exit_suppressed.discard(terminal_id)
+            self._region_history.pop(terminal_id, None)
+            self._prefilter_verdict.pop(terminal_id, None)
+            self._veto_streak.pop(terminal_id, None)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
+            for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
+                self._consumed_digests.pop(key, None)
 
     def mark_exit_suppress(self, terminal_id: str) -> None:
         """Suppress all on_screen effects for a terminal that is exiting (Layer B).
@@ -416,6 +561,13 @@ class AutoResponder:
             return None
         supplied_status = self._classify_region(terminal_id, provider, region)
         incarnation = self._snapshot_incarnation(terminal_id, metadata)
+        # D6 (r4-B1): push the eval-entry region into the last-2 history EXACTLY
+        # ONCE per eval and compute this eval's scroll-exclusion (banner) verdict,
+        # cached per-terminal for D3's match_verdict. had_history reflects the
+        # state BEFORE this push (the no-history HOLD needs the prior state).
+        with self._lock:
+            had_history = bool(self._region_history.get(terminal_id))
+        banner_marked = self._push_region_history(terminal_id, region)
 
         for rule in _store.get_rules(provider_name):
             if not rule.matches(region.normalized):
@@ -432,28 +584,56 @@ class AutoResponder:
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
                 self._log_decision(terminal_id, "matched", "wait_rule_active", rule.name)
+                # D4: a human-gated wait rule holds the terminal; re-arm a tick.
+                self._request_detection_retry(terminal_id)
                 return TerminalStatus.WAITING_USER_ANSWER
             if self._busy_veto(supplied_status):
                 self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
+                # D4: a busy-veto on a MATCHED rule is a vetoed eval — request a
+                # retry (r3-B4). D6: it also counts toward the veto streak.
+                self._note_veto_streak(terminal_id, metadata, incarnation)
+                self._request_detection_retry(terminal_id)
                 continue
-            if not self._corroborates_fire(region, supplied_status):
-                self._log_decision(
-                    terminal_id, "no_match", "corroboration_failed", rule.name,
-                    extra=f"status={supplied_status.value if supplied_status else 'None'}",
-                )
-                continue
+            # D6 fire-path decision for an UNCORROBORATED match (classifier not
+            # WAITING). The D2 classifier fast-path DISCHARGES all of this: a
+            # WAITING classification makes the match eligible on the FIRST eval.
+            #   - no history (first eval of a fresh region): HOLD, request one
+            #     D4 retry — the second capture decides (r3-B5).
+            #   - has history + banner-marked (region still moving = a scrolled
+            #     banner): SUPPRESS (C4 structural fix) — no keys, count a veto.
+            #   - has history + not banner-marked (static real dialog): eligible
+            #     → fall through and fire.
+            if supplied_status != TerminalStatus.WAITING_USER_ANSWER:
+                if not had_history:
+                    self._log_decision(terminal_id, "no_match", "no_history_hold", rule.name)
+                    self._clear_wait_rule(terminal_id)
+                    self._note_veto_streak(terminal_id, metadata, incarnation)
+                    self._request_detection_retry(terminal_id)
+                    return None
+                if banner_marked:
+                    self._log_decision(terminal_id, "no_match", "scroll_excluded", rule.name)
+                    self._clear_wait_rule(terminal_id)
+                    self._note_veto_streak(terminal_id, metadata, incarnation)
+                    self._request_detection_retry(terminal_id)
+                    return None
             self._clear_wait_rule(terminal_id)
-            state = self._state_for(terminal_id, rule.name)
+            state = self._state_for(terminal_id, rule.name, rule.body_hash)
             if time.monotonic() < state.cooldown_until:
                 self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
             self._log_decision(terminal_id, "matched", "firing", rule.name)
+            # A real fire resets the veto streak for this terminal (r2-S5 edges).
+            self._reset_veto_streak(terminal_id)
+            # D2(i)/D5: seed the pending-fire record's two digests, both over the
+            # normalized-domain rule-loop region (r5-B1).
+            match_digest = _digest_normalized(region.normalized)
+            pending_region = region.with_digests(settle=match_digest, consume=match_digest)
             self._fire(
                 terminal_id,
                 metadata,
                 provider,
                 rule,
-                region.normalized,
+                pending_region,
                 state,
                 incarnation,
             )
@@ -461,7 +641,7 @@ class AutoResponder:
 
         self._clear_wait_rule(terminal_id)
         self._log_decision(terminal_id, "no_match", "no_rule_matched")
-        return self._check_unknown(
+        unknown_result = self._check_unknown(
             terminal_id,
             metadata,
             provider_name,
@@ -471,12 +651,19 @@ class AutoResponder:
             supplied_status,
             incarnation,
         )
+        # D4: an open unknown-dialog episode holds the terminal at WAITING; on a
+        # silent pane no chunk re-triggers detection (C3), so re-arm a tick.
+        if unknown_result == TerminalStatus.WAITING_USER_ANSWER:
+            self._request_detection_retry(terminal_id)
+        return unknown_result
 
     # ----- rule firing ---------------------------------------------------
 
-    def _state_for(self, terminal_id: str, rule_name: str) -> _RuleState:
+    def _state_for(self, terminal_id: str, rule_name: str, body_hash: str = "") -> _RuleState:
         with self._lock:
-            key = (terminal_id, rule_name)
+            # D5: the cooldown key gains the rule body-hash so a changed rule
+            # resets BOTH the cooldown and the consume digest (aligned keying).
+            key = (terminal_id, rule_name, body_hash)
             state = self._rule_state.get(key)
             if state is None:
                 state = _RuleState()
@@ -489,19 +676,19 @@ class AutoResponder:
         metadata: Dict[str, Any],
         provider: Any,
         rule: Rule,
-        normalized: str,
+        region: DialogRegion,
         state: _RuleState,
         incarnation: TerminalIncarnation,
     ) -> bool:
-        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+        if not self._effect_barrier(terminal_id, metadata, provider, rule, region):
             return False
         if not self._send_answer(terminal_id, metadata, rule, incarnation):
             return False
-        self._log(terminal_id, rule, "fired", normalized)
+        self._log(terminal_id, rule, "fired", region.normalized)
         state.cooldown_until = time.monotonic() + COOLDOWN_S
         threading.Thread(
             target=self._verify_and_retry,
-            args=(terminal_id, metadata, provider, rule, state, incarnation),
+            args=(terminal_id, metadata, provider, rule, state, incarnation, region),
             daemon=True,
         ).start()
         return True
@@ -514,28 +701,53 @@ class AutoResponder:
         rule: Rule,
         state: _RuleState,
         incarnation: TerminalIncarnation,
+        region: DialogRegion,
     ) -> None:
-        """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires."""
+        """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires.
+
+        D2(i): each attempt RE-SEEDS ``settle_digest`` from its own capture
+        (r3-S2) — otherwise the first keystroke's redraw fails settle and
+        disables retries. ``consume_digest`` is carried forward unchanged.
+        """
         for attempt in range(2, RETRY_MAX + 1):
             time.sleep(RETRY_DELAY_S)
             if not self._incarnation_is_current(terminal_id, incarnation):
                 return
-            region = self._current_normalized(terminal_id)
-            if region is None or not rule.matches(region.normalized):
+            attempt_region = self._current_normalized(terminal_id)
+            if attempt_region is None or not rule.matches(attempt_region.normalized):
+                # D5: the dialog cleared — record the FROZEN consume_digest so a
+                # later identical redraw of the same region is not re-fired.
+                if attempt_region is not None:
+                    self._record_consumed(terminal_id, rule, region.consume_digest)
                 return
-            if not self._effect_barrier(terminal_id, metadata, provider, rule):
+            attempt_region = attempt_region.with_digests(
+                settle=_digest_normalized(attempt_region.normalized),
+                consume=region.consume_digest,
+            )
+            if not self._effect_barrier(
+                terminal_id, metadata, provider, rule, attempt_region
+            ):
                 return
             if not self._send_answer(terminal_id, metadata, rule, incarnation):
                 return
-            self._log(terminal_id, rule, f"retry-{attempt}", region.normalized)
+            self._log(terminal_id, rule, f"retry-{attempt}", attempt_region.normalized)
             state.cooldown_until = time.monotonic() + COOLDOWN_S
 
         time.sleep(RETRY_DELAY_S)
         if not self._incarnation_is_current(terminal_id, incarnation):
             return
-        region = self._current_normalized(terminal_id)
-        if region is not None and rule.matches(region.normalized):
+        final_region = self._current_normalized(terminal_id)
+        if final_region is not None and rule.matches(final_region.normalized):
             self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
+        elif final_region is not None:
+            # D5: cleared after the retry budget — record the consume digest.
+            self._record_consumed(terminal_id, rule, region.consume_digest)
+
+    def _record_consumed(self, terminal_id: str, rule: Rule, consume_digest: str) -> None:
+        if not consume_digest:
+            return
+        with self._lock:
+            self._consumed_digests[(terminal_id, rule.name, rule.body_hash)] = consume_digest
 
     @staticmethod
     def _current_normalized(terminal_id: str) -> Optional[DialogRegion]:
@@ -623,7 +835,11 @@ class AutoResponder:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         incarnation = incarnation or self._snapshot_incarnation(terminal_id, metadata)
-        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+        # Retry-exhausted: dialog confirmed still-matching. Settle not applicable
+        # (no rule-loop sample) → empty-digest region; barrier still enforces
+        # match + busy-veto + incarnation.
+        empty_region = DialogRegion(rows=(), normalized="")
+        if not self._effect_barrier(terminal_id, metadata, provider, rule, empty_region):
             return
 
         def surface() -> None:
@@ -886,19 +1102,48 @@ class AutoResponder:
         metadata: Dict[str, Any],
         provider: Any,
         rule: Rule,
+        pending_region: DialogRegion,
     ) -> bool:
+        # D4 barrier-False enumeration (r4-S1/r5-S2, six outcomes): provider
+        # None and capture failure are TRANSIENT (not verdicts) — request a D4
+        # retry, no streak. settle mismatch and barrier _busy_veto request a
+        # retry (busy-veto also streaks in c6). A fresh rule.matches-False
+        # (dialog cleared) does NOT retry; consumed-digest (D5, c5) will not
+        # either.
         if provider is None:
+            self._request_detection_retry(terminal_id)
             return False
         fresh = self._capture_for_analysis(metadata, [], terminal_id, provider)
         if fresh is None:
+            self._request_detection_retry(terminal_id)
             return False
         region = self._region_from_capture(fresh)
         status = self._classify_region(terminal_id, provider, region)
-        return (
-            rule.matches(region.normalized)
-            and not self._busy_veto(status)
-            and self._corroborates_fire(region, status)
+        if not rule.matches(region.normalized):
+            return False  # dialog cleared / no longer matches — no retry
+        if self._busy_veto(status):
+            self._request_detection_retry(terminal_id)
+            return False
+        # D2(i) settle (r2-B3/r5-B1): normalized-domain digest match; empty
+        # settle_digest → skipped (retry-exhausted surface path).
+        settle_ok = (not pending_region.settle_digest) or (
+            _digest_normalized(region.normalized) == pending_region.settle_digest
         )
+        if not settle_ok:
+            self._request_detection_retry(terminal_id)  # mid-repaint tearing
+            return False
+        # D5 consume gate: refuse to re-fire a pre-fire region digest already
+        # consumed for this (terminal, rule-name, body-hash) — the redraw double-
+        # fire guard, superseding COOLDOWN_S for re-fire decisions. A consumed-
+        # digest hit does NOT request a retry (r4-S1). A changed region digest is
+        # a new consume_digest and is eligible again (AC4).
+        if pending_region.consume_digest:
+            key = (terminal_id, rule.name, rule.body_hash)
+            with self._lock:
+                already = self._consumed_digests.get(key) == pending_region.consume_digest
+            if already:
+                return False
+        return True
 
     @staticmethod
     def _region_from_capture(
@@ -932,6 +1177,108 @@ class AutoResponder:
     @staticmethod
     def _busy_veto(status: TerminalStatus | None) -> bool:
         return status == TerminalStatus.PROCESSING
+
+    @staticmethod
+    def _scroll_excluded(old_rows: tuple[str, ...], new_rows: tuple[str, ...]) -> bool:
+        """F516 D6: is the newer region a SCROLLED banner rather than a dialog?
+
+        "Scrolled" (r3-S7): a maximal line-block present in BOTH captures' rows,
+        offset-independent, with ≥1 new non-empty row BELOW the block in the
+        newer capture. stdlib difflib.SequenceMatcher.get_matching_blocks — no
+        hand-rolled diff. The new-row-below test applies at the newer block end.
+        """
+        import difflib
+
+        if not old_rows or not new_rows:
+            return False
+        blocks = [
+            b
+            for b in difflib.SequenceMatcher(
+                None, list(old_rows), list(new_rows)
+            ).get_matching_blocks()
+            if b.size > 0
+        ]
+        if not blocks:
+            return False
+        largest = max(blocks, key=lambda b: b.size)
+        end_new = largest.b + largest.size
+        return any(row.strip() for row in new_rows[end_new:])
+
+    def _push_region_history(self, terminal_id: str, region: DialogRegion) -> bool:
+        """F516 D6: append the eval-entry region to the last-2 history and return
+        this eval's scroll-exclusion (banner) verdict, cached per-terminal for
+        D3's match_verdict. Called EXACTLY ONCE per eval from the rule-loop entry
+        capture (r4-B1) — never from barrier/retry captures."""
+        with self._lock:
+            history = self._region_history.get(terminal_id, [])
+            prev = history[-1] if history else None
+            banner = self._scroll_excluded(prev.rows, region.rows) if prev is not None else False
+            history.append(region)
+            del history[:-2]
+            self._region_history[terminal_id] = history
+            self._prefilter_verdict[terminal_id] = banner
+        return banner
+
+    def _reset_veto_streak(self, terminal_id: str) -> None:
+        """F516 D6: reset edges are fire, pane output, and episode close."""
+        with self._lock:
+            state = self._veto_streak.get(terminal_id)
+            if state is not None:
+                state.count = 0
+                state.episode_open = False
+
+    def _note_veto_streak(
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        incarnation: TerminalIncarnation,
+    ) -> None:
+        """F516 D6: count one match-but-vetoed eval; at the ≥5 threshold emit
+        exactly one supervisor push per episode through its OWN 300s floor (NOT
+        the unknown-dialog floor, r2-S5). ~15s bound with D4's chain."""
+        now = time.monotonic()
+        should_push = False
+        with self._lock:
+            state = self._veto_streak.get(terminal_id)
+            if state is None:
+                state = _VetoStreakState()
+                self._veto_streak[terminal_id] = state
+            state.count += 1
+            if (
+                state.count >= VETO_STREAK_THRESHOLD
+                and not state.episode_open
+                and now - state.last_push_at >= VETO_STREAK_PUSH_FLOOR_S
+            ):
+                state.episode_open = True
+                state.last_push_at = now
+                should_push = True
+        if should_push:
+            self._push(
+                terminal_id,
+                metadata,
+                f"[auto-responder] {_ar_display_name(terminal_id, metadata)} has a rule that "
+                f"matched but was vetoed {VETO_STREAK_THRESHOLD}+ evals in a row (dialog may be "
+                "stuck behind a busy classifier). Manual attention may be needed.",
+                incarnation,
+            )
+
+    def _request_detection_retry(self, terminal_id: str) -> None:
+        """F516 D4: ask status_monitor to re-arm a detection tick after this eval
+        ended without firing (busy-veto / unknown-dialog / wait-rule-active / a
+        transient barrier-False). FUNCTION-SCOPE import — status_monitor imports
+        the responder lazily, so a module-level reverse import would cycle.
+        Wrapped so a request failure can never raise into or alter on_screen
+        (r4-S5). Called as a LEAF with no responder lock held (F522)."""
+        try:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            status_monitor.schedule_detection_retry(terminal_id)
+        except Exception:
+            logger.debug(
+                "auto-responder: detection-retry request failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
 
     def _snapshot_incarnation(
         self, terminal_id: str, metadata: Dict[str, Any]

@@ -108,6 +108,16 @@ IDLE_PROMPT_SCREEN_PATTERN = rf"^\s*{IDLE_PROMPT_PATTERN}"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
+# F516 D2: the resume-working-directory chooser Codex renders on session resume.
+# It is a numbered menu with a "Press enter to continue" footer, not an approval
+# modal, so none of the existing waiting signals fire on it and the classifier
+# lands IDLE — the F509 shape (codex.py pattern table). The title line is a
+# stable, bottom-anchored hook; classify it WAITING_USER_ANSWER so the responder
+# fast-path corroborates the codex-resume-working-directory rule on the first
+# eval. Over-matching is safe here (a false WAITING merely withholds work).
+RESUME_CWD_CHOOSER_PATTERN = re.compile(
+    r"Choose working directory to resume this session", re.IGNORECASE
+)
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
 CONTENT_POLICY_REFUSAL_PATTERN = r"(?i)^ⓘ This content can't be shown"
 CONTENT_POLICY_SCREEN_RULE_ID = "codex.screen.content-policy-refusal.v1"
@@ -2470,6 +2480,11 @@ class CodexProvider(BaseProvider):
                 and DIALOG_ACTION_FOOTER_PATTERN.search(row)
             ):
                 signals.append(ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index))
+            if not progress_rows and RESUME_CWD_CHOOSER_PATTERN.search(row):
+                # F516 D2: resume-cwd chooser title → WAITING_USER_ANSWER.
+                signals.append(
+                    ScreenSignal("waiting", "RESUME_CWD_CHOOSER_PATTERN", index)
+                )
             if legacy_status == TerminalStatus.WAITING_USER_ANSWER and re.search(
                 WAITING_PROMPT_PATTERN, row, re.IGNORECASE
             ):

@@ -5011,10 +5011,30 @@ async def _wait_for_auto_responder_dialog_clear(
     from cli_agent_orchestrator.services.auto_responder import auto_responder
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+    def _responder_dialog_pending() -> bool:
+        """F516 D3: True when the responder's match primitive still sees a
+        whitelisted dialog on screen — in the F509 shape the classifier reports
+        IDLE every tick, so the raw ``!= WAITING_USER_ANSWER`` early returns
+        would exit before the auto-responder ever fires. Fail-open (False) when
+        the screen or provider name is unavailable."""
+        try:
+            lines = status_monitor.get_rendered_screen(terminal_id)
+            if lines is None:
+                return False
+            meta = get_terminal_metadata(terminal_id)
+            provider_name = meta.get("provider") if meta else None
+            if not provider_name:
+                return False
+            return auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id) is not None
+        except Exception:
+            return False
+
     # Quick pre-check: if status is already not WAITING_USER_ANSWER, return
     # immediately without any grace sleep. This is the common case (no dialog).
+    # F516 D3: unless the responder's D3p consult still sees a whitelisted dialog
+    # (the F509 classifier→IDLE shape), in which case keep waiting for the fire.
     current_status = status_monitor.get_status(terminal_id)
-    if current_status != TerminalStatus.WAITING_USER_ANSWER:
+    if current_status != TerminalStatus.WAITING_USER_ANSWER and not _responder_dialog_pending():
         return
 
     # Brief initial grace: give the TUI a moment to render a late dialog before
@@ -5025,7 +5045,7 @@ async def _wait_for_auto_responder_dialog_clear(
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         current_status = status_monitor.get_status(terminal_id)
-        if current_status != TerminalStatus.WAITING_USER_ANSWER:
+        if current_status != TerminalStatus.WAITING_USER_ANSWER and not _responder_dialog_pending():
             logger.debug(
                 "f491_dialog_clear terminal=%s status=%s — no dialog blocking",
                 terminal_id,

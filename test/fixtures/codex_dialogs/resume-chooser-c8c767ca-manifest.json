@@ -1,0 +1,19 @@
+{
+  "incident": "resume-chooser-c8c767ca",
+  "cols": 220,
+  "rows": 50,
+  "frames": [
+    {
+      "file": "resume-chooser-c8c767ca-frame-00.ansi.txt",
+      "offset_s": 0.0
+    },
+    {
+      "file": "resume-chooser-c8c767ca-frame-01.ansi.txt",
+      "offset_s": 0.2
+    },
+    {
+      "file": "resume-chooser-c8c767ca-frame-02.ansi.txt",
+      "offset_s": 0.4
+    }
+  ]
+}
