@@ -264,6 +264,10 @@ class StatusMonitor:
         self._fifo_frame_seq: Dict[str, int] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
+        # F516 D4: per-terminal geometric backoff step for detection retries
+        # (1→2→4→8s cap, max 6 per silence episode). Reset edge is the chunk
+        # path _schedule_screen_detection; purged in clear_terminal.
+        self._retry_backoff_step: Dict[str, int] = {}
         # The event loop that owns the quiescence timers. Captured when the
         # first timer is scheduled (on the loop thread). clear_terminal /
         # reset_buffer can run OFF that thread (cleanup_old_data is dispatched
@@ -1382,6 +1386,9 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
             armed = self._allow_processing_revert.get(terminal_id, False)
             last_status = self._last_status.get(terminal_id)
+            # F516 D4 reset edge: a real chunk snaps the detection-retry backoff
+            # back to zero (Decepticon #662 snap-back on first output).
+            self._retry_backoff_step.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
@@ -1492,7 +1499,9 @@ class StatusMonitor:
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent, chunk_seq)
 
-    def _arm_quiesce_timer(self, loop, terminal_id: str, callback, *cb_args) -> None:
+    def _arm_quiesce_timer(
+        self, loop, terminal_id: str, callback, *cb_args, delay: float | None = None
+    ) -> None:
         """Schedule the quiescence timer on ``loop`` from any thread.
 
         ``loop.call_later`` is not thread-safe and this may run on a worker
@@ -1501,7 +1510,13 @@ class StatusMonitor:
         inside the marshaled closure (still on the loop thread) so cancel
         marshaling in ``_cancel_quiesce_handle`` stays correct. ``cb_args``
         are extra positional args passed to ``callback`` after ``terminal_id``.
+
+        F516 D4: ``delay`` parameterizes the timer interval on this shared helper
+        (default ``PYTE_QUIESCENCE_DELAY_S`` preserves every existing caller);
+        ``schedule_detection_retry`` passes the geometric backoff delay through
+        the SAME single ``_quiesce_handle`` slot with cancel-prior semantics.
         """
+        fire_delay = PYTE_QUIESCENCE_DELAY_S if delay is None else delay
 
         def _arm() -> None:
             # Runs on the loop thread (via call_soon_threadsafe), so it is safe
@@ -1517,7 +1532,7 @@ class StatusMonitor:
                 prior = self._quiesce_handle.get(terminal_id)
                 if prior is not None:
                     prior.cancel()
-                handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, callback, terminal_id, *cb_args)
+                handle = loop.call_later(fire_delay, callback, terminal_id, *cb_args)
                 self._quiesce_handle[terminal_id] = handle
 
         try:
@@ -1525,6 +1540,57 @@ class StatusMonitor:
         except RuntimeError:
             # Loop closed during shutdown — quiescence re-detect is moot.
             pass
+
+    def schedule_detection_retry(self, terminal_id: str, delay_s: float | None = None) -> None:
+        """F516 D4: re-arm a screen-detection tick after a vetoed/unmatched eval.
+
+        The per-silence-episode eval already exists; this adds the RE-TRIGGER
+        (r2-B5). It occupies the SAME single ``_quiesce_handle`` slot with
+        cancel-prior semantics (a real chunk re-arms the slot at
+        ``PYTE_QUIESCENCE_DELAY_S`` and, via the chunk-path reset edge, snaps the
+        backoff to zero). The delay follows a geometric backoff (1→2→4→8s cap,
+        max 6 requests per silence episode) unless ``delay_s`` is explicit. It
+        snapshots ``_chunk_seq`` INTERNALLY, resolves the detection provider
+        ITSELF via ``provider_manager.get_provider``, and is a NO-OP when the
+        provider is gone or no loop is captured — NEVER an immediate detect (an
+        immediate fallback would burn all six backoff steps at once in the
+        loop-less replay harness).
+
+        Lock-order law (F522 #377): arms a timer under the monitor lock only and
+        is called as a LEAF — no responder-internal lock may be held across it,
+        and no status_monitor→auto_responder→status_monitor re-entry.
+        """
+        try:
+            loop = self._loop or self._running_loop()
+            if loop is None:
+                return  # loop-less: NO-OP, never an immediate detect
+            with self._lock:
+                if delay_s is None:
+                    step = self._retry_backoff_step.get(terminal_id, 0)
+                    if step >= 6:
+                        return  # max 6 retries per silence episode
+                    delay_s = float(min(2**step, 8))
+                    self._retry_backoff_step[terminal_id] = step + 1
+                chunk_seq = self._chunk_seq.get(terminal_id, 0)
+            provider = provider_manager.get_provider(terminal_id)
+            if provider is None:
+                return  # provider gone: NO-OP (r3-S5)
+            self._arm_quiesce_timer(
+                loop,
+                terminal_id,
+                self._on_screen_quiescent,
+                provider,
+                chunk_seq,
+                delay=delay_s,
+            )
+        except Exception:
+            # Precedent status_monitor.py:1292-1299 — a retry-request failure must
+            # never raise into or alter the caller's on_screen path.
+            logger.debug(
+                "status_monitor: schedule_detection_retry failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
 
     def _on_raw_quiescent(self, terminal_id: str, expected_seq: Optional[int] = None) -> None:
         """Quiescence timer fired for raw path: re-detect from current buffer.
@@ -1828,6 +1894,7 @@ class StatusMonitor:
             self._screens.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
+            self._retry_backoff_step.pop(terminal_id, None)
             self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)

@@ -511,9 +511,14 @@ class AutoResponder:
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
                 self._log_decision(terminal_id, "matched", "wait_rule_active", rule.name)
+                # D4: a human-gated wait rule holds the terminal; re-arm a tick.
+                self._request_detection_retry(terminal_id)
                 return TerminalStatus.WAITING_USER_ANSWER
             if self._busy_veto(supplied_status):
                 self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
+                # D4: a busy-veto on a MATCHED rule is a vetoed eval — request a
+                # retry (r3-B4; it counts toward D6's veto streak in c6).
+                self._request_detection_retry(terminal_id)
                 continue
             # D2: classifier status is a fast-path corroborator only, NEVER a
             # veto. The ONE retained exception is _busy_veto (PROCESSING),
@@ -548,7 +553,7 @@ class AutoResponder:
 
         self._clear_wait_rule(terminal_id)
         self._log_decision(terminal_id, "no_match", "no_rule_matched")
-        return self._check_unknown(
+        unknown_result = self._check_unknown(
             terminal_id,
             metadata,
             provider_name,
@@ -558,6 +563,11 @@ class AutoResponder:
             supplied_status,
             incarnation,
         )
+        # D4: an open unknown-dialog episode holds the terminal at WAITING; on a
+        # silent pane no chunk re-triggers detection (C3), so re-arm a tick.
+        if unknown_result == TerminalStatus.WAITING_USER_ANSWER:
+            self._request_detection_retry(terminal_id)
+        return unknown_result
 
     # ----- rule firing ---------------------------------------------------
 
@@ -991,29 +1001,35 @@ class AutoResponder:
         rule: Rule,
         pending_region: DialogRegion,
     ) -> bool:
+        # D4 barrier-False enumeration (r4-S1/r5-S2, six outcomes): provider
+        # None and capture failure are TRANSIENT (not verdicts) — request a D4
+        # retry, no streak. settle mismatch and barrier _busy_veto request a
+        # retry (busy-veto also streaks in c6). A fresh rule.matches-False
+        # (dialog cleared) does NOT retry; consumed-digest (D5, c5) will not
+        # either.
         if provider is None:
+            self._request_detection_retry(terminal_id)
             return False
         fresh = self._capture_for_analysis(metadata, [], terminal_id, provider)
         if fresh is None:
+            self._request_detection_retry(terminal_id)
             return False
         region = self._region_from_capture(fresh)
         status = self._classify_region(terminal_id, provider, region)
-        # D2: the last gate before keys (r2-B4). text-match + NOT busy-veto +
-        # settle. The old _corroborates_fire re-veto is REMOVED — classifier is
-        # fast-path only, never a veto here. settle (D2(i), r2-B3): the barrier's
-        # fresh capture is the second sample; it passes iff this capture's
-        # normalized-domain digest equals the pending-fire settle_digest (r5-B1).
-        # An EMPTY settle_digest means no rule-loop sample (retry-exhausted
-        # surface path) — settle is skipped. (The D4 retry-request wiring for the
-        # barrier-False outcomes is added in commit 4.)
+        if not rule.matches(region.normalized):
+            return False  # dialog cleared / no longer matches — no retry
+        if self._busy_veto(status):
+            self._request_detection_retry(terminal_id)
+            return False
+        # D2(i) settle (r2-B3/r5-B1): normalized-domain digest match; empty
+        # settle_digest → skipped (retry-exhausted surface path).
         settle_ok = (not pending_region.settle_digest) or (
             _digest_normalized(region.normalized) == pending_region.settle_digest
         )
-        return (
-            rule.matches(region.normalized)
-            and not self._busy_veto(status)
-            and settle_ok
-        )
+        if not settle_ok:
+            self._request_detection_retry(terminal_id)  # mid-repaint tearing
+            return False
+        return True
 
     @staticmethod
     def _region_from_capture(
@@ -1047,6 +1063,24 @@ class AutoResponder:
     @staticmethod
     def _busy_veto(status: TerminalStatus | None) -> bool:
         return status == TerminalStatus.PROCESSING
+
+    def _request_detection_retry(self, terminal_id: str) -> None:
+        """F516 D4: ask status_monitor to re-arm a detection tick after this eval
+        ended without firing (busy-veto / unknown-dialog / wait-rule-active / a
+        transient barrier-False). FUNCTION-SCOPE import — status_monitor imports
+        the responder lazily, so a module-level reverse import would cycle.
+        Wrapped so a request failure can never raise into or alter on_screen
+        (r4-S5). Called as a LEAF with no responder lock held (F522)."""
+        try:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            status_monitor.schedule_detection_retry(terminal_id)
+        except Exception:
+            logger.debug(
+                "auto-responder: detection-retry request failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
 
     def _snapshot_incarnation(
         self, terminal_id: str, metadata: Dict[str, Any]
