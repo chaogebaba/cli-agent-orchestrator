@@ -209,6 +209,21 @@ class Rule:
     def is_wait(self) -> bool:
         return self.answer == "wait"
 
+    @property
+    def body_hash(self) -> str:
+        """F516 D5: stable hash over question+options+answer+match_mode (NOT
+        ``enabled``). Keys the consume-digest and cooldown state so a changed
+        rule body resets both; toggling ``enabled`` alone does not."""
+        import hashlib
+        import json
+
+        payload = json.dumps(
+            [self.match_mode, self.question, list(self.options), self.answer],
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     def matches(self, normalized: str) -> bool:
         if not self.enabled:
             return False
@@ -311,6 +326,11 @@ class AutoResponder:
         self._retry_exhausted: set[str] = set()
         self._terminal_generation: Dict[str, int] = {}
         self._exit_suppressed: set[str] = set()
+        # F516 D5: consumed pre-fire region digests, keyed
+        # (terminal, rule-name, rule-body-hash). Recorded AFTER _verify_and_retry
+        # confirms the dialog cleared; the barrier refuses to re-fire a digest
+        # already consumed. Purged in clear_terminal by terminal prefix.
+        self._consumed_digests: Dict[tuple, str] = {}
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -400,6 +420,8 @@ class AutoResponder:
             self._exit_suppressed.discard(terminal_id)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
+            for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
+                self._consumed_digests.pop(key, None)
 
     def mark_exit_suppress(self, terminal_id: str) -> None:
         """Suppress all on_screen effects for a terminal that is exiting (Layer B).
@@ -531,7 +553,7 @@ class AutoResponder:
             # match traverses the barrier and fires (AC7 test_m3 is expected RED
             # for commits 3-5, green from commit 6 via D6's no-history HOLD).
             self._clear_wait_rule(terminal_id)
-            state = self._state_for(terminal_id, rule.name)
+            state = self._state_for(terminal_id, rule.name, rule.body_hash)
             if time.monotonic() < state.cooldown_until:
                 self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
@@ -571,9 +593,11 @@ class AutoResponder:
 
     # ----- rule firing ---------------------------------------------------
 
-    def _state_for(self, terminal_id: str, rule_name: str) -> _RuleState:
+    def _state_for(self, terminal_id: str, rule_name: str, body_hash: str = "") -> _RuleState:
         with self._lock:
-            key = (terminal_id, rule_name)
+            # D5: the cooldown key gains the rule body-hash so a changed rule
+            # resets BOTH the cooldown and the consume digest (aligned keying).
+            key = (terminal_id, rule_name, body_hash)
             state = self._rule_state.get(key)
             if state is None:
                 state = _RuleState()
@@ -625,6 +649,10 @@ class AutoResponder:
                 return
             attempt_region = self._current_normalized(terminal_id)
             if attempt_region is None or not rule.matches(attempt_region.normalized):
+                # D5: the dialog cleared — record the FROZEN consume_digest so a
+                # later identical redraw of the same region is not re-fired.
+                if attempt_region is not None:
+                    self._record_consumed(terminal_id, rule, region.consume_digest)
                 return
             attempt_region = attempt_region.with_digests(
                 settle=_digest_normalized(attempt_region.normalized),
@@ -645,6 +673,15 @@ class AutoResponder:
         final_region = self._current_normalized(terminal_id)
         if final_region is not None and rule.matches(final_region.normalized):
             self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
+        elif final_region is not None:
+            # D5: cleared after the retry budget — record the consume digest.
+            self._record_consumed(terminal_id, rule, region.consume_digest)
+
+    def _record_consumed(self, terminal_id: str, rule: Rule, consume_digest: str) -> None:
+        if not consume_digest:
+            return
+        with self._lock:
+            self._consumed_digests[(terminal_id, rule.name, rule.body_hash)] = consume_digest
 
     @staticmethod
     def _current_normalized(terminal_id: str) -> Optional[DialogRegion]:
@@ -1029,6 +1066,17 @@ class AutoResponder:
         if not settle_ok:
             self._request_detection_retry(terminal_id)  # mid-repaint tearing
             return False
+        # D5 consume gate: refuse to re-fire a pre-fire region digest already
+        # consumed for this (terminal, rule-name, body-hash) — the redraw double-
+        # fire guard, superseding COOLDOWN_S for re-fire decisions. A consumed-
+        # digest hit does NOT request a retry (r4-S1). A changed region digest is
+        # a new consume_digest and is eligible again (AC4).
+        if pending_region.consume_digest:
+            key = (terminal_id, rule.name, rule.body_hash)
+            with self._lock:
+                already = self._consumed_digests.get(key) == pending_region.consume_digest
+            if already:
+                return False
         return True
 
     @staticmethod
