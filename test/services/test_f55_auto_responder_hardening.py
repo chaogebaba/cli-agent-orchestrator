@@ -313,7 +313,13 @@ def test_m5_retry_processing_reenforcement_aborts_without_send_or_push(monkeypat
     incarnation = engine._snapshot_incarnation("term1", metadata)
 
     engine._verify_and_retry(
-        "term1", metadata, provider, rule, engine._state_for("term1", "r"), incarnation
+        "term1",
+        metadata,
+        provider,
+        rule,
+        engine._state_for("term1", "r"),
+        incarnation,
+        ar.dialog_region(["trust ok"]),
     )
 
     backend.send_special_key.assert_not_called()
@@ -426,7 +432,10 @@ def test_d4_a1_sequence_keeps_screen_barrier_at_sequence_start(monkeypatch):
         metadata,
         FrameStatusProvider(),
         rule,
-        "trust ok",
+        ar.dialog_region(["trust ok"]).with_digests(
+            settle=ar._digest_normalized(ar.normalize_screen(["trust ok"])),
+            consume=ar._digest_normalized(ar.normalize_screen(["trust ok"])),
+        ),
         ar._RuleState(),
         incarnation,
     )
@@ -493,6 +502,7 @@ def test_post_clear_push_and_retry_token_are_dropped(monkeypatch):
         ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"]),
         ar._RuleState(),
         incarnation,
+        ar.dialog_region(["trust ok"]),
     )
 
     assert inserted == []

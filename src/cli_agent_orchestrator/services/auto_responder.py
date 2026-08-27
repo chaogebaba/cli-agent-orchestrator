@@ -127,6 +127,22 @@ def normalize_screen(lines: List[str]) -> str:
 class DialogRegion:
     rows: tuple[str, ...]
     normalized: str
+    # F516 D2(i)/D5: pending-fire digests, both normalized-domain (r5-B1) and
+    # BOTH defaulted so the existing two-positional construction keeps working
+    # (r5-S1, r4-B2 split). ``settle_digest`` is what D2(i)'s settle compares and
+    # is re-seeded each _verify_and_retry iteration; ``consume_digest`` is set
+    # once at match time, never re-seeded, and is what D5's consume gate reads.
+    settle_digest: str = ""
+    consume_digest: str = ""
+
+    def with_digests(self, settle: str, consume: str) -> "DialogRegion":
+        """Return a copy carrying the two pending-fire digests."""
+        return DialogRegion(
+            rows=self.rows,
+            normalized=self.normalized,
+            settle_digest=settle,
+            consume_digest=consume,
+        )
 
 
 def _digest_normalized(normalized: str) -> str:
@@ -499,24 +515,32 @@ class AutoResponder:
             if self._busy_veto(supplied_status):
                 self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
                 continue
-            if not self._corroborates_fire(region, supplied_status):
-                self._log_decision(
-                    terminal_id, "no_match", "corroboration_failed", rule.name,
-                    extra=f"status={supplied_status.value if supplied_status else 'None'}",
-                )
-                continue
+            # D2: classifier status is a fast-path corroborator only, NEVER a
+            # veto. The ONE retained exception is _busy_veto (PROCESSING),
+            # unchanged — the proven M1/F55 quoted-prose suppressor. The old
+            # _corroborates_fire veto (WAITING or dialog-proximity) is gone from
+            # the fire path; _has_dialog_proximity is retained but no longer
+            # consulted here (r5-S3). Region discipline + settle now gate the
+            # fire, both inside _effect_barrier. The D6 no-history HOLD /
+            # scroll-exclusion is added in commit 6; until then an uncorroborated
+            # match traverses the barrier and fires (AC7 test_m3 is expected RED
+            # for commits 3-5, green from commit 6 via D6's no-history HOLD).
             self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name)
             if time.monotonic() < state.cooldown_until:
                 self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
             self._log_decision(terminal_id, "matched", "firing", rule.name)
+            # D2(i)/D5: seed the pending-fire record's two digests, both over the
+            # normalized-domain rule-loop region (r5-B1).
+            match_digest = _digest_normalized(region.normalized)
+            pending_region = region.with_digests(settle=match_digest, consume=match_digest)
             self._fire(
                 terminal_id,
                 metadata,
                 provider,
                 rule,
-                region.normalized,
+                pending_region,
                 state,
                 incarnation,
             )
@@ -552,19 +576,19 @@ class AutoResponder:
         metadata: Dict[str, Any],
         provider: Any,
         rule: Rule,
-        normalized: str,
+        region: DialogRegion,
         state: _RuleState,
         incarnation: TerminalIncarnation,
     ) -> bool:
-        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+        if not self._effect_barrier(terminal_id, metadata, provider, rule, region):
             return False
         if not self._send_answer(terminal_id, metadata, rule, incarnation):
             return False
-        self._log(terminal_id, rule, "fired", normalized)
+        self._log(terminal_id, rule, "fired", region.normalized)
         state.cooldown_until = time.monotonic() + COOLDOWN_S
         threading.Thread(
             target=self._verify_and_retry,
-            args=(terminal_id, metadata, provider, rule, state, incarnation),
+            args=(terminal_id, metadata, provider, rule, state, incarnation, region),
             daemon=True,
         ).start()
         return True
@@ -577,27 +601,39 @@ class AutoResponder:
         rule: Rule,
         state: _RuleState,
         incarnation: TerminalIncarnation,
+        region: DialogRegion,
     ) -> None:
-        """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires."""
+        """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires.
+
+        D2(i): each attempt RE-SEEDS ``settle_digest`` from its own capture
+        (r3-S2) — otherwise the first keystroke's redraw fails settle and
+        disables retries. ``consume_digest`` is carried forward unchanged.
+        """
         for attempt in range(2, RETRY_MAX + 1):
             time.sleep(RETRY_DELAY_S)
             if not self._incarnation_is_current(terminal_id, incarnation):
                 return
-            region = self._current_normalized(terminal_id)
-            if region is None or not rule.matches(region.normalized):
+            attempt_region = self._current_normalized(terminal_id)
+            if attempt_region is None or not rule.matches(attempt_region.normalized):
                 return
-            if not self._effect_barrier(terminal_id, metadata, provider, rule):
+            attempt_region = attempt_region.with_digests(
+                settle=_digest_normalized(attempt_region.normalized),
+                consume=region.consume_digest,
+            )
+            if not self._effect_barrier(
+                terminal_id, metadata, provider, rule, attempt_region
+            ):
                 return
             if not self._send_answer(terminal_id, metadata, rule, incarnation):
                 return
-            self._log(terminal_id, rule, f"retry-{attempt}", region.normalized)
+            self._log(terminal_id, rule, f"retry-{attempt}", attempt_region.normalized)
             state.cooldown_until = time.monotonic() + COOLDOWN_S
 
         time.sleep(RETRY_DELAY_S)
         if not self._incarnation_is_current(terminal_id, incarnation):
             return
-        region = self._current_normalized(terminal_id)
-        if region is not None and rule.matches(region.normalized):
+        final_region = self._current_normalized(terminal_id)
+        if final_region is not None and rule.matches(final_region.normalized):
             self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
 
     @staticmethod
@@ -686,7 +722,11 @@ class AutoResponder:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         incarnation = incarnation or self._snapshot_incarnation(terminal_id, metadata)
-        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+        # Retry-exhausted: dialog confirmed still-matching. Settle not applicable
+        # (no rule-loop sample) → empty-digest region; barrier still enforces
+        # match + busy-veto + incarnation.
+        empty_region = DialogRegion(rows=(), normalized="")
+        if not self._effect_barrier(terminal_id, metadata, provider, rule, empty_region):
             return
 
         def surface() -> None:
@@ -949,6 +989,7 @@ class AutoResponder:
         metadata: Dict[str, Any],
         provider: Any,
         rule: Rule,
+        pending_region: DialogRegion,
     ) -> bool:
         if provider is None:
             return False
@@ -957,10 +998,21 @@ class AutoResponder:
             return False
         region = self._region_from_capture(fresh)
         status = self._classify_region(terminal_id, provider, region)
+        # D2: the last gate before keys (r2-B4). text-match + NOT busy-veto +
+        # settle. The old _corroborates_fire re-veto is REMOVED — classifier is
+        # fast-path only, never a veto here. settle (D2(i), r2-B3): the barrier's
+        # fresh capture is the second sample; it passes iff this capture's
+        # normalized-domain digest equals the pending-fire settle_digest (r5-B1).
+        # An EMPTY settle_digest means no rule-loop sample (retry-exhausted
+        # surface path) — settle is skipped. (The D4 retry-request wiring for the
+        # barrier-False outcomes is added in commit 4.)
+        settle_ok = (not pending_region.settle_digest) or (
+            _digest_normalized(region.normalized) == pending_region.settle_digest
+        )
         return (
             rule.matches(region.normalized)
             and not self._busy_veto(status)
-            and self._corroborates_fire(region, status)
+            and settle_ok
         )
 
     @staticmethod
