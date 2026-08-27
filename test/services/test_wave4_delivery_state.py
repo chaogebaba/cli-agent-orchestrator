@@ -236,6 +236,10 @@ def test_probe_04_codex_existing_fixture_corpus_is_unchanged():
     corpus = {
         path.name: path.read_text(encoding="utf-8").splitlines()
         for path in sorted(fixture_root.glob("*.ansi.txt"))
+        # F516 commit 1 added a distinct MULTI-FRAME incident corpus
+        # (<incident>-frame-NN.ansi.txt) with its own manifest + SHA256SUMS;
+        # it is not part of this single-frame parent corpus, so exclude it.
+        if "-frame-" not in path.name
     }
     corpus.update(
         {
@@ -827,6 +831,7 @@ def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
             "TUI_PROGRESS_PATTERN",
             "TRUST_SELECTOR_PATTERN",
             "DIALOG_ACTION_FOOTER_PATTERN",
+            "RESUME_CWD_CHOOSER_PATTERN",
             "WAITING_PROMPT_PATTERN",
             "ERROR_PATTERN",
             "ASSISTANT_PREFIX_PATTERN",
