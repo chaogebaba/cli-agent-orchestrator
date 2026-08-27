@@ -1,0 +1,19 @@
+{
+  "incident": "content-policy-banner-f02ce13e",
+  "cols": 220,
+  "rows": 50,
+  "frames": [
+    {
+      "file": "content-policy-banner-f02ce13e-frame-00.ansi.txt",
+      "offset_s": 0.0
+    },
+    {
+      "file": "content-policy-banner-f02ce13e-frame-01.ansi.txt",
+      "offset_s": 0.2
+    },
+    {
+      "file": "content-policy-banner-f02ce13e-frame-02.ansi.txt",
+      "offset_s": 0.35
+    }
+  ]
+}

@@ -14,7 +14,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
 from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.constants import (
@@ -43,6 +43,12 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+# F516 commit 1: injectable monotonic clock seam (precedent: question_state.py
+# ``_clock``). The D4 detection-retry backoff (commit 4) reads through this seam
+# so the deterministic 1/2/4/8s schedule is observable in the loop-less replay
+# harness without wall-clock time. Production reads the real monotonic clock.
+_clock: Callable[[], float] = time.monotonic
 
 # F360 (#215, diff gate SHOULD): consecutive "Terminal ... not found in
 # database" misses from provider_manager.get_provider() tolerated before a

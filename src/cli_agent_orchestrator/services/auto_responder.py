@@ -39,6 +39,12 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+# F516 commit 1: injectable monotonic clock seam (precedent: question_state.py
+# ``_clock``). Deterministic tests patch ``auto_responder._clock``; production
+# reads the real monotonic clock. New D4/D5 code paths read through this seam so
+# the 1/2/4/8s backoff is observable without wall-clock sleeps.
+_clock: Callable[[], float] = time.monotonic
+
 
 def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
     """F172: Return display form for auto-responder messages."""
