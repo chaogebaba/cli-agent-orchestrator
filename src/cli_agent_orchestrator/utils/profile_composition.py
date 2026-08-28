@@ -487,3 +487,40 @@ def composed_profile_hash(layers: List[Layer]) -> str:
         h.update(layer.body.encode("utf-8"))
         h.update(b"\x00")
     return h.hexdigest()
+
+
+# Frontmatter keys excluded from the AC15 position_sha. r9 (a): the
+# ``certification:`` block MUST NOT feed position_sha, else recording a PASS row
+# would change the sha and invalidate the very row just written (self-
+# invalidation). Everything else in the position frontmatter is merge-relevant
+# (role, skills, mcpServers, requires, contextPolicy, …) and IS hashed.
+_POSITION_SHA_EXCLUDE = ("certification",)
+
+
+def position_sha(body: str, frontmatter_meta: Dict[str, Any], length: int = 16) -> str:
+    """AC15/D8 position_sha over the persona BODY + merge-relevant frontmatter.
+
+    Excludes the ``certification:`` block (r9 a) so a PASS row never invalidates
+    itself. Deterministic (sorted-key JSON for the frontmatter). Returns the
+    first ``length`` hex chars (the certification block records 16).
+    """
+    import hashlib
+    import json
+
+    merge_meta = {k: v for k, v in frontmatter_meta.items() if k not in _POSITION_SHA_EXCLUDE}
+    h = hashlib.sha256()
+    h.update(body.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(json.dumps(merge_meta, sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:length]
+
+
+def overlay_sha(fragments: List[str], length: int = 16) -> str:
+    """AC15/D8 overlay_sha over a provider's overlay fragment source(s), in order."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for frag in fragments:
+        h.update(frag.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:length]

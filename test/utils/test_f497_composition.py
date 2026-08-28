@@ -332,6 +332,52 @@ def test_ac13_every_model_field_has_an_assigned_merge_class():
     assert fields - named - {PERSONA_TEXT_FIELD}, "expected fields in the scalar catch-all"
 
 
+def test_r9_position_sha_excludes_certification_block():
+    """r9(a): position_sha hashes body + merge-relevant frontmatter EXCLUDING the
+    certification: block, so recording a PASS row never invalidates the sha."""
+    from cli_agent_orchestrator.utils.profile_composition import position_sha
+
+    body = "# P\n\npersona body\n"
+    meta_uncertified = {
+        "role": "developer",
+        "skills": ["a"],
+        "certification": [{"provider": "codex", "outcome": "UNCERTIFIED"}],
+    }
+    meta_pass = {
+        "role": "developer",
+        "skills": ["a"],
+        "certification": [{"provider": "codex", "outcome": "PASS", "date": "2026-09-01"}],
+    }
+    # Flipping certification UNCERTIFIED -> PASS must NOT change position_sha.
+    assert position_sha(body, meta_uncertified) == position_sha(body, meta_pass)
+    # A merge-relevant frontmatter change (skills) DOES change it.
+    assert position_sha(body, dict(meta_uncertified, skills=["a", "b"])) != position_sha(
+        body, meta_uncertified
+    )
+    # A body change changes it.
+    assert position_sha(body + "x", meta_uncertified) != position_sha(body, meta_uncertified)
+
+
+def test_r9_recorded_position_sha_matches_helper():
+    """The committed certification block's position_sha equals the helper output
+    over the live position file (body + merge-relevant frontmatter minus cert)."""
+    if _PROFILES is None:
+        pytest.skip("drafted persona corpus not found")
+    import frontmatter as _fm
+
+    from cli_agent_orchestrator.utils.profile_composition import position_sha
+
+    p = _fm.loads((_PROFILES / "positions" / "empirical_reviewer.md").read_text(encoding="utf-8"))
+    recomputed = position_sha(p.content, dict(p.metadata))
+    cert = p.metadata.get("certification") or []
+    assert cert, "empirical_reviewer must carry a certification block"
+    for row in cert:
+        assert (
+            row["position_sha"] == recomputed
+        ), f"recorded position_sha {row['position_sha']} != helper {recomputed} (r9)"
+        assert row["outcome"] == "UNCERTIFIED"  # P2 seeds both cells UNCERTIFIED
+
+
 def test_meta_keys_never_reach_agent_profile():
     prof = compose_profile(
         "composed",
