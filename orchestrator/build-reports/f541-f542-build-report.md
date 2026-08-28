@@ -10,7 +10,8 @@
 | F542 commit | `e2406a47` — `F542: reconcile dead-tmux-session terminal rows at startup (#398)` |
 | F541 init-timeout commit | `97260c50` — `F541: provider_init_timeout default 180s for claude_code cold start (#397)` |
 | F548 commit | `0ca9c2d0` — `F548: fix claude_code init dialog handling + fast auth-fail + pane tail (#404)` |
-| Report commits | `b6eacf44` (`F541/F542: build report`) + `c5ebeebc`… (`build report r2`) + `F541/F542: build report r3` (this update) |
+| F548 gate-test commit | `60f4cf37` — `F548: land gate SHOULD-1 regression test verbatim (#404)` |
+| Report commits | `b6eacf44` (`build report`) + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `F541/F542: build report r4` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -340,6 +341,84 @@ assert ClaudeAuthError.code == "E-CLAUDE-AUTH"
 print("F548 helpers OK")
 PY
 ```
+
+---
+
+## r4 addendum — F548 gate SHOULD-1: land the timeout-branch regression test (commit `60f4cf37`, issue #404)
+
+**Context.** The empirical delta gate on `b46bf972` ruled **GATE-YES (0 BLOCKER
+/ 1 SHOULD / 2 NIT)** (codex `cf2a83bc`, report
+`/data/cao-scratch/fork-gate-report-f548.md`, artifact SHA
+`0b5c4396…`). This r4 lands the single SHOULD; the two NITs are noted below.
+
+### SHOULD-1 — timeout-branch E-CLAUDE-AUTH had no committed regression test
+The gate found that the `initialize()` timeout-branch auth classifier
+(`claude_code.py:1257-1266` → `ClaudeAuthError`) was correct and passed the
+reviewer's independent repro, but a scratch mutation **deleting** it survived
+all four touched test files (224 passed) — i.e. no committed test would catch a
+future refactor that dropped it.
+
+**Resolution (attachment-landing doctrine: land as-is).** The reviewer
+attachment `orchestrator/tmp/orch/f548-gate-attachments/test_f548_gate_repro.py`
+was landed **VERBATIM** (byte-for-byte, `diff -q` identical) into the fork test
+tree at `test/providers/test_f548_gate_repro.py`. No amendments were made — the
+doctrine permits amending only with a stated rationale in this report, and none
+was needed: the file is already black-clean (`black --check`: would be left
+unchanged) and passes as-is. Its 9 tests cover:
+- each required auth shape detected independently (`Failed to authenticate`,
+  `OAuth session expired`, `Paste code here`, `Paste the code here`,
+  `Visit the following URL to log in`, `Visit https://claude.ai/login…`);
+- **the timeout branch** — `test_initialize_timeout_branch_raises_named_auth_with_real_tail`
+  stubs the startup handler, forces `wait_until_status → False`, supplies an
+  auth pane with unique `sentinel prelude`/`sentinel trailer` lines, and asserts
+  `ClaudeAuthError.code == "E-CLAUDE-AUTH"` plus both unique pane-tail lines;
+- the unrecognized-choice → `WAITING_USER_ANSWER` / no-blind-Enter halves.
+
+**Mutation verification (the point of SHOULD-1).** Performed locally on an
+overlay of the reviewed source and then reverted exactly (final `git status`
+shows only the new untracked test; `claude_code.py` unmodified):
+
+| State | `test/providers/test_f548_gate_repro.py -n0` |
+|---|---|
+| classifier present (as committed) | **9 passed in 0.53s** |
+| timeout-branch classifier removed from `claude_code.py` | **1 failed, 8 passed** — `test_initialize_timeout_branch_raises_named_auth_with_real_tail` fails, raising `TimeoutError` (`…timed out after 180s. Last pane lines: … Failed to authenticate …`) instead of `ClaudeAuthError` |
+
+So the landed test **kills the exact mutation** that survived before (the
+mandated four touched files stayed green under that mutation; this file does
+not). SHOULD-1 is discharged.
+
+### NITs (recorded; not addressed under the frozen-pin discipline)
+- **NIT-1** — the r3 section said "Six pre-existing tests" but enumerated
+  **seven** (2 unit + 1 coverage + 3 idle-gap + 1 container-wrapped). Correcting
+  the count here for the record: **seven** pre-existing tests were updated for
+  the trust bare-Enter → Down+Enter contract. No contract weakening (the gate
+  confirmed the coverage test's removed `mock_sleep.await_count <= 20` is
+  replaced by a finite `time.monotonic.side_effect`, which still enforces the
+  bounded-settle invariant).
+- **NIT-2** — the trust-prompt docstring at `claude_code.py:986-988` still reads
+  "requires Enter". Left unchanged to keep this commit scoped to landing the
+  regression test; flagged for a follow-up prose fix (a one-line docstring edit)
+  if the supervisor wants it in this branch.
+
+### r4 test results (exact commands + verbatim summary lines)
+```
+$ uv run pytest test/providers/test_f548_gate_repro.py -q -n0
+9 passed in 0.53s
+```
+Mandated serial touched set + the new file together:
+```
+$ uv run pytest test/providers/test_claude_code_coverage.py \
+    test/providers/test_claude_code_unit.py test/providers/test_container_wrapped.py \
+    test/providers/test_startup_prompt_idle_gap.py test/providers/test_f548_gate_repro.py -q -n0
+233 passed in 38.87s
+```
+
+### r4 integrity
+- Landed file is byte-identical to the attachment (`diff -q` clean).
+- Mutation was applied to and reverted from the worktree cleanly; post-revert
+  `git status --short` showed only the new untracked test file, then it was
+  committed as `60f4cf37`.
+- No source (`claude_code.py`) change in this commit — regression test only.
 
 ---
 
