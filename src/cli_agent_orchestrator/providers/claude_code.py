@@ -75,6 +75,20 @@ class ProviderError(Exception):
     pass
 
 
+class ClaudeAuthError(ProviderError):
+    """F548 (#404): Claude Code hit an auth-failure / login screen during init.
+
+    A named, fail-fast error (``code = "E-CLAUDE-AUTH"``) raised instead of
+    waiting out the full init timeout when the pane shows an authentication or
+    login screen (stale/expired OAuth, interactive login required, paste-code
+    prompt). The message carries the offending pane tail so the operator sees
+    *why* immediately. Box ops (re-syncing box auth) is the remediation, not a
+    code change — but the seat must not hang 180s to surface it.
+    """
+
+    code = "E-CLAUDE-AUTH"
+
+
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 CLAUDE_STASHED_CHIP_PATTERN = re.compile(r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE)
@@ -188,6 +202,54 @@ TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
+
+# F548 (#404): auth-failure / login screens that appear DURING init. On a fresh
+# or stale-auth host Claude renders one of these instead of a REPL and then sits
+# there forever, so wait_until_status waits out the whole init timeout (180s) and
+# the operator only sees "timed out". Detecting these lets init fail FAST with a
+# named, actionable error (E-CLAUDE-AUTH) instead. These are matched against the
+# cleaned pane buffer during the startup-prompt loop. Kept deliberately broad
+# (substrings, case-insensitive at the call site) — the cost of a false positive
+# is a fast, clearly-named failure the operator can read, not a silent 180s hang.
+CLAUDE_AUTH_FAILURE_PATTERNS: tuple[str, ...] = (
+    r"Failed to authenticate",
+    r"OAuth session expired",
+    r"OAuth token (?:expired|refresh failed)",
+    r"Please (?:run|use) .*/login",
+    r"/login to authenticate",
+    r"Paste (?:the )?code here",
+    r"Visit (?:the following URL|https?://\S+) to (?:log ?in|authenticate)",
+    r"Authentication required",
+)
+_CLAUDE_AUTH_FAILURE_RE = re.compile("|".join(CLAUDE_AUTH_FAILURE_PATTERNS), re.IGNORECASE)
+
+
+def _pane_tail(output: str, n: int = 15) -> str:
+    """Return the last ``n`` non-blank lines of ``output`` (ANSI stripped).
+
+    F548 (#404): an init failure/timeout error must explain itself — the old
+    message said only "timed out after 180s". This renders the same tail the
+    operator would see with ``tmux capture-pane`` so the 500 body shows the
+    trust dialog / auth screen / login prompt that actually blocked init.
+    """
+    if not output:
+        return ""
+    cleaned = re.sub(ANSI_CODE_PATTERN, "", output)
+    non_blank = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    return "\n".join(non_blank[-n:])
+
+
+def _detect_claude_auth_failure(clean_output: str) -> Optional[str]:
+    """Return the matched auth-failure marker if ``clean_output`` shows an
+    auth/login screen (#404), else None.
+
+    ``clean_output`` is expected to already have ANSI codes stripped (the
+    startup-prompt loop cleans the buffer before calling this).
+    """
+    match = _CLAUDE_AUTH_FAILURE_RE.search(clean_output)
+    return match.group(0) if match else None
+
+
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
 # always ends with the … ellipsis), the summary is past-tense + "for Ns" with NO
@@ -989,6 +1051,23 @@ class ClaudeCodeProvider(BaseProvider):
 
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
+            # 0) F548 (#404): fail FAST on an auth-failure / login screen. On a
+            #    fresh or stale-auth host Claude renders one of these instead of
+            #    a REPL and sits there forever; without this the seat waits out
+            #    the whole init timeout and the operator only sees "timed out".
+            #    Raise the named E-CLAUDE-AUTH error with the offending pane tail.
+            auth_marker = _detect_claude_auth_failure(clean_output)
+            if auth_marker is not None:
+                logger.error(
+                    "Claude Code auth/login screen detected during init (%r); failing fast",
+                    auth_marker,
+                )
+                raise ClaudeAuthError(
+                    "[E-CLAUDE-AUTH] Claude Code authentication failed during init "
+                    f"(matched {auth_marker!r}). The seat cannot reach a REPL until the "
+                    "provider is re-authenticated (box ops: re-sync auth). "
+                    f"Last pane lines:\n{_pane_tail(output)}"
+                )
             # 1) Handle bypass permissions prompt (appears before trust prompt).
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
@@ -1039,16 +1118,49 @@ class ClaudeCodeProvider(BaseProvider):
 
             # 3) Handle workspace trust prompt. Continue because the external
             #    import dialog may render immediately after trust is accepted.
+            #
+            # F548 (#404): the trust dialog is NOT a bare-Enter accept. On a
+            # fresh host (Claude 2.1.248) the dialog renders TWO options with
+            # focus defaulting to the FIRST row, "❯ No, exit", and
+            # "Yes, I trust this folder" as the SECOND row:
+            #
+            #     ❯ No, exit
+            #       Yes, I trust this folder
+            #     Enter to confirm · Esc to cancel
+            #
+            # A bare Enter therefore CONFIRMS "No, exit" -> Claude exits to the
+            # shell and the seat never reaches a REPL, so wait_until_status
+            # times out (box e2e: trust auto-accept -> 180s timeout, 500,
+            # rollback). Select the affirmative row explicitly the same way the
+            # bypass handler does: Down (move focus off "No, exit" onto
+            # "Yes, I trust this folder") then Enter. On a build whose focus
+            # already defaults to the affirmative row this is harmless — Down
+            # simply moves to the last row and back is unnecessary; the two-row
+            # trust dialog has the affirmative as the row Down lands on.
             if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                logger.info("Workspace trust prompt detected, auto-accepting")
+                logger.info(
+                    "Workspace trust prompt detected, selecting 'Yes, I trust this folder' "
+                    "(Down+Enter — bare Enter would confirm the default 'No, exit')"
+                )
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "\x1b[B",
+                    enter_count=0,
+                )
+                await asyncio.sleep(0.5)
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 trust_accepted = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # 4) Claude Code fully started — no prompts needed.
@@ -1136,9 +1248,23 @@ class ClaudeCodeProvider(BaseProvider):
             timeout=init_timeout,
             polling_interval=1.0,
         ):
-            auth_state = classify_auth_refresh_output(
-                "claude_code", get_backend().get_history(self.session_name, self.window_name)
+            final_pane = get_backend().get_history(self.session_name, self.window_name)
+            # F548 (#404): if the pane shows an auth/login screen, surface the
+            # named E-CLAUDE-AUTH error (with the pane tail) rather than a bare
+            # timeout — the startup-prompt loop normally catches this first and
+            # fails fast, but a login screen that renders only after the loop's
+            # idle-gap exit lands here.
+            auth_marker = _detect_claude_auth_failure(
+                re.sub(ANSI_CODE_PATTERN, "", final_pane or "")
             )
+            if auth_marker is not None:
+                raise ClaudeAuthError(
+                    "[E-CLAUDE-AUTH] Claude Code authentication failed during init "
+                    f"(matched {auth_marker!r}). The seat cannot reach a REPL until the "
+                    "provider is re-authenticated (box ops: re-sync auth). "
+                    f"Last pane lines:\n{_pane_tail(final_pane)}"
+                )
+            auth_state = classify_auth_refresh_output("claude_code", final_pane)
             if auth_state is not None:
                 raise ProviderAuthRefreshFailed(auth_state)
             # Bare TimeoutError here, not TerminalInputBlockedError (round-3 review fix,
@@ -1152,7 +1278,15 @@ class ClaudeCodeProvider(BaseProvider):
             # broken/unrecognized launch, rather than leaving an unreapable worker alive in
             # UNKNOWN status that answer_user_prompt would hard-refuse to touch (it only accepts
             # WAITING_USER_ANSWER) and that no watchdog reaps.
-            raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
+            #
+            # F548 (#404): include the last ~15 non-blank pane lines so the 500
+            # body explains itself — the old message said only "timed out after
+            # {N}s", which on the box gave no hint it was the trust dialog / an
+            # auth screen that blocked init.
+            raise TimeoutError(
+                f"Claude Code initialization timed out after {init_timeout}s. "
+                f"Last pane lines:\n{_pane_tail(final_pane)}"
+            )
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
         # renderer drops keystrokes for a beat after that — "box rendered" is

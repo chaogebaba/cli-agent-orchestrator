@@ -15,7 +15,6 @@ import pytest
 pytestmark = pytest.mark.slow
 
 
-
 @pytest.fixture
 def provider():
     """Create a ClaudeCodeProvider with mocked dependencies."""
@@ -125,23 +124,35 @@ class TestHandleStartupPromptsBranches:
         await provider._handle_startup_prompts(idle_gap=1.0)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, provider):
-        """Trust prompt sends Enter and settles at idle gap (bounded iterations)."""
+    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, mock_time, provider):
+        """Trust prompt selects the affirmative row (Down+Enter) and settles at
+        idle gap (bounded iterations).
+
+        F548 (#404): bare Enter would confirm the default 'No, exit' and kill
+        the seat, so trust is now Down (onto 'Yes, I trust this folder') + Enter.
+        The trust branch now uses ``asyncio.sleep`` (not blocking ``time.sleep``)
+        to match the async-offload doctrine, so ``time.monotonic`` is mocked here
+        to drive the idle-gap exit deterministically instead of relying on a real
+        blocking sleep to advance wall-clock.
+        """
+        # outer_deadline, last_prompt_time, iter1 (trust @ t=1), reset, iter2 (gap
+        # 3-1=2 >= idle_gap 1 -> settle/return).
+        mock_time.monotonic.side_effect = [0.0, 0.0, 1.0, 1.0, 3.0]
         mock_backend.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
+        mock_backend.send_keys.assert_called_once_with(
+            provider.session_name, provider.window_name, "\x1b[B", enter_count=0
+        )
         mock_backend.send_special_key.assert_called_once_with(
             provider.session_name, provider.window_name, "Enter"
         )
-        # With the trust branch setting any_prompt_handled=True, the handler
-        # settles after the idle gap.  Under instant-sleep mock it should NOT
-        # spin to the outer timeout (60s / hundreds of iterations).
-        assert mock_sleep.await_count <= 20
 
     @pytest.mark.asyncio
     @patch(
@@ -155,9 +166,7 @@ class TestHandleStartupPromptsBranches:
     ):
         """Lone external-imports prompt settles at idle gap, not outer timeout."""
         mock_backend.get_history.return_value = (
-            "Allow external CLAUDE.md file imports?\n"
-            "❯ 1. Yes\n"
-            "  2. No\n"
+            "Allow external CLAUDE.md file imports?\n" "❯ 1. Yes\n" "  2. No\n"
         )
 
         await provider._handle_startup_prompts(idle_gap=1.0)

@@ -9,7 +9,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 import pytest
 
@@ -2287,9 +2287,11 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Bypass: send_keys (Down) + send_special_key (Enter)
-        # Trust: send_special_key (Enter) — called twice total
-        assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
+        # F548 (#404): BOTH bypass AND trust now select the affirmative row via
+        # Down+Enter (bare Enter on the trust dialog would confirm the default
+        # "No, exit" and kill the seat). So send_keys (Down) is called twice —
+        # once for bypass, once for trust — and send_special_key (Enter) twice.
+        assert mock_tmux.send_keys.call_count == 2  # Down arrow for bypass AND trust
         assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
 
     @pytest.mark.asyncio
@@ -2312,9 +2314,12 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(outer_timeout=5.0)
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "\x1b[B", enter_count=0
-        )
+        # F548 (#404): trust now selects the affirmative row via Down+Enter (not
+        # bare Enter), and the external-import reject also uses Down+Enter — so
+        # send_keys (Down) is called twice, send_special_key (Enter) twice.
+        assert mock_tmux.send_keys.call_count == 2
+        for call_ in mock_tmux.send_keys.call_args_list:
+            assert call_ == call("test-session", "window-0", "\x1b[B", enter_count=0)
         assert mock_tmux.send_special_key.call_count == 2
 
     @pytest.mark.asyncio
@@ -3056,3 +3061,118 @@ class TestClaudeCodeInitTimeout:
         the base resolution (global provider_init_timeout)."""
         with patch(_CC_SETTINGS_FN, return_value={"provider_init_timeout": 60}):
             assert self._provider().get_init_timeout() == 60
+
+
+# F548 (#404): trust dialog affirmative selection, auth fast-fail, pane tail in error
+class TestF548InitDialogAndAuth:
+    """F548 (#404).
+
+    - The workspace-trust dialog defaults focus to '❯ No, exit'; a bare Enter
+      confirms exit and the seat never reaches a REPL. Trust must select the
+      affirmative row via Down+Enter.
+    - An auth/login screen during init must fail FAST with a named
+      E-CLAUDE-AUTH error (ClaudeAuthError), not wait out the init timeout.
+    - Init-timeout / auth-failure error text must include the last pane lines.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_trust_prompt_selects_affirmative_row_not_bare_enter(self, mock_tmux):
+        """Trust dialog -> Down (off 'No, exit') then Enter, never a bare Enter."""
+        mock_tmux.get_history.side_effect = [
+            # Real box shape (Claude 2.1.248): focus defaults to 'No, exit'.
+            "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel",
+            "Welcome to Claude Code v2.1.248",
+        ]
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        # Down arrow sent to move focus onto 'Yes, I trust this folder', then Enter.
+        assert mock_tmux.send_keys.call_count == 1
+        assert mock_tmux.send_keys.call_args == call(
+            "test-session", "window-0", "\x1b[B", enter_count=0
+        )
+        assert mock_tmux.send_special_key.call_count == 1
+        assert mock_tmux.send_special_key.call_args == call("test-session", "window-0", "Enter")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_auth_failure_screen_fails_fast_with_named_error(self, mock_tmux):
+        """A stale-OAuth screen during init raises ClaudeAuthError (E-CLAUDE-AUTH)
+        with the pane tail — not a bare timeout."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
+
+        pane = (
+            "$ claude --dangerously-skip-permissions ...\n"
+            "Failed to authenticate: OAuth session expired and could not be refreshed\n"
+            "$ "
+        )
+        mock_tmux.get_history.return_value = pane
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        with pytest.raises(ClaudeAuthError) as exc:
+            await provider._handle_startup_prompts(outer_timeout=5.0)
+
+        assert exc.value.code == "E-CLAUDE-AUTH"
+        msg = str(exc.value)
+        assert "E-CLAUDE-AUTH" in msg
+        # The matched marker and the offending pane tail are included.
+        assert "OAuth session expired" in msg
+        assert "Last pane lines:" in msg
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_login_url_prompt_also_fails_fast(self, mock_tmux):
+        from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
+
+        mock_tmux.get_history.return_value = (
+            "Please run /login to authenticate\nVisit https://claude.ai/login to log in\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with pytest.raises(ClaudeAuthError):
+            await provider._handle_startup_prompts(outer_timeout=5.0)
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_init_timeout_error_includes_pane_tail(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """The init-timeout error carries the last pane lines so the 500 body
+        explains itself (#404)."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        # No auth marker -> falls to the timeout branch; pane tail must appear.
+        mock_tmux.get_history.return_value = (
+            "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]),
+            patch("cli_agent_orchestrator.providers.claude_code.time.sleep"),
+        ):
+            with pytest.raises(TimeoutError) as exc:
+                await provider.initialize()
+        msg = str(exc.value)
+        assert "Claude Code initialization timed out" in msg
+        assert "Last pane lines:" in msg
+        assert "Yes, I trust this folder" in msg
+
+    def test_pane_tail_returns_last_n_nonblank_lines(self):
+        from cli_agent_orchestrator.providers.claude_code import _pane_tail
+
+        text = "\n".join(["line%d" % i for i in range(1, 21)] + ["", "  ", "last"])
+        tail = _pane_tail(text, n=3)
+        assert tail.splitlines() == ["line19", "line20", "last"]
+
+    def test_detect_claude_auth_failure_matches_and_misses(self):
+        from cli_agent_orchestrator.providers.claude_code import _detect_claude_auth_failure
+
+        assert _detect_claude_auth_failure("Failed to authenticate: OAuth ...") is not None
+        assert _detect_claude_auth_failure("OAuth session expired") is not None
+        # A normal REPL / trust dialog is NOT an auth failure.
+        assert _detect_claude_auth_failure("Welcome to Claude Code v2.1.248") is None
+        assert _detect_claude_auth_failure("Yes, I trust this folder") is None
