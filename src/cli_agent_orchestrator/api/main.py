@@ -126,6 +126,7 @@ from cli_agent_orchestrator.models.terminal import (
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.claude_code import ProfileNotFoundError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
 )
@@ -4245,6 +4246,16 @@ async def create_terminal_in_session(
         # a capability rejection is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except ProfileNotFoundError as e:
+        # F557 (#412): a CAO-launched claude_code terminal named an agent profile
+        # that does not resolve. Subclasses ValueError, so must precede the generic
+        # ValueError arm (which would 404 it). Fail loud with the structured
+        # E-PROFILE-NOT-FOUND code + the store dir searched, so the caller sees the
+        # real cause instead of the old ~30s native-store fallthrough + init timeout.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": e.code, "message": e.detail},
+        ) from e
     except (
         NativeHomeIsolationUnavailable,
         ProviderAuthRefreshFailed,

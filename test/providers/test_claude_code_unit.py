@@ -23,7 +23,11 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerPathMap,
 )
 from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
-from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
+from cli_agent_orchestrator.providers.claude_code import (
+    ClaudeCodeProvider,
+    ProfileNotFoundError,
+    ProviderError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -167,7 +171,7 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_initialize_with_missing_profile_falls_back_to_native_agent(
+    async def test_missing_profile_fails_loud_no_native_fallback(
         self,
         mock_tmux,
         mock_wait_status,
@@ -177,40 +181,79 @@ class TestClaudeCodeProviderInitialization:
         tmp_path,
         monkeypatch,
     ):
-        """Test missing CAO profile falls back to --agent <name> for native agent store."""
-        defaults = tmp_path / "providers.toml"
-        defaults.write_text(
-            '[claude_code]\nreasoning_effort = "high"\n',
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
-            defaults,
-        )
-        mock_wait_shell.return_value = True
-        mock_wait_status.return_value = True
-        mock_load.side_effect = FileNotFoundError("Profile not found")
-        mock_tmux.get_history.side_effect = [
-            "",
-            "Welcome to Claude Code v2.0",
-            "Welcome to Claude Code v2.0",
-        ]
+        """F557 (#412): a requested CAO profile that does not resolve fails LOUD via
+        preflight_launch (E-PROFILE-NOT-FOUND) and spawns NO subprocess.
 
-        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "my-native-agent")
-        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
-            result = await provider.initialize()
+        This REPLACES the former
+        test_initialize_with_missing_profile_falls_back_to_native_agent, which
+        asserted the old, dangerous behaviour: on FileNotFoundError the provider
+        silently passed the bare name to `claude --agent <name>` against Claude
+        Code's NATIVE agent store (~/.claude/agents/), which does not know CAO
+        profile names — so `cao launch --agents <name>` on an empty CAO_HOME_DIR
+        landed on "--agent '<name>' not found", dropped to a shell, and only 500'd
+        ~30s later on the init timeout (real ~30 min misdiagnosis in F548 gate r2).
+        The native-store fallthrough is removed for CAO-launched terminals: CAO
+        profiles are the contract, and a missing profile is indistinguishable from
+        a typo'd native name on an empty store, so it must fail loud.
 
-        assert result is True
-        # Verify --agent flag was passed with the profile name
-        send_keys_call = mock_tmux.send_keys.call_args
-        command = (
-            send_keys_call[0][2]
-            if len(send_keys_call[0]) > 2
-            else send_keys_call[1].get("keys", "")
-        )
-        args = shlex.split(command)
-        assert args[args.index("--agent") + 1] == "my-native-agent"
-        assert "--effort" not in args
+        Mutation note: kills a mutant that swallows FileNotFoundError in
+        preflight_launch (returns None) — that mutant would let the create proceed
+        to the native fallthrough and this test's `pytest.raises` would fail. Also
+        kills a mutant that spawns before preflighting — asserted via send_keys
+        never being called.
+        """
+        # Point CAO_HOME_DIR at an empty dir so the store dir named in the error
+        # is deterministic and no profile can resolve.
+        empty_home = tmp_path / "empty-home"
+        empty_home.mkdir()
+        monkeypatch.setenv("CAO_HOME_DIR", str(empty_home))
+        mock_load.side_effect = FileNotFoundError("Agent profile not found: my-native-agent")
+
+        with pytest.raises(ProfileNotFoundError) as excinfo:
+            await ClaudeCodeProvider.preflight_launch(agent_profile="my-native-agent", model=None)
+
+        err = excinfo.value
+        assert err.code == "E-PROFILE-NOT-FOUND"
+        assert err.profile_name == "my-native-agent"
+        # The store dir searched is named in the structured detail.
+        assert "my-native-agent" in err.detail
+        assert "agent-store" in err.detail
+        assert str(empty_home) in err.store_dir
+        # No subprocess spawn: preflight must fail before any backend send.
+        mock_tmux.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    async def test_preflight_launch_present_profile_passes(self, mock_load):
+        """F557 (#412) regression: a profile that DOES resolve passes preflight
+        (returns None, raises nothing), so the loud guard does not block real
+        launches.
+
+        Mutation note: kills a mutant that raises unconditionally in
+        preflight_launch (ignoring whether the load succeeded) — that mutant would
+        break every valid claude_code launch and this test would fail.
+        """
+        mock_load.return_value = AgentProfile(name="real-agent", description="", model="sonnet")
+
+        result = await ClaudeCodeProvider.preflight_launch(agent_profile="real-agent", model=None)
+
+        assert result is None
+        mock_load.assert_called_once_with("real-agent")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    async def test_preflight_launch_no_profile_name_is_noop(self, mock_load):
+        """F557 (#412): preflight_launch with no agent_profile is a no-op — it must
+        not consult the store or raise (a nameless launch is not a missing CAO
+        profile).
+
+        Mutation note: kills a mutant that drops the `if not agent_profile` guard
+        and calls load_agent_profile(None)/raises — asserted via load never called.
+        """
+        result = await ClaudeCodeProvider.preflight_launch(agent_profile=None, model=None)
+
+        assert result is None
+        mock_load.assert_not_called()
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
@@ -1893,6 +1936,7 @@ class TestClaudeCodeProviderEffortFlag:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_real_seed_applies_design_reviewer_effort(self, mock_load, tmp_path, monkeypatch):
         from test.conftest import ROOT_REPO
+
         if ROOT_REPO is None:
             pytest.skip("providers.toml.default not found (worktree without .git context)")
         outer_template = ROOT_REPO / "providers.toml.default"
@@ -1907,7 +1951,9 @@ class TestClaudeCodeProviderEffortFlag:
         mock_load.return_value = self._profile(name="claude_design_reviewer")
 
         args = shlex.split(
-            ClaudeCodeProvider("tid", "sess", "win", "claude_design_reviewer")._build_claude_command()
+            ClaudeCodeProvider(
+                "tid", "sess", "win", "claude_design_reviewer"
+            )._build_claude_command()
         )
 
         assert args[args.index("--effort") + 1] == "high"
