@@ -222,7 +222,7 @@ def test_attempt_rung1_rang_is_delivered(tmp_path):
         ),
     ):
         result = attempt_rung1(target, 42)
-    ring.assert_called_once_with("sup1", 42)
+    ring.assert_called_once_with("sup1", 42, message_body=None)
     assert result.delivered is True
     assert result.decision == "proceed"
     assert result.reason is None

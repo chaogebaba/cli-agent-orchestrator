@@ -30,6 +30,19 @@ import pytest
 # ===========================================================================
 
 
+@pytest.fixture(autouse=True)
+def _reset_wake_dedupe_window():
+    """F547 #403 point 5: the per-sender content-hash dedupe window in
+    cc_session_registry is module-global; reset it around each test so a
+    payload reused across tests (e.g. build_wake_payload("worker", 1)) is not
+    dropped as an inter-test duplicate."""
+    from cli_agent_orchestrator.services.cc_session_registry import _reset_dedupe_windows
+
+    _reset_dedupe_windows()
+    yield
+    _reset_dedupe_windows()
+
+
 @pytest.fixture()
 def sessions_dir(tmp_path):
     """Create a fixture ~/.claude/sessions/ directory."""
