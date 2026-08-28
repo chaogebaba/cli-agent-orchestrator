@@ -293,16 +293,15 @@ def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProf
 #
 # The resolver sits ABOVE the provider layer (D2): it feeds the existing
 # ``load_agent_profile`` seam so ``profile.name`` composition is computed once,
-# not fanned into the four provider modules. Phase 1 (migration step 1) lands
-# the seam and the new model field ONLY — composition of ``positions/`` and
-# ``overlays/`` fragments is Phase 2. A legacy profile that declares no
-# composition keys resolves BYTE-IDENTICALLY to today's direct parse (AC1).
+# not fanned into the four provider modules. A legacy profile that declares no
+# composition keys resolves BYTE-IDENTICALLY to today's direct parse (AC1); a
+# profile declaring ``position:``/``extends:`` is composed from the
+# ``positions/`` + ``overlays/`` stores via the D5 merge engine
+# (``utils/profile_composition.py``).
 
 # Frontmatter keys whose PRESENCE marks a profile as composition-bearing. A
 # profile carrying either one is refused by ``cao install`` on a resolver-less
-# server (AC2) and, until Phase 2 lands the merge engine, is refused at load
-# time here too rather than silently booting a worker with an empty persona
-# (the exact cross-release hazard the migration ordering closes).
+# server (AC2); on a resolver-capable server it is composed here (D5).
 PROFILE_COMPOSITION_KEYS = ("extends", "position")
 
 # Resolver-owned meta-keys stripped from the merged dict before ``AgentProfile``
@@ -312,7 +311,14 @@ PROFILE_COMPOSITION_KEYS = ("extends", "position")
 # ``position`` IS a resolver-internal model field (D6): the raw ``position:``
 # frontmatter DIRECTIVE is consumed here, and the resolver sets the field
 # programmatically from the resolved persona — the two are not the same thing.
-_RESOLVER_META_KEYS = ("extends", "_replace", "position", "providers")
+_RESOLVER_META_KEYS = (
+    "extends",
+    "_replace",
+    "position",
+    "providers",
+    "requires",
+    "certification",
+)
 
 
 def profile_declares_composition(metadata: dict) -> bool:
@@ -327,33 +333,228 @@ def profile_declares_composition(metadata: dict) -> bool:
     return any(key in metadata for key in PROFILE_COMPOSITION_KEYS)
 
 
+def _read_composition_store(
+    store_dir: Path, stem: str, *, resolve_env: bool = True
+) -> "tuple[dict, str] | None":
+    """Read one composition-store fragment (``positions/`` or ``overlays/``).
+
+    Returns ``(metadata, body)`` for ``<store_dir>/<stem>.md`` when present and
+    NOT a frozen fragment (``# FROZEN:`` first line — D3), else ``None``. Uses
+    ``_safe_join`` so a crafted stem cannot escape the store root.
+
+    ``resolve_env`` controls ``${VAR}`` expansion: True (default) for the
+    load/spawn path (an ``AgentProfile`` wants concrete values); False for the
+    install-time SOURCE composition (the context file stores UNRESOLVED source
+    so ``${VAR}`` defers to runtime, F497 D2 addendum / Ruling 1).
+    """
+    path = _safe_join(store_dir, f"{stem}.md")
+    if path is None or not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    # D3: the ``# FROZEN:`` first-line convention applies to positions/overlays
+    # too, else a frozen fragment silently resurrects.
+    if text.lstrip().startswith("# FROZEN:"):
+        return None
+    if resolve_env:
+        text = resolve_env_vars(text)
+    parsed = frontmatter.loads(text)
+    return dict(parsed.metadata), parsed.content
+
+
+def _resolve_composition_layers(
+    position_name: str,
+    provider: str,
+    *,
+    resolve_env: bool = True,
+) -> "list":
+    """Load the ordered composition layers for (position, provider) (D4 2→4).
+
+    Order: ``positions/<pos>.md`` → ``overlays/<provider>.md`` →
+    ``overlays/<provider>.<pos>.md``. The position fragment is REQUIRED; either
+    overlay is optional. Enforces the position ``providers:`` allowlist (D7):
+    a provider outside the allowlist raises so the assign/load is rejected
+    rather than silently running the wrong instructions.
+
+    ``resolve_env`` is threaded to ``_read_composition_store``: True for the
+    load/spawn path, False for install-time SOURCE composition (Ruling 1).
+    """
+    from cli_agent_orchestrator.constants import overlays_store_dir, positions_store_dir
+    from cli_agent_orchestrator.utils.profile_composition import CompositionError, Layer
+
+    positions_dir = positions_store_dir()
+    overlays_dir = overlays_store_dir()
+
+    pos = _read_composition_store(positions_dir, position_name, resolve_env=resolve_env)
+    if pos is None:
+        raise CompositionError(
+            f"position '{position_name}' not found in positions store "
+            f"{positions_dir} (or it is frozen)"
+        )
+    pos_meta, pos_body = pos
+
+    # D7: position-level providers allowlist. Absent allowlist = unconstrained.
+    allow = pos_meta.get("providers")
+    if isinstance(allow, list) and allow and provider not in allow:
+        raise CompositionError(
+            f"provider '{provider}' is not in position '{position_name}' "
+            f"allowlist {allow}; refusing composition (D7)"
+        )
+
+    layers = [Layer(kind=f"position:{position_name}", metadata=pos_meta, body=pos_body)]
+
+    overlay = _read_composition_store(overlays_dir, provider, resolve_env=resolve_env)
+    if overlay is not None:
+        o_meta, o_body = overlay
+        layers.append(
+            Layer(
+                kind=f"overlay:{provider}",
+                metadata=o_meta,
+                body=o_body,
+                provider=provider,
+                replaces=list(o_meta.get("replaces") or []),
+            )
+        )
+
+    overlay_pos = _read_composition_store(
+        overlays_dir, f"{provider}.{position_name}", resolve_env=resolve_env
+    )
+    if overlay_pos is not None:
+        op_meta, op_body = overlay_pos
+        layers.append(
+            Layer(
+                kind=f"overlay:{provider}.{position_name}",
+                metadata=op_meta,
+                body=op_body,
+                provider=provider,
+                replaces=list(op_meta.get("replaces") or []),
+            )
+        )
+    return layers
+
+
+def _stub_composition_inputs(metadata: dict, profile_name: str) -> "tuple[str, str]":
+    """Resolve (position_name, provider) from a composition-bearing profile's frontmatter.
+
+    Two spellings are accepted:
+      * alias stub: ``extends: <position>`` + ``provider: <provider>`` (D3/D4).
+      * direct: ``position: <position>`` + ``provider: <provider>``.
+    ``extends`` wins when both are present. The provider MUST resolve — a
+    composition profile with no provider cannot be composed (D7).
+    """
+    position_name = metadata.get("extends") or metadata.get("position")
+    if not position_name or not isinstance(position_name, str):
+        raise ValueError(
+            f"Agent profile '{profile_name}' declares composition but names no "
+            f"position (expected 'extends:' or 'position:')"
+        )
+    provider = metadata.get("provider")
+    if not provider or not isinstance(provider, str):
+        raise ValueError(
+            f"Agent profile '{profile_name}' declares composition (position "
+            f"'{position_name}') but names no provider; cannot compose (D7)"
+        )
+    return position_name, provider
+
+
 def resolve_agent_profile(resolved_text: str, profile_name: str) -> AgentProfile:
     """Compose an ``AgentProfile`` from already-env-resolved markdown text.
 
-    This is the F497 resolver seam (D2). It is the single point above the
-    provider layer where a profile's persona/overlay composition happens.
+    This is the F497 resolver seam (D2) — the single point above the provider
+    layer where persona/overlay composition happens, so ``.name`` composition
+    is computed once, not fanned into the four provider modules.
 
-    Phase 1 contract:
+    Contract:
       * A profile declaring NO composition key resolves exactly as
-        ``parse_agent_profile_text`` does today — same code path, byte-identical
-        result (AC1). This is the whole corpus until Phase 2.
-      * A profile declaring ``extends:``/``position:`` is refused here with a
-        clear error. The merge engine (D5's six key-classes) is Phase 2; until
-        then, letting such a profile through would boot a worker with an empty
-        persona and no error — the hazard the migration ordering exists to
-        close. ``cao install`` refuses these upstream (AC2), so a well-run
-        deploy never reaches this raise; it is a fail-closed backstop.
+        ``parse_agent_profile_text`` does today — byte-identical (AC1). This is
+        the whole legacy corpus.
+      * A profile declaring ``extends:``/``position:`` is a COMPOSITION profile
+        (an alias stub or a direct position profile). The resolver loads the
+        ``positions/<pos>.md`` persona and the ``overlays/<provider>[.<pos>].md``
+        overlays, merges them via the D5 engine, stamps the LEGACY concrete name
+        (D6), and enforces the D3 ``role`` mirror agreement + owns
+        ``description`` from the stub layer.
     """
-    metadata = frontmatter.loads(resolved_text).metadata
-    if profile_declares_composition(metadata):
-        declared = [k for k in PROFILE_COMPOSITION_KEYS if k in metadata]
+    parsed = frontmatter.loads(resolved_text)
+    metadata = dict(parsed.metadata)
+    if not profile_declares_composition(metadata):
+        return parse_agent_profile_text(resolved_text, profile_name)
+
+    from cli_agent_orchestrator.utils.profile_composition import compose_profile
+
+    position_name, provider = _stub_composition_inputs(metadata, profile_name)
+    layers = _resolve_composition_layers(position_name, provider)
+
+    composed = compose_profile(
+        profile_name,
+        layers,
+        position_name=position_name,
+        provider=provider,
+    )
+
+    # D3 field split: ``description`` is STUB-OWNED (per-legacy-name identity
+    # text) and contributes to the composed profile; ``role`` is a SCANNER-ONLY
+    # MIRROR excluded from the merge, with a STRICT agreement check.
+    stub_description = metadata.get("description")
+    if isinstance(stub_description, str) and stub_description:
+        composed.description = stub_description
+
+    stub_role = metadata.get("role")
+    if isinstance(stub_role, str) and stub_role and composed.role and stub_role != composed.role:
         raise ValueError(
-            f"Agent profile '{profile_name}' declares composition key(s) "
-            f"{declared} but profile composition is not available until F497 "
-            f"Phase 2. Phase 1 lands the resolver seam and model fields only; "
-            f"no profile should carry these keys yet."
+            f"Agent profile '{profile_name}': mirrored role '{stub_role}' in the "
+            f"alias stub disagrees with the composed role '{composed.role}' "
+            f"(D3 role-mirror agreement check, AC12)"
         )
-    return parse_agent_profile_text(resolved_text, profile_name)
+    # The stub's role mirror is authoritative for the composed .role only when
+    # the position layer left it unset; otherwise the agreement check above has
+    # already confirmed they match.
+    if isinstance(stub_role, str) and stub_role and not composed.role:
+        composed.role = stub_role
+
+    return composed
+
+
+def compose_agent_profile_source(raw_text: str, profile_name: str) -> str:
+    """Compose the UNRESOLVED markdown SOURCE for a composition stub (Ruling 1).
+
+    F497 D2 addendum: kiro delivers its persona via the install-time CONTEXT
+    FILE (``agent-context/<name>.md``), which stores the UNRESOLVED profile
+    source so ``${VAR}`` defers to runtime. A composition stub has an EMPTY
+    body, so the context file must instead receive the COMPOSED body — but
+    still unresolved. This mirrors ``resolve_agent_profile`` EXCEPT it never
+    env-resolves and it re-serialises to markdown (frontmatter + composed body)
+    instead of constructing an ``AgentProfile``.
+
+    For a NON-composition profile this returns ``raw_text`` UNCHANGED (byte
+    identical), so the legacy install path is untouched.
+    """
+    parsed = frontmatter.loads(raw_text)
+    metadata = dict(parsed.metadata)
+    if not profile_declares_composition(metadata):
+        return raw_text
+
+    from cli_agent_orchestrator.utils.profile_composition import (
+        compose_source_body,
+    )
+
+    position_name, provider = _stub_composition_inputs(metadata, profile_name)
+    layers = _resolve_composition_layers(position_name, provider, resolve_env=False)
+
+    # Composed BODY (unresolved) from the raw fragments.
+    composed_body = compose_source_body(layers)
+
+    # Composed FRONTMATTER: merge the layer frontmatters (same dict-layer merge
+    # the AgentProfile path uses is overkill here — the context file is prose +
+    # frontmatter for kiro's resource, and only the BODY carries the persona).
+    # Preserve the stub's identity keys (name/description/provider/role) and
+    # drop resolver meta-keys so the context file frontmatter is clean.
+    out_meta = dict(metadata)
+    for meta_key in ("extends", "_replace", "replaces", "providers", "requires", "certification"):
+        out_meta.pop(meta_key, None)
+    out_meta["position"] = position_name
+
+    post = frontmatter.Post(composed_body, **out_meta)
+    return str(frontmatter.dumps(post)) + "\n"
 
 
 def read_agent_profile_source(agent_name: str) -> str:
@@ -439,8 +640,9 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
     Routes through the F497 resolver seam (``resolve_agent_profile``) so a
     single point above the provider layer owns profile composition (D2). For
     the whole legacy corpus this is byte-identical to the previous direct
-    ``parse_agent_profile_text`` call (AC1); composition-bearing profiles are
-    Phase 2.
+    ``parse_agent_profile_text`` call (AC1); a composition-bearing profile
+    (``position:``/``extends:``) is composed from the positions/overlays
+    stores via the D5 merge engine.
     """
     try:
         raw_text = read_agent_profile_source(agent_name)

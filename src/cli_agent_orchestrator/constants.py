@@ -352,7 +352,12 @@ AGENT_CONTEXT_DIR = CAO_HOME_DIR / "agent-context"
 # Local agent store for custom agent profiles
 LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 
-# Local skill store for installed CAO skills
+# F497 (D3) — sibling composition stores read DIRECTLY by the resolver, never
+# scanned as flat profiles (they must not surface as fake profiles in
+# ``cao profile list`` / ``find_profiles``). ``install.sh`` syncs the repo's
+# ``profiles/{positions,overlays}/`` into these siblings of the agent store.
+POSITIONS_STORE_DIR = LOCAL_AGENT_STORE_DIR / "positions"
+OVERLAYS_STORE_DIR = LOCAL_AGENT_STORE_DIR / "overlays"
 SKILLS_DIR = CAO_HOME_DIR / "skills"
 
 # Confinement root for graph-layer sink exports (Issue #348, B3). Every graph
@@ -390,6 +395,43 @@ COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agent
 OPENCODE_CONFIG_DIR = Path.home() / ".aws" / "opencode"  # OpenCode CAO-managed config root
 OPENCODE_AGENTS_DIR = OPENCODE_CONFIG_DIR / "agents"  # OpenCode agent .md files
 OPENCODE_CONFIG_FILE = OPENCODE_CONFIG_DIR / "opencode.json"  # OpenCode MCP + tool gating config
+
+
+# F549 (#405) — CALL-TIME agent-dir resolution. The module-level constants above
+# are bound at IMPORT, so a test (or a caller) that sets CAO_AGENTS_DIR/CAO_HOME_DIR
+# after import still hits the real ``~/.kiro`` / ``~/.aws`` paths — the exact
+# footgun that let an install test clobber the user's live kiro agent. These
+# accessors re-read the environment on every call so ``install_agent`` (and any
+# other write path) resolves the target dir at CALL time. Prefer these over the
+# import-time constants in any code that WRITES provider agent files.
+def kiro_agents_dir() -> Path:
+    """Kiro agents dir, resolved from ``CAO_AGENTS_DIR`` at call time (F549)."""
+    return Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
+
+
+def agent_context_dir() -> Path:
+    """Shared agent-context dir, resolved from ``CAO_HOME_DIR`` at call time (F549)."""
+    raw = os.environ.get("CAO_HOME_DIR", "").strip()
+    home = Path(raw) if raw else Path.home() / ".aws" / "cli-agent-orchestrator"
+    return home / "agent-context"
+
+
+def local_agent_store_dir() -> Path:
+    """Local agent store, resolved from ``CAO_HOME_DIR`` at call time."""
+    raw = os.environ.get("CAO_HOME_DIR", "").strip()
+    home = Path(raw) if raw else Path.home() / ".aws" / "cli-agent-orchestrator"
+    return home / "agent-store"
+
+
+def positions_store_dir() -> Path:
+    """F497 positions store, resolved at call time."""
+    return local_agent_store_dir() / "positions"
+
+
+def overlays_store_dir() -> Path:
+    """F497 overlays store, resolved at call time."""
+    return local_agent_store_dir() / "overlays"
+
 
 # =============================================================================
 # Database Configuration

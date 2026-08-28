@@ -363,7 +363,7 @@ class ClaudeCodeProvider(BaseProvider):
 
         Returns None for native_agent path (honest: CAO does not control model).
         """
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     def __init__(
         self,
@@ -605,6 +605,7 @@ class ClaudeCodeProvider(BaseProvider):
                         mcp_config[server_name]["env"] = env
                     if "CAO_TERMINAL_TOKEN" not in env:
                         import os as _os
+
                         _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
                         if _token:
                             env["CAO_TERMINAL_TOKEN"] = _token
@@ -680,13 +681,14 @@ class ClaudeCodeProvider(BaseProvider):
         brief_mode = None
         try:
             if self._agent_profile:
-                from cli_agent_orchestrator.utils.agent_profiles import (
-                    parse_agent_profile_text,
-                    read_agent_profile_source,
-                )
+                # F497 D2 (named edit): route sessionBrief through the resolver
+                # (load_agent_profile) rather than a raw read+parse, so a
+                # position-inherited sessionBrief composes correctly. A raw
+                # parse of a composition-bearing stub would miss a sessionBrief
+                # declared on the position layer and silently skip the hook.
+                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-                raw = read_agent_profile_source(self._agent_profile)
-                candidate = parse_agent_profile_text(raw, self._agent_profile).sessionBrief
+                candidate = load_agent_profile(self._agent_profile).sessionBrief
                 brief_mode = candidate if candidate in ("required", "optional") else None
         except Exception:
             pass
@@ -1648,6 +1650,7 @@ class ClaudeCodeProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002h")
         return IDLE_PROMPT_PATTERN_LOG
 
