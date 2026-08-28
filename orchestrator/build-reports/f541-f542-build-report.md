@@ -11,7 +11,8 @@
 | F541 init-timeout commit | `97260c50` — `F541: provider_init_timeout default 180s for claude_code cold start (#397)` |
 | F548 commit | `0ca9c2d0` — `F548: fix claude_code init dialog handling + fast auth-fail + pane tail (#404)` |
 | F548 gate-test commit | `60f4cf37` — `F548: land gate SHOULD-1 regression test verbatim (#404)` |
-| Report commits | `b6eacf44` (`build report`) + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `F541/F542: build report r4` (this update) |
+| F548 r3-fix commit | `c5587aa4` — `F548: send arrow as real tmux Down key + settle poll; structured init errors (#404)` |
+| Report commits | `b6eacf44` (`build report`) + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `F541/F542: build report r5` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -419,6 +420,122 @@ $ uv run pytest test/providers/test_claude_code_coverage.py \
   `git status --short` showed only the new untracked test file, then it was
   committed as `60f4cf37`.
 - No source (`claude_code.py`) change in this commit — regression test only.
+
+---
+
+## r5 addendum — F548 box e2e r3 fix: real Down key + settle poll + structured errors (commit `c5587aa4`, issue #404)
+
+**Box e2e r3 @ `61008d9d` FAILED both legs on grok-box-2.** Evidence:
+`/data/cao-scratch/f548-e2e-r3/` and `orchestrator/tmp/orch/f548-e2e-r3/`.
+
+### What I disproved / proved (with evidence)
+- **Hypothesis 1 (the arrow is sent as literal bytes, not a real key) — PROVEN, this is the cause.**
+  `pos.native.log`: `10:19:55,214 … selecting 'Yes, I trust this folder'` →
+  `10:19:55,215 … send_keys … keys length: 3` (the 3 bytes `\x1b[B`) →
+  `10:19:56,032 … send_special_key … key: Enter`. The final pane in the timeout
+  error still shows `❯ No, exit` above `box@cursor:~/cli-subagents$` — Claude
+  EXITED. `send_keys` uses tmux load-buffer/paste-buffer (vis-sanitized on
+  tmux ≥ 3.7), so `\x1b[B` is delivered as LITERAL TEXT; Ink never parses it as
+  Down, focus stayed on "No, exit", and Enter confirmed EXIT.
+  **Fix:** send the arrow as a tmux SPECIAL KEY — `send_special_key("Down")`
+  (libtmux `send_keys("Down", enter=False)` → the real key name, `clients/tmux.py:1214`).
+- **Hypothesis 2 (keys fire before Ink's input handler attached) — mitigated by the settle poll.**
+  After the real Down, `_select_menu_affirmative` re-captures the pane and waits
+  until `❯` sits on the affirmative row before Enter, giving Ink time to attach.
+- **Hypothesis 3 (repaint resets focus) — mitigated by the same settle poll**, which
+  re-reads after any transient repaint rather than trusting a single frame.
+- **Negative leg (creds moved): the auth screen was masked by the trust exit.**
+  With trust now actually accepted, the startup loop's next iteration re-reads
+  the post-Enter pane and the top-of-loop auth check catches a login screen,
+  failing fast as E-CLAUDE-AUTH (see r3 section). Also confirmed the P/N legs'
+  transport defect: `pos.headers` = `HTTP/1.1 500 … content-type: text/plain`
+  with body `Internal Server Error`; `neg.headers` empty (hang) — no structured
+  error. Fixed below.
+
+### Acceptance-criteria checklist (r5)
+
+| # | Directive | How met | Evidence (file:line) |
+|---|---|---|---|
+| 1 | Send Down as a tmux special-key name, not literal ESC[B. | `_select_menu_affirmative` sends `send_special_key("Down")`; all three dialogs (bypass/trust/external-import) route through it; no `send_keys("\x1b[B")` remains. | helper `providers/claude_code.py:975`; Down send `:1020`; call sites `:1157`,`:1178`,`:1221` |
+| 2 | Add a settle poll: re-capture pane, confirm focus moved to the affirmative before Enter. | The helper checks the caller's current pane first, then re-reads until `❯` precedes the affirmative option (`❯[^\n]*<affirmative>`), then sends Enter (after confirm-or-timeout; WARNING if unconfirmed). | helper body `providers/claude_code.py:975-1054` |
+| 3 | Negative-leg: check auth AFTER trust accepted (pane after Enter). | The startup loop re-reads the pane every iteration and runs the auth fast-fail at the TOP, so the iteration after trust-accept inspects the post-Enter pane. | loop auth check (r3) `providers/claude_code.py` top of loop; loop re-reads each iteration |
+| 4 | Pre-init failure must be a 4xx/5xx JSON with E-CLAUDE-AUTH, not text/plain 500 / hang. | `start_session_endpoint` maps `ClaudeAuthError` → 500 JSON `{code:'E-CLAUDE-AUTH', message}` and a provider-init `TimeoutError` → 500 JSON `{code:'provider_init_timeout', message}` (message carries the pane tail). | auth arm `api/main.py:3758`; timeout arm `:3763-3777`; import `api/main.py:129` |
+| 5 | Unit tests: exact key sequence + settle poll; mutation (raw ESC[B) fails. | `test_trust_prompt_selects_affirmative_row_not_bare_enter` + `test_trust_prompt_down_is_special_key_not_literal_escape` assert `send_special_key('Down')` then `'Enter'` and NO `send_keys`. Mutation-verified: reverting the Down to `send_keys("\x1b[B")` fails BOTH (locally observed, reverted exactly). | `test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth` |
+| 6 | Corrected negative-leg contract. | Two endpoint tests assert the structured JSON (E-CLAUDE-AUTH; provider_init_timeout) and `content-type: application/json` (not text/plain). | `test/api/test_wp2s3_http_contract.py::{test_start_claude_auth_error_is_structured_json_e_claude_auth,test_start_init_timeout_is_structured_json_not_text_plain}` |
+| 7 | Box-runnable repro note. | Below. | — |
+
+### Design note (why Enter is still sent when focus is unconfirmed)
+The r3-box failure was NOT "blind Enter after a real Down moved focus" — it was
+a literal-bytes arrow that never moved focus at all. With a real Down key, focus
+moves. The settle poll's job is (a) give Ink time to attach and (b) verify. If a
+flaky/slow capture can't confirm within `settle_timeout`, refusing to Enter would
+strand every launch; so the helper Enters anyway and logs a WARNING. The
+confirm/return value gates tests and observability, not the keypress.
+
+### Contract change to pre-existing tests (r5)
+Seven pre-existing bypass/trust/idle-gap/container tests asserted the old
+`send_keys("\x1b[B")` arrow. They were updated to the new real-special-key
+contract (Down+Enter via `send_special_key`, no `send_keys`), with fixtures that
+model `❯` moving onto the affirmative row so the settle poll confirms:
+`test/providers/test_claude_code_unit.py` (2), `test_claude_code_coverage.py` (3:
+trust/bypass/external-import), `test_startup_prompt_idle_gap.py` (5: the
+ClaudeCode class only — Kimi/Antigravity untouched), `test_container_wrapped.py`
+(2).
+
+### r5 test results (exact commands + verbatim summary lines)
+```
+$ uv run pytest test/providers/test_claude_code_unit.py test/providers/test_claude_code_coverage.py \
+    test/providers/test_startup_prompt_idle_gap.py test/providers/test_container_wrapped.py \
+    test/providers/test_f548_gate_repro.py test/api/test_wp2s3_http_contract.py -q -n0
+253 passed
+```
+Mutation verification (raw ESC[B via send_keys), reverted exactly afterward:
+```
+test_trust_prompt_down_is_special_key_not_literal_escape       FAILED (down_calls == 0)
+test_trust_prompt_selects_affirmative_row_not_bare_enter       FAILED (special-key seq lacks 'Down')
+```
+
+### r5 lint/type
+- black: `claude_code.py`, `main.py`, and my added test blocks are clean.
+  (`test/api/test_wp2s3_http_contract.py` was already non-black-compliant on the
+  pinned HEAD; I appended only black-clean tests and did NOT reformat the
+  pre-existing body, to avoid unrelated churn — `black --diff` shows no change
+  to my added block.)
+- isort: clean on `claude_code.py` / `main.py` (the new `ClaudeAuthError` import
+  in main.py is ordered).
+- mypy: `claude_code.py` clean; `main.py` has only the two pre-existing errors
+  (lines 7760, 8324) outside my edits.
+
+### r5 box-runnable repro note (grok box, tmux backend)
+Prereq: a box with valid Claude auth (else you exercise the E-CLAUDE-AUTH leg,
+which is also correct — it should now 500 fast with a JSON `E-CLAUDE-AUTH` body,
+not hang). Build the fork at this HEAD and launch cold:
+```bash
+# On the box, in the fork checkout at c5587aa4 (or cao/e08be272 tip):
+uv tool install --force --python 3.14 .
+export CAO_HOME_DIR=/data/cao-scratch/f548-e2e/cao-home   # isolated
+cao-server >/data/cao-scratch/f548-e2e/server.stdout 2>&1 &
+# cold launch immediately (fresh host => trust dialog focuses 'No, exit'):
+cao launch --agents chao_supervisor --provider claude_code \
+  --session-name f548chk --headless --yolo
+```
+Expected with this fix + valid auth:
+- server log shows `Workspace trust prompt detected, selecting 'Yes, I trust
+  this folder'`, then `send_special_key … key: Down`, then a settle confirm
+  (`affirmative row confirmed focused; sending Enter`), then `Enter`;
+- the pane advances PAST the trust dialog to the Claude REPL; `wait_until_status`
+  reaches idle; `cao launch` exits 0 and `tmux attach -t cao-f548chk` shows the
+  REPL (NOT a shell prompt).
+Failure signatures this fixes:
+- OLD: `send_keys … keys length: 3` then Enter, pane stuck on `❯ No, exit`,
+  180s timeout, `HTTP/1.1 500 … text/plain Internal Server Error`.
+- If auth is stale on the box: expect a FAST (not 180s) `HTTP/1.1 500` with
+  `content-type: application/json` and body `{"detail":{"code":"E-CLAUDE-AUTH",
+  "message":"[E-CLAUDE-AUTH] …\nLast pane lines:\n…"}}` — re-sync box auth
+  (`scripts/box-setup.sh`), an ops step, then re-run.
+Auth-only quick check (no CAO): `claude -p` on the box; rc=1 +
+`Failed to authenticate: OAuth session expired …` means box auth must be
+re-synced before a green e2e is possible.
 
 ---
 
