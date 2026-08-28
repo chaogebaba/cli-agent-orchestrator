@@ -2,7 +2,7 @@
 
 **Issue:** F524 / #379 (P0) — supervisor→worker `send_message` stuck `pending` for 68 min, then delivered stale.
 **Branch:** `cao/00ef81f8` (worker terminal-id branch; fx121 commit hook enforces this name).
-**Git-SHA-fork:** 4f2022ece4093006bb806cd3cf50abec92004828 (code head; this docs-only report commit rides on top).
+**Git-SHA-fork:** 4e38138dcca5dbd531853ef7a4f68fd8acd2fab8 (code head; this docs-only report commit rides on top).
 **Base:** `main` @ 4e873cfd.
 **Worktree:** `/home/chao/VScode_projects/cli-subagents/.cao/worktrees/00ef81f8/cli-agent-orchestrator`
 **Merge status:** NOT merged — F244 gate follows.
@@ -114,6 +114,14 @@ in the existing reconcile sweep, plus a delivery-time staleness guard.
   `kind = 'f524.stall_surfaced'` (every other trace kind stays append-only /
   multi-row). **`claim_message_trace_once(...)`** does an insert-or-ignore under
   that index and returns `True` iff THIS call won the claim.
+- **S1-migration (upgrade path)** — `Base.metadata.create_all` only creates the
+  index on a FRESH DB; it never adds an index to an existing table. So
+  **`_migrate_f524_stall_surface_unique_index()`** (registered in `init_db()`
+  right after `_migrate_fx191_trace_extension`, following the same
+  `engine.begin` / `sqlite_master` convention) runs on every existing-DB
+  startup: it **dedupes** pre-existing `f524.stall_surfaced` rows (keeping the
+  LOWEST rowid per `message_id`, so a stray duplicate cannot block the unique
+  index) and then `CREATE UNIQUE INDEX IF NOT EXISTS`. Idempotent.
 
 ### `src/cli_agent_orchestrator/services/inbox_service.py`
 - Constant **`F524_STALL_SURFACED_KIND = "f524.stall_surfaced"`**.
@@ -161,7 +169,16 @@ reconstruction; the reconciler test never calls the sweep method directly).
   (check→send→stamp across sessions, no uniqueness). **Fixed:** partial unique
   index + `claim_message_trace_once` insert-or-ignore; stamp-first, send-only-if-won.
 
-### Test inventory — `test/services/test_f524_direct_delivery_stall.py` (9 passed)
+### Re-gate correction round 2 (S1-migration, serious)
+- **S1-migration:** the round-1 unique index existed only on FRESH databases —
+  `init_db()` did not create it on an existing `inbox_message_trace_event`
+  table, so on a deployed-upgrade DB the index was absent and two
+  `claim_message_trace_once('f524.stall_surfaced')` calls both returned `True`
+  (duplicate rows). **Fixed:** `_migrate_f524_stall_surface_unique_index()` runs
+  on the upgrade path (dedupe-then-`CREATE UNIQUE INDEX IF NOT EXISTS`),
+  registered in `init_db()`.
+
+### Test inventory — `test/services/test_f524_direct_delivery_stall.py` (11 passed)
 - Leg 1 stall surfacing: aged direct message surfaces to sender; fresh message
   NOT surfaced; service-sender (`message-trace:`) excluded; supervisor-mailbox
   row NOT surfaced here (rides FX191).
@@ -171,6 +188,11 @@ reconstruction; the reconciler test never calls the sweep method directly).
   when the row is stamped; delivers the raw wire when it is not.
 - **S1** atomic one-shot: repeat sweeps emit exactly one notice; a claim taken
   by a crashed prior sweep is not re-sent (degradation, not duplication).
+- **S1-migration** upgrade path (`TestF524UpgradePathMigration`): a DB with the
+  trace table but WITHOUT the index (and a pre-seeded duplicate pair) → after
+  `init_db()` the index exists, the duplicate is deduped to one row, an
+  unrelated trace kind is untouched, and claim-once holds; `init_db()` is
+  idempotent on a second run.
 
 ### Mutation verification (each new test KILLS its mutant)
 | Mutant | Injected change | Result |
@@ -178,8 +200,9 @@ reconstruction; the reconciler test never calls the sweep method directly).
 | B1 | delete `self.surface_stalled_direct_deliveries()` in `reconcile_orphaned_messages` | `TestF524ReconcilerWiring` **FAILED** (0 notices ≠ 1) — killed |
 | B2 | neuter the banner prepend (`if stale_ids and False`) in `deliver_pending` | `test_surfaced_message_delivered_with_banner` **FAILED** (wire had no banner) — killed; `without_banner` still passed |
 | S1 | `claim_message_trace_once` returns `True` on `IntegrityError` | both `TestF524AtomicOneShot` tests **FAILED** (duplicate notice) — killed |
+| S1-migration | remove `_migrate_f524_stall_surface_unique_index()` from `init_db()` | both `TestF524UpgradePathMigration` tests **FAILED** (index absent on upgraded DB) — killed |
 
-All mutants reverted; the 9 tests pass clean afterward (no `MUTANT` markers remain).
+All mutants reverted; the 11 tests pass clean afterward (no `MUTANT` markers remain).
 
 ### Regression (related suites, unchanged behavior)
 - `test_f165_real_sqlite_reconciler.py` + `test_inbox_service.py` +
@@ -208,12 +231,19 @@ real `deliver_pending` composition path (B2), not a test reconstruction.
 
 ---
 
-## 6. Re-gate change summary (round 2)
+## 6. Re-gate change summary
 
-Additive over the round-1 fix; no behavior removed:
+Round 2 (additive over the round-1 fix; no behavior removed):
 - Added partial unique index `uq_inbox_trace_f524_stall_surfaced` +
   `claim_message_trace_once` (atomic one-shot; S1).
 - Surfacing loop now stamps-first via the atomic claim and sends the sender
   notice only on the winning claim.
 - New tests: reconciler-wiring integration (B1), real-path banner assertions
   (B2), atomic one-shot / crash-safe (S1) — each mutation-verified.
+
+Round 3 (S1-migration):
+- Added `_migrate_f524_stall_surface_unique_index()` to `init_db()` so the
+  unique index is created (with pre-dedupe) on existing/upgraded databases, not
+  only fresh ones.
+- New tests: `TestF524UpgradePathMigration` (index-creation + dedupe on an
+  existing DB; idempotent) — mutation-verified by removing the migration call.
