@@ -65,12 +65,55 @@ def hardened_db(monkeypatch):
             pass
 
 
-def test_production_engine_sets_wal_and_busy_timeout():
-    """The shipped ORM engine must open connections in WAL with a busy timeout."""
-    with db.engine.connect() as conn:
-        journal_mode = conn.execute(text("PRAGMA journal_mode")).scalar()
-        busy_timeout = conn.execute(text("PRAGMA busy_timeout")).scalar()
+def test_production_connect_listener_sets_wal_and_busy_timeout():
+    """The production ``connect`` listener must set WAL + busy_timeout on a
+    FRESH connection.
+
+    ``busy_timeout`` is a MUTABLE, PER-CONNECTION pragma. Reading it off the
+    shared, module-global, POOLED ``db.engine`` mid-suite is not isolation-safe:
+    under xdist (``-n 2 --dist loadgroup``) a checked-out pooled connection can
+    report a value another test left on it (observed 1000), so that assertion
+    fails net-new even though the product code is correct (F554 gate r1b/B1).
+
+    Instead, exercise the ACTUAL production listener (``db._set_sqlite_pragmas``)
+    on a dedicated ``NullPool`` engine pointed at an ISOLATED scratch DB file:
+    NullPool opens a brand-new physical connection per checkout and never reuses
+    one, so the only code that has touched the connection is the production
+    listener. This proves the fix without depending on shared pool state and
+    without touching the production database file.
+    """
+    from sqlalchemy.pool import NullPool
+
+    if not os.path.isdir("/data"):
+        pytest.skip("/data not mounted — scratch policy forbids /tmp")
+    os.makedirs(_SCRATCH_ROOT, exist_ok=True)
+    db_path = os.path.join(_SCRATCH_ROOT, f"f554-listener-{uuid.uuid4().hex}.db")
+
+    probe_engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+    # Attach the *production* listener function — not a test copy — so this
+    # verifies the shipped code path.
+    event.listen(probe_engine, "connect", db._set_sqlite_pragmas)
+    try:
+        with probe_engine.connect() as conn:
+            journal_mode = conn.execute(text("PRAGMA journal_mode")).scalar()
+            busy_timeout = conn.execute(text("PRAGMA busy_timeout")).scalar()
+    finally:
+        probe_engine.dispose()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(db_path + suffix)
+            except OSError:
+                pass
+
+    # journal_mode=WAL is a persistent per-database property.
     assert str(journal_mode).lower() == "wal"
+    # busy_timeout read on a fresh NullPool connection reflects exactly what the
+    # production listener set — no pool-state contamination.
+    assert int(busy_timeout) == CAO_DB_BUSY_TIMEOUT_MS
     assert int(busy_timeout) >= 5000
 
 

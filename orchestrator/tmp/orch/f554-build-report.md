@@ -132,3 +132,79 @@ uv run pytest test/services/test_f230_progress_fence_closed_db.py \
 No offload-box work was performed. All commands ran on the laptop in the
 provisioned worktree `.cao/worktrees/c8f4e63d`. Targeted tests only (3 new + 16
 regression), no full suite. Scratch under `/data/cao-scratch/c8f4e63d`.
+
+
+---
+
+## r2 — gate r1b remediation (GATE-NO → addressed)
+
+Gate r1b (`/data/cao-scratch/f554-gate-report-r1b.md`) ruled GATE-NO on one
+BLOCKING (B1, test-only) + one SHOULD (S1). The product change (WAL +
+busy_timeout connect-listener + bounded retry) was ruled proven correct and
+load-bearing (mutation 3/3 both mutants, controls green); only the new test and
+a docstring needed work. Both fixed here. N1 (WAL sidecar note) needs no code.
+
+### B1 (BLOCKING, TEST-ONLY) — fixed
+
+Root cause (from the gate): the new test read `busy_timeout` off the shared,
+module-global, **pooled** production `db.engine` mid-suite. `busy_timeout` is a
+**mutable per-connection** PRAGMA; under the merge-gate xdist invocation
+(`-n 2 --dist loadgroup`) a checked-out pooled connection reported `1000`, so
+`assert int(busy_timeout) >= 5000` failed net-new — even though the product code
+is correct. It passed only in isolation (`-n0`).
+
+Fix (test-only; product code untouched): replaced
+`test_production_engine_sets_wal_and_busy_timeout` with
+`test_production_connect_listener_sets_wal_and_busy_timeout`, which exercises the
+**actual production listener function** `db._set_sqlite_pragmas` on a dedicated
+`create_engine(..., poolclass=NullPool)` engine pointed at an isolated scratch DB
+file. NullPool opens a brand-new physical connection per checkout and never
+reuses one, so the only code that has touched the connection is the production
+listener — no shared-pool state can contaminate the read. It now also asserts
+the exact value (`== CAO_DB_BUSY_TIMEOUT_MS`). The probe engine uses an isolated
+`/data/cao-scratch` file (not `DATABASE_URL`), so the test never touches or
+WAL-converts the production DB file.
+
+### S1 (SHOULD) — fixed
+
+Added a "Durability window" paragraph to the `CAO_DB_BUSY_TIMEOUT_MS` comment in
+`constants.py` stating that `synchronous=NORMAL`+WAL keeps a COMMIT durable
+against an **application** crash, but the last committed transaction(s) whose WAL
+frames are not yet checkpointed **can be lost on OS crash / power loss** (unlike
+`synchronous=FULL`) — an accepted trade for CAO's coordination DB (state is
+reconstructable from live sessions on restart; the win is far fewer fsyncs under
+the concurrent-assign load that caused #410). No code-behaviour change.
+
+### Verification (r2)
+
+- Targeted file, isolation: `CI=1 uv run pytest test/clients/test_f554_sqlite_concurrent_writes.py -p no:suite_slot -n0` → **3 passed**.
+- xdist reproduction of the B1 config over the slice containing the file:
+  `CI=1 uv run pytest test/clients -n 2 --dist loadgroup -p no:suite_slot -q`
+  → **381 passed, 1 skipped, 0 failures** (previously B1 failed here). The new
+  test is now isolation-safe by construction (own NullPool engine + own scratch
+  file), so mixing in `test/services` cannot re-trigger it — the shared-pool read
+  that B1 depended on no longer exists.
+  - Note: the full `test/services test/clients` slice is a ~7k-test heavy suite;
+    per box-ops it is a box job, not a laptop run (a laptop run of the full slice
+    exceeded the 15-min tool ceiling). No offload box was configured/reachable to
+    this lane this round (`scripts/box-run.sh` not present in the worktree,
+    `CAO_BOXES` unset), so the scoped-but-representative xdist proof above stands;
+    the shared-pool defect is structurally removed regardless of sibling tests.
+- Lint/types on touched files: `black`/`isort` clean; `mypy --strict constants.py`
+  → Success (docstring-only change this round).
+
+### r2 diff --stat (this round, vs r1 tip 7f9b7db5)
+
+```
+ orchestrator/tmp/orch/f554-build-report.md         | (this r2 section)
+ src/cli_agent_orchestrator/constants.py            |  (durability-window comment)
+ test/clients/test_f554_sqlite_concurrent_writes.py |  (B1 test rewrite)
+```
+
+### r2 box-actions ledger
+
+No offload-box work this round (no box configured/reachable to this lane;
+`scripts/box-run.sh` absent from the worktree, `CAO_BOXES` unset). All commands
+ran on the laptop in the provisioned worktree `.cao/worktrees/c8f4e63d`; scratch
+under `/data/cao-scratch/c8f4e63d`; no `/tmp`. Targeted + scoped-xdist tests
+only, no full suite on the laptop.
