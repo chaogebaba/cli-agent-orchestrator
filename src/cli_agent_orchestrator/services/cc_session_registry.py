@@ -31,7 +31,7 @@ from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.fork_context_service import (
     _PROC_ROOT,
     _descendants,
-    pane_pid,
+    first_pane,
 )
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import SandboxProviderUnsafe
@@ -256,10 +256,21 @@ def _resolve_tmux_window_id(tmux_session: str, tmux_window_name: str) -> Optiona
     return None
 
 
-def _record_matches_pane(record: RegistryRecord, tmux_session: str, window_id: str) -> bool:
+def _record_matches_pane(
+    record: RegistryRecord,
+    tmux_session: str,
+    window_id: str,
+    pane_id: Optional[str] = None,
+) -> bool:
     """Check if a record's tmux field matches the expected pane.
 
     Registry tmux format: "<session>:<window_id>.<pane_id>"
+
+    F545 (#401): when ``pane_id`` is supplied (the seat's FIRST pane ``%N``), the
+    record's pane_id must ALSO match — session+window_id alone let a second pane
+    in the same split window pass, which is exactly how the doorbell rang the
+    consultant Claude. When ``pane_id`` is None (older records / no %N to compare
+    against), fall back to the session+window_id check.
     """
     if not record.tmux:
         return False
@@ -268,12 +279,18 @@ def _record_matches_pane(record: RegistryRecord, tmux_session: str, window_id: s
     try:
         colon_idx = record.tmux.index(":")
         rec_session = record.tmux[:colon_idx]
-        rest = record.tmux[colon_idx + 1:]
+        rest = record.tmux[colon_idx + 1 :]
         dot_idx = rest.index(".")
         rec_window_id = rest[:dot_idx]
+        rec_pane_id = rest[dot_idx + 1 :]
     except (ValueError, IndexError):
         return False
-    return rec_session == tmux_session and rec_window_id == window_id
+    if rec_session != tmux_session or rec_window_id != window_id:
+        return False
+    if pane_id is not None:
+        # Compare pane %N exactly — a candidate on a different pane is never a match.
+        return rec_pane_id == pane_id
+    return True
 
 
 def resolve_target(
@@ -297,14 +314,20 @@ def resolve_target(
     if not records:
         return ResolveResult(refusal_reason="no_registry_records")
 
-    # Step 1: get pane pid and find descendant CC processes
+    # Step 1: get the seat's FIRST pane (%N + pid) and find descendant CC procs.
+    # F545 (#401): resolve the WINDOW'S FIRST pane, never the active pane. A split
+    # seat window with a second (consultant) pane focused would otherwise make the
+    # active pane's process tree the candidate set and ring the wrong Claude.
     try:
-        pane_leader = pane_pid(tmux_session, tmux_window)
+        seat_pane_id, pane_leader = first_pane(tmux_session, tmux_window)
     except (subprocess.CalledProcessError, OSError, ValueError):
         return ResolveResult(refusal_reason="pane_pid_failed")
 
     descendants = _descendants(pane_leader)
-    # Find registry records whose pid is in the descendant tree
+    # Find registry records whose pid is in the FIRST pane's descendant tree.
+    # A record whose pid tree lives under any other pane is not in this set and is
+    # therefore never a target — it cannot inflate the candidate count into a false
+    # target_ambiguous.
     candidate_records = [r for r in records if r.pid in descendants]
 
     if not candidate_records:
@@ -313,21 +336,32 @@ def resolve_target(
     # Step 2: resolve the tmux window_id for cross-checking
     window_id = _resolve_tmux_window_id(tmux_session, tmux_window)
 
-    # Step 3: cross-check — prefer records whose tmux field matches this pane
+    # Step 3: cross-check — prefer records whose tmux field matches this pane.
+    # F545: compare the seat's FIRST pane %N too, so a record that carries the
+    # terminal id but sits on a different pane is filtered out here as well.
     if window_id is not None:
-        matched = [r for r in candidate_records if _record_matches_pane(r, tmux_session, window_id)]
+        matched = [
+            r
+            for r in candidate_records
+            if _record_matches_pane(r, tmux_session, window_id, seat_pane_id)
+        ]
     else:
         # Cannot cross-check — all candidates remain
         matched = candidate_records
 
     if len(matched) == 0:
-        # No cross-check match among candidates — ambiguous
+        # No cross-check match among the first-pane candidates.
         if len(candidate_records) > 1:
+            # >1 procfs candidate under the seat's first pane, none pane-matched —
+            # genuinely ambiguous within THIS pane's tree (not a second-pane leak).
             return ResolveResult(refusal_reason="target_ambiguous")
-        # Single candidate without cross-check match — use it (procfs-only resolution)
+        # Exactly one candidate proven under the first pane's tree by procfs, but its
+        # registry tmux %N did not match (e.g. a stale tmux field). procfs descent is
+        # authoritative for "which pane" here, so use it. This cannot be a second-pane
+        # record — those never entered candidate_records (F545).
         matched = candidate_records
     elif len(matched) > 1:
-        # Multiple records match the same pane — ambiguous
+        # Multiple records match the same first pane — ambiguous
         return ResolveResult(refusal_reason="target_ambiguous")
 
     record = matched[0]

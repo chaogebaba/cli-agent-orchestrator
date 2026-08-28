@@ -403,7 +403,10 @@ class TestAC5ResolutionGrandchild:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants") as mock_desc,
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
@@ -443,7 +446,10 @@ class TestAC5ResolutionGrandchild:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 200, 300],
@@ -481,7 +487,10 @@ class TestAC6ResolutionRefusals:
         _make_registry_record(sessions_dir, 300, tmux="s:@0.%0", proc_start=3000)
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 300],
@@ -516,7 +525,10 @@ class TestAC6ResolutionRefusals:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 300],
@@ -546,7 +558,10 @@ class TestAC6ResolutionRefusals:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 300, 400],
@@ -584,7 +599,10 @@ class TestAC6ResolutionRefusals:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 300, 400],
@@ -616,7 +634,10 @@ class TestAC6ResolutionRefusals:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 300, 400],
@@ -633,6 +654,121 @@ class TestAC6ResolutionRefusals:
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
         assert result.refusal_reason == "target_ambiguous"
+
+
+# ===========================================================================
+# F545 (#401): split seat window — resolve_target must key on the FIRST pane,
+# never the active pane. A second (consultant) pane whose Claude inherited
+# CAO_TERMINAL_ID via tmux env must never become the doorbell target, and must
+# never inflate the candidate set into a false target_ambiguous.
+#
+# These tests exercise the REAL _descendants() walk over a synthetic /proc tree
+# (patching fork_context_service._PROC_ROOT) so that "a candidate whose pid tree
+# is not under the first pane is never a target" is proven by procfs, not by a
+# mocked descendant list. first_pane is patched to return the seat's FIRST pane
+# (%0) — the fix under test is that resolve_target consults first_pane, not the
+# active pane.
+# ===========================================================================
+
+
+class TestF545FirstPaneResolution:
+    """resolve_target keys on the window's first pane, not the active pane."""
+
+    def _resolve(self, sessions_dir, proc_root):
+        from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+
+        with (
+            # Seat's FIRST pane is %0 with leader pid 100. Pre-fix, pane_pid()
+            # would have returned the ACTIVE pane (the consultant's %1 / pid 400).
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
+            # Real descendant walk over the synthetic tree.
+            patch(
+                "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
+                proc_root,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                side_effect=lambda pid: {300: 3000, 500: 5000}.get(pid),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            return resolve_target("term-01", "cao-test", "win-0", sessions_dir=sessions_dir)
+
+    def test_two_panes_both_have_cc_records_picks_first_pane(self, sessions_dir, proc_root):
+        """Two-pane split, a CC record in BOTH pane trees -> first pane's record wins.
+
+        First pane %0: leader 100 -> child 300 (seat CC, tmux %0).
+        Second pane %1: leader 400 -> child 500 (consultant CC, tmux %1) —
+        inherited the same terminal id but sits on a DIFFERENT pane.
+        """
+        # First pane tree
+        _make_proc_entry(proc_root, 100, ppid=1, starttime=1000)
+        _make_proc_entry(proc_root, 300, ppid=100, starttime=3000)
+        # Second pane tree (never under first pane)
+        _make_proc_entry(proc_root, 400, ppid=1, starttime=4000)
+        _make_proc_entry(proc_root, 500, ppid=400, starttime=5000)
+
+        _make_registry_record(
+            sessions_dir, 300, session_id="seat", tmux="cao-test:@0.%0", proc_start=3000
+        )
+        _make_registry_record(
+            sessions_dir, 500, session_id="consultant", tmux="cao-test:@0.%1", proc_start=5000
+        )
+
+        result = self._resolve(sessions_dir, proc_root)
+
+        assert result.refusal_reason is None
+        assert result.record is not None
+        assert result.record.pid == 300
+        assert result.record.session_id == "seat"
+
+    def test_single_pane_unchanged(self, sessions_dir, proc_root):
+        """Single-pane window: the one CC record resolves exactly as before."""
+        _make_proc_entry(proc_root, 100, ppid=1, starttime=1000)
+        _make_proc_entry(proc_root, 300, ppid=100, starttime=3000)
+
+        _make_registry_record(
+            sessions_dir, 300, session_id="seat", tmux="cao-test:@0.%0", proc_start=3000
+        )
+
+        result = self._resolve(sessions_dir, proc_root)
+
+        assert result.refusal_reason is None
+        assert result.record is not None
+        assert result.record.pid == 300
+
+    def test_cc_only_in_second_pane_no_target_not_ambiguous(self, sessions_dir, proc_root):
+        """CC record ONLY in the second pane -> no_descendant_record (nudge), NOT ambiguous.
+
+        First pane %0: leader 100, a plain shell with no CC child.
+        Second pane %1: leader 400 -> child 500 (the only CC, tmux %1).
+        The seat's first-pane tree has no CC record, so resolution refuses with
+        no_descendant_record and falls to the nudge transport — it must NEVER
+        return target_ambiguous just because a record exists on another pane.
+        """
+        # First pane tree — no CC descendant
+        _make_proc_entry(proc_root, 100, ppid=1, starttime=1000)
+        # Second pane tree — carries the only CC record
+        _make_proc_entry(proc_root, 400, ppid=1, starttime=4000)
+        _make_proc_entry(proc_root, 500, ppid=400, starttime=5000)
+
+        _make_registry_record(
+            sessions_dir, 500, session_id="consultant", tmux="cao-test:@0.%1", proc_start=5000
+        )
+
+        result = self._resolve(sessions_dir, proc_root)
+
+        assert result.record is None
+        assert result.refusal_reason == "no_descendant_record"
+        assert result.refusal_reason != "target_ambiguous"
 
 
 # ===========================================================================
@@ -1440,7 +1576,10 @@ class TestFX170S2StringCoercion:
         (sessions_dir / "2130420.json").write_text(json.dumps(record_data))
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 2130420],
@@ -1484,7 +1623,10 @@ class TestFX170S2StringCoercion:
         (sessions_dir / "999.json").write_text(json.dumps(record_data))
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch(
                 "cli_agent_orchestrator.services.cc_session_registry._descendants",
                 return_value=[100, 999],
