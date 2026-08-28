@@ -101,7 +101,13 @@ class TestSendKeys:
         """On tmux >=3.7, force=True sends raw content through paste-buffer -p."""
         client.send_keys("sess", "win", "hello", force_bracketed_paste=True)
 
-        calls = mock_subprocess.run.call_args_list
+        # Use payload_calls (not the raw list) for the SAME reason test_basic_message
+        # does: send_keys now cancels any active pane mode before the paste and again
+        # before the submitting Enter (#654), so the raw call list is offset by the
+        # -X cancel guards. Filtering them out asserts the paste PIPELINE at the same
+        # indices it occupied before the guards existed; the cancels are pinned by
+        # their own tests in test_tmux_client.py.
+        calls = payload_calls(mock_subprocess)
         assert calls[0] == call(
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=b"hello",

@@ -1050,8 +1050,10 @@ class TmuxClient:
             # Unconditional on purpose -- when the pane is not in a mode the
             # command fails with "not in a mode" and delivers nothing, so no
             # pane-state pre-check is needed (and none would be race-free).
+            # Routed through tmux_argv (G7A closed-world socket choke point) --
+            # a raw ["tmux", ...] literal here would break the g7a AST guard.
             subprocess.run(
-                ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+                tmux_argv("send-keys", "-t", target, "-X", "cancel"),
                 check=False,
                 capture_output=True,
             )
@@ -1123,8 +1125,9 @@ class TmuxClient:
                 # mode and eat the Enter -- the exact #654 stall the leading
                 # cancel exists to prevent (text in the composer, submission
                 # never fires, nothing raises).
+                # Routed through tmux_argv (G7A closed-world socket choke point).
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", target, "-X", "cancel"],
+                    tmux_argv("send-keys", "-t", target, "-X", "cancel"),
                     check=False,
                     capture_output=True,
                 )

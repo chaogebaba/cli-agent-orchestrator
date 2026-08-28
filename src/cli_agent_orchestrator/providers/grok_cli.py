@@ -271,6 +271,13 @@ class GrokCliProvider(BaseProvider):
                 get_backend().get_pane_working_directory(self.session_name, self.window_name)
                 or os.getcwd()
             )
+            # The backend contract returns a path string, but guard the type
+            # explicitly: a non-str (e.g. a mocked backend in unit tests, or a
+            # future backend returning a Path) would blow up quote() below with
+            # a TypeError that the except cannot catch because it is raised
+            # outside this block. Fall back to the real cwd in that case.
+            if not isinstance(cwd, str):
+                cwd = os.getcwd()
         except Exception:
             cwd = os.getcwd()
         root = provider_home("grok_cli").home / "sessions" / quote(cwd, safe="")

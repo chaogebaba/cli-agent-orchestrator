@@ -60,7 +60,7 @@ PROVIDERS = [
     pytest.param(AntigravityCliProvider, "_turns", id="antigravity_cli"),
     pytest.param(HermesProvider, None, id="hermes"),
     pytest.param(ClaudeCodeProvider, None, id="claude_code"),
-    pytest.param(GrokCliProvider, "_turns", id="grok_cli"),
+    pytest.param(GrokCliProvider, "_input_received", id="grok_cli"),
     pytest.param(MiniMaxCodeProvider, "_has_received_input", id="mcode"),
     pytest.param(MockCliProvider, None, id="mock_cli"),
 ]
