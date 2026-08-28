@@ -14,7 +14,8 @@
 | F548 r3-fix commit | `c5587aa4` — `F548: send arrow as real tmux Down key + settle poll; structured init errors (#404)` |
 | F548 r6 commit | `7f07e277` — `F548 r6: post-idle 'Not logged in' auth scan -> fast E-CLAUDE-AUTH (#404)` |
 | F548 r7 commit | `affe0438` — `F548 r7: gate S-1 settle-poll regression + S-2 bound post-idle scan + N-1 (#404)` |
-| Report commits | `b6eacf44` + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `5d4c410d` (`r5`) + `e2728529` (`r6`) + `F541/F542: build report r7` (this update) |
+| F548 r8 commit | `a14faba7` — `F548 r8: fix gate B-1 — extend settle-poll-affected test fixture (#404)` |
+| Report commits | `b6eacf44` + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `5d4c410d` (`r5`) + `e2728529` (`r6`) + `26878496` (`r7`) + `F541/F542: build report r8` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -662,6 +663,54 @@ Claude CLI / box-checkout guard). That is unchanged and out of this lane's
 control; r7 addresses only the change-merit SHOULDs/NIT. The r6 box
 negative-leg recipe (above) still applies once a box with a valid Claude CLI is
 available.
+
+---
+
+## r8 addendum — F548 gate r2 B-1 fixed: settle-poll re-read exhausted a 2-value test fixture (commit `a14faba7`, issue #404)
+
+Empirical gate r2 ruled **GATE-NO / 1 BLOCKING**.
+
+**B-1.** At `26878496`,
+`test/providers/test_provider_init_timeout.py::TestStartupPromptHandlerHonorsOuterTimeout::test_passed_outer_timeout_extends_deadline_past_settings_default`
+FAILED with `RuntimeError: coroutine raised StopIteration` (@ `claude_code.py`
+in the settle-poll re-read). Cause: the r5 settle poll adds a `get_history`
+re-read when the affirmative row is not already focused in the current pane;
+that test's `get_history.side_effect` was a 2-value list whose trust frame
+(`"Yes, I trust this folder"`, no `❯` on the affirmative) did NOT confirm from
+`current_pane`, so the poll re-read past the end of the list.
+
+**Fix (identical shape to the 7 tests adjusted in r6/r7):** focus the
+affirmative row in the fixture — `"❯ Yes, I trust this folder"` — so
+`_select_menu_affirmative` confirms from the current pane WITHOUT a re-read
+(and, via the r7 short-circuit, without consuming an extra `time.monotonic`,
+keeping the test's exact 5-value clock sequence valid). Then updated the stale
+`send_special_key.assert_called_once()` to the F548 real-special-key contract
+(`Down` then `Enter`; `send_keys` not called) and added `call` to the mock
+import.
+
+**Bug-family sweep (as mandated).** Audited every `_handle_startup_prompts` /
+`_select_menu_affirmative` call site under `test/providers/` for `get_history`
+`side_effect` lists of length ≤ 2 that enter the affirmative-selection re-read:
+- `test_provider_init_timeout.py`: the failing test (fixed here); its sibling
+  `test_passed_outer_timeout_caps_a_wedged_start` uses a non-dialog
+  `return_value` (never enters `_select_menu_affirmative`) — safe.
+- `test_claude_code_unit.py`, `test_claude_code_coverage.py`,
+  `test_startup_prompt_idle_gap.py`, `test_container_wrapped.py`,
+  `test_f548_gate_repro.py`: already handled in r6/r7 (affirmative-focused
+  fixtures / stateful captures / stubbed helper). No remaining ≤2-length
+  offender.
+
+### r8 test result (exact command + verbatim summary line)
+```
+$ uv run pytest test/providers/test_provider_init_timeout.py test/providers -q -n0
+1 failed, 2083 passed, 13 skipped, 6 xfailed, 1 xpassed
+```
+The **single failure is the PRE-EXISTING F550 (#406)**
+`test_omp_unit.py::test_extension_root_merges_mcp_without_overriding_explicit_terminal_id`
+— the OMP provider merges an extra `CAO_TERMINAL_TOKEN` that leaks from THIS
+worker's own CAO environment into the test's expected-env assertion. OMP is not
+touched by this branch; unrelated to F548/B-1. (B-1 itself: PASS.)
+black/isort: touched test file clean; no source change this round.
 
 ---
 
