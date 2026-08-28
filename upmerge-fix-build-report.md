@@ -377,3 +377,67 @@ black --check / isort --check-only (r-touched files)   → clean
 Full-suite box rerun follows; the 4 flake nodeids (#2 + clusters 2/3) may still flip
 under load — not code-fixable without perf/harness changes, which were not made. No merge
 to main (F244 — supervisor runs the gate).
+
+
+---
+
+# Round 4 — Trace-manifest staleness from the F524 line shift (3 nodeids)
+
+The R3 box suite (14032 passed / 7 failed) confirmed the 21 in-scope fixes held and the
+4 known flakes flipped as predicted. Three NEW non-flaky failures shared one cause: the
+committed trace manifest was stale against the live tree after F524 shifted
+`inbox_service.py` line numbers (`:1870`→`:1877`) and added one traced site (hits
+39→40).
+
+- `test/cli/commands/test_cli_verify.py::test_verify_manifest_regen_preserves_identities_across_line_shift`
+- `test/cli/commands/test_cli_verify.py::test_verify_manifest_regen_unchanged_tree_does_not_write`
+- `test/services/test_stage0_flip_machinery.py::test_trace_manifest_is_byte_exact_and_has_36_hits`
+
+## Adjudication — a MAIN defect, inherited via merge (not created on this branch)
+
+Ran all 3 on a fresh detached scratch worktree at fork main **before** touching this
+branch. They **failed on main too** — twice:
+
+1. At `8c0493c0` (pre-regen): the committed manifest still had the pre-F524 line numbers.
+   → main defect: the F524 merge shifted lines without `cao verify manifest --regen`.
+2. At `2814d0d2` (supervisor's first regen): the manifest `.txt` was corrected to 40 hits,
+   but three hardcoded `39`/`36` literals in the two TEST files were left stale, so the
+   count/byte-exact assertions still failed on main.
+
+Both times the fix belonged on main (the trace-manifest contract is main-authoritative),
+so this branch changed nothing and reported back. I explicitly did **not** edit the test
+literals here (that would diverge from files main owns and could read as weakening a
+contract test).
+
+## Resolution
+
+The supervisor fixed main under Option A and pushed `8d213806` (bump the hit-count
+contract 39→40: `test_stage0_flip_machinery.py:513`, `test_cli_verify.py:432/436/466` —
+the correct contract update, since F524 legitimately added one traced site). This branch
+then re-merged `origin/main` (`8d213806`).
+
+The 3-way auto-merge was clean (zero conflicts); it staged the regenerated
+`kernel/receiver_state/trace_manifest.txt` plus the two test files with the bumped
+literals. All prior fixes verified intact after the merge (r1 `_spec_dir`; r2 two
+`tmux_argv(...-X cancel)` sites; r2 grok `_input_received`; round-1 `xdist_group` marker).
+
+## Round-4 Changes
+
+| Change | Detail |
+|--------|--------|
+| Merge `origin/main` (`8d213806`) into `cao/26643eb7` | F534 PII scrub + F524 + trace-manifest regen (hits 39→40) + the 3 test-literal bumps; zero conflicts |
+| (report) | this round-4 section |
+
+No fork source/test edits authored on this branch this round — the manifest and its
+contract literals came entirely from main via the merge.
+
+## Round-4 Test Results (local worktree, merged tree, `uv run pytest -n0 --dist=no`)
+
+```
+3 manifest nodeids + test_f524_direct_delivery_stall.py   → 14 passed
+  (was: all 3 manifest nodeids failing pre-merge)
+core in-scope re-verify (tmux/g7a + realserver + PII + full native-status matrix)
+                                                          → 167 passed, 1 skipped
+```
+
+No merge to main (F244 — supervisor re-gates on the new revision).
