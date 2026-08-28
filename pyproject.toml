@@ -355,6 +355,7 @@ markers = [
     "requires_git_object: test requires a specific git object reachable in the repo",
     "requires_tmux: test requires tmux on PATH",
     "serial_only: quarantined test that must run serial (xdist_group quarantine-serial)",
+    "xdist_group(name): pytest-xdist grouping mark; registered here so collection does not INTERNALERROR under -p no:xdist + --strict-markers (the plugin registers it only when loaded)",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
