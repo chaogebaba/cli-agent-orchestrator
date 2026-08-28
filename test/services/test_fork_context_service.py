@@ -290,3 +290,101 @@ def test_first_pane_no_panes_raises():
     ):
         with pytest.raises(ValueError):
             first_pane("cao-test", "win-0")
+
+
+# =============================================================================
+# F560: Kiro session-id capture (legacy fallback via --list-sessions)
+# =============================================================================
+
+
+def test_kiro_list_sessions_argv_kas_and_v2():
+    from cli_agent_orchestrator.services.fork_context_service import _kiro_list_sessions_argv
+
+    assert _kiro_list_sessions_argv(True) == [
+        "kiro-cli",
+        "--v3",
+        "chat",
+        "--list-sessions",
+        "--format",
+        "json",
+    ]
+    assert _kiro_list_sessions_argv(False) == [
+        "kiro-cli",
+        "chat",
+        "--list-sessions",
+        "--format",
+        "json",
+    ]
+
+
+def test_select_kiro_session_id_picks_newest_updated():
+    from cli_agent_orchestrator.services.fork_context_service import _select_kiro_session_id
+
+    payload = json.dumps(
+        [
+            {
+                "cwd": "/w",
+                "sessions": [
+                    {"sessionId": "sess_old", "updatedAt": "2026-08-28T10:00:00.000Z"},
+                    {"sessionId": "sess_new", "updatedAt": "2026-08-28T12:00:00.000Z"},
+                ],
+            }
+        ]
+    )
+    assert _select_kiro_session_id(payload, 0.0) == "sess_new"
+
+
+def test_select_kiro_session_id_none_raises_forkcontexterror():
+    from cli_agent_orchestrator.services.fork_context_service import (
+        ForkContextError,
+        _select_kiro_session_id,
+    )
+
+    with pytest.raises(ForkContextError) as ei:
+        _select_kiro_session_id(json.dumps([{"cwd": "/w", "sessions": []}]), 0.0)
+    assert ei.value.code == "session_capture_none"
+
+
+def test_select_kiro_session_id_unparseable_raises():
+    from cli_agent_orchestrator.services.fork_context_service import (
+        ForkContextError,
+        _select_kiro_session_id,
+    )
+
+    with pytest.raises(ForkContextError) as ei:
+        _select_kiro_session_id("not json", 0.0)
+    assert ei.value.code == "session_capture_unparseable"
+
+
+def test_capture_kiro_uuid_returns_selected_id(monkeypatch):
+    from cli_agent_orchestrator.services import fork_context_service as fcs
+
+    payload = json.dumps(
+        [
+            {
+                "cwd": "/w",
+                "sessions": [{"sessionId": "sess_cap", "updatedAt": "2026-01-01T00:00:00Z"}],
+            }
+        ]
+    )
+
+    class _Res:
+        returncode = 0
+        stdout = payload
+
+    monkeypatch.setattr(fcs.subprocess, "run", lambda *a, **k: _Res())
+    assert fcs.capture_kiro_uuid(True, 0.0, "/w") == "sess_cap"
+
+
+def test_capture_kiro_uuid_retries_then_raises(monkeypatch):
+    from cli_agent_orchestrator.services import fork_context_service as fcs
+
+    class _Empty:
+        returncode = 0
+        stdout = json.dumps([{"cwd": "/w", "sessions": []}])
+
+    monkeypatch.setattr(fcs.subprocess, "run", lambda *a, **k: _Empty())
+    monkeypatch.setattr(fcs.time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(fcs.ForkContextError) as ei:
+        fcs.capture_kiro_uuid(True, 0.0, "/w")
+    assert ei.value.code == "session_capture_none"

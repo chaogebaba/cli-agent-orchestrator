@@ -317,9 +317,7 @@ def probe_kiro_capabilities(
             # by the wrapper directly, then let the downstream required-flag
             # check produce a precise "missing capability" error.
             try:
-                all_help_result = _run(
-                    runner, ("kiro-cli", "--help-all"), timeout, engine
-                )
+                all_help_result = _run(runner, ("kiro-cli", "--help-all"), timeout, engine)
                 chat_help_output = (
                     (all_help_result.stdout or "") + "\n" + (all_help_result.stderr or "")
                 )
@@ -401,8 +399,17 @@ def build_kiro_command(
     model: Optional[str] = None,
     yolo: bool = False,
     legacy_ui: bool = False,
+    resume_session_id: Optional[str] = None,
 ) -> list[str]:
-    """Build a deterministic Kiro command without executing it."""
+    """Build a deterministic Kiro command without executing it.
+
+    ``resume_session_id`` (F560): when set, append ``--resume-id <id>`` so the
+    launched chat continues an existing conversation instead of starting fresh.
+    Kiro CLI accepts ``--resume-id`` on both the KAS (``--v3``) and v2 engines
+    (verified against ``kiro-cli chat --help``, 2.20.1); the flag sits right
+    after ``chat`` in both forms. The id is opaque and stored verbatim
+    (KAS ids are ``sess_``-prefixed, classic are bare UUIDs).
+    """
     if engine == KiroEngine.KAS:
         # F107 B1: KAS honors --trust-all-tools as a session-scope override
         # (v3 permissions doc; CI path). Always append for autonomous workers.
@@ -413,6 +420,8 @@ def build_kiro_command(
             command.append("--legacy-ui")
         if yolo:
             command.append("--trust-all-tools")
+    if resume_session_id:
+        command.extend(["--resume-id", resume_session_id])
     if model:
         command.extend(["--model", model])
     command.extend(["--agent", agent_profile])

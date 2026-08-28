@@ -582,6 +582,99 @@ def capture_codex_uuid(
     return sid
 
 
+def _kiro_list_sessions_argv(kas: bool) -> list[str]:
+    """Argv that lists Kiro chat sessions for the current working directory.
+
+    ``--v3`` targets the KAS store; its absence targets the v2/classic store.
+    ``--format json`` is the stable, documented machine interface (verified
+    against kiro-cli 2.20.1). Sessions are keyed per-directory by the CLI, so
+    the caller runs this with ``cwd`` set to the terminal's working directory.
+    """
+    argv = ["kiro-cli"]
+    if kas:
+        argv.append("--v3")
+    argv.extend(["chat", "--list-sessions", "--format", "json"])
+    return argv
+
+
+def _select_kiro_session_id(sessions_json: str, launch_time: float) -> str:
+    """Pick the newest Kiro session id from ``--list-sessions --format json``.
+
+    The JSON is ``[{"cwd": ..., "sessions": [{"sessionId", "updatedAt", ...}]}]``
+    (one envelope per cwd; run scoped to a single cwd it yields one envelope).
+    Kiro mints its own session id and can keep several sessions under one cwd,
+    so — mirroring codex's launch-time window — the just-launched terminal is
+    the session with the newest ``updatedAt``. ``launch_time`` is a monotonic
+    process-launch epoch used only to disambiguate ties defensively; selection
+    is by newest ``updatedAt`` regardless. ``sessionId`` is returned verbatim.
+    """
+    try:
+        envelopes = json.loads(sessions_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ForkContextError("session_capture_unparseable") from exc
+    if not isinstance(envelopes, list):
+        raise ForkContextError("session_capture_unparseable")
+    candidates: list[tuple[str, str]] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            continue
+        for entry in envelope.get("sessions") or []:
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("sessionId")
+            updated = entry.get("updatedAt")
+            if isinstance(sid, str) and sid:
+                # updatedAt is an ISO8601 string; lexical order matches
+                # chronological order for a fixed offset, so sort by it
+                # directly and fall back to "" when absent.
+                candidates.append((updated if isinstance(updated, str) else "", sid))
+    if not candidates:
+        raise ForkContextError("session_capture_none")
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[-1][1]
+
+
+def capture_kiro_uuid(kas: bool, launch_time: float, cwd: str) -> str:
+    """Capture the newest Kiro session id for ``cwd`` after a launch.
+
+    Kiro stores every chat session in a single SQLite DB (not one file per
+    session), so codex's ``/proc``-fd rollout-file scan does not apply. Instead
+    this queries the CLI's own documented ``--list-sessions --format json``
+    surface (run in ``cwd``) and selects the most recently updated session —
+    the one the just-launched terminal owns. Retries briefly because the first
+    conversation turn (which persists the session row) may not have landed at
+    the instant of capture.
+    """
+    argv = _kiro_list_sessions_argv(kas)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0 and (result.stdout or "").strip():
+                return _select_kiro_session_id(result.stdout, launch_time)
+            last_error = ForkContextError("session_capture_list_failed")
+        except (subprocess.SubprocessError, OSError) as exc:
+            last_error = exc
+        except ForkContextError as exc:
+            # session_capture_none is retryable (row not persisted yet);
+            # unparseable is not.
+            if str(exc) != "session_capture_none":
+                raise
+            last_error = exc
+        if attempt < 2:
+            time.sleep(1)
+    if isinstance(last_error, ForkContextError):
+        raise last_error
+    raise ForkContextError("session_capture_list_failed")
+
+
 def _registration_error(code: str, message: str) -> NoReturn:
     raise OfflineBaseRegistrationError(code, message)
 
@@ -629,9 +722,7 @@ def validate_base_source(
                 )
             )
         else:
-            found = (
-                _resolved_grok_sessions() / quote(cwd, safe="") / session_uuid
-            ).exists()
+            found = (_resolved_grok_sessions() / quote(cwd, safe="") / session_uuid).exists()
         if not found:
             raise ForkContextError("session_file_missing")
         return {}
