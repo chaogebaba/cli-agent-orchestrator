@@ -316,11 +316,16 @@ def _attempt_native_ring(
 
     # D5: build payload
     # F459: pass message_body and sender_display_name for payload-carrying wake
+    # F547 #403 point 1: bind msg_id to the receiver's live process incarnation
+    # (procStart, else pid) so a re-push for the same row+seat is a stable,
+    # de-dupable id rather than a fresh uuid4 every ring.
+    incarnation = str(record.proc_start if record.proc_start is not None else record.pid)
     payload = build_wake_payload(
         terminal_id,
         max_written_row_id,
         message_body=message_body,
         sender_display_name=sender_display_name,
+        incarnation=incarnation,
     )
 
     # D8: sample pre-write status for verification

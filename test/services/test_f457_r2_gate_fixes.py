@@ -233,7 +233,7 @@ class TestB2AttemptRung1Gates:
 
             assert result.delivered is True
             assert result.decision == "proceed"
-            mock_native.assert_called_once_with(_TERMINAL_ID, 800)
+            mock_native.assert_called_once_with(_TERMINAL_ID, 800, message_body=None)
 
 
 # ===========================================================================

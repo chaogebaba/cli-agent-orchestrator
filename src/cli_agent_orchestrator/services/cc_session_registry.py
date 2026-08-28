@@ -15,14 +15,16 @@ Identity guards: procStart PID-reuse check + record freshness.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import socket
 import subprocess
+import threading
 import time
-import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -56,6 +58,81 @@ _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 # F337 B1: canonical default for supervisor.wake.native — ship DARK (False).
 # All call sites and the config-registry entry MUST reference this constant.
 WAKE_NATIVE_DEFAULT = False
+
+
+# ---------------------------------------------------------------------------
+# F547 #403 point 5: CAO-side per-sender content-hash dedupe window.
+#
+# The Claude client only dropped a peer message when it was identical to the
+# IMMEDIATELY previous message from that sender; a single interleaved message
+# from another sender reset that "previous" and let a byte-identical doorbell
+# push through again. We defend on the CAO write side too: keep a per-sender
+# ring of the last N content hashes and refuse to re-emit a byte-identical
+# bridge payload that is still inside that window, regardless of interleaving.
+# ---------------------------------------------------------------------------
+
+# Per-sender window size. Overridable via `supervisor.wake.dedupe_window`.
+_DEDUPE_WINDOW_DEFAULT = 20
+
+_dedupe_lock = threading.Lock()
+# sender_address -> deque[str] of recent content hashes (most-recent last).
+_dedupe_windows: dict[str, deque[str]] = {}
+
+
+def _extract_sender_and_content(payload_line: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse the bridge payload for its sender address and message content.
+
+    Returns (sender, content); either may be None if the payload is not the
+    expected JSON wake shape (in which case dedupe is skipped — fail-open).
+    """
+    try:
+        obj = json.loads(payload_line)
+    except (ValueError, TypeError):
+        return None, None
+    sender = obj.get("from") if isinstance(obj, dict) else None
+    content = None
+    msg = obj.get("message") if isinstance(obj, dict) else None
+    if isinstance(msg, dict):
+        content = msg.get("content")
+    return (sender if isinstance(sender, str) else None,
+            content if isinstance(content, str) else None)
+
+
+def _dedupe_window_size() -> int:
+    try:
+        n = int(ConfigService.get("supervisor.wake.dedupe_window", default=_DEDUPE_WINDOW_DEFAULT))
+    except (TypeError, ValueError):
+        n = _DEDUPE_WINDOW_DEFAULT
+    return max(1, n)
+
+
+def _is_duplicate_in_window(payload_line: str) -> bool:
+    """F547 #403 point 5: True if this payload duplicates a recent one per sender.
+
+    Records the hash as a side effect on a miss (so the window advances). A
+    payload we cannot parse (no sender/content) is never treated as a duplicate.
+    """
+    sender, content = _extract_sender_and_content(payload_line)
+    if sender is None or content is None:
+        return False
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    window_size = _dedupe_window_size()
+    with _dedupe_lock:
+        window = _dedupe_windows.get(sender)
+        if window is None or window.maxlen != window_size:
+            # (Re)size preserving the most-recent entries.
+            window = deque(window or (), maxlen=window_size)
+            _dedupe_windows[sender] = window
+        if digest in window:
+            return True
+        window.append(digest)
+        return False
+
+
+def _reset_dedupe_windows() -> None:
+    """Test seam: clear the per-sender dedupe windows."""
+    with _dedupe_lock:
+        _dedupe_windows.clear()
 
 
 # Registry base path — resolved per call through the injected provider plane, never
@@ -419,6 +496,31 @@ def check_version_guard(record: RegistryRecord) -> Optional[str]:
 _F459_MAX_BODY_BYTES = 8192
 
 
+def build_wake_msg_id(
+    receiver: str,
+    inbox_row_id: int,
+    incarnation: Optional[str] = None,
+) -> str:
+    """F547 #403 point 1: deterministic msg_id per (receiver incarnation, row).
+
+    The same (receiver, inbox_row_id, incarnation) triple ALWAYS produces the
+    same id, so a consumer that has already seen this id can drop a re-push as
+    a duplicate. A different receiver incarnation (process restart) produces a
+    different id, so a genuinely new seat still surfaces the callback.
+
+    incarnation is a stable token for the receiver's live process (e.g. the
+    resolved procStart or pid). None collapses to the empty string — callers
+    that cannot resolve an incarnation still get a per-(receiver,row) id, which
+    is strictly better than a fresh uuid4 every ring.
+    """
+    seed = f"{receiver}\x00{int(inbox_row_id)}\x00{incarnation or ''}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    # Format as a uuid-shaped string so downstream parsers that assume the
+    # legacy uuid4 shape keep working (8-4-4-4-12 hex layout).
+    h = digest
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 def build_wake_payload(
     worker_name: str,
     inbox_row_id: int,
@@ -426,12 +528,18 @@ def build_wake_payload(
     priority: Optional[str] = None,
     message_body: Optional[str] = None,
     sender_display_name: Optional[str] = None,
+    incarnation: Optional[str] = None,
 ) -> str:
     """D5/D7/F459: build the single JSON line for the socket write.
 
     F459: When message_body is provided, the bridge message carries the actual
     worker callback text (defensively truncated to 8KB) instead of a generic ping.
     sender_display_name overrides the from-name (the worker's display name).
+
+    F547 #403 point 1: msg_id is now DETERMINISTIC in
+    (worker_name/receiver, inbox_row_id, incarnation) — see build_wake_msg_id.
+    A re-push for the same row+incarnation carries the SAME id, so the consumer
+    can drop it; a fresh uuid4 per ring (the old behaviour) defeated all dedupe.
     """
     if priority is None:
         priority = ConfigService.get("supervisor.wake.priority", default="next")
@@ -473,7 +581,7 @@ def build_wake_payload(
 
     payload = {
         "msgV": 1,
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": build_wake_msg_id(worker_name, inbox_row_id, incarnation),
         "type": "user",
         "message": {"role": "user", "content": content},
         "priority": priority,
@@ -588,6 +696,15 @@ def write_to_socket(
     # F216: EINVAL short-circuit — refuse empty/null socket path before connect
     if not socket_path:
         return "socket_path_empty"
+
+    # F547 #403 point 5: per-sender content-hash window. If this exact content
+    # was already written to this sender inside the last-N window, treat the
+    # write as an idempotent no-op (return None = success) rather than re-emit a
+    # byte-identical bridge message. Returning success (not an error) avoids
+    # spuriously triggering the fx168 pane-nudge fallback for a suppressed dupe.
+    if _is_duplicate_in_window(payload_line):
+        logger.info("f547 wake dedupe: suppressed byte-identical bridge write within window")
+        return None
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(connect_timeout_s)
