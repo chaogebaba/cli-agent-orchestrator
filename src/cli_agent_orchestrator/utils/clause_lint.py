@@ -15,7 +15,10 @@ required clause is present. It is FAIL-CLOSED both directions (r6 S3):
   * a ``[required]`` row naming a position with no position file          -> error
 
 A position file's frontmatter ``requires:`` may only ADD ids on top of the
-table's set for that position — never subtract (checked here).
+table's set for that position — never subtract (checked here). Each entry is
+classified: an id-shaped token (``^[a-z0-9]+(-[a-z0-9]+)*$``, no whitespace)
+MUST be a known clause id or the lint fails closed (naming the position + id);
+anything else is a free-text prose sentence and is ignored.
 
 The table is POLICY (lintian precedent): it lives beside the positions but is a
 ``.toml`` (outside install.sh's ``profiles/*.md`` glob) and is never edited in
@@ -26,6 +29,7 @@ by install or composition.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +41,12 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover
     import tomli as tomllib
+
+
+# A frontmatter `requires:` entry is treated as a clause-id reference only when
+# it is id-shaped: lowercase alnum groups joined by single hyphens, no
+# whitespace. Anything else is a free-text prose sentence and is ignored.
+_ID_SHAPED = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
 class ClauseLintError(ValueError):
@@ -169,9 +179,21 @@ def lint_positions(
         requires_extra = parsed.metadata.get("requires") or []
         if not isinstance(requires_extra, list):
             raise ClauseLintError(f"position '{pos}' requires: must be a list")
-        # Frontmatter `requires:` may carry free-text sentences OR clause ids;
-        # only clause ids (present in the table) are treated as ADD directives.
-        extra_ids = [r for r in requires_extra if isinstance(r, str) and r in table.rules]
+        # Frontmatter `requires:` may carry free-text sentences OR clause ids.
+        # Classify each entry: an id-shaped token MUST be a known clause id
+        # (fail-closed — a bogus id is a mistake, not silently dropped);
+        # anything else is prose and ignored.
+        extra_ids: List[str] = []
+        for r in requires_extra:
+            if not isinstance(r, str):
+                continue
+            if _ID_SHAPED.match(r):
+                if r not in table.rules:
+                    raise ClauseLintError(
+                        f"position '{pos}' requires: names unknown clause id '{r}'"
+                    )
+                extra_ids.append(r)
+            # else: free-text prose sentence — legal, ignored.
         required_ids = _position_required_ids(table, pos, extra_ids)
         matched: List[str] = []
         for cid in required_ids:

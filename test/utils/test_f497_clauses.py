@@ -138,7 +138,30 @@ dev = ["callback-contract", "does-not-exist"]
 
 
 def test_ac14_requires_may_only_add(tmp_path):
-    # A position `requires:` naming an unknown clause id fails closed.
+    # A position `requires:` naming a BOGUS id-shaped clause id fails closed
+    # (AC14: unknown id is a mistake, never silently dropped).
+    table = """
+[clauses.callback-contract]
+marker = "<!-- clause:callback-contract -->"
+[clauses.containment]
+marker = "<!-- clause:containment -->"
+[required]
+dev = ["callback-contract", "containment"]
+"""
+    _mk_positions(
+        tmp_path,
+        table,
+        {
+            "dev.md": "---\nrequires: [no-such-clause]\n---\n\n"
+            "<!-- clause:callback-contract -->\n<!-- clause:containment -->\n"
+        },
+    )
+    with pytest.raises(ClauseLintError, match="unknown clause id 'no-such-clause'"):
+        lint_positions(tmp_path)
+
+
+def test_ac14_requires_known_id_must_be_present(tmp_path):
+    # requires adds a KNOWN id -> must now be present or lint fails.
     table = """
 [clauses.callback-contract]
 marker = "<!-- clause:callback-contract -->"
@@ -149,7 +172,6 @@ marker = "<!-- clause:extra-thing -->"
 [required]
 dev = ["callback-contract", "containment"]
 """
-    # requires adds a KNOWN id -> must now be present or lint fails.
     _mk_positions(
         tmp_path,
         table,
@@ -161,6 +183,31 @@ dev = ["callback-contract", "containment"]
     )
     with pytest.raises(ClauseLintError, match="missing required clause 'extra-thing'"):
         lint_positions(tmp_path)
+
+
+def test_ac14_requires_prose_sentence_is_accepted(tmp_path):
+    # A free-text prose sentence in `requires:` is legal and ignored — it is
+    # not id-shaped, so it is neither an ADD directive nor a fail-closed error.
+    table = """
+[clauses.callback-contract]
+marker = "<!-- clause:callback-contract -->"
+[clauses.containment]
+marker = "<!-- clause:containment -->"
+[required]
+dev = ["callback-contract", "containment"]
+"""
+    _mk_positions(
+        tmp_path,
+        table,
+        {
+            "dev.md": "---\n"
+            'requires:\n  - "Runs the empirical gate; never edits the artifact."\n'
+            "---\n\n"
+            "<!-- clause:callback-contract -->\n<!-- clause:containment -->\n"
+        },
+    )
+    results = lint_positions(tmp_path)
+    assert set(results["dev"]) == {"callback-contract", "containment"}
 
 
 def test_ac14_clause_must_set_exactly_one_of_heading_marker(tmp_path):
