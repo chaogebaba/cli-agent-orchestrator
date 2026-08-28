@@ -32,6 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     attempt_proven_pre_paste,
     begin_delivery_attempt,
     begin_delivery_attempt_if_no_other_delivering,
+    claim_message_trace_once,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
     create_inbox_message,
@@ -53,12 +54,11 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     list_pending_receiver_ids_with_terminal,
-    list_stalled_direct_pending_messages,
     list_stale_delivering_messages,
     list_stale_open_claude_attempts,
+    list_stalled_direct_pending_messages,
     make_admission_proof,
     merge_wpm1_attempt_evidence,
-    claim_message_trace_once,
     messages_with_trace_kind,
     record_wpm1_stalled_notice,
     recover_transcript_binding_if_current,
@@ -2343,12 +2343,12 @@ class InboxService:
 
             if is_supervisor_mailbox_pull_terminal(terminal_id):
                 # WP-W2M-PUSH-BRIDGE: attempt teammate-push notification (best-effort).
+                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
+                from cli_agent_orchestrator.services.config_service import ConfigService as _CS
                 from cli_agent_orchestrator.services.teammate_push_service import (
                     _should_teammate_push,
                     attempt_teammate_push,
                 )
-                from cli_agent_orchestrator.services.config_service import ConfigService as _CS
-                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
                 # F457: unified gate — wake.native=false suppresses teammate push
                 # (same gate the doorbell native ring honors).
@@ -4029,98 +4029,144 @@ class InboxService:
             lock.release()
 
     def recover_stale_deliveries(self, recurring: bool = False) -> None:
-        """Settle DELIVERING rows left by a process crash before consumers start."""
+        """Settle DELIVERING rows left by a process crash before consumers start.
+
+        F556: a DELIVERING row is a hard exclusion — while it is open,
+        ``begin_delivery_attempt_if_no_other_delivering`` returns
+        ``delivering_conflict`` and ``deliver_pending`` short-circuits at its
+        ``list_delivering_attempts_for_terminal`` guard, so NOTHING behind that
+        row can be delivered. The startup branch (``recurring=False``) settles
+        every stuck DELIVERING row across ALL providers. The periodic
+        reconciliation heartbeat (``recurring=True``) historically recovered
+        ONLY ``claude_code`` attempts (``list_stale_open_claude_attempts``),
+        which meant a stuck non-claude (e.g. kiro_cli) DELIVERING row was never
+        cleared while the server stayed up — permanently stalling the pending
+        backlog behind it (the incident's ``status=completed`` worker with a
+        pending row and "no open delivery attempt"). The heartbeat now runs the
+        SAME provider-agnostic recovery for aged non-claude stuck rows, gated by
+        ``WPM2_STALE_OPEN_AGE_SECONDS`` so it never races an in-flight paste.
+        """
+        seen_attempts: set[str] = set()
         if recurring:
             for attempt in list_stale_open_claude_attempts(WPM2_STALE_OPEN_AGE_SECONDS):
                 self._recover_wpm2_attempt(attempt)
+            # F556: also adopt aged NON-claude stuck DELIVERING rows. claude rows
+            # are already handled by the WPM2 sweep above; recovering them again
+            # here would double-process, so the per-message helper skips them.
+            for message in list_stale_delivering_messages(
+                min_age_seconds=WPM2_STALE_OPEN_AGE_SECONDS
+            ):
+                self._recover_stale_delivering_message(
+                    message, seen_attempts, reason_tag="reconcile_sweep", skip_claude=True
+                )
             return
-        seen_attempts: set[str] = set()
         for message in list_stale_delivering_messages():
-            trace = get_message_trace(message.id)
-            if not trace or not trace["attempts"]:
-                update_message_status(message.id, MessageStatus.DELIVERY_FAILED)
-                self._notify_delivery_failed(message.receiver_id, [message.id])
-                continue
-            attempt = trace["attempts"][-1]
-            attempt_uuid = attempt["attempt_uuid"]
-            if attempt_uuid in seen_attempts:
-                continue
-            seen_attempts.add(attempt_uuid)
-            message_ids = list_attempt_member_ids(attempt_uuid) or [message.id]
-            if attempt.get("provider") == "claude_code":
-                self._recover_wpm2_attempt(
-                    {
-                        **attempt,
-                        "receiver_terminal_id": message.receiver_id,
-                        "message_ids": message_ids,
-                    }
-                )
-                continue
-            metadata = get_terminal_metadata(message.receiver_id)
-            if not metadata:
-                settle_delivery_attempt(
-                    attempt_uuid, MessageStatus.FAILED, "failed", reason="receiver_metadata_gone"
-                )
-                continue
-            try:
-                from cli_agent_orchestrator.backends.registry import get_backend
-
-                get_backend().get_history(
-                    metadata["tmux_session"], metadata["tmux_window"], tail_lines=1
-                )
-            except Exception:
-                settle_delivery_attempt(
-                    attempt_uuid, MessageStatus.PENDING, "interrupted", reason="pane_unresolvable"
-                )
-                continue
-            resolution = resolve_session_transcript(metadata)
-            if resolution is None:
-                settle_delivery_attempt(
-                    attempt_uuid, MessageStatus.PENDING, "interrupted", reason="no_oracle"
-                )
-                continue
-            path = getattr(resolution, "path", resolution)
-            result, evidence = transcript_lookup(
-                path, attempt["payload_hash"], attempt.get("started_at"), attempt.get("evidence")
+            self._recover_stale_delivering_message(
+                message, seen_attempts, reason_tag="startup_sweep", skip_claude=False
             )
-            evidence["resolution_kind"] = getattr(resolution, "resolution_kind", "exact_id")
-            stale_note = getattr(resolution, "stale_note", None)
-            if stale_note:
-                evidence["binding_stale"] = stale_note
-            if result == "hit":
-                _confirmed_settlement(
-                    lambda: settle_delivery_attempt(
-                        attempt_uuid,
-                        MessageStatus.DELIVERED,
-                        "confirmed",
-                        reason="startup_sweep",
-                        evidence=json.dumps(evidence),
-                        on_confirmed=lambda: self._commit_watchdog_ops(
-                            message.receiver_id,
-                            attempt["sender_id"],
-                            OrchestrationType(attempt["orchestration_type"]),
-                            metadata,
-                            get_park_warm_for_message_ids(message_ids),
-                        ),
+
+    def _recover_stale_delivering_message(
+        self,
+        message,
+        seen_attempts: set[str],
+        *,
+        reason_tag: str,
+        skip_claude: bool,
+    ) -> None:
+        """Settle one stuck DELIVERING message via transcript continuity.
+
+        Extracted verbatim from the startup branch (F556) so the periodic
+        reconciliation heartbeat runs IDENTICAL non-claude recovery. ``skip_claude``
+        lets the recurring caller defer claude rows to the WPM2 sweep it already
+        ran; the startup caller recovers claude rows here as before.
+        """
+        trace = get_message_trace(message.id)
+        if not trace or not trace["attempts"]:
+            update_message_status(message.id, MessageStatus.DELIVERY_FAILED)
+            self._notify_delivery_failed(message.receiver_id, [message.id])
+            return
+        attempt = trace["attempts"][-1]
+        attempt_uuid = attempt["attempt_uuid"]
+        if attempt_uuid in seen_attempts:
+            return
+        seen_attempts.add(attempt_uuid)
+        message_ids = list_attempt_member_ids(attempt_uuid) or [message.id]
+        if attempt.get("provider") == "claude_code":
+            if skip_claude:
+                return
+            self._recover_wpm2_attempt(
+                {
+                    **attempt,
+                    "receiver_terminal_id": message.receiver_id,
+                    "message_ids": message_ids,
+                }
+            )
+            return
+        metadata = get_terminal_metadata(message.receiver_id)
+        if not metadata:
+            settle_delivery_attempt(
+                attempt_uuid, MessageStatus.FAILED, "failed", reason="receiver_metadata_gone"
+            )
+            return
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            get_backend().get_history(
+                metadata["tmux_session"], metadata["tmux_window"], tail_lines=1
+            )
+        except Exception:
+            settle_delivery_attempt(
+                attempt_uuid, MessageStatus.PENDING, "interrupted", reason="pane_unresolvable"
+            )
+            return
+        resolution = resolve_session_transcript(metadata)
+        if resolution is None:
+            settle_delivery_attempt(
+                attempt_uuid, MessageStatus.PENDING, "interrupted", reason="no_oracle"
+            )
+            return
+        path = getattr(resolution, "path", resolution)
+        result, evidence = transcript_lookup(
+            path, attempt["payload_hash"], attempt.get("started_at"), attempt.get("evidence")
+        )
+        evidence["resolution_kind"] = getattr(resolution, "resolution_kind", "exact_id")
+        stale_note = getattr(resolution, "stale_note", None)
+        if stale_note:
+            evidence["binding_stale"] = stale_note
+        if result == "hit":
+            _confirmed_settlement(
+                lambda: settle_delivery_attempt(
+                    attempt_uuid,
+                    MessageStatus.DELIVERED,
+                    "confirmed",
+                    reason=reason_tag,
+                    evidence=json.dumps(evidence),
+                    on_confirmed=lambda: self._commit_watchdog_ops(
+                        message.receiver_id,
+                        attempt["sender_id"],
+                        OrchestrationType(attempt["orchestration_type"]),
+                        metadata,
+                        get_park_warm_for_message_ids(message_ids),
                     ),
-                )
-            elif result == "absent":
-                settle_delivery_attempt(
-                    attempt_uuid,
-                    MessageStatus.PENDING,
-                    "interrupted",
-                    reason="proven_absent",
-                    evidence=json.dumps(evidence),
-                )
-            else:
-                settle_delivery_attempt(
-                    attempt_uuid,
-                    MessageStatus.DELIVERY_FAILED,
-                    "unresolved",
-                    reason="continuity_uncertain",
-                    evidence=json.dumps(evidence),
-                )
-                self._notify_delivery_failed(message.receiver_id, message_ids)
+                ),
+            )
+        elif result == "absent":
+            settle_delivery_attempt(
+                attempt_uuid,
+                MessageStatus.PENDING,
+                "interrupted",
+                reason="proven_absent",
+                evidence=json.dumps(evidence),
+            )
+        else:
+            settle_delivery_attempt(
+                attempt_uuid,
+                MessageStatus.DELIVERY_FAILED,
+                "unresolved",
+                reason="continuity_uncertain",
+                evidence=json.dumps(evidence),
+            )
+            self._notify_delivery_failed(message.receiver_id, message_ids)
 
 
 inbox_service = InboxService()
