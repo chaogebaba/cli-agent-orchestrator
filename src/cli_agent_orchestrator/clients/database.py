@@ -531,6 +531,16 @@ class InboxMessageTraceEventModel(Base):
             "decision",
             sqlite_where=text("phase IS NOT NULL"),
         ),
+        # F524 (#379) S1: at most ONE f524.stall_surfaced row per message, so the
+        # one-shot sender notice cannot be duplicated by a concurrent sweep or a
+        # crash-between-commits. Partial (kind-scoped) so every other trace kind
+        # stays append-only / multi-row as before.
+        Index(
+            "uq_inbox_trace_f524_stall_surfaced",
+            "message_id",
+            unique=True,
+            sqlite_where=text("kind = 'f524.stall_surfaced'"),
+        ),
     )
 
 
@@ -620,12 +630,14 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
         if sess is not None:
             stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
             preview = (target.message or "").split("\n", 1)[0]
-            stash.append((
-                target.receiver_id,
-                row_id,
-                (target.sender_id or "")[:8],
-                preview[:120],
-            ))
+            stash.append(
+                (
+                    target.receiver_id,
+                    row_id,
+                    (target.sender_id or "")[:8],
+                    preview[:120],
+                )
+            )
         return
     connection.execute(
         insert(DeliveryObligationModel.__table__).values(
@@ -1443,6 +1455,7 @@ def init_db() -> None:
     _migrate_f138_orphan_reconciliation()
     _migrate_f175_dedup_columns()
     _migrate_fx191_trace_extension()
+    _migrate_f524_stall_surface_unique_index()
     _migrate_f218_dead_supervisor_safety()
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
@@ -1658,6 +1671,50 @@ def _migrate_fx191_trace_extension() -> None:
                     "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
                 )
             )
+
+
+def _migrate_f524_stall_surface_unique_index() -> None:
+    """F524 (#379) S1: partial unique index for one-shot stall surfacing.
+
+    ``Base.metadata.create_all`` only creates the index on a FRESH database — it
+    never adds an index to a table that already exists. On a deployed-upgrade DB
+    the ``inbox_message_trace_event`` table predates this index, so without this
+    migration the index is absent and ``claim_message_trace_once`` degrades to a
+    plain insert (both concurrent claims win -> duplicate sender notices).
+
+    Idempotent, and safe against pre-existing duplicates that would otherwise
+    block ``CREATE UNIQUE INDEX``:
+      1. Dedupe existing ``f524.stall_surfaced`` rows, keeping the LOWEST rowid
+         per ``message_id`` (the first/authoritative surface).
+      2. ``CREATE UNIQUE INDEX IF NOT EXISTS`` scoped to that kind.
+    """
+    with engine.begin() as connection:
+        indexes = connection.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='inbox_message_trace_event'"
+            )
+        ).fetchall()
+        idx_names = {r[0] for r in indexes}
+        if "uq_inbox_trace_f524_stall_surfaced" in idx_names:
+            return
+        # Dedupe FIRST so a pre-existing duplicate pair cannot abort index creation.
+        connection.execute(
+            text(
+                "DELETE FROM inbox_message_trace_event "
+                "WHERE kind = 'f524.stall_surfaced' AND rowid NOT IN ("
+                "  SELECT MIN(rowid) FROM inbox_message_trace_event "
+                "  WHERE kind = 'f524.stall_surfaced' GROUP BY message_id"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbox_trace_f524_stall_surfaced "
+                "ON inbox_message_trace_event(message_id) "
+                "WHERE kind = 'f524.stall_surfaced'"
+            )
+        )
 
 
 def _migrate_f175_dedup_columns() -> None:
@@ -3170,9 +3227,7 @@ def create_terminal(
             )
 
             existing_pin = (
-                db.query(AuthorityPinModel.id)
-                .filter_by(task_key=terminal_id, frozen=True)
-                .first()
+                db.query(AuthorityPinModel.id).filter_by(task_key=terminal_id, frozen=True).first()
             )
             if existing_pin is not None:
                 rotate_frozen_pins(
@@ -3315,9 +3370,7 @@ def create_terminal_with_warm_intent(
             )
 
             existing_pin = (
-                db.query(AuthorityPinModel.id)
-                .filter_by(task_key=terminal_id, frozen=True)
-                .first()
+                db.query(AuthorityPinModel.id).filter_by(task_key=terminal_id, frozen=True).first()
             )
             if existing_pin is not None:
                 rotate_frozen_pins(
@@ -5497,6 +5550,166 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
             .all()
         )
         return [row[0] for row in rows]
+
+
+def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMessage]:
+    """List aged PENDING messages routed straight at a terminal (F524).
+
+    A *direct-terminal* message is one with ``logical_receiver_id IS NULL`` — it
+    is addressed to a concrete terminal incarnation rather than a durable
+    supervisor mailbox. Those are exactly the rows the FX191 obligation ladder
+    never accepts (``_f413_after_insert`` requires a supervisor mailbox), so a
+    supervisor->worker ``send_message`` that misses the IDLE gate ages silently
+    in ``pending`` with no sender-side liveness (issue #379).
+
+    Returned rows are:
+
+    * ``status == pending`` and older than ``min_age_seconds``;
+    * direct-terminal (``logical_receiver_id IS NULL``);
+    * whose receiver terminal still exists (join on ``terminals`` — a message to
+      a reaped terminal is settled elsewhere, not surfaced as a stall);
+    * whose sender is a real terminal, not an internal/service sender — so the
+      stall notice we route back actually reaches a human-driven supervisor and
+      cannot feed a notice->notice loop.
+
+    See ``list_pending_receiver_ids_older_than`` for the ``created_at`` naive-UTC
+    at-rest convention; the same harmless <=4h over-collection window applies and
+    is idempotent downstream (the caller dedupes via a trace event).
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.is_(None),
+                InboxModel.created_at < cutoff,
+            )
+            .order_by(InboxModel.created_at, InboxModel.id)
+            .all()
+        )
+        result: List[InboxMessage] = []
+        for row in rows:
+            sender = str(row.sender_id or "")
+            # Internal/service senders never receive a stall notice: they are not
+            # real supervisor terminals and routing back would be meaningless (or
+            # a loop). Reserved-sender prefixes mirror those used across the inbox
+            # (message-trace:, cao-*, watchdog:, cao-bridge). Any ':'-namespaced
+            # sender is treated as a service sender.
+            if not sender or ":" in sender or sender.startswith("cao-"):
+                continue
+            result.append(_inbox_message_from_row(row))
+        return result
+
+
+def message_has_trace_kind(message_id: int, kind: str) -> bool:
+    """True iff an ``inbox_message_trace_event`` of ``kind`` exists for the row.
+
+    Used to make one-shot delivery-trace side effects idempotent (F524 stall
+    surfacing writes ``f524.stall_surfaced`` once per message).
+    """
+    with SessionLocal() as db:
+        exists = (
+            db.query(InboxMessageTraceEventModel.id)
+            .filter(
+                InboxMessageTraceEventModel.message_id == message_id,
+                InboxMessageTraceEventModel.kind == kind,
+            )
+            .first()
+        )
+        return exists is not None
+
+
+def messages_with_trace_kind(message_ids: list[int], kind: str) -> set[int]:
+    """Return the subset of ``message_ids`` that carry a trace event of ``kind``.
+
+    Batch form of :func:`message_has_trace_kind` for the delivery-time staleness
+    banner check (F524), so a batch of N messages costs one query, not N.
+    """
+    if not message_ids:
+        return set()
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxMessageTraceEventModel.message_id)
+            .filter(
+                InboxMessageTraceEventModel.message_id.in_(message_ids),
+                InboxMessageTraceEventModel.kind == kind,
+            )
+            .distinct()
+            .all()
+        )
+        return {int(row[0]) for row in rows}
+
+
+def record_message_trace_event(
+    message_id: int,
+    kind: str,
+    *,
+    phase: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Append one ``inbox_message_trace_event`` row (best-effort, own session)."""
+    with SessionLocal() as db:
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=message_id,
+                kind=kind,
+                phase=phase,
+                decision=decision,
+                reason=reason,
+                payload=payload or {},
+            )
+        )
+        db.commit()
+
+
+def claim_message_trace_once(
+    message_id: int,
+    kind: str,
+    *,
+    phase: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    """Atomically stamp a one-shot trace event; return True iff THIS call won.
+
+    F524 (#379) S1: the stall-surfacing side effect must fire at most once per
+    message even under a concurrent reconcile sweep or a crash between the old
+    check and stamp. This collapses check+stamp into a single atomic INSERT
+    guarded by the partial unique index ``uq_inbox_trace_f524_stall_surfaced``
+    (for ``kind == 'f524.stall_surfaced'``). A losing racer sees the
+    ``IntegrityError`` and returns ``False`` without inserting a duplicate.
+
+    The caller stamps FIRST and only performs the observable side effect (the
+    sender notice) when it wins the claim. A crash after the commit but before
+    the side effect loses one notice — never duplicates one — and the row stays
+    PENDING with its banner armed, so the failure mode is degradation, not a
+    duplicated instruction.
+
+    For kinds NOT covered by a unique index this degenerates to a plain insert
+    that always returns True (no uniqueness to enforce).
+    """
+    with SessionLocal() as db:
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=message_id,
+                kind=kind,
+                phase=phase,
+                decision=decision,
+                reason=reason,
+                payload=payload or {},
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return False
+        return True
 
 
 def list_pending_receiver_ids_with_terminal() -> List[str]:

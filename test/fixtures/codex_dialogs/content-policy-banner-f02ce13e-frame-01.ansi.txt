@@ -3,14 +3,14 @@
  
 k..rees/f02ce13e\]7;file://fedora/home/chao/VScode_projects/cli-subagents/.cao/worktrees/f02ce13e\
 [0m[27m[24m[J
-[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  quiye8584@gmail.com[0m 
+[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  userxxx@example.com[0m 
 [1;32m❯[0m [K[?1h=[?2004h[?1l>[?2004l
 
 [1m[7m%[27m[1m[0m                                                                                                                                                                                              
  
 k..rees/f02ce13e\]7;file://fedora/home/chao/VScode_projects/cli-subagents/.cao/worktrees/f02ce13e\
 [0m[27m[24m[J
-[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  quiye8584@gmail.com[0m 
+[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  userxxx@example.com[0m 
 [1;32m❯[0m [K[?1h=[?2004heecho ready[10D[7me[7mc[7mh[7mo[7m [7mr[7me[7ma[7md[7my[27m[10D[27me[27mc[27mh[27mo[27m [27mr[27me[27ma[27md[27my[?1l>[?2004l
 
 kecho\ready
@@ -18,7 +18,7 @@
  
 k..rees/f02ce13e\]7;file://fedora/home/chao/VScode_projects/cli-subagents/.cao/worktrees/f02ce13e\
 [0m[27m[24m[J
-[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  quiye8584@gmail.com[0m 
+[1;36mf02ce13e[0m on [1;35m cao/f02ce13e[0m via [1;33m🐍 v3.14.7 [0mon [1;34m☁️  userxxx@example.com[0m 
 [1;32m❯[0m [K[?1h=[?2004hccodex resume --dangerously-bypass-approvals-and-sandbox --no-alt-screen --disable shell_snapshot --model gpt-5.6-sol -c 'mcp_servers.cao-mcp-server.command="/home/chao/.local/bin/cao-mcp-se 
 [Kr
 rver"' -c 'mcp_servers.cao-mcp-server.args=[]' -c 'mcp_servers.cao-mcp-server.env.CAO_TERMINAL_ID="f02ce13e"' -c 'mcp_servers.cao-mcp-server.env.CAO_INSTANCE_ID=""' -c 'mcp_servers.cao-mcp-se 

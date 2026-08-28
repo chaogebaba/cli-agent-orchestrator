@@ -53,10 +53,13 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     list_pending_receiver_ids_with_terminal,
+    list_stalled_direct_pending_messages,
     list_stale_delivering_messages,
     list_stale_open_claude_attempts,
     make_admission_proof,
     merge_wpm1_attempt_evidence,
+    claim_message_trace_once,
+    messages_with_trace_kind,
     record_wpm1_stalled_notice,
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
@@ -119,6 +122,10 @@ _FX158_GATE5_WARN_INTERVAL_S: float = 60.0
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
+# F524 (#379): trace-event kind stamped on a direct-terminal message once its
+# stall has been surfaced to the sender. Presence flips the delivery-time
+# staleness banner on and dedupes the one-shot sender notice.
+F524_STALL_SURFACED_KIND = "f524.stall_surfaced"
 # After this many presumed-stale suppress cycles, stop blocking delivery and
 # allow the normal confirm path (often send_returned_unverified). Matches the
 # binding-authority notice threshold so the operator is told at the same time
@@ -2405,6 +2412,26 @@ class InboxService:
             ):
                 batch = list(group)
                 combined = "\n".join(m.message for m in batch)
+                # F524 (#379): if any message in this batch had its stall
+                # surfaced to the sender (aged past delivery.escalate_after_s
+                # undelivered), a late delivery must NOT be consumed as a fresh
+                # instruction. Prefix a staleness banner so the receiver treats
+                # it as possibly-superseded — the incident's builder acted on a
+                # ruling that was already 68 minutes stale.
+                try:
+                    stale_ids = messages_with_trace_kind(
+                        [m.id for m in batch], F524_STALL_SURFACED_KIND
+                    )
+                except Exception:
+                    stale_ids = set()
+                if stale_ids:
+                    combined = (
+                        "[CAO STALE-DELIVERY WARNING] This message was delayed past the "
+                        "delivery escalation window and is being delivered late. Its sender "
+                        "was already told it did not land. Treat it as AGED and possibly "
+                        "SUPERSEDED — reconcile against any newer instruction before acting.\n\n"
+                        + combined
+                    )
                 attempt_uuid = None
                 submit_observation = None
                 submit_evidence = None
@@ -3373,6 +3400,117 @@ class InboxService:
             except Exception as e:
                 logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
 
+    def surface_stalled_direct_deliveries(self) -> int:
+        """F524 (#379): warn the sender when a direct message ages undelivered.
+
+        A supervisor->worker ``send_message`` is a direct-terminal row
+        (``logical_receiver_id IS NULL``) and therefore never gets an FX191
+        delivery obligation — the obligation ladder only accepts supervisor
+        mailboxes (``_f413_after_insert``). So when the receiver stays
+        PROCESSING past the IDLE gate, the row ages silently in ``pending``
+        with no sender-side liveness, and is later delivered stale on the first
+        idle. That is the F524 incident: message 1210 starved 68 minutes, the
+        worker built to the countermanded instruction, and nobody was told.
+
+        This sweep is the direct-row equivalent of the ladder's escalation rung.
+        For each PENDING direct-terminal message older than
+        ``delivery.escalate_after_s`` whose stall has not already been surfaced:
+
+        * route a one-shot notice back to the ORIGINAL SENDER so the supervisor
+          learns its message did not land (acceptance #2/#3), and
+        * stamp a ``f524.stall_surfaced`` trace event, which both dedupes this
+          notice (idempotency) and arms the delivery-time staleness banner so a
+          late delivery is not consumed as a fresh instruction.
+
+        Returns the number of messages newly surfaced this pass (for tests).
+        """
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        escalate_after_s = float(ConfigService.get("delivery.escalate_after_s", 120.0))
+        try:
+            stalled = list_stalled_direct_pending_messages(int(escalate_after_s))
+        except Exception as e:
+            logger.debug("f524 list_stalled_direct_pending_messages failed: %s", e)
+            return 0
+
+        surfaced = 0
+        for message in stalled:
+            try:
+                # S1 (atomic one-shot): claim the surface FIRST via an
+                # insert-or-ignore guarded by the partial unique index. If we do
+                # not win the claim, another sweep already surfaced this message
+                # (or is mid-flight) — skip without sending a duplicate notice.
+                # Stamping before the observable side effect means a crash after
+                # the commit loses at most one notice; it never duplicates one.
+                receiver_status = None
+                try:
+                    receiver_status = status_monitor.get_status(message.receiver_id)
+                    status_label = (
+                        receiver_status.value
+                        if isinstance(receiver_status, TerminalStatus)
+                        else "unknown"
+                    )
+                except Exception:
+                    status_label = "unknown"
+
+                created_at = message.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age_s = int((_utcnow() - created_at).total_seconds())
+
+                won = claim_message_trace_once(
+                    message.id,
+                    F524_STALL_SURFACED_KIND,
+                    phase="stall_surfaced",
+                    decision="notify_sender",
+                    reason="direct_delivery_stalled",
+                    payload={
+                        "receiver_id": message.receiver_id,
+                        "sender_id": message.sender_id,
+                        "age_s": age_s,
+                        "receiver_status": status_label,
+                        "escalate_after_s": int(escalate_after_s),
+                    },
+                )
+                if not won:
+                    # Already surfaced by a prior/concurrent sweep — no duplicate.
+                    continue
+
+                preview = (message.message or "").split("\n", 1)[0][:120]
+                body = (
+                    f"[delivery-stall] Your send_message (id {message.id}) to terminal "
+                    f"{message.receiver_id} has been undelivered for {age_s}s "
+                    f"(receiver status={status_label}); it exceeded "
+                    f"delivery.escalate_after_s={int(escalate_after_s)}s. The receiver "
+                    f"has not returned to an idle boundary, so the message never landed. "
+                    f"It will still be delivered when the receiver next goes idle, but "
+                    f"flagged as AGED — treat it as possibly superseded and re-send or "
+                    f"retract if your instruction has changed.\n"
+                    f"First line: {preview}"
+                )
+
+                # Route the notice to the ORIGINAL SENDER (the supervisor), not
+                # the receiver's caller. Reuses the plain inbox path; the
+                # message-trace: sender prefix keeps it out of callback barriers
+                # and out of this very sweep (excluded as a service sender).
+                create_inbox_message(
+                    f"message-trace:{message.receiver_id}",
+                    message.sender_id,
+                    body,
+                )
+                surfaced += 1
+                logger.warning(
+                    "f524_stall_surfaced message=%s receiver=%s sender=%s age_s=%s status=%s",
+                    message.id,
+                    message.receiver_id,
+                    message.sender_id,
+                    age_s,
+                    status_label,
+                )
+            except Exception as e:
+                logger.debug("f524 stall surface for message %s failed: %s", message.id, e)
+        return surfaced
+
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
         """Re-attempt delivery for messages stuck in PENDING past the grace window.
 
@@ -3393,6 +3531,13 @@ class InboxService:
                 self.deliver_pending(terminal_id, registry=registry)
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
+        # F524 (#379): surface supervisor->worker messages that have aged past the
+        # escalation window undelivered. Direct-terminal rows never get an FX191
+        # obligation, so this sweep is their only sender-side liveness.
+        try:
+            self.surface_stalled_direct_deliveries()
+        except Exception as e:
+            logger.debug("f524 stall surface sweep failed: %s", e)
         self.recover_stale_deliveries(recurring=True)
         # fx158 D1/D2: pull-mode pending-push reconciler (bypasses deliver_pending).
         self.reconcile_pull_mode_notifications()
@@ -3545,7 +3690,9 @@ class InboxService:
 
                 # F457-r2 B1: unified gate — wake.native=false suppresses reconciler push
                 # (mirrors the deliver_pending gate at :2315).
-                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT as _WND
+                from cli_agent_orchestrator.services.cc_session_registry import (
+                    WAKE_NATIVE_DEFAULT as _WND,
+                )
 
                 if not ConfigService.get("supervisor.wake.native", default=_WND):
                     logger.debug(

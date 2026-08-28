@@ -275,3 +275,105 @@ isort --check-only --profile black → OK
 No g7a guard was weakened — the tmux invariant is preserved by routing through
 `tmux_argv`, and its self-test + all 4 mutation-kill params pass. Full-suite box rerun
 follows. No merge (F244).
+
+
+---
+
+# Round 3 — Post-Box Adjudication (6 failed / 14022 passed on b0de6f6a)
+
+The box full-suite at b0de6f6a: all 21 round-1/2 in-scope fixes held. The 3 known
+flakes flipped as predicted (2× `TestLedgerSampling` pgid, 1× `test_600_virtual_seconds`
+at 4.38s). Three NON-flaky failures remained; adjudicated below.
+
+## #1 — test_fixtures_no_personal_pii — FIXED via `origin/main` merge
+
+Not a defect on this branch: the personal email (`quiye8584@gmail.com`) lived in 9
+`test/fixtures/codex_dialogs/*.ansi.txt` frames, and the F534 scrub (fork main
+`030b166c`, merge `8c0493c0`) landed on `main` AFTER this branch forked at `4e873cfd`.
+
+**Fix:** merged `origin/main` (`8c0493c0` — F534 PII scrub + F524 `33c15128`) into
+`cao/26643eb7`. The 3-way auto-merge completed with **ZERO conflicts**: this branch's
+r1/r2/r3 edits and main's F524/F534 touched disjoint lines.
+
+Post-merge verification:
+- `quiye8584@gmail.com` scrubbed from all 9 fixtures; `test_fixtures_no_personal_pii`
+  passes.
+- Every prior fix survived intact: r1 `_spec_dir` baseline form; r2's two
+  `tmux_argv(...-X cancel)` sites; r2 grok flag `_input_received`; round-1 `xdist_group`
+  marker in `pyproject.toml`; this report.
+- Merge-brought code is coherent here: new `test_f524_direct_delivery_stall.py` → 11
+  passed; `inbox_service` suite → 347 passed; collect-only (xdist disabled) → 14259
+  collected, no INTERNALERROR.
+
+## #2 — test_worker_terminal_cap ... test_thread_race_barrier_inside_listing — BOX FLAKE
+
+**Adjudication: load-induced timing flake, NOT a regression, NOT caused by the r2
+`tmux_argv` change.**
+
+- `test/services/test_worker_terminal_cap.py` AND `src/.../fifo_reader.py` are
+  **untouched** by the merge (`4e873cfd..8dab9fcb` empty diff) AND by the r2 diff
+  (`8dab9fcb..b0de6f6a` touches only `clients/tmux.py` [two cancel call-shapes],
+  `grok_cli.py`, and two test files). The failing code path is byte-identical at both
+  commits → behavior identical by construction. The r2 change swapped
+  `["tmux",…,"-X","cancel"]` for `tmux_argv(…,"-X","cancel")`, which is the same argv
+  when no socket name is set — and touches `send_keys`, not the worker-admission
+  pipe-pane forwarder.
+- The test rendezvouses 4 threads on `barrier.wait(timeout=10)`. Under saturation a
+  thread's pipe-pane forwarder (`fifo_reader.py:1166`) starts late and one thread misses
+  the 10 s window → `BrokenBarrierError`. A wall-clock-bounded thread rendezvous is
+  inherently load-sensitive.
+- Empirical: **10/10** isolated (`-n0`); the single nodeid **8/8** under `-n2`; the full
+  `TestConcurrentAdmission` class under `-n2` was **5/6** (the one failure stalled to 15 s
+  vs the ~3 s norm — the load signature, not a logic error).
+- The test's own line-805 comment calls `BrokenBarrierError` "the r2 bug" — that names a
+  **historical F439-round-3** bug this test guards against, not this task's round 2. A
+  coincidental label collision, easy to misread as implicating the r2 change; it does
+  not.
+
+**No code change** — raising the barrier timeout would weaken a real concurrency guard.
+
+## #3 — test_wpdt ... test_doctrine_arming_section_exists — ROOT-REPO ENVIRONMENT
+
+`_root_repo()` resolves to `fork_root.parent` — the **outer `cli-subagents` repo**, a
+SEPARATE repo from this fork. The test asserts
+`doctrine/sections/shared/ws-arming.md` exists there and only `pytest.skip`s when the
+`doctrine/` **directory** is absent. On the box the stale root checkout has the directory
+but not the file, so the skip does not fire and the assertion fails.
+
+`ws-arming.md` is **not tracked anywhere in the fork repo** (no branch, not `origin/main`,
+no `doctrine/` dir in the fork) — it is exclusively a root-repo artifact this fork branch
+cannot create or fix. It fails locally too, for the identical root-repo-staleness reason
+(my local `cli-subagents` checkout also lacks the file). **Box/root-repo environment; no
+fork code change; test not weakened** (matches the supervisor's pre-diagnosis).
+
+## Round-3 Changes
+
+| Change | Detail |
+|--------|--------|
+| Merge `origin/main` (`8c0493c0`) into `cao/26643eb7` | F534 PII scrub of 9 codex_dialogs fixtures + F524; zero conflicts |
+| (report) | this round-3 section |
+
+No fork source/test edits this round — #1 is resolved by the merge, #2 and #3 are
+adjudicated non-defects.
+
+## Round-3 Test Results (local worktree, merged tree, `uv run pytest -n0 --dist=no`)
+
+```
+test_fixtures_no_personal_pii.py                       → 1 passed  (was: 1 failed / 9 fixtures)
+6 tmux/g7a in-scope + realserver + PII                 → 13 passed, 1 skipped
+test/providers/test_native_status_shared.py (matrix)   → 156 passed
+test/services/test_f524_direct_delivery_stall.py (new) → 11 passed
+inbox_service suite (merge touched inbox_service.py)   → 347 passed
+collect-only, xdist disabled                           → 14259 collected, no INTERNALERROR
+
+# Flake adjudication (#2)
+barrier test isolated -n0                              → 10/10 passed
+barrier nodeid -n2                                     → 8/8 passed
+full TestConcurrentAdmission class -n2                 → 5/6 (1 load stall @15s)
+
+black --check / isort --check-only (r-touched files)   → clean
+```
+
+Full-suite box rerun follows; the 4 flake nodeids (#2 + clusters 2/3) may still flip
+under load — not code-fixable without perf/harness changes, which were not made. No merge
+to main (F244 — supervisor runs the gate).
