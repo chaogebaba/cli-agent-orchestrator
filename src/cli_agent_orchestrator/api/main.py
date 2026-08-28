@@ -1669,6 +1669,23 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("purged %d stale terminals", purged)
 
+    # F542 (#398): reconcile terminal rows whose whole tmux_session is gone
+    # (e.g. the tmux server did not survive a host reboot). Runs BEFORE the
+    # FIFO re-arm below so a dead-session row is cleaned up once instead of
+    # being enrolled in the pipe-pane liveness watchdog, which would otherwise
+    # log "Failed to get history from <session>:<window>" every few seconds
+    # forever.
+    try:
+        reconcile_result = terminal_service.reconcile_dead_session_terminals()
+    except Exception:
+        logger.exception("Startup dead-session reconciliation failed; deferring to next boot")
+    else:
+        logger.info(
+            "startup_dead_session_reconcile reconciled=%d skipped_session_live=%d",
+            reconcile_result["reconciled"],
+            reconcile_result["skipped_session_live"],
+        )
+
     # D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
     try:
         rearm_result = terminal_service.rearm_fifo_readers_at_startup()

@@ -299,9 +299,7 @@ def _maybe_ensure_fleet_tui(session_name: Optional[str] = None) -> None:
 
         script_path = get_tui_ensure_script()
         if not os.path.isfile(script_path):
-            logger.debug(
-                "fleet-tui-ensure: script not found at %s, skipping", script_path
-            )
+            logger.debug("fleet-tui-ensure: script not found at %s, skipping", script_path)
             return
 
         # Build args: pass session name if known
@@ -894,6 +892,96 @@ def purge_stale_terminal_records() -> int:
             logger.exception("purge_row_failed terminal=%s", terminal_id)
             continue
     return purged
+
+
+def reconcile_dead_session_terminals() -> dict:
+    """F542 (#398): reconcile terminal rows whose tmux_session no longer exists.
+
+    The tmux server does not survive a host reboot, but the SQLite terminal
+    rows do. The pipe-pane liveness watchdog (``services/fifo_reader.py``) then
+    re-arms a FIFO reader per surviving row and probes ``get_history`` every
+    ``PIPE_LIVENESS_CHECK_INTERVAL_S`` — each probe logs
+    ``clients.tmux - ERROR - Failed to get history from <session>:<window>``
+    forever, because the whole session is gone (incident 2026-08-28).
+
+    This runs the cleanup/terminated path ONCE for every row whose session is
+    absent, so those rows never get re-armed and the poll storm never starts.
+
+    Invariants:
+    - ``session_exists`` is checked ONCE per distinct session name (not per
+      row), so a supervisor + N workers of one dead session cost one probe.
+    - Rows whose session still exists are NEVER touched.
+    - Idempotent: a reconciled row is deleted, so a second call is a no-op.
+
+    Must run BEFORE ``rearm_fifo_readers_at_startup`` at lifespan startup so a
+    dead-session row is reconciled instead of enrolled in the watchdog.
+
+    Returns ``{reconciled: int, skipped_session_live: int}``.
+    """
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        # Event-inbox backends (herdr) have no tmux session to reconcile.
+        return {"reconciled": 0, "skipped_session_live": 0}
+
+    reconciled = 0
+    skipped_session_live = 0
+    # Cache per-session existence so N rows of one dead session cost one probe.
+    session_alive: dict[str, bool] = {}
+
+    for metadata in db_list_all_terminals():
+        terminal_id = metadata["id"]
+        session_name = metadata.get("tmux_session")
+        if not session_name:
+            continue
+
+        if session_name not in session_alive:
+            try:
+                session_alive[session_name] = backend.session_exists(session_name)
+            except Exception:
+                # An unclassifiable backend failure is NOT proof of absence —
+                # never reconcile a row we could not confirm is orphaned.
+                logger.warning(
+                    "reconcile_session_exists_failed session=%s; leaving rows intact",
+                    session_name,
+                    exc_info=True,
+                )
+                session_alive[session_name] = True
+
+        if session_alive[session_name]:
+            skipped_session_live += 1
+            continue
+
+        # Session confirmed gone — run the cleanup/terminated path once.
+        try:
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
+            if delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)[
+                "terminal_deleted"
+            ]:
+                settlement = settle_pending_orphan_messages(receiver_ids=[terminal_id])
+                if settlement.busy_aborted:
+                    logger.warning(
+                        "reconcile_dead_session_settlement_busy terminal=%s", terminal_id
+                    )
+                reconciled += 1
+                logger.info(
+                    "reconcile_dead_session terminal=%s session=%s (session gone; row reconciled)",
+                    terminal_id,
+                    session_name,
+                )
+        except Exception:
+            logger.exception("reconcile_dead_session_failed terminal=%s", terminal_id)
+            continue
+
+    if reconciled:
+        logger.info(
+            "reconcile_dead_session_complete reconciled=%d skipped_session_live=%d",
+            reconciled,
+            skipped_session_live,
+        )
+    return {"reconciled": reconciled, "skipped_session_live": skipped_session_live}
 
 
 def inject_memory_context(first_message: str, terminal_id: str, *, consume: bool = True) -> str:
@@ -2020,9 +2108,7 @@ async def create_terminal(
         # F337: Also require wake.native=true — the cc_team_inbox_path is only
         # useful when the native channel is active; deriving it when native is
         # disabled would leave a stale path that split-brain code could use.
-        metadata = _maybe_derive_cc_team_inbox_path(
-            provider, metadata, working_directory
-        )
+        metadata = _maybe_derive_cc_team_inbox_path(provider, metadata, working_directory)
 
         window_name = generate_window_name(agent_profile, terminal_id)
 
@@ -5025,7 +5111,10 @@ async def _wait_for_auto_responder_dialog_clear(
             provider_name = meta.get("provider") if meta else None
             if not provider_name:
                 return False
-            return auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id) is not None
+            return (
+                auto_responder.match_verdict(provider_name, lines, terminal_id=terminal_id)
+                is not None
+            )
         except Exception:
             return False
 
