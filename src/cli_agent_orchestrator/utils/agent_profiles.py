@@ -718,21 +718,6 @@ class AssignmentResolutionError(ValueError):
         self.code = code
 
 
-def _is_legacy_profile_name(agent_profile: str) -> bool:
-    """True when ``agent_profile`` names a real profile file in a configured store.
-
-    Legacy names take precedence over position names (D6: the composed profile's
-    ``.name`` stays the legacy concrete name, and every name-keyed consumer keeps
-    working). A name that resolves to a store file is legacy; only a name with no
-    store file is a candidate POSITION name.
-    """
-    try:
-        read_agent_profile_source(agent_profile)
-        return True
-    except (FileNotFoundError, ValueError):
-        return False
-
-
 def _position_exists(position_name: str) -> bool:
     """True when ``positions/<position_name>.md`` exists (and is not frozen)."""
     from cli_agent_orchestrator.constants import positions_store_dir
@@ -747,37 +732,49 @@ def _position_exists(position_name: str) -> bool:
 def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "tuple[str, Optional[str]]":
     """Resolve an assign ``agent_profile`` (+ optional ``provider=``) to a spawn target (D7).
 
+    The resolver ENGAGES (position mode) only when the caller passes ``provider=``
+    OR ``agent_profile`` is a bare position file (``positions/<name>.md``). Every
+    OTHER name passes through UNTOUCHED as a legacy concrete name — no store
+    lookup, no ``<provider>_<position>`` shape inference (that synthesis is D9/P4).
+    This is the r2 (option b) fix: a legacy name (installed OR NOT — e.g.
+    ``kiro_dev`` / ``codex_dev`` on a clean store) spawns exactly as pre-D7, and
+    a ``<provider>_<position>``-shaped legacy name is never mistaken for a
+    position miss.
+
     Returns ``(effective_profile_name, resolved_provider)``:
 
-      * LEGACY name (a real store profile): returned UNCHANGED with the caller's
-        ``provider`` passed through (may be None — the existing ``resolve_provider``
-        chain owns provider resolution for legacy names). Behaviour is identical
-        to pre-D7.
-      * POSITION name (no store file, but ``positions/<name>.md`` exists): requires
-        a ``provider`` (else ``E-POSITION-NEEDS-PROVIDER``); the provider must be in
-        the position's ``providers:`` allowlist (else ``E-PROVIDER-NOT-ALLOWED``).
-        On success the position is returned as the effective profile name with the
-        resolved provider — the LIVE on-disk spawn wiring for a position-name
-        target (materialising/keying the composed ``<provider>_<position>`` profile
-        for the server-side ``load_agent_profile``) is D9/P4; P3 lands the
-        resolution + validation layer, and the assign path spawns through the
-        mocked/legacy seam in tests.
-      * Neither: ``E-UNKNOWN-POSITION`` (a name that is not a store profile and not
-        a position file).
+      * ENGAGED + ``agent_profile`` is a position file: requires a ``provider``
+        (else ``E-POSITION-NEEDS-PROVIDER``); the provider must be in the
+        position's ``providers:`` allowlist (else ``E-PROVIDER-NOT-ALLOWED``). On
+        success returns the position as the effective name + resolved provider —
+        the LIVE on-disk spawn wiring for a position target is D9/P4; P3 lands the
+        resolution + validation layer.
+      * ENGAGED via ``provider=`` but ``agent_profile`` is NOT a position file:
+        ``E-UNKNOWN-POSITION`` (position mode was requested on a non-position).
+      * NOT ENGAGED (no ``provider=`` and not a position file): passthrough
+        unchanged (legacy).
 
-    Raises ``AssignmentResolutionError`` (with ``.code``) on every failure.
+    Raises ``AssignmentResolutionError`` (with ``.code``) on a position-mode
+    failure only.
     """
-    if _is_legacy_profile_name(agent_profile):
+    is_position = _position_exists(agent_profile)
+
+    # NOT ENGAGED: no provider= and not a bare position file → legacy passthrough
+    # (no store lookup, no shape inference). Pre-D7 behaviour preserved exactly.
+    if provider is None and not is_position:
         return agent_profile, provider
 
-    if not _position_exists(agent_profile):
+    # ENGAGED via provider= but the name is not a position file → position mode
+    # was requested on a non-position.
+    if not is_position:
         raise AssignmentResolutionError(
             E_UNKNOWN_POSITION,
-            f"{E_UNKNOWN_POSITION}: '{agent_profile}' is neither an installed "
-            f"profile nor a known position",
+            f"{E_UNKNOWN_POSITION}: '{agent_profile}' is not a known position "
+            f"(provider= requests position mode; <provider>_<position> synthesis "
+            f"is P4)",
         )
 
-    # It is a position name. Provider is mandatory in P3 (D9 routing = P4).
+    # ENGAGED + a bare position file. Provider is mandatory in P3 (D9 routing = P4).
     if not provider:
         raise AssignmentResolutionError(
             E_POSITION_NEEDS_PROVIDER,
@@ -785,8 +782,8 @@ def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "t
             f"explicit provider= (routing-binding resolution is P4)",
         )
 
-    # Enforce the position ``providers:`` allowlist (D7). An absent/empty allowlist
-    # is unconstrained; a non-empty allowlist that omits the provider rejects.
+    # Enforce the position ``providers:`` allowlist (D7). Absent/empty = open; a
+    # non-empty allowlist that omits the provider rejects.
     from cli_agent_orchestrator.constants import positions_store_dir
 
     pos = _read_composition_store(positions_store_dir(), agent_profile, resolve_env=False)
@@ -798,5 +795,4 @@ def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "t
             f"{E_PROVIDER_NOT_ALLOWED}: provider '{provider}' is not in position "
             f"'{agent_profile}' allowlist {allow}",
         )
-
     return agent_profile, provider
