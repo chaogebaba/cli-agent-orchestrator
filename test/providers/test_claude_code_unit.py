@@ -2183,7 +2183,13 @@ class TestClaudeCodeProviderStartupPrompts:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
-        """Test that trust prompt is detected and auto-accepted."""
+        """Test that trust prompt is detected and auto-accepted.
+
+        F548 (#404): affirmative selection is now Down + Enter via
+        send_special_key (real tmux keys), not a literal ESC[B via send_keys.
+        The fixture already focuses 'Yes, I trust this folder' (❯ on row 1), so
+        the settle poll confirms from the current pane without a re-read.
+        """
         mock_tmux.get_history.side_effect = [
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n",
             "Welcome to Claude Code v2.1.211",
@@ -2192,7 +2198,12 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=2.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        # No literal-ESC arrow via send_keys any more.
+        mock_tmux.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -2253,46 +2264,78 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        # F548 (#404): Down then Enter via send_special_key; confirmed from the
+        # current pane (❯ already on the affirmative row), so no re-read.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
-        """Test that bypass permissions prompt is detected and auto-accepted."""
-        # First poll: bypass prompt; second poll: welcome banner (after dismissal)
-        mock_tmux.get_history.side_effect = [
+        """Test that bypass permissions prompt is detected and auto-accepted.
+
+        F548 (#404): the affirmative ('Yes, I accept') is row 2, focus defaults
+        to 'No, exit'. The handler sends a real Down (send_special_key), the
+        settle poll re-captures and confirms ❯ moved onto 'Yes, I accept', then
+        sends Enter. Model that focus move in the mock: first capture shows
+        focus on 'No, exit'; after Down, captures show ❯ on 'Yes, I accept'.
+        """
+        pane_focus_no = (
             "WARNING: Claude Code running in Bypass Permissions mode\n"
-            "❯ 1. No, exit\n  2. Yes, I accept\n",
-            "Welcome to Claude Code v2.1.74",
+            "❯ 1. No, exit\n  2. Yes, I accept\n"
+        )
+        pane_focus_yes = (
+            "WARNING: Claude Code running in Bypass Permissions mode\n"
+            "  1. No, exit\n❯ 2. Yes, I accept\n"
+        )
+        mock_tmux.get_history.side_effect = [
+            pane_focus_no,  # loop read -> bypass branch
+            pane_focus_yes,  # settle poll re-read -> focus confirmed on affirmative
+            "Welcome to Claude Code v2.1.74",  # next loop iter -> banner, return
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Verify Down arrow sent via send_keys and Enter via send_special_key
-        mock_tmux.send_keys.assert_called_once()
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        # Down then Enter, both as real special keys (no literal-ESC send_keys).
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        mock_tmux.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
-        """Test that bypass prompt is handled, then trust prompt follows."""
-        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        """Test that bypass prompt is handled, then trust prompt follows.
+
+        F548 (#404): each affirmative selection is Down + settle-confirm + Enter
+        via send_special_key. Bypass affirmative ('Yes, I accept') is row 2, so
+        the settle poll needs a post-Down capture showing ❯ on it; the trust
+        fixture already focuses 'Yes, I trust this folder' (confirmed from the
+        current pane, no re-read).
+        """
         mock_tmux.get_history.side_effect = [
-            "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
-            "❯ 1. Yes, I trust this folder\n  2. No",
-            "Welcome to Claude Code v2.1.211",
+            "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",  # bypass read
+            "WARNING: Bypass Permissions mode\n  1. No, exit\n❯ 2. Yes, I accept\n",  # settle confirm
+            "❯ 1. Yes, I trust this folder\n  2. No",  # trust read (already focused)
+            "Welcome to Claude Code v2.1.211",  # banner -> return
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # F548 (#404): BOTH bypass AND trust now select the affirmative row via
-        # Down+Enter (bare Enter on the trust dialog would confirm the default
-        # "No, exit" and kill the seat). So send_keys (Down) is called twice —
-        # once for bypass, once for trust — and send_special_key (Enter) twice.
-        assert mock_tmux.send_keys.call_count == 2  # Down arrow for bypass AND trust
-        assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
+        # F548: both dialogs -> Down then Enter as real special keys; the literal
+        # ESC[B via send_keys is gone entirely.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        mock_tmux.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -2305,22 +2348,29 @@ class TestClaudeCodeProviderStartupPrompts:
             lambda _provider: type("Plane", (), {"classification": "shared-auth-read-only"})(),
         )
         mock_tmux.get_history.side_effect = [
-            "❯ 1. Yes, I trust this folder\n  2. No",
+            "❯ 1. Yes, I trust this folder\n  2. No",  # trust read (already focused)
+            # trust accepted -> next loop iter: external-import prompt (focus row 1)
             "Yes, I trust this folder\nAllow external CLAUDE.md file imports?\n"
             "❯ 1. Yes, allow external imports\n  2. No, disable external imports",
-            "Welcome to Claude Code v2.1.211",
+            # settle poll re-read for the reject: ❯ moved onto 'No, disable...'
+            "Allow external CLAUDE.md file imports?\n"
+            "  1. Yes, allow external imports\n❯ 2. No, disable external imports",
+            "Welcome to Claude Code v2.1.211",  # banner -> return
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(outer_timeout=5.0)
 
-        # F548 (#404): trust now selects the affirmative row via Down+Enter (not
-        # bare Enter), and the external-import reject also uses Down+Enter — so
-        # send_keys (Down) is called twice, send_special_key (Enter) twice.
-        assert mock_tmux.send_keys.call_count == 2
-        for call_ in mock_tmux.send_keys.call_args_list:
-            assert call_ == call("test-session", "window-0", "\x1b[B", enter_count=0)
-        assert mock_tmux.send_special_key.call_count == 2
+        # F548 (#404): trust (confirmed from current pane) and the external-import
+        # reject (confirmed via settle re-read) each send Down then Enter as real
+        # special keys; the literal ESC[B via send_keys is gone.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        mock_tmux.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -3078,22 +3128,55 @@ class TestF548InitDialogAndAuth:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_trust_prompt_selects_affirmative_row_not_bare_enter(self, mock_tmux):
-        """Trust dialog -> Down (off 'No, exit') then Enter, never a bare Enter."""
+        """Trust dialog -> real Down key (NOT literal ESC[B), settle-confirm that
+        focus moved onto 'Yes, I trust this folder', then Enter. Never a bare
+        Enter, and never a raw ESC[B via send_keys.
+
+        This is the F548 r3 mutation guard: sending the arrow as literal bytes
+        via send_keys (the old bug) would make this test fail — send_special_key
+        would not be called with 'Down' and send_keys would be called instead.
+        """
+        # Real box shape (Claude 2.1.248): focus defaults to 'No, exit' (row 1).
+        pane_focus_no = "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        # After a real Down, ❯ moves onto the affirmative row.
+        pane_focus_yes = "  No, exit\n❯ Yes, I trust this folder\nEnter to confirm · Esc to cancel"
         mock_tmux.get_history.side_effect = [
-            # Real box shape (Claude 2.1.248): focus defaults to 'No, exit'.
-            "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel",
-            "Welcome to Claude Code v2.1.248",
+            pane_focus_no,  # loop read -> trust branch (focus on 'No, exit')
+            pane_focus_yes,  # settle poll re-read -> focus confirmed on affirmative
+            "Welcome to Claude Code v2.1.248",  # banner -> return
         ]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Down arrow sent to move focus onto 'Yes, I trust this folder', then Enter.
-        assert mock_tmux.send_keys.call_count == 1
-        assert mock_tmux.send_keys.call_args == call(
-            "test-session", "window-0", "\x1b[B", enter_count=0
-        )
-        assert mock_tmux.send_special_key.call_count == 1
-        assert mock_tmux.send_special_key.call_args == call("test-session", "window-0", "Enter")
+        # The arrow is a REAL tmux special key 'Down', then 'Enter' — exactly,
+        # in order. A raw ESC[B via send_keys (the box-r3 bug) would break this.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        mock_tmux.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_trust_prompt_down_is_special_key_not_literal_escape(self, mock_tmux):
+        """Explicit mutation guard: the Down MUST go through send_special_key as
+        the tmux key name 'Down' — the literal 3-byte ESC[B via send_keys is what
+        the box e2e r3 proved Ink ignores (focus stayed on 'No, exit')."""
+        pane_focus_no = "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        pane_focus_yes = "  No, exit\n❯ Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        mock_tmux.get_history.side_effect = [
+            pane_focus_no,
+            pane_focus_yes,
+            "Welcome to Claude Code",
+        ]
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        # Down delivered as a special key; NO literal-ESC bytes via send_keys.
+        down_calls = [c for c in mock_tmux.send_special_key.call_args_list if c.args[-1] == "Down"]
+        assert len(down_calls) == 1
+        for c in mock_tmux.send_keys.call_args_list:
+            assert "\x1b[B" not in c.args, "raw ESC[B must never be sent via send_keys"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")

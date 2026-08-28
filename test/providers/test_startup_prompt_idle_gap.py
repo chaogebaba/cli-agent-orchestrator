@@ -8,7 +8,7 @@ total runtime is hard-capped by ``provider_init_timeout``.
 Covers: ClaudeCodeProvider, KimiCliProvider, AntigravityCliProvider.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -78,19 +78,24 @@ class TestClaudeCodeIdleGap:
             36.0,  # iter3: welcome banner → return (composed post-trust loop)
         ]
         mock_backend.get_history.side_effect = [
-            "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
-            "Yes, I trust this folder",
+            "WARNING: Bypass\n  1. No, exit\n❯ 2. Yes, I accept\n",
+            "❯ Yes, I trust this folder",
             "Welcome to Claude Code v2.1.211",
         ]
 
         p = self._make()
         await p._handle_startup_prompts()
 
-        # Bypass at t=18 (Down + Enter) and the late trust prompt at t=35
-        # (Down + Enter, F548 #404) are both handled — proving the idle-gap
-        # reset kept the loop polling past the old 20s window.
-        assert mock_backend.send_keys.call_count == 2  # bypass Down + trust Down
-        assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
+        # Bypass at t=18 and the late trust prompt at t=35 are both handled via
+        # real Down + Enter special keys (F548 #404, no literal-ESC send_keys) —
+        # proving the idle-gap reset kept the loop polling past the old 20s window.
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -148,14 +153,18 @@ class TestClaudeCodeIdleGap:
             36.0,  # iter2: welcome banner -> return
         ]
         mock_backend.get_history.side_effect = [
-            "Yes, I trust this folder",
+            "❯ Yes, I trust this folder",
             "Welcome to Claude Code v2.1.211",
         ]
 
         p = self._make()
         await p._handle_startup_prompts()
 
-        mock_backend.send_special_key.assert_called_once_with("sess", "win", "Enter")
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _outer_cap_settings)
     @pytest.mark.asyncio
@@ -179,17 +188,22 @@ class TestClaudeCodeIdleGap:
             30.0,  # iter2: bypass_accepted=True, no trust, no welcome; sleep
             61.0,  # iter3 now >= 60 outer_deadline → return (outer cap)
         ]
-        # Output always has bypass prompt (handled once, then ignored)
+        # Output always has bypass prompt (handled once, then ignored). F548
+        # (#404): ❯ on the affirmative row so the settle poll confirms from the
+        # current pane (no extra get_history/monotonic during the handler).
         mock_backend.get_history.return_value = (
-            "WARNING: Bypass Permissions\n1. No\n2. Yes, I accept\n"
+            "WARNING: Bypass Permissions\n  1. No, exit\n❯ 2. Yes, I accept\n"
         )
 
         p = self._make()
         await p._handle_startup_prompts()
 
-        # Bypass accepted once
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once()
+        # Bypass accepted once via real Down + Enter (no literal-ESC send_keys).
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -209,17 +223,22 @@ class TestClaudeCodeIdleGap:
             9.0,  # iter3: welcome banner → return
         ]
         mock_backend.get_history.side_effect = [
-            "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
-            "Yes, I trust this folder",
+            "WARNING: Bypass\n  1. No, exit\n❯ 2. Yes, I accept\n",
+            "❯ Yes, I trust this folder",
             "Welcome to Claude Code v2.1.211",
         ]
 
         p = self._make()
         await p._handle_startup_prompts()
 
-        # Bypass: Down + Enter. Trust (F548 #404): Down + Enter (affirmative row).
-        assert mock_backend.send_keys.call_count == 2  # bypass Down + trust Down
-        assert mock_backend.send_special_key.call_count == 2
+        # Bypass then trust: each Down + Enter as real special keys (F548 #404).
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @pytest.mark.asyncio
@@ -242,17 +261,23 @@ class TestClaudeCodeIdleGap:
             23.0,  # iter3: welcome banner → return
         ]
         mock_backend.get_history.side_effect = [
-            "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
-            "Yes, I trust this folder",
+            "WARNING: Bypass\n  1. No, exit\n❯ 2. Yes, I accept\n",
+            "❯ Yes, I trust this folder",
             "Welcome to Claude Code v2.1.211",
         ]
 
         p = self._make()
         await p._handle_startup_prompts()
 
-        # Both prompts handled. Trust (F548 #404) now Down+Enter like bypass.
-        assert mock_backend.send_keys.call_count == 2  # bypass Down + trust Down
-        assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
+        # Both prompts handled. Bypass then trust: each Down + Enter as real
+        # special keys (F548 #404, no literal-ESC send_keys).
+        mock_backend.send_keys.assert_not_called()
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
 
 
 # ---------------------------------------------------------------------------

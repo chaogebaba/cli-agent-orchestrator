@@ -126,6 +126,7 @@ from cli_agent_orchestrator.models.terminal import (
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
 )
@@ -3753,6 +3754,26 @@ async def start_session_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    except ClaudeAuthError as exc:  # F548 (#404): E-CLAUDE-AUTH -> JSON
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except TimeoutError as exc:
+        # F548 (#404): a provider init failure must surface as a STRUCTURED JSON
+        # error, not FastAPI's default text/plain 500. Two shapes reach here from
+        # ClaudeCodeProvider.initialize():
+        #   - ClaudeAuthError (subclass of the provider ProviderError, NOT
+        #     TimeoutError) — handled in its own arm below;
+        #   - a plain TimeoutError ("Claude Code initialization timed out after
+        #     Ns. Last pane lines: …") — the seat never reached a ready status.
+        # Map the latter to a 500 JSON body carrying the code and the message
+        # (which includes the pane tail), so the CLI/box e2e sees a parseable
+        # error instead of a bare "Internal Server Error" / connection hang.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "provider_init_timeout", "message": str(exc)},
         ) from exc
     except RuntimeError as exc:
         code = str(exc)

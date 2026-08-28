@@ -23,7 +23,7 @@ All backends and subprocesses are mocked — no Docker/Podman/tmux required.
 """
 
 import shlex
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -213,18 +213,24 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
         36.0,  # iter3: welcome banner -> return (lawful settle after trust)
     ]
     mock_backend.get_history.side_effect = [
-        "WARNING: Bypass Permissions\n1. No\n2. Yes, I accept\n",
-        "Yes, I trust this folder",
+        "WARNING: Bypass Permissions\n  1. No, exit\n❯ 2. Yes, I accept\n",
+        "❯ Yes, I trust this folder",
         "Welcome to Claude Code v2.1.211",
     ]
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
     await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
-    # Bypass: Down (send_keys) + Enter. Trust (F548 #404): Down + Enter (affirmative
-    # row — bare Enter would confirm the default 'No, exit' and kill the seat).
-    assert mock_backend.send_keys.call_count == 2  # bypass Down + trust Down
-    assert mock_backend.send_special_key.call_count == 2
+    # Bypass then trust: each selected via real Down + Enter special keys (F548
+    # #404). ❯ is on the affirmative row so the settle poll confirms from the
+    # current pane (no extra get_history/monotonic). No literal-ESC send_keys.
+    mock_backend.send_keys.assert_not_called()
+    assert mock_backend.send_special_key.call_args_list == [
+        call("sess", "win", "Down"),
+        call("sess", "win", "Enter"),
+        call("sess", "win", "Down"),
+        call("sess", "win", "Enter"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -251,8 +257,10 @@ async def test_wrapped_provider_lifecycle(
     # D6c: The trust dialog shows on the first buffer read; subsequent reads show
     # the version banner so the idle-gap loop exits immediately instead of spinning
     # for ~20s of real asyncio.sleep(1.0) calls (ledger: 25.04s → ~1s).
+    # F548 (#404): ❯ on the affirmative row so the settle poll confirms from the
+    # current pane (no extra re-read) and Enter is sent after a real Down.
     mock_backend.get_history.side_effect = [
-        "Yes, I trust this folder",
+        "❯ Yes, I trust this folder",
         "Welcome to Claude Code v2.1.211",
     ]
     # Wrapped exec -> native status is always unresolved; status is buffer-driven.

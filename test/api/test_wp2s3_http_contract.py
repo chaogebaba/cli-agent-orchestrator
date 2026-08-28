@@ -270,3 +270,49 @@ def test_start_seed_failure_is_closed_422_v1(client):
                       "error_code": "seed_exec_failed"},
         "manifest": None, "manifest_error": None,
     }
+
+
+
+# F548 (#404): provider init failures must surface as STRUCTURED JSON errors,
+# not FastAPI's default text/plain 500 (box e2e r3: the P leg got text/plain
+# "Internal Server Error"; the N leg got a connection hang with no JSON).
+
+
+def test_start_claude_auth_error_is_structured_json_e_claude_auth(client):
+    from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
+
+    err = ClaudeAuthError(
+        "[E-CLAUDE-AUTH] Claude Code authentication failed during init "
+        "(matched 'OAuth session expired'). Last pane lines:\nOAuth session expired"
+    )
+    with patch(
+        "cli_agent_orchestrator.api.main.session_service.start_session",
+        new=AsyncMock(side_effect=err),
+    ):
+        response = client.post("/sessions/start", params={"agent_profile": "dev"})
+    assert response.status_code == 500
+    # Structured JSON body, not text/plain "Internal Server Error".
+    assert response.headers["content-type"].startswith("application/json")
+    detail = response.json()["detail"]
+    assert detail["code"] == "E-CLAUDE-AUTH"
+    assert "OAuth session expired" in detail["message"]
+
+
+def test_start_init_timeout_is_structured_json_not_text_plain(client):
+    with patch(
+        "cli_agent_orchestrator.api.main.session_service.start_session",
+        new=AsyncMock(
+            side_effect=TimeoutError(
+                "Claude Code initialization timed out after 180s. "
+                "Last pane lines:\n\u276f No, exit\n  Yes, I trust this folder"
+            )
+        ),
+    ):
+        response = client.post("/sessions/start", params={"agent_profile": "dev"})
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    detail = response.json()["detail"]
+    assert detail["code"] == "provider_init_timeout"
+    # The pane tail is carried in the message so the 500 body explains itself.
+    assert "Last pane lines:" in detail["message"]
+    assert "timed out after 180s" in detail["message"]

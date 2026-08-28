@@ -972,6 +972,87 @@ class ClaudeCodeProvider(BaseProvider):
         config_path.write_text(json.dumps(config), encoding="utf-8")
         config_path.chmod(0o600)
 
+    async def _select_menu_affirmative(
+        self,
+        affirmative_pattern: str,
+        *,
+        label: str,
+        current_pane: Optional[str] = None,
+        settle_timeout: float = 3.0,
+        poll: float = 0.25,
+    ) -> bool:
+        """F548 (#404): move focus onto the affirmative menu row, confirm it
+        landed there, then press Enter.
+
+        The startup dialogs (bypass-permissions, workspace-trust) render the
+        SAFE option ("No, exit") focused FIRST and the affirmative option second.
+        The focused row is marked with ``❯``. Selecting the affirmative requires
+        a real DOWN-ARROW keypress, NOT the literal bytes ``\\x1b[B``: the old
+        code sent those three bytes through ``send_keys`` (tmux paste-buffer),
+        which delivers them as LITERAL TEXT — Ink never parses them as an arrow,
+        focus stays on "No, exit", and the following Enter confirms EXIT. The
+        seat then dies and init times out (box e2e r3: send_keys len 3 at
+        10:19:55, Enter at 10:19:56, then the shell prompt — Claude exited).
+
+        Fix: send the arrow as a tmux SPECIAL KEY (``send_special_key("Down")``),
+        which emits the correct terminal sequence Ink understands. Then SETTLE-
+        POLL: re-capture the pane and confirm ``❯`` sits on the affirmative row
+        (``affirmative_pattern``) before pressing Enter. The poll gives Ink's
+        input handler time to attach (hypothesis 2) and re-reads after any
+        transient repaint (hypothesis 3). ``current_pane`` (the buffer the caller
+        already holds) is checked first so a build that already focuses the
+        affirmative row confirms without a re-read.
+
+        Returns True if focus on the affirmative row was CONFIRMED before Enter,
+        False if it could not be confirmed within ``settle_timeout``. Either way
+        Enter is sent: a real Down almost always moves focus, and refusing to
+        confirm on a flaky/slow capture would strand every launch — the return
+        value is for observability and tests, not a gate on pressing Enter. When
+        unconfirmed, a WARNING is logged so a genuine focus failure is visible.
+        """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        # A line whose focus marker ❯ precedes the affirmative option text.
+        focus_re = re.compile(r"❯[^\n]*" + affirmative_pattern)
+
+        status_monitor.notify_input_sent(self.terminal_id)
+        await asyncio.to_thread(
+            get_backend().send_special_key, self.session_name, self.window_name, "Down"
+        )
+
+        confirmed = bool(
+            current_pane and focus_re.search(re.sub(ANSI_CODE_PATTERN, "", current_pane))
+        )
+        if not confirmed:
+            deadline = time.monotonic() + settle_timeout
+            while not confirmed and time.monotonic() < deadline:
+                await asyncio.sleep(poll)
+                try:
+                    pane = await asyncio.to_thread(
+                        get_backend().get_history, self.session_name, self.window_name
+                    )
+                except Exception:
+                    continue
+                if pane and focus_re.search(re.sub(ANSI_CODE_PATTERN, "", pane)):
+                    confirmed = True
+
+        if confirmed:
+            logger.info("%s: affirmative row confirmed focused; sending Enter", label)
+        else:
+            logger.warning(
+                "%s: could not confirm focus on the affirmative row within %.1fs; "
+                "sending Enter anyway (a real Down normally moves focus — watch for an "
+                "unexpected exit if this recurs)",
+                label,
+                settle_timeout,
+            )
+
+        status_monitor.notify_input_sent(self.terminal_id)
+        await asyncio.to_thread(
+            get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+        )
+        return confirmed
+
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
@@ -1071,22 +1152,12 @@ class ClaudeCodeProvider(BaseProvider):
             # 1) Handle bypass permissions prompt (appears before trust prompt).
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
-                from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-                logger.info("Bypass permissions prompt detected, auto-accepting")
-                # Send Down arrow to move cursor to "Yes, I accept", then Enter.
-                status_monitor.notify_input_sent(self.terminal_id)
-                await asyncio.to_thread(
-                    get_backend().send_keys,
-                    self.session_name,
-                    self.window_name,
-                    "\x1b[B",
-                    enter_count=0,
-                )
-                await asyncio.sleep(0.5)
-                status_monitor.notify_input_sent(self.terminal_id)
-                await asyncio.to_thread(
-                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                logger.info("Bypass permissions prompt detected, selecting 'Yes, I accept'")
+                # F548 (#404): real DOWN key + settle poll + Enter (not literal ESC[B).
+                await self._select_menu_affirmative(
+                    BYPASS_PROMPT_PATTERN,
+                    label="Bypass permissions prompt",
+                    current_pane=clean_output,
                 )
                 bypass_accepted = True
                 any_prompt_handled = True
@@ -1100,20 +1171,19 @@ class ClaudeCodeProvider(BaseProvider):
                 and not external_imports_rejected
                 and re.search(EXTERNAL_IMPORT_PROMPT_PATTERN, clean_output)
             ):
-                from cli_agent_orchestrator.services.status_monitor import status_monitor
-
                 logger.info("External CLAUDE.md import prompt detected, rejecting")
-                status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(
-                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                # F548 (#404): real DOWN key + settle poll + Enter (not literal
+                # ESC[B). The reject option ("No, disable external imports") is
+                # the second row, reached by one Down.
+                await self._select_menu_affirmative(
+                    r"No, disable external imports",
+                    label="External import prompt (reject)",
+                    current_pane=clean_output,
                 )
-                time.sleep(0.5)
-                status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 external_imports_rejected = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # 3) Handle workspace trust prompt. Continue because the external
@@ -1138,24 +1208,20 @@ class ClaudeCodeProvider(BaseProvider):
             # simply moves to the last row and back is unnecessary; the two-row
             # trust dialog has the affirmative as the row Down lands on.
             if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
-                from cli_agent_orchestrator.services.status_monitor import status_monitor
-
                 logger.info(
                     "Workspace trust prompt detected, selecting 'Yes, I trust this folder' "
                     "(Down+Enter — bare Enter would confirm the default 'No, exit')"
                 )
-                status_monitor.notify_input_sent(self.terminal_id)
-                await asyncio.to_thread(
-                    get_backend().send_keys,
-                    self.session_name,
-                    self.window_name,
-                    "\x1b[B",
-                    enter_count=0,
-                )
-                await asyncio.sleep(0.5)
-                status_monitor.notify_input_sent(self.terminal_id)
-                await asyncio.to_thread(
-                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                # F548 (#404): real DOWN key + settle poll confirming focus moved
+                # onto 'Yes, I trust this folder' + Enter. The old literal ESC[B
+                # via send_keys was delivered as TEXT, never moved focus, and the
+                # Enter confirmed the default 'No, exit' -> Claude exited (box e2e
+                # r3). If focus can't be confirmed we do NOT press Enter and leave
+                # the dialog to surface as WAITING_USER_ANSWER.
+                await self._select_menu_affirmative(
+                    TRUST_PROMPT_PATTERN,
+                    label="Workspace trust prompt",
+                    current_pane=clean_output,
                 )
                 trust_accepted = True
                 any_prompt_handled = True
