@@ -29,6 +29,7 @@ by install or composition.
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -43,10 +44,18 @@ else:  # pragma: no cover
     import tomli as tomllib
 
 
+logger = logging.getLogger(__name__)
+
+
 # A frontmatter `requires:` entry is treated as a clause-id reference only when
 # it is id-shaped: lowercase alnum groups joined by single hyphens, no
 # whitespace. Anything else is a free-text prose sentence and is ignored.
 _ID_SHAPED = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+# A position name is a lowercase identifier with underscores (e.g.
+# ``empirical_reviewer``), unlike clause ids which use hyphens. Used by the
+# AC17 budget lint to tell a forward-declared position budget key from a typo.
+_POSITION_KEY_SHAPED = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
 
 
 class ClauseLintError(ValueError):
@@ -77,6 +86,15 @@ class ClauseRule:
 class ClauseTable:
     rules: Dict[str, ClauseRule]
     required: Dict[str, List[str]]
+    budget: Dict[str, int]
+
+
+# F497 AC17 (D13) — reserved ``[budget]`` keys that are NOT position names.
+#   ``overlay``        — the byte ceiling applied to EVERY overlay fragment.
+#   ``composed_slack`` — the allowance ABOVE ``position + overlay`` for a
+#                        composed body (composed ≤ position_budget + overlay_budget
+#                        + composed_slack).
+_BUDGET_RESERVED_KEYS = ("overlay", "composed_slack")
 
 
 def load_clause_table(path: Path) -> ClauseTable:
@@ -119,7 +137,23 @@ def load_clause_table(path: Path) -> ClauseTable:
             if cid not in rules:
                 raise ClauseLintError(f"[required].{pos} references unknown clause id '{cid}'")
         required[pos] = list(ids)
-    return ClauseTable(rules=rules, required=required)
+
+    # F497 AC17 (D13) — optional ``[budget]`` table: position/reserved key -> int
+    # bytes. Parsed permissively here (values must be positive ints); the
+    # per-position "must have a row" and "unknown key" fail-closed checks live in
+    # ``lint_budgets`` where the position corpus is known.
+    raw_budget = data.get("budget")
+    budget: Dict[str, int] = {}
+    if raw_budget is not None:
+        if not isinstance(raw_budget, dict):
+            raise ClauseLintError("[budget] must be a table of name -> byte count")
+        for key, val in raw_budget.items():
+            if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+                raise ClauseLintError(
+                    f"[budget].{key} must be a positive integer byte count (got {val!r})"
+                )
+            budget[key] = val
+    return ClauseTable(rules=rules, required=required, budget=budget)
 
 
 def _position_required_ids(
@@ -204,4 +238,184 @@ def lint_positions(
                 )
             matched.append(cid)
         results[pos] = matched
+    return results
+
+
+
+# --------------------------------------------------------------------------
+# F497 AC17 (D13) — persona byte-budget lint
+# --------------------------------------------------------------------------
+#
+# ``clause_lint`` reads ``[budget]`` from ``positions/_clauses.toml`` and fails
+# CLOSED when any position body, overlay fragment, or composed body exceeds its
+# budget. Body bytes = the UTF-8 markdown body (frontmatter excluded),
+# deterministic (≈4 B/token, no tokenizer dependency). The three ceilings:
+#
+#   * position body       ≤ ``[budget].<position>``
+#   * each overlay body    ≤ ``[budget].overlay``
+#   * composed body        ≤ ``[budget].<position>`` + ``[budget].overlay``
+#                            + ``[budget].composed_slack``   (per (position, provider) cell)
+#
+# Fail-closed extras: a composed position with NO ``[budget]`` row is an error;
+# a ``[budget]`` key that is neither a position file stem nor a reserved key
+# (``overlay`` / ``composed_slack``) is an unknown-key error.
+
+
+def _body_bytes(text: str) -> int:
+    """UTF-8 byte length of a markdown fragment's BODY (frontmatter excluded).
+
+    Measures ``frontmatter.loads(text).content`` — the exact body the D5 merge
+    engine composes from (``compose_source_body`` strips only leading/trailing
+    newlines, which do not change the budget class). Frontmatter is excluded so
+    a metadata edit never spends the persona's prose budget.
+    """
+    return len(frontmatter.loads(text).content.encode("utf-8"))
+
+
+def _overlay_provider_cells(overlays_dir: Path, position: str) -> Dict[str, List[Path]]:
+    """Map each provider to its overlay fragment(s) applicable to ``position``.
+
+    Mirrors the resolver's D4 layer order: ``overlays/<provider>.md`` (base
+    overlay) then ``overlays/<provider>.<position>.md`` (per-position overlay).
+    A provider is any overlay filename stem's leading segment; the returned list
+    is in compose order (base first, per-position second) and omits absent
+    files. Providers that touch this position AT ALL (either fragment) appear.
+    """
+    if not overlays_dir.exists():
+        return {}
+    providers: set[str] = set()
+    for f in overlays_dir.glob("*.md"):
+        stem = f.stem  # e.g. "codex" or "codex.empirical_reviewer"
+        providers.add(stem.split(".", 1)[0])
+    cells: Dict[str, List[Path]] = {}
+    for provider in sorted(providers):
+        frags: List[Path] = []
+        base = overlays_dir / f"{provider}.md"
+        if base.exists():
+            frags.append(base)
+        per_pos = overlays_dir / f"{provider}.{position}.md"
+        if per_pos.exists():
+            frags.append(per_pos)
+        # Only a provider that supplies AT LEAST the per-position OR base overlay
+        # forms a cell worth measuring; a provider with neither does not.
+        if frags:
+            cells[provider] = frags
+    return cells
+
+
+def lint_budgets(
+    positions_dir: Path,
+    overlays_dir: Path | None = None,
+    clause_table_path: Path | None = None,
+) -> Dict[str, int]:
+    """Fail-closed AC17 byte-budget lint over positions + overlays + composed cells.
+
+    Returns ``{measured-name: bytes}`` on success (position bodies, overlay
+    fragments keyed ``overlay:<file>``, and composed cells keyed
+    ``composed:<position>+<provider>``). Raises ``ClauseLintError`` on the first
+    violation, naming the file, bytes, and budget.
+
+    ``overlays_dir`` defaults to the ``overlays`` sibling of ``positions_dir``.
+    When absent, only position-body budgets are checked (no overlay/composed
+    cells to measure).
+    """
+    table_path = clause_table_path or (positions_dir / "_clauses.toml")
+    table = load_clause_table(table_path)
+    budget = table.budget
+    if not budget:
+        raise ClauseLintError(
+            f"clause table {table_path} has no [budget] section (AC17 requires one)"
+        )
+    if overlays_dir is None:
+        overlays_dir = positions_dir.parent / "overlays"
+
+    position_files = {p.stem: p for p in positions_dir.glob("*.md")}
+
+    # Fail-closed: every [budget] key must be a reserved key, an existing
+    # position file, OR an id-shaped identifier (a legitimately forward-declared
+    # position budget — the supervisor-owned policy table may carry a budget for
+    # a position not yet extracted, e.g. design_reviewer). A key that is neither
+    # reserved nor id-shaped is a typo and fails closed. An id-shaped key with no
+    # position file AND no [required] row is a FORWARD DECLARATION: log a single
+    # warning and continue (supervisor decision 2026-08-28, D13 clarification).
+    for key in budget:
+        if key in _BUDGET_RESERVED_KEYS or key in position_files:
+            continue
+        if not _POSITION_KEY_SHAPED.match(key):
+            raise ClauseLintError(
+                f"[budget] key '{key}' is neither a reserved key "
+                f"{_BUDGET_RESERVED_KEYS}, an existing position file, nor an "
+                f"id-shaped position name (fail-closed: unknown budget key)"
+            )
+        if key not in table.required:
+            logger.warning(
+                "forward-declared budget key %s (no position file)", key
+            )
+
+    overlay_budget = budget.get("overlay")
+    composed_slack = budget.get("composed_slack")
+    results: Dict[str, int] = {}
+
+    # 1. Position bodies. Fail-closed: a composed position with no budget row.
+    for pos, path in sorted(position_files.items()):
+        pos_budget = budget.get(pos)
+        if pos_budget is None:
+            raise ClauseLintError(
+                f"position '{pos}' has no [budget] row in {table_path} "
+                f"(fail-closed: every position needs a byte budget)"
+            )
+        body = path.read_text(encoding="utf-8")
+        n = _body_bytes(body)
+        if n > pos_budget:
+            raise ClauseLintError(
+                f"position '{pos}' body is {n} B, over its budget of {pos_budget} B "
+                f"({path})"
+            )
+        results[pos] = n
+
+    # 2. Overlay fragments (each ≤ overlay budget).
+    if overlay_budget is not None and overlays_dir.exists():
+        for ov in sorted(overlays_dir.glob("*.md")):
+            n = _body_bytes(ov.read_text(encoding="utf-8"))
+            if n > overlay_budget:
+                raise ClauseLintError(
+                    f"overlay '{ov.name}' body is {n} B, over the overlay budget "
+                    f"of {overlay_budget} B ({ov})"
+                )
+            results[f"overlay:{ov.name}"] = n
+
+    # 3. Composed cells (position + provider overlays ≤ position + overlay + slack).
+    if overlay_budget is not None and composed_slack is not None:
+        from cli_agent_orchestrator.utils.profile_composition import (
+            Layer,
+            compose_source_body,
+        )
+
+        for pos, path in sorted(position_files.items()):
+            pos_budget = budget[pos]
+            cell_ceiling = pos_budget + overlay_budget + composed_slack
+            pos_body = frontmatter.loads(path.read_text(encoding="utf-8")).content
+            for provider, frags in _overlay_provider_cells(overlays_dir, pos).items():
+                layers = [Layer(kind=f"position:{pos}", metadata={}, body=pos_body)]
+                for frag in frags:
+                    fparsed = frontmatter.loads(frag.read_text(encoding="utf-8"))
+                    layers.append(
+                        Layer(
+                            kind=f"overlay:{frag.stem}",
+                            metadata=dict(fparsed.metadata),
+                            body=fparsed.content,
+                            provider=provider,
+                            replaces=list(fparsed.metadata.get("replaces") or []),
+                        )
+                    )
+                composed = compose_source_body(layers)
+                n = len(composed.encode("utf-8"))
+                if n > cell_ceiling:
+                    raise ClauseLintError(
+                        f"composed cell '{pos}+{provider}' body is {n} B, over its "
+                        f"budget of {cell_ceiling} B (= position {pos_budget} + overlay "
+                        f"{overlay_budget} + composed_slack {composed_slack})"
+                    )
+                results[f"composed:{pos}+{provider}"] = n
+
     return results

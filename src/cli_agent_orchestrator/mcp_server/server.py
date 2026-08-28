@@ -1592,6 +1592,60 @@ def _configured_default_fork_base(agent_profile: str) -> Optional[str]:
     return get_default_fork_base(provider, agent_profile)
 
 
+# F497 D12 — the single-line ``[COLD-FALLBACK …]`` preamble grammar. There is
+# EXACTLY ONE such line per spawn, carrying optional fields in a FIXED order:
+# ``position``, ``cell``, ``base`` (r12 N1). D10 (stale warm base under the old
+# provider) contributes ``base=stale``; D12's general-cell fallback (P4)
+# contributes ``position=<pos>`` / ``cell=<outcome>``. When more than one fires
+# on the same spawn they APPEND fields to the ONE line rather than emitting a
+# second bare ``[COLD-FALLBACK]`` (r11 S1). This helper folds a new field set
+# into any existing ``[COLD-FALLBACK …]`` line, re-emitting the fields in the
+# fixed order; a non-fallback preamble (e.g. the resolve_base ``unavailable``
+# path's free-text ``[COLD-FALLBACK] configured default …`` line, or a
+# ``[CROSS-REPO]`` note) is left untouched and this line is composed fresh.
+_COLD_FALLBACK_FIELD_ORDER = ("position", "cell", "base")
+_COLD_FALLBACK_LINE_RE = re.compile(r"^\[COLD-FALLBACK((?:\s+\w+=\S+)*)\]$", re.MULTILINE)
+
+
+def _cold_fallback_preamble(
+    existing: Optional[str],
+    *,
+    position: Optional[str] = None,
+    cell: Optional[str] = None,
+    base_stale: bool = False,
+) -> str:
+    """Fold COLD-FALLBACK field(s) into the ONE ``[COLD-FALLBACK …]`` line (D12).
+
+    Parses any existing structured ``[COLD-FALLBACK f=v …]`` line in ``existing``,
+    merges the new fields, and re-emits a single line with fields in the fixed
+    order ``position``, ``cell``, ``base``. Any other preamble text in
+    ``existing`` is preserved around the rebuilt line. When ``existing`` has no
+    structured fallback line, a fresh line is prepended.
+    """
+    fields: Dict[str, str] = {}
+    other = existing or ""
+    if existing:
+        m = _COLD_FALLBACK_LINE_RE.search(existing)
+        if m:
+            for tok in m.group(1).split():
+                k, _, v = tok.partition("=")
+                fields[k] = v
+            other = (existing[: m.start()] + existing[m.end() :]).strip("\n")
+    if position is not None:
+        fields["position"] = position
+    if cell is not None:
+        fields["cell"] = cell
+    if base_stale:
+        fields["base"] = "stale"
+    rendered = " ".join(
+        f"{k}={fields[k]}" for k in _COLD_FALLBACK_FIELD_ORDER if k in fields
+    )
+    line = f"[COLD-FALLBACK {rendered}]" if rendered else "[COLD-FALLBACK]"
+    if other:
+        return f"{line}\n{other}"
+    return line
+
+
 def _assign_impl(
     agent_profile: str,
     message: str,
@@ -1608,6 +1662,7 @@ def _assign_impl(
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     task_label: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1618,9 +1673,35 @@ def _assign_impl(
     under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
     concurrent assigns from the same LLM turn run their init phases in
     parallel instead of blocking one behind the other.
+
+    ``provider`` (F497 D7): when ``agent_profile`` names a POSITION (not a
+    legacy profile), the provider is resolved from this argument (routing-binding
+    resolution is P4). A legacy name ignores it and keeps the existing
+    ``resolve_provider`` chain. A disallowed provider or a position with no
+    provider is rejected BEFORE any terminal is created (named error codes).
     """
     terminal_id: Optional[str] = None
     try:
+        # F497 D7 — resolve the assign target: legacy name (unchanged) or a
+        # position name (provider from provider= arg, allowlist-checked). Reject
+        # BEFORE creating any terminal so a disallowed/underspecified position
+        # never spawns.
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            AssignmentResolutionError,
+            resolve_assignment_target,
+        )
+
+        try:
+            agent_profile, _resolved_provider = resolve_assignment_target(
+                agent_profile, provider
+            )
+        except AssignmentResolutionError as exc:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": f"Assignment failed: {exc}",
+            }
+
         fork_context = None
         refresh_base_name = None
         assignment_preamble = None
@@ -1657,7 +1738,26 @@ def _assign_impl(
         if row is not None:
             provider = resolve_provider(agent_profile, fallback_provider=row["provider"])
             if provider != row["provider"]:
-                raise ValueError("provider_mismatch")
+                # F497 D10 — routing-flip fork-base tolerance. When ``fork_from``
+                # was DEFAULTED from the configured default fork base (not an
+                # explicit caller argument) and that base is still registered
+                # under the OLD provider after a binding flip, a hard
+                # ``provider_mismatch`` no-spawn is exactly the operation F497
+                # exists to make cheap. Degrade instead of raising: null the
+                # base (fork_from + row), set the single-line ``[COLD-FALLBACK``
+                # preamble (D12 grammar — D10-alone form ``base=stale``), and
+                # fall through to the cold path. An EXPLICIT ``fork_from=``
+                # mismatch still raises (test_fork_assign_errors.py:59 passes an
+                # explicit base, so ``defaulted_fork`` is False there and its
+                # no-spawn assertion stays green).
+                if not defaulted_fork:
+                    raise ValueError("provider_mismatch")
+                assignment_preamble = _cold_fallback_preamble(
+                    assignment_preamble, base_stale=True
+                )
+                fork_from = None
+                row = None
+        if row is not None:
             from cli_agent_orchestrator.providers.manager import get_provider_class
 
             try:
@@ -2033,6 +2133,16 @@ async def assign(
             "for fleet TUI display. Removed automatically on delete_terminal."
         ),
     ),
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "F497 D7: when agent_profile names a POSITION (not a legacy profile), "
+            "the provider to compose it with (e.g. 'codex', 'kiro_cli'). Required "
+            "for a position-name assign until routing-binding resolution ships "
+            "(P4); rejected if outside the position's providers allowlist. Ignored "
+            "for a legacy profile name (its own resolution chain applies)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -2050,6 +2160,7 @@ async def assign(
         use_worktree=use_worktree,
         authority_files=authority_files,
         task_label=task_label,
+        provider=provider,
     )
 
 

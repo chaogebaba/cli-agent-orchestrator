@@ -690,3 +690,109 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
             )
 
     return fallback_provider
+
+
+
+# --- F497 D7 — assign(provider=) position-name resolution ------------------
+#
+# ``agent_profile`` on an assign becomes resolvable as EITHER a legacy concrete
+# name (a real file in the agent store — unchanged behaviour) OR a POSITION name
+# (a file in the positions store, composed with a provider). A position-name
+# assign resolves its provider from the ``provider=`` arg; the routing binding
+# (D9) that would otherwise supply it is P4, so until then a position name with
+# no ``provider=`` is a HARD FAIL. The position's ``providers: [...]`` allowlist
+# (D7) rejects a disallowed provider so a mismatched cell never spawns (a warn
+# would burn a gate round running the wrong instructions).
+#
+# NAMED ERRORS (stable codes, asserted by tests and surfaced to the operator):
+E_POSITION_NEEDS_PROVIDER = "E-POSITION-NEEDS-PROVIDER"
+E_PROVIDER_NOT_ALLOWED = "E-PROVIDER-NOT-ALLOWED"
+E_UNKNOWN_POSITION = "E-UNKNOWN-POSITION"
+
+
+class AssignmentResolutionError(ValueError):
+    """A position-name assign could not be resolved (carries a stable ``.code``)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _position_exists(position_name: str) -> bool:
+    """True when ``positions/<position_name>.md`` exists (and is not frozen)."""
+    from cli_agent_orchestrator.constants import positions_store_dir
+
+    try:
+        _validate_agent_name(position_name)
+    except ValueError:
+        return False
+    return _read_composition_store(positions_store_dir(), position_name, resolve_env=False) is not None
+
+
+def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "tuple[str, Optional[str]]":
+    """Resolve an assign ``agent_profile`` (+ optional ``provider=``) to a spawn target (D7).
+
+    The resolver ENGAGES (position mode) only when the caller passes ``provider=``
+    OR ``agent_profile`` is a bare position file (``positions/<name>.md``). Every
+    OTHER name passes through UNTOUCHED as a legacy concrete name — no store
+    lookup, no ``<provider>_<position>`` shape inference (that synthesis is D9/P4).
+    This is the r2 (option b) fix: a legacy name (installed OR NOT — e.g.
+    ``kiro_dev`` / ``codex_dev`` on a clean store) spawns exactly as pre-D7, and
+    a ``<provider>_<position>``-shaped legacy name is never mistaken for a
+    position miss.
+
+    Returns ``(effective_profile_name, resolved_provider)``:
+
+      * ENGAGED + ``agent_profile`` is a position file: requires a ``provider``
+        (else ``E-POSITION-NEEDS-PROVIDER``); the provider must be in the
+        position's ``providers:`` allowlist (else ``E-PROVIDER-NOT-ALLOWED``). On
+        success returns the position as the effective name + resolved provider —
+        the LIVE on-disk spawn wiring for a position target is D9/P4; P3 lands the
+        resolution + validation layer.
+      * ENGAGED via ``provider=`` but ``agent_profile`` is NOT a position file:
+        ``E-UNKNOWN-POSITION`` (position mode was requested on a non-position).
+      * NOT ENGAGED (no ``provider=`` and not a position file): passthrough
+        unchanged (legacy).
+
+    Raises ``AssignmentResolutionError`` (with ``.code``) on a position-mode
+    failure only.
+    """
+    is_position = _position_exists(agent_profile)
+
+    # NOT ENGAGED: no provider= and not a bare position file → legacy passthrough
+    # (no store lookup, no shape inference). Pre-D7 behaviour preserved exactly.
+    if provider is None and not is_position:
+        return agent_profile, provider
+
+    # ENGAGED via provider= but the name is not a position file → position mode
+    # was requested on a non-position.
+    if not is_position:
+        raise AssignmentResolutionError(
+            E_UNKNOWN_POSITION,
+            f"{E_UNKNOWN_POSITION}: '{agent_profile}' is not a known position "
+            f"(provider= requests position mode; <provider>_<position> synthesis "
+            f"is P4)",
+        )
+
+    # ENGAGED + a bare position file. Provider is mandatory in P3 (D9 routing = P4).
+    if not provider:
+        raise AssignmentResolutionError(
+            E_POSITION_NEEDS_PROVIDER,
+            f"{E_POSITION_NEEDS_PROVIDER}: position '{agent_profile}' needs an "
+            f"explicit provider= (routing-binding resolution is P4)",
+        )
+
+    # Enforce the position ``providers:`` allowlist (D7). Absent/empty = open; a
+    # non-empty allowlist that omits the provider rejects.
+    from cli_agent_orchestrator.constants import positions_store_dir
+
+    pos = _read_composition_store(positions_store_dir(), agent_profile, resolve_env=False)
+    assert pos is not None  # _position_exists confirmed it
+    allow = pos[0].get("providers")
+    if isinstance(allow, list) and allow and provider not in allow:
+        raise AssignmentResolutionError(
+            E_PROVIDER_NOT_ALLOWED,
+            f"{E_PROVIDER_NOT_ALLOWED}: provider '{provider}' is not in position "
+            f"'{agent_profile}' allowlist {allow}",
+        )
+    return agent_profile, provider

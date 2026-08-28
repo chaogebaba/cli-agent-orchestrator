@@ -399,6 +399,37 @@ def install_agent(
         # separately (unresolved) inside _write_context_file.
         from cli_agent_orchestrator.utils.agent_profiles import resolve_agent_profile
 
+        # F497 AC14 + AC17: when installing a composition-bearing profile, lint
+        # the position corpus it composes from — the required-clause floor
+        # (AC14) and the persona byte budgets (AC17) — and REFUSE the install on
+        # a violation (fail-closed). The lints run against the live positions
+        # store the resolver composes from; a legacy profile (no composition
+        # key) skips them entirely, so the legacy install path is untouched.
+        if profile_declares_composition(_install_meta):
+            from cli_agent_orchestrator.constants import (
+                overlays_store_dir,
+                positions_store_dir,
+            )
+            from cli_agent_orchestrator.utils.clause_lint import (
+                ClauseLintError,
+                lint_budgets,
+                lint_positions,
+            )
+
+            _positions_dir = positions_store_dir()
+            if (_positions_dir / "_clauses.toml").is_file():
+                try:
+                    lint_positions(_positions_dir)
+                    lint_budgets(_positions_dir, overlays_store_dir())
+                except ClauseLintError as exc:
+                    return InstallResult(
+                        success=False,
+                        message=(
+                            f"Agent profile '{agent_name}' declares composition, "
+                            f"but the position corpus fails the F497 lint: {exc}"
+                        ),
+                    )
+
         profile = resolve_agent_profile(resolved_content, agent_name)
 
         # No explicit provider — honour the profile's frontmatter ``provider:``
