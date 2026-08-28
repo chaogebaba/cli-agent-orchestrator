@@ -262,6 +262,8 @@ async def test_wrapped_provider_lifecycle(
     mock_backend.get_history.side_effect = [
         "❯ Yes, I trust this folder",
         "Welcome to Claude Code v2.1.211",
+        # F548 r6: post-idle auth scan reads an authenticated REPL (no marker).
+        "Welcome to Claude Code v2.1.211\n❯ ",
     ]
     # Wrapped exec -> native status is always unresolved; status is buffer-driven.
     mock_backend.get_native_status.return_value = None

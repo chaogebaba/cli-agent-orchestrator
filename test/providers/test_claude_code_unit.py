@@ -2433,9 +2433,19 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, "Welcome to Claude Code v2.1.211"]
+        # 4th frame: the post-idle auth scan reads an authenticated REPL (no
+        # logged-out marker) so init proceeds. wait_until_input_ready is stubbed.
+        mock_tmux.get_history.side_effect = [
+            "",
+            trust_output,
+            "Welcome to Claude Code v2.1.211",
+            "Welcome to Claude Code v2.1.211\n❯ ",
+        ]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+        with (
+            patch.object(provider, "get_status", return_value=TerminalStatus.IDLE),
+            patch.object(provider, "wait_until_input_ready"),
+        ):
             result = await provider.initialize()
 
         assert result is True
@@ -3244,6 +3254,61 @@ class TestF548InitDialogAndAuth:
         assert "Last pane lines:" in msg
         assert "Yes, I trust this folder" in msg
 
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_post_idle_logged_out_pane_raises_e_claude_auth(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """F548 r6 (#404): on Claude >= 2.1.250 an unauthenticated REPL reaches
+        idle (wait_until_status succeeds) showing 'Not logged in · Run /login';
+        the post-idle scan must fail fast as E-CLAUDE-AUTH with the pane tail."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
+
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True  # REPL reached idle
+        idle_pane = (
+            "Claude Code v2.1.250 / Opus 5\nsentinel-prelude\n"
+            "Not logged in · Run /login\n❯ \nsentinel-trailer"
+        )
+        mock_tmux.get_history.return_value = idle_pane
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch.object(provider, "wait_until_input_ready"),
+        ):
+            with pytest.raises(ClaudeAuthError) as exc:
+                await provider.initialize()
+        assert exc.value.code == "E-CLAUDE-AUTH"
+        msg = str(exc.value)
+        assert "Not logged in" in msg
+        assert "Last pane lines:" in msg
+        assert "sentinel-prelude" in msg and "sentinel-trailer" in msg
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_post_idle_authenticated_pane_does_not_raise(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """A normal (authenticated) idle REPL has no logged-out marker, so the
+        post-idle scan does NOT raise and init succeeds."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.get_history.return_value = "Claude Code v2.1.250 / Opus 5\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch.object(provider, "wait_until_input_ready"),
+        ):
+            result = await provider.initialize()
+        assert result is True
+        assert provider._initialized is True
+
     def test_pane_tail_returns_last_n_nonblank_lines(self):
         from cli_agent_orchestrator.providers.claude_code import _pane_tail
 
@@ -3256,6 +3321,9 @@ class TestF548InitDialogAndAuth:
 
         assert _detect_claude_auth_failure("Failed to authenticate: OAuth ...") is not None
         assert _detect_claude_auth_failure("OAuth session expired") is not None
+        # F548 r6: the 2.1.250 logged-out REPL footer.
+        assert _detect_claude_auth_failure("Not logged in · Run /login") is not None
+        assert _detect_claude_auth_failure("Not logged in") is not None
         # A normal REPL / trust dialog is NOT an auth failure.
         assert _detect_claude_auth_failure("Welcome to Claude Code v2.1.248") is None
         assert _detect_claude_auth_failure("Yes, I trust this folder") is None

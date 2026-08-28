@@ -220,6 +220,10 @@ CLAUDE_AUTH_FAILURE_PATTERNS: tuple[str, ...] = (
     r"Paste (?:the )?code here",
     r"Visit (?:the following URL|https?://\S+) to (?:log ?in|authenticate)",
     r"Authentication required",
+    # F548 r6 (#404): Claude Code >= 2.1.250 does NOT crash on missing auth at
+    # startup — it renders an unauthenticated REPL that reaches idle and shows
+    # this footer. Detect it in a post-idle pane scan (see initialize()).
+    r"Not logged in(?:\s*·\s*Run /login)?",
 )
 _CLAUDE_AUTH_FAILURE_RE = re.compile("|".join(CLAUDE_AUTH_FAILURE_PATTERNS), re.IGNORECASE)
 
@@ -1352,6 +1356,28 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(
                 f"Claude Code initialization timed out after {init_timeout}s. "
                 f"Last pane lines:\n{_pane_tail(final_pane)}"
+            )
+
+        # F548 r6 (#404): wait_until_status SUCCEEDED — but Claude Code >= 2.1.250
+        # does NOT crash on missing credentials at startup; it renders an
+        # unauthenticated REPL that reaches idle and shows a "Not logged in ·
+        # Run /login" footer (box e2e r4: HTTP 200 in 38s, no error). readiness
+        # (banner + idle) is satisfied regardless of auth state, so neither the
+        # startup-prompt loop nor the timeout branch above ever sees it. Scan the
+        # idle pane ONCE for a logged-out marker and fail fast as E-CLAUDE-AUTH,
+        # using the same classifier + message shape as the timeout branch. A
+        # normal (authenticated) idle pane has no such marker, so this never
+        # fires on a healthy launch.
+        idle_pane = get_backend().get_history(self.session_name, self.window_name)
+        idle_auth_marker = _detect_claude_auth_failure(
+            re.sub(ANSI_CODE_PATTERN, "", idle_pane or "")
+        )
+        if idle_auth_marker is not None:
+            raise ClaudeAuthError(
+                "[E-CLAUDE-AUTH] Claude Code reached its REPL unauthenticated during init "
+                f"(matched {idle_auth_marker!r}). The seat is up but not logged in; "
+                "re-authenticate the provider (box ops: re-sync auth). "
+                f"Last pane lines:\n{_pane_tail(idle_pane)}"
             )
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
