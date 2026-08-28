@@ -8,6 +8,27 @@ from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities
 
 
 @pytest.fixture(autouse=True)
+def _reset_wake_dedupe_windows():
+    """F547 (#403) B1: the per-sender content-hash dedupe window in
+    cc_session_registry is a MODULE-GLOBAL (``_dedupe_windows``). Left populated
+    by one test, it suppresses a byte-identical native-ring payload in a later
+    test in the same worker (e.g. test_f337_auth_handshake's
+    ``test_native_ring_works_without_key_file`` saw ``len([]) == 0``). Reset it
+    around every services test so the window never leaks across test boundaries.
+
+    Placed here (services conftest) rather than per-file: one autouse fixture
+    covers test_f337_auth_handshake, test_fx170_native_doorbell, the F547 files,
+    and any future services test that exercises the wake write path — strictly
+    smaller than repeating the fixture in each file.
+    """
+    from cli_agent_orchestrator.services.cc_session_registry import _reset_dedupe_windows
+
+    _reset_dedupe_windows()
+    yield
+    _reset_dedupe_windows()
+
+
+@pytest.fixture(autouse=True)
 def mock_kiro_capability_probe(monkeypatch):
     """Keep service tests independent from a locally installed Kiro wrapper."""
 
