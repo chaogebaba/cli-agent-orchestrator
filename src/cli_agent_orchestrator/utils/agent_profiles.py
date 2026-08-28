@@ -690,3 +690,113 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
             )
 
     return fallback_provider
+
+
+
+# --- F497 D7 — assign(provider=) position-name resolution ------------------
+#
+# ``agent_profile`` on an assign becomes resolvable as EITHER a legacy concrete
+# name (a real file in the agent store — unchanged behaviour) OR a POSITION name
+# (a file in the positions store, composed with a provider). A position-name
+# assign resolves its provider from the ``provider=`` arg; the routing binding
+# (D9) that would otherwise supply it is P4, so until then a position name with
+# no ``provider=`` is a HARD FAIL. The position's ``providers: [...]`` allowlist
+# (D7) rejects a disallowed provider so a mismatched cell never spawns (a warn
+# would burn a gate round running the wrong instructions).
+#
+# NAMED ERRORS (stable codes, asserted by tests and surfaced to the operator):
+E_POSITION_NEEDS_PROVIDER = "E-POSITION-NEEDS-PROVIDER"
+E_PROVIDER_NOT_ALLOWED = "E-PROVIDER-NOT-ALLOWED"
+E_UNKNOWN_POSITION = "E-UNKNOWN-POSITION"
+
+
+class AssignmentResolutionError(ValueError):
+    """A position-name assign could not be resolved (carries a stable ``.code``)."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _is_legacy_profile_name(agent_profile: str) -> bool:
+    """True when ``agent_profile`` names a real profile file in a configured store.
+
+    Legacy names take precedence over position names (D6: the composed profile's
+    ``.name`` stays the legacy concrete name, and every name-keyed consumer keeps
+    working). A name that resolves to a store file is legacy; only a name with no
+    store file is a candidate POSITION name.
+    """
+    try:
+        read_agent_profile_source(agent_profile)
+        return True
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def _position_exists(position_name: str) -> bool:
+    """True when ``positions/<position_name>.md`` exists (and is not frozen)."""
+    from cli_agent_orchestrator.constants import positions_store_dir
+
+    try:
+        _validate_agent_name(position_name)
+    except ValueError:
+        return False
+    return _read_composition_store(positions_store_dir(), position_name, resolve_env=False) is not None
+
+
+def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "tuple[str, Optional[str]]":
+    """Resolve an assign ``agent_profile`` (+ optional ``provider=``) to a spawn target (D7).
+
+    Returns ``(effective_profile_name, resolved_provider)``:
+
+      * LEGACY name (a real store profile): returned UNCHANGED with the caller's
+        ``provider`` passed through (may be None — the existing ``resolve_provider``
+        chain owns provider resolution for legacy names). Behaviour is identical
+        to pre-D7.
+      * POSITION name (no store file, but ``positions/<name>.md`` exists): requires
+        a ``provider`` (else ``E-POSITION-NEEDS-PROVIDER``); the provider must be in
+        the position's ``providers:`` allowlist (else ``E-PROVIDER-NOT-ALLOWED``).
+        On success the position is returned as the effective profile name with the
+        resolved provider — the LIVE on-disk spawn wiring for a position-name
+        target (materialising/keying the composed ``<provider>_<position>`` profile
+        for the server-side ``load_agent_profile``) is D9/P4; P3 lands the
+        resolution + validation layer, and the assign path spawns through the
+        mocked/legacy seam in tests.
+      * Neither: ``E-UNKNOWN-POSITION`` (a name that is not a store profile and not
+        a position file).
+
+    Raises ``AssignmentResolutionError`` (with ``.code``) on every failure.
+    """
+    if _is_legacy_profile_name(agent_profile):
+        return agent_profile, provider
+
+    if not _position_exists(agent_profile):
+        raise AssignmentResolutionError(
+            E_UNKNOWN_POSITION,
+            f"{E_UNKNOWN_POSITION}: '{agent_profile}' is neither an installed "
+            f"profile nor a known position",
+        )
+
+    # It is a position name. Provider is mandatory in P3 (D9 routing = P4).
+    if not provider:
+        raise AssignmentResolutionError(
+            E_POSITION_NEEDS_PROVIDER,
+            f"{E_POSITION_NEEDS_PROVIDER}: position '{agent_profile}' needs an "
+            f"explicit provider= (routing-binding resolution is P4)",
+        )
+
+    # Enforce the position ``providers:`` allowlist (D7). An absent/empty allowlist
+    # is unconstrained; a non-empty allowlist that omits the provider rejects.
+    from cli_agent_orchestrator.constants import positions_store_dir
+
+    pos = _read_composition_store(positions_store_dir(), agent_profile, resolve_env=False)
+    assert pos is not None  # _position_exists confirmed it
+    allow = pos[0].get("providers")
+    if isinstance(allow, list) and allow and provider not in allow:
+        raise AssignmentResolutionError(
+            E_PROVIDER_NOT_ALLOWED,
+            f"{E_PROVIDER_NOT_ALLOWED}: provider '{provider}' is not in position "
+            f"'{agent_profile}' allowlist {allow}",
+        )
+
+    return agent_profile, provider

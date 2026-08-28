@@ -238,3 +238,140 @@ def test_ac14_markers_are_never_stripped_by_composition():
     )
     assert "<!-- clause:callback-contract -->" in composed
     assert "<!-- clause:never-edit-artifact-branch -->" in composed
+
+
+
+# ==========================================================================
+# F497 AC17 (D13) — persona byte-budget lint
+# ==========================================================================
+
+from cli_agent_orchestrator.utils.clause_lint import lint_budgets  # noqa: E402
+
+
+def _mk_budget_tree(tmp, *, positions: dict, budget_toml: str, overlays: dict | None = None):
+    """Build a tmp positions/ + overlays/ tree with a _clauses.toml carrying budgets.
+
+    ``positions``/``overlays`` map filename -> full file text (frontmatter+body).
+    ``budget_toml`` is the ``[budget]`` section body (keys under it).
+    """
+    pos_dir = tmp / "positions"
+    ov_dir = tmp / "overlays"
+    pos_dir.mkdir()
+    ov_dir.mkdir()
+    # A minimal clause table is required by load_clause_table; budgets ride along.
+    table = (
+        "[clauses.callback-contract]\n"
+        'marker = "<!-- clause:callback-contract -->"\n'
+        "[required]\n"
+        + "".join(f'{name.removesuffix(".md")} = ["callback-contract"]\n' for name in positions)
+        + "\n[budget]\n"
+        + budget_toml
+    )
+    (pos_dir / "_clauses.toml").write_text(table, encoding="utf-8")
+    for name, text in positions.items():
+        (pos_dir / name).write_text(text, encoding="utf-8")
+    for name, text in (overlays or {}).items():
+        (ov_dir / name).write_text(text, encoding="utf-8")
+    return pos_dir, ov_dir
+
+
+def _body_of(n: int) -> str:
+    """A position body of exactly ``n`` UTF-8 bytes carrying the required marker."""
+    marker = "<!-- clause:callback-contract -->\n"
+    filler = "x" * (n - len(marker.encode("utf-8")))
+    return marker + filler
+
+
+def _pos_file(body: str) -> str:
+    return f"---\nrole: developer\n---\n{body}"
+
+
+def test_ac17_position_one_byte_over_fails(tmp_path):
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(_body_of(101))},
+        budget_toml="dev = 100\noverlay = 1200\ncomposed_slack = 500\n",
+    )
+    with pytest.raises(ClauseLintError, match=r"position 'dev' body is 101 B, over its budget of 100"):
+        lint_budgets(pos, ov)
+
+
+def test_ac17_position_at_budget_passes(tmp_path):
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(_body_of(100))},
+        budget_toml="dev = 100\noverlay = 1200\ncomposed_slack = 500\n",
+    )
+    results = lint_budgets(pos, ov)
+    assert results["dev"] == 100  # exactly at budget is allowed (<=)
+
+
+def test_ac17_composed_over_sum_fails(tmp_path):
+    # position 60 (≤64) + overlay 60 (≤64) but composed body exceeds
+    # position_budget + overlay_budget + composed_slack.
+    pos_body = _body_of(60)
+    overlay_body = "y" * 60
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(pos_body)},
+        overlays={"codex.md": f"---\n---\n{overlay_body}"},
+        # ceiling = 64 + 64 + 5 = 133; composed = 60 + "\n\n## Provider notes (codex)\n\n" + 60 > 133
+        budget_toml="dev = 64\noverlay = 64\ncomposed_slack = 5\n",
+    )
+    with pytest.raises(ClauseLintError, match=r"composed cell 'dev\+codex' body is \d+ B, over its budget"):
+        lint_budgets(pos, ov)
+
+
+def test_ac17_unknown_budget_key_fails(tmp_path):
+    # A NON-id-shaped budget key is a typo and fails closed (supervisor decision
+    # 2026-08-28 (1a): unknown = not reserved AND not id-shaped).
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(_body_of(50))},
+        budget_toml='dev = 100\n"bad key!" = 100\noverlay = 1200\ncomposed_slack = 500\n',
+    )
+    with pytest.raises(ClauseLintError, match=r"\[budget\] key 'bad key!' is neither a reserved key"):
+        lint_budgets(pos, ov)
+
+
+def test_ac17_forward_declared_budget_key_warns_and_continues(tmp_path, caplog):
+    # An id-shaped budget key with no positions/<key>.md and no [required] row is
+    # a legitimate FORWARD declaration (e.g. design_reviewer): exactly one WARNING,
+    # lint continues (supervisor decision 2026-08-28 (1a), D13 clarification).
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(_body_of(50))},
+        budget_toml="dev = 100\ndesign_reviewer = 8000\noverlay = 1200\ncomposed_slack = 500\n",
+    )
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        results = lint_budgets(pos, ov)
+    assert results["dev"] == 50  # lint completed
+    warnings = [r for r in caplog.records if "forward-declared budget key design_reviewer" in r.message]
+    assert len(warnings) == 1, f"expected exactly one forward-declaration warning, got {warnings}"
+
+
+def test_ac17_missing_budget_row_fails(tmp_path):
+    # dev.md exists but has no [budget].dev row.
+    pos, ov = _mk_budget_tree(
+        tmp_path,
+        positions={"dev.md": _pos_file(_body_of(50))},
+        budget_toml="overlay = 1200\ncomposed_slack = 500\n",
+    )
+    with pytest.raises(ClauseLintError, match=r"position 'dev' has no \[budget\] row"):
+        lint_budgets(pos, ov)
+
+
+def test_ac17_no_budget_section_fails(tmp_path):
+    # A table with no [budget] at all is an AC17 error (the lint requires one).
+    pos_dir = tmp_path / "positions"
+    pos_dir.mkdir()
+    (pos_dir / "_clauses.toml").write_text(
+        '[clauses.callback-contract]\nmarker = "<!-- clause:callback-contract -->"\n'
+        '[required]\ndev = ["callback-contract"]\n',
+        encoding="utf-8",
+    )
+    (pos_dir / "dev.md").write_text(_pos_file(_body_of(50)), encoding="utf-8")
+    with pytest.raises(ClauseLintError, match="no \\[budget\\] section"):
+        lint_budgets(pos_dir)
