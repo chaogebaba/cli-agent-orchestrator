@@ -308,3 +308,104 @@ def test_native_ring_threads_incarnation_from_record(monkeypatch):
     assert inc_a == "1000"
     assert inc_b == "2000"
     assert build_wake_msg_id("sup1", 42, inc_a) != build_wake_msg_id("sup1", 42, inc_b)
+
+
+
+# ---------------------------------------------------------------------------
+# Live-evidence regression (points 1 + 2 + 5 together).
+#
+# Observed 2026-08-28 on the supervisor seat (60d393b2): the bridge frame
+#   "[cao] Callback from 60d393b2 (message id 1616). Run any command ..."
+# arrived THREE times, and id 1617 TWICE, interleaved, all within ~2 min while
+# the row was still unacked. With deterministic msg_id (pt1) + first-ring legacy
+# text (pt2) + per-sender content-hash window (pt5), the SAME (sender,row)
+# unacked inside the first 60 s must yield exactly ONE socket write, and any
+# later re-ring text must differ (attempt count / age).
+# ---------------------------------------------------------------------------
+
+
+def test_live_evidence_one_write_per_sender_row_within_60s(monkeypatch):
+    """Same (sender,row) rung repeatedly while unacked → exactly ONE socket
+    write in the first-ring window; a later re-ring (backoff body) is a distinct
+    line that DOES write.
+
+    Reproduces the #403 screenshot: id 1616 x3 and 1617 x2 interleaved collapse
+    to one write each inside the window.
+
+    Mutation (any of):
+      * restore uuid4 msg_id in build_wake_payload (pt1) → each ring's content
+        wrapper still identical (content has no id), but see pt5;
+      * delete the _is_duplicate_in_window guard in write_to_socket (pt5) → the
+        3 identical 1616 frames all write → written count 3 → fail;
+      * make the re-ring reuse the legacy first-ring text (pt2) → the later
+        distinct-line assertion fails.
+    """
+    from cli_agent_orchestrator.services import cc_session_registry as reg
+
+    _reset_dedupe_windows()
+
+    written: list[str] = []
+
+    class _FakeSock:
+        def __init__(self, *a, **k):
+            pass
+
+        def settimeout(self, *_):
+            pass
+
+        def connect(self, *_):
+            pass
+
+        def sendall(self, data):
+            # Capture only the payload line (auth frame, if any, is separate).
+            written.append(data.decode("utf-8").rstrip("\n"))
+
+        def shutdown(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(reg.socket, "socket", lambda *a, **k: _FakeSock())
+
+    sender = "60d393b2"
+
+    def _ring(row: int, *, message_body=None):
+        # Mirrors what _attempt_native_ring builds and writes for one ring.
+        payload = build_wake_payload(
+            sender, row, message_body=message_body, incarnation="pid:4242"
+        )
+        return write_to_socket("/tmp/60d393b2.sock", payload)
+
+    # Interleaved first-ring frames, all unacked within the first 60 s:
+    # 1616, 1616, 1617, 1616, 1617  (exactly the observed multiplicities).
+    for row in (1616, 1616, 1617, 1616, 1617):
+        assert _ring(row) is None  # every call returns success (no error/fallback)
+
+    first_ring_lines = list(written)
+    # Exactly one write per distinct (sender,row): 1616 once, 1617 once.
+    assert len(first_ring_lines) == 2, first_ring_lines
+    payloads = [json.loads(x) for x in first_ring_lines]
+    rows_written = sorted(
+        int(p["message"]["content"].split("message id ")[1].split(")")[0]) for p in payloads
+    )
+    assert rows_written == [1616, 1617]
+    # Deterministic ids (pt1): re-deriving the id for the same (sender,row,incarnation)
+    # reproduces exactly what was written.
+    for p in payloads:
+        row = int(p["message"]["content"].split("message id ")[1].split(")")[0])
+        assert p["msg_id"] == build_wake_msg_id(sender, row, "pid:4242")
+
+    # A later re-ring for 1616 carries the escalating-backoff body (attempt/age):
+    # a DISTINCT content line, so it is NOT suppressed by the window and DOES write.
+    repush_body = (
+        "[cao] re-push 1, unacked 1m. Pending callback message id(s): 1616. "
+        "Run any command to surface and ack."
+    )
+    assert _ring(1616, message_body=repush_body) is None
+    assert len(written) == 3  # the re-ring wrote a new, distinct line
+    assert written[-1] != first_ring_lines[0]
+    # The re-ring content differs from the legacy first-ring text.
+    last = json.loads(written[-1])
+    assert "re-push 1" in last["message"]["content"]
+    assert "Run any command to surface and ack it." not in last["message"]["content"]
