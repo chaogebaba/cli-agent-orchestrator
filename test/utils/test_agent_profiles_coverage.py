@@ -47,14 +47,22 @@ class TestScanDirectory:
     def test_scan_subdirectory_without_agent_md(self, tmp_path):
         from cli_agent_orchestrator.utils.agent_profiles import _scan_directory
 
-        # Create subdirectory without agent.md
+        # A subdirectory WITHOUT agent.md is not a profile and must be skipped
+        # entirely (F558 #413) — recording it previously produced a fake
+        # profile whose load/charter-projection raised FileNotFoundError and
+        # crashed the session brief on a fresh install. This is a structural
+        # rule (no agent.md -> not a profile), not a name blacklist.
+        #
+        # Mutation note: revert the `continue`/`not agent_md.exists()` guard in
+        # _scan_directory (record the bare dir as {loadable: False}) and this
+        # assertion flips to a KeyError-free membership and fails.
         (tmp_path / "bare-agent").mkdir()
 
         profiles = {}
         _scan_directory(tmp_path, "test", profiles)
 
-        assert "bare-agent" in profiles
-        assert profiles["bare-agent"]["description"] == ""
+        assert "bare-agent" not in profiles
+        assert profiles == {}
 
     def test_scan_md_file_with_bad_frontmatter(self, tmp_path):
         from cli_agent_orchestrator.utils.agent_profiles import _scan_directory
@@ -390,3 +398,106 @@ class TestListAgentProfilesEdgeCases:
         result = list_agent_profiles()
 
         assert result == []
+
+
+class TestF497CompositionStoresNotProfiles:
+    """F558 #413: positions/ and overlays/ must never surface as fake profiles.
+
+    On a fresh ``./install.sh`` the agent store gains sibling dirs
+    ``positions/`` and ``overlays/`` (F497 composition inputs, see
+    constants.py). Before the fix, ``_scan_directory`` recorded every
+    subdirectory — even one without ``agent.md`` — as a listable profile, so
+    ``list_agent_profiles()`` returned bogus "positions"/"overlays" entries.
+    The session brief's ``profiles`` section then called
+    ``_charter_projection("positions")`` -> ``read_agent_profile_source`` ->
+    ``FileNotFoundError`` -> the ``profiles`` section errored ->
+    terminal_service raised ``required session brief core section failed:
+    profiles`` and every claude_code launch died on a fresh install.
+    """
+
+    @staticmethod
+    def _fresh_install_store(tmp_path, monkeypatch):
+        """Build a store that mirrors a fresh install and isolate discovery to it.
+
+        Layout: positions/ + overlays/ (F497 sibling dirs, no agent.md), a
+        stray non-.md top-level file, and 2 real flat profiles. Provider/extra
+        dirs are emptied and the built-in store is stubbed empty so
+        list_agent_profiles() reflects only this store.
+        """
+        store = tmp_path / "agent-store"
+        store.mkdir()
+        # F497 composition-input sibling dirs (no agent.md) — the crash source.
+        (store / "positions").mkdir()
+        (store / "positions" / "supervisor.md").write_text(
+            "---\nrole: supervisor\n---\nposition body"
+        )
+        (store / "overlays").mkdir()
+        (store / "overlays" / "claude_code.md").write_text("---\n---\noverlay body")
+        # A stray top-level non-.md file must also be ignored.
+        (store / "README.txt").write_text("not a profile")
+        # Two real, loadable flat profiles.
+        (store / "developer.md").write_text(
+            "---\nname: developer\ndescription: Dev agent\n---\nDev prompt"
+        )
+        (store / "reviewer.md").write_text(
+            "---\nname: reviewer\ndescription: Review agent\n---\nReview prompt"
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", store
+        )
+        empty_builtin = tmp_path / "builtin"
+        empty_builtin.mkdir()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: empty_builtin,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs", lambda: []
+        )
+        return store
+
+    def test_positions_overlays_stray_excluded_only_real_profiles(self, tmp_path, monkeypatch):
+        """Store with positions/, overlays/, a stray file + 2 real profiles -> exactly 2.
+
+        Mutation note: revert the ``if not agent_md.exists(): continue`` guard
+        in ``_scan_directory`` (record bare dirs as listable). ``names`` then
+        gains "positions" and "overlays" and this assertion fails.
+        """
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        self._fresh_install_store(tmp_path, monkeypatch)
+
+        names = sorted(p["name"] for p in list_agent_profiles())
+
+        assert names == ["developer", "reviewer"]
+        assert "positions" not in names
+        assert "overlays" not in names
+
+    def test_brief_profiles_section_builds_over_fresh_install_store(self, tmp_path, monkeypatch):
+        """Regression: the session-brief profiles loop no longer raises FileNotFoundError.
+
+        This drives the exact loop ``session_manifest_service.build_session_manifest``
+        runs for its ``profiles`` section: for every name from
+        ``list_agent_profiles()`` it calls ``_charter_projection(name)``. Before
+        the fix a bogus "positions"/"overlays" name raised FileNotFoundError
+        here, erroring the section and crashing the required brief.
+
+        Mutation note: revert the ``_scan_directory`` guard and this raises
+        FileNotFoundError on the "positions"/"overlays" projection, failing the
+        test exactly as the fresh-install launch failed.
+        """
+        from cli_agent_orchestrator.services.session_manifest_service import _charter_projection
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        self._fresh_install_store(tmp_path, monkeypatch)
+
+        rows = [_charter_projection(item["name"]) for item in list_agent_profiles()]
+
+        assert sorted(r["name"] for r in rows) == ["developer", "reviewer"]
