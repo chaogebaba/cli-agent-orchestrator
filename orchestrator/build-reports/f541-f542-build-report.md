@@ -13,7 +13,8 @@
 | F548 gate-test commit | `60f4cf37` — `F548: land gate SHOULD-1 regression test verbatim (#404)` |
 | F548 r3-fix commit | `c5587aa4` — `F548: send arrow as real tmux Down key + settle poll; structured init errors (#404)` |
 | F548 r6 commit | `7f07e277` — `F548 r6: post-idle 'Not logged in' auth scan -> fast E-CLAUDE-AUTH (#404)` |
-| Report commits | `b6eacf44` + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `5d4c410d` (`r5`) + `F541/F542: build report r6` (this update) |
+| F548 r7 commit | `affe0438` — `F548 r7: gate S-1 settle-poll regression + S-2 bound post-idle scan + N-1 (#404)` |
+| Report commits | `b6eacf44` + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `5d4c410d` (`r5`) + `e2728529` (`r6`) + `F541/F542: build report r7` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -619,6 +620,48 @@ Expected on 2.1.250 WITH r6: the seat reaches its REPL showing
 `.credentials.json`; kill the server and `tmux kill-server` when done.
 Auth-only precheck: `claude -p` returns rc=1 (unauthenticated) while
 credentials are moved.
+
+---
+
+## r7 addendum — F548 empirical gate r1 (0B/2S/1N) closed (commit `affe0438`, issue #404)
+
+Empirical gate r1 (`orchestrator/tmp/orch/f548-empirical-gate-r1.md`, delta
+`61008d9d..e2728529`) ruled GATE-NO **only** on the two BOX e2e legs being
+unrunnable in that environment (whole grok fleet down / no Claude CLI / box
+checkout guard) — NOT a change-merit failure. On merit it was **0 BLOCKING /
+2 SHOULD / 1 NIT**. r7 closes all three.
+
+| id | Gate finding | r7 resolution | Evidence (file:line) |
+|---|---|---|---|
+| S-1 | The "remove the settle-poll" mutation SURVIVED the whole test set — no committed test gated the settle/confirm behavior (the key sequence is unchanged because Enter is always sent). | Added two direct `_select_menu_affirmative` tests: (1) current pane + first re-read show `❯` on the NEGATIVE row, a LATER re-read shows it on the affirmative → asserts `confirmed is True` (reachable ONLY if the re-read poll runs) and Enter follows; (2) never-confirms → returns `False` + logs the WARNING. Mutation verified: neutering the poll (`if False and not confirmed`) makes test (1) fail `assert False is True` — done locally, reverted exactly. | `test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth::{test_settle_poll_confirms_only_after_affirmative_capture,test_settle_poll_warns_and_returns_false_when_never_confirms}` |
+| S-2 | The post-idle auth scan `re.search`ed the whole 200-line `get_history` window → false-positive on an AUTHENTICATED pane merely containing "Not logged in" (reachable via `--resume` transcript replay). | Bounded the scan to the live footer: `get_history(..., tail_lines=_POST_IDLE_AUTH_SCAN_LINES=15)` AND detect over `_pane_tail(idle_pane, 15)` only. Tests: (a) authed pane with "Not logged in" ~40 lines up + clean footer → no raise; (b) marker in the tail → E-CLAUDE-AUTH. Mutation verified: scanning the full pane fails (a) — done locally, reverted. | constant `providers/claude_code.py` `_POST_IDLE_AUTH_SCAN_LINES` (near auth patterns); scan site (post-`wait_until_status` block); tests `::{test_post_idle_auth_scan_ignores_marker_far_up_scrollback,test_post_idle_auth_scan_raises_when_marker_in_tail}` |
+| N-1 | Stale `_handle_startup_prompts` docstring said the workspace-trust dialog "requires Enter". | Docstring now states focus defaults to "❯ No, exit" with the affirmative second and requires Down+Enter via `_select_menu_affirmative`. | `providers/claude_code.py` `_handle_startup_prompts` docstring item 2 |
+
+Note: the startup-LOOP auth check (inside `_handle_startup_prompts`) is left
+scanning its per-iteration pane as before — it runs on the pre-REPL dialog
+frames, not a replayed transcript, so S-2's `--resume` false-positive is
+specific to the post-idle scan, which is the one bounded here.
+
+### r7 test results (exact command + verbatim summary line)
+```
+$ uv run pytest test/providers/test_claude_code_unit.py test/providers/test_claude_code_coverage.py \
+    test/providers/test_startup_prompt_idle_gap.py test/providers/test_container_wrapped.py \
+    test/providers/test_f548_gate_repro.py test/api/test_wp2s3_http_contract.py -q -n0
+259 passed
+```
+black/isort/mypy: `claude_code.py` clean (black would leave unchanged, isort
+clean, mypy "Success: no issues found").
+
+### r7 mutation ledger (both applied to the worktree then reverted exactly; final `git status` clean)
+- settle-poll removed (`if False and not confirmed`) → `test_settle_poll_confirms_only_after_affirmative_capture` FAILS (`assert False is True`); the warns-path test still passes. (closes S-1's surviving mutation)
+- post-idle scan over full pane (not `_pane_tail`) → `test_post_idle_auth_scan_ignores_marker_far_up_scrollback` FAILS (spurious ClaudeAuthError). (proves S-2 bound is load-bearing)
+
+### r7 note on the box legs (items 4 & 5, still deferred)
+The gate's GATE-NO was procedural: the box e2e could not run (fleet down / no
+Claude CLI / box-checkout guard). That is unchanged and out of this lane's
+control; r7 addresses only the change-merit SHOULDs/NIT. The r6 box
+negative-leg recipe (above) still applies once a box with a valid Claude CLI is
+available.
 
 ---
 
