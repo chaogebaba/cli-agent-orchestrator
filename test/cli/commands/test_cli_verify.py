@@ -429,11 +429,11 @@ def test_verify_manifest_regen_preserves_identities_across_line_shift(
     result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
 
     assert result.exit_code == 0
-    assert result.output == "Trace manifest: hits=39 files_touched=1 changed=yes\n"
+    assert result.output == "Trace manifest: hits=40 files_touched=1 changed=yes\n"
     regenerated = manifest_path.read_text(encoding="utf-8")
     committed_rows = committed.splitlines()
     regenerated_rows = regenerated.splitlines()
-    assert len(committed_rows) == len(regenerated_rows) == 39
+    assert len(committed_rows) == len(regenerated_rows) == 40
     assert [_trace_identity(row) for row in committed_rows] == [
         _trace_identity(row) for row in regenerated_rows
     ]
@@ -463,7 +463,7 @@ def test_verify_manifest_regen_unchanged_tree_does_not_write(tmp_path, monkeypat
     result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
 
     assert result.exit_code == 0
-    assert result.output == "Trace manifest: hits=39 files_touched=0 changed=no\n"
+    assert result.output == "Trace manifest: hits=40 files_touched=0 changed=no\n"
     assert writes == []
     assert manifest_path.read_bytes() == committed
 
