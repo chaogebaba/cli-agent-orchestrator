@@ -39,6 +39,7 @@ _TEST_CAO_HOME = Path(tempfile.mkdtemp(prefix="cao-pytest-"))
 # helper walks up first (covers normal checkouts), then falls back to
 # git-common-dir (covers worktrees) to reliably locate the root repo.
 
+
 def _derive_root_repo() -> "Path | None":
     """Find the root repository that contains the cli-agent-orchestrator subrepo.
 
@@ -57,15 +58,18 @@ def _derive_root_repo() -> "Path | None":
 
     # Strategy 2: git-common-dir fallback (worktree → main checkout's .git)
     try:
-        common = Path(_sp.check_output(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=subrepo, text=True, stderr=_sp.DEVNULL,
-        ).strip())
+        common = Path(
+            _sp.check_output(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=subrepo,
+                text=True,
+                stderr=_sp.DEVNULL,
+            ).strip()
+        )
         # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
         candidate = common.parents[1]
         if candidate.exists() and (
-            (candidate / "providers.toml.default").exists()
-            or (candidate / "install.sh").exists()
+            (candidate / "providers.toml.default").exists() or (candidate / "install.sh").exists()
         ):
             return candidate
     except Exception:
@@ -76,6 +80,11 @@ def _derive_root_repo() -> "Path | None":
 
 ROOT_REPO: "Path | None" = _derive_root_repo()
 os.environ["CAO_HOME_DIR"] = str(_TEST_CAO_HOME)
+# F549 (#405): pin the kiro agents dir into the test home too. Without this,
+# CAO_AGENTS_DIR defaults to the REAL ~/.kiro/agents and any test that calls
+# install_agent (or another provider-file write) clobbers the user's live agent
+# configs (incident 2026-08-28). Set at import, BEFORE constants.py binds it.
+os.environ["CAO_AGENTS_DIR"] = str(_TEST_CAO_HOME / "kiro-agents")
 
 from cli_agent_orchestrator.clients.database import engine, init_db  # noqa: E402
 
@@ -245,10 +254,12 @@ def _reset_backend_registry():
 # ---------------------------------------------------------------------------
 # F352: Global sender-token bypass for tests not exercising enforcement
 # ---------------------------------------------------------------------------
-_F352_ENFORCEMENT_MODULES = frozenset((
-    "test_inbox_sender_token",
-    "test_f352_sender_token_injection",
-))
+_F352_ENFORCEMENT_MODULES = frozenset(
+    (
+        "test_inbox_sender_token",
+        "test_f352_sender_token_injection",
+    )
+)
 
 
 @pytest.fixture(autouse=True)
@@ -287,6 +298,7 @@ def _sim_leak_guard():
         # Force cleanup from a previous leak
         import cli_agent_orchestrator.sim.clock as _clk
         import cli_agent_orchestrator.sim.rng as _rng
+
         _clk._active_clock = None
         _rng._active_rng = None
 
@@ -298,6 +310,7 @@ def _sim_leak_guard():
     if leaked_clock is not None or leaked_rng is not None:
         import cli_agent_orchestrator.sim.clock as _clk
         import cli_agent_orchestrator.sim.rng as _rng
+
         _clk._active_clock = None
         _rng._active_rng = None
         parts = []
@@ -354,6 +367,48 @@ def _isolate_seam_parity_and_incarnations():
     except Exception:
         # If SessionLocal itself is broken (e.g. no DB file), skip silently.
         pass
+
+
+@pytest.fixture(autouse=True)
+def _f549_guard_real_home_dirs():
+    """F549 (#405): fail-loud if a test writes into the user's REAL home dirs.
+
+    CAO_HOME_DIR and CAO_AGENTS_DIR are pinned into the test home at import, so
+    a correctly-behaved test never touches ``~/.kiro`` or
+    ``~/.aws/cli-agent-orchestrator``. This snapshots the mtimes of those real
+    dirs (and the kiro agents dir) at setup and asserts they are unchanged at
+    teardown, catching any code path that still resolves a real dir at import
+    time and writes to it (the 2026-08-28 install-clobber incident shape).
+    """
+    import os as _os
+
+    watched = [
+        pathlib.Path.home() / ".kiro" / "agents",
+        pathlib.Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store",
+        pathlib.Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context",
+    ]
+
+    def _snapshot():
+        snap = {}
+        for d in watched:
+            if d.exists():
+                snap[d] = d.stat().st_mtime_ns
+                for child in d.rglob("*"):
+                    try:
+                        snap[child] = child.stat().st_mtime_ns
+                    except OSError:
+                        pass
+        return snap
+
+    before = _snapshot()
+    yield
+    after = _snapshot()
+    # New or modified real-home paths => a test wrote outside the test home.
+    changed = [str(p) for p in set(before) | set(after) if before.get(p) != after.get(p)]
+    assert not changed, (
+        "F549: a test mutated the user's REAL home dirs (expected all writes under "
+        f"the test home): {changed[:10]}"
+    )
 
 
 @pytest.fixture(autouse=True)
