@@ -12,7 +12,8 @@
 | F548 commit | `0ca9c2d0` — `F548: fix claude_code init dialog handling + fast auth-fail + pane tail (#404)` |
 | F548 gate-test commit | `60f4cf37` — `F548: land gate SHOULD-1 regression test verbatim (#404)` |
 | F548 r3-fix commit | `c5587aa4` — `F548: send arrow as real tmux Down key + settle poll; structured init errors (#404)` |
-| Report commits | `b6eacf44` (`build report`) + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `F541/F542: build report r5` (this update) |
+| F548 r6 commit | `7f07e277` — `F548 r6: post-idle 'Not logged in' auth scan -> fast E-CLAUDE-AUTH (#404)` |
+| Report commits | `b6eacf44` + `c5ebeebc`… (`r2`) + `b46bf972` (`r3`) + `61008d9d` (`r4`) + `5d4c410d` (`r5`) + `F541/F542: build report r6` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -536,6 +537,88 @@ Failure signatures this fixes:
 Auth-only quick check (no CAO): `claude -p` on the box; rc=1 +
 `Failed to authenticate: OAuth session expired …` means box auth must be
 re-synced before a green e2e is possible.
+
+---
+
+## r6 addendum — F548: post-idle "Not logged in" auth scan on Claude ≥ 2.1.250 (commit `7f07e277`, issue #404)
+
+**Box e2e r4** (`probes/f548-box-e2e-r4.md`, grok-box-5, Claude Code **2.1.250**,
+HEAD `5d4c410d` which includes the r3 fix `c5587aa4`) found:
+- **Positive/trust leg not exercised:** under `skipDangerousModePermissionPrompt:true`
+  (rewritten unconditionally by `_ensure_skip_bypass_prompt_setting`) +
+  `--dangerously-skip-permissions`, 2.1.250 rendered **no** workspace-trust
+  dialog for an untrusted dir ("started without prompts"). The Down+Enter path
+  was not triggered.
+- **Negative leg reached the REPL:** credentials moved aside → Claude rendered
+  an **unauthenticated REPL** showing `Not logged in · Run /login`, idled, and
+  `POST /sessions/start` returned **HTTP 200 in 38s** — `ClaudeAuthError` never
+  fired, because `wait_until_status` SUCCEEDED (readiness = banner+idle,
+  regardless of auth), so neither the startup-loop nor the timeout-branch auth
+  check ran.
+
+### Plain statement on the trust-dialog path (r6)
+On **Claude Code ≥ 2.1.250** with `skipDangerousModePermissionPrompt` +
+`--dangerously-skip-permissions` (CAO's default launch shape), the **workspace-
+trust dialog does not render**, so the F548 **Down+Enter selection path is
+UNIT-VERIFIED ONLY** and is not reachable via a box e2e on that version. It
+remains correct and necessary for versions/paths that DO render the dialog (r3's
+box did). The box e2e covers the **negative (auth) leg**.
+
+### What r6 changes (the "(2)" fix)
+
+| # | Directive | How met | Evidence (file:line) |
+|---|---|---|---|
+| 1 | Add `Not logged in(?:\s*·\s*Run /login)?` to the auth patterns. | Added to `CLAUDE_AUTH_FAILURE_PATTERNS`. | `providers/claude_code.py:214-222` (new pattern at `:219`) |
+| 2 | After `wait_until_status` succeeds, one pane scan; on match raise `ClaudeAuthError` with the pane tail (same classifier as the timeout branch). No other behavior change. | Post-idle `get_history` → `_detect_claude_auth_failure` → `ClaudeAuthError("[E-CLAUDE-AUTH] … reached its REPL unauthenticated … Last pane lines:\n…")`; only runs on the success path, only raises on a marker. | `providers/claude_code.py` post-idle block right after the `wait_until_status` success (immediately before `wait_until_input_ready`) |
+| 3a | Test: post-idle logged-out pane → ClaudeAuthError; endpoint 500 JSON E-CLAUDE-AUTH. | `test_post_idle_logged_out_pane_raises_e_claude_auth` (unit, asserts code + pane tail); the endpoint JSON is covered by `test_start_claude_auth_error_is_structured_json_e_claude_auth`, which maps `ClaudeAuthError` **by type** regardless of which init site raised it. | `test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth`; `test/api/test_wp2s3_http_contract.py` |
+| 3b | Test: normal idle pane → no raise. | `test_post_idle_authenticated_pane_does_not_raise` (init returns True). | same class |
+| 3c | Mutation note: removing the post-idle scan fails (a). | Neutering the scan (`idle_auth_marker = None`) makes `test_post_idle_logged_out_pane_raises_e_claude_auth` fail with **"DID NOT RAISE ClaudeAuthError"** — verified locally, reverted exactly. | — |
+
+Also: the detector unit now asserts `Not logged in · Run /login` (and bare
+`Not logged in`) match. Two pre-existing success-path tests
+(`test_initialize_calls_handle_startup_prompts`, `test_wrapped_provider_lifecycle`)
+got ONE extra authenticated post-idle `get_history` frame for the new scan's
+read — no assertion weakened.
+
+### r6 test results (exact commands + verbatim summary lines)
+```
+$ uv run pytest test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth \
+    test/api/test_wp2s3_http_contract.py test/providers/test_f548_gate_repro.py -q -n0
+37 passed
+$ uv run pytest test/providers/test_claude_code_unit.py test/providers/test_claude_code_coverage.py \
+    test/providers/test_startup_prompt_idle_gap.py test/providers/test_container_wrapped.py \
+    test/providers/test_f548_gate_repro.py test/api/test_wp2s3_http_contract.py -q -n0
+255 passed
+```
+black/isort/mypy: `claude_code.py` clean (black unchanged, isort clean, mypy
+"Success: no issues found").
+
+### r6 box negative-leg repro recipe (Claude ≥ 2.1.250, tmux)
+On a box whose Claude auth is currently VALID (so the failure is induced, not
+pre-existing):
+```bash
+# fork checkout at 7f07e277 (cao/e08be272 tip), then:
+uv tool install --force --python 3.14 .
+export CAO_HOME_DIR=/data/cao-scratch/f548-neg/cao-home
+cao-server >/data/cao-scratch/f548-neg/server.stdout 2>&1 &
+# move real credentials aside, with a trap to restore no matter what:
+CRED=~/.claude/.credentials.json
+cp "$CRED" "$CRED.f548bak" && trap 'mv -f "$CRED.f548bak" "$CRED"' EXIT
+mv "$CRED" "$CRED.moved"
+cao launch --agents chao_supervisor --provider claude_code \
+  --session-name f548neg --headless --yolo
+# restore immediately (the trap also covers a crash):
+mv -f "$CRED.moved" "$CRED"
+```
+Expected on 2.1.250 WITH r6: the seat reaches its REPL showing
+`Not logged in · Run /login`, the post-idle scan fires, and
+`POST /sessions/start` returns a **fast** `HTTP/1.1 500` with
+`content-type: application/json` body
+`{"detail":{"code":"E-CLAUDE-AUTH","message":"[E-CLAUDE-AUTH] … Not logged in … Last pane lines:\n…"}}`
+(NOT the pre-r6 `HTTP 200` idle). Cleanup: the `trap`/`mv` restores
+`.credentials.json`; kill the server and `tmux kill-server` when done.
+Auth-only precheck: `claude -p` returns rc=1 (unauthenticated) while
+credentials are moved.
 
 ---
 
