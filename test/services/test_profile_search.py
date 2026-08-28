@@ -501,15 +501,19 @@ class TestLoadabilityExclusion:
         assert profiles["bad-monitor"]["loadable"] is False
         assert not search_profiles("monitor", profiles=list(profiles.values()))
 
-    def test_directory_without_agent_md_marked_unloadable(self, tmp_path):
-        """Reviewer repro: a bare directory is listable by name, but
-        load_agent_profile() raises FileNotFoundError for it."""
+    def test_directory_without_agent_md_excluded(self, tmp_path):
+        """A bare directory (no agent.md) is NOT a profile and must not be
+        listed at all (F558 #413). Listing it as a bogus, unloadable entry was
+        the root cause: the session brief's profiles section then tried to
+        _charter_projection() it and raised FileNotFoundError, crashing every
+        fresh-install launch."""
         import cli_agent_orchestrator.utils.agent_profiles as ap
 
         (tmp_path / "empty-monitor").mkdir()
         profiles: dict = {}
         ap._scan_directory(tmp_path, "local", profiles)
-        assert profiles["empty-monitor"]["loadable"] is False
+        assert "empty-monitor" not in profiles
+        assert profiles == {}
         assert not search_profiles("monitor", profiles=list(profiles.values()))
 
     def test_dir_style_profile_follows_source_rules(self, tmp_path, monkeypatch):
@@ -558,9 +562,11 @@ class TestLoadabilityExclusion:
         """End-to-end discover-then-load consistency: every profile that
         search recommends must actually load via load_agent_profile().
 
-        Store contains all three unloadable shapes from the #438 re-review:
-        broken YAML, valid-YAML/invalid-model metadata, and a profile
-        directory without agent.md."""
+        Store contains the unloadable-but-real-file shapes from the #438
+        re-review: broken YAML and valid-YAML/invalid-model metadata (both
+        are real ``.md`` files, so still listed but not searchable). A profile
+        DIRECTORY without agent.md is no longer a profile at all (F558 #413)
+        and must not appear in the list."""
         import cli_agent_orchestrator.utils.agent_profiles as ap
 
         store = tmp_path / "store"
@@ -587,11 +593,11 @@ class TestLoadabilityExclusion:
             "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
         )
         local = [p for p in ap.list_agent_profiles() if p["source"] == "local"]
-        # list still shows all four (existing behavior preserved)
+        # the two real .md files are still listed; the bare directory
+        # (empty-monitor) is no longer a profile (F558 #413).
         assert {p["name"] for p in local} == {
             "broken-monitor",
             "bad-model-monitor",
-            "empty-monitor",
             "good-monitor",
         }
         # search only recommends the loadable one...

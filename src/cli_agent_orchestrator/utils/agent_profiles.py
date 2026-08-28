@@ -138,6 +138,12 @@ def _scan_directory(
     from provider and extra directories, not from the local store, so the
     local-store scan passes ``False`` to keep such entries listable but never
     recommendable.
+
+    Only two things are profiles: a top-level ``<name>.md`` regular file, or a
+    subdirectory that CONTAINS ``<name>/agent.md``. A subdirectory WITHOUT an
+    ``agent.md`` (e.g. the F497 ``positions/`` / ``overlays/`` composition
+    stores that live inside the agent store) is not a profile and is skipped
+    entirely — a structural rule, not a name blacklist (F558 #413).
     """
     if not directory.exists():
         return
@@ -152,19 +158,26 @@ def _scan_directory(
         if item.is_dir():
             profile_name = item.name
             agent_md = item / "agent.md"
-            if agent_md.exists() and dir_profiles_loadable:
+            if not agent_md.exists():
+                # A directory with no ``agent.md`` is NOT a profile — it must
+                # never surface, not even as a listable-but-unloadable entry.
+                # The F497 composition stores (``positions/``, ``overlays/``)
+                # live as siblings INSIDE the agent store (constants.py) and
+                # are read directly by the resolver, never scanned as flat
+                # profiles; recording them here produced fake "positions" /
+                # "overlays" profiles whose _charter_projection() then raised
+                # FileNotFoundError and crashed the session brief on a fresh
+                # install (F558 #413). Any other stray directory is skipped by
+                # the same structural rule — this is not a name blacklist.
+                continue
+            if dir_profiles_loadable:
                 discovery, loadable = _scan_profile_source(agent_md, profile_name)
-            elif agent_md.exists():
+            else:
                 # Content may be fine, but _read_agent_profile_source() does
                 # not resolve directory-style profiles from this store, so
                 # load_agent_profile() would raise FileNotFoundError.
                 discovery, _ = _scan_profile_source(agent_md, profile_name)
                 loadable = False
-            else:
-                # A directory without agent.md is listable, but
-                # load_agent_profile() raises FileNotFoundError for it, so it
-                # must never be recommended by search.
-                discovery, loadable = _discovery_fields({}), False
             _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
@@ -692,7 +705,6 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     return fallback_provider
 
 
-
 # --- F497 D7 — assign(provider=) position-name resolution ------------------
 #
 # ``agent_profile`` on an assign becomes resolvable as EITHER a legacy concrete
@@ -726,10 +738,14 @@ def _position_exists(position_name: str) -> bool:
         _validate_agent_name(position_name)
     except ValueError:
         return False
-    return _read_composition_store(positions_store_dir(), position_name, resolve_env=False) is not None
+    return (
+        _read_composition_store(positions_store_dir(), position_name, resolve_env=False) is not None
+    )
 
 
-def resolve_assignment_target(agent_profile: str, provider: Optional[str]) -> "tuple[str, Optional[str]]":
+def resolve_assignment_target(
+    agent_profile: str, provider: Optional[str]
+) -> "tuple[str, Optional[str]]":
     """Resolve an assign ``agent_profile`` (+ optional ``provider=``) to a spawn target (D7).
 
     The resolver ENGAGES (position mode) only when the caller passes ``provider=``
