@@ -1455,6 +1455,7 @@ def init_db() -> None:
     _migrate_f138_orphan_reconciliation()
     _migrate_f175_dedup_columns()
     _migrate_fx191_trace_extension()
+    _migrate_f524_stall_surface_unique_index()
     _migrate_f218_dead_supervisor_safety()
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
@@ -1670,6 +1671,50 @@ def _migrate_fx191_trace_extension() -> None:
                     "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
                 )
             )
+
+
+def _migrate_f524_stall_surface_unique_index() -> None:
+    """F524 (#379) S1: partial unique index for one-shot stall surfacing.
+
+    ``Base.metadata.create_all`` only creates the index on a FRESH database — it
+    never adds an index to a table that already exists. On a deployed-upgrade DB
+    the ``inbox_message_trace_event`` table predates this index, so without this
+    migration the index is absent and ``claim_message_trace_once`` degrades to a
+    plain insert (both concurrent claims win -> duplicate sender notices).
+
+    Idempotent, and safe against pre-existing duplicates that would otherwise
+    block ``CREATE UNIQUE INDEX``:
+      1. Dedupe existing ``f524.stall_surfaced`` rows, keeping the LOWEST rowid
+         per ``message_id`` (the first/authoritative surface).
+      2. ``CREATE UNIQUE INDEX IF NOT EXISTS`` scoped to that kind.
+    """
+    with engine.begin() as connection:
+        indexes = connection.execute(
+            text(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='inbox_message_trace_event'"
+            )
+        ).fetchall()
+        idx_names = {r[0] for r in indexes}
+        if "uq_inbox_trace_f524_stall_surfaced" in idx_names:
+            return
+        # Dedupe FIRST so a pre-existing duplicate pair cannot abort index creation.
+        connection.execute(
+            text(
+                "DELETE FROM inbox_message_trace_event "
+                "WHERE kind = 'f524.stall_surfaced' AND rowid NOT IN ("
+                "  SELECT MIN(rowid) FROM inbox_message_trace_event "
+                "  WHERE kind = 'f524.stall_surfaced' GROUP BY message_id"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbox_trace_f524_stall_surfaced "
+                "ON inbox_message_trace_event(message_id) "
+                "WHERE kind = 'f524.stall_surfaced'"
+            )
+        )
 
 
 def _migrate_f175_dedup_columns() -> None:

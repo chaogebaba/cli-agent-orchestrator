@@ -486,3 +486,113 @@ class TestF524AtomicOneShot:
         # even though the earlier notice was lost. Degradation, not duplication.
         assert InboxService().surface_stalled_direct_deliveries() == 0
         assert _count_sender_notices(TestSession, "supervis", "worker01") == 0
+
+
+@pytest.mark.xdist_group("real_sqlite")
+class TestF524UpgradePathMigration:
+    """S1-migration: the partial unique index is created on EXISTING databases.
+
+    Base.metadata.create_all only creates the index on a fresh DB. A deployed
+    upgrade has the inbox_message_trace_event table already, so init_db() must
+    add the index (and dedupe any pre-existing duplicates) on every existing-DB
+    startup. Mutant: remove _migrate_f524_stall_surface_unique_index() from
+    init_db() -> this test must fail (index absent, duplicate claims both win).
+    """
+
+    def _build_pre_index_db(self, tmp_path):
+        """A DB whose trace table lacks the F524 unique index, with a seeded
+        duplicate pair — the deployed-upgrade shape the reviewer reproduced."""
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.orm import sessionmaker
+
+        db_file = tmp_path / "upgrade.db"
+        eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+        TS = sessionmaker(bind=eng)
+        with eng.begin() as c:
+            c.execute(
+                text(
+                    "CREATE TABLE inbox_message_trace_event ("
+                    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " message_id INTEGER NOT NULL, kind VARCHAR NOT NULL,"
+                    " phase VARCHAR, decision VARCHAR, reason VARCHAR,"
+                    " payload JSON NOT NULL, created_at DATETIME NOT NULL)"
+                )
+            )
+            # Pre-existing duplicate pair for message 7 (would block a naive
+            # CREATE UNIQUE INDEX) + an unrelated kind that must survive.
+            for _ in range(2):
+                c.execute(
+                    text(
+                        "INSERT INTO inbox_message_trace_event "
+                        "(message_id,kind,payload,created_at) "
+                        "VALUES (7,'f524.stall_surfaced','{}','2026-01-01')"
+                    )
+                )
+            c.execute(
+                text(
+                    "INSERT INTO inbox_message_trace_event "
+                    "(message_id,kind,payload,created_at) "
+                    "VALUES (7,'other.kind','{}','2026-01-01')"
+                )
+            )
+        return eng, TS, db_file
+
+    def _index_names(self, eng):
+        from sqlalchemy import text
+
+        with eng.begin() as c:
+            return {
+                r[0]
+                for r in c.execute(
+                    text(
+                        "SELECT name FROM sqlite_master WHERE type='index' "
+                        "AND tbl_name='inbox_message_trace_event'"
+                    )
+                )
+            }
+
+    def test_init_db_creates_index_and_dedupes_on_existing_db(self, tmp_path, monkeypatch):
+        import cli_agent_orchestrator.clients.database as db_mod
+        from sqlalchemy import text
+
+        eng, TS, _ = self._build_pre_index_db(tmp_path)
+        monkeypatch.setattr(db_mod, "engine", eng)
+        monkeypatch.setattr(db_mod, "SessionLocal", TS)
+
+        # Precondition: the upgrade shape — index absent, duplicate present.
+        assert "uq_inbox_trace_f524_stall_surfaced" not in self._index_names(eng)
+
+        db_mod.init_db()  # DEPLOYED entry point every startup traverses
+
+        # Index now exists; duplicate collapsed to the lowest rowid; other kind intact.
+        assert "uq_inbox_trace_f524_stall_surfaced" in self._index_names(eng)
+        with eng.begin() as c:
+            dup = c.execute(
+                text(
+                    "SELECT COUNT(*) FROM inbox_message_trace_event "
+                    "WHERE kind='f524.stall_surfaced' AND message_id=7"
+                )
+            ).scalar()
+            other = c.execute(
+                text("SELECT COUNT(*) FROM inbox_message_trace_event WHERE kind='other.kind'")
+            ).scalar()
+        assert dup == 1
+        assert other == 1
+
+        # And claim-once semantics now hold on this upgraded DB.
+        from cli_agent_orchestrator.clients.database import claim_message_trace_once
+        from cli_agent_orchestrator.services.inbox_service import F524_STALL_SURFACED_KIND
+
+        assert claim_message_trace_once(9, F524_STALL_SURFACED_KIND) is True
+        assert claim_message_trace_once(9, F524_STALL_SURFACED_KIND) is False
+
+    def test_init_db_is_idempotent_on_index(self, tmp_path, monkeypatch):
+        import cli_agent_orchestrator.clients.database as db_mod
+
+        eng, TS, _ = self._build_pre_index_db(tmp_path)
+        monkeypatch.setattr(db_mod, "engine", eng)
+        monkeypatch.setattr(db_mod, "SessionLocal", TS)
+
+        db_mod.init_db()
+        db_mod.init_db()  # second run must not raise
+        assert "uq_inbox_trace_f524_stall_surfaced" in self._index_names(eng)
