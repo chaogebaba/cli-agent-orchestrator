@@ -18,7 +18,7 @@ import threading
 import uuid
 
 import pytest
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
@@ -66,8 +66,8 @@ def hardened_db(monkeypatch):
 
 
 def test_production_connect_listener_sets_wal_and_busy_timeout():
-    """The production ``connect`` listener must set WAL + busy_timeout on a
-    FRESH connection.
+    """The production ``connect`` listener must set WAL + busy_timeout +
+    synchronous on a FRESH connection.
 
     ``busy_timeout`` is a MUTABLE, PER-CONNECTION pragma. Reading it off the
     shared, module-global, POOLED ``db.engine`` mid-suite is not isolation-safe:
@@ -75,12 +75,22 @@ def test_production_connect_listener_sets_wal_and_busy_timeout():
     report a value another test left on it (observed 1000), so that assertion
     fails net-new even though the product code is correct (F554 gate r1b/B1).
 
-    Instead, exercise the ACTUAL production listener (``db._set_sqlite_pragmas``)
-    on a dedicated ``NullPool`` engine pointed at an ISOLATED scratch DB file:
-    NullPool opens a brand-new physical connection per checkout and never reuses
-    one, so the only code that has touched the connection is the production
-    listener. This proves the fix without depending on shared pool state and
-    without touching the production database file.
+    It is ALSO not enough to simply read ``busy_timeout`` back off a fresh
+    connection: on this platform pysqlite's DEFAULT ``busy_timeout`` on a brand-
+    new connection is already 5000 == ``CAO_DB_BUSY_TIMEOUT_MS`` (F554 gate
+    r2/B1). So ``assert busy_timeout == 5000`` on a fresh connection is VACUOUS —
+    it passes whether or not the production listener ran, and therefore does NOT
+    catch dropping the ``PRAGMA busy_timeout`` line from the shipped code.
+
+    Fix: exercise the ACTUAL production listener (``db._set_sqlite_pragmas``)
+    directly against a raw DBAPI connection whose pragmas have first been driven
+    to DISTINGUISHABLE non-default values (``busy_timeout=0``, which the
+    production value 5000 is not, and ``synchronous=FULL(2)``/``journal_mode``
+    left at the ``delete`` default). Then invoke the listener and assert it
+    RAISED each pragma to the production value. Because the pre-state differs
+    from the production post-state for every pragma, each assertion is now
+    sensitive to the corresponding ``PRAGMA`` line being removed from the shipped
+    function — the mutation the F554 brief mandates be caught.
     """
     from sqlalchemy.pool import NullPool
 
@@ -89,18 +99,55 @@ def test_production_connect_listener_sets_wal_and_busy_timeout():
     os.makedirs(_SCRATCH_ROOT, exist_ok=True)
     db_path = os.path.join(_SCRATCH_ROOT, f"f554-listener-{uuid.uuid4().hex}.db")
 
+    # NullPool so every checkout is a brand-new physical connection with no
+    # pool-state contamination; we drive the connection ourselves rather than
+    # letting a "connect" listener fire, so we control the pre-state precisely.
     probe_engine = create_engine(
         f"sqlite:///{db_path}",
         connect_args={"check_same_thread": False},
         poolclass=NullPool,
     )
-    # Attach the *production* listener function — not a test copy — so this
-    # verifies the shipped code path.
-    event.listen(probe_engine, "connect", db._set_sqlite_pragmas)
     try:
-        with probe_engine.connect() as conn:
-            journal_mode = conn.execute(text("PRAGMA journal_mode")).scalar()
-            busy_timeout = conn.execute(text("PRAGMA busy_timeout")).scalar()
+        raw = probe_engine.raw_connection()
+        try:
+            dbapi_conn = raw.driver_connection
+            assert dbapi_conn is not None
+            pre = dbapi_conn.cursor()
+            try:
+                # Poison the pre-state so each production PRAGMA has a visible
+                # effect. busy_timeout=0 is distinguishable from the 5000 the
+                # listener sets AND from the pysqlite 5000 default; synchronous
+                # is forced to FULL(2); journal_mode is left at the "delete"
+                # default (WAL is what the listener must switch it to).
+                pre.execute("PRAGMA busy_timeout=0")
+                pre.execute("PRAGMA synchronous=FULL")
+                pre_busy = pre.execute("PRAGMA busy_timeout").fetchone()[0]
+                pre_sync = pre.execute("PRAGMA synchronous").fetchone()[0]
+                pre_journal = pre.execute("PRAGMA journal_mode").fetchone()[0]
+            finally:
+                pre.close()
+
+            # Sanity: the pre-state genuinely differs from the production
+            # post-state, so the assertions below cannot be satisfied by the
+            # pre-state alone.
+            assert int(pre_busy) == 0
+            assert int(pre_sync) == 2  # FULL
+            assert str(pre_journal).lower() != "wal"
+
+            # Invoke the SHIPPED listener function directly on the raw
+            # connection — not a test copy — so this verifies the exact code
+            # path CAO runs in production.
+            db._set_sqlite_pragmas(dbapi_conn, None)
+
+            post = dbapi_conn.cursor()
+            try:
+                busy_timeout = post.execute("PRAGMA busy_timeout").fetchone()[0]
+                synchronous = post.execute("PRAGMA synchronous").fetchone()[0]
+                journal_mode = post.execute("PRAGMA journal_mode").fetchone()[0]
+            finally:
+                post.close()
+        finally:
+            raw.close()
     finally:
         probe_engine.dispose()
         for suffix in ("", "-wal", "-shm"):
@@ -109,12 +156,17 @@ def test_production_connect_listener_sets_wal_and_busy_timeout():
             except OSError:
                 pass
 
-    # journal_mode=WAL is a persistent per-database property.
+    # journal_mode=WAL is a persistent per-database property; default is
+    # "delete", so this catches dropping the WAL PRAGMA.
     assert str(journal_mode).lower() == "wal"
-    # busy_timeout read on a fresh NullPool connection reflects exactly what the
-    # production listener set — no pool-state contamination.
+    # busy_timeout was 0 pre-listener; the listener raised it to the production
+    # value. This is now sensitive to dropping the busy_timeout PRAGMA (would
+    # stay 0, not fall back to the vacuous 5000 default).
     assert int(busy_timeout) == CAO_DB_BUSY_TIMEOUT_MS
     assert int(busy_timeout) >= 5000
+    # synchronous was FULL(2) pre-listener; the listener set NORMAL(1). Default
+    # is FULL, so this catches dropping the synchronous PRAGMA.
+    assert int(synchronous) == 1  # NORMAL
 
 
 def test_concurrent_writes_do_not_raise_database_locked(hardened_db):

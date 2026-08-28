@@ -208,3 +208,95 @@ No offload-box work this round (no box configured/reachable to this lane;
 ran on the laptop in the provisioned worktree `.cao/worktrees/c8f4e63d`; scratch
 under `/data/cao-scratch/c8f4e63d`; no `/tmp`. Targeted + scoped-xdist tests
 only, no full suite on the laptop.
+
+
+---
+
+## r3 — fix-round after gate r2 GATE-NO (B1 vacuous busy_timeout, S1 net-new strict errors)
+
+**Worktree:** `/data/cao-scratch/wt-f554-r3` on lane branch `cao/c8f4e63d` (start tip `a2b11640`).
+**Scope:** TEST-ONLY. No product-code change (`database.py`, `constants.py` both byte-identical to r2 tip). Only `test/clients/test_f554_sqlite_concurrent_writes.py` changed.
+
+### B1 (BLOCKER) fix — make the mandated busy_timeout mutation catchable
+
+Root cause (confirmed by gate r2): pysqlite's DEFAULT `busy_timeout` on a fresh
+connection is `5000` == `CAO_DB_BUSY_TIMEOUT_MS`, so the r2 NullPool rewrite's
+`assert int(busy_timeout) == 5000` (read off a fresh connection AFTER the listener
+ran) was satisfied by the platform default whether or not the listener set it —
+VACUOUS for busy_timeout.
+
+Fix: `test_production_connect_listener_sets_wal_and_busy_timeout` no longer relies
+on a `connect` listener firing. It now:
+1. Opens a raw DBAPI connection (`probe_engine.raw_connection().driver_connection`,
+   NullPool, isolated `/data/cao-scratch/c8f4e63d` scratch file).
+2. Drives the PRE-state to values DISTINGUISHABLE from the production post-state:
+   `PRAGMA busy_timeout=0`, `PRAGMA synchronous=FULL` (journal_mode left at the
+   `delete` default). Asserts the pre-state (`busy_timeout==0`, `synchronous==2`,
+   `journal_mode!=wal`) so the post-assertions cannot be satisfied by the pre-state.
+3. Invokes the SHIPPED function directly: `db._set_sqlite_pragmas(dbapi_conn, None)`.
+4. Asserts the listener RAISED each pragma: `journal_mode==wal`,
+   `busy_timeout==CAO_DB_BUSY_TIMEOUT_MS` (and `>=5000`), `synchronous==1` (NORMAL).
+
+Because busy_timeout starts at 0 (not the vacuous 5000 default), dropping the
+`PRAGMA busy_timeout` line now leaves it at 0 and the assertion fails.
+
+**Mutation proof (RAN):**
+- Baseline `database.py` sha256 = `3013a8fb0b4bc65ad8d361630ea99a3daa20b664744aece419c7abbff77e56ae`.
+- Dropped the `cursor.execute(f"PRAGMA busy_timeout={CAO_DB_BUSY_TIMEOUT_MS}")` line from `_set_sqlite_pragmas`:
+  ```
+  CI=1 uv run pytest test/clients/test_f554_sqlite_concurrent_writes.py::test_production_connect_listener_sets_wal_and_busy_timeout -p no:suite_slot -n0 -q
+  => 1 failed
+     assert 0 == 5000
+      +  where 0 = int(0)     # test/clients/test_f554_sqlite_concurrent_writes.py:164
+  ```
+  MUTANT KILLED (r2: mutant SURVIVED / 3 passed).
+- Restored byte-identical: `database.py` sha256 = `3013a8fb0b4bc65ad8d361630ea99a3daa20b664744aece419c7abbff77e56ae` (unchanged), `git status` shows only the test file modified.
+- Post-restore: `3 passed`.
+
+### S1 (SHOULD) fix — net-new mypy --strict = 0 on the touched file
+
+The r2 rewrite's `int(...)` on `.scalar()` (`Any | None`) produced 2 net-new
+`[arg-type]` errors. The r3 rewrite reads pragmas via a raw cursor
+(`.fetchone()[0]`), so those are gone; the only net-new error the raw-connection
+approach introduced was `[union-attr]` on `raw.driver_connection` (`Any | None`),
+fixed with `assert dbapi_conn is not None` immediately after the assignment.
+
+Baseline (r1 tip `7f9b7db5`, `git show 7f9b7db5:…` through the same checker):
+**8 errors** = {`[import-untyped]`×2, `[no-untyped-def]`×6}, zero `[arg-type]`, zero `[union-attr]`.
+HEAD (r3): **8 errors** = {`[import-untyped]`×2, `[no-untyped-def]`×6} — identical multiset.
+**Net-new = 0.**
+
+### Verification (RAN)
+
+- Targeted isolation `-n0`:
+  `CI=1 uv run pytest test/clients/test_f554_sqlite_concurrent_writes.py -p no:suite_slot -n0 -q` → **3 passed**.
+- `mypy --strict test/clients/test_f554_sqlite_concurrent_writes.py` → 8 errors, net-new 0 vs baseline (above).
+- `black --check` + `isort --check-only` on the touched file → clean (1 file unchanged).
+- Scoped xdist B1 config:
+  `CI=1 uv run pytest test/clients -n 2 --dist loadgroup -p no:suite_slot -q` → **381 passed, 1 skipped, 0 failures** (27.77s).
+  - NOTE: a first attempt produced 302 collection ERRORS
+    (`FileNotFoundError: .../pytest-tmp/popen-gwN`) — a PRE-EXISTING race in the
+    `test.plugins.basetemp_offload` prune (KEEP=3) against xdist worker tmpdirs on a
+    stale/accumulated `/data/cao-scratch/pytest-tmp`, NOT a test/product fault.
+    Confirmed by re-running green two ways: (a) fresh isolated basetemp
+    (`CAO_PYTEST_BASETEMP=/data/cao-scratch/f554-r3-ptmp CAO_PYTEST_BASETEMP_KEEP=200`)
+    → 381 passed/1 skipped; (b) after `rm -rf /data/cao-scratch/pytest-tmp` with the
+    default basetemp → 381 passed/1 skipped.
+
+### r3 diff --stat
+
+```
+ test/clients/test_f554_sqlite_concurrent_writes.py | 88 +++++++++++++++++-----
+ 1 file changed, 70 insertions(+), 18 deletions(-)
+```
+(plus the force-added, gitignored build report)
+
+### r3 containment / box-actions ledger
+
+No offload-box work this round. All commands ran on the laptop in the provisioned
+worktree `/data/cao-scratch/wt-f554-r3` (lane branch `cao/c8f4e63d`); scratch under
+`/data/cao-scratch/c8f4e63d` and `/data/cao-scratch/f554-r3-ptmp`; no `/tmp`;
+`/data` mounted. Targeted + one scoped-xdist `test/clients` slice only; no laptop
+full suite. All transient product mutations (busy_timeout drop) were applied ONLY
+to exercise the gate and restored byte-identical, verified by sha256. Never touched
+`~/` or `~/.claude`.
