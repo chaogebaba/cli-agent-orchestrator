@@ -54,6 +54,19 @@ _FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
 )
 _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 
+# F541 (#397): POST /sessions/start latency is bounded by provider init
+# (cold Claude Code + MCP startup after a reboot), NOT by an MCP request, so
+# the 30s ``mcp_request_timeout`` is the wrong bound — it fired mid-launch and
+# a successful-but-slow cold launch was reported as a connection failure. Use
+# a launch-specific read timeout, and on a read timeout poll the session
+# instead of failing (the seat is usually already up).
+SESSION_START_TIMEOUT_S = 120
+# Bounded confirm-then-attach poll after a read timeout: how long to keep
+# asking GET /sessions/<name> whether the supervisor terminal came up, and how
+# often. ~120s total at a 2s cadence.
+SESSION_START_POLL_TIMEOUT_S = 120
+SESSION_START_POLL_INTERVAL_S = 2
+
 
 def _parse_env_pairs(pairs):
     """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
@@ -96,6 +109,142 @@ def _parse_env_pairs(pairs):
             )
         result[key] = value
     return result
+
+
+def _poll_session_supervisor_after_timeout(session_name):
+    """F541 (#397): after a read timeout on POST /sessions/start, confirm the
+    launch actually succeeded by polling ``GET /sessions/<session_name>``.
+
+    The read timeout does not mean the launch failed — a cold post-reboot
+    provider init routinely takes longer than the request read timeout while
+    the server goes on to create the supervisor terminal and bring the seat up
+    healthy (issue #397 incident). So instead of reporting a failure, poll the
+    session for up to ``SESSION_START_POLL_TIMEOUT_S`` and, the moment its
+    supervisor terminal exists, return a terminal dict shaped like the one the
+    POST would have returned so the caller can continue the normal path.
+
+    Returns the supervisor terminal dict on success, or ``None`` if the
+    supervisor never appeared within the bound (launch still initializing or
+    genuinely failed). A 404 while polling is not fatal — the session row may
+    not be visible yet — so it is treated the same as "not ready yet". A
+    connection error while polling IS surfaced (the server is unreachable, a
+    different failure class from a slow launch).
+
+    Raises ``requests.exceptions.RequestException`` if the server becomes
+    unreachable during polling.
+    """
+    if not session_name:
+        # Without a caller-supplied session name we cannot address the poll;
+        # the server would have minted one, but it is only returned in the POST
+        # response we never received. Signal "cannot confirm" to the caller.
+        return None
+
+    deadline = time.monotonic() + SESSION_START_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            resp = cao_http.get(
+                f"/sessions/{session_name}",
+                timeout=get_server_settings()["mcp_request_timeout"],
+            )
+        except requests.exceptions.RequestException:
+            # Server unreachable — a genuinely different failure from a slow
+            # launch. Propagate so the caller reports "server unreachable".
+            raise
+        if resp.status_code == 404:
+            # Session row not visible yet; keep waiting.
+            time.sleep(SESSION_START_POLL_INTERVAL_S)
+            continue
+        if resp.status_code >= 400:
+            time.sleep(SESSION_START_POLL_INTERVAL_S)
+            continue
+        try:
+            payload = resp.json()
+        except ValueError:
+            time.sleep(SESSION_START_POLL_INTERVAL_S)
+            continue
+        terminals = payload.get("terminals") or []
+        if terminals:
+            # The supervisor terminal exists — the launch succeeded. Return the
+            # first terminal (the supervisor) with fields the caller needs.
+            supervisor = terminals[0]
+            session_info = payload.get("session") or {}
+            resolved_session = (
+                supervisor.get("session_name") or session_info.get("id") or session_name
+            )
+            return {
+                "id": supervisor["id"],
+                "name": supervisor.get("name", supervisor["id"]),
+                "session_name": resolved_session,
+            }
+        time.sleep(SESSION_START_POLL_INTERVAL_S)
+    return None
+
+
+def _finish_launch_after_start(terminal, *, headless, message, is_async):
+    """Attach to the launched session (or send the message in headless mode).
+
+    Extracted so both the normal POST path and the F541 (#397) read-timeout
+    confirm-then-attach path share exactly one post-start behavior. ``terminal``
+    must carry ``id``, ``name``, and ``session_name``.
+
+    Attach to tmux session unless headless. Wait for the provider to finish
+    initializing first — otherwise tmux attach races with the TUI's input
+    handler wiring, resizes the pty mid-init, and the TUI silently drops
+    keystrokes (issue #220). The wait is advisory: if it times out we still
+    attach so the user can inspect the half-initialized session rather than
+    orphan it in tmux.
+    """
+    if not headless:
+        # Align the CLI's backend singleton with the running server. Without
+        # this, ``cao-server --terminal herdr`` + no config.json entry causes
+        # the CLI to default to tmux. See issue #308.
+        sync_backend_from_server()
+        ready = wait_until_terminal_status(
+            terminal["id"],
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=120,
+        )
+        if not ready:
+            click.echo(
+                click.style(
+                    f"  Warning: {terminal['id']} did not reach idle within 120s — "
+                    "attaching anyway; input may be unreliable until init completes.",
+                    fg="yellow",
+                )
+            )
+        get_backend().attach_session(terminal["session_name"])
+    elif message:
+        ready = wait_until_terminal_status(
+            terminal["id"],
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=120,
+        )
+        if not ready:
+            raise click.ClickException(
+                f"Conductor {terminal['id']} did not become ready within 120s"
+            )
+        request_timeout = get_server_settings()["mcp_request_timeout"]
+        response = cao_http.post(
+            f"/terminals/{terminal['id']}/input",
+            params={"message": message},
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        time.sleep(3)
+        if is_async:
+            click.echo(f"Message sent to {terminal['name']}. Running in background.")
+            return
+        poll_until_done(terminal["id"], timeout=300)
+        request_timeout = get_server_settings()["mcp_request_timeout"]
+        output_resp = cao_http.get(
+            f"/terminals/{terminal['id']}/output",
+            params={"mode": "last"},
+            timeout=request_timeout,
+        )
+        output_resp.raise_for_status()
+        output = output_resp.json().get("output", "")
+        if output:
+            click.echo(output)
 
 
 @click.command()
@@ -329,13 +478,53 @@ def launch(
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        request_timeout = get_server_settings()["mcp_request_timeout"]
-        post_kwargs: dict = {"params": params, "timeout": request_timeout}
+        #
+        # F541 (#397): the read timeout here is launch-specific (~120s), NOT
+        # ``mcp_request_timeout`` (30s) — POST /sessions/start latency is
+        # bounded by provider init, not by an MCP request. On a read timeout we
+        # confirm-then-attach: poll the session and, if the supervisor terminal
+        # came up, continue the normal success path rather than reporting a
+        # failure for a launch that actually succeeded.
+        post_kwargs: dict = {"params": params, "timeout": SESSION_START_TIMEOUT_S}
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
-        response = cao_http.post(url, **post_kwargs)
         from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
+
+        try:
+            response = cao_http.post(url, **post_kwargs)
+        except requests.exceptions.Timeout:
+            # The launch did not fail — provider init simply outran the read
+            # timeout. Poll the session to confirm the supervisor came up.
+            click.echo(
+                "Launch is still initializing (server did not respond within "
+                f"{SESSION_START_TIMEOUT_S}s); confirming the session came up...",
+                err=True,
+            )
+            try:
+                confirmed = _poll_session_supervisor_after_timeout(session_name)
+            except requests.exceptions.RequestException as e:
+                raise click.ClickException(
+                    f"cao-server became unreachable while confirming the launch: {e}"
+                )
+            if confirmed is None:
+                target = f" '{session_name}'" if session_name else ""
+                raise click.ClickException(
+                    f"Launch of session{target} is still initializing after "
+                    f"{SESSION_START_POLL_TIMEOUT_S}s and could not be confirmed. "
+                    "The server is reachable but the supervisor terminal has not "
+                    "come up yet — check `cao status` shortly, or attach manually."
+                )
+            terminal = confirmed
+            click.echo(f"Session created: {terminal['session_name']}")
+            click.echo(f"Terminal created: {terminal['name']}")
+            _finish_launch_after_start(
+                terminal,
+                headless=headless,
+                message=message,
+                is_async=is_async,
+            )
+            return
 
         start_error = None
         try:
@@ -368,63 +557,12 @@ def launch(
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
 
-        # Attach to tmux session unless headless. Wait for the provider to
-        # finish initializing first — otherwise tmux attach races with the
-        # TUI's input handler wiring, resizes the pty mid-init, and the TUI
-        # silently drops keystrokes. See issue #220. The wait is advisory:
-        # if it times out we still attach so the user can inspect the
-        # half-initialized session rather than orphan it in tmux.
-        if not headless:
-            # Align the CLI's backend singleton with the running server.
-            # Without this, ``cao-server --terminal herdr`` + no config.json
-            # entry causes the CLI to default to tmux. See issue #308.
-            sync_backend_from_server()
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                click.echo(
-                    click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
-                        fg="yellow",
-                    )
-                )
-            get_backend().attach_session(terminal["session_name"])
-        elif message:
-            ready = wait_until_terminal_status(
-                terminal["id"],
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
-            )
-            if not ready:
-                raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
-                )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = cao_http.post(
-                f"/terminals/{terminal['id']}/input",
-                params={"message": message},
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            time.sleep(3)
-            if is_async:
-                click.echo(f"Message sent to {terminal['name']}. Running in background.")
-                return
-            poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
-            output_resp = cao_http.get(
-                f"/terminals/{terminal['id']}/output",
-                params={"mode": "last"},
-                timeout=request_timeout,
-            )
-            output_resp.raise_for_status()
-            output = output_resp.json().get("output", "")
-            if output:
-                click.echo(output)
+        _finish_launch_after_start(
+            terminal,
+            headless=headless,
+            message=message,
+            is_async=is_async,
+        )
 
     except click.exceptions.Exit:
         raise
