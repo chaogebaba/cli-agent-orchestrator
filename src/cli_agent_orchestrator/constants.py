@@ -440,6 +440,16 @@ def overlays_store_dir() -> Path:
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
+# F554 (#410): SQLite writer-contention hardening for the shared ORM engine.
+# Default journal_mode=DELETE takes a whole-database exclusive lock for every
+# write and, with no busy_timeout, a concurrent writer fails INSTANTLY with
+# "database is locked" instead of waiting. Under concurrent assigns this killed
+# workers in deferred init. WAL lets readers and a single writer coexist;
+# busy_timeout makes a would-be writer WAIT (in the C layer) instead of raising.
+# busy_timeout is per-connection; journal_mode=WAL is a persistent per-database
+# property (set idempotently on every connect). >=5s per the issue.
+CAO_DB_BUSY_TIMEOUT_MS = 5000
+
 # =============================================================================
 # Server Configuration
 # =============================================================================

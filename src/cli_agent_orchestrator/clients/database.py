@@ -41,7 +41,12 @@ from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred,
 from sqlalchemy.orm.exc import DetachedInstanceError, ObjectDeletedError, StaleDataError
 from tzlocal import get_localzone
 
-from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import (
+    CAO_DB_BUSY_TIMEOUT_MS,
+    DATABASE_URL,
+    DB_DIR,
+    DEFAULT_PROVIDER,
+)
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import RecoveryState, TerminalStatus
@@ -1399,6 +1404,36 @@ _fence_production_db()
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+# F554 (#410): Set SQLite pragmas on EVERY connection the pool opens.
+#
+# Proven root cause of the deferred-init "database is locked" death: this shared
+# ORM engine set NEITHER journal_mode=WAL NOR busy_timeout on connect (grep-
+# confirmed: no prior engine "connect" listener existed). Default
+# journal_mode=DELETE takes a whole-database exclusive lock for the duration of
+# any write, and with no busy_timeout a concurrent writer gets SQLITE_BUSY
+# ("database is locked") returned INSTANTLY from the C layer rather than
+# waiting. Under concurrent assigns (2 kiro_reviewer + 4 kiro_dev + secretary in
+# the incident) the deferred-init ready-commit lost that race and the worker died.
+#
+# Fix, applied once per physical connection (pysqlite has no bound-parameter form
+# for PRAGMA, so the interpolated value comes from a trusted constant only):
+#   - journal_mode=WAL   : readers and a single writer coexist; writers no longer
+#                          need a whole-db exclusive lock (persistent per-db).
+#   - busy_timeout=>=5s   : a would-be writer WAITS inside SQLite up to this long
+#                          for the lock instead of raising immediately.
+#   - synchronous=NORMAL : the safe/standard durability level to pair with WAL.
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute(f"PRAGMA busy_timeout={CAO_DB_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cursor.close()
+
 
 # F413 D6: Register session-level listeners for doorbell drain / rollback clear.
 event.listen(SessionLocal, "after_commit", _f413_after_commit)
@@ -5071,6 +5106,19 @@ def _clear_progress_fence(fence_fn, terminal_id: str) -> None:
         )
 
 
+def _is_sqlite_busy_error(exc: BaseException) -> bool:
+    """True iff the exception is a SQLite busy/locked contention error.
+
+    Shared by the deferred-init write paths so a transient writer-contention
+    error is retried rather than surfaced. A missing busy_timeout used to make
+    these fire instantly under concurrent assigns (F554/#410).
+    """
+    if not isinstance(exc, OperationalError):
+        return False
+    text_l = str(exc).lower()
+    return "database is locked" in text_l or "database is busy" in text_l
+
+
 def mark_terminal_init_ready(
     terminal_id: str,
     *,
@@ -5078,8 +5126,47 @@ def mark_terminal_init_ready(
     decide_commit: Optional[Callable[[], bool]] = None,
     commit_is_decided: Optional[Callable[[], bool]] = None,
     on_committed: Optional[Callable[[], None]] = None,
+    busy_attempts: int = 4,
+    busy_delay_s: float = 0.025,
 ) -> bool:
     """Commit pending-to-ready only while the abandonment fence owns it.
+
+    F554 (#410): the single ready-commit attempt is wrapped in a bounded
+    SQLITE_BUSY retry — mirroring ``claim_deferred_init_failure`` — so a
+    concurrent writer that momentarily holds the lock (despite WAL +
+    busy_timeout) does not kill the deferred init. Only pure busy/locked
+    ``OperationalError``s are retried; every other outcome (veto, invariant
+    breach, abandonment interrupt, success) is returned/raised on the first
+    attempt exactly as before.
+    """
+    for attempt in range(busy_attempts):
+        try:
+            return _mark_terminal_init_ready_once(
+                terminal_id,
+                should_commit=should_commit,
+                decide_commit=decide_commit,
+                commit_is_decided=commit_is_decided,
+                on_committed=on_committed,
+            )
+        except OperationalError as exc:
+            if not _is_sqlite_busy_error(exc):
+                raise
+            if attempt + 1 >= busy_attempts:
+                raise
+            time.sleep(busy_delay_s)
+    # Unreachable: the loop either returns or raises on the final attempt.
+    raise RuntimeError("mark_terminal_init_ready_busy_exhausted")
+
+
+def _mark_terminal_init_ready_once(
+    terminal_id: str,
+    *,
+    should_commit: Optional[Callable[[], bool]] = None,
+    decide_commit: Optional[Callable[[], bool]] = None,
+    commit_is_decided: Optional[Callable[[], bool]] = None,
+    on_committed: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Single pending-to-ready commit attempt (see ``mark_terminal_init_ready``).
 
     SQLite's progress handler is part of the transaction execution path.  It
     closes the interval between the last Python guard and the real COMMIT: a
