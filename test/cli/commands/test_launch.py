@@ -1217,3 +1217,24 @@ def test_launch_read_timeout_without_session_name_cannot_confirm():
         assert result.exit_code != 0
         assert "could not be confirmed" in result.output
         mock_get.assert_not_called()
+
+
+# ── F541 (#397) r2: poll window must outlast the server init ceiling ──
+
+
+def test_launch_poll_window_covers_server_init_ceiling():
+    """The CLI confirm-then-attach poll bound must be >= the server's init
+    ceiling + margin, or the CLI gives up before the server does (#397).
+
+    claude_code's server-side init cap default is 180s (claude_code_init_timeout);
+    the poll bound and the POST read timeout are set to init_ceiling + 60s = 240s.
+    """
+    from cli_agent_orchestrator.cli.commands.launch import (
+        SESSION_START_POLL_TIMEOUT_S,
+        SESSION_START_TIMEOUT_S,
+    )
+
+    server_init_ceiling = 180  # claude_code_init_timeout default
+    margin = 60
+    assert SESSION_START_POLL_TIMEOUT_S >= server_init_ceiling + margin
+    assert SESSION_START_TIMEOUT_S >= server_init_ceiling + margin

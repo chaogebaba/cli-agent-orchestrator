@@ -60,11 +60,20 @@ _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 # a successful-but-slow cold launch was reported as a connection failure. Use
 # a launch-specific read timeout, and on a read timeout poll the session
 # instead of failing (the seat is usually already up).
-SESSION_START_TIMEOUT_S = 120
+#
+# The bound must exceed the SERVER's init ceiling + margin, or the CLI gives up
+# before the server does. claude_code's server-side init cap is now
+# ``claude_code_init_timeout`` (default 180s; the longest of any provider — see
+# settings_service._SERVER_DEFAULTS), so both the read timeout and the poll
+# window are set to init_ceiling(180) + 60s margin = 240s. Keep them a flat
+# constant (not read from server settings) so the CLI has no extra round trip
+# before it can even talk to the server; 240s comfortably covers the 180s
+# default plus any modestly-raised override.
+SESSION_START_TIMEOUT_S = 240
 # Bounded confirm-then-attach poll after a read timeout: how long to keep
 # asking GET /sessions/<name> whether the supervisor terminal came up, and how
-# often. ~120s total at a 2s cadence.
-SESSION_START_POLL_TIMEOUT_S = 120
+# often. ~240s total at a 2s cadence — >= server init ceiling (180s) + 60s.
+SESSION_START_POLL_TIMEOUT_S = 240
 SESSION_START_POLL_INTERVAL_S = 2
 
 

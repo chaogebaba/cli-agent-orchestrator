@@ -357,13 +357,40 @@ class ClaudeCodeProvider(BaseProvider):
     # F127: claude_code uses Escape to interrupt
     interrupt_keys: list[str] = ["Escape"]
 
+    def get_init_timeout(self, profile: "Optional[AgentProfile]" = None) -> int:
+        """Resolve the init timeout for Claude Code (#397).
+
+        Precedence, highest first:
+          1. a per-profile ``provider_init_timeout`` override (unchanged — the
+             existing per-profile mechanism still wins, e.g. containerized
+             profiles);
+          2. the claude_code-specific ``claude_code_init_timeout`` setting
+             (default 180s, settable via settings.json / CAO_CLAUDE_CODE_INIT_TIMEOUT);
+          3. the base resolution (global ``provider_init_timeout``, 60s).
+
+        Claude Code cold start (fresh MCP + Ink TUI, first launch after a
+        reboot) routinely renders a ready status well past the 60s global
+        default; that global default killed genuinely-healthy launches (same
+        defect class as F541). Only claude_code gets the longer default here —
+        other providers keep the 60s global via ``BaseProvider.get_init_timeout``.
+        """
+        if profile is not None and profile.provider_init_timeout is not None:
+            return profile.provider_init_timeout
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        settings = get_server_settings()
+        override = settings.get("claude_code_init_timeout")
+        if override is not None:
+            return int(override)
+        return super().get_init_timeout(profile)
+
     @property
     def resolved_model(self) -> "Optional[str]":
         """Return the effective model resolved during command build.
 
         Returns None for native_agent path (honest: CAO does not control model).
         """
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     def __init__(
         self,
@@ -605,6 +632,7 @@ class ClaudeCodeProvider(BaseProvider):
                         mcp_config[server_name]["env"] = env
                     if "CAO_TERMINAL_TOKEN" not in env:
                         import os as _os
+
                         _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
                         if _token:
                             env["CAO_TERMINAL_TOKEN"] = _token
@@ -1648,6 +1676,7 @@ class ClaudeCodeProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002h")
         return IDLE_PROMPT_PATTERN_LOG
 

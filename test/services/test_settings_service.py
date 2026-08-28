@@ -394,10 +394,30 @@ class TestGetServerSettings:
             "mcp_request_timeout": 30,
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
+            "claude_code_init_timeout": 180,
             "startup_prompt_handler_timeout": 20,
             "artifact_validate_deadline_s": 60.0,
             "state_buffer_max": 32768,
         }
+
+    def test_claude_code_init_timeout_default_is_180(self, settings_file):
+        """F541 (#397): claude_code gets a longer init cap than the 60s global."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        result = get_server_settings()
+        assert result["claude_code_init_timeout"] == 180
+        # The global default is unchanged — other providers keep 60s.
+        assert result["provider_init_timeout"] == 60
+
+    def test_claude_code_init_timeout_is_user_settable(self, settings_file):
+        """The knob is settable via settings.json (env override covered by the
+        shared _SERVER_ENV_VARS mechanism)."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"claude_code_init_timeout": 240}})
+        result = get_server_settings()
+        assert result["claude_code_init_timeout"] == 240
+        assert result["provider_init_timeout"] == 60
 
     def test_reads_custom_values(self, settings_file):
         """Reads custom values from settings.json."""

@@ -1893,6 +1893,7 @@ class TestClaudeCodeProviderEffortFlag:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_real_seed_applies_design_reviewer_effort(self, mock_load, tmp_path, monkeypatch):
         from test.conftest import ROOT_REPO
+
         if ROOT_REPO is None:
             pytest.skip("providers.toml.default not found (worktree without .git context)")
         outer_template = ROOT_REPO / "providers.toml.default"
@@ -1907,7 +1908,9 @@ class TestClaudeCodeProviderEffortFlag:
         mock_load.return_value = self._profile(name="claude_design_reviewer")
 
         args = shlex.split(
-            ClaudeCodeProvider("tid", "sess", "win", "claude_design_reviewer")._build_claude_command()
+            ClaudeCodeProvider(
+                "tid", "sess", "win", "claude_design_reviewer"
+            )._build_claude_command()
         )
 
         assert args[args.index("--effort") + 1] == "high"
@@ -2994,3 +2997,62 @@ class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
     def test_blocks_orchestrated_input_while_waiting_user_answer(self):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+# F541 (#397): claude_code-specific init-timeout default
+_CC_SETTINGS_FN = "cli_agent_orchestrator.services.settings_service.get_server_settings"
+
+
+class TestClaudeCodeInitTimeout:
+    """ClaudeCodeProvider.get_init_timeout override (#397).
+
+    claude_code cold start (fresh MCP + Ink TUI) routinely exceeds the 60s
+    global provider_init_timeout, which killed genuinely-healthy launches
+    (same defect class as F541). claude_code gets a longer default via the
+    claude_code_init_timeout setting; a per-profile override still wins; other
+    providers are unaffected.
+    """
+
+    def _provider(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def test_default_uses_claude_code_init_timeout_180(self):
+        """With no profile, claude_code resolves the 180s claude_code default,
+        NOT the 60s global provider_init_timeout."""
+        with patch(
+            _CC_SETTINGS_FN,
+            return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 180},
+        ):
+            assert self._provider().get_init_timeout() == 180
+
+    def test_profile_without_override_still_uses_claude_code_default(self):
+        profile = AgentProfile(name="a", description="d")
+        with patch(
+            _CC_SETTINGS_FN,
+            return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 180},
+        ):
+            assert self._provider().get_init_timeout(profile) == 180
+
+    def test_per_profile_override_still_wins(self):
+        """The existing per-profile provider_init_timeout override wins over the
+        claude_code-specific default (e.g. containerized profiles)."""
+        profile = AgentProfile(name="a", description="d", provider_init_timeout=300)
+        with patch(
+            _CC_SETTINGS_FN,
+            return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 180},
+        ):
+            assert self._provider().get_init_timeout(profile) == 300
+
+    def test_user_settable_override_of_claude_code_default(self):
+        """The claude_code default is user-settable (settings.json / env)."""
+        with patch(
+            _CC_SETTINGS_FN,
+            return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 90},
+        ):
+            assert self._provider().get_init_timeout() == 90
+
+    def test_falls_back_to_global_when_claude_code_key_absent(self):
+        """If the claude_code_init_timeout key is somehow absent, fall back to
+        the base resolution (global provider_init_timeout)."""
+        with patch(_CC_SETTINGS_FN, return_value={"provider_init_timeout": 60}):
+            assert self._provider().get_init_timeout() == 60
