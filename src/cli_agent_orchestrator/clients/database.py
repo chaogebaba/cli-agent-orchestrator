@@ -531,6 +531,16 @@ class InboxMessageTraceEventModel(Base):
             "decision",
             sqlite_where=text("phase IS NOT NULL"),
         ),
+        # F524 (#379) S1: at most ONE f524.stall_surfaced row per message, so the
+        # one-shot sender notice cannot be duplicated by a concurrent sweep or a
+        # crash-between-commits. Partial (kind-scoped) so every other trace kind
+        # stays append-only / multi-row as before.
+        Index(
+            "uq_inbox_trace_f524_stall_surfaced",
+            "message_id",
+            unique=True,
+            sqlite_where=text("kind = 'f524.stall_surfaced'"),
+        ),
     )
 
 
@@ -5609,6 +5619,52 @@ def record_message_trace_event(
             )
         )
         db.commit()
+
+
+def claim_message_trace_once(
+    message_id: int,
+    kind: str,
+    *,
+    phase: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    """Atomically stamp a one-shot trace event; return True iff THIS call won.
+
+    F524 (#379) S1: the stall-surfacing side effect must fire at most once per
+    message even under a concurrent reconcile sweep or a crash between the old
+    check and stamp. This collapses check+stamp into a single atomic INSERT
+    guarded by the partial unique index ``uq_inbox_trace_f524_stall_surfaced``
+    (for ``kind == 'f524.stall_surfaced'``). A losing racer sees the
+    ``IntegrityError`` and returns ``False`` without inserting a duplicate.
+
+    The caller stamps FIRST and only performs the observable side effect (the
+    sender notice) when it wins the claim. A crash after the commit but before
+    the side effect loses one notice — never duplicates one — and the row stays
+    PENDING with its banner armed, so the failure mode is degradation, not a
+    duplicated instruction.
+
+    For kinds NOT covered by a unique index this degenerates to a plain insert
+    that always returns True (no uniqueness to enforce).
+    """
+    with SessionLocal() as db:
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=message_id,
+                kind=kind,
+                phase=phase,
+                decision=decision,
+                reason=reason,
+                payload=payload or {},
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return False
+        return True
 
 
 def list_pending_receiver_ids_with_terminal() -> List[str]:

@@ -58,9 +58,8 @@ from cli_agent_orchestrator.clients.database import (
     list_stale_open_claude_attempts,
     make_admission_proof,
     merge_wpm1_attempt_evidence,
-    message_has_trace_kind,
+    claim_message_trace_once,
     messages_with_trace_kind,
-    record_message_trace_event,
     record_wpm1_stalled_notice,
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
@@ -3437,13 +3436,13 @@ class InboxService:
         surfaced = 0
         for message in stalled:
             try:
-                # Idempotent: one notice per message, even across many sweeps.
-                if message_has_trace_kind(message.id, F524_STALL_SURFACED_KIND):
-                    continue
-
-                # Receiver status is advisory context for the operator; a stall
-                # only matters while the row is genuinely undelivered, which the
-                # PENDING filter already guarantees.
+                # S1 (atomic one-shot): claim the surface FIRST via an
+                # insert-or-ignore guarded by the partial unique index. If we do
+                # not win the claim, another sweep already surfaced this message
+                # (or is mid-flight) — skip without sending a duplicate notice.
+                # Stamping before the observable side effect means a crash after
+                # the commit loses at most one notice; it never duplicates one.
+                receiver_status = None
                 try:
                     receiver_status = status_monitor.get_status(message.receiver_id)
                     status_label = (
@@ -3458,6 +3457,25 @@ class InboxService:
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=timezone.utc)
                 age_s = int((_utcnow() - created_at).total_seconds())
+
+                won = claim_message_trace_once(
+                    message.id,
+                    F524_STALL_SURFACED_KIND,
+                    phase="stall_surfaced",
+                    decision="notify_sender",
+                    reason="direct_delivery_stalled",
+                    payload={
+                        "receiver_id": message.receiver_id,
+                        "sender_id": message.sender_id,
+                        "age_s": age_s,
+                        "receiver_status": status_label,
+                        "escalate_after_s": int(escalate_after_s),
+                    },
+                )
+                if not won:
+                    # Already surfaced by a prior/concurrent sweep — no duplicate.
+                    continue
+
                 preview = (message.message or "").split("\n", 1)[0][:120]
                 body = (
                     f"[delivery-stall] Your send_message (id {message.id}) to terminal "
@@ -3479,20 +3497,6 @@ class InboxService:
                     f"message-trace:{message.receiver_id}",
                     message.sender_id,
                     body,
-                )
-                record_message_trace_event(
-                    message.id,
-                    F524_STALL_SURFACED_KIND,
-                    phase="stall_surfaced",
-                    decision="notify_sender",
-                    reason="direct_delivery_stalled",
-                    payload={
-                        "receiver_id": message.receiver_id,
-                        "sender_id": message.sender_id,
-                        "age_s": age_s,
-                        "receiver_status": status_label,
-                        "escalate_after_s": int(escalate_after_s),
-                    },
                 )
                 surfaced += 1
                 logger.warning(
