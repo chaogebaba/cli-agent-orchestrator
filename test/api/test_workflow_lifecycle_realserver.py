@@ -61,7 +61,6 @@ Style: pytest parity with ``test/api/``; black + isort (line 100). Additive, tes
 
 from __future__ import annotations
 
-import os
 import time
 import uuid
 from pathlib import Path
@@ -70,8 +69,6 @@ from typing import Optional
 
 import pytest
 import requests
-
-from cli_agent_orchestrator.constants import CAO_HOME_DIR, WORKFLOW_SPEC_DIR
 
 pytestmark = pytest.mark.integration
 
@@ -106,15 +103,19 @@ _SCRIPT_LONG = "import time\ntime.sleep(120)\n"
 def _spec_dir(server: CaoServer) -> Path:
     """The server subprocess's own ``WORKFLOW_SPEC_DIR`` under its isolated ``$HOME``.
 
-    An explicit ``CAO_HOME_DIR`` is inherited unchanged by the subprocess and
-    already reflected in the shared constant. Otherwise, map the constant's
-    home-relative path under the fixture's redirected ``$HOME``. In either case,
-    a spec written here lands on the SAME disk path the subprocess resolves.
+    The subprocess resolves ``WORKFLOW_SPEC_DIR`` against its OWN environment,
+    and the ``cao_server`` fixture deliberately (a) redirects ``$HOME`` to
+    ``server.home_dir`` and (b) STRIPS ``CAO_HOME_DIR`` / ``CAO_HOME`` from the
+    child env (``cao_server._subprocess_env``). So the child always falls back
+    to the ``$HOME/.aws/cli-agent-orchestrator/workflows`` layout regardless of
+    whatever ``CAO_HOME_DIR`` the TEST process carries (``test/conftest.py`` sets
+    one to keep the suite off the production DB — but that override never reaches
+    the child). We must therefore write the spec at the child's redirected-``$HOME``
+    location, NOT at the test process's ``WORKFLOW_SPEC_DIR`` (that mismatch was
+    the af15b36d upstream-merge regression: the child 404'd because the spec was
+    written under the test process's ``CAO_HOME_DIR`` instead of its own ``$HOME``).
     """
-    if os.environ.get("CAO_HOME_DIR", "").strip():
-        return WORKFLOW_SPEC_DIR
-    # Fallback only when CAO_HOME_DIR is unset; constant is home-derived at import.
-    return server.home_dir / WORKFLOW_SPEC_DIR.relative_to(CAO_HOME_DIR.parent.parent)
+    return server.home_dir / ".aws" / "cli-agent-orchestrator" / "workflows"
 
 
 def _write_script_spec(server: CaoServer, source: str, name: str) -> str:
