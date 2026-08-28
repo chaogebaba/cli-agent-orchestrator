@@ -8,7 +8,8 @@
 | Branch | `cao/e08be272` (isolated worktree `e08be272`) |
 | F541 commit | `a2f446a1` — `F541: launch confirm-then-attach on slow cold start (#397)` |
 | F542 commit | `e2406a47` — `F542: reconcile dead-tmux-session terminal rows at startup (#398)` |
-| Report commit | `F541/F542: build report` (this file) |
+| F541 init-timeout commit | `97260c50` — `F541: provider_init_timeout default 180s for claude_code cold start (#397)` |
+| Report commits | `b6eacf44` (`F541/F542: build report`) + `F541/F542: build report r2` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -140,6 +141,94 @@ Environmental, unrelated to F541/F542.
   verified byte-identical in base `f6c35046` — pre-existing baseline noise in a
   function I did not touch. I reverted isort's reorder of it to keep my diff
   scoped; it can be fixed separately if a fully isort-clean file is desired.
+
+---
+
+## r2 addendum — F541: claude_code cold-start init timeout (commit `97260c50`)
+
+**Motivation.** grok-box-3 e2e reproduced a server 500
+`Claude Code initialization timed out after 60s` (session rolled back) on this
+branch. Investigation (message 1435) established the cause is NOT the F541/F542
+diff but the UNCHANGED 60s global `provider_init_timeout`: Claude Code cold
+start renders a ready status past 60s, so `create_terminal` tore a
+genuinely-healthy launch down. Supervisor classified this as the SAME defect as
+F541 (a cold launch killed by a timeout unrelated to real latency) and directed
+a fix.
+
+### Acceptance-criteria checklist (r2)
+
+| # | AC (from #397, r2 directive) | How met | Evidence (file:line) |
+|---|---|---|---|
+| 1 | Raise the default init timeout for claude_code cold start. | claude_code now resolves a 180s default init cap instead of the 60s global. | new setting `claude_code_init_timeout: 180` `services/settings_service.py:244`; consumed by `ClaudeCodeProvider.get_init_timeout` `providers/claude_code.py:360-383` |
+| 2 | Prefer a claude_code-specific override so OTHER providers keep 60s (cite the per-provider mechanism). | The existing per-provider mechanism is `BaseProvider.get_init_timeout(profile)` (`providers/base.py:853`), which resolves a per-profile `AgentProfile.provider_init_timeout` override else the global setting. I extended it the idiomatic way: a provider-class override. `ClaudeCodeProvider.get_init_timeout` resolves profile-override → `claude_code_init_timeout` setting → `super()` (global). Only claude_code is changed; every other provider still hits `BaseProvider.get_init_timeout` → global 60s. | override `providers/claude_code.py:360-383`; base unchanged `providers/base.py:853-869`; global default still `provider_init_timeout: 60` `services/settings_service.py:237` |
+| 3 | Keep the knob user-settable. | `claude_code_init_timeout` is in `_SERVER_DEFAULTS` + `_SERVER_ENV_VARS` (env `CAO_CLAUDE_CODE_INIT_TIMEOUT`) and documented in `get_server_settings`. Settable via settings.json `server` block or the env var, same precedence as every other server setting (env > settings.json > default). A per-profile `provider_init_timeout` still overrides it. | default `services/settings_service.py:244`; env map `:268`; docstring `:289-295` |
+| 4 | Add/adjust the unit test asserting the resolved default. | New `TestClaudeCodeInitTimeout` (5 tests) asserts claude_code default=180, profile-without-override=180, per-profile override wins (300), user-settable (90), fallback to global when key absent (60). New settings tests assert default=180 and global stays 60, and the knob is settable (240). The pre-existing exact-defaults assertion in `test_returns_defaults_when_no_settings` was updated to include the new key (legitimate contract change). | `test/providers/test_claude_code_unit.py::TestClaudeCodeInitTimeout`; `test/services/test_settings_service.py::TestGetServerSettings::{test_returns_defaults_when_no_settings,test_claude_code_init_timeout_default_is_180,test_claude_code_init_timeout_is_user_settable}` |
+| 5 | CLI poll window >= server init timeout + margin (set to init_timeout+60 or flat 240). | `SESSION_START_POLL_TIMEOUT_S` and the POST read timeout `SESSION_START_TIMEOUT_S` both raised 120 → 240 (= claude_code ceiling 180 + 60s margin). Kept a flat constant (no extra round trip to read server settings before contacting the server). New test asserts both are >= 180 + 60. | `cli/commands/launch.py:72` (`SESSION_START_TIMEOUT_S = 240`), `:76` (`SESSION_START_POLL_TIMEOUT_S = 240`); rationale comment `:58-71`; test `test/cli/commands/test_launch.py::test_launch_poll_window_covers_server_init_ceiling` |
+
+### Design note (why the provider override, and the lazy-import subtlety)
+- The idiomatic per-provider seam here IS a `get_init_timeout` override — base
+  already centralises the resolution and claude_code already calls
+  `self.get_init_timeout(profile)` at `providers/claude_code.py:1053`. No new
+  wiring needed at the call sites.
+- The override lazy-imports `get_server_settings` INSIDE the method (mirroring
+  `BaseProvider.get_init_timeout`) rather than using the module-top import.
+  This is load-bearing: the existing `test_provider_init_timeout.py` suite
+  patches `settings_service.get_server_settings`, and a module-top bound name
+  would bypass that patch. With the lazy import, those tests still pass — when
+  their mock omits the `claude_code_init_timeout` key, the override falls
+  through to `super()` and returns the mocked global, preserving the base
+  contract they assert.
+
+### r2 test results (exact commands + verbatim summary lines)
+```
+$ uv run pytest test/providers/test_claude_code_unit.py::TestClaudeCodeInitTimeout \
+    test/services/test_settings_service.py test/cli/commands/test_launch.py -q
+151 passed in 11.12s
+```
+Broad regression sweep across everything r2 could affect (one deselect —
+pre-existing worktree-only install.sh test):
+```
+$ uv run pytest test/cli test/services/test_settings_service.py \
+    test/providers/test_claude_code_unit.py test/providers/test_provider_init_timeout.py \
+    test/providers/test_base_provider.py test/providers/test_container_wrapped.py \
+    test/services/test_f542_dead_session_reconcile.py test/clients/test_tmux_client.py -q \
+    --deselect test/cli/commands/test_config_reconcile.py::test_root_installer_delegates_without_toml_or_stanza_parsing
+1191 passed, 6 skipped in 39.88s
+```
+
+### r2 lint/type notes
+- black: clean (6 touched files unchanged after format).
+- isort: no new top-level imports in the touched source files (the override's
+  `get_server_settings` is a lazy in-function import).
+- mypy: my additions are error-free. `settings_service.py:866` reports one
+  pre-existing `no-any-return` in the UNRELATED `ensure_script` TUI helper
+  (present on base `f6c35046` at line 851, shifted by my added lines) — not
+  introduced by r2. `claude_code.py` / `launch.py` additions are clean.
+
+### r2 reviewer verification (detached worktree)
+```bash
+# claude_code resolves 180 by default; other providers keep 60:
+uv run python - <<'PY'
+from unittest.mock import patch
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.base import BaseProvider
+S = "cli_agent_orchestrator.services.settings_service.get_server_settings"
+with patch(S, return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 180}):
+    cc = ClaudeCodeProvider("t1", "s", "w")
+    print("claude_code default:", cc.get_init_timeout())          # 180
+    assert cc.get_init_timeout() == 180
+# a concrete non-claude provider (base resolution) stays on the 60s global:
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+with patch(S, return_value={"provider_init_timeout": 60, "claude_code_init_timeout": 180}):
+    # per-profile override still wins for claude_code:
+    assert cc.get_init_timeout(AgentProfile(name="a", description="d",
+                                            provider_init_timeout=300)) == 300
+print("r2 init-timeout resolution OK")
+PY
+# NOTE: the *unmocked* defaults depend on any local settings.json `server`
+# override, so assert the built-in defaults directly instead (env-independent):
+uv run python -c "from cli_agent_orchestrator.services.settings_service import _SERVER_DEFAULTS as d; print(d['claude_code_init_timeout'], d['provider_init_timeout']); assert d['claude_code_init_timeout']==180 and d['provider_init_timeout']==60"
+```
 
 ---
 
