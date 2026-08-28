@@ -62,6 +62,16 @@ class TestPersonaPlanningSeam:
         bind = MagicMock(return_value={})
         monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
         monkeypatch.setattr(terminal_service, "load_agent_profile", lambda name: profile)
+        # F557 (#412): the sandbox branch skips persona composition and reaches
+        # ClaudeCodeProvider.preflight_launch, which resolves the profile through
+        # its OWN module binding (providers.claude_code.load_agent_profile), not
+        # terminal_service's. Stub that binding too so preflight sees the same
+        # present profile and this test still exercises the "already exists" path
+        # rather than tripping E-PROFILE-NOT-FOUND first.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.load_agent_profile",
+            lambda name: profile,
+        )
         monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "persona-terminal")
         monkeypatch.setattr(terminal_service, "is_sandbox", lambda: True)
         monkeypatch.setattr(terminal_service, "bind_pane_identity", bind)
@@ -83,6 +93,7 @@ class TestPersonaPlanningSeam:
         assert "incarnation_token" in kwargs and isinstance(kwargs["incarnation_token"], str)
         warnings = [record for record in caplog.records if "shared-auth" in record.message]
         assert len(warnings) == 1
+
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 

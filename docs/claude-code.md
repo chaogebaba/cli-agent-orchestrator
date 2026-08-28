@@ -125,7 +125,7 @@ See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate
 
 When a CAO profile specifies a `native_agent` field, the provider passes `--agent <name>` directly to Claude Code's native agent store (`~/.claude/agents/`). This is a thin-wrapper mode where Claude Code handles all configuration (MCP servers, hooks, tools, model).
 
-If no CAO profile is found for the given agent name, the provider also falls back to `--agent <name>`, assuming it exists in the native store.
+If no CAO profile is found for the given agent name, a CAO-launched terminal now **fails loud** at create: `ClaudeCodeProvider.preflight_launch` raises `ProfileNotFoundError` (`E-PROFILE-NOT-FOUND`, surfaced as HTTP 400) naming the profile and the agent store searched — the bare name is never handed to Claude Code's native store. The `--agent <name>` passthrough is reached only via the explicit `native_agent:` profile field above.
 
 ```markdown
 ---

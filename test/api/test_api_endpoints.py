@@ -10,6 +10,7 @@ from datetime import datetime
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import (
     app,
@@ -931,6 +932,42 @@ class TestCreateTerminalInSession:
         assert detail["current_count"] == 10
         assert detail["cap"] == 10
         assert detail["reap_candidates"] == candidates
+
+    def test_create_terminal_missing_profile_returns_400_structured(
+        self, client: TestClient
+    ) -> None:
+        """F557 (#412) S2: ProfileNotFoundError maps to 400 with E-PROFILE-NOT-FOUND.
+
+        Drives the create-terminal endpoint through the REAL exception type
+        raised by ``ClaudeCodeProvider.preflight_launch`` and asserts HTTP 400 +
+        ``code == E-PROFILE-NOT-FOUND``. ``ProfileNotFoundError`` subclasses
+        ``ValueError``, and the generic ``except ValueError`` arm 404s. This test
+        is load-bearing on ARM ORDERING: the dedicated ``ProfileNotFoundError``
+        arm must precede the generic ``ValueError`` arm, or the response flips
+        400 -> 404 and this assertion fails (mutation-killing for that reorder).
+        """
+        from cli_agent_orchestrator.providers.claude_code import (  # type: ignore[import-untyped]
+            ProfileNotFoundError,
+        )
+
+        exc = ProfileNotFoundError("persona", "/tmp/cao-empty/agent-store")
+        assert isinstance(exc, ValueError)  # why arm ORDER matters
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+            mock_svc.create_terminal = AsyncMock(side_effect=exc)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "persona",
+                },
+            )
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "E-PROFILE-NOT-FOUND"
+        assert "persona" in detail["message"]
 
 
 class TestListTerminalsInSession:
