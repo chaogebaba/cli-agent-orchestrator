@@ -9,7 +9,8 @@
 | F541 commit | `a2f446a1` — `F541: launch confirm-then-attach on slow cold start (#397)` |
 | F542 commit | `e2406a47` — `F542: reconcile dead-tmux-session terminal rows at startup (#398)` |
 | F541 init-timeout commit | `97260c50` — `F541: provider_init_timeout default 180s for claude_code cold start (#397)` |
-| Report commits | `b6eacf44` (`F541/F542: build report`) + `F541/F542: build report r2` (this update) |
+| F548 commit | `0ca9c2d0` — `F548: fix claude_code init dialog handling + fast auth-fail + pane tail (#404)` |
+| Report commits | `b6eacf44` (`F541/F542: build report`) + `c5ebeebc`… (`build report r2`) + `F541/F542: build report r3` (this update) |
 
 All paths below are relative to the worktree root
 `/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/e08be272/`.
@@ -228,6 +229,116 @@ PY
 # NOTE: the *unmocked* defaults depend on any local settings.json `server`
 # override, so assert the built-in defaults directly instead (env-independent):
 uv run python -c "from cli_agent_orchestrator.services.settings_service import _SERVER_DEFAULTS as d; print(d['claude_code_init_timeout'], d['provider_init_timeout']); assert d['claude_code_init_timeout']==180 and d['provider_init_timeout']==60"
+```
+
+---
+
+## r3 addendum — F548: init dialog handling + fast auth-fail + pane tail (commit `0ca9c2d0`, issue #404)
+
+**Motivation.** The r2 box e2e still 500'd (`init timed out after 180s`,
+never idle). The tester's discriminator (pane sampling every 15s + cold
+`claude -p`, `probes/f541-diag.md`) found the real cause: on a fresh host the
+first dialog is the **workspace-trust prompt whose focus DEFAULTS to
+`❯ No, exit`** (with "Yes, I trust this folder" as the second row). The old
+trust handler answered it with a **bare Enter** → confirmed "No, exit" → Claude
+exited to the shell → the seat never reached a REPL → `wait_until_status` waited
+out the full init timeout. A second, independent box blocker: `claude -p`
+returns `Failed to authenticate: OAuth session expired…` (stale copied auth), so
+even a correct trust-Yes would park on a login screen and never go idle.
+Confirmed present on `main` too — this is why the box e2e could not pass
+regardless of the F541 timeout raise.
+
+### Acceptance-criteria checklist (r3)
+
+| # | AC (from #404) | How met | Evidence (file:line) |
+|---|---|---|---|
+| 1a | Dialog handling keys on dialog TEXT; trust prompt → accept. | The trust branch keys on `TRUST_PROMPT_PATTERN` ("Yes, I trust this folder") and now selects the AFFIRMATIVE row: `Down` (off the default "No, exit") then `Enter`, mirroring the bypass handler — never a bare Enter. | trust branch `providers/claude_code.py:1140`; Down+Enter sequence `:1144-1166` |
+| 1b | Bypass-permissions ack → select "Yes, I accept" (Down/2 + Enter). | Unchanged and already correct: the bypass branch sends `Down` then `Enter` for "Yes, I accept". The box's specific dialog is the TRUST prompt (probe), which now uses the same mechanic. Verified the Ink menu from the tester's pane samples: two rows, affirmative reached by one `Down`. | bypass branch `providers/claude_code.py:1073-1096` (pre-existing); trust now matches |
+| 1c | Any other early dialog → do NOT blind-Enter; set WAITING_USER_ANSWER so the auto-responder owns it. | The startup loop only ever sends keys inside the bypass / external-import / trust TEXT branches; an unrecognised dialog falls through and is never Entered. `get_status` classifies an unrecognised choice dialog as WAITING_USER_ANSWER via `WAITING_USER_ANSWER_PATTERN`, and `initialize()`'s `wait_until_status` already accepts WAITING_USER_ANSWER, returning control to the auto-responder path. | loop key-sends are text-gated `providers/claude_code.py:1073-1166`; WAITING_USER_ANSWER pattern `:187`; init accepts it `:1230-1235` |
+| 2 | Auth-failure/login screens during init → fail FAST with a named error (E-CLAUDE-AUTH). | New `ClaudeAuthError(ProviderError)` with `code = "E-CLAUDE-AUTH"`. `CLAUDE_AUTH_FAILURE_PATTERNS` (Failed to authenticate / OAuth session expired / /login / paste-code / login URL / Authentication required) → `_detect_claude_auth_failure`. Checked at the TOP of the startup-prompt loop (fail fast, before waiting) AND in the `initialize()` timeout branch (a login screen that renders after the loop's idle-gap exit). Message is prefixed `[E-CLAUDE-AUTH]` and names box-ops remediation. | class `providers/claude_code.py:78-89`; patterns `:214-224`; detector `:242-249`; loop fast-fail `:1059-1070`; timeout-branch check `:1257-1266` |
+| 3 | Init-timeout / init-failure error text includes the last ~15 non-blank pane lines. | `_pane_tail(output, n=15)` (ANSI-stripped, last N non-blank lines). Both the `TimeoutError` and the `ClaudeAuthError` messages append `Last pane lines:\n{_pane_tail(...)}`. This flows into `create_terminal`'s `except Exception as e: "Failed to create terminal: {e}"` → the HTTP 500 body/log. | helper `providers/claude_code.py:227-239`; timeout raise `:1285-1289`; auth raise `:1065-1070`,`:1261-1266`; create surfaces it `services/terminal_service.py:2927-2929` |
+| — | Keep the 180s default. | `claude_code_init_timeout` default unchanged at 180 (F541 r2). | `services/settings_service.py:244` |
+| — | Box auth refresh is ops, not code. | Acknowledged — the stale-OAuth box needs `scripts/box-setup.sh` re-sync; E-CLAUDE-AUTH makes that failure fast and self-explaining instead of a 180s hang. | — |
+
+### Design notes (r3)
+- The trust branch now uses `asyncio.sleep` between Down and Enter (not a
+  blocking `time.sleep`), consistent with the bypass branch and the
+  single-event-loop async-offload doctrine (#451). One pre-existing coverage
+  test (`test_trust_prompt_detected`) relied on the old blocking `time.sleep`
+  to advance wall-clock for its idle-gap exit; it was reworked to drive the
+  exit via a mocked `time.monotonic` sequence instead. This is the only test
+  behavioural-model change; the assertion now verifies Down+Enter.
+- `ClaudeAuthError` subclasses the module's `ProviderError` (an `Exception`),
+  so it flows through `create_terminal`'s generic failure path and becomes the
+  500 detail with its `[E-CLAUDE-AUTH]` message + pane tail — no new special
+  re-raise wiring was required. (The pre-existing `ProviderAuthRefreshFailed`
+  special-case at `terminal_service.py:2808` is left as-is; E-CLAUDE-AUTH is a
+  distinct, init-time, pane-derived signal.)
+
+### Contract changes to pre-existing tests (r3)
+The trust prompt changing from bare-Enter to Down+Enter is a legitimate
+behavioural contract change. Six pre-existing tests asserting the old contract
+were updated to the new one (send_keys Down count +1 per trust dialog):
+- `test/providers/test_claude_code_unit.py`: `test_handle_bypass_then_trust_prompt`,
+  `test_handle_trust_then_external_import_prompt_rejects_import`
+- `test/providers/test_claude_code_coverage.py`: `test_trust_prompt_detected`
+  (also reworked to mock `time.monotonic`, see design note)
+- `test/providers/test_startup_prompt_idle_gap.py`: `test_late_prompt_handled`,
+  `test_cascading_prompts_all_handled`, `test_idle_gap_resets_on_each_prompt`
+  (the ClaudeCode class only — Kimi/Antigravity classes untouched)
+- `test/providers/test_container_wrapped.py`: `test_idle_timeout_prompt_handler`
+
+### r3 test results (exact commands + verbatim summary lines)
+```
+$ uv run pytest test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth -q -n0
+6 passed in 1.73s
+```
+```
+$ uv run pytest test/providers/test_claude_code_unit.py test/providers/test_claude_code_coverage.py \
+    test/providers/test_startup_prompt_idle_gap.py test/providers/test_container_wrapped.py \
+    test/providers/test_provider_init_timeout.py test/providers/test_base_provider.py -q -n0
+273 passed in 39.37s
+```
+Broad provider + CLI sweep (serial, `-n0`):
+```
+$ uv run pytest test/providers test/cli test/services/test_settings_service.py \
+    test/services/test_f542_dead_session_reconcile.py -q -n0
+2924 passed, 19 skipped, 6 xfailed, 1 xpassed  (2 pre-existing failures — see below)
+```
+
+### r3 lint/type notes
+- black: clean (5 touched files).
+- isort: clean on `claude_code.py`; the only new import is `call` added to the
+  existing `unittest.mock` import in `test_claude_code_unit.py`.
+- mypy: `Success: no issues found` on `claude_code.py`.
+
+### r3 pre-existing / environmental failures (NOT introduced by F548)
+My r3 diff touches ONLY `providers/claude_code.py` + its 4 provider test files.
+Two failures in the broad sweep are unrelated:
+1. `test/cli/commands/test_config_reconcile.py::test_root_installer_delegates…`
+   — the known worktree-only `install.sh` FileNotFoundError (git worktrees have
+   no `install.sh` at root).
+2. `test/providers/test_omp_unit.py::test_extension_root_merges_mcp_without_overriding_explicit_terminal_id`
+   — the OMP provider merges an extra `CAO_TERMINAL_TOKEN` env key; this leaks
+   from THIS worker's own CAO environment into the test's expected-env
+   assertion. OMP is not touched by F548 (or any of my commits). Environmental.
+
+### r3 reviewer verification (detached worktree)
+```bash
+# Trust dialog: affirmative selection is Down+Enter, never a bare Enter.
+uv run pytest test/providers/test_claude_code_unit.py::TestF548InitDialogAndAuth -q -n0   # 6 passed
+# Direct unit exercise of the two helpers + the fast-fail:
+uv run python - <<'PY'
+from cli_agent_orchestrator.providers.claude_code import (
+    _detect_claude_auth_failure, _pane_tail, ClaudeAuthError,
+)
+assert _detect_claude_auth_failure("Failed to authenticate: OAuth ...")
+assert _detect_claude_auth_failure("OAuth session expired")
+assert _detect_claude_auth_failure("Welcome to Claude Code v2.1.248") is None
+assert _pane_tail("a\n\nb\n  \nc", n=2).splitlines() == ["b", "c"]
+assert ClaudeAuthError.code == "E-CLAUDE-AUTH"
+print("F548 helpers OK")
+PY
 ```
 
 ---
