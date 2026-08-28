@@ -227,6 +227,13 @@ CLAUDE_AUTH_FAILURE_PATTERNS: tuple[str, ...] = (
 )
 _CLAUDE_AUTH_FAILURE_RE = re.compile("|".join(CLAUDE_AUTH_FAILURE_PATTERNS), re.IGNORECASE)
 
+# F548 r7 (#404, gate S-2): the post-idle auth scan must look at the live footer
+# region only, not the full 200-line scrollback — otherwise an authenticated
+# --resume seat whose replayed transcript contains "Not logged in" is spuriously
+# failed. 15 lines comfortably covers Claude's bottom footer/status region while
+# staying well clear of transcript body content.
+_POST_IDLE_AUTH_SCAN_LINES = 15
+
 
 def _pane_tail(output: str, n: int = 15) -> str:
     """Return the last ``n`` non-blank lines of ``output`` (ANSI stripped).
@@ -1068,8 +1075,10 @@ class ClaudeCodeProvider(BaseProvider):
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
            The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
            this in most cases; this handler is a defensive fallback.
-        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
-           requires ``Enter``.
+        2. **Workspace trust dialog** – focus defaults to "❯ No, exit" with
+           "Yes, I trust this folder" as the second row; requires ``Down`` +
+           ``Enter`` (a bare ``Enter`` would confirm "No, exit" and kill the
+           seat — F548 #404). Handled via ``_select_menu_affirmative``.
         3. **External CLAUDE.md import dialog** – reject external imports so an
            isolated provider pane cannot read configuration from production home.
 
@@ -1368,10 +1377,18 @@ class ClaudeCodeProvider(BaseProvider):
         # using the same classifier + message shape as the timeout branch. A
         # normal (authenticated) idle pane has no such marker, so this never
         # fires on a healthy launch.
-        idle_pane = get_backend().get_history(self.session_name, self.window_name)
-        idle_auth_marker = _detect_claude_auth_failure(
-            re.sub(ANSI_CODE_PATTERN, "", idle_pane or "")
+        #
+        # F548 r7 (#404, gate S-2): the marker must be found in the current
+        # FOOTER/tail, NOT anywhere in the 200-line scrollback. Otherwise an
+        # AUTHENTICATED seat whose transcript merely CONTAINS "Not logged in"
+        # (reachable via --resume transcript replay) would be spuriously failed.
+        # Scan only the last _POST_IDLE_AUTH_SCAN_LINES non-blank lines (the
+        # live footer region), not the whole history.
+        idle_pane = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=_POST_IDLE_AUTH_SCAN_LINES
         )
+        idle_tail = _pane_tail(idle_pane, _POST_IDLE_AUTH_SCAN_LINES)
+        idle_auth_marker = _detect_claude_auth_failure(idle_tail)
         if idle_auth_marker is not None:
             raise ClaudeAuthError(
                 "[E-CLAUDE-AUTH] Claude Code reached its REPL unauthenticated during init "

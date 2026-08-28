@@ -9,7 +9,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call, mock_open, patch
+from unittest.mock import AsyncMock, MagicMock, call, mock_open, patch
 
 import pytest
 
@@ -3327,3 +3327,132 @@ class TestF548InitDialogAndAuth:
         # A normal REPL / trust dialog is NOT an auth failure.
         assert _detect_claude_auth_failure("Welcome to Claude Code v2.1.248") is None
         assert _detect_claude_auth_failure("Yes, I trust this folder") is None
+
+    # F548 r7 (#404, gate S-1): the settle poll must actually gate confirmation —
+    # Enter is confirmed only after a re-read shows ❯ on the affirmative row.
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_settle_poll_confirms_only_after_affirmative_capture(self, mock_tmux, mock_sleep):
+        """The FIRST capture after Down still shows ❯ on the NEGATIVE row; only a
+        LATER capture shows it on the affirmative. _select_menu_affirmative must
+        return True (confirmed) only after that later capture — i.e. the settle
+        poll re-read is load-bearing. Removing the poll (confirmed=False, no
+        re-read) makes this assert False and fails the test."""
+        neg = "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        yes = "  No, exit\n❯ Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        # current pane (pre-move) is negative; 1st re-read still negative; 2nd
+        # re-read shows the affirmative focused.
+        mock_tmux.get_history.side_effect = [neg, yes]
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        confirmed = await provider._select_menu_affirmative(
+            "Yes, I trust this folder",
+            label="Workspace trust prompt",
+            current_pane=neg,  # not yet on the affirmative -> must re-read
+            settle_timeout=5.0,
+            poll=0.01,
+        )
+
+        assert confirmed is True  # only reachable if the re-read poll ran
+        # Down then Enter, both real special keys; Enter only after confirm.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+        # The poll re-read the pane (the negative current_pane did not confirm).
+        assert mock_tmux.get_history.call_count >= 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.time")
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_settle_poll_warns_and_returns_false_when_never_confirms(
+        self, mock_tmux, mock_sleep, mock_time, caplog
+    ):
+        """When focus never lands on the affirmative row within settle_timeout,
+        _select_menu_affirmative returns False and logs the WARNING (Enter is
+        still sent — the fallback — but the return value flags the failure)."""
+        import logging
+
+        neg = "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        mock_tmux.get_history.return_value = neg  # never shows affirmative focus
+        # deadline = 0 + settle_timeout(=3); polls at now=1,2 then now=4 -> expire.
+        mock_time.monotonic.side_effect = [0.0, 1.0, 2.0, 4.0]
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        with caplog.at_level(logging.WARNING):
+            confirmed = await provider._select_menu_affirmative(
+                "Yes, I trust this folder",
+                label="Workspace trust prompt",
+                current_pane=neg,
+                settle_timeout=3.0,
+                poll=0.01,
+            )
+
+        assert confirmed is False
+        assert "could not confirm focus on the affirmative row" in caplog.text
+        # Enter is still sent (fallback), but only after the poll gave up.
+        assert mock_tmux.send_special_key.call_args_list == [
+            call("test-session", "window-0", "Down"),
+            call("test-session", "window-0", "Enter"),
+        ]
+
+    # F548 r7 (#404, gate S-2): the post-idle auth scan must look at the footer
+    # tail only, NOT the full 200-line scrollback (a --resume transcript may
+    # contain "Not logged in" far up).
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_post_idle_auth_scan_ignores_marker_far_up_scrollback(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """(a) An AUTHENTICATED idle pane whose transcript contains 'Not logged
+        in' ~40 lines up (e.g. --resume replay) but whose live footer is a clean
+        REPL must NOT raise."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        body = ["user: what does 'Not logged in · Run /login' mean?"]
+        body += ["assistant line %d" % i for i in range(40)]
+        authed_pane = "\n".join(
+            ["Claude Code v2.1.250 / Opus 5"] + body + ["", "❯ ", "bypass permissions on"]
+        )
+        mock_tmux.get_history.return_value = authed_pane
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch.object(provider, "wait_until_input_ready"),
+        ):
+            result = await provider.initialize()
+        assert result is True
+        assert provider._initialized is True
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_post_idle_auth_scan_raises_when_marker_in_tail(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+    ):
+        """(b) The logged-out marker in the live footer/tail must raise
+        E-CLAUDE-AUTH."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeAuthError
+
+        pane = "\n".join(
+            ["Claude Code v2.1.250 / Opus 5"]
+            + ["assistant line %d" % i for i in range(30)]
+            + ["❯ ", "Not logged in · Run /login"]
+        )
+        mock_tmux.get_history.return_value = pane
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch.object(provider, "wait_until_input_ready"),
+        ):
+            with pytest.raises(ClaudeAuthError) as exc:
+                await provider.initialize()
+        assert exc.value.code == "E-CLAUDE-AUTH"
+        assert "Not logged in" in str(exc.value)
