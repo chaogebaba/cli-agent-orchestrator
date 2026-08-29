@@ -59,6 +59,15 @@ def _wire(monkeypatch, metadata, backend, *, supervisors=()):
         "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
         lambda _operation: False,
     )
+    # F597 #454 pt2 (a): feed the settle gate the same screen via
+    # status_monitor.get_rendered_screen so the matched frame is byte-stable, and
+    # no-op the settle sleep. Tests asserting the dialog CLEARED still stub
+    # _current_normalized for the retry loop separately.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+        lambda tid, *a, **k: list(str(backend.capture_viewport.return_value).splitlines()),
+    )
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
 
 
 def _backend(screen: list[str] | None = None):
@@ -104,7 +113,10 @@ def test_all_rule_match_call_sites_receive_a_dialog_region_normalized_value():
         and node.func.attr == "matches"
     ]
 
-    assert len(calls) == 6
+    # F597 #454 pt2 (a): the settle gate added two more rule.matches() sites
+    # (the two settle captures, first/second). Both still receive a
+    # DialogRegion.normalized value, preserving the F55 AST invariant below.
+    assert len(calls) == 8
     assert all(
         len(call.args) == 1
         and isinstance(call.args[0], ast.Attribute)

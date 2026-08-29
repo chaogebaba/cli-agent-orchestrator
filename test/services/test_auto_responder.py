@@ -65,12 +65,33 @@ class SyncThread:
 def _reset_engine(monkeypatch):
     """Fresh engine + rule cache + no real sleeping for every test."""
     monkeypatch.setattr(ar.time, "sleep", lambda _s: None)
+    # F597 #454 pt2: settle uses the injectable sleep seam; no real waits.
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
     monkeypatch.setattr(ar.threading, "Thread", SyncThread)
     engine = ar.AutoResponder()
     monkeypatch.setattr(
         engine,
         "_capture_fresh",
         lambda _metadata, lines: (ar.normalize_screen(lines), lines),
+    )
+    # F597 #454 pt2 (a) SETTLE: the settle gate samples _settle_capture twice
+    # before the FIRST send. These unit tests drive fixed screens; default
+    # _settle_capture to echo the last screen passed to on_screen (a stable,
+    # matched frame) so settle passes deterministically. This is SEPARATE from
+    # the retry loop's _current_normalized, which the 'dialog cleared' tests stub
+    # on their own — so settle sees the dialog present while the retry sees it go.
+    last_lines: dict[str, list[str]] = {}
+    real_on_screen = engine._on_screen
+
+    def _tracking_on_screen(terminal_id, provider, lines):
+        last_lines["v"] = list(lines)
+        return real_on_screen(terminal_id, provider, lines)
+
+    monkeypatch.setattr(engine, "_on_screen", _tracking_on_screen)
+    monkeypatch.setattr(
+        engine,
+        "_settle_capture",
+        lambda tid, chrome=None: ar.dialog_region(last_lines.get("v", []), chrome),
     )
     monkeypatch.setattr(ar, "auto_responder", engine)
     ar._store._cache.clear()

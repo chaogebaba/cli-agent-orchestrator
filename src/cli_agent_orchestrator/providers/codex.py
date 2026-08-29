@@ -519,6 +519,15 @@ CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS = 4
 # Interval between confirmation polls (seconds), for both the initial grace
 # window and the post-re-Enter re-verification.
 CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS = 0.5
+# F598 #455: when the paste lands while a blocking dialog (trust-dir → resume-
+# workdir chooser) owns the pane, F435's F491 pre-check used to raise
+# CodexSubmitStuckError on the FIRST still-WAITING recheck and give up — a single
+# synchronous pass with no re-arm once the dialog clears and the composer finally
+# renders, so the drafted chip sat unsubmitted forever (incident 55e84b8a). These
+# bound a re-arm loop that repeatedly nudges the auto-responder and waits for the
+# WHOLE dialog sequence to clear before proceeding to the composer recovery Enter.
+CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS = 8
+CODEX_SUBMIT_VERIFY_DIALOG_REARM_INTERVAL_SECONDS = 1.5
 # BLOCKERS 1/2/3 (r4): the durable submission boundary is the pasted task
 # echoed as a SUBMITTED user turn in scrollback (its collapsed chip, or its raw
 # text). For the raw-text case we match a distinctive normalized PREFIX of the
@@ -3444,20 +3453,49 @@ class CodexProvider(BaseProvider):
 
             _f491_status = status_monitor.get_status(self.terminal_id)
             if _f491_status == TerminalStatus.WAITING_USER_ANSWER:
-                # A dialog is blocking. Give auto-responder one more chance to
-                # fire by forcing a screen evaluation.
-                _f491_lines = status_monitor.get_rendered_screen(self.terminal_id)
-                if _f491_lines is not None:
-                    _f491_provider = self
-                    auto_responder.on_screen(self.terminal_id, _f491_provider, _f491_lines)
-                # Brief wait for auto-responder dismiss + TUI redraw
-                time.sleep(1.5)
-                _f491_recheck = status_monitor.get_status(self.terminal_id)
-                if _f491_recheck == TerminalStatus.WAITING_USER_ANSWER:
-                    logger.warning(
-                        "F435/F491 submit-verify: terminal %s has active dialog "
-                        "(status WAITING_USER_ANSWER); cannot recover with Enter",
+                # F598 #455: a blocking dialog owns the pane and absorbed the
+                # submit Enter, so the paste never reached a composer. The trust-
+                # dir → resume-workdir chooser sequence can occupy the pane for
+                # MINUTES; the old code nudged the auto-responder ONCE, waited
+                # 1.5s, and if still WAITING raised CodexSubmitStuckError and gave
+                # up — a single pass with NO re-arm, so once the dialog finally
+                # cleared and the composer rendered, nothing re-verified and the
+                # chip stayed drafted forever (incident 55e84b8a). RE-ARM instead:
+                # repeatedly nudge the auto-responder and wait for the WHOLE
+                # sequence to clear (bounded), only raising if it never clears.
+                dialog_cleared = False
+                for rearm in range(1, CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS + 1):
+                    _f491_lines = status_monitor.get_rendered_screen(self.terminal_id)
+                    if _f491_lines is not None:
+                        auto_responder.on_screen(self.terminal_id, self, _f491_lines)
+                    logger.info(
+                        "F435/F598 submit_verify_rearm: terminal %s dialog still "
+                        "blocking (attempt %d/%d); nudged auto-responder, waiting "
+                        "for it to clear before composer recovery",
                         self.terminal_id,
+                        rearm,
+                        CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS,
+                    )
+                    time.sleep(CODEX_SUBMIT_VERIFY_DIALOG_REARM_INTERVAL_SECONDS)
+                    # A submit may have landed the moment the dialog cleared.
+                    if _rollout_confirms():
+                        logger.info(
+                            "F435/F598 submit_verify_rearm: terminal %s confirmed "
+                            "via rollout after dialog cleared",
+                            self.terminal_id,
+                        )
+                        return
+                    if status_monitor.get_status(self.terminal_id) != (
+                        TerminalStatus.WAITING_USER_ANSWER
+                    ):
+                        dialog_cleared = True
+                        break
+                if not dialog_cleared:
+                    logger.warning(
+                        "F435/F598 submit-verify: terminal %s dialog never cleared "
+                        "after %d re-arm attempts; cannot recover with Enter",
+                        self.terminal_id,
+                        CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS,
                     )
                     raise CodexSubmitStuckError(
                         f"Codex terminal {self.terminal_id} has an active dialog "
@@ -3465,10 +3503,13 @@ class CodexProvider(BaseProvider):
                         f"never submitted. Auto-responder dismiss pending."
                     )
                 logger.info(
-                    "F435/F491 submit-verify: terminal %s dialog cleared by "
-                    "auto-responder; rechecking rollout",
+                    "F435/F598 submit_verify_rearm: terminal %s dialog cleared; "
+                    "the composer is now live — proceeding to chip recovery",
                     self.terminal_id,
                 )
+                # Dialog cleared and the composer should now be live: fall
+                # through to the normal stuck-chip recovery loop, which re-reads
+                # the (now composer-visible) pane and sends the recovery Enter.
                 if _rollout_confirms():
                     return
         except CodexSubmitStuckError:
