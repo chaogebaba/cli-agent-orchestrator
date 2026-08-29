@@ -43,3 +43,65 @@ _None of the three static tools is currently green on fork main itself; the merg
 ## Could-not / notes
 - Did not "fix" black/isort/mypy: pre-existing env/config drift, out of scope for a merge and would collide with upstream. Flagged above.
 - Suite was run on box only (not locally), per brief.
+
+
+## Fix-up (post gate r1)
+
+The Codex EMPIRICAL gate (report `/data/cao-scratch/fork-gate-report.md`) measured one
+merge-introduced mypy regression: `uv run mypy --config-file mypy.ini src` reported
+**BASE 622ba52f = 472 errors / 314 files** vs **HEAD 09a1c07a = 473 errors / 322 files** (+1).
+
+### Root cause — isolated, not guessed
+A naive sorted-line diff is dominated by line-number shift noise (upstream added code above
+existing errors, so every error line moved). Diffing at the **message level** (line:col
+stripped) on one box isolated exactly ONE new diagnostic; the per-file error count confirmed
+`clients/database.py` went 11 → 12 while every other file was unchanged.
+
+Exact mypy diff line (verbatim, the +1):
+
+```text
+src/cli_agent_orchestrator/clients/database.py:2361: error: Name "_migrate_workflow_plan_approval" already defined on line 2092  [no-redef]
+```
+
+The merge duplicated `_migrate_workflow_plan_approval()` — two **byte-for-byte identical**
+definitions (both 44-line bodies hash to the same sha256), at line 2092 and line 2361, with a
+single call site at line 1501.
+
+### Fix (real fix, not a `# type: ignore`)
+Deleted the second, duplicate definition (lines 2359–2404, the def block plus its two leading
+blank lines). Zero behavioral change: the functions were identical and the surviving
+definition (line 2092) precedes the sole call site. `git diff` = 46 deletions, single file,
+`python -m ast` parse OK. Chosen over `type: ignore[no-redef]` because the duplication is a
+genuine defect (dead redefinition), and removing it narrows rather than widens the diff.
+
+- File:line fixed: `src/cli_agent_orchestrator/clients/database.py` (removed duplicate def @ 2361; kept @ 2092)
+
+### Box mypy counts (before → after)
+Measured with `uv sync --frozen` + `uv run mypy --config-file mypy.ini src` on the offload boxes:
+
+| | errors | files checked | box |
+|---|---:|---:|---|
+| BASE 622ba52f | 472 | 314 | grok-box-005 (A/B) |
+| HEAD 09a1c07a (pre-fix) | 473 | 322 | grok-box-005 (A/B) |
+| HEAD a50696ed (post-fix) | **472** | 322 | grok-box-002 (same box the gate used) |
+
+Post-fix HEAD == BASE at 472 errors; the merge-introduced +1 is eliminated. HEAD still checks
+322 files (the merge legitimately added 8 upstream files to the checked set) with no net error
+increase. The `already defined on line 2092` diagnostic is gone (0 matches).
+
+### Flake counts (test unmodified)
+`test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner`
+on grok-box-002, `pytest-repeat` available → `--count=20`: **19 passed, 1 failed** (`[20-20]`).
+Confirms the known pre-existing flake at its usual low rate; the test was NOT modified.
+
+### New tip
+- Fix commit: `a50696ed` — `fixup(upstream-remerge): mypy +1 — clients/database.py duplicate _migrate_workflow_plan_approval`
+- Branch `cao/upstream-remerge-45da6b3e` pushed `09a1c07a..a50696ed`
+- (New tip after appending this report section is recorded in the callback.)
+
+### Box-actions ledger (fix-up)
+- box-run.sh `mypy-ab` (grok-box-005): fetch 622ba52f+09a1c07a, two `git worktree add --detach` snapshots under `/data/cao-scratch/mypy-ab/`, `uv sync --frozen`, `uv run mypy` both sides, `comm` sorted diff. Worktrees + scratch removed at end.
+- box-run.sh `mypy-ab2` (grok-box-005): same, with message-level (line:col-stripped) normalized diff + per-file count diff. Worktrees + scratch removed.
+- box-run.sh `mypy-head-verify` (grok-box-002): fetch a50696ed, one detached worktree under `/data/cao-scratch/mypy-head-verify/`, `uv sync --frozen`, `uv run mypy` HEAD-only + `--count=20` flake test. Worktree + scratch removed.
+- Attempted pin to grok-box-002 for the A/B first; it was held by another lane (`upstream-gate-final`) so the A/B ran on grok-box-005. Cross-box is valid here: both A/B sides ran on the SAME box and mypy is deterministic static analysis, not a timing measurement. Final HEAD verify landed on grok-box-002 (the gate's box).
+- Raw ssh: none. Env mutations: `uv sync --frozen` (venv only; no lockfile change). Long-lived box checkouts untouched (grok-box-002 left at 2fd3d25c, grok-box-005 at 44738edf). Temp files left: none (all scratch under `/data/cao-scratch/<label>/` removed; no laptop `/tmp` used).
