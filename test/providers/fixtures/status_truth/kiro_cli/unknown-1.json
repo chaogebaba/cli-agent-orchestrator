@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "unknown",
+  "source": "copied byte-exact from test/providers/fixtures/kiro_cli_handoff_successful.txt",
+  "captured_at": "2025-11-18T08:55:44-05:00 (last commit touching source; original capture date unknown)",
+  "notes": "Handoff transcript ('Initiating handoff to developer agent…' → 'Handoff completed successfully') ending back at '[supervisor]>' prompt; delegation shown but no child-running frame — delegating-cell candidate, semantics deferred to the WP."
+}

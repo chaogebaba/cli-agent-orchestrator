@@ -1,0 +1,144 @@
+   ⎿ 160 |  161 |  162 | @dataclass(frozen=True) 163 | class RuleMatchVerdict: 164...
+[thinking] Good. Now, key design decision for the corpus test. The brief: "load the real rules file (copy into the fixture dir as rules.yaml so the test is hermetic), run the real matcher, as
+sert the expected rule matches."
+
+So the test should:
+- Copy ~/.aws/cli-agent-orchestrator/auto-answers/codex.yaml → fixture dir rules.yaml at authoring time (I copy it now, committing the snapshot).
+- Test loads rules.yaml itself (Rule objects via _RuleStore._load or yaml), runs dialog_region + Rule.matches / reject_reason against the fixture pane lines.
+
+Note: `diagnose_rules` uses `_store.get_rules(provider)` which reads `_rules_path` under ~/.aws — not hermetic. So the test should construct Rule objects directly from rules.yaml (via `_RuleS
+tore._load(Path)` — a staticmethod, usable hermetically) and use `dialog_region(lines, chrome_patterns)` with codex's `_CHROME_ROW_PATTERNS`, then check `rule.matches(match_region.normalized)
+`.
+
+Also, `normalize_screen` — the matcher matches against the normalized region. The brief says "run the real matcher" — dialog_region + Rule.matches is the real matcher path (same as on_screen'
+s rule loop uses dialog_region(screen, chrome).normalized? Let me check on_screen to see exactly which region rules are matched against. Let me read on_screen around line 613 and the rule loo
+p.
+[read_files] {"files":[{"end_line":760,"path":"/home/chao/VScode_proje...
+   ⎿ 613 |     def on_screen( 614 |         self, terminal_id: str, provider: Any,...
+[thinking] Let me see the rule loop start (~line 685-704) to know exactly how rules are fetched and matched.
+[read_files] {"files":[{"end_line":704,"path":"/home/chao/VScode_proje...
+   ⎿ 683 |         supplied_status = self._classify_region(terminal_id, provider, ...
+[thinking] Now I understand the matcher: rules matched against `match_region.normalized` = dialog_region(lines, chrome_patterns).normalized, where chrome_patterns come from the provider (code
+x._CHROME_ROW_PATTERNS). `normalize_screen` collapses whitespace.
+
+Now let me look at codex.py's _CHROME_ROW_PATTERNS and RESUME_CWD_CHOOSER_PATTERN for context.
+[run_commands] grep -n -A 30 '_CHROME_ROW_PATTERNS' /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_or...
+   ⎿ 2410:    _CHROME_ROW_PATTERNS = ( 2411-        re.compile(TUI_PROGRESS_PATTER...
+[run_commands] grep -rn 'normalize_screen' /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrato...
+   ⎿ 117:def normalize_screen(lines: List[str]) -> str: 204:    return DialogRegio...
+[thinking] Now I need the actual pane text for the samples. Let me decide the 5 fixtures. Available real material:
+
+A. **5th no-fire verbatim normalized text** (comment 2026-08-29T04:21:56Z, terminal 7e2ad242): `Choose working directory to resume this session Session = latest cwd recorded in the resumed se
+ssion Current = your current working directory › 1. Use session directory (…) 2. Use current directory (…/.cao/worktrees/7e2ad242) 3. Always use session directory 4. Always use current direct
+ory Press enter to continue`. This is normalized (whitespace collapsed) — I can reconstruct pane lines reasonably. Since matching runs on the normalized form, line layout doesn't matter for m
+atching. I can store it as one line or a plausible multi-line rendering. Verbatim: keep the exact text; note in the sidecar it's the pushed normalized text. Expected rules: codex-resume-workd
+ir-choice (the fresh control rule), codex-resume-working-directory, codex-resume-working-directory-4opt. Post-fix build still no-fire → likely xfail.
+
+Wait — will it fail though? Let's test: dialog_region(lines, chrome) normalized would contain "Choose working directory to resume this session" and "Use session directory", "Use current direc
+tory", "Press enter to continue" — all present. The rules codex-resume-working-directory (regex question + 3 options incl "Press enter to continue") would match. So the pure matcher (dialog_r
+egion+Rule.matches) would MATCH this text. So a pure rule-match test would PASS for this sample! The no-fire was not in the pure matching layer — it was classification/busy-veto (pre-fix) or,
+ post-fix, something else (hot-reload? the fresh rule was appended BEFORE spawning — so the store should have loaded it... but it still reported no rule matched).
+
+Hmm. So what does "run the real matcher" mean, and what would FAIL today? The brief says: "assert the expected rule matches. Expected: some cases FAIL today — that is the point; mark those xf
+ail(strict=True)".
+
+So the test asserts rule.matches(match_region.normalized) for the expected rule. Cases that fail today = xfail. Which sample texts would fail the pure match?
+
+Key candidates for pure-match failures:
+1. The trust-dir dialog post-fix recurrence: 'Do you trust the contents of this directory? … 1. Yes, continue'. The rule codex-trust-dir requires options "Yes, continue" AND "No, quit". If th
+e actual dialog doesn't render "No, quit" (or renders it differently), the rule rejects on option[No, quit]. Real codex trust dialog — is there a capture? test/fixtures/codex_dialogs/trust.an
+si.txt! Let me check its content — if it's the codex trust dialog. That would be a genuine sample where rule textually "should have fired" per the issue ("the whitelisted codex rule did not f
+ire") but maybe the option substring "No, quit" isn't present in the real pane.
+
+2. The 3-option vs 4-option variants — both match.
+
+3. Chrome displacement: a tall pane where the chooser + chrome exceeds 20 rows → without chrome filtering the chooser would fall out of the tail; WITH the fix it's filtered. Pre-fix it failed
+, post-fix passes. Those would be PASS cases now.
+
+Let me check trust.ansi.txt content.
+[run_commands] sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/test/fixtures/cod...
+   ⎿ ok
+[run_commands] cat /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/test/fixtures/codex_dialogs/trust.ansi.txt | head...
+   ⎿ > ^[[1mYou are in ^[[0m/home/chao/VScode_projects/cli-subagents/cli-agent-orc...
+[thinking] The trust.ansi.txt fixture contains the real codex trust dialog: "Do you trust the contents of this directory? ... 1. Yes, continue / 2. No, quit / Press enter to continue". Rule c
+odex-trust-dir: question contains "Do you trust the contents of this directory?", options ["Yes, continue", "No, quit"] — both present. So it matches. That's a passing case (and it's a real c
+apture).
+
+Now the post-fix trust-dir no-fire (03:41Z): the dialog was the same presumably. It should match at the pure-match layer. So what fails today at the pure-match layer?
+
+Hmm — maybe nothing fails at the pure-match layer, and the "5 no-fire samples" are meant to be tested through more of the pipeline. The brief says "run the real matcher, assert the expected r
+ule matches. Expected: some cases FAIL today". So the supervisor expects some to fail. If none fail, I report that — but then the xfail marking instruction is moot. I should be empirical: bui
+ld the corpus, run it, see what fails, mark failures xfail.
+
+What could fail at the dialog_region + Rule.matches layer with real captured panes?
+
+- The resume-chooser fixtures from logs (61e1b848, c8c767ca) — real full-pane ANSI captures including zsh prompt, tmux borders etc. If I strip ANSI and feed rows... The chooser + chrome withi
+n 20-row tail? These are tall panes. dialog_region takes the last 20 non-empty rows. With chrome filtering (spinner dropped) the chooser stays. Without chrome filtering (i.e., if the test use
+s no chrome patterns — but the "real matcher" uses chrome patterns via provider). These captures are PRE-F516-fix (2026-08-26) and the rules fired on them back then? Not sure.
+
+Wait — importantly: these fixtures are ansi captures that need pyte rendering. The brief says fixtures are "<n>-<slug>.txt with each sample's raw pane text verbatim". Raw pane text = rendered
+ rows (like what capture-pane -e gives, or the plain text). The CLI `cao auto-answers test` reads a plain-text file, one screen row per line.
+
+So for each sample I need plain rendered rows. For the resume-chooser fixtures, I'd need to render the ANSI via pyte like the existing tests do. Let me look at how test/providers/test_codex_d
+ialog_screens.py renders fixtures, and whether there's a helper.
+
+Actually — maybe simpler and more faithful to the issue: the samples' "raw pane text" — for the 5th no-fire, the issue gives the normalized text (already collapsed). For occ 1, pane.txt is bl
+ank. Hmm.
+
+The empirical approach: build 5 fixtures from the best available real material:
+
+1. `01-resume-cwd-4opt-7e2ad242.txt` — verbatim normalized text from the 5th no-fire comment (reconstructed as pane rows). Expected rule: codex-resume-workdir-choice (fresh control rule).
+2. `02-resume-cwd-4opt-spinner-17e71e1e.txt` — occurrence 1 shape: 4-option chooser + "• Working (Ns • esc to interrupt)" spinner row (from build report's reproduced frame). Expected rule: co
+dex-resume-working-directory. Post-fix should match (chrome filter drops spinner).
+3. `03-trust-dir-1906-1907.txt` — the post-fix trust-dir recurrence. Use the real trust.ansi.txt capture rendered to plain rows (it IS the codex trust dialog — real capture, same dialog as th
+e recurrence). Expected rule: codex-trust-dir.
+4. `04-resume-chooser-61e1b848.txt` — real captured pane (rendered from fixture). Expected rule: codex-resume-working-directory.
+5. `05-resume-chooser-c8c767ca.txt` — same, second capture.
+
+For 2, I need to construct the dialog. From the issue body: "codex resume-cwd 4-option menu" with options 'Use session directory'/'Use current directory'/'Press enter to continue' all present
+. And build report says the frame had "• Working (…s • esc to interrupt)" spinner and "• Ran 3 commands" completion rows. I can reconstruct from the 5th-no-fire verbatim text plus a spinner r
+ow. But "verbatim" — the issue's normalized text is the only verbatim. For the spinner variant, I compose: verbatim dialog rows + spinner chrome rows as documented in the build report. That's
+ a reasonable "occurrence-1 shape" sample, documented in the sidecar as reconstructed.
+
+Hmm wait, but is composing fixtures okay? The brief says "each sample's raw pane text verbatim (from the issue comments / any captures they reference...)". The issue references pane.txt (blan
+k — useless). I should note this discrepancy in my callback. But rather than stop-and-ask (which the directive says for real forks...), this IS a fork: the brief assumes 5 no-fire samples wit
+h dialog text exist; reality: only one verbatim dialog text in the issue + related captures in the repo. Hmm. The stop-and-ask directive: "when an instruction conflicts with what you find in
+the tree... STOP and send a concise send_message".
+
+This is a judgment call. Options: (a) stop and ask which 5 samples; (b) build the corpus from best-available real material and clearly document provenance. The supervisor's intent is clear: a
+ replayable corpus of the F530 no-fire evidence. The material constraint is discoverable and I can document it precisely. But per my rules, "a silent workaround that deviates from the brief i
+s a violation even if it works". Deviating = inventing sample content. Hmm, but fixtures 4/5 (resume-chooser captures) are real captures referenced by the codebase; the trust capture is real;
+ the 5th no-fire text is verbatim from the issue; only the spinner variant would be composed.
+
+Actually wait — let me reconsider. Maybe there ARE 5 samples with pane text. Let me check logs — ~/.aws/cli-agent-orchestrator/logs/terminal/ maybe has the no-fire terminals' logs (17e71e1e,
+fa78a3d7, 6533f8b2, 86854b69, cf2a83bc, 940a5884, af4d7cf9, 5c7865ce, a09bd99f, 7e2ad242, 92f11bab). The resume-brief said logs/terminal/*.log were reaped for old ones, but recent ones may ex
+ist. Let me check!
+[run_commands] ls ~/.aws/cli-agent-orchestrator/logs/terminal/ 2>/dev/null | grep -E '17e71e1e|fa78a3d7|6533f8b2|86854b69|cf2a83bc|9...
+   ⎿ 17e71e1e.log 17e71e1e.scrollback 17e71e1e.snapshot.json 5c7865ce.log 5c7865ce...
+[thinking] Excellent! The logs exist for all the no-fire terminals. The `.log` files are likely raw pane captures (capture-pane output over time). The 5 samples with dialog text + rule:
+
+The 5 no-fire samples (per issue: occurrences with distinct no-fire):
+1. 17e71e1e (occ 1, 2026-08-27 23:47Z) — rule codex-resume-working-directory (and -4opt didn't exist yet; occ 1 says "existing rule codex-resume-working-directory").
+2. fa78a3d7 (occ 2/new-evidence 00:11Z) — both rules.
+3. 6533f8b2 (occ #5) — both rules.
+4. 86854b69 (occ 8) — both rules, pushed "unknown blocking dialog".
+5. cf2a83bc (occ 9) — both rules.
+Plus 940a5884 (occ 14), af4d7cf9 (occ 15), and post-fix: 5c7865ce/a09bd99f (trust-dir), 7e2ad242/92f11bab (5th no-fire).
+
+"the 5 no-fire samples" — I'll take the 5 named in the issue as the primary no-fire sequence... actually occurrences 1,2,#5(6533f8b2),8,9 — hmm, or maybe first 5 occurrences: 17e71e1e, fa78a3
+d7, 6533f8b2, e4945a3e(occ6), dc4d176f(occ7). Either way I have logs for ALL of them. Since the brief says 5, I could include all the distinct no-fire ones I have captures for... but stick to
+ 5? The brief explicitly says 5 samples. The five most-documented: 17e71e1e (occ1, issue body), fa78a3d7 (occ2), 6533f8b2 (occ5), 86854b69 (occ8, unknown-dialog push), cf2a83bc (occ9). But ho
+nestly the post-fix ones (7e2ad242 5th no-fire with fresh rule, 5c7865ce/a09bd99f trust-dir) are the ones most likely to fail today.
+
+Hmm. "the 5 no-fire samples (dialog text + rule that should have fired)". Since all these logs exist, I can extract the raw pane text verbatim from each .log/.scrollback. Let me check the for
+mat of these logs. The .log is probably a stream of captures; .scrollback maybe the pane history. Let me inspect 7e2ad242 and 17e71e1e logs.
+[run_commands] for t in 17e71e1e 7e2ad242 5c7865ce; do d=~/.aws/cli-agent-orchestrator/logs/terminal/$t; echo "===== $t"; ls -la $d*...
+   ⎿ ===== 17e71e1e -rw-r--r--. 1 chao chao 946175 Aug 27 20:00 /home/chao/.aws/cl...
+[thinking] The .log files are streaming captures (mixed escape codes, partial). The .scrollback files might be the pane scrollback. The dialog (resume chooser) would appear mid-log when it ha
+ppened. Let me search the logs for "Choose working directory" and "Do you trust the contents" in these terminal logs, and extract the surrounding pane frame. The log is a stream — the last fu
+ll frame before the dialog would need pyte rendering. But maybe the scrollback file has rendered text.
+
+Let me check what format scrollback is and grep for the dialogs.
+[run_commands] for t in 17e71e1e fa78a3d7 6533f8b2 86854b69 cf2a83bc 940a5884 af4d7cf9 7e2ad242 92f11bab 5c7865ce a09bd99f; do f=~/....
+   ⎿ 17e71e1e log=0 trust=0 sb-log=1 sb-trust=0 fa78a3d7 log=0 trust=0 sb-log=1 sb...
+

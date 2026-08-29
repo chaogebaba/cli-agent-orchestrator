@@ -1,0 +1,44 @@
+
+  Do-NOTs: no provider name in doctrine, docs prose, or memory (roster only); no dual-binding per position; no auto-spend of usage resets (health-down only, never "answer the reset prompt").
+
+  Next step from me: when Query 4 returns I fold this as a §amendment to the F497 blueprint (P5) with a DESIGN gate → Opus/codex per the routing file, and file the F# — unless you want a
+  different cut.
+
+✻ Crunched for 32s · done 12:32 AM · 1 monitor still running
+
+❯  routing.toml  i need to set the cli and the model behind as the provider info . for example i can use cline + deepseek v4 flash as grunt lane provider and use cline+ glm 5.3 as secretary
+  lane. because one cli has multiple supported models
+  pls pivot and sharpen it.
+
+● Sharpened: the routing unit is not a CLI, it's a backend = (cli, model, knobs) — and everything downstream keys on the backend, not the CLI.
+
+  routing.toml shape
+
+  [backends.cline-dsv4]   # one CLI, many backends
+  cli = "cline_cli";  model = "deepseek-v4-flash"
+  [backends.cline-glm]
+  cli = "cline_cli";  model = "glm-5.3"
+  [backends.codex-sol]
+  cli = "codex";      model = "gpt-5.6-sol";  reasoning = "high"
+  [backends.kiro-kas]
+  cli = "kiro_cli";   engine = "kas"
+  [backends.claude-opus]
+  cli = "claude_code"; model = "claude-opus-5"
+
+  [positions.grunt]           chain = ["cline-dsv4", "kiro-kas"]
+  [positions.secretary]       chain = ["cline-glm"]
+  [positions.design_reviewer] chain = ["codex-sol", "claude-opus"]
+
+  What changes because the unit is a backend
+
+  1. Certification is per (position, backend), not per CLI — swapping GLM→DeepSeek on the same CLI is a new backend and needs its own (cheap) canary; D9's E-PROVIDER-UNCERTIFIED becomes
+     E-BACKEND-UNCERTIFIED. A model change can never silently inherit another model's cert.
+  2. Health has two scopes. Quota/monthly caps are usually per CLI account (ClinePass cap hits both cline backends); rate limits and 5xx are per backend. cao routing down cline_cli --until …
+     downs every backend on it; down cline-dsv4 downs one. Chain walking skips both kinds.
+  3.
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  …/VScode_projects/cli-subagents | Fable 5 | ctx:23% | ↑159 ↓233.4k | $76.51 | rate:15%                                                                                                  /rc
+  ⏵⏵ bypass permissions on · 1 monitor · ← 1 agent

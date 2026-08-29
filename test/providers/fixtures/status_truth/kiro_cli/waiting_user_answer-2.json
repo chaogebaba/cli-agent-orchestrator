@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "waiting_user_answer",
+  "source": "copied byte-exact from test/providers/fixtures/kiro_cli_handoff_with_permission.txt",
+  "captured_at": "2025-11-18T08:55:44-05:00 (last commit touching source; original capture date unknown)",
+  "notes": "Permission prompt mid-handoff ('Allow this action? [y/n/t]' after delegation intent)."
+}

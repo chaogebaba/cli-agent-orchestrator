@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "working",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:0 (live CAO pane chao_supervisor-b93613da, terminal b93613da, provider claude_code per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "'✻ Shenaniganing… (40s · ↓ 1.9k tokens)' spinner above composer; statusline '1 monitor · ← 1 agent'; fleet API reported status=completed at capture — live status-truth discrepancy, seat actively working with a child-agent row visible."
+}

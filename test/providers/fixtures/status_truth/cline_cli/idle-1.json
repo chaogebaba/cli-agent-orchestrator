@@ -1,0 +1,7 @@
+{
+  "provider": "cline_cli",
+  "state": "idle",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:3 (live CAO pane secretary-231f1de1, terminal 231f1de1, provider cline_cli per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "Secretary seat parked after completed turn: final message 'Parking for queries.', no in-flight tool rows; fleet API status=completed. Mid-file contains a kiro_dev statusline echo from its ingest output — quoted content, not seat state."
+}

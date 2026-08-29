@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/wpq1_claude_2_1_211/initial-empty-composer.txt",
+  "captured_at": "2026-07-16T21:15:16-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "Empty composer box (Claude Code 2.1.211)."
+}

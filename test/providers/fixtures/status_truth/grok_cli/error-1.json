@@ -1,0 +1,7 @@
+{
+  "provider": "grok_cli",
+  "state": "error",
+  "source": "copied byte-exact from test/providers/fixtures/grok_cli_error.txt",
+  "captured_at": "2026-08-16T13:33:33+10:00 (last commit touching source; original capture date unknown)",
+  "notes": "CLI usage error: 'error: unexpected argument …' + Usage block."
+}

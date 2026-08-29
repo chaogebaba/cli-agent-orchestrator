@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "working",
+  "source": "copied byte-exact from test/providers/fixtures/kiro_cli_tui_processing_output.txt",
+  "captured_at": "2026-04-10T18:40:27+10:00 (last commit touching source; original capture date unknown)",
+  "notes": "'Kiro is working' status line mid-turn."
+}

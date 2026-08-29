@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "delegating",
+  "source": "recovered byte-exact via git show cao/4fd45dca:test/providers/fixtures/f568/idle-subagent-churn-a.txt (worker worktree discarded after terminal deletion; branch tip 801598d7 — see README)",
+  "captured_at": "2026-08-29T04:27-04:40Z (window per f568 README)",
+  "notes": "Seat idle at empty composer, turn done ('✻ Crunched … done'), background Agent running ('1 monitor still running' / '← 1 agent'); no spinner above box top rail — f568 AC-F568-6 negative."
+}

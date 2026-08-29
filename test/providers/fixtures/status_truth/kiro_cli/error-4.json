@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "error",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:6 (live CAO pane kiro_dev-d31db3d4, terminal d31db3d4, provider kiro_cli per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "'● Your connection was interrupted…' + '◐ 2 tasks remaining' over idle composer; fleet API reported status=completed at capture time."
+}

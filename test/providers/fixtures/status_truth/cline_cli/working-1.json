@@ -1,0 +1,7 @@
+{
+  "provider": "cline_cli",
+  "state": "working",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:7 (live CAO pane cline_dev-618510c4, terminal 618510c4, provider cline_cli per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "Active [thinking]/[run_commands]/⎿ tool churn mid-turn (ClinePass TUI); fleet API status=processing, fusion_reason=pane_delta."
+}

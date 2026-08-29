@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "unknown",
+  "source": "copied byte-exact from test/providers/fixtures/codex_f435_stuck_paste_pane.txt",
+  "captured_at": "2026-08-24T22:29:00-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "F435 stuck-paste wedge: '› [Pasted Content 3048 chars]' sits in composer, no spinner/turn; wedge classification deferred to the WP."
+}

@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/codex-five-hour-statusline.txt",
+  "captured_at": "2026-07-22T20:49:16-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "Composer holding unsent input '› Explain this codebase' + statusline (quirks-merge-train · 3h 12m left); no spinner."
+}

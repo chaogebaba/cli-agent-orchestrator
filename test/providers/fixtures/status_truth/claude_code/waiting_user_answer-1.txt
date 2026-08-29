@@ -1,0 +1,4 @@
+Choose a deployment target
+❯ 1. Staging
+  2. Production
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Nvim · Esc to cancel
