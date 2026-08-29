@@ -2402,10 +2402,28 @@ class CodexProvider(BaseProvider):
     # a purpose-built override.
     supports_screen_detection = True
 
+    # F530: rows the codex TUI renders as persistent footer chrome, NOT agent
+    # output. dialog_region() drops these before measuring the dialog tail, so a
+    # still-active modal (the resume-cwd chooser) is not pushed out of the tail
+    # by its own spinner/composer/status bar. Genuine agent output matches none
+    # of these, so real scrollback below a dialog still supersedes it (F55).
+    _CHROME_ROW_PATTERNS = (
+        re.compile(TUI_PROGRESS_PATTERN),  # • Working (…s • esc to interrupt)
+        re.compile(r"•\s+Ran\b.*\bctrl \+ t to view transcript"),  # turn footer
+        re.compile(r"^\s*" + IDLE_PROMPT_PATTERN + r"\s+Ask Codex to do anything"),
+        re.compile(STARTUP_FOOTER_PATTERN),  # status/context bar, "? for shortcuts"
+        re.compile(r"\btab\s+to\s+queue\s+message\b", re.IGNORECASE),
+        re.compile(r"^\s*" + IDLE_PROMPT_PATTERN + r"\s*$"),  # bare composer prompt
+    )
+
+    def chrome_row_patterns(self) -> list["re.Pattern[str]"]:
+        return list(self._CHROME_ROW_PATTERNS)
+
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
         return getattr(self, "_resolved_model", None)
+
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -2480,8 +2498,15 @@ class CodexProvider(BaseProvider):
                 and DIALOG_ACTION_FOOTER_PATTERN.search(row)
             ):
                 signals.append(ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index))
-            if not progress_rows and RESUME_CWD_CHOOSER_PATTERN.search(row):
+            if RESUME_CWD_CHOOSER_PATTERN.search(row):
                 # F516 D2: resume-cwd chooser title → WAITING_USER_ANSWER.
+                # F530: emit UNCONDITIONALLY, even when a progress spinner
+                # coexists on screen. The chooser is a hard input-blocking modal
+                # — codex cannot actually be "working" while blocked on it, so a
+                # concurrently-rendered "• Working" footer must not demote it to
+                # PROCESSING. The shared law resolves ``waiting`` before
+                # ``progress``/``completion``, so this WAITING signal wins and the
+                # auto-responder's D6 gates no longer veto the fire (F530 layer 2).
                 signals.append(
                     ScreenSignal("waiting", "RESUME_CWD_CHOOSER_PATTERN", index)
                 )

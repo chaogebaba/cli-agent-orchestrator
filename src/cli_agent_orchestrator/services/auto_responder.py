@@ -171,12 +171,35 @@ class RuleMatchVerdict:
     matched_region_rows: tuple[str, ...]
 
 
-def dialog_region(screen: List[str]) -> DialogRegion:
-    """Return the rendered dialog-bearing tail without normalizing provider input."""
-    end = len(screen)
-    while end and not screen[end - 1].strip():
+def _drop_chrome_rows(
+    rows: List[str], chrome_patterns: Optional[List["re.Pattern[str]"]]
+) -> List[str]:
+    """F530: drop provider footer/chrome rows so the dialog tail is measured in
+    CONTENT rows only. A blocking modal is superseded only by rows the agent
+    emitted after it, never by its own spinner/composer/status bar. Genuine
+    output matches none of these patterns, so real scrollback below a dialog
+    still pushes it out (F55 suppression preserved)."""
+    if not chrome_patterns:
+        return rows
+    return [row for row in rows if not any(pat.search(row) for pat in chrome_patterns)]
+
+
+def dialog_region(
+    screen: List[str], chrome_patterns: Optional[List["re.Pattern[str]"]] = None
+) -> DialogRegion:
+    """Return the rendered dialog-bearing tail without normalizing provider input.
+
+    F530: when ``chrome_patterns`` is supplied, provider footer/chrome rows are
+    dropped BEFORE the ``DIALOG_REGION_LINES`` tail is sliced, so a still-active
+    modal is not pushed out of the tail by its own footer. The tail
+    ``rows``/``normalized`` are otherwise unchanged, so all 6 ``.matches()`` call
+    sites keep matching against ``.normalized`` (the F55 AST invariant holds).
+    """
+    filtered = _drop_chrome_rows(screen, chrome_patterns)
+    end = len(filtered)
+    while end and not filtered[end - 1].strip():
         end -= 1
-    rows = tuple(screen[max(0, end - DIALOG_REGION_LINES) : end])
+    rows = tuple(filtered[max(0, end - DIALOG_REGION_LINES) : end])
     return DialogRegion(rows=rows, normalized=normalize_screen(list(rows)))
 
 
@@ -194,6 +217,54 @@ def _rules_path(provider: str) -> Path:
     if seed and not path.exists():
         path.write_text(seed, encoding="utf-8")
     return path
+
+
+def _chrome_patterns_for_class(
+    provider_cls: type,
+) -> Optional[List["re.Pattern[str]"]]:
+    """F530: obtain a provider's chrome_row_patterns without constructing a live
+    terminal provider (used by the diagnostic CLI). Reads the class-level
+    ``_CHROME_ROW_PATTERNS`` when present; falls back to None."""
+    patterns = getattr(provider_cls, "_CHROME_ROW_PATTERNS", None)
+    if patterns:
+        return list(patterns)
+    return None
+
+
+def diagnose_rules(
+    provider_name: str, lines: List[str], provider_cls: type | None = None
+) -> Dict[str, Any]:
+    """F530 diagnosability: compute the dialog region (unfiltered + chrome-
+    filtered match region) for ``lines`` and each rule's verdict, WITHOUT sending
+    any keys or mutating state. Powers ``cao auto-answers test``.
+
+    Returns a plain dict: ``region`` (tail rows + normalized), ``match_region``
+    (chrome-filtered normalized), and ``rules`` (name, enabled, match_mode,
+    matched bool, reject reason)."""
+    chrome_patterns = _chrome_patterns_for_class(provider_cls) if provider_cls else None
+    region = dialog_region(lines)
+    match_region = dialog_region(lines, chrome_patterns) if chrome_patterns else region
+    rule_reports = []
+    for rule in _store.get_rules(provider_name):
+        reason = rule.reject_reason(match_region.normalized)
+        rule_reports.append(
+            {
+                "name": rule.name,
+                "enabled": rule.enabled,
+                "match_mode": rule.match_mode,
+                "answer": rule.answer,
+                "matched": reason is None,
+                "reject_reason": reason,
+            }
+        )
+    return {
+        "provider": provider_name,
+        "chrome_filtered": chrome_patterns is not None,
+        "region_rows": list(region.rows),
+        "region_normalized": region.normalized,
+        "match_normalized": match_region.normalized,
+        "rules": rule_reports,
+    }
 
 
 @dataclass
@@ -234,6 +305,26 @@ class Rule:
             if self.question not in normalized:
                 return False
         return all(opt in normalized for opt in self.options)
+
+    def reject_reason(self, normalized: str) -> Optional[str]:
+        """F530 diagnosability: return WHY this rule does NOT match ``normalized``,
+        or None when it matches. Names the failing field so a stalled dialog is
+        diagnosable from the decisions log / CLI without a supervisor.
+
+        Reasons: ``disabled``, ``question(regex)``, ``question(contains)``,
+        ``option[<opt>]``.
+        """
+        if not self.enabled:
+            return "disabled"
+        if self.match_mode == "regex":
+            if not re.search(self.question, normalized):
+                return "question(regex)"
+        elif self.question not in normalized:
+            return "question(contains)"
+        for opt in self.options:
+            if opt not in normalized:
+                return f"option[{opt}]"
+        return None
 
 
 @dataclass(frozen=True)
@@ -378,6 +469,32 @@ class AutoResponder:
     def waiting_gate(self, terminal_id: str) -> str | tuple[str, str] | None:
         with self._lock:
             return self._waiting_gate_locked(terminal_id)
+
+    @staticmethod
+    def _chrome_patterns(provider: Any) -> Optional[List["re.Pattern[str]"]]:
+        """F530: the provider's footer/chrome row patterns, or None. Never
+        raises — a provider without the hook (or a raising one) yields None so
+        ``dialog_region`` behaves exactly as before for that provider."""
+        try:
+            patterns = provider.chrome_row_patterns()
+            return patterns or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _reject_summary(provider_name: str, normalized: str) -> str:
+        """F530 diagnosability: for a 'no_rule_matched' eval, name WHY each rule
+        rejected (rule + failing field) plus the first 80 chars of the window
+        that was matched against. Written into the decisions log ``extra`` field
+        so this whole class of no-fire is diagnosable without a supervisor."""
+        parts: List[str] = []
+        for rule in _store.get_rules(provider_name):
+            reason = rule.reject_reason(normalized)
+            if reason is not None:
+                parts.append(f"{rule.name}:{reason}")
+        window = normalized[:80]
+        rejects = " ".join(parts) if parts else "no-rules"
+        return f"rejects=[{rejects}] window={window!r}"
 
     def match_verdict(
         self, provider_name: str, lines: List[str], terminal_id: str | None = None
@@ -554,7 +671,14 @@ class AutoResponder:
             return None
 
         provider_name = metadata["provider"]
+        chrome_patterns = self._chrome_patterns(provider)
+        # Classifier, D6 history/banner, and the unknown-dialog shape heuristic
+        # all read the UNFILTERED bottom-anchored tail (unchanged behavior). Only
+        # whitelist RULE MATCHING uses the chrome-filtered tail (F530 layer 1),
+        # so a modal is not pushed out of the tail by its own footer chrome while
+        # the classifier still sees the true bottom of the pane.
         region = dialog_region(lines)
+        match_region = dialog_region(lines, chrome_patterns) if chrome_patterns else region
         if not region.normalized:
             self._clear_wait_rule(terminal_id)
             self._log_decision(terminal_id, "not_running", "empty_region")
@@ -570,14 +694,14 @@ class AutoResponder:
         banner_marked = self._push_region_history(terminal_id, region)
 
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(region.normalized):
+            if not rule.matches(match_region.normalized):
                 continue
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
                 if fresh is None:
                     self._log_decision(terminal_id, "no_match", "wait_rule_capture_failed", rule.name)
                     return None
-                fresh_region = self._region_from_capture(fresh)
+                fresh_region = self._region_from_capture(fresh, self._chrome_patterns(provider))
                 if not rule.matches(fresh_region.normalized):
                     self._log_decision(terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name)
                     return None
@@ -624,10 +748,11 @@ class AutoResponder:
             self._log_decision(terminal_id, "matched", "firing", rule.name)
             # A real fire resets the veto streak for this terminal (r2-S5 edges).
             self._reset_veto_streak(terminal_id)
-            # D2(i)/D5: seed the pending-fire record's two digests, both over the
-            # normalized-domain rule-loop region (r5-B1).
-            match_digest = _digest_normalized(region.normalized)
-            pending_region = region.with_digests(settle=match_digest, consume=match_digest)
+            # D2(i)/D5: seed the pending-fire digests over the CHROME-FILTERED
+            # match region (F530) so the barrier's settle/consume compares the
+            # same domain the rule matched — the classifier still saw ``region``.
+            match_digest = _digest_normalized(match_region.normalized)
+            pending_region = match_region.with_digests(settle=match_digest, consume=match_digest)
             self._fire(
                 terminal_id,
                 metadata,
@@ -640,7 +765,12 @@ class AutoResponder:
             return None
 
         self._clear_wait_rule(terminal_id)
-        self._log_decision(terminal_id, "no_match", "no_rule_matched")
+        self._log_decision(
+            terminal_id,
+            "no_match",
+            "no_rule_matched",
+            extra=self._reject_summary(provider_name, match_region.normalized),
+        )
         unknown_result = self._check_unknown(
             terminal_id,
             metadata,
@@ -709,11 +839,12 @@ class AutoResponder:
         (r3-S2) — otherwise the first keystroke's redraw fails settle and
         disables retries. ``consume_digest`` is carried forward unchanged.
         """
+        chrome_patterns = self._chrome_patterns(provider)
         for attempt in range(2, RETRY_MAX + 1):
             time.sleep(RETRY_DELAY_S)
             if not self._incarnation_is_current(terminal_id, incarnation):
                 return
-            attempt_region = self._current_normalized(terminal_id)
+            attempt_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
             if attempt_region is None or not rule.matches(attempt_region.normalized):
                 # D5: the dialog cleared — record the FROZEN consume_digest so a
                 # later identical redraw of the same region is not re-fired.
@@ -736,7 +867,7 @@ class AutoResponder:
         time.sleep(RETRY_DELAY_S)
         if not self._incarnation_is_current(terminal_id, incarnation):
             return
-        final_region = self._current_normalized(terminal_id)
+        final_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
         if final_region is not None and rule.matches(final_region.normalized):
             self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
         elif final_region is not None:
@@ -750,13 +881,30 @@ class AutoResponder:
             self._consumed_digests[(terminal_id, rule.name, rule.body_hash)] = consume_digest
 
     @staticmethod
-    def _current_normalized(terminal_id: str) -> Optional[DialogRegion]:
+    def _current_normalized(
+        terminal_id: str, chrome_patterns: Optional[List["re.Pattern[str]"]] = None
+    ) -> Optional[DialogRegion]:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         lines = status_monitor.get_rendered_screen(terminal_id)
         if lines is None:
             return None
-        return dialog_region(lines)
+        return dialog_region(lines, chrome_patterns)
+
+    def _current_normalized_filtered(
+        self, terminal_id: str, chrome_patterns: Optional[List["re.Pattern[str]"]]
+    ) -> Optional[DialogRegion]:
+        """F530: chrome-aware wrapper around ``_current_normalized`` used by the
+        retry loop. Kept separate so tests that patch the single-arg
+        ``_current_normalized`` (F55/M5, retry-cap) keep working: they patch the
+        base method, and this wrapper re-applies chrome filtering to the rows it
+        returns without changing that method's call signature."""
+        region = self._current_normalized(terminal_id)
+        if region is None or not chrome_patterns:
+            return region
+        # Re-slice the returned rows with chrome dropped (idempotent for callers
+        # that already filtered; correct for patched single-arg stand-ins).
+        return dialog_region(list(region.rows), chrome_patterns)
 
     def _send_answer(
         self,
@@ -1117,17 +1265,23 @@ class AutoResponder:
         if fresh is None:
             self._request_detection_retry(terminal_id)
             return False
+        chrome_patterns = self._chrome_patterns(provider)
+        # Classify on the UNFILTERED tail (unchanged behavior); match + settle on
+        # the CHROME-FILTERED tail (F530 layer 1), mirroring the on_screen split.
         region = self._region_from_capture(fresh)
+        match_region = (
+            self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
+        )
         status = self._classify_region(terminal_id, provider, region)
-        if not rule.matches(region.normalized):
+        if not rule.matches(match_region.normalized):
             return False  # dialog cleared / no longer matches — no retry
         if self._busy_veto(status):
             self._request_detection_retry(terminal_id)
             return False
-        # D2(i) settle (r2-B3/r5-B1): normalized-domain digest match; empty
-        # settle_digest → skipped (retry-exhausted surface path).
+        # D2(i) settle (r2-B3/r5-B1): normalized-domain digest match on the
+        # chrome-filtered match region; empty settle_digest → skipped.
         settle_ok = (not pending_region.settle_digest) or (
-            _digest_normalized(region.normalized) == pending_region.settle_digest
+            _digest_normalized(match_region.normalized) == pending_region.settle_digest
         )
         if not settle_ok:
             self._request_detection_retry(terminal_id)  # mid-repaint tearing
@@ -1148,10 +1302,11 @@ class AutoResponder:
     @staticmethod
     def _region_from_capture(
         capture: tuple[str, List[str]] | AutoResponderDecision,
+        chrome_patterns: Optional[List["re.Pattern[str]"]] = None,
     ) -> DialogRegion:
         if isinstance(capture, AutoResponderDecision):
-            return dialog_region(list(capture.lines))
-        return dialog_region(capture[1])
+            return dialog_region(list(capture.lines), chrome_patterns)
+        return dialog_region(capture[1], chrome_patterns)
 
     @staticmethod
     def _classify_region(

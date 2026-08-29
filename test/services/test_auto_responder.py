@@ -559,6 +559,193 @@ def test_single_torn_codex_processing_frame_is_suppressed(monkeypatch, _reset_en
     assert "term1" not in _reset_engine._unknown_state
 
 
+# ----- F530: resume-cwd chooser under codex footer chrome (option D) --------
+
+
+def _f530_resume_rules():
+    """The two real codex.yaml rules for the resume-cwd chooser (F530)."""
+    return [
+        ar.Rule(
+            "codex-resume-working-directory",
+            True,
+            "regex",
+            "Choose working directory to resume this session",
+            ["Use session directory", "Use current directory", "Press enter to continue"],
+            ["Down", "Enter"],
+        ),
+        ar.Rule(
+            "codex-resume-working-directory-4opt",
+            True,
+            "contains",
+            "Choose working directory to resume this session",
+            ["Always use current directory"],
+            ["Down", "Enter"],
+        ),
+    ]
+
+
+_F530_CHOOSER_ROWS = [
+    "Choose working directory to resume this session",
+    "  Session = latest cwd recorded in the resumed session",
+    "  Current = your current working directory",
+    "",
+    "  1. Use session directory (/home/chao/VScode_projects/cli-subagents)",
+    "\u203a 2. Use current directory (/home/chao/VScode_projects/cli-subagents/.cao/worktrees/cf2a83bc)",
+    "  3. Always use session directory",
+    "  4. Always use current directory",
+    "  Press enter to continue",
+]
+
+# Codex FOOTER CHROME rendered below the still-active chooser: a live spinner,
+# the turn footer, the composer prompt and the status bar. These are NOT agent
+# output — they must be dropped before the tail is measured so the chooser is
+# not pushed out of the 20-line window by its own chrome (F530 layer 1).
+_F530_CHROME_BELOW = [
+    "",
+    "\u2022 Working (12s \u2022 esc to interrupt)",
+    "",
+    "\u2022 Ran 3 commands \u00b7 ctrl + t to view transcript",
+    "",
+    "\u203a Ask Codex to do anything",
+    "",
+    "  gpt-5.6-sol high \u00b7 Context 66% left",
+]
+
+
+def test_f530_layer1_chrome_rows_dropped_keep_chooser_in_tail():
+    """F530 layer 1: dialog_region drops codex footer chrome before slicing the
+    tail, so the chooser (with chrome below it) stays inside the tail and the
+    whitelist rule can match .normalized (the F55 AST invariant is untouched)."""
+    provider = _codex_provider()
+    screen = _F530_CHOOSER_ROWS + _F530_CHROME_BELOW
+
+    filtered = ar.dialog_region(screen, provider.chrome_row_patterns())
+
+    assert "Choose working directory to resume this session" in filtered.normalized
+    assert "Always use current directory" in filtered.normalized
+    # No chrome row leaked into the filtered tail.
+    assert "esc to interrupt" not in filtered.normalized
+    assert "Ask Codex to do anything" not in filtered.normalized
+    # The filtered region is strictly the chooser rows (8 non-blank + 1 blank).
+    assert len([r for r in filtered.rows if r.strip()]) == 8
+    # Genuine output below the chooser is NOT dropped (F55 scrollback preserved).
+    real_output = _F530_CHOOSER_ROWS + [f"genuine output {i}" for i in range(25)]
+    assert (
+        "Choose working directory to resume this session"
+        not in ar.dialog_region(real_output, provider.chrome_row_patterns()).normalized
+    )
+
+
+def test_f530_layer2_resume_chooser_classifies_waiting_despite_spinner():
+    """F530 layer 2: the resume-cwd chooser is a hard modal — codex cannot be
+    "working" while blocked on it — so it classifies WAITING_USER_ANSWER even
+    when a '• Working' spinner coexists, so the D6 gates do not veto the fire."""
+    provider = _codex_provider()
+
+    assert (
+        provider.get_status_from_screen(list(_F530_CHOOSER_ROWS))
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert (
+        provider.get_status_from_screen(_F530_CHOOSER_ROWS + _F530_CHROME_BELOW)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+
+
+def test_f530_layer3_reject_reason_names_failing_field():
+    """F530 layer 3: Rule.reject_reason names WHY a rule does not match — the
+    failing field — so a stalled dialog is diagnosable from the decisions log."""
+    rule = ar.Rule(
+        "codex-trust-dir",
+        True,
+        "contains",
+        "Do you trust the contents of this directory?",
+        ["Yes, continue", "No, quit"],
+        ["Enter"],
+    )
+    # question absent → question(contains)
+    assert rule.reject_reason("unrelated screen text") == "question(contains)"
+    # question present, an option absent → option[<opt>]
+    assert (
+        rule.reject_reason("Do you trust the contents of this directory? Yes, continue")
+        == "option[No, quit]"
+    )
+    # full match → None
+    assert (
+        rule.reject_reason(
+            "Do you trust the contents of this directory? Yes, continue No, quit"
+        )
+        is None
+    )
+    # disabled → disabled (short-circuits before field checks)
+    disabled = ar.Rule("r", False, "contains", "x", [], ["Enter"])
+    assert disabled.reject_reason("x") == "disabled"
+
+    regex_rule = ar.Rule("re", True, "regex", r"Update available! [\d.]+", [], "wait")
+    assert regex_rule.reject_reason("no update here") == "question(regex)"
+
+
+def test_f530_layer3_diagnose_rules_reports_region_and_verdicts(monkeypatch):
+    """F530 layer 3: diagnose_rules returns the region + per-rule verdicts with
+    no side effects, powering `cao auto-answers test`."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    trust = ar.Rule(
+        "codex-trust-dir",
+        True,
+        "contains",
+        "Do you trust the contents of this directory?",
+        ["Yes, continue", "No, quit"],
+        ["Enter"],
+    )
+    monkeypatch.setattr(
+        ar._store, "get_rules", lambda provider: _f530_resume_rules() + [trust]
+    )
+
+    report = ar.diagnose_rules(
+        "codex", _F530_CHOOSER_ROWS + _F530_CHROME_BELOW, CodexProvider
+    )
+    assert report["provider"] == "codex"
+    assert report["chrome_filtered"] is True
+    # chrome dropped from the match region, present in the unfiltered region.
+    assert "esc to interrupt" in report["region_normalized"]
+    assert "esc to interrupt" not in report["match_normalized"]
+    by_name = {r["name"]: r for r in report["rules"]}
+    assert by_name["codex-resume-working-directory"]["matched"] is True
+    assert by_name["codex-resume-working-directory-4opt"]["matched"] is True
+    # A non-matching rule reports its failing field.
+    assert by_name["codex-trust-dir"]["matched"] is False
+    assert by_name["codex-trust-dir"]["reject_reason"] == "question(contains)"
+
+
+def test_f530_resume_chooser_under_chrome_fires_end_to_end(monkeypatch, _reset_engine):
+    """F530 end-to-end: real 2 rules + real CodexProvider + the chooser under
+    live footer chrome → the auto-responder fires Down+Enter (option 2, current
+    dir) instead of pushing 'unknown blocking dialog'. Occurrence-9 (cf2a83bc)
+    decisions log showed this as a flood of no_rule_matched with rare firing."""
+    sent = []
+    _wire_common(monkeypatch, sent_keys=sent)
+    pushed = _capture_pushes(monkeypatch)
+    monkeypatch.setattr(ar._store, "get_rules", lambda provider: _f530_resume_rules())
+    provider = _codex_provider()
+
+    screen = _F530_CHOOSER_ROWS + _F530_CHROME_BELOW
+
+    # The barrier re-captures the same screen (dialog still up); the background
+    # retry recapture then shows it cleared so there is no re-fire.
+    _set_fresh_screen(monkeypatch, _reset_engine, screen)
+    monkeypatch.setattr(
+        ar.AutoResponder,
+        "_current_normalized",
+        staticmethod(lambda tid: ar.dialog_region(["gone"])),
+    )
+
+    _reset_engine.on_screen("term1", provider, screen)
+
+    assert sent == [("cao-sess", "win", "Down"), ("cao-sess", "win", "Enter")]
+    assert pushed == []
+
+
 def test_genuine_codex_menu_with_idle_footer_is_suppressed(monkeypatch, _reset_engine):
     _wire_common(monkeypatch)
     pushed = _capture_pushes(monkeypatch)

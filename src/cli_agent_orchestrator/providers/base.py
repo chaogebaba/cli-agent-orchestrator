@@ -328,6 +328,25 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
+    def chrome_row_patterns(self) -> List["re.Pattern[str]"]:
+        """Return regexes matching NON-CONTENT footer/chrome rows (F530).
+
+        The auto-responder's ``dialog_region`` measures the dialog-bearing tail
+        in SCREEN rows. But a provider TUI persistently renders footer chrome
+        below whatever is on screen — a progress spinner, the composer prompt, a
+        status/context bar. Those rows are not agent output: a blocking modal is
+        superseded only by rows the AGENT emitted after it, never by its own
+        chrome. Rows matching these patterns are dropped BEFORE the tail is
+        sliced, so a still-active modal (e.g. the codex resume-cwd chooser under
+        a live spinner) is not pushed out of the tail by its own footer, while
+        genuine output below a dialog still pushes it out (F55 scrollback
+        suppression is preserved — real content matches none of these).
+
+        Default: no chrome rows (empty list) — a safe no-op for providers that
+        have not opted in. Override to return compiled patterns.
+        """
+        return []
+
     def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
         """Return status plus Wave 4 deciding evidence for a composited frame.
 

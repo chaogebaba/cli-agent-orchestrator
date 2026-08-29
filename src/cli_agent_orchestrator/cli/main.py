@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 import click
 
 from cli_agent_orchestrator.cli.commands.agents import agents
+from cli_agent_orchestrator.cli.commands.auto_answers import auto_answers
 from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
@@ -79,6 +80,7 @@ cli.add_command(verify)
 cli.add_command(ledger)
 cli.add_command(update)
 cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
+cli.add_command(auto_answers)  # F530: whitelist auto-responder diagnostics
 
 
 if __name__ == "__main__":
