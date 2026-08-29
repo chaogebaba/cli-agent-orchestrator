@@ -410,7 +410,6 @@ def _create_terminal(
         if use_worktree is not None:
             params["use_worktree"] = "true" if use_worktree else "false"
 
-
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -1246,7 +1245,6 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
-
         }
         if use_worktree is not None:
             payload["use_worktree"] = use_worktree
@@ -1562,7 +1560,12 @@ async def handoff(
         HandoffResult with success status, message, and agent output
     """
     return await _handoff_impl(
-        agent_profile, message, timeout, working_directory, model=model, use_worktree=use_worktree,
+        agent_profile,
+        message,
+        timeout,
+        working_directory,
+        model=model,
+        use_worktree=use_worktree,
         task_label=task_label,
     )
 
@@ -1637,9 +1640,7 @@ def _cold_fallback_preamble(
         fields["cell"] = cell
     if base_stale:
         fields["base"] = "stale"
-    rendered = " ".join(
-        f"{k}={fields[k]}" for k in _COLD_FALLBACK_FIELD_ORDER if k in fields
-    )
+    rendered = " ".join(f"{k}={fields[k]}" for k in _COLD_FALLBACK_FIELD_ORDER if k in fields)
     line = f"[COLD-FALLBACK {rendered}]" if rendered else "[COLD-FALLBACK]"
     if other:
         return f"{line}\n{other}"
@@ -1686,21 +1687,67 @@ def _assign_impl(
         # position name (provider from provider= arg, allowlist-checked). Reject
         # BEFORE creating any terminal so a disallowed/underspecified position
         # never spawns.
+        # F497 D9 — a bare POSITION name with NO explicit provider= is a
+        # ROUTING-DRIVEN spawn: the provider comes from routing.toml and the full
+        # D9 validator runs (provider-cert-first, row-clause, cell-cert +
+        # general fallback). An explicit provider= is an OPERATOR OVERRIDE (D7):
+        # the operator owns the cell choice, so only the allowlist + D6 synthesis
+        # apply, never the cert/fallback validator. Detect the routing-driven
+        # case BEFORE resolution mutates ``agent_profile``.
         from cli_agent_orchestrator.utils.agent_profiles import (
             AssignmentResolutionError,
+            _position_exists,
             resolve_assignment_target,
         )
 
+        _routing_driven = provider is None and _position_exists(agent_profile)
+        _routing_position = agent_profile if _routing_driven else None
+
         try:
-            agent_profile, _resolved_provider = resolve_assignment_target(
-                agent_profile, provider
-            )
+            agent_profile, _resolved_provider = resolve_assignment_target(agent_profile, provider)
         except AssignmentResolutionError as exc:
             return {
                 "success": False,
                 "terminal_id": None,
                 "message": f"Assignment failed: {exc}",
             }
+
+        # F497 D9/D12 — routing-driven validation + general fallback substitution.
+        # Runs ONLY on the routing-driven path (bare position, provider from
+        # routing). Refusals (E-PROVIDER-UNCERTIFIED / E-ROW-CLAUSES-MISSING /
+        # uncertified gate cell) fail BEFORE any terminal is created; a non-PASS
+        # NON-gate cell substitutes ``<provider>_general`` and owes a
+        # ``[COLD-FALLBACK position=<pos> cell=<outcome>]`` preamble field.
+        _fallback_profile: Optional[str] = None
+        _d9_position: Optional[str] = None
+        _d9_cell: Optional[str] = None
+        if _routing_driven and _resolved_provider:
+            from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
+            from cli_agent_orchestrator.utils.routing import (
+                RoutingError,
+                load_routing_table,
+                resolve_routing_binding,
+            )
+
+            try:
+                _rt = load_routing_table(routing_toml_path())
+                _res = resolve_routing_binding(
+                    _routing_position,
+                    _resolved_provider,
+                    table=_rt,
+                    positions_dir=positions_store_dir(),
+                )
+            except RoutingError as exc:
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "message": f"Assignment failed: {exc}",
+                }
+            agent_profile = _res.spawn_profile
+            if _res.fallback_profile:
+                _fallback_profile = _res.fallback_profile
+                _d9_position = _res.fallback_position
+                _d9_cell = _res.fallback_cell
 
         fork_context = None
         refresh_base_name = None
@@ -1752,9 +1799,7 @@ def _assign_impl(
                 # no-spawn assertion stays green).
                 if not defaulted_fork:
                     raise ValueError("provider_mismatch")
-                assignment_preamble = _cold_fallback_preamble(
-                    assignment_preamble, base_stale=True
-                )
+                assignment_preamble = _cold_fallback_preamble(assignment_preamble, base_stale=True)
                 fork_from = None
                 row = None
         if row is not None:
@@ -1877,6 +1922,14 @@ def _assign_impl(
             )
         else:
             worker_message = message
+        # F497 D12 — when the D9 resolver substituted <provider>_general for a
+        # non-PASS non-gate cell, fold the position/cell fields into the ONE
+        # [COLD-FALLBACK …] line (D10's base=stale, if it also fired, is already
+        # present and this appends without a second bare marker — r11 S1).
+        if _fallback_profile:
+            assignment_preamble = _cold_fallback_preamble(
+                assignment_preamble, position=_d9_position, cell=_d9_cell
+            )
         if assignment_preamble:
             worker_message = f"{assignment_preamble}\n\n{worker_message}"
 
@@ -1943,6 +1996,9 @@ def _assign_impl(
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
                 for af in authority_files
             ]
+        # F497 D12 — surface the general-cell substitution to the operator.
+        if _fallback_profile:
+            result["fallback_profile"] = _fallback_profile
         # F483: Write fleet-labels.tsv row (never fails the assign)
         if task_label and terminal_id:
             from cli_agent_orchestrator.services.fleet_labels import upsert_label
@@ -3269,9 +3325,7 @@ async def update_task_label(
     terminal_id: str = Field(
         description="Terminal ID to update the label for (defaults to caller's own terminal)"
     ),
-    task_label: str = Field(
-        description="New task label (max 40 chars) for the fleet TUI display"
-    ),
+    task_label: str = Field(description="New task label (max 40 chars) for the fleet TUI display"),
 ) -> Dict[str, Any]:
     """Update the fleet-labels.tsv entry for a terminal.
 

@@ -4,7 +4,7 @@ import logging
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import frontmatter
 
@@ -751,20 +751,20 @@ def resolve_assignment_target(
     The resolver ENGAGES (position mode) only when the caller passes ``provider=``
     OR ``agent_profile`` is a bare position file (``positions/<name>.md``). Every
     OTHER name passes through UNTOUCHED as a legacy concrete name — no store
-    lookup, no ``<provider>_<position>`` shape inference (that synthesis is D9/P4).
-    This is the r2 (option b) fix: a legacy name (installed OR NOT — e.g.
+    lookup, no ``<provider>_<position>`` shape inference. This is
+    the r2 (option b) fix: a legacy name (installed OR NOT — e.g.
     ``kiro_dev`` / ``codex_dev`` on a clean store) spawns exactly as pre-D7, and
     a ``<provider>_<position>``-shaped legacy name is never mistaken for a
     position miss.
 
     Returns ``(effective_profile_name, resolved_provider)``:
 
-      * ENGAGED + ``agent_profile`` is a position file: requires a ``provider``
-        (else ``E-POSITION-NEEDS-PROVIDER``); the provider must be in the
+      * ENGAGED + ``agent_profile`` is a position file: the provider comes from
+        ``provider=`` or, when absent, the routing.toml binding (D9); a position
+        with neither is ``E-POSITION-NEEDS-PROVIDER``. The provider must be in the
         position's ``providers:`` allowlist (else ``E-PROVIDER-NOT-ALLOWED``). On
-        success returns the position as the effective name + resolved provider —
-        the LIVE on-disk spawn wiring for a position target is D9/P4; P3 lands the
-        resolution + validation layer.
+        success the effective name is the legacy ALIAS for that cell when one
+        exists, else the D6 synthesis ``<provider>_<position>``.
       * ENGAGED via ``provider=`` but ``agent_profile`` is NOT a position file:
         ``E-UNKNOWN-POSITION`` (position mode was requested on a non-position).
       * NOT ENGAGED (no ``provider=`` and not a position file): passthrough
@@ -790,12 +790,16 @@ def resolve_assignment_target(
             f"is P4)",
         )
 
-    # ENGAGED + a bare position file. Provider is mandatory in P3 (D9 routing = P4).
+    # ENGAGED + a bare position file. In P4 (D9) a bare position with no
+    # explicit provider= consults the routing binding for its provider; only
+    # when neither is available is it a hard fail.
+    if not provider:
+        provider = _routing_provider_for_position(agent_profile)
     if not provider:
         raise AssignmentResolutionError(
             E_POSITION_NEEDS_PROVIDER,
             f"{E_POSITION_NEEDS_PROVIDER}: position '{agent_profile}' needs an "
-            f"explicit provider= (routing-binding resolution is P4)",
+            f"explicit provider= or a routing.toml binding (D9)",
         )
 
     # Enforce the position ``providers:`` allowlist (D7). Absent/empty = open; a
@@ -811,4 +815,80 @@ def resolve_assignment_target(
             f"{E_PROVIDER_NOT_ALLOWED}: provider '{provider}' is not in position "
             f"'{agent_profile}' allowlist {allow}",
         )
-    return agent_profile, provider
+
+    # D6 — synthesise the spawn profile name for a position-name target. When a
+    # legacy alias stub exists for this (provider, position) cell, prefer it (its
+    # ``description`` identity + ``[p.profiles.<name>]`` overrides stay keyed on
+    # the legacy name, D6); otherwise synthesise ``<provider>_<position>``
+    # deterministically. Legacy dev names (``codex_dev``/``grok_dev``) are never
+    # reached here — they are not position files, so this branch is position-only.
+    effective = _synthesise_position_profile_name(agent_profile, provider)
+    return effective, provider
+
+
+def _routing_provider_for_position(position_name: str) -> Optional[str]:
+    """The provider bound to ``position_name`` by routing.toml (D9), or None.
+
+    A missing/malformed routing store is treated as "no binding" here (None) so
+    the caller falls through to the ``E-POSITION-NEEDS-PROVIDER`` hard fail with
+    its explicit message — the routing store's own structural validation surfaces
+    via the D9 validator on the resolution path, not this convenience lookup.
+    """
+    from cli_agent_orchestrator.constants import routing_toml_path
+
+    try:
+        from cli_agent_orchestrator.utils.routing import load_routing_table
+
+        table = load_routing_table(routing_toml_path())
+    except Exception:
+        return None
+    binding = table.binding_for(position_name, None)
+    if binding is not None and binding.kind == "cao" and binding.provider:
+        return binding.provider
+    return None
+
+
+def _synthesise_position_profile_name(position_name: str, provider: str) -> str:
+    """D6 — resolve a position-name target to its concrete spawn profile name.
+
+    Prefers an existing LEGACY ALIAS stub for the (provider, position) cell so
+    name-keyed config (``[p.profiles.<name>]``, ``default_fork_base``,
+    ``find_profiles``) stays keyed on the legacy name (D6). Falls back to the
+    deterministic ``<provider>_<position>`` synthesis when no alias resolves it.
+    The alias search reads the flat agent store and matches a stub whose
+    ``extends``/``position`` == this position AND ``provider`` == this provider.
+    """
+    synthesized = f"{provider}_{position_name}"
+    try:
+        alias = _find_alias_for_cell(position_name, provider)
+    except Exception:
+        alias = None
+    return alias or synthesized
+
+
+def _find_alias_for_cell(position_name: str, provider: str) -> Optional[str]:
+    """Find a legacy alias stub bound to (position_name, provider), or None.
+
+    Scans the flat agent-store ``*.md`` for a composition stub whose resolved
+    (position, provider) matches. Returns the stub's file stem (the legacy
+    concrete name) so D6 keeps name-keyed consumers working. A synthesised name
+    that IS itself an installed stub is returned as-is by the caller's default.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.constants import local_agent_store_dir
+
+    store = local_agent_store_dir()
+    if not store.exists():
+        return None
+    for path in sorted(store.glob("*.md")):
+        try:
+            meta = dict(frontmatter.loads(path.read_text(encoding="utf-8")).metadata)
+        except Exception:
+            continue
+        if not profile_declares_composition(meta):
+            continue
+        pos = meta.get("extends") or meta.get("position")
+        if pos == position_name and meta.get("provider") == provider:
+            return path.stem
+    return None
