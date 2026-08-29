@@ -39,7 +39,8 @@ def test_codex_seed_trust_subdir_matches_worktree_prompt(tmp_path: Path) -> None
         "This folder is a subdirectory of a Git project. Trusting will apply to the "
         "repository root. › 1. Yes, continue 2. No, quit Press enter to continue"
     )
-    assert rules["codex-trust-dir-subdir"].matches(screen)
+    # F597 #454: .matches() receives the canonical screen string.
+    assert rules["codex-trust-dir-subdir"].matches(ar.canonicalize(screen))
     assert not rules["codex-trust-dir-subdir"].matches(
-        "Do you trust the contents of this directory? Yes, continue No, quit"
+        ar.canonicalize("Do you trust the contents of this directory? Yes, continue No, quit")
     )

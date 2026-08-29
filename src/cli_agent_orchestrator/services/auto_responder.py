@@ -17,9 +17,14 @@ on the user's behalf.
 
 THE line-break trap: terminal width changes where TUI lines wrap, but a TUI
 never splits a word mid-token, so the word sequence is stable while the
-newlines are not. All matching therefore runs against the composited screen
-with every run of whitespace (including newlines) collapsed to a single
-space -- never against raw lines. Rules must never encode newlines.
+newlines are not. All matching therefore runs against a CANONICAL form of the
+composited screen (see ``canonicalize``): NFKC-normalized, lowercased, every
+non-``[a-z0-9]`` character mapped to a space, then whitespace collapsed. This
+drops box-drawing walls, block glyphs, arrows, bullets/markers (``> › • ▸``),
+numbering dots, and quotes/apostrophes, and makes wrap points irrelevant, so a
+rule author writes plain prose and never needs ``\\W+`` in a rule. Rules are
+canonicalized the same way on load, so both sides of every match share one
+domain. Matching never runs against raw lines.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +93,13 @@ _PERMISSION_PROMPT_PATTERNS = (
 # the blueprint.
 SEED_RULES: Dict[str, str] = {
     "codex.yaml": """\
+# F597 #454: rules match against the CANONICAL form of the screen (NFKC,
+# lowercased, every non-[a-z0-9] char -> space, whitespace collapsed). Write
+# plain prose in `question`/`options` for `contains` rules — glyphs, box walls,
+# bullets, quotes, apostrophes and wrap points are all folded away, so no rule
+# needs \\W+. For `match_mode: regex` the pattern is applied to that same
+# canonical string (word/digit tokens survive the fold), so write lowercase
+# patterns over [a-z0-9 ] — e.g. digits in `\\d+` still match.
 - name: codex-usage-resets
   enabled: true
   match_mode: regex
@@ -115,19 +128,51 @@ SEED_RULES: Dict[str, str] = {
 }
 
 # Generic unknown-dialog heuristic (any provider): numbered options like
-# "1. Yes, continue" plus a "press enter to continue"-style footer.
-_NUMBERED_OPTION_PATTERN = re.compile(r"\b[1-3]\.\s+\S")
+# "1. Yes, continue" plus a "press enter to continue"-style footer. F597 #454:
+# these run against the CANONICAL string, where "1." has been folded to "1 "
+# (the dot became a space), so the numbered-option pattern is "<digit> <word>".
+_NUMBERED_OPTION_PATTERN = re.compile(r"\b[1-3]\s+\S")
 _PRESS_ENTER_PATTERN = re.compile(r"press enter", re.IGNORECASE)
+# F597 #454: canonical-domain equivalent of codex's WAITING_PROMPT_PATTERN
+# (providers/codex.py). The screen is already lowercased and punctuation-folded
+# here, so "Approve command? y/n" reads "approve command y n": an approve/allow
+# lead, then a yes/no affordance ("y n"/"yes no"/"yes"/"no") later in the region.
+_CANONICAL_APPROVAL_PATTERN = re.compile(r"^(?:approve|allow)\b.*\b(?:y n|yes no|yes|no)\b")
+
+
+def canonicalize(text: str) -> str:
+    """Fold ``text`` into the canonical match domain (F597 #454).
+
+    Steps: NFKC-normalize → lowercase → map every character that is not
+    ``[a-z0-9]`` to a space → collapse whitespace runs → strip. The effect is
+    that all TUI chrome (box-drawing walls, block elements, arrows, bullets and
+    prompt markers like ``> › • ▸``, numbering dots, quotes and apostrophes) is
+    reduced to word boundaries, and where a line wraps no longer matters. A
+    58-col bordered card whose question wraps across a ``│`` wall canonicalizes
+    to the same string as the same prompt rendered as plain unwalled text, so a
+    plain-prose ``contains`` rule matches both. Word/digit tokens survive intact,
+    so ``regex`` rules like ``you have \\d+ usage limit resets`` still match.
+
+    This is applied to BOTH the composited screen (via ``normalize_screen``) and
+    every rule's ``question``/``options`` (on load), so both sides of a match
+    share one domain. Deliberately NOT fuzzy/semantic: it is a pure, reversible
+    character fold, nothing more.
+    """
+    folded = unicodedata.normalize("NFKC", text).lower()
+    folded = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else " " for ch in folded)
+    return " ".join(folded.split())
 
 
 def normalize_screen(lines: List[str]) -> str:
-    """Flatten composited screen lines into whitespace-normalized text.
+    """Flatten composited screen lines into the canonical match domain.
 
-    Every run of whitespace/newlines collapses to a single space -- this is
-    the line-break trap invariant. Never match against raw ``lines``.
+    Joins ``lines`` and returns their ``canonicalize`` fold. This is the single
+    producer of the ``normalized`` string that flows into every ``Rule`` match,
+    so rule matching is glyph/chrome/wrap insensitive without touching any call
+    site. Never match against raw ``lines``; the raw text (for diagnostics) is
+    recoverable by joining ``DialogRegion.rows``.
     """
-    text = " ".join(lines)
-    return re.sub(r"\s+", " ", text).strip()
+    return canonicalize(" ".join(lines))
 
 
 @dataclass(frozen=True)
@@ -282,6 +327,36 @@ class Rule:
     question: str
     options: List[str]
     answer: Any  # list[str] of tmux special-key names, or the literal "wait"
+    # F597 #454: canonical match forms, computed in __post_init__ (not init args).
+    _canon_question: str = field(init=False, repr=False, compare=False, default="")
+    _canon_options: tuple[str, ...] = field(init=False, repr=False, compare=False, default=())
+    _regex: "re.Pattern[str] | None" = field(init=False, repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        # F597 #454: precompute the canonical match forms once on load so every
+        # match shares the same domain as the canonicalized screen text. For
+        # ``contains`` the question is canonicalized. For ``regex`` the pattern
+        # is applied to the canonical screen string, which is lowercased with
+        # punctuation folded to single spaces — so the pattern is compiled
+        # case-insensitively (an authored ``You have`` still matches the folded
+        # ``you have``) while ``\d+`` and word tokens survive the fold. Options
+        # are always canonicalized (they are plain-prose substrings).
+        # ``question``/``options`` keep their authored text for display in reject
+        # reasons.
+        if self.match_mode == "regex":
+            self._canon_question = self.question
+            try:
+                self._regex = re.compile(self.question, re.IGNORECASE)
+            except re.error:
+                logger.warning(
+                    "auto-responder: rule %r has an invalid regex question; disabling",
+                    self.name,
+                )
+                self._regex = None
+        else:
+            self._canon_question = canonicalize(self.question)
+            self._regex = None
+        self._canon_options = tuple(canonicalize(opt) for opt in self.options)
 
     @property
     def is_wait(self) -> bool:
@@ -306,31 +381,33 @@ class Rule:
         if not self.enabled:
             return False
         if self.match_mode == "regex":
-            if not re.search(self.question, normalized):
+            if self._regex is None or not self._regex.search(normalized):
                 return False
         else:
-            if self.question not in normalized:
+            if self._canon_question not in normalized:
                 return False
-        return all(opt in normalized for opt in self.options)
+        return all(opt in normalized for opt in self._canon_options)
 
     def reject_reason(self, normalized: str) -> Optional[str]:
         """F530 diagnosability: return WHY this rule does NOT match ``normalized``,
         or None when it matches. Names the failing field so a stalled dialog is
         diagnosable from the decisions log / CLI without a supervisor.
 
-        Reasons: ``disabled``, ``question(regex)``, ``question(contains)``,
+        ``normalized`` is the canonical screen string; the rule's own canonical
+        forms are compared against it. Reasons name the AUTHORED text so the log
+        is human-readable: ``disabled``, ``question(regex)``, ``question(contains)``,
         ``option[<opt>]``.
         """
         if not self.enabled:
             return "disabled"
         if self.match_mode == "regex":
-            if not re.search(self.question, normalized):
+            if self._regex is None or not self._regex.search(normalized):
                 return "question(regex)"
-        elif self.question not in normalized:
+        elif self._canon_question not in normalized:
             return "question(contains)"
-        for opt in self.options:
-            if opt not in normalized:
-                return f"option[{opt}]"
+        for authored, canon in zip(self.options, self._canon_options):
+            if canon not in normalized:
+                return f"option[{authored}]"
         return None
 
 
@@ -449,6 +526,12 @@ class AutoResponder:
         self._region_history: Dict[str, list[DialogRegion]] = {}
         self._prefilter_verdict: Dict[str, bool] = {}
         self._veto_streak: Dict[str, _VetoStreakState] = {}
+        # F597 #454: per-terminal set of canonical-region hashes already dumped
+        # in full to the decisions log. The first no_match on a distinct region
+        # logs the FULL canonical region (2 KB cap) so the next no-fire class is
+        # diagnosable without a live capture; repeats are deduped to one line.
+        # Purged in clear_terminal.
+        self._logged_region_hashes: Dict[str, set[str]] = {}
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -491,9 +574,11 @@ class AutoResponder:
     @staticmethod
     def _reject_summary(provider_name: str, normalized: str) -> str:
         """F530 diagnosability: for a 'no_rule_matched' eval, name WHY each rule
-        rejected (rule + failing field) plus the first 80 chars of the window
-        that was matched against. Written into the decisions log ``extra`` field
-        so this whole class of no-fire is diagnosable without a supervisor."""
+        rejected (rule + failing field) plus the first 80 chars of the CANONICAL
+        window that was matched against. Written into the decisions log ``extra``
+        field so this whole class of no-fire is diagnosable without a supervisor.
+        The full canonical region is dumped once per distinct region by
+        ``_log_no_match_region`` (F597 #454)."""
         parts: List[str] = []
         for rule in _store.get_rules(provider_name):
             reason = rule.reject_reason(normalized)
@@ -502,6 +587,32 @@ class AutoResponder:
         window = normalized[:80]
         rejects = " ".join(parts) if parts else "no-rules"
         return f"rejects=[{rejects}] window={window!r}"
+
+    def _log_no_match_region(self, terminal_id: str, canonical: str) -> None:
+        """F597 #454: on the FIRST no_match for a distinct canonical region,
+        dump the FULL canonical region (2 KB cap) to the decisions log so the
+        next no-fire is diagnosable from the log alone — no live capture needed.
+
+        Deduped per (terminal, region-hash): a static stalled pane re-evaluates
+        the same region every tick, so only the first sighting is dumped in full.
+        Best-effort; never raises into the detection tick."""
+        if not canonical:
+            return
+        import hashlib
+
+        region_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        with self._lock:
+            seen = self._logged_region_hashes.setdefault(terminal_id, set())
+            if region_hash in seen:
+                return
+            seen.add(region_hash)
+        payload = canonical[:2048]
+        self._log_decision(
+            terminal_id,
+            "no_match",
+            "region_dump",
+            extra=f"region_hash={region_hash} canonical={payload!r}",
+        )
 
     def match_verdict(
         self, provider_name: str, lines: List[str], terminal_id: str | None = None
@@ -582,6 +693,7 @@ class AutoResponder:
             self._region_history.pop(terminal_id, None)
             self._prefilter_verdict.pop(terminal_id, None)
             self._veto_streak.pop(terminal_id, None)
+            self._logged_region_hashes.pop(terminal_id, None)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
             for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
@@ -778,6 +890,7 @@ class AutoResponder:
             "no_rule_matched",
             extra=self._reject_summary(provider_name, match_region.normalized),
         )
+        self._log_no_match_region(terminal_id, match_region.normalized)
         unknown_result = self._check_unknown(
             terminal_id,
             metadata,
@@ -1507,9 +1620,13 @@ class AutoResponder:
     @staticmethod
     def _looks_like_dialog(normalized: str, provider_name: str) -> bool:
         if provider_name == "codex":
-            from cli_agent_orchestrator.providers.codex import WAITING_PROMPT_PATTERN
-
-            if re.search(WAITING_PROMPT_PATTERN, normalized):
+            # F597 #454: ``normalized`` is the CANONICAL string (lowercased,
+            # punctuation folded to spaces), so codex's raw-screen
+            # WAITING_PROMPT_PATTERN (which relies on capitalization, "y/n"
+            # slashes and a line anchor) cannot match here. Use a canonical-
+            # domain equivalent: an "approve"/"allow" lead followed by a yes/no
+            # affordance somewhere in the region.
+            if _CANONICAL_APPROVAL_PATTERN.search(normalized):
                 return True
         return AutoResponder._has_dialog_proximity(normalized)
 

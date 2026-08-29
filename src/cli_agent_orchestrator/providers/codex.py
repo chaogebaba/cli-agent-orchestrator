@@ -60,6 +60,63 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
     return resolved
 
 
+def _pretrust_cwd_in_codex_home(cwd: str, codex_home: Path) -> bool:
+    """Idempotently mark ``cwd`` trusted in ``codex_home/config.toml`` (F597 #454).
+
+    Worktree seats get a fresh, never-trusted path on every assign, so an
+    interactive codex launch there shows the trust-directory dialog and stalls
+    the gate. codex records a trusted directory as a ``[projects."<abs path>"]``
+    table with ``trust_level = "trusted"`` — the same shape it writes when the
+    user answers the dialog — so pre-writing that table means the dialog is
+    never shown.
+
+    The ``-c`` CLI override cannot express this reliably: codex's dotted-path
+    ``-c`` parser has no TOML quoted-key support (openai/codex#34261), so
+    ``-c 'projects."<abs path>".trust_level="trusted"'`` is silently misapplied,
+    and the unquoted workaround breaks for any path containing a ``.`` (every
+    ``.cao/worktrees/...`` seat). Writing the config table is the robust path.
+
+    Behavior: additive and idempotent — returns True if the entry already
+    resolves to trusted (no write) or is appended; returns False on any error
+    (never raises into the launch path). NEVER rewrites or removes existing
+    content: the table is appended verbatim, mirroring codex's own writes.
+    """
+    import tomllib
+
+    abs_cwd = os.path.abspath(cwd)
+    config_path = codex_home / "config.toml"
+    try:
+        codex_home.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if config_path.exists():
+            existing = config_path.read_text(encoding="utf-8")
+            try:
+                parsed = tomllib.loads(existing)
+            except tomllib.TOMLDecodeError:
+                logger.warning("codex pre-trust: %s is not valid TOML; not modifying", config_path)
+                return False
+            projects = parsed.get("projects")
+            if (
+                isinstance(projects, dict)
+                and isinstance(projects.get(abs_cwd), dict)
+                and projects[abs_cwd].get("trust_level") == "trusted"
+            ):
+                return True  # already trusted — idempotent no-op
+        # Append the table verbatim; never touch existing content. TOML basic
+        # strings escape backslash and double-quote; POSIX abs paths contain
+        # neither, but escape defensively so an odd path can't corrupt the file.
+        escaped = abs_cwd.replace("\\", "\\\\").replace('"', '\\"')
+        block = f'\n[projects."{escaped}"]\ntrust_level = "trusted"\n'
+        if existing and not existing.endswith("\n"):
+            block = "\n" + block
+        with config_path.open("a", encoding="utf-8") as fh:
+            fh.write(block)
+        return True
+    except OSError:
+        logger.exception("codex pre-trust: failed to write %s", config_path)
+        return False
+
+
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
@@ -2140,6 +2197,19 @@ class CodexProvider(BaseProvider):
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, "echo ready")
         await asyncio.sleep(2.0)
+
+        # F597 #454: pre-trust the worker cwd so the codex trust-directory dialog
+        # is never shown for a fresh worktree seat. codex records trust as a
+        # [projects."<cwd>"] table in its config.toml; we pre-write it in the
+        # CODEX_HOME this launch uses. The pane's cwd is the launch cwd; if it
+        # cannot be resolved the launch proceeds and the yaml auto-answer rule
+        # remains the belt-and-braces fallback.
+        try:
+            pane_cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name)
+            if pane_cwd:
+                _pretrust_cwd_in_codex_home(pane_cwd, _resolved_codex_home(self.terminal_id))
+        except Exception:
+            logger.exception("codex pre-trust: skipped (cwd resolution failed)")
 
         # Build command with flags and agent profile (developer_instructions).
         # --no-alt-screen: run in inline mode so output stays in normal scrollback,
