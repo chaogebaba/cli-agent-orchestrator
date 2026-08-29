@@ -22,7 +22,6 @@ import logging
 import re
 import shlex
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -181,21 +180,31 @@ E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
 
 class KiroCliProvider(BaseProvider):
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
-    # F560: Kiro session resume via id MINTING at spawn (claude_code pattern,
-    # NOT codex's /proc capture). The provider mints `sess_<uuid4>` in its
-    # constructor; terminal creation writes it to terminals.provider_session_id
-    # at create time (provider_session_id = resume_uuid or allocated_uuid). The
-    # launch always passes `--resume-id <allocated_session_uuid>`: a never-used
-    # id starts a fresh session that ADOPTS that id (verified live, kiro-cli
-    # 2.20.1), and a re-launch with the same id resumes the conversation. This
-    # is what makes F444 #299 hibernate/wake possible — assign(resume=True,
-    # fork_from=<id>) re-launches the same id so the worker wakes with context.
+    # F566 (fixes F560): kiro session identity is HARVESTED, never minted.
+    # Empirical rule (kiro-cli 2.20.1, probe report
+    # /data/cao-scratch/kiro-mcp-probe/report.md): `--resume-id <id>` naming a
+    # session that does NOT exist on disk makes kiro take
+    # `session.load.create_uncreated` — it materialises an empty session stub
+    # and SILENTLY IGNORES `--agent <profile>`, so no profile is applied and
+    # 0 MCP servers are prepared (the worker boots with no cao-mcp-server
+    # tools). `--resume-id` naming an existing session resumes it correctly,
+    # WITH the profile and its MCP servers. kiro has no flag to start a fresh
+    # session under a caller-chosen id (see `kiro-cli --v3 chat --help`).
+    #
+    # Therefore: a FRESH spawn launches WITHOUT `--resume-id`, and its provider
+    # session id is UNKNOWN until harvested (allocated_session_uuid is None;
+    # terminal creation persists provider_session_id = NULL). `--resume-id` is
+    # passed ONLY when re-attaching to an id previously observed real (the
+    # fork_context mode=="resume" path), which is what makes F444 #299
+    # hibernate/wake work once the real id is known.
+    #
+    # Harvesting the real id after spawn (so a fresh worker becomes wakeable)
+    # is tracked separately as #416 pt2 and is NOT implemented here.
     #
     # Deliberately NOT supports_reauth_rebind: that seam captures+validates a
-    # session artifact at init, but a freshly minted id has no artifact until
-    # the first turn, so capture is both unnecessary (the id is authoritative
-    # by construction) and would spuriously fail. Mirrors claude_code, which
-    # also mints and does not opt into the capture seam.
+    # session artifact at init, but a fresh spawn has no session artifact until
+    # the first turn, so capture would spuriously fail. Mirrors claude_code,
+    # which also does not opt into the capture seam.
     """Provider for Kiro CLI tool integration.
 
     This provider manages the lifecycle of a Kiro CLI chat session within a tmux window,
@@ -252,16 +261,17 @@ class KiroCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
-        # F560: session id identity. On resume the prior id is reused verbatim
-        # (so the same conversation is re-opened); on a fresh spawn we mint a
-        # new `sess_<uuid4>`. Either way it is passed as `--resume-id` at launch
-        # and written to terminals.provider_session_id at create time. Kiro's
-        # own v3 ids are `sess_`-prefixed; bare uuids also work (both verified
-        # live) but we mint the prefixed form to match kiro's native format.
+        # F566: session id identity. On resume the prior (real, previously
+        # observed) id is reused verbatim, so kiro re-opens that conversation
+        # with its profile and MCP servers. On a fresh spawn the id is UNKNOWN
+        # — kiro allocates it itself and CAO cannot choose it — so this stays
+        # None and no `--resume-id` is passed (see the class comment: a minted
+        # id is by definition uncreated, and an uncreated `--resume-id` strips
+        # the agent profile and all MCP servers).
         if fork_context is not None and fork_context.mode == "resume":
-            self.allocated_session_uuid = fork_context.session_uuid
+            self.allocated_session_uuid: Optional[str] = fork_context.session_uuid
         else:
-            self.allocated_session_uuid = f"sess_{uuid.uuid4()}"
+            self.allocated_session_uuid = None
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -287,32 +297,36 @@ class KiroCliProvider(BaseProvider):
         """F560: the resume seed, used by the create path's settlement logic.
 
         Returns the prior session id when this terminal was created to resume
-        (assign(resume=True) / fork_from=<uuid>), else None. On a fresh spawn
-        the create path persists ``allocated_session_uuid`` instead
-        (provider_session_id = resume_uuid or allocated_uuid).
+        (assign(resume=True) / fork_from=<uuid>), else None. F566: on a fresh
+        spawn there is no id to persist — the create path writes
+        provider_session_id = NULL (resume_uuid or allocated_uuid, both None)
+        until the real id is harvested (#416 pt2).
         """
         if self._fork_context is not None and self._fork_context.mode == "resume":
             return self._fork_context.session_uuid
         return None
 
     def _resume_session_id(self) -> Optional[str]:
-        """The ``--resume-id`` value for launch.
+        """The ``--resume-id`` value for launch, or None to omit the flag.
 
-        Always the terminal's identity id (minted on fresh spawn, or the prior
-        id on resume). A never-used id starts a fresh session that adopts it;
-        a re-used id resumes the conversation. So the launch is identical in
-        both cases — only the id's prior existence differs.
+        F566: only a REAL (previously observed) session id may be passed.
+        That is exactly the resume path's prior id; a fresh spawn returns None
+        so the launch omits ``--resume-id`` entirely. Passing an id kiro has
+        never created makes it take ``session.load.create_uncreated``, which
+        silently ignores ``--agent`` and prepares 0 MCP servers.
         """
         return self.allocated_session_uuid
 
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
-        """F560: return the authoritative (minted/resumed) session id.
+        """F566: return the known session id, else capture it from kiro.
 
-        Because kiro's id is minted at spawn and passed via ``--resume-id``,
-        it needs no capture — the id is known before launch. This mirrors
-        claude_code/grok, which return their pre-allocated id. A list-sessions
-        capture is kept only as a legacy fallback (below) for a terminal that
-        somehow reaches here without an allocated id. ``pane_pid`` is unused.
+        On a resume the id is already known (the prior real id) and is returned
+        without shelling out. On a fresh spawn ``allocated_session_uuid`` is
+        None — kiro chose the id itself — so the list-sessions capture below is
+        the only way to learn it. ``pane_pid`` is unused. Note this method is
+        not on the create path today: kiro is not ``supports_reauth_rebind``,
+        so ``_persist_provider_runtime_identity`` returns before reaching it;
+        wiring a post-spawn harvest is #416 pt2.
         """
         if isinstance(self.allocated_session_uuid, str) and self.allocated_session_uuid:
             return self.allocated_session_uuid
@@ -511,10 +525,12 @@ class KiroCliProvider(BaseProvider):
         #   timeout, preserving prior behavior for older kiro-cli versions).
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
-        # F560: always launch with --resume-id <allocated_session_uuid>. On a
-        # fresh spawn the id is newly minted, so kiro starts a new session and
-        # adopts it; on resume the id is the prior session's, so kiro re-opens
-        # the conversation. Same flag both ways (verified live, kiro-cli 2.20.1).
+        # F566: pass --resume-id ONLY when re-attaching to a real prior session
+        # id (the resume path). None on a fresh spawn, so build_kiro_command
+        # omits the flag and kiro takes session/new — which applies --agent and
+        # prepares the profile's MCP servers. An uncreated --resume-id would
+        # instead take session.load.create_uncreated: no profile, 0 MCP servers
+        # (kiro-cli 2.20.1, /data/cao-scratch/kiro-mcp-probe/report.md).
         resume_id = self._resume_session_id()
 
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
@@ -585,10 +601,13 @@ class KiroCliProvider(BaseProvider):
             # session-locked banner, surface a clear error rather than a bare
             # timeout — the id is still held by another live process (should
             # not happen once the old worker is reaped before wake).
-            if self._fork_context is not None and self._detect_session_lock():
+            # F566: only a launch that actually passed --resume-id can be
+            # blocked by another holder of that id, so gate on resume_id (not
+            # merely on fork_context) — a fresh spawn has no id to report.
+            if resume_id and self._detect_session_lock():
                 raise RuntimeError(
                     f"{E_KIRO_SESSION_LOCKED}: kiro session "
-                    f"'{self.allocated_session_uuid}' is still open in another "
+                    f"'{resume_id}' is still open in another "
                     f"process; reap the prior worker before resuming."
                 )
             if yolo:

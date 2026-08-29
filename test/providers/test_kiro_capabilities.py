@@ -415,6 +415,11 @@ def test_build_kiro_command_appends_resume_id_v2_before_model():
 
 
 def test_build_kiro_command_omits_resume_id_when_none():
-    """No --resume-id token when the id is None (back-compat shape)."""
+    """No --resume-id token when the id is None (back-compat shape).
+
+    F566: this is the fresh-spawn shape — the provider passes None so kiro
+    takes session/new and applies --agent plus the profile's MCP servers.
+    """
     cmd = build_kiro_command(KiroEngine.KAS, "developer", resume_session_id=None)
     assert "--resume-id" not in cmd
+    assert cmd[-2:] == ["--agent", "developer"]
