@@ -1,0 +1,8 @@
+Choose working directory to resume this session
+
+  1. Use session directory (/home/chao/project)
+› 2. Use current directory (/home/chao/project/.cao/worktrees/abcd1234)
+  3. Always use session directory
+  4. Always use current directory
+
+  Press enter to continue

@@ -479,6 +479,24 @@ class TmuxClient:
         )
 
     @staticmethod
+    def _pane_in_mode(pane: Pane) -> bool:
+        """True iff the pane is currently in a tmux mode (copy-mode, view-mode…).
+
+        F597 #454 pt2: reads ``#{pane_in_mode}`` (tmux returns "1"/"0"). Used to
+        gate the ``send-keys -X cancel`` copy-mode escape so we never issue a
+        spurious cancel into a live application composer. Any failure to read the
+        flag conservatively returns False (skip the cancel): sending the key
+        without a preceding cancel is the common, correct case, and a stray
+        cancel is exactly what we are avoiding.
+        """
+        try:
+            result = pane.cmd("display-message", "-p", "#{pane_in_mode}")
+            stdout = getattr(result, "stdout", None) or []
+            return bool(stdout) and stdout[0].strip() == "1"
+        except Exception:
+            return False
+
+    @staticmethod
     def _kill_via_cli(session_name: str, window_name: Optional[str] = None) -> bool:
         """Kill a session (or a single window) straight through the tmux CLI.
 
@@ -1235,11 +1253,19 @@ class TmuxClient:
 
             pane = self._find_active_pane(window, session_name, window_name)
             if pane:
-                # Same copy-mode guard as the paste paths (#654): a control
-                # key like C-c sent into an active mode is consumed by the
-                # mode's key table and never reaches the application.
-                pane.cmd("send-keys", "-X", "cancel")
-                pane.send_keys(key, enter=False)
+                # F597 #454 pt2: only exit copy-mode when the pane is ACTUALLY in
+                # a mode. An unconditional `send-keys -X cancel` is at best a
+                # wasted round-trip and at worst races the TUI's own redraw; gate
+                # it on #{pane_in_mode} so a live composer is never disturbed by a
+                # spurious cancel before the key lands. (#654's guard is only
+                # needed when a mode is present.)
+                if self._pane_in_mode(pane):
+                    pane.cmd("send-keys", "-X", "cancel")
+                # Send the tmux key NAME (not literal text) directly. libtmux's
+                # send_keys(key, enter=False) with default suppress_history=False
+                # emits exactly `send-keys <key>` — no leading space, no -l — so
+                # this is equivalent and unambiguous.
+                pane.cmd("send-keys", key)
                 logger.debug(f"Sent special key to {session_name}:{window_name}")
         except Exception as e:
             logger.error(f"Failed to send special key to {session_name}:{window_name}: {e}")

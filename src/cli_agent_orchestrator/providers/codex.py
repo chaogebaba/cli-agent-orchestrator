@@ -60,6 +60,63 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
     return resolved
 
 
+def _pretrust_cwd_in_codex_home(cwd: str, codex_home: Path) -> bool:
+    """Idempotently mark ``cwd`` trusted in ``codex_home/config.toml`` (F597 #454).
+
+    Worktree seats get a fresh, never-trusted path on every assign, so an
+    interactive codex launch there shows the trust-directory dialog and stalls
+    the gate. codex records a trusted directory as a ``[projects."<abs path>"]``
+    table with ``trust_level = "trusted"`` — the same shape it writes when the
+    user answers the dialog — so pre-writing that table means the dialog is
+    never shown.
+
+    The ``-c`` CLI override cannot express this reliably: codex's dotted-path
+    ``-c`` parser has no TOML quoted-key support (openai/codex#34261), so
+    ``-c 'projects."<abs path>".trust_level="trusted"'`` is silently misapplied,
+    and the unquoted workaround breaks for any path containing a ``.`` (every
+    ``.cao/worktrees/...`` seat). Writing the config table is the robust path.
+
+    Behavior: additive and idempotent — returns True if the entry already
+    resolves to trusted (no write) or is appended; returns False on any error
+    (never raises into the launch path). NEVER rewrites or removes existing
+    content: the table is appended verbatim, mirroring codex's own writes.
+    """
+    import tomllib
+
+    abs_cwd = os.path.abspath(cwd)
+    config_path = codex_home / "config.toml"
+    try:
+        codex_home.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if config_path.exists():
+            existing = config_path.read_text(encoding="utf-8")
+            try:
+                parsed = tomllib.loads(existing)
+            except tomllib.TOMLDecodeError:
+                logger.warning("codex pre-trust: %s is not valid TOML; not modifying", config_path)
+                return False
+            projects = parsed.get("projects")
+            if (
+                isinstance(projects, dict)
+                and isinstance(projects.get(abs_cwd), dict)
+                and projects[abs_cwd].get("trust_level") == "trusted"
+            ):
+                return True  # already trusted — idempotent no-op
+        # Append the table verbatim; never touch existing content. TOML basic
+        # strings escape backslash and double-quote; POSIX abs paths contain
+        # neither, but escape defensively so an odd path can't corrupt the file.
+        escaped = abs_cwd.replace("\\", "\\\\").replace('"', '\\"')
+        block = f'\n[projects."{escaped}"]\ntrust_level = "trusted"\n'
+        if existing and not existing.endswith("\n"):
+            block = "\n" + block
+        with config_path.open("a", encoding="utf-8") as fh:
+            fh.write(block)
+        return True
+    except OSError:
+        logger.exception("codex pre-trust: failed to write %s", config_path)
+        return False
+
+
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
@@ -462,6 +519,15 @@ CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS = 4
 # Interval between confirmation polls (seconds), for both the initial grace
 # window and the post-re-Enter re-verification.
 CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS = 0.5
+# F598 #455: when the paste lands while a blocking dialog (trust-dir → resume-
+# workdir chooser) owns the pane, F435's F491 pre-check used to raise
+# CodexSubmitStuckError on the FIRST still-WAITING recheck and give up — a single
+# synchronous pass with no re-arm once the dialog clears and the composer finally
+# renders, so the drafted chip sat unsubmitted forever (incident 55e84b8a). These
+# bound a re-arm loop that repeatedly nudges the auto-responder and waits for the
+# WHOLE dialog sequence to clear before proceeding to the composer recovery Enter.
+CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS = 8
+CODEX_SUBMIT_VERIFY_DIALOG_REARM_INTERVAL_SECONDS = 1.5
 # BLOCKERS 1/2/3 (r4): the durable submission boundary is the pasted task
 # echoed as a SUBMITTED user turn in scrollback (its collapsed chip, or its raw
 # text). For the raw-text case we match a distinctive normalized PREFIX of the
@@ -2141,6 +2207,19 @@ class CodexProvider(BaseProvider):
         get_backend().send_keys(self.session_name, self.window_name, "echo ready")
         await asyncio.sleep(2.0)
 
+        # F597 #454: pre-trust the worker cwd so the codex trust-directory dialog
+        # is never shown for a fresh worktree seat. codex records trust as a
+        # [projects."<cwd>"] table in its config.toml; we pre-write it in the
+        # CODEX_HOME this launch uses. The pane's cwd is the launch cwd; if it
+        # cannot be resolved the launch proceeds and the yaml auto-answer rule
+        # remains the belt-and-braces fallback.
+        try:
+            pane_cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name)
+            if pane_cwd:
+                _pretrust_cwd_in_codex_home(pane_cwd, _resolved_codex_home(self.terminal_id))
+        except Exception:
+            logger.exception("codex pre-trust: skipped (cwd resolution failed)")
+
         # Build command with flags and agent profile (developer_instructions).
         # --no-alt-screen: run in inline mode so output stays in normal scrollback,
         #   making tmux capture-pane reliable.
@@ -3374,20 +3453,49 @@ class CodexProvider(BaseProvider):
 
             _f491_status = status_monitor.get_status(self.terminal_id)
             if _f491_status == TerminalStatus.WAITING_USER_ANSWER:
-                # A dialog is blocking. Give auto-responder one more chance to
-                # fire by forcing a screen evaluation.
-                _f491_lines = status_monitor.get_rendered_screen(self.terminal_id)
-                if _f491_lines is not None:
-                    _f491_provider = self
-                    auto_responder.on_screen(self.terminal_id, _f491_provider, _f491_lines)
-                # Brief wait for auto-responder dismiss + TUI redraw
-                time.sleep(1.5)
-                _f491_recheck = status_monitor.get_status(self.terminal_id)
-                if _f491_recheck == TerminalStatus.WAITING_USER_ANSWER:
-                    logger.warning(
-                        "F435/F491 submit-verify: terminal %s has active dialog "
-                        "(status WAITING_USER_ANSWER); cannot recover with Enter",
+                # F598 #455: a blocking dialog owns the pane and absorbed the
+                # submit Enter, so the paste never reached a composer. The trust-
+                # dir → resume-workdir chooser sequence can occupy the pane for
+                # MINUTES; the old code nudged the auto-responder ONCE, waited
+                # 1.5s, and if still WAITING raised CodexSubmitStuckError and gave
+                # up — a single pass with NO re-arm, so once the dialog finally
+                # cleared and the composer rendered, nothing re-verified and the
+                # chip stayed drafted forever (incident 55e84b8a). RE-ARM instead:
+                # repeatedly nudge the auto-responder and wait for the WHOLE
+                # sequence to clear (bounded), only raising if it never clears.
+                dialog_cleared = False
+                for rearm in range(1, CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS + 1):
+                    _f491_lines = status_monitor.get_rendered_screen(self.terminal_id)
+                    if _f491_lines is not None:
+                        auto_responder.on_screen(self.terminal_id, self, _f491_lines)
+                    logger.info(
+                        "F435/F598 submit_verify_rearm: terminal %s dialog still "
+                        "blocking (attempt %d/%d); nudged auto-responder, waiting "
+                        "for it to clear before composer recovery",
                         self.terminal_id,
+                        rearm,
+                        CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS,
+                    )
+                    time.sleep(CODEX_SUBMIT_VERIFY_DIALOG_REARM_INTERVAL_SECONDS)
+                    # A submit may have landed the moment the dialog cleared.
+                    if _rollout_confirms():
+                        logger.info(
+                            "F435/F598 submit_verify_rearm: terminal %s confirmed "
+                            "via rollout after dialog cleared",
+                            self.terminal_id,
+                        )
+                        return
+                    if status_monitor.get_status(self.terminal_id) != (
+                        TerminalStatus.WAITING_USER_ANSWER
+                    ):
+                        dialog_cleared = True
+                        break
+                if not dialog_cleared:
+                    logger.warning(
+                        "F435/F598 submit-verify: terminal %s dialog never cleared "
+                        "after %d re-arm attempts; cannot recover with Enter",
+                        self.terminal_id,
+                        CODEX_SUBMIT_VERIFY_DIALOG_REARM_ATTEMPTS,
                     )
                     raise CodexSubmitStuckError(
                         f"Codex terminal {self.terminal_id} has an active dialog "
@@ -3395,10 +3503,13 @@ class CodexProvider(BaseProvider):
                         f"never submitted. Auto-responder dismiss pending."
                     )
                 logger.info(
-                    "F435/F491 submit-verify: terminal %s dialog cleared by "
-                    "auto-responder; rechecking rollout",
+                    "F435/F598 submit_verify_rearm: terminal %s dialog cleared; "
+                    "the composer is now live — proceeding to chip recovery",
                     self.terminal_id,
                 )
+                # Dialog cleared and the composer should now be live: fall
+                # through to the normal stuck-chip recovery loop, which re-reads
+                # the (now composer-visible) pane and sends the recovery Enter.
                 if _rollout_confirms():
                     return
         except CodexSubmitStuckError:

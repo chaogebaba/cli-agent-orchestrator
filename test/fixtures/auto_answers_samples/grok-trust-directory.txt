@@ -1,0 +1,6 @@
+Do you trust the contents of this directory?
+
+  1. Yes, proceed
+  2. No, quit
+
+  Press enter to continue

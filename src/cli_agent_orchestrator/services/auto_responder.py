@@ -17,9 +17,14 @@ on the user's behalf.
 
 THE line-break trap: terminal width changes where TUI lines wrap, but a TUI
 never splits a word mid-token, so the word sequence is stable while the
-newlines are not. All matching therefore runs against the composited screen
-with every run of whitespace (including newlines) collapsed to a single
-space -- never against raw lines. Rules must never encode newlines.
+newlines are not. All matching therefore runs against a CANONICAL form of the
+composited screen (see ``canonicalize``): NFKC-normalized, lowercased, every
+non-``[a-z0-9]`` character mapped to a space, then whitespace collapsed. This
+drops box-drawing walls, block glyphs, arrows, bullets/markers (``> › • ▸``),
+numbering dots, and quotes/apostrophes, and makes wrap points irrelevant, so a
+rule author writes plain prose and never needs ``\\W+`` in a rule. Rules are
+canonicalized the same way on load, so both sides of every match share one
+domain. Matching never runs against raw lines.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +50,9 @@ logger = logging.getLogger(__name__)
 # reads the real monotonic clock. New D4/D5 code paths read through this seam so
 # the 1/2/4/8s backoff is observable without wall-clock sleeps.
 _clock: Callable[[], float] = time.monotonic
+# F597 #454 pt2: injectable sleep seam so settle/re-arm delays are observable in
+# tests without real wall-clock waits (mirrors the ``_clock`` monotonic seam).
+_clock_sleep: Callable[[float], None] = time.sleep
 
 
 def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
@@ -61,6 +70,17 @@ RETRY_MAX = 3
 RETRY_DELAY_S = 1.0
 COOLDOWN_S = 5.0
 KEY_DELAY_S = 0.1
+# F597 #454 pt2 (a) SETTLE: before the FIRST send of an episode, require the
+# matched frame to be byte-stable across two captures this far apart, so the
+# dialog is fully painted and codex's TUI input handler is armed before keys are
+# sent. The 5x-in-1.6s no-op stall was Enters landing before the handler existed.
+SETTLE_INTERVAL_S = 0.5
+# F597 #454 pt2 (c) RE-ARM: retry-exhaustion must NOT latch off forever. While
+# the same dialog signature persists, re-fire on this backoff schedule (seconds),
+# then every REARM_STEADY_S, capped at REARM_CAP_S total since exhaustion.
+REARM_BACKOFF_S = (5.0, 15.0, 45.0)
+REARM_STEADY_S = 60.0
+REARM_CAP_S = 600.0
 UNKNOWN_DIALOG_PUSH_FLOOR_S = 300.0
 UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
 DIALOG_PROXIMITY_CHARS = 200
@@ -87,6 +107,15 @@ _PERMISSION_PROMPT_PATTERNS = (
 # the blueprint.
 SEED_RULES: Dict[str, str] = {
     "codex.yaml": """\
+# F597 #454: rules match against a CANONICAL form of the screen, in TWO domains.
+#   * match_mode: contains → FULL canonical (NFKC, lowercased, every
+#     non-[a-z0-9] char -> space, whitespace collapsed). Write plain prose;
+#     glyphs, box walls, bullets, quotes, apostrophes and wrap points are all
+#     folded away, so no rule needs \\W+.
+#   * match_mode: regex → LIGHT canonical (NFKC, lowercased, whitespace
+#     collapsed ONLY — PUNCTUATION PRESERVED), matched case-insensitively. Write
+#     lowercase-friendly patterns; punctuation your regex needs (?, !, version
+#     dots, ->, glyph anchors) survives, and \\d+ / word tokens still match.
 - name: codex-usage-resets
   enabled: true
   match_mode: regex
@@ -115,19 +144,77 @@ SEED_RULES: Dict[str, str] = {
 }
 
 # Generic unknown-dialog heuristic (any provider): numbered options like
-# "1. Yes, continue" plus a "press enter to continue"-style footer.
-_NUMBERED_OPTION_PATTERN = re.compile(r"\b[1-3]\.\s+\S")
+# "1. Yes, continue" plus a "press enter to continue"-style footer. F597 #454:
+# these run against the CANONICAL string, where "1." has been folded to "1 "
+# (the dot became a space), so the numbered-option pattern is "<digit> <word>".
+_NUMBERED_OPTION_PATTERN = re.compile(r"\b[1-3]\s+\S")
 _PRESS_ENTER_PATTERN = re.compile(r"press enter", re.IGNORECASE)
+# F597 #454: canonical-domain equivalent of codex's WAITING_PROMPT_PATTERN
+# (providers/codex.py). The screen is already lowercased and punctuation-folded
+# here, so "Approve command? y/n" reads "approve command y n": an approve/allow
+# lead, then a yes/no affordance ("y n"/"yes no"/"yes"/"no") later in the region.
+_CANONICAL_APPROVAL_PATTERN = re.compile(r"^(?:approve|allow)\b.*\b(?:y n|yes no|yes|no)\b")
+
+
+def canonicalize(text: str) -> str:
+    """Fold ``text`` into the canonical match domain (F597 #454).
+
+    Steps: NFKC-normalize → lowercase → map every character that is not
+    ``[a-z0-9]`` to a space → collapse whitespace runs → strip. The effect is
+    that all TUI chrome (box-drawing walls, block elements, arrows, bullets and
+    prompt markers like ``> › • ▸``, numbering dots, quotes and apostrophes) is
+    reduced to word boundaries, and where a line wraps no longer matters. A
+    58-col bordered card whose question wraps across a ``│`` wall canonicalizes
+    to the same string as the same prompt rendered as plain unwalled text, so a
+    plain-prose ``contains`` rule matches both. Word/digit tokens survive intact,
+    so ``regex`` rules like ``you have \\d+ usage limit resets`` still match.
+
+    This is applied to BOTH the composited screen (via ``normalize_screen``) and
+    every rule's ``question``/``options`` (on load), so both sides of a match
+    share one domain. Deliberately NOT fuzzy/semantic: it is a pure, reversible
+    character fold, nothing more.
+    """
+    folded = unicodedata.normalize("NFKC", text).lower()
+    folded = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else " " for ch in folded)
+    return " ".join(folded.split())
+
+
+def canonicalize_light(text: str) -> str:
+    """Light canonical fold for ``regex`` rules (F597 #454 B2).
+
+    Steps: NFKC-normalize → lowercase → collapse whitespace runs → strip.
+    Crucially, PUNCTUATION AND GLYPHS ARE PRESERVED (unlike the full
+    ``canonicalize``, which maps every non-``[a-z0-9]`` char to a space). This is
+    the domain ``regex`` rules match against: their patterns legitimately depend
+    on punctuation the full fold would erase — e.g. ``askuserquestion`` glyph
+    anchors, ``codex-ratelimit-model-switch``'s ``->``, ``codex-update-available``'s
+    version dots and ``!``. NFKC still normalizes fullwidth/compatibility forms
+    and lowercasing + IGNORECASE keep case-insensitivity, while wrap/whitespace
+    variance is collapsed so a wrapped card still matches. Applied to BOTH the
+    screen (``normalize_screen_light``) and each regex rule's pattern source at
+    load, so both sides share this domain.
+    """
+    return " ".join(unicodedata.normalize("NFKC", text).lower().split())
 
 
 def normalize_screen(lines: List[str]) -> str:
-    """Flatten composited screen lines into whitespace-normalized text.
+    """Flatten composited screen lines into the FULL canonical match domain.
 
-    Every run of whitespace/newlines collapses to a single space -- this is
-    the line-break trap invariant. Never match against raw ``lines``.
+    Joins ``lines`` and returns their ``canonicalize`` fold — the domain
+    ``contains`` rules match against, plus the domain digests / diagnostics use.
+    Never match against raw ``lines``; the raw text (for diagnostics) is
+    recoverable by joining ``DialogRegion.rows``.
     """
-    text = " ".join(lines)
-    return re.sub(r"\s+", " ", text).strip()
+    return canonicalize(" ".join(lines))
+
+
+def normalize_screen_light(lines: List[str]) -> str:
+    """Flatten composited screen lines into the LIGHT canonical domain.
+
+    The punctuation-preserving companion to ``normalize_screen`` that ``regex``
+    rules match against (F597 #454 B2).
+    """
+    return canonicalize_light(" ".join(lines))
 
 
 @dataclass(frozen=True)
@@ -141,6 +228,12 @@ class DialogRegion:
     # once at match time, never re-seeded, and is what D5's consume gate reads.
     settle_digest: str = ""
     consume_digest: str = ""
+    # F597 #454 B2: the LIGHT canonical form of the same rows (punctuation
+    # preserved). ``regex`` rules match against this; ``contains`` rules and all
+    # digests/diagnostics use ``normalized`` (full). Defaulted so the existing
+    # two-positional ``DialogRegion(rows, normalized)`` construction keeps
+    # working; ``dialog_region`` populates it from the same rows.
+    normalized_light: str = ""
 
     def with_digests(self, settle: str, consume: str) -> "DialogRegion":
         """Return a copy carrying the two pending-fire digests."""
@@ -149,6 +242,7 @@ class DialogRegion:
             normalized=self.normalized,
             settle_digest=settle,
             consume_digest=consume,
+            normalized_light=self.normalized_light,
         )
 
 
@@ -207,7 +301,12 @@ def dialog_region(
     while end and not filtered[end - 1].strip():
         end -= 1
     rows = tuple(filtered[max(0, end - DIALOG_REGION_LINES) : end])
-    return DialogRegion(rows=rows, normalized=normalize_screen(list(rows)))
+    row_list = list(rows)
+    return DialogRegion(
+        rows=rows,
+        normalized=normalize_screen(row_list),
+        normalized_light=normalize_screen_light(row_list),
+    )
 
 
 TerminalIncarnation = tuple[int, int, str, str]
@@ -253,7 +352,7 @@ def diagnose_rules(
     match_region = dialog_region(lines, chrome_patterns) if chrome_patterns else region
     rule_reports = []
     for rule in _store.get_rules(provider_name):
-        reason = rule.reject_reason(match_region.normalized)
+        reason = rule.reject_reason(match_region)
         rule_reports.append(
             {
                 "name": rule.name,
@@ -282,6 +381,40 @@ class Rule:
     question: str
     options: List[str]
     answer: Any  # list[str] of tmux special-key names, or the literal "wait"
+    # F597 #454: canonical match forms, computed in __post_init__ (not init args).
+    _canon_question: str = field(init=False, repr=False, compare=False, default="")
+    _canon_options: tuple[str, ...] = field(init=False, repr=False, compare=False, default=())
+    _regex: "re.Pattern[str] | None" = field(init=False, repr=False, compare=False, default=None)
+
+    def __post_init__(self) -> None:
+        # F597 #454 B2: precompute the canonical match forms once on load so both
+        # sides of every match share ONE domain. TWO domains (gate decision):
+        #   * ``contains`` → the FULL canonical domain (``canonicalize``): NFKC →
+        #     lower → non-[a-z0-9]→space → collapse. Glyphs/punctuation/wrap are
+        #     folded away so plain-prose rules match a bordered card. The question
+        #     and options are canonicalized here.
+        #   * ``regex`` → the LIGHT canonical domain (``canonicalize_light``): NFKC
+        #     → lower → whitespace-collapse ONLY, PUNCTUATION PRESERVED, compiled
+        #     IGNORECASE. Shipped regex rules legitimately depend on punctuation
+        #     the full fold erases (askuserquestion glyphs, ``->``, version dots,
+        #     ``!``), so they must NOT be matched against the full domain. The
+        #     pattern is applied verbatim to the light screen string. Options are
+        #     still canonicalized against the FULL domain (plain-prose substrings).
+        # ``question``/``options`` keep their authored text for reject reasons.
+        if self.match_mode == "regex":
+            self._canon_question = self.question
+            try:
+                self._regex = re.compile(self.question, re.IGNORECASE)
+            except re.error:
+                logger.warning(
+                    "auto-responder: rule %r has an invalid regex question; disabling",
+                    self.name,
+                )
+                self._regex = None
+        else:
+            self._canon_question = canonicalize(self.question)
+            self._regex = None
+        self._canon_options = tuple(canonicalize(opt) for opt in self.options)
 
     @property
     def is_wait(self) -> bool:
@@ -302,35 +435,52 @@ class Rule:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
-    def matches(self, normalized: str) -> bool:
+    @staticmethod
+    def _domains(region: "DialogRegion | str") -> tuple[str, str]:
+        """Resolve (full, light) canonical strings from a region or bare string.
+
+        F597 #454 B2: rule matching needs BOTH domains. Callers pass a
+        ``DialogRegion`` (carrying both); a bare ``str`` is treated as the FULL
+        canonical form with light defaulting to it (back-compat for the few
+        diagnostic/string callers — only matters for regex rules, which the
+        region-passing callers always feed correctly)."""
+        if isinstance(region, DialogRegion):
+            return region.normalized, (region.normalized_light or region.normalized)
+        return region, region
+
+    def matches(self, region: "DialogRegion | str") -> bool:
         if not self.enabled:
             return False
+        full, light = self._domains(region)
         if self.match_mode == "regex":
-            if not re.search(self.question, normalized):
+            if self._regex is None or not self._regex.search(light):
                 return False
         else:
-            if self.question not in normalized:
+            if self._canon_question not in full:
                 return False
-        return all(opt in normalized for opt in self.options)
+        return all(opt in full for opt in self._canon_options)
 
-    def reject_reason(self, normalized: str) -> Optional[str]:
-        """F530 diagnosability: return WHY this rule does NOT match ``normalized``,
-        or None when it matches. Names the failing field so a stalled dialog is
-        diagnosable from the decisions log / CLI without a supervisor.
+    def reject_reason(self, region: "DialogRegion | str") -> Optional[str]:
+        """F530 diagnosability: return WHY this rule does NOT match, or None when
+        it matches. Names the failing field so a stalled dialog is diagnosable
+        from the decisions log / CLI without a supervisor.
 
-        Reasons: ``disabled``, ``question(regex)``, ``question(contains)``,
-        ``option[<opt>]``.
+        F597 #454 B2: ``contains`` is checked against the FULL canonical domain,
+        ``regex`` against the LIGHT (punctuation-preserving) domain. Reasons name
+        the AUTHORED text so the log is human-readable: ``disabled``,
+        ``question(regex)``, ``question(contains)``, ``option[<opt>]``.
         """
         if not self.enabled:
             return "disabled"
+        full, light = self._domains(region)
         if self.match_mode == "regex":
-            if not re.search(self.question, normalized):
+            if self._regex is None or not self._regex.search(light):
                 return "question(regex)"
-        elif self.question not in normalized:
+        elif self._canon_question not in full:
             return "question(contains)"
-        for opt in self.options:
-            if opt not in normalized:
-                return f"option[{opt}]"
+        for authored, canon in zip(self.options, self._canon_options):
+            if canon not in full:
+                return f"option[{authored}]"
         return None
 
 
@@ -425,6 +575,23 @@ class _VetoStreakState:
     last_push_at: float = field(default=-VETO_STREAK_PUSH_FLOOR_S)
 
 
+@dataclass
+class _RearmState:
+    """F597 #454 pt2 (c): tracks a retry-exhausted dialog so the responder can
+    re-fire on a bounded backoff instead of latching off forever.
+
+    ``signature`` is the region consume-digest that exhausted; ``exhausted_at``
+    is the monotonic time the latch was set; ``next_at`` is when the next re-fire
+    is due; ``attempts`` counts re-arm fires so far (indexes REARM_BACKOFF_S,
+    then REARM_STEADY_S). A changed signature or an eval that no longer matches
+    clears this."""
+
+    signature: str
+    exhausted_at: float
+    next_at: float
+    attempts: int = 0
+
+
 class AutoResponder:
     """Whitelist-only engine: fires ``answer`` keys for matched rules,
     surfaces everything else as WAITING_USER_ANSWER.
@@ -449,6 +616,20 @@ class AutoResponder:
         self._region_history: Dict[str, list[DialogRegion]] = {}
         self._prefilter_verdict: Dict[str, bool] = {}
         self._veto_streak: Dict[str, _VetoStreakState] = {}
+        # F597 #454: per-terminal set of canonical-region hashes already dumped
+        # in full to the decisions log. The first no_match on a distinct region
+        # logs the FULL canonical region (2 KB cap) so the next no-fire class is
+        # diagnosable without a live capture; repeats are deduped to one line.
+        # Purged in clear_terminal.
+        # F597 #454 pt2: per-terminal settle + re-arm state. ``_settled_signatures``
+        # records the region signatures whose FIRST send this episode already
+        # passed the two-capture settle gate (so we settle once, not every fire).
+        # ``_rearm_state`` tracks a latched retry-exhausted dialog so it can be
+        # re-fired on a bounded backoff instead of latching off forever. Both are
+        # purged in clear_terminal and reset when the dialog signature changes.
+        self._settled_signatures: Dict[str, set[str]] = {}
+        self._rearm_state: Dict[str, _RearmState] = {}
+        self._logged_region_hashes: Dict[str, set[str]] = {}
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -489,19 +670,48 @@ class AutoResponder:
             return None
 
     @staticmethod
-    def _reject_summary(provider_name: str, normalized: str) -> str:
+    def _reject_summary(provider_name: str, region: "DialogRegion") -> str:
         """F530 diagnosability: for a 'no_rule_matched' eval, name WHY each rule
-        rejected (rule + failing field) plus the first 80 chars of the window
-        that was matched against. Written into the decisions log ``extra`` field
-        so this whole class of no-fire is diagnosable without a supervisor."""
+        rejected (rule + failing field) plus the first 80 chars of the CANONICAL
+        window that was matched against. Written into the decisions log ``extra``
+        field so this whole class of no-fire is diagnosable without a supervisor.
+        The full canonical region is dumped once per distinct region by
+        ``_log_no_match_region`` (F597 #454). Takes the region so each rule sees
+        the correct domain (F597 #454 B2: contains→full, regex→light)."""
         parts: List[str] = []
         for rule in _store.get_rules(provider_name):
-            reason = rule.reject_reason(normalized)
+            reason = rule.reject_reason(region)
             if reason is not None:
                 parts.append(f"{rule.name}:{reason}")
-        window = normalized[:80]
+        window = region.normalized[:80]
         rejects = " ".join(parts) if parts else "no-rules"
         return f"rejects=[{rejects}] window={window!r}"
+
+    def _log_no_match_region(self, terminal_id: str, canonical: str) -> None:
+        """F597 #454: on the FIRST no_match for a distinct canonical region,
+        dump the FULL canonical region (2 KB cap) to the decisions log so the
+        next no-fire is diagnosable from the log alone — no live capture needed.
+
+        Deduped per (terminal, region-hash): a static stalled pane re-evaluates
+        the same region every tick, so only the first sighting is dumped in full.
+        Best-effort; never raises into the detection tick."""
+        if not canonical:
+            return
+        import hashlib
+
+        region_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        with self._lock:
+            seen = self._logged_region_hashes.setdefault(terminal_id, set())
+            if region_hash in seen:
+                return
+            seen.add(region_hash)
+        payload = canonical[:2048]
+        self._log_decision(
+            terminal_id,
+            "no_match",
+            "region_dump",
+            extra=f"region_hash={region_hash} canonical={payload!r}",
+        )
 
     def match_verdict(
         self, provider_name: str, lines: List[str], terminal_id: str | None = None
@@ -525,7 +735,7 @@ class AutoResponder:
         if not region.normalized:
             return None
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(region.normalized):
+            if not rule.matches(region):
                 continue
             # D6 banner path (r8-B/r9-S1): the cached banner-mark is HONORED ONLY
             # WHILE THE REGION IS STILL MOVING — this consult's fresh region
@@ -557,6 +767,10 @@ class AutoResponder:
                 before = self._waiting_gate_locked(terminal_id)
                 if status != TerminalStatus.WAITING_USER_ANSWER:
                     self._retry_exhausted.discard(terminal_id)
+                    # F597 #454 pt2 (c): the terminal left WAITING (real progress
+                    # or a fire took) — drop the re-arm latch/settle state too.
+                    self._rearm_state.pop(terminal_id, None)
+                    self._settled_signatures.pop(terminal_id, None)
                 after = self._waiting_gate_locked(terminal_id)
             self._gate_transition(terminal_id, before, after)
         except BaseException:
@@ -582,6 +796,9 @@ class AutoResponder:
             self._region_history.pop(terminal_id, None)
             self._prefilter_verdict.pop(terminal_id, None)
             self._veto_streak.pop(terminal_id, None)
+            self._logged_region_hashes.pop(terminal_id, None)
+            self._settled_signatures.pop(terminal_id, None)
+            self._rearm_state.pop(terminal_id, None)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
             for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
@@ -697,7 +914,7 @@ class AutoResponder:
         banner_marked = self._push_region_history(terminal_id, region)
 
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(match_region.normalized):
+            if not rule.matches(match_region):
                 continue
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
@@ -707,7 +924,7 @@ class AutoResponder:
                     )
                     return None
                 fresh_region = self._region_from_capture(fresh, self._chrome_patterns(provider))
-                if not rule.matches(fresh_region.normalized):
+                if not rule.matches(fresh_region):
                     self._log_decision(
                         terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name
                     )
@@ -748,17 +965,31 @@ class AutoResponder:
                     self._request_detection_retry(terminal_id)
                     return None
             self._clear_wait_rule(terminal_id)
+            match_digest = _digest_normalized(match_region.normalized)
+            # F597 #454 pt2 (c): if this terminal previously EXHAUSTED its retry
+            # budget on this same dialog, it is latched at WAITING. Do NOT latch
+            # forever — re-fire on a bounded backoff while the signature persists.
+            rearm = self._rearm_gate(terminal_id, match_digest, rule)
+            if rearm == "hold":
+                # Latched and not yet due for a re-arm fire — keep a tick armed so
+                # a silent pane still re-evaluates when the backoff elapses.
+                self._request_detection_retry(terminal_id)
+                return TerminalStatus.WAITING_USER_ANSWER
             state = self._state_for(terminal_id, rule.name, rule.body_hash)
-            if time.monotonic() < state.cooldown_until:
+            if rearm != "fire" and time.monotonic() < state.cooldown_until:
                 self._log_decision(terminal_id, "no_match", "cooldown_active", rule.name)
                 return None  # redraw double-fire guard
-            self._log_decision(terminal_id, "matched", "firing", rule.name)
+            self._log_decision(
+                terminal_id,
+                "matched",
+                "rearm_fire" if rearm == "fire" else "firing",
+                rule.name,
+            )
             # A real fire resets the veto streak for this terminal (r2-S5 edges).
             self._reset_veto_streak(terminal_id)
             # D2(i)/D5: seed the pending-fire digests over the CHROME-FILTERED
             # match region (F530) so the barrier's settle/consume compares the
             # same domain the rule matched — the classifier still saw ``region``.
-            match_digest = _digest_normalized(match_region.normalized)
             pending_region = match_region.with_digests(settle=match_digest, consume=match_digest)
             self._fire(
                 terminal_id,
@@ -772,12 +1003,21 @@ class AutoResponder:
             return None
 
         self._clear_wait_rule(terminal_id)
+        # F597 #454 pt2 (c): no rule matched → the dialog episode is over. Drop
+        # the retry-exhausted latch and its re-arm/settle state so a later,
+        # unrelated dialog starts fresh (and a persistent latch cannot survive a
+        # cleared screen).
+        with self._lock:
+            self._retry_exhausted.discard(terminal_id)
+            self._rearm_state.pop(terminal_id, None)
+            self._settled_signatures.pop(terminal_id, None)
         self._log_decision(
             terminal_id,
             "no_match",
             "no_rule_matched",
-            extra=self._reject_summary(provider_name, match_region.normalized),
+            extra=self._reject_summary(provider_name, match_region),
         )
+        self._log_no_match_region(terminal_id, match_region.normalized)
         unknown_result = self._check_unknown(
             terminal_id,
             metadata,
@@ -807,6 +1047,109 @@ class AutoResponder:
                 self._rule_state[key] = state
             return state
 
+    def _rearm_gate(self, terminal_id: str, signature: str, rule: Rule) -> Optional[str]:
+        """F597 #454 pt2 (c): decide the re-fire disposition for a matched rule
+        when the terminal may be in the retry-exhausted latch.
+
+        Returns:
+          * ``None``  — not latched; take the normal fire path (cooldown applies).
+          * ``"hold"``— latched on THIS signature but the backoff has not elapsed;
+            caller holds at WAITING and re-arms a tick.
+          * ``"fire"``— latched and the backoff HAS elapsed (or the signature
+            changed, resetting the latch): re-fire now, advancing the schedule.
+
+        A signature change clears the latch so a NEW dialog is handled fresh. The
+        schedule is REARM_BACKOFF_S then every REARM_STEADY_S, capped at
+        REARM_CAP_S since exhaustion; past the cap it holds (human already pinged).
+        """
+        now = _clock()
+        with self._lock:
+            latched = terminal_id in self._retry_exhausted
+            rearm = self._rearm_state.get(terminal_id)
+            if not latched:
+                return None
+            if rearm is None:
+                # Latched with no schedule (defensive) — treat as due.
+                return "fire"
+            if rearm.signature and signature and rearm.signature != signature:
+                # A different dialog is up now — drop the stale latch and let the
+                # normal fire path (with settle) handle the new one.
+                self._retry_exhausted.discard(terminal_id)
+                self._rearm_state.pop(terminal_id, None)
+                self._settled_signatures.pop(terminal_id, None)
+                return None
+            if now - rearm.exhausted_at >= REARM_CAP_S:
+                return "hold"  # capped — stay surfaced for the human
+            if now < rearm.next_at:
+                return "hold"
+            # Due: advance the schedule and authorize a re-fire.
+            attempts = rearm.attempts + 1
+            if attempts < len(REARM_BACKOFF_S):
+                delay = REARM_BACKOFF_S[attempts]
+            else:
+                delay = REARM_STEADY_S
+            rearm.attempts = attempts
+            rearm.next_at = now + delay
+            return "fire"
+
+    def _settle_capture(
+        self, terminal_id: str, chrome_patterns: Optional[List["re.Pattern[str]"]]
+    ) -> Optional[DialogRegion]:
+        """F597 #454 pt2 (a): the capture seam the settle gate samples twice.
+
+        Delegates to the same real screen capture the retry loop uses; kept as a
+        SEPARATE method purely so tests can control the settle samples (dialog
+        still present) independently from the retry-loop's ``_current_normalized``
+        (which a test may stub to 'cleared') — in production both read the same
+        live pane, so the two are identical."""
+        return self._current_normalized_filtered(terminal_id, chrome_patterns)
+
+    def _settle_before_first_send(
+        self,
+        terminal_id: str,
+        provider: Any,
+        region: DialogRegion,
+        rule: Rule,
+    ) -> bool:
+        """F597 #454 pt2 (a): gate the FIRST send of an episode on frame stability.
+
+        The 5x-in-1.6s no-op stall was the responder firing Enter before codex's
+        TUI input handler was armed: the dialog was matched from a mid-paint
+        frame, the keys were swallowed, the retry budget burned in ~2 s, then the
+        terminal latched off. Requiring the matched region to be BYTE-STABLE
+        across two captures ``SETTLE_INTERVAL_S`` apart proves the dialog is fully
+        painted (and, empirically, that input is armed) before any key is sent.
+
+        Runs at most ONCE per episode per region signature (``consume_digest``):
+        once settled, subsequent fires/retries for the same signature skip it.
+        Returns True if already-settled or settle passed; False if the frame kept
+        changing or could not be captured (caller must NOT send this tick — a
+        re-arm/retry will try again). A signature change resets the settle set.
+        """
+        signature = region.consume_digest
+        with self._lock:
+            settled = self._settled_signatures.setdefault(terminal_id, set())
+            if signature and signature in settled:
+                return True
+        chrome_patterns = self._chrome_patterns(provider)
+        first = self._settle_capture(terminal_id, chrome_patterns)
+        if first is None or not rule.matches(first):
+            self._log_decision(terminal_id, "no_match", "settle_capture_failed", rule.name)
+            return False
+        _clock_sleep(SETTLE_INTERVAL_S)
+        second = self._settle_capture(terminal_id, chrome_patterns)
+        if second is None or not rule.matches(second):
+            self._log_decision(terminal_id, "no_match", "settle_lost_frame", rule.name)
+            return False
+        if _digest_normalized(first.normalized) != _digest_normalized(second.normalized):
+            # Still painting/moving — do not send into an unarmed handler.
+            self._log_decision(terminal_id, "no_match", "settle_unstable", rule.name)
+            return False
+        with self._lock:
+            self._settled_signatures.setdefault(terminal_id, set()).add(signature)
+        self._log_decision(terminal_id, "matched", "settled", rule.name)
+        return True
+
     def _fire(
         self,
         terminal_id: str,
@@ -817,6 +1160,12 @@ class AutoResponder:
         state: _RuleState,
         incarnation: TerminalIncarnation,
     ) -> bool:
+        # F597 #454 pt2 (a): settle the FIRST send of an episode before touching
+        # the barrier/keys. A False here means "not stable yet" — request another
+        # detection tick and withhold the send rather than firing blind.
+        if not self._settle_before_first_send(terminal_id, provider, region, rule):
+            self._request_detection_retry(terminal_id)
+            return False
         if not self._effect_barrier(terminal_id, metadata, provider, rule, region):
             return False
         if not self._send_answer(terminal_id, metadata, rule, incarnation):
@@ -852,7 +1201,7 @@ class AutoResponder:
             if not self._incarnation_is_current(terminal_id, incarnation):
                 return
             attempt_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
-            if attempt_region is None or not rule.matches(attempt_region.normalized):
+            if attempt_region is None or not rule.matches(attempt_region):
                 # D5: the dialog cleared — record the FROZEN consume_digest so a
                 # later identical redraw of the same region is not re-fired.
                 if attempt_region is not None:
@@ -873,8 +1222,15 @@ class AutoResponder:
         if not self._incarnation_is_current(terminal_id, incarnation):
             return
         final_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
-        if final_region is not None and rule.matches(final_region.normalized):
-            self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
+        if final_region is not None and rule.matches(final_region):
+            self._surface_retry_exhausted(
+                terminal_id,
+                metadata,
+                rule,
+                provider,
+                incarnation,
+                signature=region.consume_digest,
+            )
         elif final_region is not None:
             # D5: cleared after the retry budget — record the consume digest.
             self._record_consumed(terminal_id, rule, region.consume_digest)
@@ -984,6 +1340,7 @@ class AutoResponder:
         rule: Rule,
         provider: Any = None,
         incarnation: TerminalIncarnation | None = None,
+        signature: str = "",
     ) -> None:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -999,6 +1356,16 @@ class AutoResponder:
             status_monitor.force_status(terminal_id, TerminalStatus.WAITING_USER_ANSWER)
             with self._lock:
                 self._retry_exhausted.add(terminal_id)
+                # F597 #454 pt2 (c): seed the re-arm clock so the latch is NOT
+                # permanent — while this same dialog signature persists it will
+                # be re-fired on REARM_BACKOFF_S/REARM_STEADY_S until REARM_CAP_S.
+                now = _clock()
+                self._rearm_state[terminal_id] = _RearmState(
+                    signature=signature,
+                    exhausted_at=now,
+                    next_at=now + REARM_BACKOFF_S[0],
+                    attempts=0,
+                )
 
         if not self._run_fenced_effect(terminal_id, incarnation, surface):
             return
@@ -1278,7 +1645,7 @@ class AutoResponder:
             self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
         )
         status = self._classify_region(terminal_id, provider, region)
-        if not rule.matches(match_region.normalized):
+        if not rule.matches(match_region):
             return False  # dialog cleared / no longer matches — no retry
         if self._busy_veto(status):
             self._request_detection_retry(terminal_id)
@@ -1507,9 +1874,13 @@ class AutoResponder:
     @staticmethod
     def _looks_like_dialog(normalized: str, provider_name: str) -> bool:
         if provider_name == "codex":
-            from cli_agent_orchestrator.providers.codex import WAITING_PROMPT_PATTERN
-
-            if re.search(WAITING_PROMPT_PATTERN, normalized):
+            # F597 #454: ``normalized`` is the CANONICAL string (lowercased,
+            # punctuation folded to spaces), so codex's raw-screen
+            # WAITING_PROMPT_PATTERN (which relies on capitalization, "y/n"
+            # slashes and a line anchor) cannot match here. Use a canonical-
+            # domain equivalent: an "approve"/"allow" lead followed by a yes/no
+            # affordance somewhere in the region.
+            if _CANONICAL_APPROVAL_PATTERN.search(normalized):
                 return True
         return AutoResponder._has_dialog_proximity(normalized)
 

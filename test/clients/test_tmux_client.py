@@ -414,6 +414,8 @@ class TestSendKeysViaPaste:
 class TestSendSpecialKey:
     def test_send_special_key_success(self, tmux):
         mock_pane = MagicMock()
+        # F597 #454 pt2: #{pane_in_mode} reads "0" (not in a mode) → no cancel.
+        mock_pane.cmd.return_value = MagicMock(stdout=["0"])
         mock_window = MagicMock()
         mock_window.active_pane = mock_pane
         mock_session = MagicMock()
@@ -422,10 +424,30 @@ class TestSendSpecialKey:
 
         tmux.send_special_key("ses", "win", "C-d")
 
-        # Copy-mode cancel (#654) must precede the key: a C-c/C-d sent into
-        # an active mode is consumed by the mode's key table.
-        mock_pane.cmd.assert_called_once_with("send-keys", "-X", "cancel")
-        mock_pane.send_keys.assert_called_once_with("C-d", enter=False)
+        # F597 #454 pt2: the unconditional `-X cancel` is the delivery bug — it is
+        # now gated on #{pane_in_mode}. When the pane is NOT in a mode, only the
+        # mode probe and the key send happen; NO cancel is issued.
+        mock_pane.cmd.assert_any_call("display-message", "-p", "#{pane_in_mode}")
+        mock_pane.cmd.assert_any_call("send-keys", "C-d")
+        assert (
+            call("send-keys", "-X", "cancel") not in mock_pane.cmd.call_args_list
+        ), "must NOT cancel when the pane is not in copy-mode"
+
+    def test_send_special_key_cancels_only_when_in_copy_mode(self, tmux):
+        """F597 #454 pt2: when the pane IS in a mode, the copy-mode cancel (#654)
+        precedes the key so a C-c/C-d is not eaten by the mode's key table."""
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value = MagicMock(stdout=["1"])  # #{pane_in_mode} == 1
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.send_special_key("ses", "win", "C-d")
+
+        mock_pane.cmd.assert_any_call("send-keys", "-X", "cancel")
+        mock_pane.cmd.assert_any_call("send-keys", "C-d")
 
     def test_send_special_key_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None

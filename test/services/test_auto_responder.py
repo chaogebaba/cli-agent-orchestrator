@@ -35,7 +35,9 @@ class IdleProvider(FakeProvider):
 class DialogAwareProvider(FakeProvider):
     def get_status_from_screen(self, lines):
         normalized = ar.normalize_screen(lines)
-        if "Press enter" in normalized or "Enter:submit" in normalized:
+        # F597 #454: normalize_screen returns the canonical (lowercased,
+        # punctuation-folded) form.
+        if "press enter" in normalized or "enter submit" in normalized:
             return TerminalStatus.WAITING_USER_ANSWER
         return TerminalStatus.IDLE
 
@@ -63,12 +65,33 @@ class SyncThread:
 def _reset_engine(monkeypatch):
     """Fresh engine + rule cache + no real sleeping for every test."""
     monkeypatch.setattr(ar.time, "sleep", lambda _s: None)
+    # F597 #454 pt2: settle uses the injectable sleep seam; no real waits.
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
     monkeypatch.setattr(ar.threading, "Thread", SyncThread)
     engine = ar.AutoResponder()
     monkeypatch.setattr(
         engine,
         "_capture_fresh",
         lambda _metadata, lines: (ar.normalize_screen(lines), lines),
+    )
+    # F597 #454 pt2 (a) SETTLE: the settle gate samples _settle_capture twice
+    # before the FIRST send. These unit tests drive fixed screens; default
+    # _settle_capture to echo the last screen passed to on_screen (a stable,
+    # matched frame) so settle passes deterministically. This is SEPARATE from
+    # the retry loop's _current_normalized, which the 'dialog cleared' tests stub
+    # on their own — so settle sees the dialog present while the retry sees it go.
+    last_lines: dict[str, list[str]] = {}
+    real_on_screen = engine._on_screen
+
+    def _tracking_on_screen(terminal_id, provider, lines):
+        last_lines["v"] = list(lines)
+        return real_on_screen(terminal_id, provider, lines)
+
+    monkeypatch.setattr(engine, "_on_screen", _tracking_on_screen)
+    monkeypatch.setattr(
+        engine,
+        "_settle_capture",
+        lambda tid, chrome=None: ar.dialog_region(last_lines.get("v", []), chrome),
     )
     monkeypatch.setattr(ar, "auto_responder", engine)
     ar._store._cache.clear()
@@ -131,13 +154,16 @@ def test_normalize_screen_collapses_wrapped_newlines():
     wrapped = ["Do you trust the", "contents of this directory?"]
     unwrapped = ["Do you trust the contents of this directory?"]
     assert ar.normalize_screen(wrapped) == ar.normalize_screen(unwrapped)
-    assert ar.normalize_screen(wrapped) == "Do you trust the contents of this directory?"
+    # F597 #454: normalize_screen now returns the CANONICAL form (NFKC, lowercased,
+    # non-[a-z0-9] -> space, collapsed) so wraps/glyphs/punctuation are folded.
+    assert ar.normalize_screen(wrapped) == "do you trust the contents of this directory"
 
 
 def test_normalize_screen_collapses_trailing_pad_spaces():
     # pyte pads each line to the screen width with spaces
     padded = ["Yes, continue    ", "   No, quit          "]
-    assert ar.normalize_screen(padded) == "Yes, continue No, quit"
+    # F597 #454: canonical form lowercases and drops the comma.
+    assert ar.normalize_screen(padded) == "yes continue no quit"
 
 
 # ----- rule matching --------------------------------------------------------
@@ -152,9 +178,14 @@ def test_contains_match_requires_question_and_all_options():
         options=["Yes, continue", "No, quit"],
         answer=["Enter"],
     )
-    assert rule.matches("Do you trust the contents of this directory? 1. Yes, continue 2. No, quit")
-    assert not rule.matches("Do you trust the contents of this directory? 1. Yes, continue")
-    assert not rule.matches("Some unrelated screen")
+    # F597 #454: .matches() receives the canonical screen string.
+    assert rule.matches(
+        ar.canonicalize("Do you trust the contents of this directory? 1. Yes, continue 2. No, quit")
+    )
+    assert not rule.matches(
+        ar.canonicalize("Do you trust the contents of this directory? 1. Yes, continue")
+    )
+    assert not rule.matches(ar.canonicalize("Some unrelated screen"))
 
 
 def test_regex_match_masks_variable_parts():
@@ -166,9 +197,17 @@ def test_regex_match_masks_variable_parts():
         options=["Yes, continue", "No, quit"],
         answer=["Enter"],
     )
-    assert rule.matches("You have 3 usage limit resets available Yes, continue No, quit")
-    assert rule.matches("You have 12 usage limit resets available Yes, continue No, quit")
-    assert not rule.matches("You have usage limit resets available Yes, continue No, quit")
+    # F597 #454: regex is applied case-insensitively to the canonical string;
+    # \d+ and word tokens survive the fold.
+    assert rule.matches(
+        ar.canonicalize("You have 3 usage limit resets available Yes, continue No, quit")
+    )
+    assert rule.matches(
+        ar.canonicalize("You have 12 usage limit resets available Yes, continue No, quit")
+    )
+    assert not rule.matches(
+        ar.canonicalize("You have usage limit resets available Yes, continue No, quit")
+    )
 
 
 def test_disabled_rule_never_matches():
@@ -445,7 +484,9 @@ def test_numbered_option_at_least_201_chars_before_press_enter_is_not_suspect(
 
 
 def test_multi_press_enter_uses_later_adjacent_option():
-    normalized = (
+    # F597 #454: _looks_like_dialog runs against the CANONICAL string, so build
+    # the input in that domain (lowercased, "1." folded to "1 ").
+    normalized = ar.canonicalize(
         "Press enter for help " + "x" * 220 + " 1. Continue 2. Cancel Press enter to choose"
     )
 
@@ -535,9 +576,14 @@ def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
     assert ar.AutoResponder._looks_like_dialog(ar.normalize_screen(leading), "codex")
     assert provider.get_status_from_screen(leading) == TerminalStatus.WAITING_USER_ANSWER
     assert _reset_engine.on_screen("term1", provider, leading) == TerminalStatus.WAITING_USER_ANSWER
-    assert not ar.AutoResponder._looks_like_dialog("prefix Approve command? y/n", "codex")
+    # F597 #454: _looks_like_dialog runs on the CANONICAL string. A non-leading
+    # "approve" no longer trips the anchored codex branch, and falls through to
+    # the generic numbered-option + press-enter proximity heuristic.
+    assert not ar.AutoResponder._looks_like_dialog(
+        ar.canonicalize("prefix Approve command? y/n"), "codex"
+    )
     assert ar.AutoResponder._looks_like_dialog(
-        "prefix Approve command? y/n 1. Yes Press enter", "codex"
+        ar.canonicalize("prefix Approve command? y/n 1. Yes Press enter"), "codex"
     )
     assert len(pushed) == 1
 
@@ -627,17 +673,18 @@ def test_f530_layer1_chrome_rows_dropped_keep_chooser_in_tail():
 
     filtered = ar.dialog_region(screen, provider.chrome_row_patterns())
 
-    assert "Choose working directory to resume this session" in filtered.normalized
-    assert "Always use current directory" in filtered.normalized
+    # F597 #454: filtered.normalized is the canonical (lowercased) form.
+    assert ar.canonicalize("Choose working directory to resume this session") in filtered.normalized
+    assert ar.canonicalize("Always use current directory") in filtered.normalized
     # No chrome row leaked into the filtered tail.
-    assert "esc to interrupt" not in filtered.normalized
-    assert "Ask Codex to do anything" not in filtered.normalized
+    assert ar.canonicalize("esc to interrupt") not in filtered.normalized
+    assert ar.canonicalize("Ask Codex to do anything") not in filtered.normalized
     # The filtered region is strictly the chooser rows (8 non-blank + 1 blank).
     assert len([r for r in filtered.rows if r.strip()]) == 8
     # Genuine output below the chooser is NOT dropped (F55 scrollback preserved).
     real_output = _F530_CHOOSER_ROWS + [f"genuine output {i}" for i in range(25)]
     assert (
-        "Choose working directory to resume this session"
+        ar.canonicalize("Choose working directory to resume this session")
         not in ar.dialog_region(real_output, provider.chrome_row_patterns()).normalized
     )
 
@@ -682,23 +729,27 @@ def test_f530_layer3_reject_reason_names_failing_field():
         ["Enter"],
     )
     # question absent → question(contains)
-    assert rule.reject_reason("unrelated screen text") == "question(contains)"
-    # question present, an option absent → option[<opt>]
+    assert rule.reject_reason(ar.canonicalize("unrelated screen text")) == "question(contains)"
+    # question present, an option absent → option[<opt>] (names the AUTHORED text)
     assert (
-        rule.reject_reason("Do you trust the contents of this directory? Yes, continue")
+        rule.reject_reason(
+            ar.canonicalize("Do you trust the contents of this directory? Yes, continue")
+        )
         == "option[No, quit]"
     )
     # full match → None
     assert (
-        rule.reject_reason("Do you trust the contents of this directory? Yes, continue No, quit")
+        rule.reject_reason(
+            ar.canonicalize("Do you trust the contents of this directory? Yes, continue No, quit")
+        )
         is None
     )
     # disabled → disabled (short-circuits before field checks)
     disabled = ar.Rule("r", False, "contains", "x", [], ["Enter"])
-    assert disabled.reject_reason("x") == "disabled"
+    assert disabled.reject_reason(ar.canonicalize("x")) == "disabled"
 
     regex_rule = ar.Rule("re", True, "regex", r"Update available! [\d.]+", [], "wait")
-    assert regex_rule.reject_reason("no update here") == "question(regex)"
+    assert regex_rule.reject_reason(ar.canonicalize("no update here")) == "question(regex)"
 
 
 def test_f530_layer3_diagnose_rules_reports_region_and_verdicts(monkeypatch):

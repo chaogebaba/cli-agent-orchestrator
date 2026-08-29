@@ -4,9 +4,8 @@ Commit 6 introduces the no-history HOLD (test_m3 goes GREEN here) and the full
 D6 machinery. Named outside the test_f516_* AC7-lint scope (drives internals).
 """
 
-from unittest.mock import MagicMock
-
 from test.helpers.dialog_replay import DialogReplay
+from unittest.mock import MagicMock
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import ProviderCapabilities
@@ -65,8 +64,17 @@ def _wire(monkeypatch, metadata, backend, retries=None):
         "cli_agent_orchestrator.services.status_monitor.status_monitor.schedule_detection_retry",
         lambda tid, *a, **k: (retries.append(tid) if retries is not None else None),
     )
+    # F597 #454 pt2 (a): the settle gate samples the current screen via
+    # status_monitor.get_rendered_screen; return the same fixture screen so the
+    # matched frame is byte-stable and settle passes deterministically.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+        lambda tid, *a, **k: list(backend.capture_viewport.return_value.splitlines()),
+    )
     monkeypatch.setattr(ar._store, "get_rules", lambda _p: [RESUME_RULE])
     monkeypatch.setattr(ar.threading, "Thread", MagicMock())
+    # F597 #454 pt2: no real settle sleep in tests.
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
 
 
 def _backend(screen):
@@ -195,7 +203,6 @@ def test_ac2b_delivery_arm_scrolling_banner_does_not_raise_dialog_open_error(mon
     )
     dg._consult_dialog_before_send("term-banner", _NoHazard())
     auto_responder.clear_terminal("term-banner")
-
 
 
 def test_no_history_hold_requests_exactly_one_retry(monkeypatch, tmp_path):
