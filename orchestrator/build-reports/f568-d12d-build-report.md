@@ -123,3 +123,112 @@ Run on `box@grok-box-3` via `scripts/box-run.sh` (same-box A/B):
 - Deviations: box left on `cao/4fd45dca` rather than `main` — the local
   containment guard blocks a `git checkout main` in the command string; the next
   lane's `box-run.sh` checkout resets it, and the branch is pushed/auditable.
+
+## r2 — empirical-gate fixes (2026-08-29)
+
+### Changes
+
+- Removed `rstrip("\n")` from the pure box-walk helper's capture-prefix split. The
+  helper now preserves the live snapshot's final empty row before the composer
+  top rail, so the configured six-row window is the window actually evaluated.
+- Changed the F568 fixture loader to `Path.read_bytes().decode("utf-8")`; it now
+  consumes committed capture bytes without newline translation or stripping.
+- Added a live-fixture layout guard proving `spinner-roosting.txt` places its
+  spinner in raw walk slot 5 and `supervisor-pane-working-033435.txt` places its
+  spinner in raw walk slot 6. Both are existing byte-exact live captures with
+  real blank / `›` / `⎿` chrome; no fixture was synthesised or modified.
+- Fixed the gate's new isort failure by ordering the `pane_liveness` import as
+  `PaneLivenessService, _CaptureResult`. Running Black also removed the single
+  redundant parentheses in that test file so all nine D12d Python files pass
+  Black with the mandated line length.
+
+### Targeted verification
+
+Command:
+
+```console
+$ uv run pytest -q test/services/test_pane_liveness*.py test/services/test_status_fusion.py test/providers/test_claude_code_unit.py test/providers/test_claude_code_spinner_veto.py test/services/test_f506_admission_seam.py test/services/test_f522_lock_order.py
+........................................................................ [ 26%]
+........................................................................ [ 52%]
+........................................................................ [ 78%]
+..........................................................               [100%]
+274 passed in 17.36s
+```
+
+Post-mutation restored-state check:
+
+```console
+$ rg -n '_NEW_TUI_BOX_SPINNER_WALK_ROWS = ' src/cli_agent_orchestrator/providers/claude_code.py
+381:_NEW_TUI_BOX_SPINNER_WALK_ROWS = 6
+$ uv run pytest -q test/providers/test_claude_code_spinner_veto.py
+....................                                                     [100%]
+20 passed in 1.42s
+```
+
+No laptop full suite was run in r2, per the brief.
+
+### Mandatory mutant re-check: window `6 -> 4`
+
+Exact mutation/test command (the EXIT trap restores the source, touches it, and
+removes its timestamp-based bytecode cache before returning):
+
+```console
+$ set -o pipefail
+$ cp src/cli_agent_orchestrator/providers/claude_code.py /tmp/f568-d12d-r2-claude_code.py
+$ restore() {
+    mv /tmp/f568-d12d-r2-claude_code.py src/cli_agent_orchestrator/providers/claude_code.py
+    touch src/cli_agent_orchestrator/providers/claude_code.py
+    find src/cli_agent_orchestrator/providers/__pycache__ -type f -name 'claude_code*.pyc' -delete 2>/dev/null || true
+  }
+$ trap restore EXIT
+$ uv run python - <<'PY'
+from pathlib import Path
+p = Path('src/cli_agent_orchestrator/providers/claude_code.py')
+s = p.read_text(encoding='utf-8')
+old = '_NEW_TUI_BOX_SPINNER_WALK_ROWS = 6'
+assert s.count(old) == 1
+p.write_text(s.replace(old, '_NEW_TUI_BOX_SPINNER_WALK_ROWS = 4'), encoding='utf-8')
+PY
+$ find src/cli_agent_orchestrator/providers/__pycache__ -type f -name 'claude_code*.pyc' -delete 2>/dev/null || true
+$ uv run pytest -q test/providers/test_claude_code_spinner_veto.py
+..FFF..F...........F                                                     [100%]
+FAILED test/providers/test_claude_code_spinner_veto.py::test_helper_true_on_live_spinner_fixtures[spinner-roosting.txt]
+FAILED test/providers/test_claude_code_spinner_veto.py::test_helper_true_on_live_spinner_fixtures[supervisor-pane-working-033435.txt]
+FAILED test/providers/test_claude_code_spinner_veto.py::test_live_fixture_spinner_distance_is_load_bearing[spinner-fifth-row]
+FAILED test/providers/test_claude_code_spinner_veto.py::test_live_fixture_spinner_distance_is_load_bearing[spinner-sixth-row]
+FAILED test/providers/test_claude_code_spinner_veto.py::test_get_status_processing_on_push_row_positive
+5 failed, 15 passed in 2.24s
+MUTANT_EXIT=1
+```
+
+**Mutant result: KILLED — window `6 -> 4` produces 5 failures, including the
+byte-exact fifth-row and sixth-row live-capture guards.**
+
+### Formatting and types
+
+Commands and output:
+
+```console
+$ changed_py=(${(f)"$(git diff --name-only 9b83449a -- '*.py')"})
+$ uv run black --check --line-length 100 $changed_py
+All done! ✨ 🍰 ✨
+9 files would be left unchanged.
+$ uv run isort --check-only --profile black --line-length 100 $changed_py
+# exit 0, no output
+$ git diff --check
+# exit 0, no output
+```
+
+Strict mypy was limited to the four changed production files:
+
+```console
+$ uv run mypy --strict src/cli_agent_orchestrator/providers/base.py src/cli_agent_orchestrator/providers/claude_code.py src/cli_agent_orchestrator/services/pane_liveness.py src/cli_agent_orchestrator/services/status_monitor.py
+Found 74 errors in 2 files (checked 4 source files)
+MYPY_EXIT=1
+```
+
+The two `claude_code.py` generic-parameter errors and 72
+`status_monitor.py` errors are the same pre-existing set established by the
+same-box base/head comparison in the empirical gate report; neither falls in an
+r2-changed line. `base.py` and `pane_liveness.py` remain strict-clean. No
+out-of-scope typing refactor was made.

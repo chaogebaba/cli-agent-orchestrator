@@ -19,7 +19,11 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.claude_code import new_tui_box_spinner_live
+from cli_agent_orchestrator.providers.claude_code import (
+    NEW_TUI_BOX_PATTERN,
+    NEW_TUI_BOX_SPINNER_PATTERN,
+    new_tui_box_spinner_live,
+)
 
 _FIX = Path(__file__).parent / "fixtures"
 _F568 = _FIX / "f568"
@@ -27,7 +31,9 @@ _WPQ1 = _FIX / "wpq1_claude_2_1_211"
 
 
 def _read(p: Path) -> str:
-    return p.read_text(encoding="utf-8")
+    # Decode the committed capture bytes directly: newline translation or
+    # stripping would collapse the live blank row immediately above the rail.
+    return p.read_bytes().decode("utf-8")
 
 
 # ---- AC-F568-6 predicate matrix -----------------------------------------
@@ -54,6 +60,30 @@ _NONE_FIXTURES = [
 @pytest.mark.parametrize("path", _TRUE_FIXTURES, ids=lambda p: p.name)
 def test_helper_true_on_live_spinner_fixtures(path):
     assert new_tui_box_spinner_live(_read(path)) is True
+
+
+@pytest.mark.parametrize(
+    ("path", "spinner_slot"),
+    [
+        (_F568 / "spinner-roosting.txt", 5),
+        (_F568 / "supervisor-pane-working-033435.txt", 6),
+    ],
+    ids=["spinner-fifth-row", "spinner-sixth-row"],
+)
+def test_live_fixture_spinner_distance_is_load_bearing(path, spinner_slot):
+    """Pin real captures whose byte-exact rows require walk windows 5 and 6."""
+    text = _read(path)
+    input_box = list(NEW_TUI_BOX_PATTERN.finditer(text))[-1]
+    above_rows = text[: input_box.start()].split("\n")
+    actual_slot = next(
+        slot
+        for slot, row in enumerate(reversed(above_rows), start=1)
+        if NEW_TUI_BOX_SPINNER_PATTERN.search(row)
+    )
+
+    assert path.read_bytes().endswith(b"\n")
+    assert actual_slot == spinner_slot
+    assert new_tui_box_spinner_live(text) is True
 
 
 @pytest.mark.parametrize("path", _FALSE_FIXTURES, ids=lambda p: p.name)

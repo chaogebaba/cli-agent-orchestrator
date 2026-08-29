@@ -426,7 +426,11 @@ def new_tui_box_spinner_live(text: str) -> bool | None:
     # that renders between a live spinner and the rail: blanks, `⎿` hint rows,
     # the own-line effort footer, and `›`-prefixed teammate-push rows. The first
     # non-skipped row decides.
-    above_lines = text[: input_box.start()].rstrip("\n").split("\n")
+    # Keep the capture prefix byte-for-byte here.  In a tmux snapshot the
+    # newline immediately before the top rail is itself the final empty row;
+    # stripping it collapses that row and makes the six-row walk behave like a
+    # shorter window on the live push/hint fixtures.
+    above_lines = text[: input_box.start()].split("\n")
     for line in reversed(above_lines[-_NEW_TUI_BOX_SPINNER_WALK_ROWS:]):
         stripped = line.lstrip()
         if (

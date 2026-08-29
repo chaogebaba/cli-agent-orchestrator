@@ -15,7 +15,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import receiver_state_view
-from cli_agent_orchestrator.services.pane_liveness import _CaptureResult, PaneLivenessService
+from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService, _CaptureResult
 from cli_agent_orchestrator.services.question_state import QuestionStateService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
@@ -167,7 +167,7 @@ def test_ac18_parity_zero_mismatch_on_fusion_only_difference(wired):
             monitor=sm,
         )
     assert recorded, "record_comparison should have been called in collecting phase"
-    (args, kwargs) = recorded[0]
+    args, kwargs = recorded[0]
     # collecting records (legacy_answer, rs.answer); both fused to PROCESSING.
     legacy_answer, rs_answer = args[2], args[3]
     assert legacy_answer is TerminalStatus.PROCESSING
