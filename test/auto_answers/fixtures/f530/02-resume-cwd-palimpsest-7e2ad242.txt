@@ -1,0 +1,13 @@
+
+Choose working directory to resume this session
+
+  Session = latest cwd recorded in the resumed session
+  Current = your current working directory
+
+› 1. Use session directory (/home/chao/VScode_projects/cli-subagents)
+  2. Use current directory (/home/chao/VScode_projects/cli-subagents/.cao/worktr
+ee3.7Always2use session directory
+7e4.dAlways  cao/7e2ad242 via 🐍 v3.14.7 on ☁
+❯ echo ready
+echoready
+%
