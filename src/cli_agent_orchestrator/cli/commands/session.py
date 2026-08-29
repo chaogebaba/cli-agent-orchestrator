@@ -40,6 +40,7 @@ def _get_terminal(terminal_id):
 
 def _get_terminal_output(terminal_id):
     from cli_agent_orchestrator.utils.tombstones import tombstone
+
     tombstone("TS-0003")
     response = cao_http.get(f"/terminals/{terminal_id}/output", params={"mode": "last"})
     response.raise_for_status()
@@ -64,6 +65,14 @@ def session():
 @click.option("--provider")
 @click.option("--cwd", "working_directory")
 @click.option("--tools", "allowed_tools")
+@click.option(
+    "--yolo",
+    is_flag=True,
+    help="[DANGEROUS] Unrestricted tool access: resolves allowed_tools to '*', "
+    "which suppresses provider tool restrictions (e.g. claude_code's "
+    "--disallowedTools) and keeps the provider's skip-permissions bypass. "
+    "Mirrors 'cao launch --yolo'. Mutually exclusive with --tools.",
+)
 @click.option("--env", "env_pairs", multiple=True)
 @click.option("--allow-incomplete-brief", is_flag=True)
 @click.option("--memory", is_flag=True)
@@ -74,6 +83,7 @@ def start(
     provider,
     working_directory,
     allowed_tools,
+    yolo,
     env_pairs,
     allow_incomplete_brief,
     memory,
@@ -81,6 +91,18 @@ def start(
 ):
     """Start a CAO session through the canonical lifecycle API."""
     from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs
+
+    # --yolo mirrors `cao launch --yolo`: it resolves allowed_tools to ["*"].
+    # The server forwards "*" to the provider, where a non-empty allowed_tools
+    # list containing "*" suppresses tool restriction (claude_code.py skips
+    # --disallowedTools) while the skip-permissions bypass still applies. This
+    # is the ONLY way to reproduce the launch --yolo supervisor seat through the
+    # canonical lifecycle verb; without it, a supervisor-role profile resolves
+    # to ROLE_TOOL_DEFAULTS and Bash/Edit/Write/Agent are stripped.
+    if yolo and allowed_tools:
+        raise click.ClickException("--yolo and --tools are mutually exclusive")
+    if yolo:
+        allowed_tools = "*"
 
     params = {"agent_profile": agents}
     if session_name:
@@ -320,12 +342,9 @@ def recover(
             click.echo(
                 f"NOTE: recovered terminal {label} is IDLE until messaged — send a continue nudge."
             )
-        if reason == "content-flag" and show and isinstance(
-            item.get("decontamination"), dict
-        ):
+        if reason == "content-flag" and show and isinstance(item.get("decontamination"), dict):
             click.echo(
-                f"{label}: decontamination "
-                + json.dumps(item["decontamination"], sort_keys=True)
+                f"{label}: decontamination " + json.dumps(item["decontamination"], sort_keys=True)
             )
     if reason == "epoch":
         for item in result.get("respawn_candidates", []):

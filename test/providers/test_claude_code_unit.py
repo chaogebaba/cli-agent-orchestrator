@@ -2220,6 +2220,60 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" not in command
 
 
+class TestF565PhoenixSeatContract:
+    """F565 (#421): the phoenix-resolved `cao session start --yolo` newborn seat
+    MUST match the canonical `cao launch --yolo` supervisor seat at the provider
+    argv level: allowed_tools=["*"] => skip-permissions bypass AND no
+    --disallowedTools. A supervisor-role profile without --yolo resolves to
+    ROLE_TOOL_DEFAULTS and must STILL strip Bash (#125 restriction semantics).
+
+    These assert the argv-construction seam directly (no live server), which is
+    where claude_code.py decides restriction: `if self._allowed_tools and "*"
+    not in self._allowed_tools: emit --disallowedTools`.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_seat_bypasses_and_never_disallows_bash(self, mock_os, mock_load):
+        """allowed_tools=["*"] (the --yolo seat): argv carries
+        --dangerously-skip-permissions and NO --disallowedTools (Test 1)."""
+        mock_os.geteuid.return_value = 1000  # non-root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" in command
+        assert "--disallowedTools" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_supervisor_role_without_yolo_still_disallows_bash(self, mock_os, mock_load):
+        """Regression guard for #125: a supervisor-role resolved tool set
+        (no --yolo) STILL emits --disallowedTools Bash (Test 2)."""
+        mock_os.geteuid.return_value = 1000  # non-root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        # ROLE_TOOL_DEFAULTS['supervisor'] — the exact set terminal_service
+        # resolves when session start forwards allowed_tools=None for a
+        # supervisor-role profile (constants.py). Restriction must remain.
+        supervisor_tools = ["@cao-mcp-server", "fs_read", "fs_list"]
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=supervisor_tools)
+        command = provider._build_claude_command()
+
+        assert "--disallowedTools Bash" in command
+
+
 class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
