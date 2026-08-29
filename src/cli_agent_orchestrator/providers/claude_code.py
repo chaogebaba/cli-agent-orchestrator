@@ -371,6 +371,80 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 NEW_TUI_BOX_RAIL_PATTERN = re.compile(r"─{8,}")
 NEW_TUI_BOX_PROMPT_PATTERN = re.compile(r"[>❯](?:[\s\xa0]|$)")
 
+# F568 D12d — window over which the spinner walk skips footer chrome above the
+# composer box's top rail. Widened from the historical 4 to 6 to clear the two
+# extra chrome rows a live seat renders between the spinner and the box: a
+# `⎿` hint AND a `›` teammate-push row (see supervisor-pane-working-033435.txt,
+# where the spinner sits five rows above the top rail behind exactly that
+# chrome). Today's 4-row/no-`›` walk misses it — a latent false-COMPLETED in
+# get_status the same helper fixes.
+_NEW_TUI_BOX_SPINNER_WALK_ROWS = 6
+
+
+def new_tui_box_spinner_live(text: str) -> bool | None:
+    """Is the seat's own TUI turn spinner live above the composer box? (F568 D12d)
+
+    PURE, module-level, and shared: the box-anchored walk was extracted verbatim
+    from ``get_status`` (only the ``›``-skip + window-6 change) so ``get_status``
+    and ``ClaudeCodeProvider.rule3a_busy_marker`` derive the spinner fact from
+    ONE predicate. The spinner row (``<glyph> <Gerund>… (<elapsed> · ↓ <N>k
+    tokens · …)``; verbs vary, glyph cycles ``· ✢ * ✶ ✻ ✽``, the tuple is
+    optional) is rendered by the seat's TUI ONLY during its own open turn — absent
+    while only a background Agent runs.
+
+    Input is the plain snapshot string the liveness sampler already holds (the
+    single ``get_history(..., strip_escapes=True)`` read; no second capture).
+
+    Returns:
+        ``True``  — a complete rail→❯→rail box containing the freshest prompt
+                    exists AND the first non-skipped row within the six rows above
+                    its top rail matches ``NEW_TUI_BOX_SPINNER_PATTERN``.
+        ``False`` — such a box exists but that first non-skipped row is not a
+                    spinner (or no non-chrome content sits above the rail).
+        ``None``  — no complete rail→❯→rail box containing the last prompt.
+
+    Never a status source (S1 truth table): ``False`` withholds an upgrade,
+    ``True`` only re-enables the pre-existing rule 3a, subject to every other
+    guard. No NEW regex enters this helper.
+    """
+    # Anchor to the box that actually CONTAINS the freshest ❯ prompt — not just
+    # any separator-framed region — mirroring get_status's last_idle anchoring.
+    last_prompt = None
+    for m in re.finditer(IDLE_PROMPT_PATTERN, text):
+        last_prompt = m
+    if last_prompt is None:
+        return None
+
+    input_box = None
+    for m in NEW_TUI_BOX_PATTERN.finditer(text):
+        if m.start() <= last_prompt.start() < m.end():
+            input_box = m
+    if input_box is None:
+        return None
+
+    # Walk up from the box's top rail over at most six rows, skipping the chrome
+    # that renders between a live spinner and the rail: blanks, `⎿` hint rows,
+    # the own-line effort footer, and `›`-prefixed teammate-push rows. The first
+    # non-skipped row decides.
+    # Keep the capture prefix byte-for-byte here.  In a tmux snapshot the
+    # newline immediately before the top rail is itself the final empty row;
+    # stripping it collapses that row and makes the six-row walk behave like a
+    # shorter window on the live push/hint fixtures.
+    above_lines = text[: input_box.start()].split("\n")
+    for line in reversed(above_lines[-_NEW_TUI_BOX_SPINNER_WALK_ROWS:]):
+        stripped = line.lstrip()
+        if (
+            not line.strip()
+            or stripped.startswith("⎿")
+            or stripped.startswith("›")
+            or EFFORT_FOOTER_LINE_PATTERN.match(line)
+        ):
+            continue
+        return bool(NEW_TUI_BOX_SPINNER_PATTERN.search(line))
+    # A complete box exists but only chrome sits above the rail — no live spinner.
+    return False
+
+
 # Claude pins its dialogs and composer near the bottom of the viewport. Keep this
 # shared with get_status_from_screen so both classifiers inspect the same region.
 CLAUDE_STATUS_BOTTOM_ROWS = 25
@@ -1532,6 +1606,22 @@ class ClaudeCodeProvider(BaseProvider):
         )
         return False
 
+    def rule3a_busy_marker(self, snapshot: str) -> bool | None:
+        """F568 D12d busy-marker for rule 3a: is the seat's own TUI spinner live?
+
+        Delegates to the shared pure helper ``new_tui_box_spinner_live`` — the
+        SAME predicate ``get_status`` uses for its spinner source, so the two can
+        never disagree. ``snapshot`` is the plain (escape-stripped) pane string
+        the liveness sampler already holds; no second capture.
+
+        Truth table (S1): ``None`` ⇒ legacy rule 3a (no identifiable current
+        box); ``False`` ⇒ veto this sample's upgrade; ``True`` ⇒ permits rule 3a
+        only when every other guard passes — never sufficient alone, never
+        publishes. This method is NOT consulted by ``get_status`` (which calls
+        the helper directly); it is the read side ``pane_liveness`` samples.
+        """
+        return new_tui_box_spinner_live(snapshot)
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
 
@@ -1725,30 +1815,15 @@ class ClaudeCodeProvider(BaseProvider):
         #   2. a mid-buffer separator-framed region (e.g. a markdown blockquote)
         #      that is not the real input box (it does not contain the last ❯).
         # Older builds (no box) fall through to the legacy ⏺-based logic unchanged.
-        input_box = None
-        if last_idle is not None:
-            for m in NEW_TUI_BOX_PATTERN.finditer(output):
-                if m.start() <= last_idle.start() < m.end():
-                    input_box = m
-        if input_box is not None:
-            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines,
-            # blanks, and (GH #459) an own-line effort footer ("● high ·
-            # /effort") — render BETWEEN the live spinner and the box's top
-            # border, so checking only the single line above the box misses
-            # an active spinner (false COMPLETED during MCP calls, or IDLE
-            # once fix #1 above stops the footer from false-matching COMPLETED
-            # via EXTRACTION_RESPONSE_PATTERN).
-            above_lines = output[: input_box.start()].rstrip("\n").split("\n")
-            for line in reversed(above_lines[-4:]):
-                if (
-                    not line.strip()
-                    or line.lstrip().startswith("⎿")
-                    or EFFORT_FOOTER_LINE_PATTERN.match(line)
-                ):
-                    continue
-                if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
-                    return authoritative(TerminalStatus.PROCESSING)
-                break
+        #
+        # F568 D12d: the box-anchored walk that used to live inline here is now
+        # the shared pure helper new_tui_box_spinner_live() — get_status and
+        # ClaudeCodeProvider.rule3a_busy_marker derive the spinner fact from ONE
+        # predicate. The only behaviour change vs the old inline walk is the
+        # `›` teammate-push skip + the six-row window (covered by AC-6's `›`-push
+        # positive fixture); True ⇒ a live spinner sits above the current box.
+        if new_tui_box_spinner_live(output) is True:
+            return authoritative(TerminalStatus.PROCESSING)
 
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
         # completion summary OR a start-of-line response marker (legacy ⏺ or the

@@ -30,7 +30,7 @@ import time
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+from cli_agent_orchestrator.services.pane_liveness import _CaptureResult, pane_liveness
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 # Bounded wall-clock budget for the whole concurrent phase. Healthy code
@@ -55,7 +55,11 @@ def _seeded_singletons(monkeypatch):
     * Prime one usable pane sample so ``peek`` returns a real observation
       rather than ``None`` (again, so the contended arm is actually taken).
     """
-    monkeypatch.setattr(pane_liveness, "_capture", lambda tid: ("fp-const", "tail"))
+    monkeypatch.setattr(
+        pane_liveness,
+        "_capture",
+        lambda tid: _CaptureResult("fp-const", "tail", None, 0, ()),
+    )
 
     with status_monitor._lock:
         status_monitor._last_status[_TID] = TerminalStatus.PROCESSING
