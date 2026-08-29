@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -136,6 +135,22 @@ def _is_wedge_suspect(row: dict[str, Any]) -> bool | None:
     return None
 
 
+def _children_count_from_row(row: dict[str, Any]) -> int:
+    """F568 D12a/D12c: length of the children ledger on the fleet row.
+
+    The ledger lives at the free-form top-level ``children`` key on the parsed
+    ``metadata_json`` dict — the SAME list D12d's liveness READ side counts. The
+    fleet loop already holds this dict (``row["metadata"]``), so no extra DB read
+    is taken here (D12c: "no schema change and no watchdog coupling"). Absent /
+    malformed → 0.
+    """
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        return 0
+    children = metadata.get("children")
+    return len(children) if isinstance(children, list) else 0
+
+
 def build_fleet(session_name: str) -> dict[str, Any]:
     rows = list_terminals_by_session(session_name)
     if not rows:
@@ -187,6 +202,18 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         init_health = _compute_init_health(row, now)
         if init_health == "failed":
             status = TerminalStatus.ERROR
+        # F568 D12c: `delegating` is a projection over the FINAL status (computed
+        # here, AFTER all three ERROR overrides above) and the children ledger.
+        # An ERROR/quarantined seat never renders `delegating` (r11 S2); a
+        # PROCESSING seat keeps `working` (its own turn is open). Only an
+        # IDLE/COMPLETED seat with children in flight is `delegating`. The status
+        # enum value is left untouched (r11 S3) — `delegating`/`children_count`
+        # are additive sibling keys, mirroring `fusion_changed`/`fusion_reason`.
+        children_count = _children_count_from_row(row)
+        delegating = children_count > 0 and status in (
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        )
         last_active = row.get("last_active")
         if last_active is not None:
             last_active = _as_utc(last_active)
@@ -214,6 +241,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 # provider-published one); fusion_reason shows in the row detail.
                 "fusion_changed": fusion_changed,
                 "fusion_reason": fusion_reason,
+                # F568 D12c: additive sibling keys — the raw `status` enum is
+                # unchanged (no new persisted status value). The TUI renders
+                # `delegating (N)` when `delegating` is True.
+                "delegating": delegating,
+                "children_count": children_count,
                 "init_state": row.get("init_state"),
                 "init_health": init_health,
                 "since_last_input": since_last_input,
@@ -238,9 +270,9 @@ def build_fleet(session_name: str) -> dict[str, Any]:
 def get_wake_exhaustion_alarms() -> list[dict[str, Any]]:
     """F476 B5: Return active wake-exhaustion alarms for fleet/dashboard surfaces."""
     from cli_agent_orchestrator.clients.database import (
+        _WAKE_STREAK_CAP,
         MailboxModel,
         SessionLocal,
-        _WAKE_STREAK_CAP,
     )
 
     alarms: list[dict[str, Any]] = []
