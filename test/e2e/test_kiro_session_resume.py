@@ -1,12 +1,16 @@
-"""E2E: F560 Kiro session resume via id minting (ZQX7 round-trip).
+"""E2E: Kiro session resume round-trip (ZQX7), F560 as corrected by F566.
 
-Drives the REAL KiroCliProvider against a real ``kiro-cli`` process in tmux,
-exercising the exact mint+resume path shipped in F560:
+Drives the REAL KiroCliProvider against a real ``kiro-cli`` process in tmux:
 
-1. Construct a provider (fresh spawn) — it mints ``sess_<uuid4>`` and launches
-   ``kiro-cli ... --resume-id <minted>``. Verify the process adopts that id.
-2. Send "remember token ZQX7"; wait for the turn to complete (persists the
-   session under the minted id).
+1. Construct a provider (fresh spawn) — F566: it has NO session id and
+   launches WITHOUT ``--resume-id`` (an uncreated id would make kiro take
+   session.load.create_uncreated, dropping ``--agent`` and all MCP servers).
+   kiro allocates the id itself, so the test reads it back from
+   ``--list-sessions``. NOTE: CAO does not yet harvest that id into
+   terminals.provider_session_id — that is #416 pt2 — so this leg reads it
+   here rather than asserting a persisted id.
+2. Send "remember token ZQX7"; wait for the turn to complete (this persists
+   the session row), then read back the id kiro allocated.
 3. Kill the tmux window (worker reaped), then construct a SECOND provider with
    a resume ForkContext carrying the SAME id — it launches
    ``kiro-cli ... --resume-id <same-id>`` and re-opens the conversation.
@@ -98,11 +102,11 @@ def _TOKEN_seen_or_prompt(session: str, window: str) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_kiro_mint_and_resume_round_trip(kiro_window):
-    """A minted id starts a fresh session and resumes it with ZQX7 recall."""
+async def test_kiro_fresh_spawn_then_resume_round_trip(kiro_window):
+    """A fresh spawn (no --resume-id) is resumable by its real id, ZQX7 recall."""
     session, window, cwd = kiro_window
 
-    # --- 1. Fresh spawn: provider mints the id and launches --resume-id ---
+    # --- 1. Fresh spawn: NO --resume-id (F566); kiro allocates the id ---
     p1 = KiroCliProvider(
         "f560t1",
         session,
@@ -111,26 +115,32 @@ async def test_kiro_mint_and_resume_round_trip(kiro_window):
         allowed_tools=["*"],
         engine=KiroEngine.KAS,
     )
-    minted = p1.allocated_session_uuid
-    assert minted.startswith("sess_")
+    assert p1.allocated_session_uuid is None  # F566: unknown until harvested
+    assert p1._resume_session_id() is None
+
+    def _list_session_ids() -> set[str]:
+        listed = subprocess.run(
+            ["kiro-cli", "--v3", "chat", "--list-sessions", "--format", "json"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return set(re.findall(r"sess_[0-9a-fA-F-]+", listed.stdout or ""))
+
+    before = _list_session_ids()
 
     # Point the provider's backend context at our tmux window and initialize.
     await p1.initialize()
 
-    # The launched process must have adopted the minted id.
-    listed = subprocess.run(
-        ["kiro-cli", "--v3", "chat", "--list-sessions", "--format", "json"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert minted in (
-        listed.stdout or ""
-    ), f"minted id {minted} not adopted; list-sessions: {listed.stdout!r}"
-
-    # --- 2. Plant the token ---
+    # --- 2. Plant the token (this is also what persists the session row) ---
     await _drive_turn(p1, session, window, f"Remember this token: {_TOKEN}. Just acknowledge.")
+
+    # Harvest the real id kiro allocated. #416 pt2 is to do this inside CAO;
+    # until then the resume leg below supplies it the way a harvest would.
+    new_ids = _list_session_ids() - before
+    assert len(new_ids) == 1, f"expected exactly one new kiro session, got {new_ids!r}"
+    minted = new_ids.pop()
 
     # --- 3. Reap the worker (kill the window), then resume the SAME id ---
     _tmux("kill-session", "-t", session)
