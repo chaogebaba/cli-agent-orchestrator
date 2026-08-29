@@ -454,6 +454,65 @@ class TestLegacyStatus:
         assert "Ledger: 0" not in result.output
 
 
+class TestStart:
+    """`cao session start` — F565 (#421): --yolo mirrors `cao launch --yolo`
+    by resolving allowed_tools to '*', the ONLY way to reproduce the
+    unrestricted supervisor seat through the canonical lifecycle verb."""
+
+    def _ok_post(self):
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {
+            "session": {"name": "cao-test"},
+            "supervisor_terminal": {"name": "cao-test-sup"},
+        }
+        return resp
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_yolo_forwards_wildcard_allowed_tools(self, mock_post, runner):
+        mock_post.return_value = self._ok_post()
+
+        result = runner.invoke(
+            session,
+            ["start", "cao-test", "--agents", "chao_supervisor", "--yolo"],
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["params"]["allowed_tools"] == "*"
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_without_yolo_omits_allowed_tools(self, mock_post, runner):
+        mock_post.return_value = self._ok_post()
+
+        result = runner.invoke(
+            session,
+            ["start", "cao-test", "--agents", "chao_supervisor"],
+        )
+
+        assert result.exit_code == 0
+        assert "allowed_tools" not in mock_post.call_args.kwargs["params"]
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_tools_flag_still_forwarded_verbatim(self, mock_post, runner):
+        mock_post.return_value = self._ok_post()
+
+        result = runner.invoke(
+            session,
+            ["start", "cao-test", "--agents", "dev", "--tools", "@cao-mcp-server,fs_read"],
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["params"]["allowed_tools"] == "@cao-mcp-server,fs_read"
+
+    def test_yolo_and_tools_are_mutually_exclusive(self, runner):
+        result = runner.invoke(
+            session,
+            ["start", "cao-test", "--agents", "dev", "--yolo", "--tools", "@cao-mcp-server"],
+        )
+
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
+
 class TestSend:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
