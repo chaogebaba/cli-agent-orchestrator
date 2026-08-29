@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService
+from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService, _CaptureResult
 from cli_agent_orchestrator.services.question_state import QuestionStateService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
@@ -47,8 +47,23 @@ def _backend(event_inbox=False):
     return backend
 
 
-def _seed_pane(pane, terminal_id, monitor, published, *, fingerprints, now_start=1000.0):
-    """Drive `observe` N times with a controlled capture + published status."""
+def _seed_pane(
+    pane,
+    terminal_id,
+    monitor,
+    published,
+    *,
+    fingerprints,
+    now_start=1000.0,
+    busy_marker=None,
+    children_count=0,
+    marker_rows=(),
+):
+    """Drive `observe` N times with a controlled capture + published status.
+
+    F568: ``busy_marker``/``children_count``/``marker_rows`` seed the sampled
+    facts each capture carries (a constant across the driven samples).
+    """
     captured = iter(fingerprints)
 
     def fake_capture(_tid):
@@ -56,7 +71,15 @@ def _seed_pane(pane, terminal_id, monitor, published, *, fingerprints, now_start
             fp = next(captured)
         except StopIteration:
             fp = None
-        return (fp, "tail") if fp is not None else None
+        if fp is None:
+            return None
+        return _CaptureResult(
+            fingerprint=fp,
+            filtered_tail="tail",
+            busy_marker=busy_marker,
+            children_count=children_count,
+            marker_rows=marker_rows,
+        )
 
     with (
         patch.object(pane, "_capture", side_effect=fake_capture),
@@ -186,7 +209,7 @@ def test_ac22_hold_bound_expires_once_then_admits(_wire_singletons):
 
     def fake_capture(_tid):
         captured["fp"] += 1
-        return (str(captured["fp"]), "tail")  # churns every sample
+        return _CaptureResult(str(captured["fp"]), "tail", None, 0, ())  # churns every sample
 
     warns = []
     with (
@@ -216,7 +239,7 @@ def test_ac22_arm_c_processing_never_arms_bound(_wire_singletons):
 
     def fake_capture(_tid):
         captured["fp"] += 1
-        return (str(captured["fp"]), "tail")  # churns every sample
+        return _CaptureResult(str(captured["fp"]), "tail", None, 0, ())  # churns every sample
 
     warns = []
     with (
@@ -232,3 +255,154 @@ def test_ac22_arm_c_processing_never_arms_bound(_wire_singletons):
         state = pane._state["t1"]
         assert state.downgrade_since is None
         assert state.pane_hold_expired is False
+
+
+# ---- AC-F568-8 precedence matrix (D12d) ----------------------------------
+# For an ELIGIBLE churning sample (usable, unchanged_count < K, no question
+# marker, hold not expired), assert exact (status, fusion_reason) across
+# children_count × busy_marker × published.
+_IDLE = TerminalStatus.IDLE
+_PROC = TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize(
+    "children,marker,published,expect_status,expect_reason",
+    [
+        # children>0 × {None,False,True} × IDLE  ⇒ (IDLE, delegating)
+        (1, None, _IDLE, _IDLE, "pane_delta_delegating"),
+        (1, False, _IDLE, _IDLE, "pane_delta_delegating"),
+        (1, True, _IDLE, _IDLE, "pane_delta_delegating"),
+        # children>0 × any × PROCESSING          ⇒ (PROCESSING, delegating)
+        (2, None, _PROC, _PROC, "pane_delta_delegating"),
+        (2, False, _PROC, _PROC, "pane_delta_delegating"),
+        # children=0 × None × IDLE/PROCESSING     ⇒ (PROCESSING, pane_delta)
+        (0, None, _IDLE, _PROC, "pane_delta"),
+        (0, None, _PROC, _PROC, "pane_delta"),
+        # children=0 × False × IDLE               ⇒ (IDLE, vetoed)
+        (0, False, _IDLE, _IDLE, "pane_delta_vetoed"),
+        # children=0 × False × PROCESSING         ⇒ (PROCESSING, vetoed)
+        (0, False, _PROC, _PROC, "pane_delta_vetoed"),
+        # children=0 × True × IDLE/PROCESSING     ⇒ (PROCESSING, pane_delta)
+        (0, True, _IDLE, _PROC, "pane_delta"),
+        (0, True, _PROC, _PROC, "pane_delta"),
+    ],
+)
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_ac8_precedence_matrix(
+    mock_backend, _wire_singletons, children, marker, published, expect_status, expect_reason
+):
+    mock_backend.return_value = _backend()
+    pane, _question, _clock = _wire_singletons
+    sm = StatusMonitor()
+    sm._last_status["t1"] = published
+    # Two changing fingerprints => unchanged_count=1 < K=3 (eligible, churning).
+    _seed_pane(
+        pane,
+        "t1",
+        sm,
+        published,
+        fingerprints=["a", "b"],
+        busy_marker=marker,
+        children_count=children,
+    )
+    status, reason = sm.fuse_status("t1", published)
+    assert status is expect_status
+    assert reason == expect_reason
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_ac8_stable_pane_never_tagged_even_with_busy_marker_false(mock_backend, _wire_singletons):
+    """Frozen AC4 arm re-asserted with busy_marker=False: a stable pane
+    (unchanged_count >= K) falls through to rule 4 ⇒ (published, None)."""
+    mock_backend.return_value = _backend()
+    pane, _question, _clock = _wire_singletons
+    sm = StatusMonitor()
+    sm._last_status["t1"] = TerminalStatus.IDLE
+    _seed_pane(
+        pane,
+        "t1",
+        sm,
+        TerminalStatus.IDLE,
+        fingerprints=["s"] * 5,  # unchanged_count >> K
+        busy_marker=False,
+        children_count=0,
+    )
+    status, reason = sm.fuse_status("t1", TerminalStatus.IDLE)
+    assert status is TerminalStatus.IDLE
+    assert reason is None
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_ac8_expiry_only_when_no_veto(mock_backend, _wire_singletons):
+    """Hold expired × children=0 × {None,True} ⇒ (published, pane_delta_expired);
+    with busy_marker=False the clock was cleared so expiry cannot co-occur."""
+    mock_backend.return_value = _backend()
+    pane, _question, clock = _wire_singletons
+    sm = StatusMonitor()
+    sm._last_status["t1"] = TerminalStatus.COMPLETED
+
+    captured = {"fp": 0}
+
+    def fake_capture(_tid):
+        captured["fp"] += 1
+        # busy_marker None (no veto) so the hold clock arms and can expire.
+        return _CaptureResult(str(captured["fp"]), "tail", None, 0, ())
+
+    with (
+        patch.object(pane, "_capture", side_effect=fake_capture),
+        patch.object(sm, "get_published_status", return_value=TerminalStatus.COMPLETED),
+    ):
+        pane.observe("t1", monitor=sm)
+        clock.advance(301.0)
+        pane.observe("t1", monitor=sm)
+    status, reason = sm.fuse_status("t1", TerminalStatus.COMPLETED)
+    assert status is TerminalStatus.COMPLETED
+    assert reason == "pane_delta_expired"
+
+    # Now a False-marker sample: the clock is cleared, no expiry can appear.
+    captured2 = {"fp": 0}
+
+    def fake_capture_veto(_tid):
+        captured2["fp"] += 1
+        return _CaptureResult("v" + str(captured2["fp"]), "tail", False, 0, ())
+
+    with (
+        patch.object(pane, "_capture", side_effect=fake_capture_veto),
+        patch.object(sm, "get_published_status", return_value=TerminalStatus.COMPLETED),
+    ):
+        pane.observe("t2", monitor=sm)
+        clock.advance(301.0)
+        pane.observe("t2", monitor=sm)
+    sm._last_status["t2"] = TerminalStatus.COMPLETED
+    status2, reason2 = sm.fuse_status("t2", TerminalStatus.COMPLETED)
+    assert reason2 == "pane_delta_vetoed"
+    assert pane._state["t2"].pane_hold_expired is False
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_ac8_delegating_never_opens_hold_episode(mock_backend, _wire_singletons):
+    """children>0 admits with delegating and opens NO hold episode (D12b:
+    the bound never expires while children > 0 because nothing is withheld)."""
+    mock_backend.return_value = _backend()
+    pane, _question, clock = _wire_singletons
+    sm = StatusMonitor()
+    sm._last_status["t1"] = TerminalStatus.IDLE
+
+    captured = {"fp": 0}
+
+    def fake_capture(_tid):
+        captured["fp"] += 1
+        return _CaptureResult(str(captured["fp"]), "tail", None, 1, ())  # children=1, churns
+
+    with (
+        patch.object(pane, "_capture", side_effect=fake_capture),
+        patch.object(sm, "get_published_status", return_value=TerminalStatus.IDLE),
+    ):
+        for _ in range(100):
+            pane.observe("t1", monitor=sm)
+            clock.advance(5.0)  # >300s of simulated time
+    assert pane._state["t1"].downgrade_since is None
+    assert pane._state["t1"].pane_hold_expired is False
+    status, reason = sm.fuse_status("t1", TerminalStatus.IDLE)
+    assert status is TerminalStatus.IDLE
+    assert reason == "pane_delta_delegating"
