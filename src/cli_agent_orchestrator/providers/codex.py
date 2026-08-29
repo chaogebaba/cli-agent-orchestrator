@@ -2506,9 +2506,7 @@ class CodexProvider(BaseProvider):
                 # PROCESSING. The shared law resolves ``waiting`` before
                 # ``progress``/``completion``, so this WAITING signal wins and the
                 # auto-responder's D6 gates no longer veto the fire (F530 layer 2).
-                signals.append(
-                    ScreenSignal("waiting", "RESUME_CWD_CHOOSER_PATTERN", index)
-                )
+                signals.append(ScreenSignal("waiting", "RESUME_CWD_CHOOSER_PATTERN", index))
             if legacy_status == TerminalStatus.WAITING_USER_ANSWER and re.search(
                 WAITING_PROMPT_PATTERN, row, re.IGNORECASE
             ):

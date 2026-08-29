@@ -23,11 +23,13 @@ if not progress_rows and RESUME_CWD_CHOOSER_PATTERN.search(row):
 Codex renders a persistent `• Working (…s • esc to interrupt)` footer spinner on
 the SAME frame as the still-active chooser. That spinner makes `progress_rows`
 truthy, so the `not progress_rows` guard **suppressed the chooser's `waiting`
-signal entirely**. The frame then resolved to `PROCESSING` (progress wins). In
-`AutoResponder.on_screen`, the whitelist rule DID textually match, but a matched
-rule under a PROCESSING classification hits `_busy_veto(...)` → the fire is
+signal entirely**. With no `waiting` signal emitted, the frame resolved to a
+non-waiting class — empirically `COMPLETED` (the `• Ran 3 commands` and
+assistant-prefix rows emit `completion` signals, which win; `progress` does not).
+In `AutoResponder.on_screen`, the whitelist rule DID textually match, but a
+matched rule under a non-waiting classification hits `_busy_veto(...)` → the fire is
 vetoed and the responder falls through to the `unknown blocking dialog` push.
-Because the classification demotes on every subsequent eval too, appending a
+Because the classification stays non-waiting on every subsequent eval too, appending a
 fresh rule and letting the mtime hot-reload fire also never fires — the new rule
 is vetoed for the same reason. Hence "hot-reload no re-match."
 
@@ -44,8 +46,8 @@ CURRENT tree get_status_from_screen = TerminalStatus.WAITING_USER_ANSWER
 ```
 
 The `not progress_rows` guard is the reproduced defect: with a spinner present
-the waiting signal was never emitted, so the modal classified PROCESSING and the
-matched rule was busy-vetoed.
+the waiting signal was never emitted, so the modal classified to a non-waiting
+class (empirically COMPLETED) and the matched rule was busy-vetoed.
 
 ## 2. The fix
 
@@ -134,3 +136,75 @@ Worktree-only (`.cao/worktrees/1700084b`). No `~/` or `~/.claude` writes; the
 real `~/.aws/.../auto-answers/codex.yaml` was NOT read (out of containment) — the
 root-cause proof uses the two rules transcribed in the test file. No laptop full
 suite. Scratch under `/data/cao-scratch/1700084b/`.
+
+
+---
+
+## Round 2 — gate-fix addendum (terminal `6f21b8b4`)
+
+Gate report `/data/cao-scratch/f530-gate-report.md` returned **GATE-NO** (3
+BLOCKER / 1 SHOULD / 1 NIT), all mechanical. This round lands those amendments.
+The gate report was written against old main `7803421a`; the lane was merged
+onto **current** origin/main `7fb34602` per supervisor decision (`--no-ff`
+merge commit "merge F530 lane c1bacf86 onto main 7fb34602"), which surfaced
+pre-existing main breakage handled as a separate labelled commit (see below).
+
+### Fixes landed
+
+- **B1 / B2 (BLOCKER) — F530 commit.** The F530 fix added the `cao auto-answers
+  test` diagnostic leaf; the Click tree now has **102** leaves. Added
+  `CommandId::AutoAnswersTest` (parent `auto-answers`, leaf `test`), classified
+  **HIDE** (pure read-only diagnostic: sends no keys, mutates no state, no HTTP
+  route, no TUI integration), wired into `DISPLAY_ORDER`, `entry()`, the
+  `every_id()` identity match + array, the `route()` arm in `tui/src/server.rs`
+  (`=> None`), and bumped `COMMAND_COUNT` 101→102. Distribution literals updated
+  to 24 IN-APP / 18 HANDOFF / 60 HIDE = 102, distinct 102.
+  - Verify: `cargo test --bin cao-tui catalog` → 7 passed; `pytest
+    test/test_command_catalog_matches_click.py` → 4 passed.
+
+- **B3 (BLOCKER) — F530 commit.** Regenerated the stale receiver-state trace
+  manifest via `cao verify manifest --regen` (the +224-line `auto_responder.py`
+  addition shifted traced call-site line numbers). `hits` 36→40, one file
+  touched. `src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt`
+  regenerated; the test already asserted `== 40` on current main, so no test
+  edit was needed.
+  - Verify: `pytest -k trace_manifest_is_byte_exact` → 1 passed.
+
+- **S1 (SHOULD) — F530 commit.** Collapsed the F530-added
+  `signals.append(ScreenSignal("waiting", "RESUME_CWD_CHOOSER_PATTERN", index))`
+  in `providers/codex.py` to a single line (black line-length = 100 in this
+  repo; black now leaves the F530 hunk unchanged). Remaining `black --diff`
+  output on `codex.py` is pre-existing debt on untouched lines, out of scope
+  per the gate report.
+  - Verify: `black --diff` no longer touches the F530 hunk; `isort --check`
+    clean; `mypy --strict codex.py` = 1 error (pre-existing, line 1963,
+    documented in the round-1 gate appendix), net-new 0.
+
+- **N1 (NIT) — this report.** §1 amended: the spinner+chooser frame is demoted
+  to a **non-waiting class (empirically COMPLETED)**, not PROCESSING — the
+  `• Ran 3 commands` + assistant-prefix rows emit `completion` signals which
+  win; `progress` does not. The substance (no `waiting` signal → non-waiting
+  class → busy-veto) is unchanged.
+
+### Inherited main fix (SEPARATE commit, not F530 semantics)
+
+Merging onto current main `7fb34602` surfaced pre-existing breakage in the tui
+catalog area, orphaned from F530, that blocked the catalog tests from even
+compiling. Fixed in a separate commit ("inherited main fix: make cao-tui
+catalog tests compile+pass on 7fb34602") per supervisor decision on 1857:
+1. `server.rs` `route()` was non-exhaustive — `CommandId::ConfigPreflight`
+   (added to the enum on newer main) had no arm → E0004, `cao-tui` test binary
+   did not compile. Added `ConfigPreflight => None`.
+2. `catalog.rs` distribution literals were stale by one (asserted 24/18/58=100,
+   distinct 99, while the table already carried 101) → corrected to
+   24/18/59=101, distinct 101.
+3. `catalog.rs` `every_id()` array feeding `.map(identity)` was missing
+   `DoctorCheck`/`DoctorReadopt` (99 of 101) → added both.
+
+### Targeted test summary (this round, laptop, no full suite)
+- `cargo test --bin cao-tui catalog`: 7 passed.
+- `test/test_command_catalog_matches_click.py`: 4 passed.
+- `test/services/test_stage0_flip_machinery.py -k trace_manifest_is_byte_exact`: 1 passed.
+- codex + auto_responder + auto_answers targeted set: 541 passed, 3 skipped.
+- `isort --check` codex.py clean; `black` F530 hunk clean; `mypy --strict`
+  codex.py net-new 0.
