@@ -970,6 +970,21 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         marker_hooks = [{"type": "command", "command": marker_command, "timeout": 5}]
+        # F568 D12a: the children-ledger hook. Same env/credential shape as the
+        # F507 interaction-marker hook. Fired on the subagent dispatch edge
+        # (PreToolUse matcher Agent|Task) and the paired SubagentStop; the module
+        # itself classifies each event into a register/release edge, so the same
+        # command is reused for both blocks below.
+        ledger_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.children_ledger",
+            ]
+        )
+        ledger_hooks = [{"type": "command", "command": ledger_command, "timeout": 5}]
         settings = {
             "hooks": {
                 "SessionStart": [
@@ -991,11 +1006,19 @@ class ClaudeCodeProvider(BaseProvider):
                         "hooks": marker_hooks,
                     }
                 ],
+                # PreToolUse carries BOTH the F507 question-open matcher
+                # (AskUserQuestion) and the F568 children-ledger register matcher
+                # (Agent|Task) — separate blocks, distinct matchers, each routed
+                # to its own module.
                 "PreToolUse": [
                     {
                         "matcher": "AskUserQuestion",
                         "hooks": marker_hooks,
-                    }
+                    },
+                    {
+                        "matcher": "Agent|Task",
+                        "hooks": ledger_hooks,
+                    },
                 ],
                 # CLEAR edges (D7):
                 #   PostToolUse / PostToolUseFailure matcher AskUserQuestion
@@ -1015,6 +1038,13 @@ class ClaudeCodeProvider(BaseProvider):
                 "Stop": [
                     {
                         "hooks": marker_hooks,
+                    }
+                ],
+                # F568 D12a release edge: the subagent's Stop (converted to
+                # SubagentStop at runtime) releases its ledger entry.
+                "SubagentStop": [
+                    {
+                        "hooks": ledger_hooks,
                     }
                 ],
             }
