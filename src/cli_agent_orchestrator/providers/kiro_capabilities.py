@@ -416,8 +416,6 @@ def build_kiro_command(
         command = ["kiro-cli", "--v3", "chat", "--trust-all-tools"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
-        if legacy_ui:
-            command.append("--legacy-ui")
         if yolo:
             command.append("--trust-all-tools")
     if resume_session_id:
@@ -431,7 +429,14 @@ def build_kiro_command(
 def requested_kiro_capabilities(
     engine: KiroEngine, *, model: Optional[str], yolo: bool
 ) -> set[str]:
-    """Return every wrapper feature used by the launch and fallback lifecycle."""
+    """Return every wrapper feature used by the launch lifecycle.
+
+    ``ui`` (``--legacy-ui``) is deliberately absent: there is no longer a
+    legacy-UI retry to verify, because the flag is incompatible with
+    ``--agent-engine=v2`` and its bare form drops the wrapper to the v1 engine,
+    which serves no MCP tools. Requiring it would also reject wrappers that are
+    otherwise fully usable. See ``build_kiro_command``.
+    """
     requested = {"profile"}
     if model:
         requested.add("model")

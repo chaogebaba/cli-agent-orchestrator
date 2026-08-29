@@ -11,6 +11,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     _flags_from_help,
     build_kiro_command,
     probe_kiro_capabilities,
+    requested_kiro_capabilities,
 )
 
 _HELP = (
@@ -351,14 +352,11 @@ def test_probe_reports_distinct_execution_failures(runner, kind):
 
 
 def test_builds_explicit_v2_and_deterministic_kas_commands():
-    assert build_kiro_command(
-        KiroEngine.V2, "developer", model="fixture-model", yolo=True, legacy_ui=True
-    ) == [
+    assert build_kiro_command(KiroEngine.V2, "developer", model="fixture-model", yolo=True) == [
         "kiro-cli",
         "chat",
         "--agent-engine",
         "v2",
-        "--legacy-ui",
         "--trust-all-tools",
         "--model",
         "fixture-model",

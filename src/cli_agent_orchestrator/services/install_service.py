@@ -1,5 +1,6 @@
 """Service helpers for installing agent profiles."""
 
+import errno
 import logging
 import os
 import re
@@ -44,6 +45,10 @@ from cli_agent_orchestrator.utils.opencode_config import (
 )
 from cli_agent_orchestrator.utils.opencode_permissions import (
     cao_tools_to_opencode_permission,
+)
+from cli_agent_orchestrator.utils.path_validation import (
+    flatten_path_separators,
+    validate_path_component,
 )
 from cli_agent_orchestrator.utils.resolver_probe import (
     resolver_probe_skipped,
@@ -272,6 +277,23 @@ def _write_context_file(agent_name: str, raw_content: str) -> Path:
     for a legacy (non-composition) profile that helper returns ``raw_content``
     unchanged, so the legacy context file is byte-identical. Dirs resolve at
     CALL time (F549 #405) so a test/caller pinning CAO_HOME cannot write real.
+
+    SECURITY (GHSA-6m35-gcf5-xm75, upstream #695): the context copy's filename
+    derives from ``agent_name``, which is NOT covered by ``_PROFILE_NAME_RE``
+    (that regex validates the install *source handle*, not the resolved name)
+    and a profile can be installed straight from a URL, so the field is
+    attacker-controlled. Without a guard, a name like ``../../foo`` or an
+    absolute path steers this write outside the context dir and can overwrite a
+    trusted ``.md`` instruction file. Three layers, all inlined in this function
+    (barrier placement — CodeQL's py/path-injection dataflow only recognises a
+    barrier that guards, in the same function as the sink, the very variable that
+    reaches it):
+
+    1. ``validate_path_component`` -- rejects empty, ``.``/``..``, NUL, every
+       path separator, and anything outside ``[A-Za-z0-9._-]``.
+    2. Lexical containment under the realpath of the base directory.
+    3. ``O_NOFOLLOW`` at the open, so the kernel refuses to write *through* a
+       symlink at the final component.
     """
     from cli_agent_orchestrator.constants import agent_context_dir
     from cli_agent_orchestrator.utils.agent_profiles import compose_agent_profile_source
@@ -279,8 +301,37 @@ def _write_context_file(agent_name: str, raw_content: str) -> Path:
     content = compose_agent_profile_source(raw_content, agent_name)
     context_root = agent_context_dir()
     context_root.mkdir(parents=True, exist_ok=True)
-    context_file = context_root / f"{agent_name}.md"
-    context_file.write_text(content, encoding="utf-8")
+    safe_name = validate_path_component(agent_name, description="profile name")
+    # Resolve only the BASE (so a symlinked context root is handled) and keep the
+    # final component UNRESOLVED. Resolving the whole candidate would follow a
+    # symlink planted at the target and silently write to wherever it resolves;
+    # leaving the final component lexical means such a symlink is refused by
+    # O_NOFOLLOW below.
+    base = os.path.realpath(context_root)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError(
+            f"Refusing to write context copy: profile name {agent_name!r} resolves "
+            f"to a path outside the agent context directory ({candidate!r})."
+        )
+    context_file = Path(candidate)
+    # O_NOFOLLOW so the kernel itself refuses to write THROUGH a symlink at the
+    # final component. O_TRUNC (not O_EXCL) so a normal reinstall still
+    # overwrites the profile's own regular-file copy. Mode 0o600. O_NOFOLLOW is
+    # POSIX-only (getattr -> 0 on Windows); the validation + containment still
+    # hold there, only the write-time symlink/race guard is POSIX-only.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(context_file, flags, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+            raise ValueError(
+                f"Refusing to write context copy: {context_file} exists and is not a "
+                "regular file (symlink, directory, or device). Remove it and reinstall."
+            ) from exc
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
     return context_file
 
 
@@ -471,7 +522,12 @@ def install_agent(
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
-        safe_filename = profile.name.replace("/", "__")
+        # Defence in depth. The resolved profile name is attacker-controlled, but
+        # _write_context_file above has already REJECTED any name carrying a path
+        # separator, so nothing separator-bearing reaches these provider sinks in
+        # the normal flow. The flatten stays so each sink is independently safe if
+        # the order ever changes or a new caller appears.
+        safe_filename = flatten_path_separators(profile.name)
 
         if provider == ProviderType.KIRO_CLI.value:
             # F107 A8: v3 honors v2 JSON agent configs by backward compat.
