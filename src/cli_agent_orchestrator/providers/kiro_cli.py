@@ -516,7 +516,7 @@ class KiroCliProvider(BaseProvider):
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
         #
-        # UI mode selection:
+        # UI mode selection (OUR behaviour, preserved over upstream #691):
         # - Yolo (--trust-all-tools): kiro-cli 2.0.1 TUI blocks on an
         #   interactive "Yes, I accept" consent dialog before the chat is
         #   ready; only --legacy-ui/--classic/--no-interactive bypass it.

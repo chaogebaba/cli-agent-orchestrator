@@ -123,7 +123,7 @@ async def test_deferred_assign_runs_real_send_input_commit_and_keeps_watchdog_pa
         patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
         patch.object(terminal_service, "get_backend", return_value=backend),
         patch.object(terminal_service, "preserve_draft_before_send", return_value=None),
-        patch.object(terminal_service, "inject_memory_context", side_effect=lambda m, *_: m),
+        patch.object(terminal_service, "inject_memory_context", side_effect=lambda m, *_a, **_k: m),
         patch.object(terminal_service, "_prepare_fork_message", AsyncMock(return_value="task")),
         patch.object(terminal_service, "_prepare_provider_runtime_identity", return_value=None),
         patch.object(terminal_service, "_confirm_worker_started_or_resubmit", AsyncMock(return_value=True)),

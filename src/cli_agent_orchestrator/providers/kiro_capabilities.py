@@ -403,6 +403,12 @@ def build_kiro_command(
 ) -> list[str]:
     """Build a deterministic Kiro command without executing it.
 
+    ``legacy_ui`` (fork ours-side, retained through the upstream #691 merge):
+    on the v2 engine, emit ``--legacy-ui`` right after ``--agent-engine v2`` and
+    before ``--trust-all-tools``. This launch shape is live-proven for CAO's
+    kiro_capabilities engine handling (workers spawn with full MCP tools on it),
+    so upstream #691's blanket removal is deliberately not adopted here.
+
     ``resume_session_id`` (F560): when set, append ``--resume-id <id>`` so the
     launched chat continues an existing conversation instead of starting fresh.
     Kiro CLI accepts ``--resume-id`` on both the KAS (``--v3``) and v2 engines
@@ -431,7 +437,14 @@ def build_kiro_command(
 def requested_kiro_capabilities(
     engine: KiroEngine, *, model: Optional[str], yolo: bool
 ) -> set[str]:
-    """Return every wrapper feature used by the launch and fallback lifecycle."""
+    """Return every wrapper feature used by the launch lifecycle.
+
+    ``ui`` (``--legacy-ui``) is deliberately absent: there is no longer a
+    legacy-UI retry to verify, because the flag is incompatible with
+    ``--agent-engine=v2`` and its bare form drops the wrapper to the v1 engine,
+    which serves no MCP tools. Requiring it would also reject wrappers that are
+    otherwise fully usable. See ``build_kiro_command``.
+    """
     requested = {"profile"}
     if model:
         requested.add("model")

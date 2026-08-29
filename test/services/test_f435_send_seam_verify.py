@@ -107,7 +107,7 @@ def _wire_send_input(monkeypatch, events, provider):
     )
     monkeypatch.setattr(terminal_service, "preserve_draft_before_send", lambda *_a, **_k: None)
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _tid: None)
-    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda msg, _tid: msg)
+    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda msg, _tid, *_a, **_k: msg)
     monkeypatch.setattr(terminal_service, "_append_message_contract", lambda msg, *_a, **_k: msg)
     return backend
 

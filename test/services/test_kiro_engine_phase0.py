@@ -517,7 +517,7 @@ def test_send_input_allows_persisted_kas_to_reach_provider():
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.status_monitor") as status_monitor,
-        patch(f"{_MODULE}.inject_memory_context", side_effect=lambda m, _t: m),
+        patch(f"{_MODULE}.inject_memory_context", side_effect=lambda m, _t, *_a, **_k: m),
         patch(f"{_MODULE}.preserve_draft_before_send", return_value=None),
         patch(f"{_MODULE}._append_message_contract", side_effect=lambda m, *_a, **_k: m),
     ):

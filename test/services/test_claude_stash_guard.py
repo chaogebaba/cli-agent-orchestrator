@@ -193,7 +193,9 @@ def test_send_input_default_does_not_defer_on_dialog(monkeypatch, tmp_path):
     monkeypatch.setattr(
         terminal_service.provider_manager, "get_provider", lambda _: provider
     )
-    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda message, _: message)
+    monkeypatch.setattr(
+        terminal_service, "inject_memory_context", lambda message, _, *_a, **_k: message
+    )
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _: None)
     monkeypatch.setattr(

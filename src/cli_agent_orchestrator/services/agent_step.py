@@ -26,14 +26,18 @@ import logging
 import os
 import time
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.services import receiver_state_view, terminal_service
+from cli_agent_orchestrator.services import (
+    frozen_run_memory,
+    receiver_state_view,
+    terminal_service,
+)
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
@@ -146,6 +150,7 @@ async def _teardown_terminal(terminal_id: str, registry: Optional[PluginRegistry
         await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
     except Exception as exc:  # noqa: BLE001 - teardown is best-effort
         logger.warning("run_agent_step: failed to tear down terminal %s: %s", terminal_id, exc)
+
 
 # Delivery verification on the synchronous step path (#562). Readiness cannot
 # prove the TUI will accept input — an OpenCode splash frame carries the same
@@ -625,17 +630,39 @@ async def run_agent_step(
     cancel_signal = _resolve_cancel_signal(cancel_signal, cancel_event)
     cleanup = False
     extraction_succeeded = False
+
+    # issue #583 Bolt 2, ``memory-resolve-once``: resolve this run's FROZEN memory block (if any)
+    # exactly once, HERE, so a replayed run sees the memory the ORIGINAL run recorded rather than the
+    # store's state today (FR-9). ``None`` means no workflow manifest to honour (historical live-memory
+    # path); ``""`` means an existing manifest's memory fill could not persist and MUST be passed
+    # through explicitly. Threaded into OUR send_input call below alongside ``orchestration_type``.
+    frozen_memory = await asyncio.to_thread(
+        frozen_run_memory.frozen_memory_for,
+        (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+        terminal_id,
+        prompt,
+    )
     try:
         if cancel_signal is not None and cancel_signal.is_set():
             cleanup = True
             raise StepCancelledError(terminal_id=terminal_id)
 
         try:
+            # issue #583 Bolt 2 (fork contract): the frozen-memory workflow path and
+            # the live orchestration path are mutually exclusive at the send_input
+            # seam. A workflow step whose memory was resolved once (frozen_memory is
+            # not None, incl. the "" suppress-live sentinel) delivers with
+            # ``frozen_memory`` alone; a non-workflow step delivers with
+            # ``orchestration_type=HANDOFF`` alone, byte-identically to before #583.
+            if frozen_memory is not None:
+                send_kwargs: dict[str, Any] = {"frozen_memory": frozen_memory}
+            else:
+                send_kwargs = {"orchestration_type": OrchestrationType.HANDOFF}
             await asyncio.to_thread(
                 terminal_service.send_input,
                 terminal_id,
                 prompt,
-                orchestration_type=OrchestrationType.HANDOFF,
+                **send_kwargs,
             )
         except TerminalInputBlockedError as exc:
             if cancel_signal is not None and cancel_signal.is_set():

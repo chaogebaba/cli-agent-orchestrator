@@ -690,66 +690,16 @@ fn route(id: CommandId) -> Option<Route> {
         // unbounded for this client's purposes.
         CommandId::WorkflowResume => None,
         CommandId::WorkflowRun => None,
-        // HIDE: fork-only read verb; no TUI roster pane (wp-agents-status)
-        CommandId::AgentsStatus => None,
-        // HIDE: pure read-only auto-responder diagnostic; no HTTP route (F530)
-        CommandId::AutoAnswersTest => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::BarrierCancel => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::BarrierStatus => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::BaseRegister => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::ConfigReconcile => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::Fold => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::LedgerCheck => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::MailboxDelete => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::MailboxList => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::MessagesAck => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::MessagesList => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::MessagesTrace => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::Redeploy => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SandboxDown => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SandboxStatus => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SandboxUp => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SeamReset => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SeamRollback => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SeamStatus => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SessionClose => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SessionManifest => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SessionRecover => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::SessionStart => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::Suite => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::VerifyDeploy => None,
-        // HIDE: offline operator diagnostic, run from a shell (F94R)
-        CommandId::VerifyIdentity => None,
-        // HIDE: fork-only / ops; unclassified default
-        CommandId::VerifyManifest => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifyScope => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifySuiteLog => None,
+        // `cao workflow approve` is classified HIDE, so the TUI never routes it — and this arm
+        // exists only because the match is exhaustive on purpose. It is deliberately `None` rather
+        // than a real binding: routing a command the TUI does not offer would build a reachable
+        // path to a human authorisation act that nothing in the interface has reviewed.
+        // (#583 Bolt 2, approval-operation)
+        CommandId::WorkflowApprove => None,
     }
 }
 

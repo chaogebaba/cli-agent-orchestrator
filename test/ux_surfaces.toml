@@ -56,7 +56,7 @@ obligation = "ECS"
 [[surface]]
 id = "S08"
 name = "workflow_* / workflow_return"
-mcp_tools = ["workflow_run", "workflow_start", "workflow_status", "workflow_wait", "workflow_result", "workflow_events", "workflow_cancel", "workflow_return", "workflow_resume", "workflow_list"]
+mcp_tools = ["workflow_run", "workflow_start", "workflow_status", "workflow_wait", "workflow_result", "workflow_events", "workflow_cancel", "workflow_return", "workflow_resume", "workflow_list", "workflow_plan_approval"]
 invariants = ["UX-4"]
 obligation = "ECS"
 
