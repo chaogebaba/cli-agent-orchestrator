@@ -31,6 +31,126 @@ logger = logging.getLogger(__name__)
 # F203 D17: Health-warning dedup state — (terminal_id, inbox_row_id, diagnosis) → last emit time
 _health_warning_dedup: dict[tuple[str, int, str], "datetime"] = {}
 
+
+# ---------------------------------------------------------------------------
+# F547 #403: rung1 re-ring discipline (backoff + hold + socket_delivered)
+# ---------------------------------------------------------------------------
+
+# Default escalating backoff (seconds) applied AFTER a delivered rung1, indexed
+# by how many times the row has already been socket-delivered: 1st delivered →
+# 60s until re-ring, 2nd → 300s (5m), 3rd+ → 1800s (30m, cap). Overridable via
+# config key `delivery.rung1_backoff_s`.
+_RUNG1_BACKOFF_DEFAULT = [60.0, 300.0, 1800.0]
+
+# Cheapest pane-tail detectors for "the seat cannot run tools right now" states
+# the status monitor does not model as a distinct TerminalStatus (compaction,
+# API retry). Overridable via `delivery.hold_pane_markers`.
+_HOLD_PANE_MARKERS_DEFAULT = ["Compacting", "Retrying"]
+
+
+def _rung1_backoff_seconds(delivered_count: int) -> float:
+    """F547 #403 point 2: escalating re-ring backoff after a delivered rung1.
+
+    delivered_count is how many times this row has ALREADY been socket-delivered
+    (>=1 once the current ring lands). Steps through the configured ladder and
+    holds at the last (cap) entry.
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    ladder = ConfigService.get("delivery.rung1_backoff_s", default=_RUNG1_BACKOFF_DEFAULT)
+    try:
+        steps = [float(x) for x in ladder] or _RUNG1_BACKOFF_DEFAULT
+    except (TypeError, ValueError):
+        steps = _RUNG1_BACKOFF_DEFAULT
+    idx = max(0, delivered_count - 1)
+    if idx >= len(steps):
+        idx = len(steps) - 1
+    return steps[idx]
+
+
+def _socket_delivered_count(db: Session, row_id: int) -> int:
+    """F547 #403: how many times this row has been socket-delivered (rung1 success).
+
+    Counts the f459.socket_delivered trace rows — the same marker point 4
+    records on rung1 success and doorbell_service.is_socket_delivered reads.
+    """
+    try:
+        return (
+            db.query(InboxMessageTraceEventModel.id)
+            .filter(
+                InboxMessageTraceEventModel.message_id == row_id,
+                InboxMessageTraceEventModel.kind == "f459.socket_delivered",
+            )
+            .count()
+        )
+    except Exception:
+        return 0
+
+
+def _receiver_hold_reason(terminal_id: str) -> str | None:
+    """F547 #403 point 3: is the receiver seat blocked on the human / unable to run tools?
+
+    Returns a short reason string when the seat must NOT be rung (obligation is
+    kept, ring is skipped), else None. Consults the status monitor for
+    WAITING_USER_ANSWER, then falls back to the cheapest pane-tail markers for
+    compaction / API-retry states the monitor does not model distinctly.
+    """
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+    from cli_agent_orchestrator.services.config_service import ConfigService
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    try:
+        status = status_monitor.get_status(terminal_id)
+    except Exception:
+        status = None
+    if status == TerminalStatus.WAITING_USER_ANSWER:
+        return "waiting_user_answer"
+
+    markers = ConfigService.get("delivery.hold_pane_markers", default=_HOLD_PANE_MARKERS_DEFAULT)
+    try:
+        tail = status_monitor.get_buffer(terminal_id) or ""
+    except Exception:
+        tail = ""
+    # Only the very tail matters — an old 'Compacting' in scrollback is not a hold.
+    tail = tail[-2000:]
+    for marker in markers:
+        if marker and marker in tail:
+            return f"pane_marker:{marker.lower()}"
+    return None
+
+
+def _pending_row_ids_for_mailbox(db: Session, mailbox_id: str) -> list[int]:
+    """F547 #403 point 3: all still-pending inbox row ids for a mailbox, oldest first.
+
+    Used to build the ONE consolidated re-ring when a held seat unblocks.
+    """
+    rows = (
+        db.query(InboxModel.id)
+        .filter(
+            InboxModel.logical_receiver_id == mailbox_id,
+            InboxModel.status.in_(["pending", "held"]),
+        )
+        .order_by(InboxModel.id.asc())
+        .all()
+    )
+    return [int(r.id) for r in rows]
+
+
+def _rung1_repush_body(attempt: int, unacked_age_s: float, pending_ids: list[int]) -> str:
+    """F547 #403 point 2/3: re-ring body carrying attempt count + unacked age.
+
+    NEVER byte-identical to the legacy first-ring text (which build_wake_payload
+    emits when message_body is None). `attempt` is the re-push number (1-based
+    for the first re-ring). A consolidated post-hold ring lists all pending ids.
+    """
+    mins = int(unacked_age_s // 60)
+    ids = ",".join(str(i) for i in pending_ids) if pending_ids else "?"
+    return (
+        f"[cao] re-push {attempt}, unacked {mins}m. "
+        f"Pending callback message id(s): {ids}. Run any command to surface and ack."
+    )
+
+
 # ---------------------------------------------------------------------------
 # D2: Delivery target resolution
 # ---------------------------------------------------------------------------
@@ -344,11 +464,19 @@ def attempt_rung1(
     inbox_row_id: int,
     message_count: int = 1,
     oldest_age_s: float = 0.0,
+    *,
+    message_body: str | None = None,
 ) -> LadderResult:
     """Rung 1: native CC socket ring + cc_inbox_path write. Best-effort.
 
     At S0 (shadow), this is purely additive — old transports still run.
     F203 D9: no_registry_records is a counted refusal → ejection after N.
+
+    F547 #403: message_body, when provided, carries the re-push text (attempt
+    count + unacked age) through to the native bridge message so a re-ring is
+    never byte-identical to the first ring. On a delivered ring the row is
+    marked f459.socket_delivered (point 4) so re-firing is governed by the
+    escalating backoff, not the 5s tick.
     """
     import os
 
@@ -424,8 +552,23 @@ def attempt_rung1(
     try:
         from cli_agent_orchestrator.services.doorbell_service import _attempt_native_ring
 
-        result = _attempt_native_ring(target.terminal_id, inbox_row_id)
+        result = _attempt_native_ring(
+            target.terminal_id, inbox_row_id, message_body=message_body
+        )
         if result == "rang":
+            # F547 #403 point 4: record socket_delivered on rung1 success so the
+            # delivered-count / backoff machinery sees this ring and _is_row_still
+            # _pending is no longer the only thing gating a 5s re-fire.
+            try:
+                from cli_agent_orchestrator.services.doorbell_service import (
+                    _mark_socket_delivered,
+                )
+
+                _mark_socket_delivered(inbox_row_id)
+            except Exception:
+                logger.debug(
+                    "f547 mark_socket_delivered failed for row %s", inbox_row_id, exc_info=True
+                )
             return LadderResult(
                 delivered=True,
                 phase="transport_attempt",
@@ -1011,15 +1154,44 @@ def _drive_one_obligation(
     # Calculate age for nudge text
     msg_age_s = age_s
 
+    from datetime import timedelta
+
+    # F547 #403 point 3: HOLD before any rung1 ring while the seat is blocked on
+    # the human or cannot run tools (WAITING_USER_ANSWER / compacting / API
+    # retry). Skip the ring, KEEP the obligation, re-check next tick. On the
+    # first unblocked tick we ring ONCE with a consolidated list of all pending
+    # row ids for this mailbox.
+    hold_reason = _receiver_hold_reason(target.terminal_id)
+    if hold_reason is not None:
+        obl.next_attempt_at = now + timedelta(seconds=tick_s)
+        obl.attempts += 1
+        emit_trace_or_collapse(obl.inbox_row_id, "transport_attempt", "defer", hold_reason, db)
+        return
+
+    # F547 #403 point 2: after a delivered rung1 we re-ring only on an escalating
+    # backoff, never every tick. delivered_count is how many times this row has
+    # already been socket-delivered; the FIRST ring (count 0) uses the legacy
+    # text, every re-ring carries "re-push N, unacked Xm" + the pending id list.
+    delivered_count = _socket_delivered_count(db, obl.inbox_row_id)
+    repush_body: str | None = None
+    if delivered_count > 0:
+        pending_ids = _pending_row_ids_for_mailbox(db, obl.mailbox_id)
+        repush_body = _rung1_repush_body(delivered_count, msg_age_s, pending_ids)
+
     # Attempt rung 1 (optimization — only in primary or shadow modes)
-    r1 = attempt_rung1(target, obl.inbox_row_id, oldest_age_s=msg_age_s)
+    r1 = attempt_rung1(
+        target, obl.inbox_row_id, oldest_age_s=msg_age_s, message_body=repush_body
+    )
     emit_trace_or_collapse(obl.inbox_row_id, r1.phase, r1.decision, r1.reason, db)
 
     if r1.delivered:
-        # Rung 1 succeeded — obligation stays OPEN until ACKED by consumption (D10)
-        from datetime import timedelta
-
-        obl.next_attempt_at = now + timedelta(seconds=tick_s)
+        # F547 #403 point 2: escalating re-ring backoff (60s → 5m → 30m, cap)
+        # instead of re-arming at now+tick_s. attempt_rung1 recorded the
+        # socket_delivered marker for this ring, so re-read the count to place
+        # this delivery on the ladder.
+        new_count = _socket_delivered_count(db, obl.inbox_row_id)
+        backoff_s = _rung1_backoff_seconds(new_count)
+        obl.next_attempt_at = now + timedelta(seconds=backoff_s)
         obl.attempts += 1
         emit_trace_or_collapse(obl.inbox_row_id, "surface", "proceed", None, db)
         return

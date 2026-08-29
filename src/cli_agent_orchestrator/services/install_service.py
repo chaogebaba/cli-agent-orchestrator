@@ -29,7 +29,6 @@ from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     PROFILE_COMPOSITION_KEYS,
     _read_agent_profile_source,
-    parse_agent_profile_text,
     profile_declares_composition,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
@@ -265,10 +264,23 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
 
 
 def _write_context_file(agent_name: str, raw_content: str) -> Path:
-    """Write the unresolved profile source to the shared context directory."""
-    AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    context_file = AGENT_CONTEXT_DIR / f"{agent_name}.md"
-    context_file.write_text(raw_content, encoding="utf-8")
+    """Write the (composition-aware) profile source to the shared context dir.
+
+    F497 Ruling 1: for a composition stub the raw source has an EMPTY body, so
+    kiro's context-file persona would be empty. Compose the UNRESOLVED source
+    (``${VAR}`` preserved) via ``compose_agent_profile_source`` before writing;
+    for a legacy (non-composition) profile that helper returns ``raw_content``
+    unchanged, so the legacy context file is byte-identical. Dirs resolve at
+    CALL time (F549 #405) so a test/caller pinning CAO_HOME cannot write real.
+    """
+    from cli_agent_orchestrator.constants import agent_context_dir
+    from cli_agent_orchestrator.utils.agent_profiles import compose_agent_profile_source
+
+    content = compose_agent_profile_source(raw_content, agent_name)
+    context_root = agent_context_dir()
+    context_root.mkdir(parents=True, exist_ok=True)
+    context_file = context_root / f"{agent_name}.md"
+    context_file.write_text(content, encoding="utf-8")
     return context_file
 
 
@@ -380,7 +392,45 @@ def install_agent(
                     ),
                 )
 
-        profile = parse_agent_profile_text(resolved_content, agent_name)
+        # F497 D2/Ruling 1: compose through the resolver for the composed
+        # AgentProfile fields (description/tools/mcpServers/model/...). For a
+        # legacy (non-composition) profile this is byte-identical to the direct
+        # parse (AC1). The persona BODY for kiro's context file is composed
+        # separately (unresolved) inside _write_context_file.
+        from cli_agent_orchestrator.utils.agent_profiles import resolve_agent_profile
+
+        # F497 AC14 + AC17: when installing a composition-bearing profile, lint
+        # the position corpus it composes from — the required-clause floor
+        # (AC14) and the persona byte budgets (AC17) — and REFUSE the install on
+        # a violation (fail-closed). The lints run against the live positions
+        # store the resolver composes from; a legacy profile (no composition
+        # key) skips them entirely, so the legacy install path is untouched.
+        if profile_declares_composition(_install_meta):
+            from cli_agent_orchestrator.constants import (
+                overlays_store_dir,
+                positions_store_dir,
+            )
+            from cli_agent_orchestrator.utils.clause_lint import (
+                ClauseLintError,
+                lint_budgets,
+                lint_positions,
+            )
+
+            _positions_dir = positions_store_dir()
+            if (_positions_dir / "_clauses.toml").is_file():
+                try:
+                    lint_positions(_positions_dir)
+                    lint_budgets(_positions_dir, overlays_store_dir())
+                except ClauseLintError as exc:
+                    return InstallResult(
+                        success=False,
+                        message=(
+                            f"Agent profile '{agent_name}' declares composition, "
+                            f"but the position corpus fails the F497 lint: {exc}"
+                        ),
+                    )
+
+        profile = resolve_agent_profile(resolved_content, agent_name)
 
         # No explicit provider — honour the profile's frontmatter ``provider:``
         # key, mirroring resolve_provider() on the launch/handoff paths. Bogus
@@ -463,7 +513,10 @@ def install_agent(
                     ]
                 }
 
-            KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            from cli_agent_orchestrator.constants import kiro_agents_dir
+
+            _kiro_dir = kiro_agents_dir()
+            _kiro_dir.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
             kiro_resources = [
@@ -491,7 +544,7 @@ def install_agent(
                 model=profile.model,
                 permissions=kiro_permissions,
             )
-            agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
+            agent_file = _kiro_dir / f"{safe_filename}.json"
             agent_file.write_text(
                 kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
                 encoding="utf-8",

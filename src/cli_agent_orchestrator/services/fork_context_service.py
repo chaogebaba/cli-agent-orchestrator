@@ -403,14 +403,57 @@ def _require_forkable(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def pane_pid(session: str, window: str) -> int:
+def first_pane(session: str, window: str) -> tuple[str, int]:
+    """Return the window's FIRST pane as ``(pane_id, pane_pid)``.
+
+    F545 (#401): "first pane" == the lowest ``#{pane_index}``, matching
+    ``clients/tmux.py`` which uses ``window.panes[0]`` (index-ordered) everywhere
+    else. A bare ``display-message -t <session>:<window> '#{pane_pid}'`` resolves
+    the window's ACTIVE pane instead — so when the CAO seat window is split and
+    the operator focuses a second pane (e.g. a consultant Claude that inherited
+    CAO_TERMINAL_ID via tmux env), the old code walked the WRONG process tree.
+
+    ``list-panes`` emits panes in ascending ``pane_index`` order; we take the
+    first line rather than trusting the shell's default sort. The returned
+    ``pane_id`` (``%N``) lets callers cross-check a candidate against the seat
+    pane exactly, not merely the window.
+    """
     out = subprocess.run(
-        tmux_argv("display-message", "-p", "-t", f"{session}:{window}", "#{pane_pid}"),
+        tmux_argv(
+            "list-panes",
+            "-t",
+            f"{session}:{window}",
+            "-F",
+            "#{pane_index} #{pane_id} #{pane_pid}",
+        ),
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    return int(out.strip())
+    rows: list[tuple[int, str, int]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            rows.append((int(parts[0]), parts[1], int(parts[2])))
+        except ValueError:
+            continue
+    if not rows:
+        raise ValueError(f"no panes for {session}:{window}")
+    # Lowest pane_index wins — consistent with window.panes[0].
+    rows.sort(key=lambda r: r[0])
+    _, pane_id, pid = rows[0]
+    return pane_id, pid
+
+
+def pane_pid(session: str, window: str) -> int:
+    """Return the pid of the window's FIRST pane (see ``first_pane``).
+
+    F545 (#401): resolves the first pane (lowest ``pane_index``), NOT the active
+    pane, so a split seat window never rings/binds the wrong process tree.
+    """
+    return first_pane(session, window)[1]
 
 
 # F124 S3: module-level proc root — tests monkeypatch this to a synthetic tree.

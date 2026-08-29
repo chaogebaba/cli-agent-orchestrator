@@ -89,6 +89,40 @@ class ClaudeAuthError(ProviderError):
     code = "E-CLAUDE-AUTH"
 
 
+class ProfileNotFoundError(ValueError):
+    """A CAO agent profile name was requested but no profile resolves for it.
+
+    F557 (#412): a CAO-launched claude_code terminal is ALWAYS driven by a CAO
+    agent profile. Historically, when ``load_agent_profile`` raised
+    ``FileNotFoundError`` (e.g. an empty/isolated ``CAO_HOME_DIR``), the provider
+    silently fell through to ``claude --agent <name>`` against Claude Code's
+    NATIVE agent store — which does not know CAO profile names — so the pane
+    landed on ``--agent '<name>' not found`` and dropped to a shell, and
+    ``cao launch`` only failed ~30s later on the init timeout. That silent
+    fallthrough cost real misdiagnosis time.
+
+    Raised from ``ClaudeCodeProvider.preflight_launch`` (BEFORE any resource is
+    allocated) so a missing profile fails LOUD at terminal create — no tmux
+    window, no database row, no ``claude`` subprocess — with a structured
+    ``E-PROFILE-NOT-FOUND`` code naming both the profile and the store directory
+    that was searched. Subclasses ``ValueError`` so the existing api/main.py
+    ladder never masks it as a 500; a dedicated 400 arm surfaces the code.
+    """
+
+    code = "E-PROFILE-NOT-FOUND"
+
+    def __init__(self, profile_name: str, store_dir: str) -> None:
+        self.profile_name = profile_name
+        self.store_dir = store_dir
+        self.detail = (
+            f"{self.code}: CAO agent profile '{profile_name}' not found "
+            f"(searched agent store: {store_dir}). A CAO-launched claude_code "
+            f"terminal must name a CAO agent profile; the name is never handed "
+            f"to Claude Code's native agent store."
+        )
+        super().__init__(self.detail)
+
+
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 CLAUDE_STASHED_CHIP_PATTERN = re.compile(r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE)
@@ -536,13 +570,45 @@ class ClaudeCodeProvider(BaseProvider):
         text = "\n".join(response_lines).strip()
         return text if text else None
 
+    @classmethod
+    async def preflight_launch(cls, *, agent_profile: str | None, model: str | None) -> None:
+        """Fail loud at terminal create when a requested CAO profile is missing.
+
+        F557 (#412): overrides the BaseProvider no-op. Runs in
+        ``terminal_service.create_terminal`` BEFORE any resource is allocated
+        (window, DB row, incarnation token, ``claude`` subprocess). When an
+        ``agent_profile`` name was requested but ``load_agent_profile`` cannot
+        resolve it (``FileNotFoundError`` — e.g. an empty/isolated
+        ``CAO_HOME_DIR``), raise ``ProfileNotFoundError`` so the create fails
+        with a structured ``E-PROFILE-NOT-FOUND`` 400 instead of falling through
+        to ``claude --agent <name>`` against Claude Code's native store.
+
+        Only ``FileNotFoundError`` (genuinely no such profile) is converted to
+        the loud error here. A profile that exists but fails to parse/validate
+        is left to raise from the authoritative load inside ``initialize`` /
+        ``_build_claude_command`` (``ProviderError``) — that was never the silent
+        path and keeping it there preserves the existing broken-profile contract.
+        """
+        if not agent_profile:
+            return None
+        from cli_agent_orchestrator.constants import local_agent_store_dir
+
+        try:
+            load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            raise ProfileNotFoundError(agent_profile, str(local_agent_store_dir()))
+        return None
+
     def _load_profile(self) -> Optional["AgentProfile"]:
         """Load this terminal's CAO agent profile from disk, if any.
 
         Returns None when no profile name was given or the named profile does
-        not exist (the "pass --agent <name> to the native store" path). Raises
-        ProviderError on a genuine load/parse failure so a broken profile is not
-        silently ignored.
+        not exist. F557 (#412): for a CAO-launched terminal, a missing profile is
+        caught earlier and loudly by ``preflight_launch`` (E-PROFILE-NOT-FOUND at
+        create time), so ``initialize`` never reaches the native-store fallthrough
+        with a None profile. This None return is retained for direct/legacy
+        callers. Raises ProviderError on a genuine load/parse failure so a broken
+        profile is not silently ignored.
 
         ``self._agent_profile`` is a profile *name string*, not an object.
         """
@@ -564,8 +630,15 @@ class ClaudeCodeProvider(BaseProvider):
         Three routing paths based on agent profile state:
         1. Profile with native_agent field -> pass --agent <native_agent> directly
            (thin wrapper: Claude Code handles all config)
-        2. No CAO profile found -> pass --agent <name> directly to Claude Code's
-           native agent store (~/.claude/agents/)
+        2. Requested profile name did not resolve to a CAO profile -> pass
+           --agent <name> to Claude Code's native store. F557 (#412): for a
+           CAO-launched terminal this branch is now UNREACHABLE — preflight_launch
+           raises E-PROFILE-NOT-FOUND at create time before this runs, so a
+           missing CAO profile fails loud instead of silently landing on Claude's
+           native store (which does not know CAO profile names). The branch is
+           retained only for direct/legacy callers that build a command without
+           going through create_terminal's preflight (and unit tests exercising
+           the raw builder); it is no longer a supported launch path.
         3. Full CAO profile -> decompose into CLI flags (model, prompt, MCP, etc.)
 
         Args:
@@ -620,9 +693,13 @@ class ClaudeCodeProvider(BaseProvider):
             command_parts.extend(["--agent", native])
             self._resolved_model = None  # F127: honest unknown for native_agent path
         elif self._agent_profile is not None and profile is None:
-            # No CAO profile exists — pass agent name directly to Claude Code's
-            # native agent store (~/.claude/agents/). Same thin-orchestrator
-            # pattern as the Kiro CLI provider.
+            # F557 (#412): UNREACHABLE for a CAO-launched terminal — preflight_launch
+            # raised E-PROFILE-NOT-FOUND at create time before we got here. Retained
+            # only for direct/legacy callers of the raw builder (and unit tests) that
+            # bypass create_terminal's preflight. Historically this passed the agent
+            # name straight to Claude Code's native store (~/.claude/agents/), which
+            # is what silently broke `cao launch --agents <name>` on an empty
+            # CAO_HOME_DIR. It is no longer a supported launch path.
             command_parts.extend(["--agent", self._agent_profile])
             self._resolved_model = self._model if self._model else None  # F127
             if self._model:
@@ -781,13 +858,14 @@ class ClaudeCodeProvider(BaseProvider):
         brief_mode = None
         try:
             if self._agent_profile:
-                from cli_agent_orchestrator.utils.agent_profiles import (
-                    parse_agent_profile_text,
-                    read_agent_profile_source,
-                )
+                # F497 D2 (named edit): route sessionBrief through the resolver
+                # (load_agent_profile) rather than a raw read+parse, so a
+                # position-inherited sessionBrief composes correctly. A raw
+                # parse of a composition-bearing stub would miss a sessionBrief
+                # declared on the position layer and silently skip the hook.
+                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-                raw = read_agent_profile_source(self._agent_profile)
-                candidate = parse_agent_profile_text(raw, self._agent_profile).sessionBrief
+                candidate = load_agent_profile(self._agent_profile).sessionBrief
                 brief_mode = candidate if candidate in ("required", "optional") else None
         except Exception:
             pass

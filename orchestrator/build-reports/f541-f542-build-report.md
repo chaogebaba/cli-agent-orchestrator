@@ -862,3 +862,70 @@ then confirm the journal is quiet (no repeating
 `Failed to get history from <session>:<window>` at ERROR) and the dead rows are
 gone (`cao status` shows them reconciled). This is the acceptance step neither
 F541 nor F542 exercised on the laptop.
+
+
+---
+
+## r9 — merge origin/main (F557 + F556) into lane cao/e08be272
+
+**Context.** origin/main advanced to `ecdefb94` carrying **F557** (`preflight_launch`
++ `ProfileNotFoundError` in `providers/claude_code.py`, and the `E-PROFILE-NOT-FOUND`
+400 arm in `api/main.py`) and **F556** (inbox changes). Merged into the F548 gate lane
+(`cao/e08be272`, tip `c7e50465`). Goal: BOTH F548 (settle-poll / auth-scan / trust-modal
+handling + `ClaudeAuthError`/`E-CLAUDE-AUTH`) AND F557 (fail-loud profile preflight) survive
+intact, with every test from both sides kept.
+
+**Command.** `git -C /data/cao-scratch/wt-f548-gate merge origin/main`.
+
+### Conflicted hunks (2 files, 1 hunk each — both add/add against base `f6c35046`)
+
+1. **`src/cli_agent_orchestrator/providers/claude_code.py`** (lines ~78–92, add/add).
+   - HEAD (F548) added `class ClaudeAuthError(ProviderError)` (`code = "E-CLAUDE-AUTH"`).
+   - origin/main (F557) added `class ProfileNotFoundError(ValueError)` (`code = "E-PROFILE-NOT-FOUND"`,
+     with `__init__(profile_name, store_dir)` + `.detail`).
+   - Base had neither. **Resolution:** keep BOTH class definitions, ClaudeAuthError first
+     then ProfileNotFoundError. They are independent, non-overlapping types.
+
+2. **`src/cli_agent_orchestrator/api/main.py`** (line ~129, add/add import).
+   - HEAD imported `ClaudeAuthError`; origin/main imported `ProfileNotFoundError` — both
+     `from cli_agent_orchestrator.providers.claude_code`.
+   - **Resolution:** single combined multi-name import bringing in BOTH `ClaudeAuthError`
+     and `ProfileNotFoundError`.
+
+`test/providers/test_claude_code_unit.py` auto-merged cleanly (no conflict) — kept both
+sides' tests.
+
+### Why the two designs do NOT conflict (verified, not assumed)
+
+- The exception-handling ARMS auto-merged into distinct handlers with no ordering clash:
+  - `except ClaudeAuthError` (F548) → 500 JSON, in the orchestration/send-path handler
+    (`api/main.py` ~3761).
+  - `except ProfileNotFoundError` (F557) → 400 JSON, in the terminal-create handler
+    (`api/main.py` ~4288), correctly placed BEFORE the generic `ValueError` arm so the
+    subclass is not masked as a 404.
+- The two behaviours live in separate provider methods: F557 raises `ProfileNotFoundError`
+  from `preflight_launch` (`claude_code.py` ~599, before any resource alloc); F548 raises
+  `ClaudeAuthError` from `_handle_startup_prompts` (`claude_code.py` ~1237, after auth-marker
+  scan). No shared code path.
+- Name-collision check: `api/main.py` line ~3262 has a FUNCTION-LOCAL
+  `from ...services.profile_store import ProfileNotFoundError` — a different, function-scoped
+  symbol that does NOT shadow the top-level `claude_code.ProfileNotFoundError` used by the
+  terminal-create arm. Both usages resolve correctly.
+
+### Verification (targeted, `-n0`, no laptop full suite)
+
+| test file | result |
+|---|---|
+| `test/providers/test_claude_code_unit.py` | 201 passed |
+| `test/providers/test_f548_gate_repro.py` | 9 passed |
+| `test/api/test_api_endpoints.py` | 118 passed |
+| `test/services/test_terminal_service_coverage.py` | 14 passed |
+| **total** | **342 passed, 0 failed** |
+
+F548 repro tests and F557 `test_preflight_launch_*` / `test_missing_profile_fails_loud`
+pass together in the same run — both sides confirmed live.
+
+- **black / isort** on the two touched files: no changes (already clean).
+- **mypy --strict net-new:** 0. Merged tree = 132 errors on the two files; origin/main
+  baseline = 132 identical error signatures (pre-existing memory/relationship endpoint
+  `no-untyped-def` / `type-arg` noise). No new error introduced by the resolution.

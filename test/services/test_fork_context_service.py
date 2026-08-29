@@ -233,3 +233,60 @@ def test_f26_ac5_mark_ready_deleted_cwd_raises_directed_fork_context_error():
             assert "git-failure" not in str(exc)
         else:
             pytest.fail("expected ForkContextError for deleted cwd")
+
+
+# ===========================================================================
+# F545 (#401): first_pane / pane_pid resolve the window's FIRST pane
+# (lowest pane_index), NOT the active pane. Pre-fix, pane_pid() ran
+# `display-message -t <session>:<window> '#{pane_pid}'`, which tmux resolves to
+# the ACTIVE pane — so a split seat window with a focused second pane returned
+# the wrong process tree.
+# ===========================================================================
+
+
+def _fake_list_panes(stdout: str):
+    """Return a fake subprocess.run result carrying list-panes stdout."""
+
+    def _run(argv, *args, **kwargs):
+        assert "list-panes" in argv, f"expected list-panes invocation, got {argv}"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    return _run
+
+
+def test_first_pane_selects_lowest_index_not_active():
+    """Second pane is active, but first_pane returns the lowest-index pane (%0)."""
+    from cli_agent_orchestrator.services.fork_context_service import first_pane, pane_pid
+
+    # list-panes emits both panes; pane index 1 (%18) is the active one.
+    stdout = "1 %18 377867\n0 %17 377853\n"
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.subprocess.run",
+        side_effect=_fake_list_panes(stdout),
+    ):
+        assert first_pane("cao-test", "win-0") == ("%17", 377853)
+        assert pane_pid("cao-test", "win-0") == 377853
+
+
+def test_first_pane_single_pane():
+    """Single-pane window returns that pane."""
+    from cli_agent_orchestrator.services.fork_context_service import first_pane, pane_pid
+
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.subprocess.run",
+        side_effect=_fake_list_panes("0 %2 8071\n"),
+    ):
+        assert first_pane("cao-test", "win-0") == ("%2", 8071)
+        assert pane_pid("cao-test", "win-0") == 8071
+
+
+def test_first_pane_no_panes_raises():
+    """Empty list-panes output raises ValueError (surfaces as pane_pid_failed upstream)."""
+    from cli_agent_orchestrator.services.fork_context_service import first_pane
+
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.subprocess.run",
+        side_effect=_fake_list_panes(""),
+    ):
+        with pytest.raises(ValueError):
+            first_pane("cao-test", "win-0")

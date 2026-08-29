@@ -72,6 +72,15 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         context_dir,
     )
     monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir)
+    # F497/F549: install_service resolves the context/kiro dirs at CALL time via
+    # these accessors; patch them to the fixture dirs too so both the legacy
+    # module-constant path and the call-time path point at the tmp workspace.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.constants.agent_context_dir", lambda: context_dir
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.constants.kiro_agents_dir", lambda: kiro_dir
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR",
         copilot_dir,
@@ -357,11 +366,13 @@ class TestInstallAgent:
         def track_set_env_var(key: str, value: str) -> None:
             call_order.append(f"set:{key}")
 
-        def track_parse_agent_profile_text(resolved_text: str, profile_name: str):
-            call_order.append(f"parse:{profile_name}")
-            from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+        from cli_agent_orchestrator.utils import agent_profiles as _ap
 
-            return parse_agent_profile_text(resolved_text, profile_name)
+        _orig_resolve = _ap.resolve_agent_profile
+
+        def track_resolve_agent_profile(resolved_text: str, profile_name: str):
+            call_order.append(f"parse:{profile_name}")
+            return _orig_resolve(resolved_text, profile_name)
 
         with (
             patch(
@@ -369,8 +380,8 @@ class TestInstallAgent:
                 side_effect=track_set_env_var,
             ),
             patch(
-                "cli_agent_orchestrator.services.install_service.parse_agent_profile_text",
-                side_effect=track_parse_agent_profile_text,
+                "cli_agent_orchestrator.utils.agent_profiles.resolve_agent_profile",
+                side_effect=track_resolve_agent_profile,
             ),
         ):
             result = install_agent("developer", "claude_code", {"API_TOKEN": "secret-token"})
@@ -528,7 +539,7 @@ class TestInstallAgent:
         local_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
 
         with patch(
-            "cli_agent_orchestrator.services.install_service.parse_agent_profile_text",
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_agent_profile",
             side_effect=RuntimeError("Unexpected error"),
         ):
             result = install_agent("developer", "kiro_cli")
@@ -784,6 +795,12 @@ class TestInstallSkillCatalogBaking:
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.agent_context_dir", lambda: context_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.kiro_agents_dir", lambda: kiro_dir
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR", copilot_dir

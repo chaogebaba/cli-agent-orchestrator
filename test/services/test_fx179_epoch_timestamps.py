@@ -252,7 +252,10 @@ class TestResolveTargetEpochFreshness:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -280,7 +283,10 @@ class TestResolveTargetEpochFreshness:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -304,7 +310,10 @@ class TestResolveTargetEpochFreshness:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -446,7 +455,10 @@ class TestFailClosedPreserved:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -469,7 +481,10 @@ class TestFailClosedPreserved:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -504,7 +519,10 @@ class TestNegativeAgeFarFutureStale:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -528,7 +546,10 @@ class TestNegativeAgeFarFutureStale:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
@@ -553,7 +574,10 @@ class TestNegativeAgeFarFutureStale:
         )
 
         with (
-            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 100),
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
             patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
             patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),

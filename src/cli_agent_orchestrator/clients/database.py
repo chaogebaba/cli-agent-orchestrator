@@ -9315,22 +9315,56 @@ def transition_pending_to_delivery_failed(message_ids: list[int]) -> bool:
         return changed > 0
 
 
-def list_stale_delivering_messages() -> List[InboxMessage]:
+def list_stale_delivering_messages(min_age_seconds: int = 0) -> List[InboxMessage]:
+    """List messages stuck in DELIVERING.
+
+    ``min_age_seconds`` (F556): when > 0, restrict to rows whose NEWEST delivery
+    attempt started at least that long ago. The startup sweep passes 0 (every
+    DELIVERING row is stale by definition once the process that owned the paste
+    is gone). The periodic reconciliation heartbeat passes a positive age so it
+    only adopts rows that have genuinely stalled — never a paste that a
+    concurrent, healthy ``deliver_pending`` is still confirming. A row with no
+    attempt row at all is always included (age unknowable -> treat as stale),
+    matching the startup branch's own "no attempts -> DELIVERY_FAILED" handling.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds) if min_age_seconds > 0 else None
     with SessionLocal() as db:
         rows = db.query(InboxModel).filter_by(status=MessageStatus.DELIVERING.value).all()
-        return [
-            InboxMessage(
-                id=x.id,
-                sender_id=x.sender_id,
-                receiver_id=x.receiver_id,
-                message=x.message,
-                orchestration_type=OrchestrationType(x.orchestration_type),
-                status=MessageStatus(x.status),
-                park_warm=bool(getattr(x, "park_warm", False)),
-                created_at=x.created_at,
+        selected: List[InboxMessage] = []
+        for x in rows:
+            if cutoff is not None:
+                newest = (
+                    db.query(InboxDeliveryAttemptModel.started_at)
+                    .join(
+                        InboxDeliveryAttemptMemberModel,
+                        InboxDeliveryAttemptMemberModel.attempt_uuid
+                        == InboxDeliveryAttemptModel.attempt_uuid,
+                    )
+                    .filter(InboxDeliveryAttemptMemberModel.message_id == x.id)
+                    .order_by(InboxDeliveryAttemptModel.started_at.desc())
+                    .first()
+                )
+                if newest is not None:
+                    started = newest[0]
+                    if started is not None:
+                        if started.tzinfo is None:
+                            started = started.replace(tzinfo=timezone.utc)
+                        if started > cutoff:
+                            # Attempt is younger than the age gate: still in flight.
+                            continue
+            selected.append(
+                InboxMessage(
+                    id=x.id,
+                    sender_id=x.sender_id,
+                    receiver_id=x.receiver_id,
+                    message=x.message,
+                    orchestration_type=OrchestrationType(x.orchestration_type),
+                    status=MessageStatus(x.status),
+                    park_warm=bool(getattr(x, "park_warm", False)),
+                    created_at=x.created_at,
+                )
             )
-            for x in rows
-        ]
+        return selected
 
 
 def list_stale_open_claude_attempts(age_seconds: int) -> list[dict[str, Any]]:

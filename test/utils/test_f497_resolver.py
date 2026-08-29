@@ -19,6 +19,7 @@ mechanisms that gate every later extraction:
 import os
 from pathlib import Path
 
+import frontmatter
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -93,14 +94,28 @@ _PROFILE_IDS = [p.stem for p in _LEGACY_PROFILES]
 )
 @pytest.mark.parametrize("profile_path", _LEGACY_PROFILES, ids=_PROFILE_IDS)
 def test_ac1_legacy_profile_resolves_byte_identically(profile_path: Path):
-    """Every legacy profile resolves field-for-field identically to today's parse.
+    """Every NON-COMPOSED legacy profile resolves identically to today's parse.
 
     Both the resolver and the direct parse are handed the SAME env-resolved
     text, so any difference is attributable to the resolver alone (not env
     drift between two reads).
+
+    F497 P2: a COMPOSITION-BEARING profile (an extracted alias stub carrying
+    ``extends:``/``position:``) is deliberately NOT byte-identical to a direct
+    parse of its OWN stub text — a direct parse of a stub yields an empty
+    persona, whereas the resolver composes the position + overlays. Extraction
+    byte-identity for those is proven against the pre-extraction GOLDEN original
+    in ``test_f497_composition.py`` (AC1 extraction harness). Here we skip them
+    so this harness keeps asserting exactly its invariant: the resolver is a
+    transparent passthrough for the un-extracted corpus.
     """
     stem = profile_path.stem
     resolved_text = resolve_env_vars(profile_path.read_text(encoding="utf-8"))
+    if profile_declares_composition(frontmatter.loads(resolved_text).metadata):
+        pytest.skip(
+            f"{stem} is an extracted composition stub — byte-identity is proven "
+            f"against the golden original in test_f497_composition.py, not here"
+        )
 
     today = parse_agent_profile_text(resolved_text, stem)
     through_resolver = resolve_agent_profile(resolved_text, stem)
@@ -161,9 +176,12 @@ def test_extends_is_not_a_model_field():
 
 
 @pytest.mark.parametrize("key", list(PROFILE_COMPOSITION_KEYS))
-def test_resolver_refuses_composition_bearing_profile_in_phase1(key: str):
+def test_resolver_requires_provider_for_composition_profile(key: str):
+    # F497 P2: a composition-bearing profile with no provider cannot be composed
+    # (D7). (Phase 1 refused ALL composition profiles with a "Phase 2" message;
+    # P2 lands the merge engine, so the refusal is now the D7 no-provider error.)
     text = _make_profile_text(f"name: composed\ndescription: composed\n{key}: something")
-    with pytest.raises(ValueError, match="Phase 2"):
+    with pytest.raises(ValueError, match="names no provider|not found in positions"):
         resolve_agent_profile(text, "composed")
 
 

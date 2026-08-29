@@ -187,8 +187,8 @@ class TestF216SocketUnpublishedGate:
                 return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
             ),
             patch(
-                "cli_agent_orchestrator.services.cc_session_registry.pane_pid",
-                return_value=400,
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 400),
             ),
             patch(
                 "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
@@ -230,8 +230,8 @@ class TestF216SocketUnpublishedGate:
                 return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
             ),
             patch(
-                "cli_agent_orchestrator.services.cc_session_registry.pane_pid",
-                return_value=400,
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 400),
             ),
             patch(
                 "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
@@ -273,8 +273,8 @@ class TestF216SocketUnpublishedGate:
                 return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
             ),
             patch(
-                "cli_agent_orchestrator.services.cc_session_registry.pane_pid",
-                return_value=400,
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 400),
             ),
             patch(
                 "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
@@ -313,8 +313,8 @@ class TestF216SocketUnpublishedGate:
                 return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
             ),
             patch(
-                "cli_agent_orchestrator.services.cc_session_registry.pane_pid",
-                return_value=400,
+                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+                return_value=("%0", 400),
             ),
             patch(
                 "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",

@@ -244,6 +244,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
     # F210 D10: kill-switch for the whole rung2 send-keys nudge (hot-reloadable)
     "CAO_DELIVERY_NUDGE_SENDKEYS_ENABLED": ("delivery.nudge_sendkeys_enabled", "bool", True),
+    # F547 (#403): per-sender content-hash dedupe window for the native wake
+    # write (drops a byte-identical bridge push within the last-N per sender).
+    "CAO_SUPERVISOR_WAKE_DEDUPE_WINDOW": ("supervisor.wake.dedupe_window", "int", 20),
     # F218-a: dead-supervisor safety config
     "CAO_LIVENESS_SESSION_CONFIRM_SAMPLES": ("liveness.session_confirm_samples", "int", 2),
     "CAO_LIVENESS_SCOPE_PROBE_TIMEOUT_S": ("liveness.scope_probe_timeout_s", "float", 5.0),
@@ -536,6 +539,10 @@ _ALL_PATHS = sorted(
         "delivery.base_ejection_s",
         "delivery.trace_retention_h",
         "delivery.jitter",
+        # F547 (#403): rung1 re-ring discipline + wake dedupe window
+        "delivery.rung1_backoff_s",
+        "delivery.hold_pane_markers",
+        "supervisor.wake.dedupe_window",
         # F218-a: dead-supervisor safety config
         "liveness.session_confirm_samples",
         "liveness.scope_probe_timeout_s",

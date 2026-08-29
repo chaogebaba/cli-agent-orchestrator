@@ -15,14 +15,16 @@ Identity guards: procStart PID-reuse check + record freshness.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import socket
 import subprocess
+import threading
 import time
-import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -31,7 +33,7 @@ from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.fork_context_service import (
     _PROC_ROOT,
     _descendants,
-    pane_pid,
+    first_pane,
 )
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import SandboxProviderUnsafe
@@ -56,6 +58,81 @@ _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 # F337 B1: canonical default for supervisor.wake.native — ship DARK (False).
 # All call sites and the config-registry entry MUST reference this constant.
 WAKE_NATIVE_DEFAULT = False
+
+
+# ---------------------------------------------------------------------------
+# F547 #403 point 5: CAO-side per-sender content-hash dedupe window.
+#
+# The Claude client only dropped a peer message when it was identical to the
+# IMMEDIATELY previous message from that sender; a single interleaved message
+# from another sender reset that "previous" and let a byte-identical doorbell
+# push through again. We defend on the CAO write side too: keep a per-sender
+# ring of the last N content hashes and refuse to re-emit a byte-identical
+# bridge payload that is still inside that window, regardless of interleaving.
+# ---------------------------------------------------------------------------
+
+# Per-sender window size. Overridable via `supervisor.wake.dedupe_window`.
+_DEDUPE_WINDOW_DEFAULT = 20
+
+_dedupe_lock = threading.Lock()
+# sender_address -> deque[str] of recent content hashes (most-recent last).
+_dedupe_windows: dict[str, deque[str]] = {}
+
+
+def _extract_sender_and_content(payload_line: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse the bridge payload for its sender address and message content.
+
+    Returns (sender, content); either may be None if the payload is not the
+    expected JSON wake shape (in which case dedupe is skipped — fail-open).
+    """
+    try:
+        obj = json.loads(payload_line)
+    except (ValueError, TypeError):
+        return None, None
+    sender = obj.get("from") if isinstance(obj, dict) else None
+    content = None
+    msg = obj.get("message") if isinstance(obj, dict) else None
+    if isinstance(msg, dict):
+        content = msg.get("content")
+    return (sender if isinstance(sender, str) else None,
+            content if isinstance(content, str) else None)
+
+
+def _dedupe_window_size() -> int:
+    try:
+        n = int(ConfigService.get("supervisor.wake.dedupe_window", default=_DEDUPE_WINDOW_DEFAULT))
+    except (TypeError, ValueError):
+        n = _DEDUPE_WINDOW_DEFAULT
+    return max(1, n)
+
+
+def _is_duplicate_in_window(payload_line: str) -> bool:
+    """F547 #403 point 5: True if this payload duplicates a recent one per sender.
+
+    Records the hash as a side effect on a miss (so the window advances). A
+    payload we cannot parse (no sender/content) is never treated as a duplicate.
+    """
+    sender, content = _extract_sender_and_content(payload_line)
+    if sender is None or content is None:
+        return False
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    window_size = _dedupe_window_size()
+    with _dedupe_lock:
+        window = _dedupe_windows.get(sender)
+        if window is None or window.maxlen != window_size:
+            # (Re)size preserving the most-recent entries.
+            window = deque(window or (), maxlen=window_size)
+            _dedupe_windows[sender] = window
+        if digest in window:
+            return True
+        window.append(digest)
+        return False
+
+
+def _reset_dedupe_windows() -> None:
+    """Test seam: clear the per-sender dedupe windows."""
+    with _dedupe_lock:
+        _dedupe_windows.clear()
 
 
 # Registry base path — resolved per call through the injected provider plane, never
@@ -256,10 +333,21 @@ def _resolve_tmux_window_id(tmux_session: str, tmux_window_name: str) -> Optiona
     return None
 
 
-def _record_matches_pane(record: RegistryRecord, tmux_session: str, window_id: str) -> bool:
+def _record_matches_pane(
+    record: RegistryRecord,
+    tmux_session: str,
+    window_id: str,
+    pane_id: Optional[str] = None,
+) -> bool:
     """Check if a record's tmux field matches the expected pane.
 
     Registry tmux format: "<session>:<window_id>.<pane_id>"
+
+    F545 (#401): when ``pane_id`` is supplied (the seat's FIRST pane ``%N``), the
+    record's pane_id must ALSO match — session+window_id alone let a second pane
+    in the same split window pass, which is exactly how the doorbell rang the
+    consultant Claude. When ``pane_id`` is None (older records / no %N to compare
+    against), fall back to the session+window_id check.
     """
     if not record.tmux:
         return False
@@ -268,12 +356,18 @@ def _record_matches_pane(record: RegistryRecord, tmux_session: str, window_id: s
     try:
         colon_idx = record.tmux.index(":")
         rec_session = record.tmux[:colon_idx]
-        rest = record.tmux[colon_idx + 1:]
+        rest = record.tmux[colon_idx + 1 :]
         dot_idx = rest.index(".")
         rec_window_id = rest[:dot_idx]
+        rec_pane_id = rest[dot_idx + 1 :]
     except (ValueError, IndexError):
         return False
-    return rec_session == tmux_session and rec_window_id == window_id
+    if rec_session != tmux_session or rec_window_id != window_id:
+        return False
+    if pane_id is not None:
+        # Compare pane %N exactly — a candidate on a different pane is never a match.
+        return rec_pane_id == pane_id
+    return True
 
 
 def resolve_target(
@@ -297,14 +391,20 @@ def resolve_target(
     if not records:
         return ResolveResult(refusal_reason="no_registry_records")
 
-    # Step 1: get pane pid and find descendant CC processes
+    # Step 1: get the seat's FIRST pane (%N + pid) and find descendant CC procs.
+    # F545 (#401): resolve the WINDOW'S FIRST pane, never the active pane. A split
+    # seat window with a second (consultant) pane focused would otherwise make the
+    # active pane's process tree the candidate set and ring the wrong Claude.
     try:
-        pane_leader = pane_pid(tmux_session, tmux_window)
+        seat_pane_id, pane_leader = first_pane(tmux_session, tmux_window)
     except (subprocess.CalledProcessError, OSError, ValueError):
         return ResolveResult(refusal_reason="pane_pid_failed")
 
     descendants = _descendants(pane_leader)
-    # Find registry records whose pid is in the descendant tree
+    # Find registry records whose pid is in the FIRST pane's descendant tree.
+    # A record whose pid tree lives under any other pane is not in this set and is
+    # therefore never a target — it cannot inflate the candidate count into a false
+    # target_ambiguous.
     candidate_records = [r for r in records if r.pid in descendants]
 
     if not candidate_records:
@@ -313,21 +413,32 @@ def resolve_target(
     # Step 2: resolve the tmux window_id for cross-checking
     window_id = _resolve_tmux_window_id(tmux_session, tmux_window)
 
-    # Step 3: cross-check — prefer records whose tmux field matches this pane
+    # Step 3: cross-check — prefer records whose tmux field matches this pane.
+    # F545: compare the seat's FIRST pane %N too, so a record that carries the
+    # terminal id but sits on a different pane is filtered out here as well.
     if window_id is not None:
-        matched = [r for r in candidate_records if _record_matches_pane(r, tmux_session, window_id)]
+        matched = [
+            r
+            for r in candidate_records
+            if _record_matches_pane(r, tmux_session, window_id, seat_pane_id)
+        ]
     else:
         # Cannot cross-check — all candidates remain
         matched = candidate_records
 
     if len(matched) == 0:
-        # No cross-check match among candidates — ambiguous
+        # No cross-check match among the first-pane candidates.
         if len(candidate_records) > 1:
+            # >1 procfs candidate under the seat's first pane, none pane-matched —
+            # genuinely ambiguous within THIS pane's tree (not a second-pane leak).
             return ResolveResult(refusal_reason="target_ambiguous")
-        # Single candidate without cross-check match — use it (procfs-only resolution)
+        # Exactly one candidate proven under the first pane's tree by procfs, but its
+        # registry tmux %N did not match (e.g. a stale tmux field). procfs descent is
+        # authoritative for "which pane" here, so use it. This cannot be a second-pane
+        # record — those never entered candidate_records (F545).
         matched = candidate_records
     elif len(matched) > 1:
-        # Multiple records match the same pane — ambiguous
+        # Multiple records match the same first pane — ambiguous
         return ResolveResult(refusal_reason="target_ambiguous")
 
     record = matched[0]
@@ -385,6 +496,31 @@ def check_version_guard(record: RegistryRecord) -> Optional[str]:
 _F459_MAX_BODY_BYTES = 8192
 
 
+def build_wake_msg_id(
+    receiver: str,
+    inbox_row_id: int,
+    incarnation: Optional[str] = None,
+) -> str:
+    """F547 #403 point 1: deterministic msg_id per (receiver incarnation, row).
+
+    The same (receiver, inbox_row_id, incarnation) triple ALWAYS produces the
+    same id, so a consumer that has already seen this id can drop a re-push as
+    a duplicate. A different receiver incarnation (process restart) produces a
+    different id, so a genuinely new seat still surfaces the callback.
+
+    incarnation is a stable token for the receiver's live process (e.g. the
+    resolved procStart or pid). None collapses to the empty string — callers
+    that cannot resolve an incarnation still get a per-(receiver,row) id, which
+    is strictly better than a fresh uuid4 every ring.
+    """
+    seed = f"{receiver}\x00{int(inbox_row_id)}\x00{incarnation or ''}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    # Format as a uuid-shaped string so downstream parsers that assume the
+    # legacy uuid4 shape keep working (8-4-4-4-12 hex layout).
+    h = digest
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 def build_wake_payload(
     worker_name: str,
     inbox_row_id: int,
@@ -392,12 +528,18 @@ def build_wake_payload(
     priority: Optional[str] = None,
     message_body: Optional[str] = None,
     sender_display_name: Optional[str] = None,
+    incarnation: Optional[str] = None,
 ) -> str:
     """D5/D7/F459: build the single JSON line for the socket write.
 
     F459: When message_body is provided, the bridge message carries the actual
     worker callback text (defensively truncated to 8KB) instead of a generic ping.
     sender_display_name overrides the from-name (the worker's display name).
+
+    F547 #403 point 1: msg_id is now DETERMINISTIC in
+    (worker_name/receiver, inbox_row_id, incarnation) — see build_wake_msg_id.
+    A re-push for the same row+incarnation carries the SAME id, so the consumer
+    can drop it; a fresh uuid4 per ring (the old behaviour) defeated all dedupe.
     """
     if priority is None:
         priority = ConfigService.get("supervisor.wake.priority", default="next")
@@ -439,7 +581,7 @@ def build_wake_payload(
 
     payload = {
         "msgV": 1,
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": build_wake_msg_id(worker_name, inbox_row_id, incarnation),
         "type": "user",
         "message": {"role": "user", "content": content},
         "priority": priority,
@@ -554,6 +696,15 @@ def write_to_socket(
     # F216: EINVAL short-circuit — refuse empty/null socket path before connect
     if not socket_path:
         return "socket_path_empty"
+
+    # F547 #403 point 5: per-sender content-hash window. If this exact content
+    # was already written to this sender inside the last-N window, treat the
+    # write as an idempotent no-op (return None = success) rather than re-emit a
+    # byte-identical bridge message. Returning success (not an error) avoids
+    # spuriously triggering the fx168 pane-nudge fallback for a suppressed dupe.
+    if _is_duplicate_in_window(payload_line):
+        logger.info("f547 wake dedupe: suppressed byte-identical bridge write within window")
+        return None
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(connect_timeout_s)
