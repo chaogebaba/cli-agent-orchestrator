@@ -1,5 +1,6 @@
 """Unit tests for Codex provider."""
 
+import logging
 import os
 import re
 import shlex
@@ -110,7 +111,9 @@ class TestCodexProviderInitialization:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep):
+    async def test_initialize_success(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep
+    ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -148,7 +151,9 @@ class TestCodexProviderInitialization:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep):
+    async def test_initialize_codex_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep
+    ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -5192,3 +5197,56 @@ class TestMCPInterruptNotBlockingIdle:
             "  gpt-5.6-sol medium · Context 100% left\n"
         )
         assert _has_startup_idle_composer(output) is False
+
+
+class TestCodexSeedResumeIdentity:
+    """F587 #445: seed prompt must be 'Say hello.' and rc!=0 must surface stdout tail."""
+
+    @patch("cli_agent_orchestrator.providers.codex.CodexProvider.validate_session_artifact")
+    @patch("cli_agent_orchestrator.providers.codex._resolved_codex_profile_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.subprocess.run")
+    def test_seed_argv_uses_say_hello_not_seed_ok(
+        self, mock_run, mock_load, mock_cfg, mock_validate
+    ):
+        """(a) The argv passed to subprocess.run contains 'Say hello.' and not 'SEED_OK'."""
+        mock_load.return_value = MagicMock()
+        mock_cfg.return_value = (None, {})
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="session id: 12345678-1234-1234-1234-1234567890ab\n",
+        )
+
+        result = CodexProvider.seed_resume_identity("/some/cwd", "codex_dev")
+
+        assert result == "12345678-1234-1234-1234-1234567890ab"
+        mock_run.assert_called_once()
+        argv = mock_run.call_args.args[0]
+        assert "Say hello." in argv
+        assert not any("SEED_OK" in str(tok) for tok in argv)
+
+    @patch("cli_agent_orchestrator.providers.codex._resolved_codex_profile_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.subprocess.run")
+    def test_seed_rc_nonzero_raises_with_tail_and_logs_error(
+        self, mock_run, mock_load, mock_cfg, caplog
+    ):
+        """(b) rc!=0 with a flagged-content stdout raises RuntimeError naming the cause
+        and logs the tail at ERROR."""
+        mock_load.return_value = MagicMock()
+        mock_cfg.return_value = (None, {})
+        mock_run.return_value = SimpleNamespace(
+            returncode=1,
+            stdout="ERROR: This content was flagged for possible cybersecurity risk\n",
+        )
+
+        with caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.providers.codex"):
+            with pytest.raises(RuntimeError) as excinfo:
+                CodexProvider.seed_resume_identity("/some/cwd", "codex_dev")
+
+        assert "flagged" in str(excinfo.value)
+        assert "seed_exec_failed rc=1" in str(excinfo.value)
+        assert any(
+            record.levelno == logging.ERROR and "flagged" in record.getMessage()
+            for record in caplog.records
+        )
