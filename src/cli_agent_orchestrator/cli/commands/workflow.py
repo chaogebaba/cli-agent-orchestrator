@@ -200,8 +200,8 @@ def approve_cmd(plan_id, as_json):
       1  the request was rejected or the server could not be reached
     """
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/plans/approve",
+        response = cao_http.post(
+            "/workflows/plans/approve",
             # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
             # verbatim, because a normalisation is how two distinct plans could share one approval.
             json={"plan_id": plan_id},

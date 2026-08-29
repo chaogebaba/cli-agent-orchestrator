@@ -295,11 +295,17 @@ def _write_context_file(agent_name: str, raw_content: str) -> Path:
     3. ``O_NOFOLLOW`` at the open, so the kernel refuses to write *through* a
        symlink at the final component.
     """
-    from cli_agent_orchestrator.constants import agent_context_dir
     from cli_agent_orchestrator.utils.agent_profiles import compose_agent_profile_source
 
     content = compose_agent_profile_source(raw_content, agent_name)
-    context_root = agent_context_dir()
+    # Resolve the context root through the MODULE-LEVEL ``AGENT_CONTEXT_DIR`` so a
+    # caller/test that pins the dir (monkeypatching this module attribute — the
+    # seam every install test uses) is honoured. Read as a module global at CALL
+    # time, not captured into a local at import, so the pin still takes effect.
+    # (Fork contract per the r2 conflict-resolution decision; see report Fix
+    # round r2. Upstream #695's call-time ``agent_context_dir()`` used a
+    # different seam the fork's GHSA containment tests do not patch.)
+    context_root = AGENT_CONTEXT_DIR
     context_root.mkdir(parents=True, exist_ok=True)
     safe_name = validate_path_component(agent_name, description="profile name")
     # Resolve only the BASE (so a symlinked context root is handled) and keep the

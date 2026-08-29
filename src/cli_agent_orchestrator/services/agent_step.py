@@ -648,14 +648,16 @@ async def run_agent_step(
             raise StepCancelledError(terminal_id=terminal_id)
 
         try:
-            send_kwargs: dict[str, Any] = {
-                "orchestration_type": OrchestrationType.HANDOFF,
-            }
+            # issue #583 Bolt 2 (fork contract): the frozen-memory workflow path and
+            # the live orchestration path are mutually exclusive at the send_input
+            # seam. A workflow step whose memory was resolved once (frozen_memory is
+            # not None, incl. the "" suppress-live sentinel) delivers with
+            # ``frozen_memory`` alone; a non-workflow step delivers with
+            # ``orchestration_type=HANDOFF`` alone, byte-identically to before #583.
             if frozen_memory is not None:
-                # issue #583 Bolt 2: suppress send_input's live-memory fallback and
-                # inject the frozen block. Omitted entirely on the no-frozen-block
-                # path so a non-workflow step reaches send_input byte-identically.
-                send_kwargs["frozen_memory"] = frozen_memory
+                send_kwargs: dict[str, Any] = {"frozen_memory": frozen_memory}
+            else:
+                send_kwargs = {"orchestration_type": OrchestrationType.HANDOFF}
             await asyncio.to_thread(
                 terminal_service.send_input,
                 terminal_id,

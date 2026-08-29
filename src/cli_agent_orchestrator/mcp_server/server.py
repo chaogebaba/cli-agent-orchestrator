@@ -4213,8 +4213,8 @@ async def workflow_plan_approval(
     Returns a structured envelope on EVERY path — never raises into the agent loop (EV-1).
     """
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+        response = cao_http.get(
+            f"/workflows/runs/{run_id}/plan",
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:

@@ -104,7 +104,7 @@ def test_ac3_rename_self_heals_and_routes_subsequent_input(monkeypatch, purge_ef
     monkeypatch.setattr(terminal_service, "status_monitor", status_monitor)
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _terminal_id: metadata)
     monkeypatch.setattr(
-        terminal_service, "inject_memory_context", lambda message, _terminal_id: message
+        terminal_service, "inject_memory_context", lambda message, _terminal_id, *_a, **_k: message
     )
     monkeypatch.setattr(
         terminal_service, "preserve_draft_before_send", lambda *_args, **_kwargs: None

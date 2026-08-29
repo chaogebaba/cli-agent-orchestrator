@@ -110,7 +110,7 @@ def _mock_infra(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.inject_memory_context",
-        lambda msg, _tid: msg,
+        lambda msg, _tid, *_a, **_k: msg,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service._append_message_contract",
@@ -350,7 +350,7 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.inject_memory_context",
-        lambda msg, _tid: msg,
+        lambda msg, _tid, *_a, **_k: msg,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service._append_message_contract",

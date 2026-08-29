@@ -987,9 +987,9 @@ def reconcile_dead_session_terminals() -> dict:
 def inject_memory_context(
     first_message: str,
     terminal_id: str,
-    frozen_memory: str | None = None,
     *,
     consume: bool = True,
+    frozen_memory: str | None = None,
 ) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
@@ -5976,10 +5976,10 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     defer_on_dialog: bool = False,
-    frozen_memory: str | None = None,
     *,
     expect_callback: bool = True,
     _lifecycle_internal: bool = False,
+    frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -6049,7 +6049,7 @@ def send_input(
         # Keep the original message for the PostSendMessageEvent so
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
-        message = inject_memory_context(message, terminal_id, frozen_memory)
+        message = inject_memory_context(message, terminal_id, frozen_memory=frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

@@ -403,6 +403,12 @@ def build_kiro_command(
 ) -> list[str]:
     """Build a deterministic Kiro command without executing it.
 
+    ``legacy_ui`` (fork ours-side, retained through the upstream #691 merge):
+    on the v2 engine, emit ``--legacy-ui`` right after ``--agent-engine v2`` and
+    before ``--trust-all-tools``. This launch shape is live-proven for CAO's
+    kiro_capabilities engine handling (workers spawn with full MCP tools on it),
+    so upstream #691's blanket removal is deliberately not adopted here.
+
     ``resume_session_id`` (F560): when set, append ``--resume-id <id>`` so the
     launched chat continues an existing conversation instead of starting fresh.
     Kiro CLI accepts ``--resume-id`` on both the KAS (``--v3``) and v2 engines
@@ -416,6 +422,8 @@ def build_kiro_command(
         command = ["kiro-cli", "--v3", "chat", "--trust-all-tools"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
+        if legacy_ui:
+            command.append("--legacy-ui")
         if yolo:
             command.append("--trust-all-tools")
     if resume_session_id:
