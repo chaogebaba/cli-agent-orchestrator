@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 101;
+const COMMAND_COUNT: usize = 102;
 
 /// What the TUI does with a command.
 ///
@@ -258,6 +258,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowWait,
     CommandId::WorkflowValidate,
     CommandId::AgentsStatus,
+    CommandId::AutoAnswersTest,
     CommandId::BarrierCancel,
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
@@ -478,6 +479,10 @@ pub enum CommandId {
     // `cao agents *`
     /// `cao agents status`
     AgentsStatus,
+
+    // `cao auto-answers *`
+    /// `cao auto-answers test`
+    AutoAnswersTest,
 
     // `cao barrier *`
     /// `cao barrier cancel`
@@ -1346,6 +1351,16 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only read verb; no TUI roster pane (wp-agents-status)
         },
+        CommandId::AutoAnswersTest => Command {
+            id: CommandId::AutoAnswersTest,
+            parent: Some("auto-answers"),
+            leaf_name: "test",
+            summary: "Replay a captured pane against a provider's auto-responder rules; print region + verdicts.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "provider", required: true, kind: ParamKind::Text }, Param { name: "pane_textfile", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: pure read-only diagnostic (sends no keys, mutates no state); no HTTP route, no TUI integration (F530)
+        },
         CommandId::BarrierCancel => Command {
             id: CommandId::BarrierCancel,
             parent: Some("barrier"),
@@ -1746,11 +1761,11 @@ mod tests {
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 58, "expected 58 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 60, "expected 60 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            100,
-            "the three policy counts must account for all 100 leaf commands of the Click tree"
+            102,
+            "the three policy counts must account for all 102 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1760,8 +1775,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            99,
-            "DISPLAY_ORDER must list 99 DISTINCT commands; a duplicate would let one command go \
+            102,
+            "DISPLAY_ORDER must list 102 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1901,6 +1916,7 @@ mod tests {
                     CommandId::WorkflowWait => CommandId::WorkflowWait,
                     CommandId::WorkflowValidate => CommandId::WorkflowValidate,
                     CommandId::AgentsStatus => CommandId::AgentsStatus,
+                    CommandId::AutoAnswersTest => CommandId::AutoAnswersTest,
                     CommandId::BarrierCancel => CommandId::BarrierCancel,
                     CommandId::BarrierStatus => CommandId::BarrierStatus,
                     CommandId::BaseRegister => CommandId::BaseRegister,
@@ -1934,6 +1950,8 @@ mod tests {
 
             // Every variant, each passed through the exhaustive map above.
             [
+                CommandId::DoctorCheck,
+                CommandId::DoctorReadopt,
                 CommandId::Info,
                 CommandId::Init,
                 CommandId::Install,
@@ -2005,6 +2023,7 @@ mod tests {
                 CommandId::WorkflowWait,
                 CommandId::WorkflowValidate,
                 CommandId::AgentsStatus,
+                CommandId::AutoAnswersTest,
                 CommandId::BarrierCancel,
                 CommandId::BarrierStatus,
                 CommandId::BaseRegister,
