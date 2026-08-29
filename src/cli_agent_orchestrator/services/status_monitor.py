@@ -1001,8 +1001,7 @@ class StatusMonitor:
                 self.clear_terminal(terminal_id)
             else:
                 logger.debug(
-                    "StatusMonitor: terminal %s not found in database yet "
-                    "(miss %d); tolerating",
+                    "StatusMonitor: terminal %s not found in database yet " "(miss %d); tolerating",
                     terminal_id,
                     misses,
                 )
@@ -1738,13 +1737,18 @@ class StatusMonitor:
            specifically auto_responder.force_status (D5).
         2. a question marker is open ⇒ (WAITING_USER_ANSWER, "question_marker").
         3a. status in {IDLE, COMPLETED, PROCESSING}, a usable sample exists,
-            unchanged_count < K, NOT pane_hold_expired ⇒ (PROCESSING,
-            "pane_delta"). The "usable sample" guard IS the whole no-evidence
-            rule (R3-B1). PROCESSING⇒PROCESSING is a status no-op that
-            reproduces the reason.
+            unchanged_count < K (eligibility first — a stable pane is never
+            tagged, AC4). Then, in order (F568 D12d, R3-B3/B5): children_count>0
+            ⇒ (published, "pane_delta_delegating"); busy_marker is False ⇒
+            (published, "pane_delta_vetoed"); busy_marker in (None, True) and NOT
+            pane_hold_expired ⇒ (PROCESSING, "pane_delta"). The "usable sample"
+            guard IS the whole no-evidence rule (R3-B1). PROCESSING⇒PROCESSING is
+            a status no-op that reproduces the reason.
         3b. same preconditions but pane_hold_expired ⇒ status UNCHANGED,
             "pane_delta_expired" (fusion_changed stays False — the caller sets
             it from the status delta). The expiry is a distinct outcome (R5-S3).
+            With a children/marker veto the clock was cleared, so expiry cannot
+            co-occur (AC-8).
         4. else ⇒ (status, None).
         """
         if status is None:
@@ -1780,7 +1784,27 @@ class StatusMonitor:
                     observation = None
                 if observation is not None:
                     k = self._stable_samples()
+                    # Eligibility first (R3-B3/B5): a usable sample AND an
+                    # unstable pane, else fall through to rule 4 (reason None) —
+                    # a stable pane is never tagged with any D12d reason (AC4).
                     if observation.unchanged_count < k:
+                        # F568 D12d (2) ledger veto: children in flight ⇒ admit
+                        # the published status tagged "pane_delta_delegating".
+                        # No hold episode opens (nothing is withheld — this is
+                        # how D12b's "bound never expires while children > 0" is
+                        # realised). Checked BEFORE the marker so a spinner never
+                        # overrides delegating (S2).
+                        if observation.children_count > 0:
+                            return status, "pane_delta_delegating"
+                        # F568 D12d (3) marker veto: the seat's own TUI spinner
+                        # is absent ⇒ admit the published status tagged
+                        # "pane_delta_vetoed". _rule3a_would_downgrade returned
+                        # False, so the hold clock was cleared (expiry cannot
+                        # co-occur, AC-8).
+                        if observation.busy_marker is False:
+                            return status, "pane_delta_vetoed"
+                        # F568 D12d (4) busy_marker in (None, True): existing
+                        # outcome — PROCESSING/"pane_delta", or the expired admit.
                         if not observation.pane_hold_expired:
                             return TerminalStatus.PROCESSING, "pane_delta"
                         # 3b: the bound expired — admit the published status but

@@ -37,9 +37,7 @@ def _patch_positions(positions: dict[str, dict]):
             return positions[stem], "# position body\n"
         return None
 
-    return patch.object(
-        agent_profiles, "_read_composition_store", side_effect=fake_read_store
-    )
+    return patch.object(agent_profiles, "_read_composition_store", side_effect=fake_read_store)
 
 
 def test_d7_legacy_name_unchanged(monkeypatch):
@@ -51,9 +49,12 @@ def test_d7_legacy_name_unchanged(monkeypatch):
         captured["agent_profile"] = agent_profile
         return ("worker1", "kiro_cli")
 
-    with _patch_positions({}), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
-    ) as create:
+    with (
+        _patch_positions({}),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
+        ) as create,
+    ):
         result = _assign_impl("developer", "task", working_directory="/repo")
 
     assert result["success"] is True
@@ -83,9 +84,12 @@ def test_d7_uninstalled_legacy_name_passthrough_clean_store(monkeypatch):
     # as <provider>_<position> misses (no shape inference in P3, option b).
     for name in ("kiro_dev", "codex_profile", "codex_dev", "grok_dev"):
         captured.clear()
-        with _patch_positions({"dev": {"providers": ["codex", "grok_cli", "kiro_cli"]}}), patch(
-            "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
-        ) as create:
+        with (
+            _patch_positions({"dev": {"providers": ["codex", "grok_cli", "kiro_cli"]}}),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
+            ) as create,
+        ):
             result = _assign_impl(name, "task", working_directory="/repo")
         assert result["success"] is True, f"{name} should pass through on a clean store"
         create.assert_called_once()
@@ -93,7 +97,12 @@ def test_d7_uninstalled_legacy_name_passthrough_clean_store(monkeypatch):
 
 
 def test_d7_position_plus_provider_spawns_composed(monkeypatch):
-    """A position name + an allowed provider resolves and spawns (composed cell)."""
+    """A position name + an allowed provider resolves and spawns (composed cell).
+
+    P4/D6: the effective spawn name is the deterministic ``<provider>_<position>``
+    synthesis when no legacy alias stub resolves the cell (the mocked store here
+    has no alias), so the composed cell spawns as ``codex_empirical_reviewer``.
+    """
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     captured = {}
 
@@ -101,26 +110,29 @@ def test_d7_position_plus_provider_spawns_composed(monkeypatch):
         captured["agent_profile"] = agent_profile
         return ("worker2", "codex")
 
-    with _patch_positions(
-        {"empirical_reviewer": {"providers": ["codex", "kiro_cli"]}}
-    ), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
-    ) as create:
+    with (
+        _patch_positions({"empirical_reviewer": {"providers": ["codex", "kiro_cli"]}}),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
+        ) as create,
+    ):
         result = _assign_impl(
             "empirical_reviewer", "task", working_directory="/repo", provider="codex"
         )
 
     assert result["success"] is True
     create.assert_called_once()
-    assert captured["agent_profile"] == "empirical_reviewer"
+    # D6 synthesis: no alias stub in the mocked store → <provider>_<position>.
+    assert captured["agent_profile"] == "codex_empirical_reviewer"
 
 
 def test_d7_position_without_provider_hard_fails(monkeypatch):
     """A position name with no provider= is E-POSITION-NEEDS-PROVIDER, no spawn."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal"
-    ) as create:
+    with (
+        _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
         result = _assign_impl("empirical_reviewer", "task", working_directory="/repo")
 
     assert result["success"] is False
@@ -131,9 +143,10 @@ def test_d7_position_without_provider_hard_fails(monkeypatch):
 def test_d7_disallowed_provider_hard_fails_no_terminal(monkeypatch):
     """A provider outside the position allowlist is E-PROVIDER-NOT-ALLOWED, no spawn."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal"
-    ) as create:
+    with (
+        _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
         result = _assign_impl(
             "empirical_reviewer", "task", working_directory="/repo", provider="grok_cli"
         )
@@ -150,9 +163,10 @@ def test_d7_provider_on_non_position_hard_fails(monkeypatch):
     (codex_empirical_reviewer) and an arbitrary name — with provider= both fail."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     for name in ("codex_empirical_reviewer", "no_such_thing"):
-        with _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}), patch(
-            "cli_agent_orchestrator.mcp_server.server._create_terminal"
-        ) as create:
+        with (
+            _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
+            patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+        ):
             result = _assign_impl(name, "task", working_directory="/repo", provider="codex")
         assert result["success"] is False, name
         assert "E-UNKNOWN-POSITION" in result["message"], name
@@ -169,9 +183,12 @@ def test_d7_non_position_no_provider_is_legacy_passthrough(monkeypatch):
         captured["agent_profile"] = agent_profile
         return ("worker7", "kiro_cli")
 
-    with _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
-    ) as create:
+    with (
+        _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
+        ) as create,
+    ):
         result = _assign_impl("no_such_thing", "task", working_directory="/repo")
 
     assert result["success"] is True

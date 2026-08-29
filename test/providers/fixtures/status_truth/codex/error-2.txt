@@ -1,0 +1,7 @@
+
+⚠ Selected model is at capacity. Please try a different model.
+
+
+› Write tests for @filename
+
+  gpt-5.6-sol high · ~/VScode_projects/cli-subagents

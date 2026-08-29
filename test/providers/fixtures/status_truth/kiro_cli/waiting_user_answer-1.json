@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "waiting_user_answer",
+  "source": "copied byte-exact from test/providers/fixtures/kiro_cli_permission_output.txt",
+  "captured_at": "2025-11-18T08:55:44-05:00 (last commit touching source; original capture date unknown)",
+  "notes": "'Allow this action? [y/n/t]' permission prompt."
+}

@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/wpq1_claude_2_1_211/quoted-resume-picker-completed.txt",
+  "captured_at": "2026-07-16T21:15:16-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "Post-turn '● Completed' with quoted resume-picker echo; empty composer below."
+}

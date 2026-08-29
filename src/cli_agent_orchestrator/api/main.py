@@ -73,6 +73,8 @@ from cli_agent_orchestrator.clients.database import (
     get_message_trace,
     get_terminal_metadata,
     init_db,
+    register_terminal_child,
+    release_terminal_child,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -1128,6 +1130,25 @@ class InteractionMarkerRequest(BaseModel):
     source: str = ""
     event: str = ""
     tool_name: Optional[str] = None
+    ts: Optional[str] = None
+    nonce: Optional[str] = None
+
+
+class ChildrenLedgerRequest(BaseModel):
+    """F568 D12a children-ledger edge pushed by the seat's own hooks.
+
+    ``op`` is the only closed vocabulary: ``register`` on an ``Agent|Task``
+    dispatch (``PreToolUse``), ``release`` on the paired ``SubagentStop``. The
+    body is provider-agnostic — ``child_id`` is an opaque correlation tag; the
+    server keys the ledger on nothing CC-specific. ``child_id`` may be omitted
+    on ``release`` (some Claude Code versions carry no reliable id on
+    ``SubagentStop``); the server then pops the oldest entry (count-correct).
+    """
+
+    terminal_id: str
+    op: Literal["register", "release"]
+    child_id: Optional[str] = None
+    event: str = ""
     ts: Optional[str] = None
     nonce: Optional[str] = None
 
@@ -4650,6 +4671,53 @@ async def push_interaction_marker(
         tool_name=body.tool_name,
     )
     return {"success": True, "terminal_id": terminal_id, "kind": body.kind}
+
+
+@app.post("/terminals/{terminal_id}/children-ledger")
+async def push_children_ledger(
+    terminal_id: TerminalId,
+    body: ChildrenLedgerRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Accept one F568 D12a children-ledger edge (register/release).
+
+    Same shape as the F507 interaction-marker endpoint: 404 on an unknown
+    terminal, 400 when the body ``terminal_id`` does not match the route. The
+    edge mutates the durable ledger at ``metadata_json["children"]`` — the exact
+    list D12d's frozen liveness READ side counts — via a single read-modify-write
+    that preserves every sibling metadata key. No filesystem, no transcript.
+
+    Provider-agnostic: nothing here is CC-specific; ``child_id`` is opaque and
+    optional on ``release`` (some Claude Code versions carry no id on
+    ``SubagentStop`` — the server then pops the oldest entry, count-correct).
+    The response returns ``children_count`` so a caller/test can assert the
+    ledger arithmetic without a second read.
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_children_ledger: terminal_id does not match route",
+        )
+    if body.op == "register":
+        if not body.child_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="invalid_children_ledger: register requires child_id",
+            )
+        count = register_terminal_child(terminal_id, body.child_id)
+    else:
+        count = release_terminal_child(terminal_id, body.child_id)
+    if count is None:
+        # Terminal vanished between the existence check and the mutation.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    return {
+        "success": True,
+        "terminal_id": terminal_id,
+        "op": body.op,
+        "children_count": count,
+    }
 
 
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")

@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/codex_v0145_idle_output.txt",
+  "captured_at": "2026-07-28T10:17:07-07:00 (last commit touching source; original capture date unknown)",
+  "notes": "v0.145.0 banner + composer placeholder, Context 100% left; no activity."
+}

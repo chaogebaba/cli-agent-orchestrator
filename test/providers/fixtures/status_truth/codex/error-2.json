@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "error",
+  "source": "copied byte-exact from test/providers/fixtures/codex_capacity_ghost_composer_2026-07-17.txt",
+  "captured_at": "2026-07-17T16:14:59-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "⚠ 'Selected model is at capacity' over an otherwise idle composer — error notice visible while seat looks idle."
+}

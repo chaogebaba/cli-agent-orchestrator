@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "waiting_user_answer",
+  "source": "copied byte-exact from test/providers/fixtures/codex_approval_modal.txt",
+  "captured_at": "2026-08-19T23:25:06+10:00 (last commit touching source; original capture date unknown)",
+  "notes": "'Command Approval Required' box modal, [a] Accept [d] Decline."
+}

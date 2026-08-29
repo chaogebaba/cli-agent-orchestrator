@@ -1,0 +1,85 @@
+- name: codex-usage-resets
+  enabled: true
+  match_mode: regex
+  question: 'You have \d+ usage limit resets available'
+  options: ["Yes, continue", "No, quit"]   # all must appear (normalized)
+  answer: wait                              # human-gated: never auto-spend usage-limit resets (user 2026-07-13)
+- name: codex-trust-dir
+  enabled: true
+  match_mode: contains
+  question: "Do you trust the contents of this directory?"
+  options: ["Yes, continue", "No, quit"]
+  answer: ["Enter"]
+- name: codex-hooks-trust
+  enabled: true
+  match_mode: regex
+  question: 'Hooks need review \d+ hooks? (is|are) new or changed'
+  options: ["Review hooks", "Trust all and continue", "Continue without trusting"]
+  answer: ["Down", "Enter"]   # option 2: Trust all and continue
+- name: codex-fork-workdir-choice
+  enabled: true
+  match_mode: contains
+  question: "Choose working directory to fork this session"
+  options: ["Use session directory", "Use current directory"]
+  answer: ["Down", "Enter"]   # option 2: current directory — CAO placed the pane there deliberately (worktree fork)
+- name: codex-resume-workdir-choice
+  enabled: true
+  match_mode: contains
+  question: "Choose working directory to resume this session"
+  options: ["Use session directory", "Use current directory"]
+  answer: ["Down", "Enter"]   # option 2: current directory — CAO placed the pane in its worktree deliberately (user 2026-08-29: decide, never ask)
+- name: codex-ratelimit-model-switch
+  enabled: true
+  match_mode: regex
+  question: 'Switch to \S+ for lower credit usage\?'
+  options: ["Keep current model", "Keep current model (never show again)"]
+  answer: ["Down", "Down", "Enter"]   # option 3: keep model + hide future reminders
+- name: codex-skills-toggle-panel
+  enabled: true
+  match_mode: contains
+  question: "Enable/Disable Skills Turn skills on or off. Your changes are saved automatically."
+  options: ["Press space or enter to toggle"]
+  answer: wait   # user 2026-07-12: always wait for a human on this panel
+- name: codex-update-available
+  enabled: true
+  match_mode: regex
+  question: 'Update available! [\d.]+ -> [\d.]+'
+  options: ["Update now", "Skip until next version"]
+  answer: wait   # user 2026-07-13: always wait for a human on CLI update prompts
+- name: codex-content-policy-banner
+  enabled: false   # DISABLED 2026-07-18: banner is display-only scrollback, not a dismissable dialog — typed answers can't clear it and re-fire/interleave into the composer (garbage "kkeeeepp ggooiinng"). Auto-responder false-positive-detecting non-blocking output is the real bug (F-ask). Handle manually until fixed.
+  match_mode: contains
+  question: "This content can't be shown We take extra caution with cybersecurity requests."
+  options: ["Trusted Access: https://openai.com/form/enterprise-trusted-access-for-cyber/"]
+  answer: ["k", "e", "e", "p", "space", "g", "o", "i", "n", "g", "Enter"]   # display-only refusal banner; work state intact (5 observed strikes 2026-07-17/18, samples in probes/error-pane-samples/) — typed continue-nudge (user-ratified 2026-07-18)
+
+- name: codex-additional-safety-checks
+  # 2026-07-18: pick "Keep waiting" — never auto-downgrade the model mid-task.
+  match_mode: contains
+  question: "Additional safety checks This request requires additional safety checks"
+  options: ["Retry with a faster model", "Keep waiting"]
+  answer: ["2", "Enter"]
+
+- name: codex-resume-working-directory
+  enabled: true
+  # User approved 2026-08-17: worktree-isolated codex resume asks which cwd to
+  # keep; "2" = use current directory (the worker's isolated worktree),
+  # session-scoped so non-worktree resumes are unaffected. Paths vary -> regex.
+  match_mode: regex
+  question: "Choose working directory to resume this session"
+  options: ["Use session directory", "Use current directory", "Press enter to continue"]
+  answer: ["Down", "Enter"]   # 2026-08-24: new codex menu (4 options) ignores digit keys — arrow to option 2 (current dir = isolated worktree); works on old 3-option menu too
+
+- name: codex-resume-working-directory-4opt
+  enabled: true
+  # 2026-08-27 F530 stopgap: 4-option variant of the resume-cwd menu did not
+  # match the existing rule post-F516 deploy (under investigation). Same
+  # user-ratified choice: current directory (worker's isolated worktree).
+  # RECURRED 2026-08-28 00:xx on terminal 84a2df11: dialog text contained every
+  # listed option yet neither this rule nor the regex rule fired (matcher bug,
+  # not a rule gap). User re-ratified "current directory". Edit bumps mtime to
+  # force hot-reload re-evaluation.
+  match_mode: contains
+  question: "Choose working directory to resume this session"
+  options: ["Always use current directory"]
+  answer: ["Down", "Enter"]

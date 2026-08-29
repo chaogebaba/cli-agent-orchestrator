@@ -1,0 +1,7 @@
+{
+  "provider": "cline_cli",
+  "state": "working",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:8 (live CAO pane cline_dev-91d92890 — self-capture of the corpus-builder grunt's own pane, provider cline_cli per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "Self-capture mid-task: own [run_commands] rows streaming; fleet API status=processing, fusion_reason=pane_delta."
+}

@@ -1,0 +1,29 @@
+
+%
+
+
+7e2ad242 on  cao/7e2ad242 via 🐍 v3.14.7 on ☁
+❯
+%
+
+
+7e2ad242 on  cao/7e2ad242 via 🐍 v3.14.7 on ☁
+❯ echo ready
+echoready
+%
+
+
+7e2ad242 on  cao/7e2ad242 via 🐍 v3.14.7 on ☁
+❯ codex resume --dangerously-bypass-approvals-and-sandbox --no-alt-screen --disa
+ble shell_snapshot --model gpt-5.6-sol -c 'mcp_servers.cao-mcp-server.command="/
+rver"' -c 'mcp_servers.cao-mcp-server.args=[]' -c 'mcp_servers.cao-mcp-server.en
+v.CAO_TERMINAL_ID="7e2ad242"' -c 'mcp_servers.cao-mcp-server.env.CAO_INSTANCE_ID
+rvcodex resume --dangerously-bypass-approvals-and-sandbox --no-alt-screen --disa
+ble shell_snapshot --model gpt-5.6-sol -c 'mcp_servers.cao-mcp-server.command="/
+home/chao/.local/bin/cao-mcp-server"' -c 'mcp_servers.cao-mcp-server.args=[]' -c
+ 'mcp_servers.cao-mcp-server.env.CAO_TERMINAL_ID="7e2ad242"' -c 'mcp_servers.cao
+-mcp-server.env.CAO_INSTANCE_ID=""' -c 'mcp_servers.cao-mcp-server.env.CAO_ENDPO
+INT="http://127.0.0.1:9889"' -c 'mcp_servers.cao-mcp-server.env_vars=["CAO_TERMI
+NAL_ID", "CAO_TERMINAL_TOKEN"]' -c mcp_servers.cao-mcp-server.tool_timeout_sec=6
+00.0 -c 'model_reasoning_effort="high"' -c features.multi_agent=false -c check_f
+or_update_on_startup=false 01a04bbf-1c1a-72b0-90fd-adaaa4f9c495 -c

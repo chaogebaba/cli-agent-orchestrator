@@ -433,6 +433,20 @@ def overlays_store_dir() -> Path:
     return local_agent_store_dir() / "overlays"
 
 
+def routing_toml_path() -> Path:
+    """F497 D9 routing-binding store, resolved at call time.
+
+    Authored at ``orchestrator/routing.toml`` in the repo; synced into the local
+    agent-store SIBLING (``agent-store/routing.toml``) by ``install.sh`` alongside
+    the positions/overlays fragments, so the running server resolves it without a
+    repo checkout. ``CAO_ROUTING_TOML`` overrides for tests/fixtures (mirrors the
+    positions/overlays store-dir pattern)."""
+    raw = os.environ.get("CAO_ROUTING_TOML", "").strip()
+    if raw:
+        return Path(raw)
+    return local_agent_store_dir() / "routing.toml"
+
+
 # =============================================================================
 # Database Configuration
 # =============================================================================

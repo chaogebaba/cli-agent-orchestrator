@@ -15,7 +15,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import receiver_state_view
-from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService
+from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService, _CaptureResult
 from cli_agent_orchestrator.services.question_state import QuestionStateService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
@@ -48,7 +48,7 @@ def wired(monkeypatch):
 def _seed_stable_pane(pane, sm, terminal_id, published, k=5):
     """K identical samples — the byte-stable dialog the §1 bug relies on."""
     with (
-        patch.object(pane, "_capture", return_value=("stable", "tail")),
+        patch.object(pane, "_capture", return_value=_CaptureResult("stable", "tail", None, 0, ())),
         patch.object(sm, "get_published_status", return_value=published),
     ):
         for _ in range(k):
@@ -114,7 +114,14 @@ def test_ac18_parity_zero_mismatch_on_fusion_only_difference(wired):
     sm._last_status["t1"] = TerminalStatus.IDLE
     # fp changed last sample -> rule 3a downgrades IDLE -> PROCESSING (fused).
     with (
-        patch.object(pane, "_capture", side_effect=[("a", "t"), ("b", "t")]),
+        patch.object(
+            pane,
+            "_capture",
+            side_effect=[
+                _CaptureResult("a", "t", None, 0, ()),
+                _CaptureResult("b", "t", None, 0, ()),
+            ],
+        ),
         patch.object(sm, "get_published_status", return_value=TerminalStatus.IDLE),
     ):
         pane.observe("t1", monitor=sm)
@@ -160,7 +167,7 @@ def test_ac18_parity_zero_mismatch_on_fusion_only_difference(wired):
             monitor=sm,
         )
     assert recorded, "record_comparison should have been called in collecting phase"
-    (args, kwargs) = recorded[0]
+    args, kwargs = recorded[0]
     # collecting records (legacy_answer, rs.answer); both fused to PROCESSING.
     legacy_answer, rs_answer = args[2], args[3]
     assert legacy_answer is TerminalStatus.PROCESSING

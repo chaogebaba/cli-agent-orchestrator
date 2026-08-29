@@ -64,6 +64,12 @@ def _render_fleet(payload: dict[str, Any]) -> None:
         status_cell = terminal["status"]
         if terminal.get("fusion_changed"):
             status_cell = f"{status_cell}*"
+        # F568 D12c: a seat that is idle/completed with children in flight reads
+        # `delegating (N)` — `working` stays reserved for the seat's own open
+        # turn. `delegating` is the projection the fleet builder already computed
+        # over the FINAL status + children ledger; the CLI only formats it.
+        if terminal.get("delegating"):
+            status_cell = f"delegating ({int(terminal.get('children_count', 0))})"
         rows.append(
             (
                 str(terminal["window_index"]) if terminal["window_index"] is not None else _MISSING,

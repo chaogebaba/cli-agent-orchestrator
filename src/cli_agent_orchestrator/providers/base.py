@@ -293,6 +293,18 @@ class BaseProvider(ABC):
         """
         pass
 
+    def rule3a_busy_marker(self, snapshot: str) -> bool | None:
+        """F568 D12d busy-marker veto hook for rule 3a. Default: no signal.
+
+        Returns ``True``/``False``/``None`` for whether the provider's own
+        activity marker is live in ``snapshot`` (the plain pane string the
+        liveness sampler already holds). ``None`` means "no provider signal" —
+        legacy rule 3a applies unchanged. Only ``claude_code`` overrides this
+        (it has a TUI turn spinner and a hook bus); every other provider keeps
+        the default ``None`` so its rule-3a behaviour is byte-identical.
+        """
+        return None
+
     # Opt-in flag for pyte-rendered status detection. A provider sets this True
     # ONLY when it ships a purpose-built get_status_from_screen() calibrated for
     # a composited fixed-height viewport (not the raw byte stream). When False,

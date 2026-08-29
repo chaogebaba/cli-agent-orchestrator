@@ -3824,6 +3824,156 @@ def read_terminal_system_metadata(terminal_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# F568 D12a: children ledger (in-flight subagent count on the terminal row)
+#
+# The seat's own Claude Code hooks write this ledger: a ``PreToolUse`` edge on
+# an ``Agent|Task`` dispatch registers a child; the paired ``SubagentStop``
+# releases it. The ledger lives at the FREE-FORM ``metadata_json["children"]``
+# top-level key — exactly the list D12d's frozen READ side counts
+# (``pane_liveness._children_count_from_metadata`` reads
+# ``metadata["metadata"]["children"]`` and returns its ``len``). D12b realises
+# "the pane-delta hold never expires while children > 0" off that same count.
+#
+# Both mutators are a single read-modify-write inside one ``SessionLocal``
+# transaction, so concurrent register/release edges cannot interleave a stale
+# read with a write. Sibling free-form keys (and the reserved ``cao`` system
+# namespace) are preserved verbatim — the ledger write is strictly additive to
+# the rest of the terminal's metadata (unlike the worker full-replace path).
+#
+# Staleness bound: a missed ``SubagentStop`` (child crashed, hook dropped) must
+# not pin the seat ``delegating`` forever. Each entry carries a wall-clock
+# ``started_at``; on every register/release we prune entries older than
+# ``max_age_s`` first, so a stuck entry ages out of the count. The frozen READ
+# side stays a pure ``len`` — the bound is enforced here at write time, not in
+# the count.
+# ---------------------------------------------------------------------------
+
+_CHILDREN_LEDGER_KEY = "children"
+# Default staleness bound. Deliberately generous: a legitimate in-harness Agent
+# can run for many minutes (the motivating incident had a 10+ min subagent). The
+# bound only exists so a MISSED release cannot pin the row indefinitely.
+_CHILDREN_LEDGER_MAX_AGE_S = 3600.0
+
+
+def _children_ledger_max_age_s() -> float:
+    try:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        return float(
+            ConfigService.get("liveness.children_ledger_max_age_s", _CHILDREN_LEDGER_MAX_AGE_S)
+        )
+    except Exception:
+        return _CHILDREN_LEDGER_MAX_AGE_S
+
+
+def _prune_stale_children(
+    children: List[Dict[str, Any]], now_ts: float, max_age_s: float
+) -> List[Dict[str, Any]]:
+    """Drop entries whose ``started_at`` is older than ``max_age_s``.
+
+    An entry with a missing/malformed ``started_at`` is KEPT (fail toward
+    still-in-flight: dropping a live child would under-count and prematurely
+    admit an idle bound). Only a well-formed, provably-old timestamp prunes.
+    """
+    kept: List[Dict[str, Any]] = []
+    for entry in children:
+        if not isinstance(entry, dict):
+            continue
+        started_at = entry.get("started_at")
+        if isinstance(started_at, (int, float)) and (now_ts - float(started_at)) > max_age_s:
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _load_free_form_metadata(terminal: "TerminalModel") -> Dict[str, Any]:
+    import json as _json
+
+    if not terminal.metadata_json:
+        return {}
+    try:
+        parsed = _json.loads(str(terminal.metadata_json))
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def register_terminal_child(
+    terminal_id: str, child_id: str, started_at: Optional[float] = None
+) -> Optional[int]:
+    """Append one ``{id, started_at}`` entry to the terminal's children ledger.
+
+    Returns the new children count, or ``None`` if the terminal does not exist.
+    Idempotent on ``child_id``: a duplicate ``PreToolUse`` edge for the same
+    dispatch does not double-count. Prunes stale entries first (staleness bound).
+    """
+    import json as _json
+    import time as _time
+
+    now_ts = _time.time() if started_at is None else float(started_at)
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return None
+        meta = _load_free_form_metadata(terminal)
+        raw = meta.get(_CHILDREN_LEDGER_KEY)
+        children: List[Dict[str, Any]] = list(raw) if isinstance(raw, list) else []
+        children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+        if not any(isinstance(e, dict) and e.get("id") == child_id for e in children):
+            children.append({"id": child_id, "started_at": now_ts})
+        meta[_CHILDREN_LEDGER_KEY] = children
+        terminal.metadata_json = _json.dumps(meta)
+        db.commit()
+    invalidate_terminal_metadata_cache(terminal_id)
+    return len(children)
+
+
+def release_terminal_child(terminal_id: str, child_id: Optional[str] = None) -> Optional[int]:
+    """Remove one entry from the terminal's children ledger.
+
+    Returns the new children count, or ``None`` if the terminal does not exist.
+    When ``child_id`` is given the matching entry is removed; a ``SubagentStop``
+    that carries no reliable id (id fields vary across Claude Code versions)
+    passes ``None`` and the OLDEST entry is popped — count-correct because Claude
+    Code pairs each dispatch with exactly one stop. A release with no matching
+    entry (empty ledger, unknown id) is a no-op that still returns the count.
+    """
+    import json as _json
+    import time as _time
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return None
+        meta = _load_free_form_metadata(terminal)
+        raw = meta.get(_CHILDREN_LEDGER_KEY)
+        children: List[Dict[str, Any]] = (
+            [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        )
+        children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+        if child_id is not None:
+            for idx, entry in enumerate(children):
+                if entry.get("id") == child_id:
+                    del children[idx]
+                    break
+        elif children:
+            # No id: pop the oldest by started_at (FIFO), count-correct pairing.
+            oldest = min(
+                range(len(children)),
+                key=lambda i: children[i].get("started_at", 0.0),
+            )
+            del children[oldest]
+        if children:
+            meta[_CHILDREN_LEDGER_KEY] = children
+        else:
+            meta.pop(_CHILDREN_LEDGER_KEY, None)
+        terminal.metadata_json = _json.dumps(meta) if meta else None
+        db.commit()
+    invalidate_terminal_metadata_cache(terminal_id)
+    return len(children)
+
+
+# ---------------------------------------------------------------------------
 # F175: Dedicated dedup high-water accessors (clobber-proof)
 # F476 D5: Readers/writers REMOVED — columns kept for backward compat.
 # ---------------------------------------------------------------------------

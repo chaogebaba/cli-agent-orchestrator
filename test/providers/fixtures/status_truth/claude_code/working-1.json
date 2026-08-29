@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "working",
+  "source": "recovered byte-exact via git show cao/4fd45dca:test/providers/fixtures/f568/spinner-cascading.txt (worker worktree discarded after terminal deletion; branch tip 801598d7 — see README)",
+  "captured_at": "2026-08-29T04:27-04:40Z (window per f568 README)",
+  "notes": "Live '✻ Cascading… (…)' spinner above composer box — f568 D12d busy-marker positive."
+}

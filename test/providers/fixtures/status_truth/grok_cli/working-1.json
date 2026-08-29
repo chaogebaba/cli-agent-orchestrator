@@ -1,0 +1,7 @@
+{
+  "provider": "grok_cli",
+  "state": "working",
+  "source": "copied byte-exact from test/providers/fixtures/grok_cli_processing.txt",
+  "captured_at": "2026-08-16T13:33:33+10:00 (last commit touching source; original capture date unknown)",
+  "notes": "'⠦ Waiting for response… 0.7s' spinner, Esc:cancel hint."
+}

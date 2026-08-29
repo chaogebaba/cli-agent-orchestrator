@@ -1374,7 +1374,7 @@ class CodexProvider(BaseProvider):
             argv.extend(["--model", model])
         for key, value in config.items():
             argv.extend(["-c", _toml_override(key, value)])
-        argv.append("Reply exactly: SEED_OK then stop.")
+        argv.append("Say hello.")
         logger.info(f"codex seed_resume_identity: starting seed for {agent_profile} in {cwd}")
         try:
             completed = subprocess.run(
@@ -1393,7 +1393,13 @@ class CodexProvider(BaseProvider):
             raise RuntimeError("seed_exec_failed") from exc
         logger.info(f"codex seed_resume_identity: completed rc={completed.returncode}")
         if completed.returncode != 0:
-            raise RuntimeError("seed_exec_failed")
+            stdout = completed.stdout or ""
+            tail = "\n".join(stdout.splitlines()[-10:])
+            logger.error(
+                f"codex seed_resume_identity: exec rc={completed.returncode} for "
+                f"{agent_profile}; last 10 stdout lines:\n{tail}"
+            )
+            raise RuntimeError(f"seed_exec_failed rc={completed.returncode}: {tail[-400:]}")
         matches: set[str] = set(
             re.findall(
                 r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
@@ -1746,9 +1752,7 @@ class CodexProvider(BaseProvider):
             if len(matches) > 1:
                 # B5 r7: identity-validate ambiguous candidates via session_meta.
                 # mtime orders candidates, but identity decides.
-                validated = self._identity_filter_rollout_candidates(
-                    matches, session_uuid
-                )
+                validated = self._identity_filter_rollout_candidates(matches, session_uuid)
                 if validated:
                     return validated
                 # Fallback: mtime (best-effort, logged as ambiguous).
@@ -1769,9 +1773,7 @@ class CodexProvider(BaseProvider):
             if len(matches) == 1:
                 return matches[0]
             if len(matches) > 1:
-                validated = self._identity_filter_rollout_candidates(
-                    matches, resume_uuid
-                )
+                validated = self._identity_filter_rollout_candidates(matches, resume_uuid)
                 if validated:
                     return validated
                 return max(matches, key=lambda p: p.stat().st_mtime)
@@ -1892,10 +1894,7 @@ class CodexProvider(BaseProvider):
                 # truncated in the rollout.  Both candidate and message must be
                 # of distinctive length, and the match is prefix-equality (not
                 # arbitrary substring containment).
-                if (
-                    len(norm_candidate) >= min_distinctive_len
-                    and len(norm_message) > 40
-                ):
+                if len(norm_candidate) >= min_distinctive_len and len(norm_message) > 40:
                     # Prefix equality: the shorter of (candidate[:200], message[:200])
                     # must equal the other's same-length prefix.
                     prefix_len = min(200, len(norm_candidate), len(norm_message))
@@ -1949,10 +1948,7 @@ class CodexProvider(BaseProvider):
                 if norm_candidate == norm_message:
                     count += 1
                     break
-                if (
-                    len(norm_candidate) >= min_distinctive_len
-                    and len(norm_message) > 40
-                ):
+                if len(norm_candidate) >= min_distinctive_len and len(norm_message) > 40:
                     prefix_len = min(200, len(norm_candidate), len(norm_message))
                     if norm_candidate[:prefix_len] == norm_message[:prefix_len]:
                         count += 1
@@ -2973,9 +2969,7 @@ class CodexProvider(BaseProvider):
         if captured is None:
             return CodexSubmitBaseline()
         fingerprints, _prompt_idx, chip_counts = CodexProvider._extract_submitted_turns(captured)
-        chip_counter = Counter(
-            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
-        )
+        chip_counter = Counter(f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0)
         return CodexSubmitBaseline(
             turn_fingerprints=frozenset(fingerprints),
             chip_counter=tuple(sorted(chip_counter.items())),
@@ -3041,9 +3035,7 @@ class CodexProvider(BaseProvider):
         #    baseline multiset for that exact N. A same-N repeat dispatch only
         #    counts once the post-send count exceeds the baseline count, so a
         #    pre-existing identical chip cannot confirm (BLOCKER 1: same-N).
-        post_chip_counter = Counter(
-            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
-        )
+        post_chip_counter = Counter(f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0)
         for chip, post_count in post_chip_counter.items():
             if post_count > baseline.chip_count(chip):
                 return CODEX_SUBMIT_STATE_SUBMITTED
@@ -3240,7 +3232,8 @@ class CodexProvider(BaseProvider):
             """
             try:
                 captured = backend.get_history(
-                    session, window,
+                    session,
+                    window,
                     tail_lines=PYTE_SCREEN_ROWS,
                     strip_escapes=False,
                 )
@@ -3249,9 +3242,7 @@ class CodexProvider(BaseProvider):
             except Exception:
                 return False
             # Check pane for new submitted turn (fast path)
-            new_task_state = self._pane_shows_new_submitted_task(
-                captured, message, baseline
-            )
+            new_task_state = self._pane_shows_new_submitted_task(captured, message, baseline)
             if new_task_state == CODEX_SUBMIT_STATE_SUBMITTED:
                 return True
             # Also check the Working/Thinking spinner
@@ -3271,7 +3262,8 @@ class CodexProvider(BaseProvider):
             """
             try:
                 captured = backend.get_history(
-                    session, window,
+                    session,
+                    window,
                     tail_lines=PYTE_SCREEN_ROWS,
                     strip_escapes=False,
                 )
@@ -3299,6 +3291,7 @@ class CodexProvider(BaseProvider):
                     from cli_agent_orchestrator.services.draft_guard import (
                         DeliveryDeferredError,
                     )
+
                     raise DeliveryDeferredError(
                         f"F435 r7 B2: pre-paste composer already held a draft "
                         f"(chip {baseline.pre_paste_chip_count} chars) within "
@@ -3343,8 +3336,7 @@ class CodexProvider(BaseProvider):
         while time.monotonic() < poll_deadline:
             if _rollout_confirms():
                 logger.info(
-                    "F435 submit-verify: terminal %s confirmed via rollout "
-                    "structural signal",
+                    "F435 submit-verify: terminal %s confirmed via rollout " "structural signal",
                     self.terminal_id,
                 )
                 return
@@ -3459,15 +3451,15 @@ class CodexProvider(BaseProvider):
             # the actual keystroke.
             try:
                 pre_enter_pane = backend.get_history(
-                    session, window,
+                    session,
+                    window,
                     tail_lines=PYTE_SCREEN_ROWS,
                     strip_escapes=False,
                 )
                 if isinstance(pre_enter_pane, str):
                     pre_enter_chip = self._active_composer_chip_count(pre_enter_pane)
                     if pre_enter_chip is None or (
-                        own_chip_count is not None
-                        and abs(pre_enter_chip - own_chip_count) > 1
+                        own_chip_count is not None and abs(pre_enter_chip - own_chip_count) > 1
                     ):
                         # Chip gone between re-check and now — the submit may
                         # have landed (TOCTOU race). Skip this Enter, re-poll.
