@@ -375,7 +375,10 @@ def test_r9_recorded_position_sha_matches_helper():
         assert (
             row["position_sha"] == recomputed
         ), f"recorded position_sha {row['position_sha']} != helper {recomputed} (r9)"
-        assert row["outcome"] == "UNCERTIFIED"  # P2 seeds both cells UNCERTIFIED
+        # AC15 three-outcome contract (PASS/FAIL/UNCERTIFIED). P2 seeded both cells
+        # UNCERTIFIED; P4 records the real AC15 results (kiro re-run pending →
+        # UNCERTIFIED, codex → FAIL), so the row is any valid outcome, not a P2 seed.
+        assert row["outcome"] in {"PASS", "FAIL", "UNCERTIFIED"}
 
 
 def test_meta_keys_never_reach_agent_profile():
