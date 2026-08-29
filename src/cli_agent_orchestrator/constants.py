@@ -440,6 +440,25 @@ def overlays_store_dir() -> Path:
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
+# F554 (#410): SQLite writer-contention hardening for the shared ORM engine.
+# Default journal_mode=DELETE takes a whole-database exclusive lock for every
+# write and, with no busy_timeout, a concurrent writer fails INSTANTLY with
+# "database is locked" instead of waiting. Under concurrent assigns this killed
+# workers in deferred init. WAL lets readers and a single writer coexist;
+# busy_timeout makes a would-be writer WAIT (in the C layer) instead of raising.
+# busy_timeout is per-connection; journal_mode=WAL is a persistent per-database
+# property (set idempotently on every connect). >=5s per the issue.
+#
+# Durability window (S1): the connect listener also sets synchronous=NORMAL,
+# the standard companion to WAL. Under NORMAL+WAL, a COMMIT is durable against
+# an APPLICATION crash, but the last committed transaction(s) whose WAL frames
+# have not yet been checkpointed to the main DB file CAN be lost on an OS crash
+# or power loss (unlike synchronous=FULL, which fsyncs the WAL on every commit).
+# This is an accepted trade for CAO's coordination DB — the state is
+# reconstructable from live tmux/provider sessions on restart, and the win is
+# far fewer fsyncs under the concurrent-assign write load that caused #410.
+CAO_DB_BUSY_TIMEOUT_MS = 5000
+
 # =============================================================================
 # Server Configuration
 # =============================================================================
