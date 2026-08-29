@@ -92,13 +92,19 @@ SEED_RULES: Dict[str, str] = {
   match_mode: regex
   question: 'You have \\d+ usage limit resets available'
   options: ["Yes, continue", "No, quit"]   # all must appear (normalized)
-  answer: ["Enter"]                         # tmux special-key names, 0.1s apart
+  answer: wait                              # human-gated: never auto-spend usage-limit resets
 - name: codex-trust-dir
   enabled: true
   match_mode: contains
   question: "Do you trust the contents of this directory?"
   options: ["Yes, continue", "No, quit"]
   answer: ["Enter"]
+- name: codex-trust-dir-subdir
+  enabled: true
+  match_mode: contains
+  question: "subdirectory of a Git project. Trusting will apply to the repository root"
+  options: ["Press enter to continue"]
+  answer: ["Enter"]   # worktree seats: option 1 (Yes, continue) is pre-selected
 - name: codex-resume-working-directory
   enabled: true
   match_mode: contains
