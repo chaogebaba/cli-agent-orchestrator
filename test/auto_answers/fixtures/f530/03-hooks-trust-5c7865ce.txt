@@ -1,0 +1,11 @@
+
+  Hooks need review
+  1 hook is new or changed.
+  Hooks can run outside the sandbox after you trust them.
+  Trusting hooks...
+
+›    Review hooks
+     Trust all and continue
+     Continue without trusting (hooks won't run)
+
+  Press enter to confirm or esc to go back

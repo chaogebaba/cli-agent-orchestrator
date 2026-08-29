@@ -1,0 +1,15 @@
+# F530 #386 corpus sidecar. See test_f530_corpus.py header for the contract.
+expected_rule: codex-hooks-trust
+occurrence: "occ (2026-08-29 03:41Z) — codex startup hooks-trust dialog; issue paraphrases it as 'trust-directory' but the real pane (5c7865ce.log) is the HOOKS-need-review dialog"
+terminal: 5c7865ce
+provenance: "https://github.com/chaogebaba/cli-subagents/issues/386#issuecomment-5460130584"
+# PASS case (regression guard): REAL composited pyte render (cols=80) of the
+# hooks-trust dialog from ~/.aws/cli-agent-orchestrator/logs/terminal/5c7865ce.log.
+# No progress spinner coexists in this log, so on the current tree the frame
+# matches codex-hooks-trust (regex question + all 3 options present) AND
+# classifies WAITING → would fire. NOTE: the live no-fire for this terminal was
+# logged as reason=no_rule_matched with window=the zsh shell prompt (same
+# tail-anchoring shape as fixture 01) — i.e. the dialog fired only once it
+# reached the tail; the settled dialog frame itself is matchable, which is what
+# this guard pins. See the corpus test's hypothesis note for 01.
+xfail: false
