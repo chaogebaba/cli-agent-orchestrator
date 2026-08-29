@@ -2424,7 +2424,6 @@ class CodexProvider(BaseProvider):
         """Return the effective model resolved during command build."""
         return getattr(self, "_resolved_model", None)
 
-
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
         """Block orchestrated input while Codex is showing an interactive dialog."""

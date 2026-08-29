@@ -28,8 +28,7 @@ _CHOOSER_PANE = "\n".join(
     ]
 )
 
-_RULES_YAML = textwrap.dedent(
-    """\
+_RULES_YAML = textwrap.dedent("""\
     - name: codex-resume-working-directory
       enabled: true
       match_mode: regex
@@ -42,8 +41,7 @@ _RULES_YAML = textwrap.dedent(
       question: "Do you trust the contents of this directory?"
       options: ["Yes, continue", "No, quit"]
       answer: ["Enter"]
-    """
-)
+    """)
 
 
 @pytest.fixture()
@@ -74,7 +72,9 @@ def test_auto_answers_test_reports_match_and_chrome_region(tmp_path, _isolated_r
 
 def test_auto_answers_test_names_failing_field_when_no_rule_matches(tmp_path, _isolated_rules):
     pane = tmp_path / "pane.txt"
-    pane.write_text("just some ordinary output\n\u203a Ask Codex to do anything\n", encoding="utf-8")
+    pane.write_text(
+        "just some ordinary output\n\u203a Ask Codex to do anything\n", encoding="utf-8"
+    )
 
     result = CliRunner().invoke(cli, ["auto-answers", "test", "codex", str(pane)])
 

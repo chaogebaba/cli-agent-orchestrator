@@ -68,10 +68,19 @@ def auto_answers_test(provider: str, pane_textfile: Path) -> None:
     for rule in rules:
         if rule["matched"]:
             any_match = True
-            click.echo(f"  ✓ {rule['name']} (mode={rule['match_mode']}) → MATCH answer={rule['answer']!r}")
+            click.echo(
+                f"  ✓ {rule['name']} (mode={rule['match_mode']}) → MATCH answer={rule['answer']!r}"
+            )
         else:
             click.echo(
                 f"  ✗ {rule['name']} (mode={rule['match_mode']}) → reject: {rule['reject_reason']}"
             )
     click.echo("")
-    click.echo("verdict: " + ("a rule MATCHES (would fire/wait)" if any_match else "NO rule matched (unknown-dialog push)"))
+    click.echo(
+        "verdict: "
+        + (
+            "a rule MATCHES (would fire/wait)"
+            if any_match
+            else "NO rule matched (unknown-dialog push)"
+        )
+    )

@@ -615,7 +615,13 @@ _F530_CHROME_BELOW = [
 def test_f530_layer1_chrome_rows_dropped_keep_chooser_in_tail():
     """F530 layer 1: dialog_region drops codex footer chrome before slicing the
     tail, so the chooser (with chrome below it) stays inside the tail and the
-    whitelist rule can match .normalized (the F55 AST invariant is untouched)."""
+    whitelist rule can match .normalized (the F55 AST invariant is untouched).
+
+    Mutation caught: deleting the `_drop_chrome_rows` call in dialog_region (or
+    making chrome_row_patterns() return []) re-admits the footer rows into the
+    tail — the `esc to interrupt`/`Ask Codex` asserts flip and the non-blank
+    row count changes from 8. Inverting the F55 scrollback guard (dropping
+    genuine output too) makes the final assert fail."""
     provider = _codex_provider()
     screen = _F530_CHOOSER_ROWS + _F530_CHROME_BELOW
 
@@ -637,9 +643,16 @@ def test_f530_layer1_chrome_rows_dropped_keep_chooser_in_tail():
 
 
 def test_f530_layer2_resume_chooser_classifies_waiting_despite_spinner():
-    """F530 layer 2: the resume-cwd chooser is a hard modal — codex cannot be
-    "working" while blocked on it — so it classifies WAITING_USER_ANSWER even
-    when a '• Working' spinner coexists, so the D6 gates do not veto the fire."""
+    """F530 layer 2 (PROVEN ROOT CAUSE): the resume-cwd chooser is a hard modal
+    — codex cannot be "working" while blocked on it — so it classifies
+    WAITING_USER_ANSWER even when a '• Working' spinner coexists, so the D6
+    busy-veto does not veto the fire.
+
+    Mutation caught: restoring main's `not progress_rows and
+    RESUME_CWD_CHOOSER_PATTERN` guard in emit_screen_signals re-suppresses the
+    waiting signal whenever a spinner row is present, so the spinner variant
+    (second assert) demotes to PROCESSING and this test fails. This is the exact
+    regression that caused occurrences #1-#15."""
     provider = _codex_provider()
 
     assert (
@@ -654,7 +667,12 @@ def test_f530_layer2_resume_chooser_classifies_waiting_despite_spinner():
 
 def test_f530_layer3_reject_reason_names_failing_field():
     """F530 layer 3: Rule.reject_reason names WHY a rule does not match — the
-    failing field — so a stalled dialog is diagnosable from the decisions log."""
+    failing field — so a stalled dialog is diagnosable from the decisions log.
+
+    Mutation caught: dropping the `disabled` short-circuit makes the disabled
+    assert return a field name instead of "disabled"; swapping regex/contains
+    branches flips the question(regex)/question(contains) reasons; skipping the
+    options loop makes the option[No, quit] assert return None."""
     rule = ar.Rule(
         "codex-trust-dir",
         True,
@@ -672,9 +690,7 @@ def test_f530_layer3_reject_reason_names_failing_field():
     )
     # full match → None
     assert (
-        rule.reject_reason(
-            "Do you trust the contents of this directory? Yes, continue No, quit"
-        )
+        rule.reject_reason("Do you trust the contents of this directory? Yes, continue No, quit")
         is None
     )
     # disabled → disabled (short-circuits before field checks)
@@ -687,7 +703,13 @@ def test_f530_layer3_reject_reason_names_failing_field():
 
 def test_f530_layer3_diagnose_rules_reports_region_and_verdicts(monkeypatch):
     """F530 layer 3: diagnose_rules returns the region + per-rule verdicts with
-    no side effects, powering `cao auto-answers test`."""
+    no side effects, powering `cao auto-answers test`.
+
+    Mutation caught: making diagnose_rules match against region.normalized
+    (unfiltered) instead of match_region.normalized would leak chrome into the
+    match window (the `esc to interrupt not in match_normalized` assert fails);
+    dropping the reject_reason call makes the codex-trust-dir reject_reason
+    assert fail."""
     from cli_agent_orchestrator.providers.codex import CodexProvider
 
     trust = ar.Rule(
@@ -698,13 +720,9 @@ def test_f530_layer3_diagnose_rules_reports_region_and_verdicts(monkeypatch):
         ["Yes, continue", "No, quit"],
         ["Enter"],
     )
-    monkeypatch.setattr(
-        ar._store, "get_rules", lambda provider: _f530_resume_rules() + [trust]
-    )
+    monkeypatch.setattr(ar._store, "get_rules", lambda provider: _f530_resume_rules() + [trust])
 
-    report = ar.diagnose_rules(
-        "codex", _F530_CHOOSER_ROWS + _F530_CHROME_BELOW, CodexProvider
-    )
+    report = ar.diagnose_rules("codex", _F530_CHOOSER_ROWS + _F530_CHROME_BELOW, CodexProvider)
     assert report["provider"] == "codex"
     assert report["chrome_filtered"] is True
     # chrome dropped from the match region, present in the unfiltered region.
@@ -722,7 +740,13 @@ def test_f530_resume_chooser_under_chrome_fires_end_to_end(monkeypatch, _reset_e
     """F530 end-to-end: real 2 rules + real CodexProvider + the chooser under
     live footer chrome → the auto-responder fires Down+Enter (option 2, current
     dir) instead of pushing 'unknown blocking dialog'. Occurrence-9 (cf2a83bc)
-    decisions log showed this as a flood of no_rule_matched with rare firing."""
+    decisions log showed this as a flood of no_rule_matched with rare firing.
+
+    Mutation caught: reverting EITHER layer regresses this test — restoring the
+    `not progress_rows` guard in codex.py demotes the frame to PROCESSING so the
+    fire is busy-vetoed (sent == []), and removing the chrome filter lets the
+    footer displace the chooser on a tall pane. This is the deadlock the whole
+    fix exists to prevent, asserted at the send-keys boundary."""
     sent = []
     _wire_common(monkeypatch, sent_keys=sent)
     pushed = _capture_pushes(monkeypatch)
@@ -1271,7 +1295,6 @@ def test_wpq1_production_fresh_capture_confirms_once_without_overwriting_screen(
         )
     finally:
         status_monitor._screens.pop("term1", None)
-
 
 
 # ---------------------------------------------------------------------------

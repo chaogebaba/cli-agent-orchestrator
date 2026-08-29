@@ -53,6 +53,7 @@ def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
         return f"{profile}-{terminal_id}"
     return terminal_id
 
+
 AUTO_ANSWER_DIR = CAO_HOME_DIR / "auto-answers"
 AUTO_ANSWER_LOG_DIR = CAO_HOME_DIR / "logs" / "auto-answers"
 
@@ -530,15 +531,11 @@ class AutoResponder:
             #   moving + no-mark/no-cache → defer (return verdict)
             with self._lock:
                 banner_mark = self._prefilter_verdict.get(terminal_id_key)
-                history = (
-                    self._region_history.get(terminal_id_key, []) if terminal_id_key else []
-                )
+                history = self._region_history.get(terminal_id_key, []) if terminal_id_key else []
                 newest = history[-1] if history else None
-            still_moving = (
-                newest is not None
-                and _digest_normalized(newest.normalized)
-                != _digest_normalized(region.normalized)
-            )
+            still_moving = newest is not None and _digest_normalized(
+                newest.normalized
+            ) != _digest_normalized(region.normalized)
             if banner_mark and still_moving:
                 return None
             return RuleMatchVerdict(
@@ -699,11 +696,15 @@ class AutoResponder:
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
                 if fresh is None:
-                    self._log_decision(terminal_id, "no_match", "wait_rule_capture_failed", rule.name)
+                    self._log_decision(
+                        terminal_id, "no_match", "wait_rule_capture_failed", rule.name
+                    )
                     return None
                 fresh_region = self._region_from_capture(fresh, self._chrome_patterns(provider))
                 if not rule.matches(fresh_region.normalized):
-                    self._log_decision(terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name)
+                    self._log_decision(
+                        terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name
+                    )
                     return None
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
@@ -855,9 +856,7 @@ class AutoResponder:
                 settle=_digest_normalized(attempt_region.normalized),
                 consume=region.consume_digest,
             )
-            if not self._effect_barrier(
-                terminal_id, metadata, provider, rule, attempt_region
-            ):
+            if not self._effect_barrier(terminal_id, metadata, provider, rule, attempt_region):
                 return
             if not self._send_answer(terminal_id, metadata, rule, incarnation):
                 return
