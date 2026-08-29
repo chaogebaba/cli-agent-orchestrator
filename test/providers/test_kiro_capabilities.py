@@ -373,3 +373,48 @@ def test_builds_explicit_v2_and_deterministic_kas_commands():
         "--agent",
         "developer",
     ]
+
+
+def test_build_kiro_command_appends_resume_id_kas():
+    """F560: --resume-id sits after `chat`/trust flags on the KAS engine."""
+    assert build_kiro_command(KiroEngine.KAS, "kiro_dev", resume_session_id="sess_abc-123") == [
+        "kiro-cli",
+        "--v3",
+        "chat",
+        "--trust-all-tools",
+        "--resume-id",
+        "sess_abc-123",
+        "--agent",
+        "kiro_dev",
+    ]
+
+
+def test_build_kiro_command_appends_resume_id_v2_before_model():
+    """F560: --resume-id precedes --model on the v2 engine, after trust flags."""
+    assert build_kiro_command(
+        KiroEngine.V2,
+        "developer",
+        model="m1",
+        yolo=True,
+        legacy_ui=True,
+        resume_session_id="sess_xyz",
+    ) == [
+        "kiro-cli",
+        "chat",
+        "--agent-engine",
+        "v2",
+        "--legacy-ui",
+        "--trust-all-tools",
+        "--resume-id",
+        "sess_xyz",
+        "--model",
+        "m1",
+        "--agent",
+        "developer",
+    ]
+
+
+def test_build_kiro_command_omits_resume_id_when_none():
+    """No --resume-id token when the id is None (back-compat shape)."""
+    cmd = build_kiro_command(KiroEngine.KAS, "developer", resume_session_id=None)
+    assert "--resume-id" not in cmd

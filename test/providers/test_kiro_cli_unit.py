@@ -1,6 +1,7 @@
 """Unit tests for Kiro CLI provider."""
 
 import re
+import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,7 +13,6 @@ from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-
 
 
 def load_fixture(filename: str) -> str:
@@ -59,7 +59,8 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} --agent developer",
         )
         mock_wait_status.assert_called_once()
 
@@ -117,13 +118,15 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -151,7 +154,8 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -176,6 +180,7 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} "
             "--model claude-opus-4-6 --agent developer",
         )
 
@@ -227,7 +232,9 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} "
+            "--model claude-opus-4.6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -281,6 +288,7 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} "
             "--model claude-opus-4.6 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
@@ -288,6 +296,7 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            f"--resume-id {provider.allocated_session_uuid} "
             "--model claude-opus-4.6 --agent developer",
         )
 
@@ -2478,3 +2487,186 @@ class TestKiroCliBlockedWaitPolicy:
         assert result is True
         # The second call should have seen None (reset done before the call)
         assert captured_policies[1] is None
+
+
+# =============================================================================
+# F560: session resume via id minting (claude_code pattern)
+# =============================================================================
+
+
+class TestKiroCliSessionResumeMint:
+    """Mint-at-spawn session identity and --resume-id launch (F560)."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_identity_guards(self):
+        """Patch F118 identity guards so init tests don't need a real agents dir."""
+        with (
+            patch.object(KiroCliProvider, "_assert_kiro_identity_guard"),
+            patch.object(KiroCliProvider, "_assert_postlaunch_identity"),
+        ):
+            yield
+
+    def _provider(self, engine=KiroEngine.KAS, fork_context=None):
+        return KiroCliProvider(
+            "term5560",
+            "sess",
+            "win-0",
+            "kiro_dev",
+            allowed_tools=["*"],
+            engine=engine,
+            fork_context=fork_context,
+        )
+
+    def test_fresh_spawn_mints_sess_prefixed_uuid(self):
+        """A fresh terminal mints a `sess_<uuid4>` id at construction."""
+        p = self._provider()
+        assert isinstance(p.allocated_session_uuid, str)
+        assert p.allocated_session_uuid.startswith("sess_")
+        # Body is a parseable uuid4.
+        body = p.allocated_session_uuid[len("sess_") :]
+        parsed = uuid.UUID(body)
+        assert parsed.version == 4
+
+    def test_two_providers_mint_distinct_ids(self):
+        assert self._provider().allocated_session_uuid != self._provider().allocated_session_uuid
+
+    def test_resume_fork_context_reuses_prior_id(self):
+        """On resume the prior session id is reused verbatim (not re-minted)."""
+        from cli_agent_orchestrator.models.terminal import ForkContext
+
+        ctx = ForkContext(
+            mode="resume",
+            session_uuid="sess_prior-1234",
+            base_name="base",
+            provider="kiro_cli",
+            initial_preamble="",
+        )
+        p = self._provider(fork_context=ctx)
+        assert p.allocated_session_uuid == "sess_prior-1234"
+        assert p.resume_session_uuid() == "sess_prior-1234"
+
+    def test_fresh_spawn_has_no_resume_seed(self):
+        """resume_session_uuid() is None on a fresh spawn (create path persists
+        allocated_session_uuid instead)."""
+        assert self._provider().resume_session_uuid() is None
+
+    def test_resume_session_id_launch_value_is_allocated_id(self):
+        """The launch --resume-id value is always the identity id."""
+        p = self._provider()
+        assert p._resume_session_id() == p.allocated_session_uuid
+
+    def test_capture_session_uuid_returns_allocated_without_subprocess(self):
+        """capture returns the minted id and never shells out for a new terminal."""
+        p = self._provider()
+        with patch(
+            "cli_agent_orchestrator.services.fork_context_service.capture_kiro_uuid"
+        ) as legacy:
+            got = p.capture_session_uuid(1234, 0.0, "/tmp/x")
+        assert got == p.allocated_session_uuid
+        legacy.assert_not_called()
+
+    def test_capture_session_uuid_legacy_fallback_when_unset(self):
+        """If the minted id is somehow absent, fall back to list-sessions capture."""
+        p = self._provider()
+        p.allocated_session_uuid = ""  # simulate a legacy terminal with no id
+        with patch(
+            "cli_agent_orchestrator.services.fork_context_service.capture_kiro_uuid",
+            return_value="sess_legacy-99",
+        ) as legacy:
+            got = p.capture_session_uuid(1234, 12.0, "/tmp/x")
+        assert got == "sess_legacy-99"
+        legacy.assert_called_once()
+
+    def test_not_opted_into_reauth_rebind_capture_seam(self):
+        """Mint pattern must NOT opt into the capture/validate seam."""
+        assert KiroCliProvider.supports_reauth_rebind is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_kas_launch_includes_resume_id(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """KAS (--v3) launch carries --resume-id <minted> after chat/trust flags."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        p = self._provider(engine=KiroEngine.KAS)
+        await p.initialize()
+
+        mock_tmux.return_value.send_keys.assert_called_once_with(
+            "sess",
+            "win-0",
+            "kiro-cli --v3 chat --trust-all-tools "
+            f"--resume-id {p.allocated_session_uuid} --agent kiro_dev",
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_resume_launch_reuses_prior_id_in_command(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """assign(resume=True) relaunch uses the SAME id via --resume-id."""
+        from cli_agent_orchestrator.models.terminal import ForkContext
+
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        ctx = ForkContext(
+            mode="resume",
+            session_uuid="sess_wake-me",
+            base_name="base",
+            provider="kiro_cli",
+            initial_preamble="",
+        )
+        p = self._provider(engine=KiroEngine.KAS, fork_context=ctx)
+        await p.initialize()
+
+        mock_tmux.return_value.send_keys.assert_called_once_with(
+            "sess",
+            "win-0",
+            "kiro-cli --v3 chat --trust-all-tools --resume-id sess_wake-me --agent kiro_dev",
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_resume_session_locked_raises_clear_error(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """A resume whose ready-wait fails with a session-locked banner raises
+        E-KIRO-SESSION-LOCKED instead of a bare timeout."""
+        from cli_agent_orchestrator.models.terminal import ForkContext
+
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False  # never reaches ready
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+        mock_tmux.return_value.get_history.return_value = (
+            "Session is active in another process (PID 4242). Exiting."
+        )
+
+        ctx = ForkContext(
+            mode="resume",
+            session_uuid="sess_locked-1",
+            base_name="base",
+            provider="kiro_cli",
+            initial_preamble="",
+        )
+        p = self._provider(engine=KiroEngine.KAS, fork_context=ctx)
+        with pytest.raises(RuntimeError, match="E-KIRO-SESSION-LOCKED"):
+            await p.initialize()
+
+    def test_detect_session_lock_false_on_clean_pane(self):
+        p = self._provider()
+        with patch("cli_agent_orchestrator.providers.kiro_cli.get_backend") as gb:
+            gb.return_value.get_history.return_value = "ask a question or describe a task"
+            assert p._detect_session_lock() is False

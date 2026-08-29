@@ -136,6 +136,8 @@ class ProviderManager:
                     allowed_tools,
                     engine=resolved_engine,
                     model=model,
+                    skill_prompt=skill_prompt,
+                    fork_context=fork_context,
                 )
             elif provider_type == ProviderType.GROK_CLI.value:
                 provider = GrokCliProvider(

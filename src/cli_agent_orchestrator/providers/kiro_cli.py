@@ -17,17 +17,19 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import json
 import logging
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, KIRO_AGENTS_DIR
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
 from cli_agent_orchestrator.services.settings_service import (
@@ -162,9 +164,38 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # Strings that indicate the agent encountered an error
 ERROR_INDICATORS = ["Kiro is having trouble responding right now"]
 
+# F560: session-lock banner. Kiro may refuse to resume a session id that is
+# still open in another live process, printing a line naming the holding PID.
+# On kiro-cli 2.20.1 no hard lock was observed for a concurrent --resume-id
+# (both processes attached), so this is a DEFENSIVE detector, not a verified
+# path: if a future/other build does emit such a banner during init, CAO
+# surfaces a clear E-KIRO-SESSION-LOCKED error instead of a bare init timeout.
+# In normal F444 wake the supervisor reaps the old worker before resuming, so
+# the lock (if any) is already released.
+SESSION_LOCKED_PATTERN = (
+    r"[Ss]ession is (?:active|already open|in use)(?:[^.\n]*)"
+    r"(?:another process|PID\s*\d+|process\s*\d+)"
+)
+E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
+
 
 class KiroCliProvider(BaseProvider):
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
+    # F560: Kiro session resume via id MINTING at spawn (claude_code pattern,
+    # NOT codex's /proc capture). The provider mints `sess_<uuid4>` in its
+    # constructor; terminal creation writes it to terminals.provider_session_id
+    # at create time (provider_session_id = resume_uuid or allocated_uuid). The
+    # launch always passes `--resume-id <allocated_session_uuid>`: a never-used
+    # id starts a fresh session that ADOPTS that id (verified live, kiro-cli
+    # 2.20.1), and a re-launch with the same id resumes the conversation. This
+    # is what makes F444 #299 hibernate/wake possible — assign(resume=True,
+    # fork_from=<id>) re-launches the same id so the worker wakes with context.
+    #
+    # Deliberately NOT supports_reauth_rebind: that seam captures+validates a
+    # session artifact at init, but a freshly minted id has no artifact until
+    # the first turn, so capture is both unnecessary (the id is authoritative
+    # by construction) and would spuriously fail. Mirrors claude_code, which
+    # also mints and does not opt into the capture seam.
     """Provider for Kiro CLI tool integration.
 
     This provider manages the lifecycle of a Kiro CLI chat session within a tmux window,
@@ -188,6 +219,8 @@ class KiroCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         engine: Optional[KiroEngine] = None,
         model: Optional[str] = None,
+        skill_prompt: Optional[str] = None,
+        fork_context: Optional[ForkContext] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -201,13 +234,34 @@ class KiroCliProvider(BaseProvider):
             model: Explicit per-call override for profile.model (see
                 _get_profile_model), e.g. a handoff/assign caller pinning a
                 specific model for one worker without a dedicated profile.
+            skill_prompt: Optional skill catalog text (unused by kiro today;
+                accepted for constructor parity with fork-capable providers).
+            fork_context: F560 — when present with mode=="resume", carries the
+                prior session id so initialize() relaunches with --resume-id.
         """
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        super().__init__(
+            terminal_id,
+            session_name,
+            window_name,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+            fork_context=fork_context,
+        )
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
+        # F560: session id identity. On resume the prior id is reused verbatim
+        # (so the same conversation is re-opened); on a fresh spawn we mint a
+        # new `sess_<uuid4>`. Either way it is passed as `--resume-id` at launch
+        # and written to terminals.provider_session_id at create time. Kiro's
+        # own v3 ids are `sess_`-prefixed; bare uuids also work (both verified
+        # live) but we mint the prefixed form to match kiro's native format.
+        if fork_context is not None and fork_context.mode == "resume":
+            self.allocated_session_uuid = fork_context.session_uuid
+        else:
+            self.allocated_session_uuid = f"sess_{uuid.uuid4()}"
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -227,7 +281,60 @@ class KiroCliProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved by the service layer."""
-        return getattr(self, '_model', None)
+        return getattr(self, "_model", None)
+
+    def resume_session_uuid(self) -> str | None:
+        """F560: the resume seed, used by the create path's settlement logic.
+
+        Returns the prior session id when this terminal was created to resume
+        (assign(resume=True) / fork_from=<uuid>), else None. On a fresh spawn
+        the create path persists ``allocated_session_uuid`` instead
+        (provider_session_id = resume_uuid or allocated_uuid).
+        """
+        if self._fork_context is not None and self._fork_context.mode == "resume":
+            return self._fork_context.session_uuid
+        return None
+
+    def _resume_session_id(self) -> Optional[str]:
+        """The ``--resume-id`` value for launch.
+
+        Always the terminal's identity id (minted on fresh spawn, or the prior
+        id on resume). A never-used id starts a fresh session that adopts it;
+        a re-used id resumes the conversation. So the launch is identical in
+        both cases — only the id's prior existence differs.
+        """
+        return self.allocated_session_uuid
+
+    def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
+        """F560: return the authoritative (minted/resumed) session id.
+
+        Because kiro's id is minted at spawn and passed via ``--resume-id``,
+        it needs no capture — the id is known before launch. This mirrors
+        claude_code/grok, which return their pre-allocated id. A list-sessions
+        capture is kept only as a legacy fallback (below) for a terminal that
+        somehow reaches here without an allocated id. ``pane_pid`` is unused.
+        """
+        if isinstance(self.allocated_session_uuid, str) and self.allocated_session_uuid:
+            return self.allocated_session_uuid
+        # Legacy fallback: no minted id (should not happen for new terminals).
+        from cli_agent_orchestrator.services.fork_context_service import capture_kiro_uuid
+
+        return capture_kiro_uuid(self._engine == KiroEngine.KAS, launch_time, cwd)
+
+    def _detect_session_lock(self) -> bool:
+        """F560: return True if the pane shows a session-locked banner.
+
+        Best-effort, read-only scan of current pane history for the
+        SESSION_LOCKED_PATTERN. Used only to turn an otherwise-opaque init
+        stall into a clear E-KIRO-SESSION-LOCKED error when resuming an id that
+        another live process still holds.
+        """
+        try:
+            history = get_backend().get_history(self.session_name, self.window_name)
+        except Exception:
+            return False
+        clean = re.sub(ANSI_CODE_PATTERN, "", history or "")
+        return re.search(SESSION_LOCKED_PATTERN, clean) is not None
 
     @property
     def paste_enter_count(self) -> int:
@@ -404,6 +511,11 @@ class KiroCliProvider(BaseProvider):
         #   timeout, preserving prior behavior for older kiro-cli versions).
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
+        # F560: always launch with --resume-id <allocated_session_uuid>. On a
+        # fresh spawn the id is newly minted, so kiro starts a new session and
+        # adopts it; on resume the id is the prior session's, so kiro re-opens
+        # the conversation. Same flag both ways (verified live, kiro-cli 2.20.1).
+        resume_id = self._resume_session_id()
 
         # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
         # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
@@ -425,6 +537,7 @@ class KiroCliProvider(BaseProvider):
                 model=model,
                 yolo=True,
                 legacy_ui=True,
+                resume_session_id=resume_id,
             )
         else:
             # Current CAO policy always bypasses Kiro's interactive approval
@@ -434,6 +547,7 @@ class KiroCliProvider(BaseProvider):
                 self._agent_profile,
                 model=model,
                 yolo=True,
+                resume_session_id=resume_id,
             )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
@@ -467,6 +581,16 @@ class KiroCliProvider(BaseProvider):
         # --trust-all-tools startup consent dialog (see its docstring), which
         # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
         if not await self._wait_ready_accepting_trust_dialog(blocked_policy=blocked_policy):
+            # F560: if this launch resumed a prior id and the pane shows a
+            # session-locked banner, surface a clear error rather than a bare
+            # timeout — the id is still held by another live process (should
+            # not happen once the old worker is reaped before wake).
+            if self._fork_context is not None and self._detect_session_lock():
+                raise RuntimeError(
+                    f"{E_KIRO_SESSION_LOCKED}: kiro session "
+                    f"'{self.allocated_session_uuid}' is still open in another "
+                    f"process; reap the prior worker before resuming."
+                )
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
                 suffix = (
@@ -497,6 +621,7 @@ class KiroCliProvider(BaseProvider):
                 model=model,
                 yolo=True,
                 legacy_ui=True,
+                resume_session_id=resume_id,
             )
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
@@ -1139,6 +1264,7 @@ class KiroCliProvider(BaseProvider):
         or the new TUI format.
         """
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002b")
         return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
 
