@@ -1,0 +1,6 @@
+Browse commands and keyboard shortcuts
+
+  /help    Show help
+  /quit    Quit the application
+
+  Type to filter

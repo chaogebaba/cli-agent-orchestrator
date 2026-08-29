@@ -1,0 +1,6 @@
+Choose the text style that looks best with your terminal:
+
+❯ 1. Dark mode
+  2. Light mode
+
+  Press Enter to continue

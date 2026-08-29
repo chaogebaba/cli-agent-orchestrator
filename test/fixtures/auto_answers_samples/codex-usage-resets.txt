@@ -1,0 +1,6 @@
+You have 3 usage limit resets available. Run /usage to use one.
+
+  › 1. Yes, continue
+    2. No, quit
+
+  Press enter to continue

@@ -1,0 +1,7 @@
+╭─ Question ─────────────────────────────────────────────╮
+│ ☐ Which approach should I take for the refactor?        │
+│                                                         │
+│ ☐ 1. Extract a helper                                   │
+│ ☑ 2. Inline the logic                                   │
+│ ✔ Submit                                                │
+╰─────────────────────────────────────────────────────────╯

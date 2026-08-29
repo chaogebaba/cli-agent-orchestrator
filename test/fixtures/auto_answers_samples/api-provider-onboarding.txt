@@ -1,0 +1,7 @@
+Who is your Claude API provider?
+
+❯ 1. Anthropic
+  2. Amazon Bedrock
+  3. Google Vertex AI
+
+  Press Enter to continue

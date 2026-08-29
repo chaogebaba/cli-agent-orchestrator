@@ -1,0 +1,6 @@
+Switch to gpt-5-mini for lower credit usage?
+
+  1. Keep current model
+  2. Keep current model (never show again)
+
+  Press enter to continue

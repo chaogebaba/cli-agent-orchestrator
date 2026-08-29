@@ -1,0 +1,7 @@
+Warning: Kiro is running in trust all tools mode
+
+  1. No, exit
+  2. Yes, I accept
+  3. Yes, and don't ask again
+
+  Select an option

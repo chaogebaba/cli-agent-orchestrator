@@ -1,0 +1,7 @@
+This folder is a subdirectory of a Git project. Trusting will apply to the
+repository root.
+
+  › 1. Yes, continue
+    2. No, quit
+
+  Press enter to continue

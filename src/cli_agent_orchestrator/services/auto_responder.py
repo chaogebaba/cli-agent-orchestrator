@@ -107,13 +107,15 @@ _PERMISSION_PROMPT_PATTERNS = (
 # the blueprint.
 SEED_RULES: Dict[str, str] = {
     "codex.yaml": """\
-# F597 #454: rules match against the CANONICAL form of the screen (NFKC,
-# lowercased, every non-[a-z0-9] char -> space, whitespace collapsed). Write
-# plain prose in `question`/`options` for `contains` rules — glyphs, box walls,
-# bullets, quotes, apostrophes and wrap points are all folded away, so no rule
-# needs \\W+. For `match_mode: regex` the pattern is applied to that same
-# canonical string (word/digit tokens survive the fold), so write lowercase
-# patterns over [a-z0-9 ] — e.g. digits in `\\d+` still match.
+# F597 #454: rules match against a CANONICAL form of the screen, in TWO domains.
+#   * match_mode: contains → FULL canonical (NFKC, lowercased, every
+#     non-[a-z0-9] char -> space, whitespace collapsed). Write plain prose;
+#     glyphs, box walls, bullets, quotes, apostrophes and wrap points are all
+#     folded away, so no rule needs \\W+.
+#   * match_mode: regex → LIGHT canonical (NFKC, lowercased, whitespace
+#     collapsed ONLY — PUNCTUATION PRESERVED), matched case-insensitively. Write
+#     lowercase-friendly patterns; punctuation your regex needs (?, !, version
+#     dots, ->, glyph anchors) survives, and \\d+ / word tokens still match.
 - name: codex-usage-resets
   enabled: true
   match_mode: regex
@@ -177,16 +179,42 @@ def canonicalize(text: str) -> str:
     return " ".join(folded.split())
 
 
-def normalize_screen(lines: List[str]) -> str:
-    """Flatten composited screen lines into the canonical match domain.
+def canonicalize_light(text: str) -> str:
+    """Light canonical fold for ``regex`` rules (F597 #454 B2).
 
-    Joins ``lines`` and returns their ``canonicalize`` fold. This is the single
-    producer of the ``normalized`` string that flows into every ``Rule`` match,
-    so rule matching is glyph/chrome/wrap insensitive without touching any call
-    site. Never match against raw ``lines``; the raw text (for diagnostics) is
+    Steps: NFKC-normalize → lowercase → collapse whitespace runs → strip.
+    Crucially, PUNCTUATION AND GLYPHS ARE PRESERVED (unlike the full
+    ``canonicalize``, which maps every non-``[a-z0-9]`` char to a space). This is
+    the domain ``regex`` rules match against: their patterns legitimately depend
+    on punctuation the full fold would erase — e.g. ``askuserquestion`` glyph
+    anchors, ``codex-ratelimit-model-switch``'s ``->``, ``codex-update-available``'s
+    version dots and ``!``. NFKC still normalizes fullwidth/compatibility forms
+    and lowercasing + IGNORECASE keep case-insensitivity, while wrap/whitespace
+    variance is collapsed so a wrapped card still matches. Applied to BOTH the
+    screen (``normalize_screen_light``) and each regex rule's pattern source at
+    load, so both sides share this domain.
+    """
+    return " ".join(unicodedata.normalize("NFKC", text).lower().split())
+
+
+def normalize_screen(lines: List[str]) -> str:
+    """Flatten composited screen lines into the FULL canonical match domain.
+
+    Joins ``lines`` and returns their ``canonicalize`` fold — the domain
+    ``contains`` rules match against, plus the domain digests / diagnostics use.
+    Never match against raw ``lines``; the raw text (for diagnostics) is
     recoverable by joining ``DialogRegion.rows``.
     """
     return canonicalize(" ".join(lines))
+
+
+def normalize_screen_light(lines: List[str]) -> str:
+    """Flatten composited screen lines into the LIGHT canonical domain.
+
+    The punctuation-preserving companion to ``normalize_screen`` that ``regex``
+    rules match against (F597 #454 B2).
+    """
+    return canonicalize_light(" ".join(lines))
 
 
 @dataclass(frozen=True)
@@ -200,6 +228,12 @@ class DialogRegion:
     # once at match time, never re-seeded, and is what D5's consume gate reads.
     settle_digest: str = ""
     consume_digest: str = ""
+    # F597 #454 B2: the LIGHT canonical form of the same rows (punctuation
+    # preserved). ``regex`` rules match against this; ``contains`` rules and all
+    # digests/diagnostics use ``normalized`` (full). Defaulted so the existing
+    # two-positional ``DialogRegion(rows, normalized)`` construction keeps
+    # working; ``dialog_region`` populates it from the same rows.
+    normalized_light: str = ""
 
     def with_digests(self, settle: str, consume: str) -> "DialogRegion":
         """Return a copy carrying the two pending-fire digests."""
@@ -208,6 +242,7 @@ class DialogRegion:
             normalized=self.normalized,
             settle_digest=settle,
             consume_digest=consume,
+            normalized_light=self.normalized_light,
         )
 
 
@@ -266,7 +301,12 @@ def dialog_region(
     while end and not filtered[end - 1].strip():
         end -= 1
     rows = tuple(filtered[max(0, end - DIALOG_REGION_LINES) : end])
-    return DialogRegion(rows=rows, normalized=normalize_screen(list(rows)))
+    row_list = list(rows)
+    return DialogRegion(
+        rows=rows,
+        normalized=normalize_screen(row_list),
+        normalized_light=normalize_screen_light(row_list),
+    )
 
 
 TerminalIncarnation = tuple[int, int, str, str]
@@ -312,7 +352,7 @@ def diagnose_rules(
     match_region = dialog_region(lines, chrome_patterns) if chrome_patterns else region
     rule_reports = []
     for rule in _store.get_rules(provider_name):
-        reason = rule.reject_reason(match_region.normalized)
+        reason = rule.reject_reason(match_region)
         rule_reports.append(
             {
                 "name": rule.name,
@@ -347,16 +387,20 @@ class Rule:
     _regex: "re.Pattern[str] | None" = field(init=False, repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        # F597 #454: precompute the canonical match forms once on load so every
-        # match shares the same domain as the canonicalized screen text. For
-        # ``contains`` the question is canonicalized. For ``regex`` the pattern
-        # is applied to the canonical screen string, which is lowercased with
-        # punctuation folded to single spaces — so the pattern is compiled
-        # case-insensitively (an authored ``You have`` still matches the folded
-        # ``you have``) while ``\d+`` and word tokens survive the fold. Options
-        # are always canonicalized (they are plain-prose substrings).
-        # ``question``/``options`` keep their authored text for display in reject
-        # reasons.
+        # F597 #454 B2: precompute the canonical match forms once on load so both
+        # sides of every match share ONE domain. TWO domains (gate decision):
+        #   * ``contains`` → the FULL canonical domain (``canonicalize``): NFKC →
+        #     lower → non-[a-z0-9]→space → collapse. Glyphs/punctuation/wrap are
+        #     folded away so plain-prose rules match a bordered card. The question
+        #     and options are canonicalized here.
+        #   * ``regex`` → the LIGHT canonical domain (``canonicalize_light``): NFKC
+        #     → lower → whitespace-collapse ONLY, PUNCTUATION PRESERVED, compiled
+        #     IGNORECASE. Shipped regex rules legitimately depend on punctuation
+        #     the full fold erases (askuserquestion glyphs, ``->``, version dots,
+        #     ``!``), so they must NOT be matched against the full domain. The
+        #     pattern is applied verbatim to the light screen string. Options are
+        #     still canonicalized against the FULL domain (plain-prose substrings).
+        # ``question``/``options`` keep their authored text for reject reasons.
         if self.match_mode == "regex":
             self._canon_question = self.question
             try:
@@ -391,36 +435,51 @@ class Rule:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
-    def matches(self, normalized: str) -> bool:
+    @staticmethod
+    def _domains(region: "DialogRegion | str") -> tuple[str, str]:
+        """Resolve (full, light) canonical strings from a region or bare string.
+
+        F597 #454 B2: rule matching needs BOTH domains. Callers pass a
+        ``DialogRegion`` (carrying both); a bare ``str`` is treated as the FULL
+        canonical form with light defaulting to it (back-compat for the few
+        diagnostic/string callers — only matters for regex rules, which the
+        region-passing callers always feed correctly)."""
+        if isinstance(region, DialogRegion):
+            return region.normalized, (region.normalized_light or region.normalized)
+        return region, region
+
+    def matches(self, region: "DialogRegion | str") -> bool:
         if not self.enabled:
             return False
+        full, light = self._domains(region)
         if self.match_mode == "regex":
-            if self._regex is None or not self._regex.search(normalized):
+            if self._regex is None or not self._regex.search(light):
                 return False
         else:
-            if self._canon_question not in normalized:
+            if self._canon_question not in full:
                 return False
-        return all(opt in normalized for opt in self._canon_options)
+        return all(opt in full for opt in self._canon_options)
 
-    def reject_reason(self, normalized: str) -> Optional[str]:
-        """F530 diagnosability: return WHY this rule does NOT match ``normalized``,
-        or None when it matches. Names the failing field so a stalled dialog is
-        diagnosable from the decisions log / CLI without a supervisor.
+    def reject_reason(self, region: "DialogRegion | str") -> Optional[str]:
+        """F530 diagnosability: return WHY this rule does NOT match, or None when
+        it matches. Names the failing field so a stalled dialog is diagnosable
+        from the decisions log / CLI without a supervisor.
 
-        ``normalized`` is the canonical screen string; the rule's own canonical
-        forms are compared against it. Reasons name the AUTHORED text so the log
-        is human-readable: ``disabled``, ``question(regex)``, ``question(contains)``,
-        ``option[<opt>]``.
+        F597 #454 B2: ``contains`` is checked against the FULL canonical domain,
+        ``regex`` against the LIGHT (punctuation-preserving) domain. Reasons name
+        the AUTHORED text so the log is human-readable: ``disabled``,
+        ``question(regex)``, ``question(contains)``, ``option[<opt>]``.
         """
         if not self.enabled:
             return "disabled"
+        full, light = self._domains(region)
         if self.match_mode == "regex":
-            if self._regex is None or not self._regex.search(normalized):
+            if self._regex is None or not self._regex.search(light):
                 return "question(regex)"
-        elif self._canon_question not in normalized:
+        elif self._canon_question not in full:
             return "question(contains)"
         for authored, canon in zip(self.options, self._canon_options):
-            if canon not in normalized:
+            if canon not in full:
                 return f"option[{authored}]"
         return None
 
@@ -611,19 +670,20 @@ class AutoResponder:
             return None
 
     @staticmethod
-    def _reject_summary(provider_name: str, normalized: str) -> str:
+    def _reject_summary(provider_name: str, region: "DialogRegion") -> str:
         """F530 diagnosability: for a 'no_rule_matched' eval, name WHY each rule
         rejected (rule + failing field) plus the first 80 chars of the CANONICAL
         window that was matched against. Written into the decisions log ``extra``
         field so this whole class of no-fire is diagnosable without a supervisor.
         The full canonical region is dumped once per distinct region by
-        ``_log_no_match_region`` (F597 #454)."""
+        ``_log_no_match_region`` (F597 #454). Takes the region so each rule sees
+        the correct domain (F597 #454 B2: contains→full, regex→light)."""
         parts: List[str] = []
         for rule in _store.get_rules(provider_name):
-            reason = rule.reject_reason(normalized)
+            reason = rule.reject_reason(region)
             if reason is not None:
                 parts.append(f"{rule.name}:{reason}")
-        window = normalized[:80]
+        window = region.normalized[:80]
         rejects = " ".join(parts) if parts else "no-rules"
         return f"rejects=[{rejects}] window={window!r}"
 
@@ -675,7 +735,7 @@ class AutoResponder:
         if not region.normalized:
             return None
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(region.normalized):
+            if not rule.matches(region):
                 continue
             # D6 banner path (r8-B/r9-S1): the cached banner-mark is HONORED ONLY
             # WHILE THE REGION IS STILL MOVING — this consult's fresh region
@@ -854,7 +914,7 @@ class AutoResponder:
         banner_marked = self._push_region_history(terminal_id, region)
 
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(match_region.normalized):
+            if not rule.matches(match_region):
                 continue
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
@@ -864,7 +924,7 @@ class AutoResponder:
                     )
                     return None
                 fresh_region = self._region_from_capture(fresh, self._chrome_patterns(provider))
-                if not rule.matches(fresh_region.normalized):
+                if not rule.matches(fresh_region):
                     self._log_decision(
                         terminal_id, "no_match", "wait_rule_fresh_mismatch", rule.name
                     )
@@ -955,7 +1015,7 @@ class AutoResponder:
             terminal_id,
             "no_match",
             "no_rule_matched",
-            extra=self._reject_summary(provider_name, match_region.normalized),
+            extra=self._reject_summary(provider_name, match_region),
         )
         self._log_no_match_region(terminal_id, match_region.normalized)
         unknown_result = self._check_unknown(
@@ -1073,12 +1133,12 @@ class AutoResponder:
                 return True
         chrome_patterns = self._chrome_patterns(provider)
         first = self._settle_capture(terminal_id, chrome_patterns)
-        if first is None or not rule.matches(first.normalized):
+        if first is None or not rule.matches(first):
             self._log_decision(terminal_id, "no_match", "settle_capture_failed", rule.name)
             return False
         _clock_sleep(SETTLE_INTERVAL_S)
         second = self._settle_capture(terminal_id, chrome_patterns)
-        if second is None or not rule.matches(second.normalized):
+        if second is None or not rule.matches(second):
             self._log_decision(terminal_id, "no_match", "settle_lost_frame", rule.name)
             return False
         if _digest_normalized(first.normalized) != _digest_normalized(second.normalized):
@@ -1141,7 +1201,7 @@ class AutoResponder:
             if not self._incarnation_is_current(terminal_id, incarnation):
                 return
             attempt_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
-            if attempt_region is None or not rule.matches(attempt_region.normalized):
+            if attempt_region is None or not rule.matches(attempt_region):
                 # D5: the dialog cleared — record the FROZEN consume_digest so a
                 # later identical redraw of the same region is not re-fired.
                 if attempt_region is not None:
@@ -1162,7 +1222,7 @@ class AutoResponder:
         if not self._incarnation_is_current(terminal_id, incarnation):
             return
         final_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
-        if final_region is not None and rule.matches(final_region.normalized):
+        if final_region is not None and rule.matches(final_region):
             self._surface_retry_exhausted(
                 terminal_id,
                 metadata,
@@ -1585,7 +1645,7 @@ class AutoResponder:
             self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
         )
         status = self._classify_region(terminal_id, provider, region)
-        if not rule.matches(match_region.normalized):
+        if not rule.matches(match_region):
             return False  # dialog cleared / no longer matches — no retry
         if self._busy_veto(status):
             self._request_detection_retry(terminal_id)

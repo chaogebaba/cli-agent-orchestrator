@@ -111,3 +111,108 @@ def test_mutant_identity_canonicalize_fails_card(monkeypatch: pytest.MonkeyPatch
     # card's walls/wrap, not the prompt wording).
     plain = ar.normalize_screen(_fixture_lines("codex_trust_0150_plain.txt"))
     assert mutant_rule.matches(plain)
+
+
+# ---------------------------------------------------------------------------
+# B3: NFKC is load-bearing
+# ---------------------------------------------------------------------------
+
+
+def test_nfkc_folds_fullwidth_and_circled_digits() -> None:
+    """B3: NFKC normalization maps fullwidth letters and circled digits to their
+    ASCII forms BEFORE the [a-z0-9] fold, so a fullwidth-rendered prompt reduces
+    to the same tokens as its ASCII form. Without NFKC these code points are not
+    in [a-z0-9] and would be erased to spaces."""
+    assert ar.canonicalize("ＡＢＣ①") == "abc1"
+    # Light domain (regex) also NFKC-normalizes.
+    assert ar.canonicalize_light("ＡＢＣ①") == "abc1"
+
+
+def test_fullwidth_trust_card_matches_only_with_nfkc(monkeypatch) -> None:
+    """B3: a fullwidth-glyph trust card matches the plain codex-trust-dir rule
+    only because NFKC folds the fullwidth chars to ASCII. Drop NFKC (lower-only)
+    and the same fixture no longer matches — proving NFKC is load-bearing."""
+    rule = _codex_rules_via_tmp()["codex-trust-dir"]
+    lines = _fixture_lines("codex_trust_fullwidth.txt")
+
+    # With NFKC (production): fullwidth question folds to ASCII → matches.
+    assert rule.matches(ar.dialog_region(lines)), (
+        "fullwidth card should match with NFKC; got "
+        f"{rule.reject_reason(ar.dialog_region(lines))!r}"
+    )
+
+    # MUTANT: drop NFKC from the full fold (lower + [a-z0-9] map only). The
+    # fullwidth code points are not in [a-z0-9] → erased to spaces → the anchor
+    # is destroyed → no match. Re-parse the rule under the mutant too.
+    def _no_nfkc(text: str) -> str:
+        folded = text.lower()
+        folded = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else " " for ch in folded)
+        return " ".join(folded.split())
+
+    monkeypatch.setattr(ar, "canonicalize", _no_nfkc)
+    mutant_rule = _codex_rules_via_tmp()["codex-trust-dir"]
+    mutant_region = ar.dialog_region(lines)  # normalize_screen uses ar.canonicalize
+    assert not mutant_rule.matches(mutant_region), (
+        "without NFKC the fullwidth card must NOT match; canonical=" f"{mutant_region.normalized!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B4: no-match region log is deduped per terminal/region
+# ---------------------------------------------------------------------------
+
+
+def test_log_no_match_region_dedupes_per_terminal_region(tmp_path, monkeypatch) -> None:
+    """B4: two identical _log_no_match_region calls for the same terminal+region
+    write exactly ONE decisions-log record; a fresh write is allowed after
+    clear_terminal()."""
+    monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+    engine = ar.AutoResponder()
+    canonical = "do you trust the contents of this directory 1 yes continue 2 no quit"
+
+    engine._log_no_match_region("term-b4", canonical)
+    engine._log_no_match_region("term-b4", canonical)  # identical → deduped
+
+    log_path = tmp_path / "term-b4.decisions.log"
+    dumps = [
+        line
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "reason=region_dump" in line
+    ]
+    assert len(dumps) == 1, f"expected exactly one region_dump, got {len(dumps)}: {dumps}"
+
+    # After clear_terminal, the dedupe memory is purged → a fresh dump is written.
+    engine.clear_terminal("term-b4")
+    engine._log_no_match_region("term-b4", canonical)
+    dumps_after = [
+        line
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "reason=region_dump" in line
+    ]
+    assert (
+        len(dumps_after) == 2
+    ), f"a fresh dump must be written after clear_terminal(); got {len(dumps_after)}"
+
+
+def test_mutant_remove_dedupe_writes_two_records(tmp_path, monkeypatch) -> None:
+    """MUTANT: neutralize the dedupe set → two identical calls write TWO records,
+    proving the dedupe is load-bearing (gate B4 mutant)."""
+    monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+    engine = ar.AutoResponder()
+
+    # Mutant: make the seen-set a throwaway so membership never persists.
+    class _NoMemory(dict):
+        def setdefault(self, *_a, **_k):
+            return set()
+
+    engine._logged_region_hashes = _NoMemory()
+    canonical = "some persistent unmatched dialog region text"
+    engine._log_no_match_region("term-mut", canonical)
+    engine._log_no_match_region("term-mut", canonical)
+
+    dumps = [
+        line
+        for line in (tmp_path / "term-mut.decisions.log").read_text().splitlines()
+        if "reason=region_dump" in line
+    ]
+    assert len(dumps) == 2

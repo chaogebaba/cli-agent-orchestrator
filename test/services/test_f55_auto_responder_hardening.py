@@ -101,7 +101,13 @@ def test_dialog_region_strips_only_trailing_blank_rows_and_preserves_rendered_ro
     assert region.normalized == "header dialog row option"
 
 
-def test_all_rule_match_call_sites_receive_a_dialog_region_normalized_value():
+def test_all_rule_match_call_sites_receive_a_dialog_region_value():
+    """F55 invariant (updated for F597 #454 B2): every production ``rule.matches``
+    call passes a DialogRegion (never raw ``.rows``). Before B2 each site passed
+    ``<region>.normalized`` (a single canonical string); B2 introduced a SECOND
+    canonical domain (full for contains, light for regex) so the sites now pass
+    the WHOLE region object — a bare Name — and Rule.matches selects the domain.
+    The invariant that matters is unchanged: matching never touches raw rows."""
     source = (
         Path(__file__).parents[2] / "src/cli_agent_orchestrator/services/auto_responder.py"
     ).read_text(encoding="utf-8")
@@ -113,16 +119,17 @@ def test_all_rule_match_call_sites_receive_a_dialog_region_normalized_value():
         and node.func.attr == "matches"
     ]
 
-    # F597 #454 pt2 (a): the settle gate added two more rule.matches() sites
-    # (the two settle captures, first/second). Both still receive a
-    # DialogRegion.normalized value, preserving the F55 AST invariant below.
+    # Settle (pt2) added two sites; all pass a region (Name) or a *.normalized
+    # attribute — never *.rows.
     assert len(calls) == 8
-    assert all(
-        len(call.args) == 1
-        and isinstance(call.args[0], ast.Attribute)
-        and call.args[0].attr == "normalized"
-        for call in calls
-    )
+    for call in calls:
+        assert len(call.args) == 1
+        arg = call.args[0]
+        if isinstance(arg, ast.Attribute):
+            assert arg.attr in ("normalized", "normalized_light"), ast.dump(arg)
+        else:
+            # A bare region variable (Name) carrying both canonical domains.
+            assert isinstance(arg, ast.Name), ast.dump(arg)
 
 
 def test_incident_variant2_is_suppressed_independently_by_region_and_busy_veto(
