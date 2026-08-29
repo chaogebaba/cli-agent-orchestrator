@@ -1746,11 +1746,11 @@ mod tests {
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 58, "expected 58 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 59, "expected 59 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            100,
-            "the three policy counts must account for all 100 leaf commands of the Click tree"
+            101,
+            "the three policy counts must account for all 101 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1760,8 +1760,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            99,
-            "DISPLAY_ORDER must list 99 DISTINCT commands; a duplicate would let one command go \
+            101,
+            "DISPLAY_ORDER must list 101 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1934,6 +1934,8 @@ mod tests {
 
             // Every variant, each passed through the exhaustive map above.
             [
+                CommandId::DoctorCheck,
+                CommandId::DoctorReadopt,
                 CommandId::Info,
                 CommandId::Init,
                 CommandId::Install,

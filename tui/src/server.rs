@@ -296,6 +296,9 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::ConfigList => None,
         CommandId::ConfigPath => None,
         CommandId::ConfigSet => None,
+        // HIDE, routeless: config preflight validates configuration health before server start;
+        // an operational-only check with no HTTP route (catalog classifies it Hidden).
+        CommandId::ConfigPreflight => None,
         CommandId::EnvGet => None,
         CommandId::EnvList => None,
         CommandId::EnvSet => None,
