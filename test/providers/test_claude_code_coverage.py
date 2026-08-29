@@ -7,13 +7,12 @@ regression where the echoed launch command false-matched the idle prompt).
 
 import re
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 # F254 D19: entire module exceeds unit budget (provider startup waits).
 pytestmark = pytest.mark.slow
-
 
 
 @pytest.fixture
@@ -61,18 +60,23 @@ class TestHandleStartupPromptsBranches:
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_bypass_permissions_prompt(self, mock_backend, mock_sleep, provider):
-        """Detects bypass permissions prompt and sends Down arrow + Enter via backend."""
-        mock_backend.get_history.return_value = (
-            "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
-        )
+        """Detects bypass prompt and selects 'Yes, I accept' via real Down+Enter.
+
+        F548 (#404): real special keys, not literal ESC[B. Focus defaults to
+        'No, exit' (row 1); after Down the settle re-read shows ❯ on 'Yes, I
+        accept', then Enter.
+        """
+        focus_no = "⚠ Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n"
+        focus_yes = "⚠ Bypass Permissions mode\n  1. No, exit\n❯ 2. Yes, I accept\n"
+        mock_backend.get_history.side_effect = [focus_no, focus_yes, "Welcome to Claude Code v2.5"]
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
-        # Down arrow sent via send_keys, Enter via send_special_key
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
+        assert mock_backend.send_special_key.call_args_list == [
+            call(provider.session_name, provider.window_name, "Down"),
+            call(provider.session_name, provider.window_name, "Enter"),
+        ]
+        mock_backend.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
@@ -109,11 +113,14 @@ class TestHandleStartupPromptsBranches:
 
         await provider._handle_startup_prompts(idle_gap=5.0)
 
-        # Trust dialog accepted via Enter — proves we did not early-return on the
-        # echoed "> memory_store" marker.
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
+        # Trust dialog accepted via Down+Enter (real special keys) — proves we did
+        # not early-return on the echoed "> memory_store" marker. F548 (#404):
+        # the fixture's second frame already focuses 'Yes, I trust this folder',
+        # so the settle poll confirms from the current pane.
+        assert mock_backend.send_special_key.call_args_list == [
+            call(provider.session_name, provider.window_name, "Down"),
+            call(provider.session_name, provider.window_name, "Enter"),
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
@@ -125,23 +132,36 @@ class TestHandleStartupPromptsBranches:
         await provider._handle_startup_prompts(idle_gap=1.0)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, provider):
-        """Trust prompt sends Enter and settles at idle gap (bounded iterations)."""
+    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, mock_time, provider):
+        """Trust prompt selects the affirmative row (Down+Enter) and settles at
+        idle gap (bounded iterations).
+
+        F548 (#404): bare Enter would confirm the default 'No, exit' and kill
+        the seat, so trust is now Down (onto 'Yes, I trust this folder') + Enter.
+        The trust branch now uses ``asyncio.sleep`` (not blocking ``time.sleep``)
+        to match the async-offload doctrine, so ``time.monotonic`` is mocked here
+        to drive the idle-gap exit deterministically instead of relying on a real
+        blocking sleep to advance wall-clock.
+        """
+        # outer_deadline, last_prompt_time, iter1 (trust @ t=1), reset, iter2 (gap
+        # 3-1=2 >= idle_gap 1 -> settle/return).
+        mock_time.monotonic.side_effect = [0.0, 0.0, 1.0, 1.0, 3.0]
         mock_backend.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
-        # With the trust branch setting any_prompt_handled=True, the handler
-        # settles after the idle gap.  Under instant-sleep mock it should NOT
-        # spin to the outer timeout (60s / hundreds of iterations).
-        assert mock_sleep.await_count <= 20
+        # F548 (#404): Down then Enter as real special keys; confirmed from the
+        # current pane (❯ already on the affirmative row), no send_keys ESC[B.
+        assert mock_backend.send_special_key.call_args_list == [
+            call(provider.session_name, provider.window_name, "Down"),
+            call(provider.session_name, provider.window_name, "Enter"),
+        ]
+        mock_backend.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch(
@@ -153,22 +173,30 @@ class TestHandleStartupPromptsBranches:
     async def test_external_imports_prompt_settles_at_idle_gap(
         self, mock_backend, mock_sleep, _mock_home, provider
     ):
-        """Lone external-imports prompt settles at idle gap, not outer timeout."""
-        mock_backend.get_history.return_value = (
+        """Lone external-imports prompt settles at idle gap, not outer timeout.
+
+        F548 (#404): reject via real Down + settle-confirm ❯ on 'No, disable
+        external imports' + Enter (real special keys, no literal ESC[B). Uses a
+        stateful capture: loop read shows focus on row 1, the settle re-read
+        shows ❯ moved onto the reject row, then the banner ends the loop.
+        """
+        focus_yes = (
             "Allow external CLAUDE.md file imports?\n"
-            "❯ 1. Yes\n"
-            "  2. No\n"
+            "❯ 1. Yes, allow external imports\n  2. No, disable external imports\n"
         )
+        focus_no = (
+            "Allow external CLAUDE.md file imports?\n"
+            "  1. Yes, allow external imports\n❯ 2. No, disable external imports\n"
+        )
+        mock_backend.get_history.side_effect = [focus_yes, focus_no, "Welcome to Claude Code v2.5"]
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
-        # External imports rejected via Down arrow + Enter
-        mock_backend.send_keys.assert_called_once()
-        mock_backend.send_special_key.assert_called_once_with(
-            provider.session_name, provider.window_name, "Enter"
-        )
-        # Settles at idle gap — bounded iterations, not 60s spin
-        assert mock_sleep.await_count <= 20
+        assert mock_backend.send_special_key.call_args_list == [
+            call(provider.session_name, provider.window_name, "Down"),
+            call(provider.session_name, provider.window_name, "Enter"),
+        ]
+        mock_backend.send_keys.assert_not_called()
 
 
 class TestDatabaseListAllTerminals:

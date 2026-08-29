@@ -1294,6 +1294,23 @@ class TmuxClient:
             result = pane.cmd("capture-pane", *flags)
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
+        except ValueError as e:
+            # F542 (#398): a genuinely-gone session/window is EXPECTED control
+            # flow — the pipe-pane liveness watchdog probes through here every
+            # tick and classifies this ValueError to reconcile the dead row.
+            # Logging it at ERROR made a dead session (e.g. tmux server lost to
+            # a reboot) emit a traceback-adorned ERROR every few seconds forever
+            # (incident 2026-08-28). Downgrade the known "gone" shapes to DEBUG;
+            # the caller still gets the raised ValueError to act on. Any other
+            # ValueError keeps ERROR visibility.
+            msg = str(e)
+            if (msg.startswith("Session '") and msg.endswith("' not found")) or (
+                msg.startswith("Window '") and "not found in session '" in msg
+            ):
+                logger.debug(f"get_history: {session_name}:{window_name} gone: {e}")
+            else:
+                logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
+            raise
         except Exception as e:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise

@@ -877,9 +877,7 @@ class TestParseEnvPairs:
     def test_value_under_cap_accepted(self):
         assert _parse_env_pairs(["SMALL=" + ("x" * 2047)]) == {"SMALL": "x" * 2047}
 
-    @pytest.mark.parametrize(
-        "pair", ["CAO_ARTIFACTS_DIR=", "CAO_ARTIFACTS_DIR=tmp/orch"]
-    )
+    @pytest.mark.parametrize("pair", ["CAO_ARTIFACTS_DIR=", "CAO_ARTIFACTS_DIR=tmp/orch"])
     def test_artifacts_dir_must_be_absolute(self, pair):
         import click as _click
 
@@ -1016,3 +1014,227 @@ def test_minimax_code_requires_workspace_access_confirmation():
     )
 
     assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+# ── F541 (#397): read-timeout confirm-then-attach ─────────────────────
+
+
+def test_launch_uses_launch_specific_timeout_not_mcp_timeout():
+    """The POST /sessions/start read timeout is the launch-specific bound, not
+    the 30s mcp_request_timeout (issue #397)."""
+    from cli_agent_orchestrator.cli.commands.launch import SESSION_START_TIMEOUT_S
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == SESSION_START_TIMEOUT_S
+
+
+def test_launch_read_timeout_then_poll_success_headless():
+    """A read timeout on POST is NOT a failure: poll the session, find the
+    supervisor terminal, and exit 0 in headless mode (issue #397)."""
+    import requests
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("read timeout=120")
+
+        # GET /sessions/<name> reports the supervisor terminal came up.
+        session_resp = MagicMock()
+        session_resp.status_code = 200
+        session_resp.json.return_value = {
+            "session": {"id": "claude-orch5"},
+            "terminals": [
+                {"id": "60d393b2", "name": "chao_supervisor", "session_name": "cao-claude-orch5"}
+            ],
+        }
+        mock_get.return_value = session_resp
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "chao_supervisor",
+                "--session-name",
+                "claude-orch5",
+                "--headless",
+                "--yolo",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "still initializing" in result.output
+        assert "Terminal created: chao_supervisor" in result.output
+        mock_get.assert_called()
+
+
+def test_launch_read_timeout_then_poll_success_attaches():
+    """Non-headless: after a read timeout, once the supervisor is confirmed the
+    normal attach path runs (issue #397 confirm-then-attach)."""
+    import requests
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("read timeout=120")
+        mock_wait.return_value = True
+
+        session_resp = MagicMock()
+        session_resp.status_code = 200
+        session_resp.json.return_value = {
+            "session": {"id": "claude-orch5"},
+            "terminals": [{"id": "60d393b2", "name": "sup", "session_name": "cao-claude-orch5"}],
+        }
+        mock_get.return_value = session_resp
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "sup", "--session-name", "claude-orch5", "--yolo"],
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_get_backend.return_value.attach_session.assert_called_once_with("cao-claude-orch5")
+
+
+def test_launch_read_timeout_then_poll_absent_errors():
+    """A read timeout followed by a poll that never finds the supervisor is a
+    'still initializing' error — distinct from 'server unreachable' (issue #397)."""
+    import requests
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+        patch("cli_agent_orchestrator.cli.commands.launch.time.monotonic") as mock_mono,
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("read timeout=120")
+
+        # 404 forever — session row never becomes visible.
+        session_resp = MagicMock()
+        session_resp.status_code = 404
+        mock_get.return_value = session_resp
+
+        # Drive the bounded poll loop to expire after a couple of iterations:
+        # deadline set on first call, then advance past it.
+        mock_mono.side_effect = [0.0, 1.0, 2.0, 999.0]
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "sup",
+                "--session-name",
+                "claude-orch5",
+                "--headless",
+                "--yolo",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "still initializing" in result.output
+        assert "could not be confirmed" in result.output
+        # Must NOT be misreported as a connection failure.
+        assert "Failed to connect to cao-server" not in result.output
+
+
+def test_launch_read_timeout_then_server_unreachable_errors_distinctly():
+    """If the confirm poll finds the server unreachable, that is reported as a
+    server-unreachable error, distinct from 'still initializing' (issue #397)."""
+    import requests
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("read timeout=120")
+        mock_get.side_effect = requests.exceptions.ConnectionError("refused")
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "sup",
+                "--session-name",
+                "claude-orch5",
+                "--headless",
+                "--yolo",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "became unreachable while confirming" in result.output
+
+
+def test_launch_read_timeout_without_session_name_cannot_confirm():
+    """Without --session-name the confirm poll cannot address the session, so a
+    read timeout surfaces as a 'still initializing / could not be confirmed'
+    error rather than a false success (issue #397)."""
+    import requests
+
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout("read timeout=120")
+
+        result = runner.invoke(launch, ["--agents", "sup", "--headless", "--yolo"])
+
+        assert result.exit_code != 0
+        assert "could not be confirmed" in result.output
+        mock_get.assert_not_called()
+
+
+# ── F541 (#397) r2: poll window must outlast the server init ceiling ──
+
+
+def test_launch_poll_window_covers_server_init_ceiling():
+    """The CLI confirm-then-attach poll bound must be >= the server's init
+    ceiling + margin, or the CLI gives up before the server does (#397).
+
+    claude_code's server-side init cap default is 180s (claude_code_init_timeout);
+    the poll bound and the POST read timeout are set to init_ceiling + 60s = 240s.
+    """
+    from cli_agent_orchestrator.cli.commands.launch import (
+        SESSION_START_POLL_TIMEOUT_S,
+        SESSION_START_TIMEOUT_S,
+    )
+
+    server_init_ceiling = 180  # claude_code_init_timeout default
+    margin = 60
+    assert SESSION_START_POLL_TIMEOUT_S >= server_init_ceiling + margin
+    assert SESSION_START_TIMEOUT_S >= server_init_ceiling + margin

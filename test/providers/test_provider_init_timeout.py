@@ -19,7 +19,7 @@ a longer per-profile override -- see ``TestKimiInitTimeoutWiring`` /
 ``TestAntigravityInitTimeoutWiring`` below.
 """
 
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -262,14 +262,20 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
             101.0,  # iter2: welcome banner -> return (composed continues after trust)
         ]
         mock_backend.get_history.side_effect = [
-            "Yes, I trust this folder",
+            "❯ Yes, I trust this folder",
             "Welcome to Claude Code v2.1.211",
         ]
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
         await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
-        mock_backend.send_special_key.assert_called_once()
+        # F548: trust affirmative = real Down + Enter special keys (the ❯-focused
+        # current pane confirms without a re-read, so no extra get_history).
+        assert mock_backend.send_special_key.call_args_list == [
+            call("sess", "win", "Down"),
+            call("sess", "win", "Enter"),
+        ]
+        mock_backend.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch(f"{_CC}.asyncio.sleep")

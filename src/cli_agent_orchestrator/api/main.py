@@ -126,7 +126,10 @@ from cli_agent_orchestrator.models.terminal import (
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.providers.claude_code import ProfileNotFoundError
+from cli_agent_orchestrator.providers.claude_code import (
+    ClaudeAuthError,
+    ProfileNotFoundError,
+)
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
 )
@@ -1669,6 +1672,23 @@ async def lifespan(app: FastAPI):
         logger.exception("Startup stale terminal purge failed; deferring to next boot")
     else:
         logger.info("purged %d stale terminals", purged)
+
+    # F542 (#398): reconcile terminal rows whose whole tmux_session is gone
+    # (e.g. the tmux server did not survive a host reboot). Runs BEFORE the
+    # FIFO re-arm below so a dead-session row is cleaned up once instead of
+    # being enrolled in the pipe-pane liveness watchdog, which would otherwise
+    # log "Failed to get history from <session>:<window>" every few seconds
+    # forever.
+    try:
+        reconcile_result = terminal_service.reconcile_dead_session_terminals()
+    except Exception:
+        logger.exception("Startup dead-session reconciliation failed; deferring to next boot")
+    else:
+        logger.info(
+            "startup_dead_session_reconcile reconciled=%d skipped_session_live=%d",
+            reconcile_result["reconciled"],
+            reconcile_result["skipped_session_live"],
+        )
 
     # D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
     try:
@@ -3737,6 +3757,26 @@ async def start_session_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": exc.code, "message": exc.detail},
+        ) from exc
+    except ClaudeAuthError as exc:  # F548 (#404): E-CLAUDE-AUTH -> JSON
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except TimeoutError as exc:
+        # F548 (#404): a provider init failure must surface as a STRUCTURED JSON
+        # error, not FastAPI's default text/plain 500. Two shapes reach here from
+        # ClaudeCodeProvider.initialize():
+        #   - ClaudeAuthError (subclass of the provider ProviderError, NOT
+        #     TimeoutError) — handled in its own arm below;
+        #   - a plain TimeoutError ("Claude Code initialization timed out after
+        #     Ns. Last pane lines: …") — the seat never reached a ready status.
+        # Map the latter to a 500 JSON body carrying the code and the message
+        # (which includes the pane tail), so the CLI/box e2e sees a parseable
+        # error instead of a bare "Internal Server Error" / connection hang.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "provider_init_timeout", "message": str(exc)},
         ) from exc
     except RuntimeError as exc:
         code = str(exc)

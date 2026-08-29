@@ -233,6 +233,15 @@ _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
+    # F541 (#397): Claude Code cold start (fresh MCP + Ink TUI, especially the
+    # first launch after a reboot) routinely takes 60-120s+ to render a ready
+    # status — well past the 60s global provider_init_timeout, which then tears
+    # a genuinely-healthy launch down. Give claude_code its own longer default
+    # init cap so the other providers keep the 60s global. A per-profile
+    # ``provider_init_timeout`` override still wins over this (see
+    # ClaudeCodeProvider.get_init_timeout). User-settable via settings.json or
+    # CAO_CLAUDE_CODE_INIT_TIMEOUT.
+    "claude_code_init_timeout": 180,
     "startup_prompt_handler_timeout": 20,
     "artifact_validate_deadline_s": 60.0,
     # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
@@ -256,6 +265,7 @@ _SERVER_ENV_VARS = {
     "mcp_request_timeout": "CAO_MCP_REQUEST_TIMEOUT",
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
+    "claude_code_init_timeout": "CAO_CLAUDE_CODE_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
     "artifact_validate_deadline_s": "CAO_ARTIFACT_VALIDATE_DEADLINE_S",
     "state_buffer_max": "CAO_STATE_BUFFER_MAX",
@@ -276,6 +286,11 @@ def get_server_settings() -> Dict[str, Any]:
       - event_bus_max_queue_size (1024): Max events buffered per subscriber
       - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE.
         Also the hard outer cap on total time the startup-prompt handler may run.
+      - claude_code_init_timeout (180): claude_code-specific init cap (#397).
+        Claude Code cold start (fresh MCP + Ink TUI) routinely exceeds the 60s
+        global default; ClaudeCodeProvider.get_init_timeout uses this instead so
+        other providers keep 60s. A per-profile provider_init_timeout override
+        still wins over this. Settable via CAO_CLAUDE_CODE_INIT_TIMEOUT.
       - startup_prompt_handler_timeout (20): Idle gap, in seconds, between
         consecutive startup prompts (e.g. workspace trust / bypass dialogs). The
         handler keeps polling and resets this timer every time it answers a
@@ -403,8 +418,7 @@ def get_memory_settings() -> Dict[str, Any]:
     persisted_enabled = result["enabled"]
     if persisted_enabled is not True and persisted_enabled is not False:
         logger.warning(
-            "Invalid memory.enabled=%r (expected JSON boolean); "
-            "treating as False (fail-closed)",
+            "Invalid memory.enabled=%r (expected JSON boolean); " "treating as False (fail-closed)",
             persisted_enabled,
         )
         result["enabled"] = False
@@ -527,7 +541,9 @@ def is_learning_enabled() -> bool:
     """
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", False)) and bool(settings.get("learning_enabled", False))
+        return bool(settings.get("enabled", False)) and bool(
+            settings.get("learning_enabled", False)
+        )
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
         return False
@@ -779,7 +795,6 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     settings["extra_skill_dirs"] = extra_skill_dirs
     _save(settings)
     return extra_skill_dirs
-
 
 
 # --- TUI settings (F489) ---
