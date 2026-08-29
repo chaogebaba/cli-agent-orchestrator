@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "waiting_user_answer",
+  "source": "copied byte-exact from test/providers/fixtures/wpq1_claude_2_1_211/resume-picker.txt",
+  "captured_at": "2026-07-16T20:28:49-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "'Resume session' picker dialog (Enter to select · Esc to cancel)."
+}

@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "error",
+  "source": "copied byte-exact from test/providers/fixtures/codex_content_policy_refusal_2026-07-17.txt",
+  "captured_at": "2026-07-18T08:56:59-04:00 (last commit touching source; original capture date unknown)",
+  "notes": "ⓘ 'This content can't be shown' content-policy refusal notice over idle composer."
+}

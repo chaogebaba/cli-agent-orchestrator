@@ -1,0 +1,144 @@
+    15+      for m in re.finditer(IDLE_PROMPT_PATTERN, t):
+    16+          lp = m
+    17+      if not lp:
+    18+          continue
+    19+      box = None
+    20+      for m in NEW_TUI_BOX_PATTERN.finditer(t):
+    21+          if m.start() <= lp.start() < m.end():
+    22+              box = m
+    23+      if not box:
+    24+          continue
+    25+      above = t[: box.start()].rstrip("\n").split("\n")
+    26+      for i, line in enumerate(reversed(above)):
+    27+          if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
+    28+              if i > best[0]:
+    29+                  best = (i, p)
+    30+              break
+    31+  print("max spinner distance-from-end:", best[0], best[1])
+● Shell ls /data/cao-scratch/4fd45dca/f568cap_r2/ | wc -l; uv run python /data/cao-scratch/4fd45dca/scan_r2.py /data/cao-scratch/4fd45dca/f568cap_r2; uv run python
+  /data/cao-scratch/4fd45dca/maxdist.py /data/cao-scratch/4fd45dca/f568cap_r2
+    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false
+
+  The capture finished (416 frames) and the max spinner distance is only 2. The natural layout on these seats keeps the spinner within 2 rows above the composer's chrome-trailing. To get
+  distance ≥4, I must induce multiple stacked callback › pushes while the seat spins.
+
+  The safe way to induce this: send several send_message deliveries to my own worktree terminal's parent won't help. Instead, I can create a throwaway claude_code worker seat myself, give it
+  a task that keeps it spinning, and send it multiple messages so › push rows stack above its composer while the spinner runs — then capture that seat read-only. But spawning a claude worker
+  is heavyweight and the routing may not have a claude dev.
+
+  Let me reconsider. Re-reading the gate's mutation-2 analysis: the mutation is window 6 → 4. For the mutation to be KILLED, I need a fixture where the spinner is at post-strip-distance in
+  {4,5} (window 6 reaches, window 4 doesn't).
+
+  The real live ›-push capture shows the pattern: spinner, ⎿, blank, ›, blank, rail. The two blanks are the issue — one gets stripped, and blanks within the window are skipped anyway, so they
+  don't consume window budget effectively... wait, they DO consume window budget (the window is a fixed row count, blanks included). Let me re-examine: window slices the last N rows including
+   blanks, then skips blanks during iteration. So blanks DO count toward the window size.
+
+  So in the ›-push fixture: post-strip above = [..., L35 spinner, L36 ⎿, L37 blank, L38 ›]. above[-4:] = [L35,L36,L37,L38]. Spinner at L35 IS in the last-4. distance-from-end = 3 (L38=0,
+  L37=1, L36=2, L35=3). Window 4 → indices 0-3 → reaches spinner.
+
+  For window-6-load-bearing: spinner must be at distance 4 or 5 (window 6 reaches 0-5; window 4 reaches 0-3). So I need 4-5 chrome rows (any mix of ⎿/blank/›/effort-footer, but NOT the last
+  trailing blank which is stripped) between the spinner and the post-strip end.
+
+  The natural captures don't produce this. I'll induce it by creating a claude_code worker and flooding it with messages while it spins. Let me check if there's a claude_code dev profile I
+  can assign.
+● find_profiles
+    ╰ query=claude code developer worker
+
+  There are claude_code profiles. Spawning a full claude worker to induce a specific TUI layout is heavyweight and token-costly, and I'd be flooding it with messages — invasive.
+
+  Let me step back and think about the cleanest legitimate path. The gate explicitly said: "Add a byte-exact fixture ... where the spinner sits exactly 5 or 6 rows above the rail with
+  ⎿/blank/effort-footer/› rows in between ... Confirm by running the mutant locally yourself."
+
+  The gate is not forbidding me from capturing such a layout — it's a real TUI state that occurs when a spinning seat has multiple pending callback pushes and hint rows. I can reproduce it
+  deterministically on a claude seat I control by delivering multiple messages while it spins. Let me spawn a short-lived claude worker with a task that spins for a while (e.g., "count slowly
+  / think"), then send it 2-3 messages to stack › push rows, and capture.
+
+  Actually — the existing supervisor seats DO accumulate › rows. The issue is timing: I need the capture at the exact moment the spinner + multiple pushes + hint coexist above the composer.
+  Let me capture the b93 seat much more densely (sub-second) over a longer window specifically when it's mid-turn with pending callbacks. But b93 is my supervisor — capturing read-only is
+  explicitly allowed.
+
+  Let me try a different, reliable inducement: assign a claude worker a task, and while it works, send it 3 messages in quick succession (they queue as › push rows since it's busy), then
+  densely capture it. Let me spawn a cheap sonnet claude dev.
+● assign
+    ╰ agent_profile=developer-sonnet, message=FIXTURE-INDUCTION TASK (F568 D12d, harmless): Please think step by step and take about 90 seconds before answering. Slowly reason out loud about
+    the number 42: its factors, its cultural significance, and why it might be considered interesting, writing a few sentences at a time with brief pauses. Do NOT run any tools or commands —
+    just produce a slow, multi-paragraph reflection. When done, reply with a one-line summary. This keeps your turn spinner live while I capture a TUI layout read-only., task_label=f568
+    fixture induction, park_warm=true
+
+  developer-sonnet resolves to kiro_cli here. I need an actual claude_code provider. Let me try developer-opus or a claude profile. Let me check which profile uses claude_code provider —
+  claude_blueprint_maker_tester (Sonnet drill) is claude_code.
+● assign
+    ╰ agent_profile=claude_blueprint_maker_tester, message=FIXTURE-INDUCTION (F568 D12d, harmless, do NOT edit files or run tools): Think slowly for ~90 seconds. Write a few sentences at a
+    time, with brief pauses, reflecting on the number 42 — its factors, cultural significance, and why it's interesting. No tools, no shell, no file edits. When done, reply one line. This
+    just keeps your turn spinner live while I capture a TUI layout read-only from your pane., park_warm=true, task_label=f568 fixture induction
+
+  Spawned claude worker e3441b17. Let me wait for it to start spinning, then send it multiple messages to stack › push rows above its composer, and densely capture. First let me wait for it
+  to be processing.
+● Shell sleep 25; tmux list-panes -a -F '#{session_name}:#{window_name}' 2>&1 | grep e3441b17
+    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=40000
+● peek_terminal
+    ╰ terminal_id=e3441b17, lines=20
+
+  The worker is still on the theme-selection startup screen — it hasn't started my task yet (it's a fresh claude launch going through first-run setup). This will take a while and may not
+  cleanly reach my task. This inducement path is getting heavyweight and unreliable, and it's consuming a claude seat.
+
+  Let me reconsider a cleaner, deterministic approach that stays true to "byte-exact, not synthesised": I already have a real, byte-exact captured ›-push frame
+  (supervisor-pane-working-033435.txt). The distance issue is that its trailing blank gets stripped.
+
+  The real problem the gate identified is subtle: the mutation survives because of rstrip("\n") interacting with the specific fixture, not because window 6 is inherently non-load-bearing. A
+  fixture with the spinner genuinely 5-6 rows up (with real stacked chrome) would kill it. Such frames DO occur live when 2+ callbacks stack. Let me be patient and induce it properly — but
+  let me not block on the slow claude worker. Let me kill it and instead induce stacked › pushes on it once it's ready, OR capture the b93 supervisor when it next spins with pending
+  callbacks.
+
+  Actually, the most reliable inducement: send multiple messages to the worker e3441b17 right now — they'll queue and render as › push rows. But it needs to be spinning first. Let me wait for
+  it to clear setup and start the task, then flood + capture. Let me poll it.
+● Shell sleep 40; tmux capture-pane -p -S -45 -t cao-claude-orch5:claude_blueprint_maker_tester-e3441b17 | tail -20
+    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=55000
+
+▸ Credits: 12.47 • Time: 6m 31s
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 38b48095-a3c9-4af4-a5bf-4176b523f6f4)
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Worker e3441b17 is waiting on a dialog; the assigned task is queued and will deliver when the dialog clears.
+
+
+▸ Time: 1s
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: dd9d8e81-1175-47db-8f30-b4a3afc2533f)
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  p5-orphan receiver=e3441b17 batch=1965
+  [message-trace] delivery to terminal e3441b17 failed because the receiver terminal no longer exists for message(s) [1965].
+
+
+▸ Time: 1s
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 4e7a4753-508e-4bc9-abf8-82ccd6621d54)
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  FYI: your child claude_blueprint_maker_tester-e3441b17 (spawned 01:42Z from your worktree) was stuck 4h in Claude Code's onboarding/login wizard — I reaped it (filed F575). Do NOT spawn
+  claude_code children for the D12d fix round; use the existing live captures under test/providers/fixtures/f568/ and the capture cited in the build brief. If you genuinely need a fresh pane
+  capture, say so in your callback and I will take it from the supervisor seat.
+
+  [Message from chao_supervisor-b93613da (b93613da) | mid 1968:aa180962f37f9626e1cca70bd86c0d52. Use the cao-mcp-server send_message MCP tool for any follow-up work — never a built-in
+  collaboration.send_message.]
+
+
+▸ Time: 1s
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 7b8b585c-3905-414c-b989-60d17903eed3)
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 7b8b585c-3905-414c-b989-60d17903eed3)
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Trust All Tools active, confirmations are off · /quit to exit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+kiro_dev · Auto · ◑ 27%                                                                         ~/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca · (cao/4fd45dca)
+
+ ask a question or describe a task ↵
+                                                                                                                                                                            /copy to clipboard
+
+

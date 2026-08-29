@@ -1,0 +1,144 @@
+- working: f568 spinner-*.txt (4), supervisor-pane-working-033435.txt.
+- delegating: f568 idle-subagent-churn-a/b (seat idle, background agent running). claude_code_new_tui_completed_raw.txt — 230-line raw with escapes; need to see if it's completed... name says
+ completed. It has launch command + TUI welcome. Probably idle-at-start. It's raw (alt-screen escapes) — include as idle? Its tail shows tmux focus-events notice — that's a completed turn end
+ing? Name says "completed". Hmm — the pane shows "Welcome back Ram!" tips screen = fresh session idle. But name says completed. Let me check middle content... risky. I'll classify unknown? Ac
+tually, "new_tui_completed" — likely captured after a completed turn in the new TUI. But what I observe in head/tail: welcome box and tmux notice. I can grep for "● Completed" or "✳" spinner
+markers. Let me grep quickly during build. If ambiguous → skip or unknown.
+- waiting_user_answer: askuser-tab-arrow.txt, resume-picker.txt.
+- error: claude_code — missing. No claude error fixture seen.
+
+Codex:
+- idle: codex_idle_output.txt, codex_v0145_idle_output.txt, codex-five-hour-statusline.txt.
+- working: codex_processing_output.txt; codex_complex_response.txt → completed w/ prompt → idle. Put complex_response as idle? It shows answer + ❯ → idle post-turn. OK.
+- waiting_user_answer: codex_permission_output.txt, codex_update_dialog.txt, codex_approval_modal.txt (+ others).
+- error: codex_error_output.txt, codex_capacity_ghost_composer (capacity warning → error w/ note), content_policy_refusal → hmm. "ⓘ This content can't be shown" + composer visible → I'll mark
+ as error? The refusal is a blocked-content error; seat at composer. Conservative: unknown? I'll include as error with note "content-policy refusal notice; composer visible — may read as idle
+ to a sampler; flagged". Hmm, actually for status-truth corpus this is exactly a tricky case. Let me classify "unknown" with note. I'd rather have codex error cell filled by codex_error_outpu
+t + capacity_ghost. And content_policy_refusal as unknown-1.
+
+Actually wait — capacity_ghost: "⚠ Selected model is at capacity" with composer → also a warning + composer. Similar structure. Ugh. Both are "error-ish notice over idle composer". For status
+-truth these are error-flavored panes. The task's error state presumably = pane shows error output. codex_error_output.txt is unambiguous error. capacity_ghost & content_policy_refusal: I'll
+include capacity_ghost as error (warning glyph ⚠, model unavailable → seat cannot work = error) and content_policy_refusal as error as well? The refusal means the turn ended in refusal; the s
+eat is at composer. Hmm hmm. I'll put content_policy_refusal as unknown to be safe, capacity_ghost as error. Actually let me reconsider: simpler and more defensible — mark both as "error" wit
+h clear notes quoting the observed marker? No — "state as YOU observed it; do not guess". My observation: pane contains an error/warning notice and an idle composer. What is the "state"? Ambi
+guous by construction. unknown for both? Then codex error cell = only codex_error_output.txt (still filled). And two unknown files. That's honest. I'll do: error-1 = codex_error_output.txt (u
+nambiguous "Error:" line); unknown-1 = capacity_ghost; unknown-2 = content_policy_refusal. Good.
+
+- codex delegating: f435 stuck paste → unknown (wedge). The scratch f435-recurrence pane is nearly identical to codex_f435_stuck_paste_pane.txt; the fixture version already exists. I'll use c
+odex_f435_stuck_paste_pane.txt as unknown-1 for codex (or skip scratch duplicate). Actually keep corpus lean: use the committed fixture.
+
+Cline: no existing fixtures. Live captures: 231f1de1 secretary (completed→idle), e15bef55/618510c4/91d92890 (processing→working). Capture now. Also orch5:0 supervisor b93613da claude_code com
+pleted-with-children-running → delegating live capture. And orch1 has a claude supervisor too but task limits to orch5. Also kiro 4fd45dca idle → live kiro idle capture. Two kiro_dev complete
+d (d31db3d4, f1d255f4) → their panes show... completed → idle, could capture one more live kiro idle. But live kiro idle from 4fd45dca (fleet status idle) is good.
+
+Caution: capturing panes of active workers mid-run gives "working" — good for cline_cli working. My own pane is one of the cline_dev processing ones — its content includes this conversation;
+that's fine, it's a real cline_cli working pane.
+
+Also fleet window:5/7/8 all cline processing. Capture all three → working-1..3.
+
+But wait — 618510c4 and 91d92890 might be near-free cline grunts like me. Fine.
+
+Also "delegating" for cline: no child panes under cline workers. Missing.
+
+waiting_user_answer for cline: none visible now. Missing unless pane shows a dialog. Secretary 231f1de1 completed — capture to check.
+
+Now, capture command: `tmux capture-pane -p -S -100 -t cao-claude-orch5:3` etc. -p gives plain text lines. Trailing whitespace preserved. Use -S -100 for scrollback context? For status truth,
+ the visible pane region is what the sampler sees. f568 used -S -45. I'll use -S -100. Hmm — "byte-exact pane-capture" — I'll do `tmux capture-pane -p -S -100 -E -` (to end). -E - is default
+end. Just -S -100.
+
+Then build corpus. File naming per provider dir: idle-1.txt, idle-2.txt... unknown-1.txt.
+
+Sidecar JSON fields: provider, state, source, captured_at, notes. captured_at: for copied fixtures — use file mtime? or "unknown (pre-existing fixture)". The schema requires captured_at; for
+copies I can use the git log date of the file. Simpler: put the file's git first-commit date? That's work. I'll put captured_at: null with note? Spec says {provider,state,source,captured_at,n
+otes} — I'll set captured_at to ISO date of the fixture's last git commit touching it (obtainable via git log --format=%as -1 -- <file>). Doable in a loop. Or simpler: "unknown". I'll use git
+ date — it's factual-ish (last modified). Use `git log -1 --format=%cI -- <path>`.
+
+For f568 files: they're in another worktree (.cao/worktrees/4fd45dca) — read-only copy source. Their git provenance: that worktree is on branch cao/4fd45dca. The f568 README says captured 202
+6-08-29 ~04:27-04:40 UTC. I can use that date in notes and captured_at approx from README. README gives capture time — use "2026-08-29" (approx). I'll note source path.
+
+Wait — is it OK to copy from another worker's worktree? It's read-only source; yes, reading is fine.
+
+Now live capture states: I observed fleet status (idle/processing/completed). For delegating (b93613da): fleet says completed but children running. The pane content itself — supervisor pane s
+howing Claude Code TUI idle while workers churn. Let me capture and verify pane shows idle composer + maybe agent rows. f568's idle-subagent-churn shows "1 monitor still running". For b93613d
+a pane, let me capture and look.
+
+Note: capturing my supervisor's pane is fine (read-only).
+
+Plan of corpus contents:
+
+codex/
+- idle-1 ← codex_idle_output.txt
+- idle-2 ← codex_v0145_idle_output.txt
+- idle-3 ← codex-five-hour-statusline.txt (statusline, composer w/ unsent input)
+- idle-4 ← codex_complex_response.txt (post-turn composer) — maybe keep, note.
+- working-1 ← codex_processing_output.txt
+- waiting_user_answer-1 ← codex_permission_output.txt
+- waiting_user_answer-2 ← codex_update_dialog.txt
+- waiting_user_answer-3 ← codex_approval_modal.txt
+- error-1 ← codex_error_output.txt
+- unknown-1 ← codex_capacity_ghost_composer_2026-07-17.txt
+- unknown-2 ← codex_content_policy_refusal_2026-07-17.txt
+- unknown-3 ← codex_f435_stuck_paste_pane.txt
+delegating: MISSING
+
+Hmm — file naming: "<state>-<n>.txt". So "waiting_user_answer-1.txt". OK.
+
+kiro_cli/
+- idle-1 ← kiro_cli_idle_output.txt (non-TUI, ANSI prompt)
+- idle-2 ← kiro_cli_tui_idle_output.txt
+- working-1 ← kiro_cli_processing_output.txt
+- working-2 ← kiro_cli_tui_processing_output.txt
+- waiting_user_answer-1 ← kiro_cli_permission_output.txt
+- waiting_user_answer-2 ← kiro_cli_handoff_with_permission.txt (permission during handoff)
+- error-1 ← kiro_cli_error_output.txt
+- error-2 ← kiro_cli_handoff_error.txt
+- unknown-1 ← kiro_cli_handoff_successful.txt (delegation transcript ending at prompt)
+- LIVE: idle-3 ← capture 4fd45dca pane (fleet: idle)
+- LIVE: idle-4? d31db3d4 completed → capture as idle? Completed status maps to idle seat. Capture one: idle-4 ← d31db3d4 (fleet completed). Note "CAO status completed → seat idle at prompt".
+delegating: missing (unknown-1 flagged)
+
+claude_code/
+- idle-1 ← wpq1/initial-empty-composer.txt
+- idle-2 ← wpq1/completed-composer.txt
+- idle-3 ← wpq1/quoted-resume-picker-completed.txt
+- waiting_user_answer-1 ← wpq1/askuser-tab-arrow.txt
+- waiting_user_answer-2 ← wpq1/resume-picker.txt
+- working-1..4 ← f568 spinner-cascading, spinner-roosting, spinner-ebbing-bare, supervisor-pane-working-033435
+- delegating-1,2 ← f568 idle-subagent-churn-a/b
+- LIVE delegating-3 ← capture b93613da pane (fleet completed while 3 cline children processing)
+- unknown-1 ← claude_code_new_tui_completed_raw.txt? Need grep to classify. If it contains "● Completed" or spinner... check. Might skip.
+error: MISSING
+
+cline_cli/ (all live)
+- idle-1 ← capture 231f1de1 (secretary, fleet completed)
+- working-1..3 ← capture e15bef55, 618510c4, 91d92890 (fleet processing)
+- others MISSING
+Note: I should check pane content to confirm state observation (e.g. secretary pane shows Cline TUI idle at prompt).
+
+grok_cli/
+- idle-1 ← grok_cli_idle.txt
+- idle-2 ← grok_cli_idle.raw.ansi.txt (raw alt-screen bytes; note)
+- idle-3 ← grok_cli_completed.txt (post-turn composer)
+- working-1 ← grok_cli_processing.txt
+- waiting_user_answer-1 ← grok_cli_permission.txt
+- waiting_user_answer-2 ← grok_cli_telemetry_banner.txt (opt-in dialog)
+- waiting_user_answer-3 ← grok_cli_login.txt (browser approval wait) — hmm is login "waiting_user_answer"? It's waiting for external browser approval, not a pane dialog. I'd mark unknown? It
+is a dialog state awaiting user action. I'll classify waiting_user_answer with note "device-login approval wait". Reasonable observation: pane says "Waiting for approval...", user action requ
+ired. OK.
+- error-1 ← grok_cli_error.txt
+- delegating: MISSING
+- grok_cli_completed.ansi.txt / raw.ansi — skip to keep lean; maybe include completed.raw.ansi as idle-4? Skip.
+
+Should I include grok_cli_second_turn as idle-4? Lean enough already; skip.
+
+Now execute:
+1. Live captures (before they change!). Do now: capture orch5:0 (b93613da), orch5:3 (231f1de1), orch5:4 (4fd45dca), orch5:5 (e15bef55), orch5:7 (618510c4), orch5:8 (91d92890). Also d31db3d4 o
+rch5:6 for kiro idle (fleet completed). And f1d255f4 orch5:2? Skip or include — it's kiro completed; include as extra kiro idle? I'll capture 2 and 6, decide after seeing content.
+
+Write to scratch first: /data/cao-scratch/<my-terminal-id>/. What's my terminal id? Unknown — env CAO_TERMINAL_ID. Check env. Use /data/cao-scratch/status-truth-corpus/ maybe with terminal id
+. Let me get $CAO_TERMINAL_ID.
+
+Let me do the captures now with timestamps.
+Now capturing live panes (read-only, capture only) before states change:
+[run_commands] echo "TERM=$CAO_TERMINAL_ID"; mkdir -p /data/cao-scratch/$CAO_TERMINAL_ID/status-truth-captures; date -u +%Y-%m-%dT%H...
+

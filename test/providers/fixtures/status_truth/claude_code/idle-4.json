@@ -1,0 +1,7 @@
+{
+  "provider": "claude_code",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/claude_code_new_tui_completed_raw.txt",
+  "captured_at": "2026-07-16T18:20:20-07:00 (last commit touching source; original capture date unknown)",
+  "notes": "Raw-ANSI new-TUI (v2.1.168) capture ending in '✻ Sauteed for 1s' post-turn completed marker; escape bytes intact."
+}

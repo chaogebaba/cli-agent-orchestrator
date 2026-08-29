@@ -1,0 +1,44 @@
+❯ I want you to improve and sharpen this feature. When you want a review gate or you want a dev lane, you will just dispatch it. And there is a mechanism to combine the provider and the
+  profile together using some settings.
+  Above is my vague thought: you need pivot and sharpen it.
+
+● Sharpened. The feature exists as F497 (positions + routing.toml, P4 in flight); what you're describing is the missing last mile. Proposal, pending the secretary's overlap check against the
+  F497 blueprint:
+
+  Position-only dispatch (F497 P5 — "route, don't pick")
+
+  1. The supervisor names a position, never a provider. assign(agent_profile="design_reviewer"), "dev", "empirical_reviewer", "grunt", "secretary". Provider-prefixed names
+     (codex_design_reviewer) become explicit overrides only; a PreToolUse hook warns (later blocks) on a provider-prefixed assign without an override: reason. This is what makes "never store
+     the binding in memory" enforceable — there's nothing to remember.
+  2. routing.toml row = ordered, certified chain + health. [design_reviewer] chain = ["codex", "claude_code"], allow = certified set (D9 already refuses uncertified). New: per-provider health
+     state (down_since, capped_until, last_failure=seed_exec_failed|dialog_death|auth) fed automatically by spawn failures. assign walks the chain server-side in ONE call and returns
+     resolved_provider + fallback_reason; the worker preamble already carries [COLD-FALLBACK …] (P4) — extend it to [ROUTED position=… provider=… reason=primary|fallback:<why>].
+  3. Your word becomes a command, not a note. cao routing set design_reviewer codex --fallback claude_code, cao routing down codex --until 05:00 "quota", cao routing show. The supervisor's
+     whole job on "use X as gate" is to run that verb; it appends a changelog row (ts, reason) to the routing file and the fleet TUI header shows the live chain.
+  4. Gate kinds stay distinct (DESIGN ≠ EMPIRICAL positions, tester, docs) and certification stays the hard floor: an uncertified provider is never reached even as a fallback — today's
+     mistake (kiro for DESIGN) becomes impossible rather than a memory rule.
+  5. Observability/ACs: fleet row shows position@provider; assign result carries the chain used; a lane-down retry is one assign, not a supervisor loop.
+
+  Do-NOTs: no provider name in doctrine, docs prose, or memory (roster only); no dual-binding per position; no auto-spend of usage resets (health-down only, never "answer the reset prompt").
+
+  Next step from me: when Query 4 returns I fold this as a §amendment to the F497 blueprint (P5) with a DESIGN gate → Opus/codex per the routing file, and file the F# — unless you want a
+  different cut.
+
+✻ Crunched for 32s · done 12:32 AM · 1 monitor still running
+
+❯  routing.toml  i need to set the cli and the model behind as the provider info . for example i can use cline + deepseek v4 flash as grunt lane provider and use cline+ glm 5.3 as secretary
+  lane. because one cli has multiple supported models
+  pls pivot and sharpen it.
+
+● Sharpened: the routing unit is not a CLI, it's a backend = (cli, model, knobs) — and everything downstream keys on the backend, not the CLI.
+
+  routing.toml shape
+
+  [backends.cline-dsv4]   # one CLI, many backends
+  cli = "cline_cli";  model = "deepseek-v4-flash"
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  …/VScode_projects/cli-subagents | Fable 5 | ctx:23% | ↑159 ↓233.4k | $76.51 | rate:15%                                                                                                  /rc
+  ⏵⏵ bypass permissions on · 1 monitor · ← 1 agent

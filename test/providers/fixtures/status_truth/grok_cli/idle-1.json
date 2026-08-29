@@ -1,0 +1,7 @@
+{
+  "provider": "grok_cli",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/grok_cli_idle.txt",
+  "captured_at": "2026-08-16T13:33:33+10:00 (last commit touching source; original capture date unknown)",
+  "notes": "Empty '❯' composer box (Grok Build 1.0.0), no spinner."
+}

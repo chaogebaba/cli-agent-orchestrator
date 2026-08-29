@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "working",
+  "source": "copied byte-exact from test/providers/fixtures/codex_processing_output.txt",
+  "captured_at": "2026-01-21T09:55:20+11:00 (last commit touching source; original capture date unknown)",
+  "notes": "'Codex is thinking…' + 'Running unit tests...' mid-turn."
+}

@@ -1,0 +1,7 @@
+{
+  "provider": "kiro_cli",
+  "state": "error",
+  "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:4 (live CAO pane kiro_dev-4fd45dca, terminal 4fd45dca, provider kiro_cli per fleet API)",
+  "captured_at": "2026-08-29T05:46:57Z",
+  "notes": "'● You've reached your monthly usage limit…' twice over idle composer; fleet API reported status=idle at capture time — quota-exhaustion error."
+}

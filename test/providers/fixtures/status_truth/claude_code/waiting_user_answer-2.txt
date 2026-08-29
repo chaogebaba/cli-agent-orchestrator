@@ -1,0 +1,4 @@
+Resume session
+❯ 1. Continue latest session
+  2. Start a new session
+Enter to select · Ctrl+A to toggle details · Esc to cancel

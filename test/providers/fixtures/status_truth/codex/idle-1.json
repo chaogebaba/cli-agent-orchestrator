@@ -1,0 +1,7 @@
+{
+  "provider": "codex",
+  "state": "idle",
+  "source": "copied byte-exact from test/providers/fixtures/codex_idle_output.txt (main @ 9b83449a)",
+  "captured_at": "2026-01-21T09:55:20+11:00 (last commit touching source; original capture date unknown)",
+  "notes": "Startup banner + '❯' prompt; no turn in flight."
+}
