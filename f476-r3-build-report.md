@@ -83,7 +83,7 @@ Source (4):
   request_delivery-only).
 
 Tests (6):
-- `test/services/test_f476_r3_bypass_closure.py` (NEW) — 11 tests (see below).
+- `test/services/test_f476_r3_bypass_closure.py` (NEW) — 10 tests (see below).
 - Updated to the r3 contract (blueprint Test-break list — old-behavior pins):
   `test_f413_orm_listeners.py`, `test_f158_r2_doorbell_regression.py`,
   `test_f158_r5_e2e_doorbell_race.py`, `test_f158_doorbell_fallback.py`,
