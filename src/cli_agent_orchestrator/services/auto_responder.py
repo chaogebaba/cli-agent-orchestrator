@@ -1641,9 +1641,29 @@ class AutoResponder:
         # Classify on the UNFILTERED tail (unchanged behavior); match + settle on
         # the CHROME-FILTERED tail (F530 layer 1), mirroring the on_screen split.
         region = self._region_from_capture(fresh)
-        match_region = (
-            self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
-        )
+        # F635 #490: the settle-digest is seeded (in _on_screen / _verify_and_retry)
+        # from the pyte-COMPOSITE screen (status_monitor.get_rendered_screen), but
+        # ``fresh`` here comes from ``capture_viewport`` (the raw tmux viewport).
+        # Those are two DIFFERENT capture domains: for a dialog whose content is
+        # wider than the pane (the codex resume-cwd card's long worktree paths),
+        # the composite retains the full line while the viewport truncates it at
+        # the terminal width, so their canonical/normalized strings — and thus
+        # ``_digest_normalized`` — legitimately DIFFER even though it is the SAME
+        # static dialog (rule.matches is True on both). Comparing the viewport
+        # digest against a composite settle-digest therefore NEVER agrees: the
+        # barrier withholds the send on every eval while ``matched/firing`` is
+        # re-logged ~2/s and the cooldown (set only on a real send) is never
+        # armed — the exact matched-but-no-fire deadlock in #490. The match+settle
+        # decision MUST run in the SAME domain the digest was seeded in, so
+        # re-derive the match region from the composite screen here; the raw
+        # viewport capture is still used for the provider ``status`` classify.
+        composite_match_region = self._current_normalized_filtered(terminal_id, chrome_patterns)
+        if composite_match_region is not None:
+            match_region = composite_match_region
+        else:
+            match_region = (
+                self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
+            )
         status = self._classify_region(terminal_id, provider, region)
         if not rule.matches(match_region):
             return False  # dialog cleared / no longer matches — no retry
