@@ -65,6 +65,7 @@ class TestF158R5SingleArbitration:
             ws_doorbell._connections[terminal_id] = mock_ws
 
             from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
             orig_loop = inbox_mod.inbox_service._delivery_loop
             inbox_mod.inbox_service._delivery_loop = loop
 
@@ -114,6 +115,7 @@ class TestF158R5SingleArbitration:
             ws_doorbell._connections[terminal_id] = mock_ws
 
             from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
             orig_loop = inbox_mod.inbox_service._delivery_loop
             inbox_mod.inbox_service._delivery_loop = loop
 
@@ -152,6 +154,7 @@ class TestF158R5SingleArbitration:
         send_calls = []
 
         try:
+
             async def tracked_send(text):
                 send_calls.append(text)
 
@@ -164,6 +167,7 @@ class TestF158R5SingleArbitration:
             permit.clear()  # Already cleared
 
             import concurrent.futures
+
             fut = asyncio.run_coroutine_threadsafe(
                 _guarded_push_doorbell_frame(terminal_id, row_id, "s", "p", permit),
                 loop,
@@ -283,6 +287,7 @@ class TestF158R5SameLoopCaller:
 
         try:
             from cli_agent_orchestrator.services import inbox_service as inbox_mod
+
             orig_loop = inbox_mod.inbox_service._delivery_loop
             inbox_mod.inbox_service._delivery_loop = asyncio.get_running_loop()
 
@@ -303,8 +308,12 @@ class TestF158R5S1StateLifecycle:
 
     def test_expired_mark_not_consumed(self):
         from cli_agent_orchestrator.services.ws_doorbell import (
-            _ws_delivered, _ws_delivered_lock, _WS_ENTRY_TTL, consume_ws_delivered,
+            _ws_delivered,
+            _ws_delivered_lock,
+            _WS_ENTRY_TTL,
+            consume_ws_delivered,
         )
+
         terminal_id, row_id = "term_expire_r5", 9001
         with _ws_delivered_lock:
             _ws_delivered[(terminal_id, row_id)] = time.monotonic() - _WS_ENTRY_TTL - 5.0
@@ -313,7 +322,8 @@ class TestF158R5S1StateLifecycle:
     def test_superseded_disconnect_preserves_marks(self):
         from cli_agent_orchestrator.services import ws_doorbell
         from cli_agent_orchestrator.services.ws_doorbell import (
-            consume_ws_delivered, mark_ws_delivered,
+            consume_ws_delivered,
+            mark_ws_delivered,
         )
 
         terminal_id = "term_supersede_r5"

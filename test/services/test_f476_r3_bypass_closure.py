@@ -136,9 +136,7 @@ class _Probes:
         self.native_calls: list[tuple[str, int]] = []
 
 
-def _install_probes(
-    monkeypatch: Any, *, ws_armed: bool, ws_succeeds: bool = True
-) -> _Probes:
+def _install_probes(monkeypatch: Any, *, ws_armed: bool, ws_succeeds: bool = True) -> _Probes:
     p = _Probes()
 
     # WS surface -----------------------------------------------------------
@@ -321,9 +319,7 @@ class TestAckedIdNeverReemitted:
         assert p.ws_calls == []
         assert p.native_calls == []
 
-    def test_cursor_already_past_reconnect_no_emit(
-        self, r3_env: Any, monkeypatch: Any
-    ) -> None:
+    def test_cursor_already_past_reconnect_no_emit(self, r3_env: Any, monkeypatch: Any) -> None:
         """Reconnect scenario: the row was already acked (consumed cursor past
         it) before this incarnation polls. A fresh runner poll emits nothing —
         an acked id never re-surfaces on reconnect."""
@@ -336,9 +332,7 @@ class TestAckedIdNeverReemitted:
         assert p.ws_calls == []
         assert p.native_calls == []
 
-    def test_bridge_replay_of_acked_ids_zero_emits(
-        self, r3_env: Any, monkeypatch: Any
-    ) -> None:
+    def test_bridge_replay_of_acked_ids_zero_emits(self, r3_env: Any, monkeypatch: Any) -> None:
         """Issue #388, 07:47Z sample: the bridge replayed 7 already-acked ids in
         one batch. After those ids are acked, NO runner poll may re-emit any of
         them on any surface."""
@@ -369,9 +363,7 @@ class TestAckedIdNeverReemitted:
 
 
 class TestMutantLedger:
-    def test_mutant_emit_on_both_surfaces_is_red(
-        self, r3_env: Any, monkeypatch: Any
-    ) -> None:
+    def test_mutant_emit_on_both_surfaces_is_red(self, r3_env: Any, monkeypatch: Any) -> None:
         """MUTANT: emit on BOTH the WS and native surface for one id.
 
         The production invariant is at-most-one transport per id. This asserts
@@ -390,9 +382,7 @@ class TestMutantLedger:
         assert both == set(), f"id woke on BOTH surfaces (double wake): {both}"
         assert len(p.ws_calls) + len(p.native_calls) == 1
 
-    def test_mutant_drop_cursor_advance_reemits_is_red(
-        self, r3_env: Any, monkeypatch: Any
-    ) -> None:
+    def test_mutant_drop_cursor_advance_reemits_is_red(self, r3_env: Any, monkeypatch: Any) -> None:
         """MUTANT: drop the commit_wake cursor advance.
 
         We simulate the mutant by forcing commit_wake to be a no-op that does

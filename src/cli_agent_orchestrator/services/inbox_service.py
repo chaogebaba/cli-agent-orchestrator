@@ -1247,9 +1247,7 @@ class InboxService:
                     sender_display_name=_f459_display,
                 )
             except Exception as _bell_exc:
-                logger.debug(
-                    "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
-                )
+                logger.debug("f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc)
 
         post_immediate = False
         arm_delayed: float | None = None

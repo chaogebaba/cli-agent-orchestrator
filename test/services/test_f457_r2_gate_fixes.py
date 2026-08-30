@@ -17,7 +17,6 @@ import pytest
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
-
 _NOW = datetime(2026, 8, 26, 12, 0, 0, tzinfo=timezone.utc)
 _TERMINAL_ID = "r2t00001"
 _SENDER_ID = "r2s00001"
@@ -110,9 +109,7 @@ class TestB1ReconcilerWakeNativeGate:
                 "cli_agent_orchestrator.services.inbox_service._utcnow",
                 return_value=_NOW,
             ),
-            patch(
-                "cli_agent_orchestrator.clients.database.SessionLocal"
-            ) as mock_sl,
+            patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_sl,
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
                 return_value=True,
@@ -132,6 +129,7 @@ class TestB1ReconcilerWakeNativeGate:
                 if key == "supervisor.wake.native":
                     return False  # ← the kill switch
                 return default
+
             mock_config_get.side_effect = _config_get
 
             mock_sl.return_value.__enter__ = MagicMock(side_effect=_make_db_context)
@@ -261,20 +259,20 @@ class TestS1FailOpenDbError:
 
         with (
             patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,
-            patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages") as mock_pending,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages"
+            ) as mock_pending,
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal"
             ) as mock_pull,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
             ) as mock_push,
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.request_delivery"
-            ) as mock_req_del,
-            patch(
-                "cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}
-            ),
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req_del,
+            patch("cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
                 MagicMock(),

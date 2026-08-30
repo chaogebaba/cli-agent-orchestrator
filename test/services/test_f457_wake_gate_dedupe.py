@@ -70,9 +70,7 @@ def _deliver_with_patches(
         patch(
             "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
         ) as mock_push,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_req_del,
+        patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req_del,
         patch("cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}),
         patch(
             "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",

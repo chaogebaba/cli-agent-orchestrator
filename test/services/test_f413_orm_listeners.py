@@ -44,7 +44,6 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services import mailbox_service
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -152,9 +151,7 @@ def supervisor_setup(f413_db):
 class TestAC1RawAdd:
     """Raw db.add(InboxModel) with PENDING + supervisor receiver yields obligation."""
 
-    def test_raw_add_yields_obligation_trace_sentinel_doorbell(
-        self, supervisor_setup, monkeypatch
-    ):
+    def test_raw_add_yields_obligation_trace_sentinel_doorbell(self, supervisor_setup, monkeypatch):
         """AC1: a raw db.add(InboxModel) — with NO producer helper — yields exactly
         one OPEN DeliveryObligationModel row, one fx191.accept trace event, sentinel
         file touched, and (F476 r3 #388) a request_delivery signal after commit.
@@ -191,11 +188,7 @@ class TestAC1RawAdd:
             row_id = int(row.id)
 
             # Before commit: obligation should exist (after_insert fires on flush)
-            obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=row_id)
-                .one_or_none()
-            )
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=row_id).one_or_none()
             assert obl is not None, "F413 AC1: No obligation created by after_insert"
             assert obl.state == "OPEN"
             assert obl.mailbox_id == "mb_sup_0001"
@@ -268,11 +261,7 @@ class TestAC2Rollback:
 
         # Obligation absent (rolled back — data not in DB)
         with db_factory() as db:
-            obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=row_id)
-                .one_or_none()
-            )
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=row_id).one_or_none()
             assert obl is None, "F413 AC2: Obligation survived rollback"
 
 
@@ -295,14 +284,8 @@ class TestAC3SingleObligation:
         )
 
         with db_factory() as db:
-            obligations = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=msg.id)
-                .all()
-            )
-            assert len(obligations) == 1, (
-                f"Expected exactly 1 obligation, got {len(obligations)}"
-            )
+            obligations = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).all()
+            assert len(obligations) == 1, f"Expected exactly 1 obligation, got {len(obligations)}"
 
     def test_no_obligation_call_sites_remain(self):
         """AC3: grep proves no hand-placed _create_obligation_inline calls in _insert_routed_inbox_row."""
@@ -311,12 +294,12 @@ class TestAC3SingleObligation:
         from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
 
         source = inspect.getsource(_insert_routed_inbox_row)
-        assert "_create_obligation_inline" not in source, (
-            "F413 AC3: hand-placed _create_obligation_inline still in _insert_routed_inbox_row"
-        )
-        assert "_touch_supervisor_pending_flag" not in source, (
-            "F413 AC3: hand-placed _touch_supervisor_pending_flag still in _insert_routed_inbox_row"
-        )
+        assert (
+            "_create_obligation_inline" not in source
+        ), "F413 AC3: hand-placed _create_obligation_inline still in _insert_routed_inbox_row"
+        assert (
+            "_touch_supervisor_pending_flag" not in source
+        ), "F413 AC3: hand-placed _touch_supervisor_pending_flag still in _insert_routed_inbox_row"
 
 
 # ---------------------------------------------------------------------------
@@ -346,11 +329,7 @@ class TestAC4BarrierHeld:
             db.commit()
 
         with db_factory() as db:
-            obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=row_id)
-                .one_or_none()
-            )
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=row_id).one_or_none()
             assert obl is None, "F413 AC4: HELD row should NOT have obligation"
 
 
@@ -429,9 +408,7 @@ class TestAC4bBarrierCancel:
         # Verify obligations
         with db_factory() as db:
             obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=held_row_id)
-                .one_or_none()
+                db.query(DeliveryObligationModel).filter_by(inbox_row_id=held_row_id).one_or_none()
             )
             assert obl is not None, "F413 AC4b: No obligation for HELD→PENDING supervisor row"
             assert obl.state == "OPEN"
@@ -443,9 +420,7 @@ class TestAC4bBarrierCancel:
                 .filter_by(inbox_row_id=non_sup_row_id)
                 .one_or_none()
             )
-            assert non_sup_obl is None, (
-                "F413 AC4b: Non-supervisor row should NOT have obligation"
-            )
+            assert non_sup_obl is None, "F413 AC4b: Non-supervisor row should NOT have obligation"
 
 
 # ---------------------------------------------------------------------------
@@ -496,9 +471,9 @@ class TestAC4cTerminalReap:
                         .one_or_none()
                     )
                     if row.logical_receiver_id == "mb_sup_0001":
-                        assert obl is not None, (
-                            "F413 AC4c: No obligation for reaped HELD→PENDING supervisor row"
-                        )
+                        assert (
+                            obl is not None
+                        ), "F413 AC4c: No obligation for reaped HELD→PENDING supervisor row"
 
 
 # ---------------------------------------------------------------------------
@@ -542,11 +517,7 @@ class TestAC5NonSupervisor:
             db.commit()
 
         with db_factory() as db:
-            obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=row_id)
-                .one_or_none()
-            )
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=row_id).one_or_none()
             assert obl is None, "F413 AC5: Non-supervisor should NOT have obligation"
 
         # No sentinel touch

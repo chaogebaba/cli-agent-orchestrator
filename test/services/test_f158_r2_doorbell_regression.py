@@ -112,11 +112,12 @@ class TestF158R2_ArmedButSendFails:
             _F413_DOORBELL_SNAPSHOT_KEY: None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-        ) as mock_ws, patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_req:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+            ) as mock_ws,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req,
+        ):
             _f413_after_commit(session)
 
             # r3: hook never fires WS on insert; it only signals delivery.
@@ -139,13 +140,15 @@ class TestF158R2_ArmedButSendFails:
             _F413_DOORBELL_SNAPSHOT_KEY: None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=False,
-        ), patch(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
-        ) as mock_ring, patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+                return_value=False,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
+            ) as mock_ring,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery"),
         ):
             _f413_after_commit(session)
             # ring_supervisor_doorbell must NOT be called from the hook
@@ -171,13 +174,13 @@ class TestF158R2_UnarmedFlowSingleRing:
             _F413_DOORBELL_SNAPSHOT_KEY: None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=False,
-        ), patch(
-            "cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered"
-        ) as mock_mark, patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+                return_value=False,
+            ),
+            patch("cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered") as mock_mark,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery"),
         ):
             _f413_after_commit(session)
             mock_mark.assert_not_called()
@@ -215,14 +218,16 @@ class TestF158R2_UnarmedFlowSingleRing:
 
         ring_calls = []
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=False,
-        ), patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_req, patch(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-            side_effect=lambda *a, **kw: ring_calls.append((a, kw)),
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+                return_value=False,
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
+                side_effect=lambda *a, **kw: ring_calls.append((a, kw)),
+            ),
         ):
             _f413_after_commit(session)
 
@@ -255,13 +260,13 @@ class TestF158R2_WsDeliveredNoDuplicateRing:
             _F413_DOORBELL_SNAPSHOT_KEY: None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-        ) as mock_ws, patch(
-            "cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered"
-        ) as mock_mark, patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_req:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+            ) as mock_ws,
+            patch("cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered") as mock_mark,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req,
+        ):
             _f413_after_commit(session)
             mock_ws.assert_not_called()
             mock_mark.assert_not_called()
@@ -314,15 +319,16 @@ class TestF158R2_WsDeliveredNoDuplicateRing:
             _F413_DOORBELL_SNAPSHOT_KEY: None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=True,
-        ), patch(
-            "cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered"
-        ), patch(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
-        ) as mock_ring, patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
+                return_value=True,
+            ),
+            patch("cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered"),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
+            ) as mock_ring,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery"),
         ):
             _f413_after_commit(session)
             mock_ring.assert_not_called()
