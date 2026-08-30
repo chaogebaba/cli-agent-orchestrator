@@ -166,9 +166,7 @@ def _classify(event: dict[str, Any]) -> tuple[str, str | None, str | None] | Non
         # server pops the oldest entry (count-correct). agent_id travels as the
         # release_token — the idempotency/observability field, not the key.
         child_id = event.get("tool_call_id") or event.get("toolCallId") or event.get("tool_use_id")
-        release_token = (
-            event.get("agent_id") or event.get("subagent_id") or event.get("subagentId")
-        )
+        release_token = event.get("agent_id") or event.get("subagent_id") or event.get("subagentId")
         return (
             "release",
             (str(child_id) if child_id is not None else None),

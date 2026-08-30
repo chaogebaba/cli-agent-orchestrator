@@ -6027,6 +6027,10 @@ def list_expired_pending_rows(now: datetime | None = None) -> List[int]:
     are never returned (opt-in; byte-identical to today).
     """
     now_ts = _utcnow() if now is None else now
+    # created_at is naive-UTC-at-rest; normalise both sides to naive UTC so the
+    # comparison never mixes aware/naive (TypeError).
+    if now_ts.tzinfo is not None:
+        now_ts = now_ts.astimezone(timezone.utc).replace(tzinfo=None)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.id, InboxModel.created_at, InboxModel.expire_after_s)
@@ -6040,8 +6044,8 @@ def list_expired_pending_rows(now: datetime | None = None) -> List[int]:
     for row_id, created_at, expire_after_s in rows:
         if created_at is None or expire_after_s is None:
             continue
-        # created_at is naive-UTC-at-rest; compare against a naive-UTC now.
-        deadline = created_at + timedelta(seconds=int(expire_after_s))
+        ca = created_at.replace(tzinfo=None) if created_at.tzinfo is not None else created_at
+        deadline = ca + timedelta(seconds=int(expire_after_s))
         if deadline < now_ts:
             expired.append(int(row_id))
     return expired
@@ -7127,9 +7131,7 @@ def _insert_routed_inbox_row(
             .filter(
                 receiver_filter,
                 InboxModel.supersede_key == supersede_key,
-                InboxModel.status.in_(
-                    [MessageStatus.PENDING.value, MessageStatus.HELD.value]
-                ),
+                InboxModel.status.in_([MessageStatus.PENDING.value, MessageStatus.HELD.value]),
             )
             .update(
                 {InboxModel.status: MessageStatus.SUPERSEDED.value},

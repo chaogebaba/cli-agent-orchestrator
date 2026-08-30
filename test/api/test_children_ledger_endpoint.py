@@ -46,7 +46,8 @@ class TestChildrenLedgerEndpoint:
             )
         assert response.status_code == 200
         assert response.json()["children_count"] == 0
-        rel.assert_called_once_with("abcd1234", None)
+        # D17: the endpoint now passes release_token (None here) as the 3rd arg.
+        rel.assert_called_once_with("abcd1234", None, None)
 
     def test_register_without_child_id_is_400(self, client):
         with patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=_KNOWN):

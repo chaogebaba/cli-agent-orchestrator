@@ -35,13 +35,15 @@ def test_ack_hook_composed_on_stop():
 
 def test_drain_hook_is_python_module_not_absolute_path():
     """Do-NOT 20 / F569 #426: composed as `python -m <module>`, never a
-    hardcoded /home path."""
+    hardcoded install path or a ~/.claude / .claude/hooks reference. (The python
+    interpreter path from sys.executable is legitimate; the hazard is a
+    hardcoded hook-SCRIPT path.)"""
     hooks = _settings()["hooks"]
     for block in hooks["SessionStart"]:
         for h in block["hooks"]:
             if _DRAIN_MOD in h["command"]:
                 assert "-m" in h["command"]
-                assert "/home/" not in h["command"]
+                assert ".claude" not in h["command"]
 
 
 def test_drain_ack_hooks_have_timeout_5():

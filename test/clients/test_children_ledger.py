@@ -97,11 +97,14 @@ def test_release_without_id_pops_oldest_fifo(db_env):
     assert [e["id"] for e in _children()] == ["c2"]
 
 
-def test_release_unknown_id_is_noop(db_env):
+def test_release_unknown_id_pops_oldest_d17(db_env):
+    """D17/P-B: an unmatched child_id no longer no-ops — it falls back to
+    pop-oldest (a release can never leave the count unchanged while entries
+    exist). Was a no-op pre-D17."""
     _seed()
     register_terminal_child("t1", "c1")
-    assert release_terminal_child("t1", "does-not-exist") == 1
-    assert [e["id"] for e in _children()] == ["c1"]
+    assert release_terminal_child("t1", "does-not-exist") == 0
+    assert _children() == []
 
 
 def test_release_on_empty_ledger_is_noop(db_env):
@@ -181,7 +184,6 @@ def test_write_path_is_read_by_frozen_d12d_counter(db_env):
     register_terminal_child("t1", "c2")
     meta = get_terminal_metadata("t1")
     assert _children_count_from_metadata(meta) == 2
-
 
 
 # ---- F579 D17: migration, release_token ring, reconcile conjuncts ---------
@@ -301,16 +303,10 @@ def test_reconcile_drops_entries_after_k_non_processing(db_env):
 
 
 def test_reconcile_does_not_drop_live_processing_delegation(db_env):
-    """A live long delegation (past max_age but seat still PROCESSING) is NOT
-    dropped by the publish reconcile."""
-    import time as _time
-
-    monkeypatch_age = 10.0
-    _seed(metadata=None)
-    # Register a child that is already 'old' per a tight bound, but the seat is
-    # PROCESSING so neither conjunct fires.
-    now = _time.time()
-    register_terminal_child("t1", "live", started_at=now)
+    """A live delegation with the seat still PROCESSING is NOT dropped by the
+    publish reconcile, regardless of streak."""
+    _seed()
+    register_terminal_child("t1", "live")
     assert reconcile_children_on_publish("t1", "PROCESSING", 99, 3) == 1
     assert [e["id"] for e in _children()] == ["live"]
 
