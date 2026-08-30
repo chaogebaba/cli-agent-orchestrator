@@ -64,6 +64,13 @@ else:  # pragma: no cover
 # The D7 codes live in ``utils.agent_profiles``; these two are D9-specific.
 E_PROVIDER_UNCERTIFIED = "E-PROVIDER-UNCERTIFIED"
 E_ROW_CLAUSES_MISSING = "E-ROW-CLAUSES-MISSING"
+# F613 #469: the non-gate general fallback resolves the installed alias stub for
+# (general, provider) — its stem is ``<short>_general`` (e.g. ``cline_general``),
+# NOT the raw ``<provider>_general`` f-string (``cline_cli_general``), which is
+# not an installed profile and would be handed to the server as an unknown name.
+# When no alias stub exists for the provider's general cell, refuse with this
+# code rather than emit an unresolvable spawn profile.
+E_ALIAS_MISSING = "E-ALIAS-MISSING"
 
 # Valid ``kind`` discriminator values (D9).
 _KINDS = ("cao", "in_harness")
@@ -388,7 +395,26 @@ def resolve_routing_binding(
             f"general — refusing (no spawn)",
             code=E_ROW_CLAUSES_MISSING,
         )
-    fallback = f"{provider}_{GENERAL_POSITION}"
+    # F613 #469: substitute the provider's general cell (D12). The spawn profile
+    # is the INSTALLED alias stub for (general, provider) — its stem is
+    # ``<short>_general`` (cline_general, kiro_general, …), resolved by scanning
+    # the agent store for a composition stub with ``extends/position == general``
+    # AND ``provider == provider``. The raw ``f"{provider}_{GENERAL_POSITION}"``
+    # (``cline_cli_general``) is NOT an installed profile; handing it to the
+    # server yields a load failure that silently re-derives to claude_code. Only
+    # bind the general fallback when such a stub exists; otherwise refuse with
+    # E-ALIAS-MISSING rather than emit an unresolvable name.
+    from cli_agent_orchestrator.utils.agent_profiles import _find_alias_for_cell
+
+    fallback = _find_alias_for_cell(GENERAL_POSITION, provider)
+    if fallback is None:
+        raise RoutingError(
+            f"{E_ALIAS_MISSING}: no installed general alias stub for provider "
+            f"'{provider}' (looked for a composition stub with extends/position="
+            f"'{GENERAL_POSITION}' and provider='{provider}'); refusing rather "
+            f"than spawning the unresolved name '{provider}_{GENERAL_POSITION}'",
+            code=E_ALIAS_MISSING,
+        )
     return RoutingResolution(
         spawn_profile=fallback,
         provider=provider,

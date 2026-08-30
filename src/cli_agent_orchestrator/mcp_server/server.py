@@ -336,6 +336,7 @@ def _create_terminal(
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    provider: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -367,6 +368,14 @@ def _create_terminal(
             ``working_directory`` as given. Only meaningful on the
             existing-session (assign) branch below -- the new-session branch
             has no live caller today.
+        provider: F613 #469 — the caller's already-resolved provider (e.g.
+            ``_assign_impl``'s ``_resolved_provider`` from routing /
+            ``resolve_assignment_target``). When given it WINS over the
+            per-branch ``resolve_provider(agent_profile, ...)`` re-derivation,
+            which otherwise silently falls back to the supervisor's provider
+            (claude_code) whenever ``agent_profile`` is a position/alias name
+            that fails to load. When ``None`` the behaviour is byte-identical to
+            before (re-derive via ``resolve_provider``).
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -374,6 +383,9 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    # F613 #469: a caller-supplied resolved provider is authoritative; only
+    # re-derive when it is absent (byte-identical to the pre-F613 behaviour).
+    provided_provider = provider.strip() if isinstance(provider, str) and provider.strip() else None
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -387,7 +399,13 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        # F613 #469: a caller-supplied resolved provider wins over re-derivation.
+        if provided_provider is not None:
+            provider = provided_provider
+        else:
+            provider = resolve_provider(
+                agent_profile, fallback_provider=terminal_metadata["provider"]
+            )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -458,7 +476,11 @@ def _create_terminal(
                 "(no current CAO_TERMINAL_ID)"
             )
         session_name = generate_session_name()
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        # F613 #469: caller-supplied resolved provider wins over re-derivation.
+        if provided_provider is not None:
+            provider = provided_provider
+        else:
+            provider = resolve_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -1966,6 +1988,7 @@ def _assign_impl(
             lifecycle=lifecycle,
             use_worktree=use_worktree,
             authority_files=authority_files,
+            provider=_resolved_provider,
             **create_kwargs,
         )
 
