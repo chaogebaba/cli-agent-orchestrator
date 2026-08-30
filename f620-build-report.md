@@ -95,42 +95,85 @@ Env composition worker vs supervisor, boxes present/absent: `should_inject_shim`
 (worker gets shim-prefixed PATH; supervisor gets no PATH key; boxes absent
 unchanged; idempotent no double-prefix).
 
+### Box verification (grok-box-004 / -006, branch cao/a778fc81)
+Latest head under test: `9626456e1c3a22c0c5ea3d65b747ea99c07ed059` (adds the two
+test-isolation fixes below; code behaviour of commit `ce4fa12f` unchanged).
+
+- `uv run pytest -q -m "not live and not e2e" test/services/test_worktree_service.py
+  test/services/test_laptop_shim.py` (grok-box-004 @ ce4fa12f) → **60 passed**.
+- Re-verify of the previously-broken worktree tests (grok-box-004 @ 9626456e):
+  `test_worktree_branch_integrity.py test_worktree_service.py test_laptop_shim.py
+  test_terminal_service_full.py::TestCreateTerminalWorktree` → **93 passed, 1 xfailed**.
+- Full `test/services` (grok-box-006 @ 9626456e) → **7192 passed, 9 failed, 19
+  skipped, 3 xfailed** in 179s. The 9 failures are ALL pre-existing and
+  unrelated to F620 (see analysis below).
+- `uv run mypy --strict` base-vs-head on touched src (grok-box-004):
+  - HEAD (ce4fa12f): 2 errors, both pre-existing `CompletedProcess [type-arg]`
+    in `worktree_service.py` (`_run_git` / `_run_git_bounded`, untouched), now
+    at lines 72 / 423.
+  - BASE (718849a4): the SAME 2 errors in `worktree_service.py` at pre-F620
+    lines 51 / 299.
+  - **Parity: 0 new mypy --strict errors.** New file `laptop_shim.py` is clean.
+
+### Pre-existing failure analysis (NOT caused by F620)
+Confirmed identical failures at BASE `718849a4` on the SAME box (grok-box-004):
+`test_stage0b_receiver_evidence` (x2), `test_wp2s3_start_status_bootstrap`,
+`test_wp_watchdog_delegation`, `test_wpdt_delivery_truth` — root cause a
+shared-DB schema drift (`sqlite3.OperationalError: no such column:
+inbox.expire_after_s`), entirely unrelated to worktrees/shims. The full-suite
+run on grok-box-006 also showed `test_session_brief_contract` /
+`test_stage0_flip_machinery` (byte-exact manifest tests that vary by box
+environment) — likewise untouched by F620.
+
+### Two follow-up test-isolation fixes (commit 9626456e) — required by F620 semantics
+- `test/services/test_worktree_branch_integrity.py`: added an autouse fixture
+  pinning `CAO_WORKTREE_ROOT` to a per-test tmp dir. WITHOUT F620 these tests
+  provisioned in-repo; WITH the new `/data/cao-scratch` default they all shared
+  `/data/cao-scratch/worktrees/repo/<terminal_id>` (every fixture repo is named
+  `repo`) and collided across tests/xdist workers → 14 ERRORS on a box with a
+  writable `/data`. The fixture restores per-test isolation regardless of host.
+  This is exactly the config knob F620 adds, used as intended.
+- `test/services/test_terminal_service_full.py`:
+  `test_use_worktree_rolls_back_the_worktree_on_a_later_failure` updated to
+  expect the new 3-arg `remove_worktree("/repo", "test1234", <worktree_path>)`
+  — the rollback now forwards the created checkout path (intended F620 change).
+
 ### Local verification done on the laptop (allowed)
-- `python3 -m py_compile` on all 5 touched `.py` files — OK.
+- `python3 -m py_compile` on all touched `.py` files — OK.
 - `isort --profile black -l100` + `black -l100` on all touched `.py` — clean.
 - Shim shell scripts smoke-tested directly (not pytest): deny→97, `LAPTOP_OK`
   passthrough, uv selective passthrough, real-binary discovery by PATH-strip,
   global-flag-before-subcommand detection — all as designed.
 
-### Box verification (grok-box-004, branch cao/a778fc81 @ ce4fa12f)
-- `uv run pytest -q -m "not live and not e2e" test/services/test_worktree_service.py
-  test/services/test_laptop_shim.py` → **60 passed in 2.42s**.
-- `uv run mypy --strict` on touched src files:
-  - HEAD (ce4fa12f): 2 errors, both pre-existing `CompletedProcess [type-arg]`
-    in `worktree_service.py` (`_run_git` / `_run_git_bounded`, untouched by F620),
-    now at lines 72 / 423.
-  - BASE (718849a4): the SAME 2 errors in `worktree_service.py` at the pre-F620
-    lines 51 / 299.
-  - **Parity: 0 new mypy --strict errors introduced.** New file
-    `laptop_shim.py` is clean under `--strict`.
-
 ## 4. Mutant ledger (box-confirmed test design)
 - Drop the precedence env case in `resolve_worktree_root` → `TestResolveWorktreeRoot::test_env_var_wins_over_everything` goes RED (would resolve to the toml root instead).
 - Shim exits 0 instead of 97 → `TestPytestMypyShims::test_denies_by_default_exit_97` / `TestUvShim::test_denies_heavy_subcommands_exit_97` go RED.
 
-## 5. Box used
-**grok-box-004** (fleet grok-box-2..8; not grok-box-1). box-actions ledger:
-- `scripts/box-run.sh f620-pytest -- 'git fetch origin cao/a778fc81 && git checkout ce4fa12f && uv run pytest -q -m "not live and not e2e" <2 files> | tee /tmp/f620-pytest-run.txt'` → box grok-box-004 (grok-box-002 busy, grok-box-3 unreachable).
-- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-mypy-head -- 'git checkout ce4fa12f && uv run mypy --strict <2 src files> | tee /tmp/f620-mypy-head.txt'`.
-- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-mypy-base -- 'git checkout 718849a4 && uv run mypy --strict worktree_service.py | tee /tmp/f620-mypy-base.txt; git checkout ce4fa12f'`.
-- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-cleanup -- 'git checkout main && rm -f /tmp/f620-*.txt'`.
-- Raw ssh (read-only): `git remote -v` peek on grok-box-002 and grok-box-004.
-- Checkout left at: grok-box-004 repo on `main` (e64684f9), clean tree.
+## 5. Boxes used
+**grok-box-004** and **grok-box-006** (fleet grok-box-2..8; never grok-box-1).
+box-actions ledger:
+- `scripts/box-run.sh f620-pytest -- fetch cao/a778fc81 + checkout ce4fa12f + pytest <2 files>` → grok-box-004.
+- `CAO_BOXES=grok-box-004 f620-mypy-head / f620-mypy-base` → mypy --strict head + base (base re-checked-out to head after).
+- `f620-services` / `f620-services-final` → full test/services (grok-box-004 then grok-box-006).
+- `CAO_BOXES=grok-box-004 f620-diag / f620-diag2 / f620-base-unrelated` → failure triage (incl. base-vs-head of the unrelated failures).
+- `CAO_BOXES=grok-box-004 f620-reverify` → 93 passed post-fix at 9626456e.
+- `f620-cleanup / f620-cleanup4 / f620-cleanup6` → restore each box repo to `main`.
+- Raw ssh (read-only): `git remote -v` / load / branch peeks on -002/-004/-006.
+- Checkouts left at: grok-box-004 and grok-box-006 repos on `main` (e64684f9), clean trees.
 - Env mutations: none (no installs, no lockfile changes).
-- Temp files left on box: none (removed /tmp/f620-*.txt).
-- Deviations: none.
+- Temp files left on boxes: none (used no box /tmp; laptop scratch only).
+- Deviations: full `test/services` A/B split across boxes (-004 base-unrelated
+  vs -006 final) — the 5 core pre-existing failures were still confirmed at
+  BASE on the SAME box (-004); the 2 byte-exact manifest failures are known
+  cross-box environmental. Reported honestly, not hidden.
 
 ## 6. Push note
 Branch `cao/a778fc81` pushed to origin (`chaogebaba/cli-agent-orchestrator`) as a
 SCRATCH branch for box fetch-by-SHA delivery only — never main, no PR — per the
-supervisor's clarification that this is the required box-delivery mechanism.
+supervisor's authorization. Scratch on the laptop stayed under
+`/data/cao-scratch/a778fc81/`; nothing written to `/tmp`.
+
+Commits on the branch:
+- `ce4fa12f` — implementation (code of record).
+- `c9e38de2` / `463e06f0` — build report (superseded by this update).
+- `9626456e` — test-isolation fixes surfaced by the full-suite box run.
