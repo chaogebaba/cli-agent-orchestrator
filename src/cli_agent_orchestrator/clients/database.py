@@ -1477,6 +1477,7 @@ def init_db() -> None:
     _migrate_fallback_parent_edges()
     _migrate_inbox_orchestration_type()
     _migrate_inbox_failure_reason()
+    _migrate_f582_d23_inbox_expiry()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -2046,6 +2047,29 @@ def _migrate_inbox_failure_reason() -> None:
         if not columns or "failure_reason" in {column["name"] for column in columns}:
             return
         connection.execute(text("ALTER TABLE inbox ADD COLUMN failure_reason TEXT"))
+
+
+def _migrate_f582_d23_inbox_expiry() -> None:
+    """F618/F582 D23: add the opt-in per-message delivery-control columns.
+
+    Slice B (D23, merged ``e64684f9``) added ``InboxModel.expire_after_s`` /
+    ``supersede_key`` to the mapped model (database.py) and the inbox INSERT now
+    names them, but shipped no migration. ``create_all`` never alters an existing
+    table, so on a redeployed DB every inbox INSERT 500s with "table inbox has no
+    column named expire_after_s". Both columns are nullable and independent; a
+    legacy DB may be missing either or both, so each ``ADD COLUMN`` is guarded on
+    its own PRAGMA membership check (idempotent, pattern of
+    ``_migrate_inbox_failure_reason``).
+    """
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
+        if not columns:
+            return
+        names = {column["name"] for column in columns}
+        if "expire_after_s" not in names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN expire_after_s INTEGER"))
+        if "supersede_key" not in names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN supersede_key TEXT"))
 
 
 def _migrate_mailbox_columns() -> None:
