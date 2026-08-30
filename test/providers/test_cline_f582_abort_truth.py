@@ -150,8 +150,9 @@ def test_dispatcher_crash_remains_error_even_with_visible_abort(
 ) -> None:
     provider._task_dispatched_flag = True
     provider._pane_cmd = lambda: "zsh"  # type: ignore[method-assign]
+    sub_floor_abort = "\n".join(["crashed dispatcher", ABORT_LINE])
 
-    assert provider.get_status(_authoritative(ABORT_LINE)) is TerminalStatus.ERROR
+    assert provider.get_status(sub_floor_abort) is TerminalStatus.ERROR
     assert provider._abort_reported_occ == 0
 
 
