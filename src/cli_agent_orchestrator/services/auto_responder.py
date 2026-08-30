@@ -1267,6 +1267,37 @@ class AutoResponder:
         # that already filtered; correct for patched single-arg stand-ins).
         return dialog_region(list(region.rows), chrome_patterns)
 
+    @staticmethod
+    def _barrier_composite_region(
+        terminal_id: str, chrome_patterns: Optional[List["re.Pattern[str]"]]
+    ) -> Optional[DialogRegion]:
+        """F635 #490: the barrier's match/settle capture, in the SAME domain the
+        settle-digest is seeded in.
+
+        ``_effect_barrier``'s ``fresh`` capture comes from ``capture_viewport``
+        (the RAW tmux viewport), but the settle-digest it compares against is
+        seeded (in ``_on_screen`` / ``_verify_and_retry``) from the pyte-COMPOSITE
+        screen (``status_monitor.get_rendered_screen``). Those two capture paths
+        diverge for a dialog wider than the pane: the composite retains the full
+        line while the viewport truncates it at the terminal width. For the codex
+        resume-cwd chooser (long absolute worktree paths in its options) the
+        normalized strings — and thus ``_digest_normalized`` — legitimately DIFFER
+        though it is the SAME static dialog, so the cross-domain ``settle_ok``
+        equality NEVER agreed and the send was withheld on every eval (#490's
+        matched-but-no-fire deadlock).
+
+        This reads the composite screen DIRECTLY (not via ``_current_normalized``)
+        so the barrier stays in the seed's domain WITHOUT colliding with the
+        retry-loop tests that stub ``_current_normalized`` to simulate a cleared
+        dialog. Returns None when no composite is available (the barrier then
+        keeps its prior viewport-region behaviour)."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        lines = status_monitor.get_rendered_screen(terminal_id)
+        if lines is None:
+            return None
+        return dialog_region(lines, chrome_patterns)
+
     def _send_answer(
         self,
         terminal_id: str,
@@ -1641,9 +1672,22 @@ class AutoResponder:
         # Classify on the UNFILTERED tail (unchanged behavior); match + settle on
         # the CHROME-FILTERED tail (F530 layer 1), mirroring the on_screen split.
         region = self._region_from_capture(fresh)
-        match_region = (
-            self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
-        )
+        # F635 #490: derive the match/settle region from the pyte-COMPOSITE screen
+        # (the SAME domain the settle-digest is seeded in), not from ``fresh`` (the
+        # raw ``capture_viewport`` tail). See ``_barrier_composite_region``: the two
+        # capture paths diverge for a dialog wider than the pane (codex resume-cwd
+        # long worktree paths), so comparing a truncated-viewport digest against a
+        # composite settle-digest never agreed and withheld the send forever. Fall
+        # back to the viewport tail only when no composite is available (preserving
+        # prior behaviour for tests/paths without a live composite). The raw
+        # viewport ``region`` is still used for the provider ``status`` classify.
+        composite_match_region = self._barrier_composite_region(terminal_id, chrome_patterns)
+        if composite_match_region is not None:
+            match_region = composite_match_region
+        else:
+            match_region = (
+                self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
+            )
         status = self._classify_region(terminal_id, provider, region)
         if not rule.matches(match_region):
             return False  # dialog cleared / no longer matches — no retry
