@@ -696,15 +696,20 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
 def _f413_after_commit(session: Any) -> None:
     """D3: Drain doorbell stash after commit, with nested-tx guard.
 
-    F158-R2: The after-commit hook is the FIRST point where the inbox row is
-    durable. Two wake paths:
-      1. WS armed AND send succeeds → advisory frame wakes supervisor; record
-         in _f158_ws_delivered so F136 post-write skips the native ring (no dup).
-      2. WS unarmed/failed → request_delivery fires the F136 runner which writes
-         the callback file and rings ONCE post-write (single native ring owner).
+    F476 r3 (#388): This hook fires on the FIRST point where the inbox row is
+    durable, but it NO LONGER emits a wake itself. Emitting a WS advisory frame
+    here (as F158-R2 did) is ungated by the single wake cursor, so a re-insert /
+    replay / aged echo of an already-acked row re-woke the supervisor (blueprint
+    D8: the doorbell is a transport of the claim/commit push cycle, never an
+    independent waker). The hook now ONLY signals request_delivery for each
+    stashed terminal; the F136 runner claims wake-eligible rows above the cursor,
+    commits, then emits exactly one wake transport (WS or native) from
+    _f136_post_delivery. The hook still NEVER calls ring_supervisor_doorbell or
+    push_doorbell_frame_sync directly — that violates write-before-wake.
 
-    The hook NEVER calls ring_supervisor_doorbell directly — that violates the
-    write-before-wake contract (supervisor wakes before callback file exists).
+    row_id/sender_short/preview are retained in the unpack for stash-shape
+    compatibility (3- and 4-tuple) but are no longer consumed here: the runner
+    re-derives them from the durable row.
     """
     if session.in_nested_transaction():
         return
@@ -713,41 +718,31 @@ def _f413_after_commit(session: Any) -> None:
     session.info.pop(_F413_DOORBELL_SNAPSHOT_KEY, None)
     if not stash:
         return
+    # F476 r3: collapse to the set of terminals needing a delivery signal.
+    # One request_delivery per terminal — the runner coalesces the rows.
+    _signalled: set[str] = set()
     for entry in stash:
         # F158: tolerate both 3-tuple (legacy idempotent-hit path) and 4-tuple
         if len(entry) == 4:
-            terminal_id, row_id, sender_short, preview = entry
+            terminal_id = entry[0]
         elif len(entry) == 3:
-            # Legacy 3-tuple from idempotent-hit stash: (logical_receiver_id, row_id, preview)
-            # logical_receiver_id is a mailbox_id — resolve to terminal_id
-            terminal_id, row_id, preview = entry
-            sender_short = ""
+            # Legacy 3-tuple: (logical_receiver_id/terminal_id, row_id, preview)
+            terminal_id = entry[0]
         else:
             continue  # malformed — skip
+        if terminal_id in _signalled:
+            continue
+        _signalled.add(terminal_id)
 
-        ws_fired = False
-        try:
-            from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
-
-            ws_fired = push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
-        except Exception:
-            pass  # advisory-only
-
-        # F158-R2: If WS delivered, record it so F136 post-write skips the
-        # redundant native ring. No direct ring_supervisor_doorbell here —
-        # that would violate write-before-wake (B2).
-        if ws_fired:
-            try:
-                from cli_agent_orchestrator.services.ws_doorbell import (
-                    mark_ws_delivered,
-                )
-
-                mark_ws_delivered(terminal_id, row_id)
-            except Exception:
-                pass
-
-        # Always signal delivery — the F136 runner writes the callback file.
-        # When WS failed/unarmed, F136 post-write rings the native doorbell.
+        # F476 r3 (#388): the WS advisory frame is NO LONGER fired here.
+        # Firing push_doorbell_frame_sync on the insert-commit is ungated by
+        # the single wake cursor, so a re-insert / replay / aged echo of an
+        # already-acked row re-emitted a WS frame (blueprint D8 violation;
+        # issue #388 "WS doorbell" leg). The WS frame is now emitted only from
+        # the cursor-gated F136 post-delivery path (_f136_post_delivery), which
+        # runs after claim_unnotified_wake/commit_wake confirm the row is
+        # wake-eligible. Here we ONLY signal request_delivery — the runner
+        # claims, commits, then fires exactly one wake transport (WS or native).
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
 

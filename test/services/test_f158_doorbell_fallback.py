@@ -1,15 +1,18 @@
-"""F158: Doorbell fallback — when WS is unarmed, ring_supervisor_doorbell fires.
+"""F158/F476 r3: after-commit hook signals request_delivery only (no WS on insert).
 
-AC1: 4-tuple stash entry: push_doorbell_frame_sync called; when it returns False,
-     request_delivery fires (F136 post-write is the ring owner). No direct ring
-     from the after-commit hook (R2 fix: write-before-wake contract).
-AC2: 4-tuple stash entry: push_doorbell_frame_sync returns True → mark_ws_delivered
-     called, request_delivery still fires (inbox processing needed).
-AC3: 3-tuple stash entry (legacy idempotent-hit path): handled without crash,
-     falls back to request_delivery.
-AC4: push_doorbell_frame_sync signature change — returns bool (R2: bounded wait).
-AC5: request_delivery still called regardless of WS outcome.
-AC6: Idempotent-hit stash path stashes 4-tuple with receiver_id (not 3-tuple).
+F476 r3 (#388) moved the WS advisory frame OUT of _f413_after_commit (firing it
+on the insert-commit was ungated by the single wake cursor, blueprint D8). The
+hook now ONLY signals request_delivery, deduped per terminal; the cursor-gated
+F136 runner emits at most one wake transport (WS or native). These tests pin the
+new behavior:
+
+AC1: 4-tuple stash entry → request_delivery fires; push_doorbell_frame_sync is
+     NOT called from the hook; no direct ring.
+AC2: WS-armed makes no difference at the hook — it still only signals
+     request_delivery and never fires the WS frame / mark_ws_delivered.
+AC3: legacy 3-tuple entry → still resolves a terminal and signals request_delivery.
+AC5: multiple entries → one request_delivery per distinct terminal (deduped).
+AC4/AC6 (below) are unchanged by r3.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ import pytest
 
 
 class TestF158AfterCommitFallback:
-    """Test the _f413_after_commit doorbell fallback path."""
+    """Test the _f413_after_commit request_delivery signalling (r3: no WS/ring)."""
 
     def _make_session(self, stash):
         """Build a mock session object."""
@@ -37,67 +40,69 @@ class TestF158AfterCommitFallback:
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
+    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync")
     def test_ac1_ws_unarmed_triggers_fallback(self, mock_ws, mock_ring, mock_req):
-        """AC1: WS unarmed → request_delivery fires (F136 owns the ring). No direct ring."""
+        """AC1 (r3): 4-tuple entry → request_delivery fires; hook never fires WS
+        or rings directly (the cursor-gated runner owns the wake)."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session([("term123", 42, "sender", "hello")])
         _f413_after_commit(session)
 
-        mock_ws.assert_called_once_with("term123", 42, "sender", "hello")
-        # R2: No direct ring from hook — F136 post-write is the single ring owner
+        mock_ws.assert_not_called()
         mock_ring.assert_not_called()
         mock_req.assert_called_once_with("term123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
     @patch("cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered")
-    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=True)
+    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync")
     def test_ac2_ws_armed_no_fallback(self, mock_ws, mock_mark, mock_ring, mock_req):
-        """AC2: WS armed and fires → mark_ws_delivered called, no direct ring."""
+        """AC2 (r3): WS armed makes no difference at the hook — it neither fires
+        the WS frame nor marks delivered; it only signals request_delivery."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session([("term123", 42, "sender", "hello")])
         _f413_after_commit(session)
 
-        mock_ws.assert_called_once_with("term123", 42, "sender", "hello")
-        mock_mark.assert_called_once_with("term123", 42)
+        mock_ws.assert_not_called()
+        mock_mark.assert_not_called()
         mock_ring.assert_not_called()
         mock_req.assert_called_once_with("term123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
+    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync")
     def test_ac3_3tuple_handled_gracefully(self, mock_ws, mock_ring, mock_req):
-        """AC3: Legacy 3-tuple stash entry doesn't crash, falls back to request_delivery."""
+        """AC3 (r3): Legacy 3-tuple entry resolves its terminal and signals
+        request_delivery; no WS frame, no direct ring."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         # 3-tuple: (logical_receiver_id/terminal_id, row_id, preview)
         session = self._make_session([("mb_abc123", 99, "preview text")])
         _f413_after_commit(session)
 
-        # Uses the mailbox ID as terminal_id (best effort) — WS won't find it
-        mock_ws.assert_called_once_with("mb_abc123", 99, "", "preview text")
-        # R2: No direct ring from hook
+        mock_ws.assert_not_called()
         mock_ring.assert_not_called()
         mock_req.assert_called_once_with("mb_abc123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
+    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync")
     def test_ac5_multiple_entries_all_processed(self, mock_ws, mock_ring, mock_req):
-        """All entries in stash are processed (no short-circuit on first failure)."""
+        """AC5 (r3): entries for distinct terminals → one request_delivery each
+        (deduped per terminal); no WS frame, no direct ring."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
-        session = self._make_session([
-            ("term1", 10, "s1", "msg1"),
-            ("term2", 20, "s2", "msg2"),
-        ])
+        session = self._make_session(
+            [
+                ("term1", 10, "s1", "msg1"),
+                ("term2", 20, "s2", "msg2"),
+            ]
+        )
         _f413_after_commit(session)
 
-        assert mock_ws.call_count == 2
-        # R2: No direct ring from hook
+        mock_ws.assert_not_called()
         mock_ring.assert_not_called()
         assert mock_req.call_count == 2
         mock_req.assert_any_call("term1")
@@ -105,20 +110,22 @@ class TestF158AfterCommitFallback:
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
     @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync", return_value=False)
+    @patch("cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync")
     def test_malformed_entry_skipped(self, mock_ws, mock_ring, mock_req):
-        """Entries with wrong arity are skipped without crashing the loop."""
+        """Entries with wrong arity are skipped without crashing the loop; the
+        valid entry still yields one request_delivery."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
-        session = self._make_session([
-            ("only_two",),  # 1-tuple — malformed
-            ("term1", 10, "s1", "msg1"),  # valid 4-tuple
-        ])
+        session = self._make_session(
+            [
+                ("only_two",),  # 1-tuple — malformed
+                ("term1", 10, "s1", "msg1"),  # valid 4-tuple
+            ]
+        )
         _f413_after_commit(session)
 
-        # Only the valid entry is processed
-        assert mock_ws.call_count == 1
-        mock_ws.assert_called_once_with("term1", 10, "s1", "msg1")
+        mock_ws.assert_not_called()
+        mock_req.assert_called_once_with("term1")
 
 
 class TestF158PushDoorbellFrameSyncReturnType:
@@ -137,12 +144,15 @@ class TestF158PushDoorbellFrameSyncReturnType:
     def test_returns_false_when_not_armed(self):
         from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
 
-        with patch(
-            "cli_agent_orchestrator.services.ws_doorbell.is_ws_monitor_enabled",
-            return_value=True,
-        ), patch(
-            "cli_agent_orchestrator.services.ws_doorbell.is_armed",
-            return_value=False,
+        with (
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.is_ws_monitor_enabled",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.ws_doorbell.is_armed",
+                return_value=False,
+            ),
         ):
             result = push_doorbell_frame_sync("term1", 1, "s", "p")
             assert result is False
@@ -163,15 +173,19 @@ class TestF158PushDoorbellFrameSyncReturnType:
             orig_loop = inbox_mod.inbox_service._delivery_loop
             inbox_mod.inbox_service._delivery_loop = loop
 
-            with patch(
-                "cli_agent_orchestrator.services.ws_doorbell.is_ws_monitor_enabled",
-                return_value=True,
-            ), patch(
-                "cli_agent_orchestrator.services.ws_doorbell.is_armed",
-                return_value=True,
-            ), patch(
-                "asyncio.run_coroutine_threadsafe",
-            ) as mock_run:
+            with (
+                patch(
+                    "cli_agent_orchestrator.services.ws_doorbell.is_ws_monitor_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "cli_agent_orchestrator.services.ws_doorbell.is_armed",
+                    return_value=True,
+                ),
+                patch(
+                    "asyncio.run_coroutine_threadsafe",
+                ) as mock_run,
+            ):
                 # R2: push_doorbell_frame_sync now waits on future.result()
                 future = concurrent.futures.Future()
                 future.set_result(True)
@@ -224,26 +238,32 @@ class TestF158IdempotentHitStashFixed:
 
         # Create supervisor mailbox + terminal
         with SL() as db:
-            db.add(MailboxModel(
-                id="mb_sup1",
-                role="supervisor",
-                current_terminal_id="term_sup",
-                generation=1,
-                consumed_through_id=0,
-                session_name="test_session",
-            ))
-            db.add(TerminalModel(
-                id="term_sup",
-                tmux_session="s",
-                tmux_window="w",
-                provider="kiro_cli",
-                agent_profile="code_supervisor",
-            ))
-            db.add(MailboxIncarnationModel(
-                mailbox_id="mb_sup1",
-                terminal_id="term_sup",
-                generation=1,
-            ))
+            db.add(
+                MailboxModel(
+                    id="mb_sup1",
+                    role="supervisor",
+                    current_terminal_id="term_sup",
+                    generation=1,
+                    consumed_through_id=0,
+                    session_name="test_session",
+                )
+            )
+            db.add(
+                TerminalModel(
+                    id="term_sup",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    agent_profile="code_supervisor",
+                )
+            )
+            db.add(
+                MailboxIncarnationModel(
+                    mailbox_id="mb_sup1",
+                    terminal_id="term_sup",
+                    generation=1,
+                )
+            )
             db.commit()
 
         # Pre-create an obligation via raw SQL (simulates existing obligation)

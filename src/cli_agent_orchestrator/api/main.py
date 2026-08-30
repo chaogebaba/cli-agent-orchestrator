@@ -8215,8 +8215,9 @@ async def create_inbox_message_endpoint(
         if supersede_key is not None:
             raw_kwargs["supersede_key"] = supersede_key
         # F158-R3: Move create_inbox_message off the event-loop thread.
-        # The after-commit ORM hook (F413) calls push_doorbell_frame_sync which
-        # schedules a coroutine on this same loop and blocks — deadlock if inline.
+        # The after-commit ORM hook (F413) signals request_delivery which may
+        # schedule work on this same loop — running it inline would risk a
+        # same-loop stall, so the insert runs in a worker thread.
         inbox_msg = await asyncio.to_thread(
             create_inbox_message,
             sender_id,
@@ -8247,11 +8248,11 @@ async def create_inbox_message_endpoint(
     except Exception:
         pass  # best-effort; deliver_pending below is the fallback
 
-    # F158-R3: Removed redundant WPDT W1 push_doorbell_frame_sync call.
-    # The F413 after-commit hook already handles WS doorbell push for this row;
-    # a second push here would fire a duplicate frame and the same-loop deadlock
-    # (the hook runs inside asyncio.to_thread now, so it correctly uses the
-    # server's event loop without blocking it).
+    # F158-R3 / F476 r3 (#388): No push_doorbell_frame_sync call here.
+    # The wake is emitted by the cursor-gated F136 runner (armed by the
+    # request_delivery above). The F413 after-commit hook no longer fires a WS
+    # frame on insert (that was ungated by the wake cursor); it only signals
+    # request_delivery. At most one wake transport (WS or native) per id.
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.

@@ -568,9 +568,10 @@ def _create_logical_inbox_message_inner(
     """Holder (d): resolve, guard, and insert one logical row under one authority.
 
     F158-R3: The mailbox authority lock is released BEFORE doorbell signaling
-    runs. The after-commit hook's push_doorbell_frame_sync (up to 0.5s timeout)
-    no longer executes under the lock, bounding cumulative lock hold time to
-    the DB transaction duration only.
+    runs, bounding cumulative lock hold time to the DB transaction duration only.
+    F476 r3 (#388): the post-unlock drain no longer fires a WS frame on insert —
+    it only signals request_delivery, so the wake is emitted by the cursor-gated
+    F136 runner (at most one transport per id; blueprint D8).
     """
     with SessionLocal() as db:
         mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
@@ -636,33 +637,27 @@ def _create_logical_inbox_message_inner(
     finally:
         lock.release()
 
-    # F158-R3: Drain deferred doorbell stash OUTSIDE the lock.
-    # This mirrors _f413_after_commit's logic but runs without the authority lock.
+    # F476 r3 (#388): Drain deferred doorbell stash OUTSIDE the lock.
+    # This used to mirror _f413_after_commit by firing push_doorbell_frame_sync
+    # on insert — but that WS frame is ungated by the single wake cursor, so a
+    # re-insert / replay / aged echo of an already-acked row re-woke the
+    # supervisor (blueprint D8: the doorbell is a transport of the claim/commit
+    # push cycle, not an independent waker). We now ONLY signal request_delivery;
+    # the F136 runner claims wake-eligible rows above the cursor, commits, then
+    # fires exactly one wake transport (WS or native) from _f136_post_delivery /
+    # the runner thread. One request_delivery per terminal — the runner coalesces.
     if _deferred_stash:
         from cli_agent_orchestrator.services.inbox_service import request_delivery as _req_del
-        from cli_agent_orchestrator.services.ws_doorbell import (
-            mark_ws_delivered,
-            push_doorbell_frame_sync,
-        )
 
+        _signalled: set[str] = set()
         for entry in _deferred_stash:
-            if len(entry) == 4:
-                _tid, _rid, _sender, _prev = entry
-            elif len(entry) == 3:
-                _tid, _rid, _prev = entry
-                _sender = ""
+            if len(entry) in (3, 4):
+                _tid = entry[0]
             else:
                 continue
-            ws_fired = False
-            try:
-                ws_fired = push_doorbell_frame_sync(_tid, _rid, _sender, _prev)
-            except Exception:
-                pass
-            if ws_fired:
-                try:
-                    mark_ws_delivered(_tid, _rid)
-                except Exception:
-                    pass
+            if _tid in _signalled:
+                continue
+            _signalled.add(_tid)
             try:
                 _req_del(_tid)
             except Exception:
