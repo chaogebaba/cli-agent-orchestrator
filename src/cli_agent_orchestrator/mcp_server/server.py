@@ -1250,6 +1250,9 @@ async def _handoff_impl(
                 message=f"Handoff failed: {_disk_low}",
                 output=None,
                 terminal_id=None,
+                display_name=None,
+                window_name=None,
+                resolved_model=None,
             )
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex

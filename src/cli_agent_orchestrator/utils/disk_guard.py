@@ -87,7 +87,7 @@ def _low_paths(worktree_root: Optional[str]) -> List[Tuple[Path, float, float]]:
     checked.append(TERMINAL_LOG_DIR)
 
     low: List[Tuple[Path, float, float]] = []
-    seen: set = set()
+    seen: set[str] = set()
     for path in checked:
         ancestor = _existing_ancestor(path)
         key = str(ancestor) if ancestor is not None else str(path)
