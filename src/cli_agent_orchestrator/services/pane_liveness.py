@@ -98,7 +98,6 @@ class PaneObservation:
     busy_marker: bool | None = None
     children_count: int = 0
     marker_rows: tuple[str, ...] = ()
-    filtered_tail: str = ""
 
 
 @dataclass
@@ -113,6 +112,10 @@ class _PaneState:
     busy_marker: bool | None = None
     children_count: int = 0
     marker_rows: tuple[str, ...] = ()
+    # F521 D15: the last admitted filtered tail, retained so a forced
+    # re-detect after a signalled stream drop has an input independent of
+    # the dropped event stream. No new capture — observe() already built it.
+    filtered_tail: str = ""
     # F568 AC-7 veto-defect episode clock — independent of downgrade_since.
     veto_episode_open: bool = False
     veto_warned_at: float | None = None

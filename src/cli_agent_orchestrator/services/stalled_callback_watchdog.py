@@ -699,10 +699,10 @@ class StalledCallbackWatchdog:
 
             # D15: re-derive from the independent pane sample after a signalled
             # stream drop, plus the low-frequency PROCESSING backstop. This adds
-            # no capture: observe() already supplied filtered_tail.
-            status_monitor.resync_from_pane_tail(
-                terminal_id, observation.filtered_tail, now=now
-            )
+            # no capture: peek() returns the tail observe() already retained.
+            retained = pane_liveness.peek(terminal_id, now=now)
+            if retained is not None:
+                status_monitor.resync_from_pane_tail(terminal_id, retained.filtered_tail, now=now)
 
             # F507: reconcile the question marker for terminals holding an open
             # marker or classified WAITING (level-triggered, D9). Cheap and
@@ -790,9 +790,7 @@ class StalledCallbackWatchdog:
                 return
             question_state.reconcile(terminal_id, metadata)
         except Exception:
-            logger.debug(
-                "question_marker reconcile failed for %s", terminal_id, exc_info=True
-            )
+            logger.debug("question_marker reconcile failed for %s", terminal_id, exc_info=True)
 
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
         from cli_agent_orchestrator.backends.registry import get_backend

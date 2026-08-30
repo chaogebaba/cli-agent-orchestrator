@@ -271,7 +271,7 @@ class StatusMonitor:
         # D15: status-stream loss recovery state. A status publish snapshots
         # the event-bus drop level; the independent pane-sampler tick can then
         # force a re-derivation when that level changes.
-        self._drop_seq_at_publish: Dict[str, int] = {}
+        self._drop_seq_seen: Dict[str, int] = {}
         self._last_publish_monotonic: Dict[str, float] = {}
         self._last_level_resync_monotonic: Dict[str, float] = {}
         self._status_fusion_reason: Dict[str, str] = {}
@@ -1207,7 +1207,7 @@ class StatusMonitor:
         # re-enter StatusMonitor while the latch state is mid-update.
         if publish_external:
             with self._lock:
-                self._drop_seq_at_publish[terminal_id] = bus.get_drop_seq(terminal_id)
+                self._drop_seq_seen[terminal_id] = bus.get_drop_seq(terminal_id)
                 self._last_publish_monotonic[terminal_id] = _clock()
                 fusion_reason = self._status_fusion_reason.get(terminal_id)
             payload = {"status": detected.value}
@@ -1855,8 +1855,7 @@ class StatusMonitor:
             # F506: fuse at read time (D2). fuse_status re-acquires the RLock
             # (safe) and only READS question_state/pane_liveness — no capture.
             fused_status, fusion_reason = self.fuse_status(terminal_id, published)
-            if fusion_reason is None:
-                fusion_reason = self._status_fusion_reason.get(terminal_id)
+            fusion_reason = self._status_fusion_reason.get(terminal_id) or fusion_reason
             if fused_status is None:
                 fused_status = published
             # fusion_changed is set HERE from the status delta (R6-S5): the
@@ -1946,11 +1945,11 @@ class StatusMonitor:
         drop_seq = bus.get_drop_seq(terminal_id)
         with self._lock:
             published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
-            published_drop_seq = self._drop_seq_at_publish.get(terminal_id, 0)
+            seen_drop_seq = self._drop_seq_seen.get(terminal_id, 0)
             published_at = self._last_publish_monotonic.get(terminal_id, now)
             last_resync = self._last_level_resync_monotonic.get(terminal_id)
             interval_s = self._resync_interval_s()
-            dropped = drop_seq != published_drop_seq
+            dropped = drop_seq != seen_drop_seq
             periodic = (
                 published == TerminalStatus.PROCESSING
                 and now - published_at >= interval_s
@@ -1959,6 +1958,11 @@ class StatusMonitor:
             if not dropped and not periodic:
                 return False
             self._last_level_resync_monotonic[terminal_id] = now
+            self._drop_seq_seen[terminal_id] = drop_seq
+            # Consume the signalled drop level here rather than only on the
+            # publish that may follow: a forced re-derive that lands on the
+            # same status publishes nothing, and re-deriving it on every
+            # subsequent tick would turn a one-shot signal into a level.
 
         provider = provider_manager.get_provider(terminal_id)
         if provider is None:
@@ -1998,7 +2002,7 @@ class StatusMonitor:
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
             self._retry_backoff_step.pop(terminal_id, None)
-            self._drop_seq_at_publish.pop(terminal_id, None)
+            self._drop_seq_seen.pop(terminal_id, None)
             self._last_publish_monotonic.pop(terminal_id, None)
             self._last_level_resync_monotonic.pop(terminal_id, None)
             self._status_fusion_reason.pop(terminal_id, None)
@@ -2086,7 +2090,7 @@ class StatusMonitor:
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
             self._status_gen.pop(terminal_id, None)
-            self._drop_seq_at_publish.pop(terminal_id, None)
+            self._drop_seq_seen.pop(terminal_id, None)
             self._last_publish_monotonic.pop(terminal_id, None)
             self._last_level_resync_monotonic.pop(terminal_id, None)
             self._status_fusion_reason.pop(terminal_id, None)

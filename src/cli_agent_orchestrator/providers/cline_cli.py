@@ -707,11 +707,9 @@ class ClineCliProvider(BaseProvider):
 
                 lines = strip_terminal_escapes(output or "").splitlines()
                 occurrences = sum(ABORT_LINE in line for line in lines)
+                non_authoritative = len(lines) <= PANE_LIVENESS_TAIL_LINES
                 now = time.monotonic()
-                if (
-                    len(lines) > PANE_LIVENESS_TAIL_LINES
-                    and occurrences > self._abort_reported_occ
-                ):
+                if not non_authoritative and occurrences > self._abort_reported_occ:
                     self._abort_reported_occ = occurrences
                     self._abort_reported_at = now
                     logger.warning(
