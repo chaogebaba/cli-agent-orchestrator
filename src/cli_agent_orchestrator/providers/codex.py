@@ -653,6 +653,11 @@ class CodexSubmitBaseline:
 
     rollout_path: "Path | None" = None
     rollout_offset: int = 0
+    # F643 (#498): wall-clock instant the baseline was taken. Bounds the
+    # forked-rollout fallback scan (verify_submission_after_send) so it only
+    # considers rollout files written for THIS dispatch, never a pre-existing
+    # sibling. 0.0 means unset (disables the fallback — fail safe).
+    baseline_wall: float = 0.0
     turn_fingerprints: frozenset[str] = field(default_factory=frozenset)
     chip_counter: tuple[tuple[str, int], ...] = ()
     turn_count: int = 0
@@ -1997,6 +2002,79 @@ class CodexProvider(BaseProvider):
         """Collapse whitespace for content comparison (rollout vs dispatch)."""
         return re.sub(r"\s+", " ", text).strip()
 
+    def _forked_rollout_match(
+        self,
+        pinned_path: "Path | None",
+        message: str,
+        baseline_wall: float,
+    ) -> bool:
+        """F643 (#498): confirm delivery in a FORKED rollout the pinned file missed.
+
+        Root cause of F643: a "fresh" codex terminal in CAO is launched by
+        RESUMING the seed rollout (``seed_resume_identity``). ``provider_session_id``
+        is pinned to the SEED uuid at spawn, so ``_resolve_rollout_file`` globs
+        ``rollout-*{seed_uuid}*.jsonl`` and returns the stale seed file (~49KB).
+        But modern Codex resume can FORK the transcript into a brand-new rollout
+        file with a NEW uuid (openai/codex ``InitialHistory::Forked`` — "a new id
+        and file"). The dispatched task turn is written to that NEW file, so
+        ``_rollout_has_user_event`` scanning the seed file after its offset never
+        matches → F435 declares delivery structurally unconfirmed → deferral →
+        composer-unreadable teardown.
+
+        This fallback scans sibling rollout files in the SAME per-terminal codex
+        sessions dir that were modified AT/AFTER the dispatch baseline instant
+        (``baseline_wall``) and checks each for the content-matched user turn from
+        byte 0. Two guards keep it from confirming an unrelated turn:
+
+          1. mtime >= baseline_wall — a file untouched since before this dispatch
+             cannot hold this dispatch's turn (excludes the seed itself).
+          2. exact CONTENT match on the dispatched ``message`` (the supervisor's
+             callback preamble makes initial-task messages effectively unique).
+
+        Fail-safe: returns False when ``baseline_wall`` is unset (0.0), the
+        sessions dir is unresolvable, or nothing matches — never a false confirm.
+        """
+        if not message or baseline_wall <= 0.0:
+            return False
+        try:
+            sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
+        except Exception:
+            return False
+        if not sessions_dir.is_dir():
+            return False
+        pinned_resolved = pinned_path.resolve() if pinned_path is not None else None
+        try:
+            candidates = list(sessions_dir.glob("**/rollout-*.jsonl"))
+        except OSError:
+            return False
+        # Newest first: the live forked file is the most recently written.
+        def _mtime(p: "Path") -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        for path in sorted(candidates, key=_mtime, reverse=True):
+            try:
+                if path.resolve() == pinned_resolved:
+                    continue  # already scanned by the pinned check
+                if path.stat().st_mtime < baseline_wall:
+                    continue  # untouched since before this dispatch → not ours
+            except OSError:
+                continue
+            # Scan from byte 0: a forked file starts fresh, the task turn is new.
+            if self._rollout_has_user_event(path, 0, message):
+                logger.warning(
+                    "F643 forked-rollout fallback: terminal %s task confirmed in "
+                    "sibling rollout %s (pinned rollout %s missed it — resume forked "
+                    "to a new session file)",
+                    getattr(self, "terminal_id", "?"),
+                    path.name,
+                    pinned_path.name if pinned_path is not None else None,
+                )
+                return True
+        return False
+
     @classmethod
     def _rollout_has_user_event(
         cls,
@@ -3279,6 +3357,11 @@ class CodexProvider(BaseProvider):
         Called by the send seam immediately before ``backend.send_keys``.
         """
         # --- Structural rollout baseline (PRIMARY) ---
+        # F643 (#498): capture the wall-clock instant FIRST. Any rollout file
+        # whose mtime is >= this instant received writes for THIS dispatch and
+        # is a legitimate forked-rollout fallback candidate; anything older is a
+        # pre-existing sibling (e.g. the resume seed) and must be ignored.
+        baseline_wall = time.time()
         session_uuid = metadata.get("provider_session_id")
         rollout_path = self._resolve_rollout_file(session_uuid)
         rollout_offset = self._rollout_file_offset(rollout_path)
@@ -3312,6 +3395,7 @@ class CodexProvider(BaseProvider):
         return CodexSubmitBaseline(
             rollout_path=rollout_path,
             rollout_offset=rollout_offset,
+            baseline_wall=baseline_wall,
             turn_fingerprints=pane_baseline.turn_fingerprints,
             chip_counter=pane_baseline.chip_counter,
             turn_count=pane_baseline.turn_count,
@@ -3394,7 +3478,13 @@ class CodexProvider(BaseProvider):
         def _rollout_confirms() -> bool:
             """Check if rollout has a matching user event after baseline offset."""
             rp = _ensure_rollout_path()
-            return self._rollout_has_user_event(rp, rollout_offset, message or "")
+            if self._rollout_has_user_event(rp, rollout_offset, message or ""):
+                return True
+            # F643 (#498): the pinned (seed-uuid) rollout may be stale because
+            # codex resume forked the transcript into a NEW rollout file. Confirm
+            # delivery in a sibling file written for THIS dispatch instead.
+            baseline_wall = baseline.baseline_wall if baseline else 0.0
+            return self._forked_rollout_match(rp, message or "", baseline_wall)
 
         def _pane_hint_submitted() -> bool:
             """Fast-path pane hint: check if pane clearly shows submission.
