@@ -1200,6 +1200,32 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             # synchronously — stops the floor from re-ringing a busy supervisor
             # whose consumption cursor already advanced.
             settled_count += _obligations_settled
+            # F642 D4/D6: transition the acked ids' ledger rows to `acked`
+            # (recording actor=explicit) and prune any queued replay for them, in
+            # the SAME transaction as the watermark advance. The watermark update
+            # is thereby a projection of the ledger, not the truth.
+            if up_to_id > _f178_prior:
+                _f642_acked_ids = [
+                    row_id
+                    for (row_id,) in db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.id <= up_to_id,
+                        InboxModel.id > _f178_prior,
+                        address_scope,
+                    )
+                    .all()
+                ]
+                if _f642_acked_ids:
+                    try:
+                        from cli_agent_orchestrator.clients import database as _db_mod
+
+                        _db_mod.ack_delivery_ledger(
+                            db,
+                            message_ids=_f642_acked_ids,
+                            actor=_db_mod.AckActor.EXPLICIT,
+                        )
+                    except Exception:
+                        logger.debug("f642_ack_ledger_failed", exc_info=True)
             db.commit()
             # FX193: disarm nudge on cursor advance (eager cancellation)
             try:
