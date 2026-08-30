@@ -61,6 +61,44 @@ class NativeResolution:
     flush_kind: Literal["done", "idle"] | None
 
 
+# F537 D20: MCP readiness code vocabulary (assign-result surfacing).
+MCP_READY = "mcp_ready"
+MCP_UNVERIFIED = "mcp_unverified"
+MCP_UNAVAILABLE = "E-MCP-UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class MCPEvidence:
+    """F537 D20: a provider's DURABLE MCP-attach readiness artifact.
+
+    ``declared`` is True whenever the provider ships a readiness artifact at all
+    (so a declared-but-absent artifact can be distinguished from an undeclared
+    provider). ``connected`` is the observed verdict from that artifact.
+    ``source`` names the artifact read (a log path / log line) for audit — NEVER
+    pane text. A provider with no artifact returns ``None`` from
+    ``mcp_ready_evidence`` rather than an ``MCPEvidence`` with ``declared=False``.
+    """
+
+    declared: bool
+    connected: bool
+    source: str = ""
+
+
+def classify_mcp_readiness(evidence: "MCPEvidence | None") -> str:
+    """F537 D20: map MCP evidence to a readiness code (Do-NOT 23).
+
+    * ``None``                     → ``mcp_unverified`` (undeclared provider is
+                                     EXEMPT — never ERROR).
+    * declared AND connected       → ``mcp_ready``.
+    * declared AND NOT connected   → ``E-MCP-UNAVAILABLE`` (a seat with evidence
+                                     DECLARED but the artifact says not-connected
+                                     goes ERROR — readiness never read from pane).
+    """
+    if evidence is None or not evidence.declared:
+        return MCP_UNVERIFIED
+    return MCP_READY if evidence.connected else MCP_UNAVAILABLE
+
+
 class ArtifactValidationError(Exception):
     """Base for stable, locally classified session-artifact failures."""
 
@@ -302,6 +340,23 @@ class BaseProvider(ABC):
         legacy rule 3a applies unchanged. Only ``claude_code`` overrides this
         (it has a TUI turn spinner and a hook bus); every other provider keeps
         the default ``None`` so its rule-3a behaviour is byte-identical.
+        """
+        return None
+
+    def mcp_ready_evidence(self) -> "MCPEvidence | None":
+        """F537 D20: durable, non-pane evidence of this seat's MCP attach state.
+
+        Returns an :class:`MCPEvidence` when the provider ships a DURABLE
+        readiness artifact it actually writes (a worker-log line, a connect-ok
+        log entry) — NEVER pane text (Do-NOT: "pane text never counts"). A
+        provider that has no declared artifact returns ``None`` and is EXEMPT:
+        its seats are marked ``mcp_unverified`` in the assign result, never
+        ERROR (failing closed on an undeclared artifact would ERROR every
+        codex/cline/claude_code worker on day one — WP Do-NOT 23).
+
+        Default: ``None`` (exempt). Only providers with a real artifact override
+        this — this WP lands the kiro leg (the ``Prepared N MCP servers`` worker
+        log line + ``~/.kiro/logs/*/mcp.log`` ``mcp.connect.ok``).
         """
         return None
 

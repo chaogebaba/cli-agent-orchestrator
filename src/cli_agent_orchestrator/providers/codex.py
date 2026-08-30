@@ -29,6 +29,7 @@ from cli_agent_orchestrator.providers.screen_classification import (
     ScreenSignal,
     screen_classification_result,
 )
+from cli_agent_orchestrator.services.secret_gate import redact_secrets
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_provider_profile_defaults,
@@ -49,6 +50,28 @@ from cli_agent_orchestrator.utils.terminal import (
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# F587 D19: how many trailing output lines a seed-failure carries into its
+# exception AND the assign error payload. Every failure branch (rc≠0, timeout,
+# and a classifier refusal that hangs into the timeout) surfaces the same
+# bounded, secret-scrubbed tail — observability only.
+_SEED_FAILURE_TAIL_LINES = 40
+
+
+def _seed_failure_tail(output: object) -> str:
+    """Return the last ``_SEED_FAILURE_TAIL_LINES`` lines of ``output``,
+    secret-scrubbed via :func:`redact_secrets`. ``None``/empty → ``""``.
+
+    Never echoes the original matched bytes — only the redacted text is
+    returned, so a token that leaked into a seed's stdout cannot ride the
+    assign error payload out (F587 secret_gate arm).
+    """
+    if not output:
+        return ""
+    text = output if isinstance(output, str) else str(output)
+    tail = "\n".join(text.splitlines()[-_SEED_FAILURE_TAIL_LINES:])
+    redacted, _fired = redact_secrets(tail)
+    return redacted
 
 
 def _resolved_codex_home(terminal_id: str | None) -> Path:
@@ -1452,18 +1475,26 @@ class CodexProvider(BaseProvider):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            logger.error(f"codex seed_resume_identity: TIMEOUT after 90s for {agent_profile}")
-            raise RuntimeError("seed_timeout") from exc
+            # F587 D19: the timeout branch previously dropped exc.output — a
+            # classifier refusal (F431/F587) hangs rather than exits, so its
+            # diagnostic lived only in the discarded captured output. Carry a
+            # bounded, secret-scrubbed tail into both the log and the exception
+            # (which becomes the assign error payload).
+            tail = _seed_failure_tail(getattr(exc, "output", None))
+            logger.error(
+                f"codex seed_resume_identity: TIMEOUT after 90s for {agent_profile}; "
+                f"last {_SEED_FAILURE_TAIL_LINES} output lines:\n{tail}"
+            )
+            raise RuntimeError(f"seed_timeout: {tail[-400:]}") from exc
         except OSError as exc:
             logger.error(f"codex seed_resume_identity: exec failed: {exc}")
             raise RuntimeError("seed_exec_failed") from exc
         logger.info(f"codex seed_resume_identity: completed rc={completed.returncode}")
         if completed.returncode != 0:
-            stdout = completed.stdout or ""
-            tail = "\n".join(stdout.splitlines()[-10:])
+            tail = _seed_failure_tail(completed.stdout or "")
             logger.error(
                 f"codex seed_resume_identity: exec rc={completed.returncode} for "
-                f"{agent_profile}; last 10 stdout lines:\n{tail}"
+                f"{agent_profile}; last {_SEED_FAILURE_TAIL_LINES} stdout lines:\n{tail}"
             )
             raise RuntimeError(f"seed_exec_failed rc={completed.returncode}: {tail[-400:]}")
         matches: set[str] = set(

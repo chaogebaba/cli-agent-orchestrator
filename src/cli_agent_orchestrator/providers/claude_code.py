@@ -985,12 +985,37 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         ledger_hooks = [{"type": "command", "command": ledger_command, "timeout": 5}]
+        # F543 D22: the supervisor drain/ack hooks, relocated OUT of any
+        # ~/.claude / repo-local .claude/hooks copy and INTO this overlay,
+        # composed with the same env/credential shape as the four hooks above
+        # (Do-NOT 20). SHOULD-5: location only — F476 owns the delivered-state
+        # internals. Drain fires on SessionStart; ack on Stop.
+        drain_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.supervisor_drain",
+            ]
+        )
+        drain_hooks = [{"type": "command", "command": drain_command, "timeout": 5}]
+        ack_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.supervisor_ack",
+            ]
+        )
+        ack_hooks = [{"type": "command", "command": ack_command, "timeout": 5}]
         settings = {
             "hooks": {
                 "SessionStart": [
                     {
                         "matcher": "startup|resume|clear|compact",
-                        "hooks": hooks,
+                        "hooks": hooks + drain_hooks,
                     }
                 ],
                 # OPEN edges (D7):
@@ -1037,7 +1062,7 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
                 "Stop": [
                     {
-                        "hooks": marker_hooks,
+                        "hooks": marker_hooks + ack_hooks,
                     }
                 ],
                 # F568 D12a release edge: the subagent's Stop (converted to

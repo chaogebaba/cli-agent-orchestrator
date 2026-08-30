@@ -20,29 +20,44 @@ def _run(event: dict) -> int:
 def test_classify_register_on_agent_and_task():
     assert children_ledger._classify(
         {"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_call_id": "c1"}
-    ) == ("register", "c1")
+    ) == ("register", "c1", None)
     assert children_ledger._classify(
         {"hook_event_name": "PreToolUse", "tool_name": "Task", "tool_call_id": "c2"}
-    ) == ("register", "c2")
+    ) == ("register", "c2", None)
 
 
 def test_classify_register_synthesizes_id_when_absent():
-    op, child_id = children_ledger._classify(
+    op, child_id, release_token = children_ledger._classify(
         {"hook_event_name": "PreToolUse", "tool_name": "Agent"}
     )
     assert op == "register"
     assert isinstance(child_id, str) and child_id
+    assert release_token is None
 
 
-def test_classify_release_on_subagent_stop_with_id():
-    assert children_ledger._classify({"hook_event_name": "SubagentStop", "agent_id": "a1"}) == (
-        "release",
-        "a1",
-    )
+def test_classify_release_subagent_stop_agent_id_is_token_not_key():
+    """F579/#425 D17 (P-B fix): a SubagentStop carries agent_id and NO
+    tool_use_id. agent_id must be the release_token (observability/dedup), NEVER
+    the ledger child_id — the classify verdict is ("release", None, <agent_id>)
+    so the server pops the oldest entry (count-correct)."""
+    assert children_ledger._classify(
+        {"hook_event_name": "SubagentStop", "agent_id": "a1", "stop_hook_active": True}
+    ) == ("release", None, "a1")
+
+
+def test_classify_release_carries_tool_call_id_by_id_when_present():
+    """A payload carrying a real tool_call_id releases that entry by id."""
+    assert children_ledger._classify(
+        {"hook_event_name": "SubagentStop", "tool_call_id": "toolu_9", "agent_id": "a1"}
+    ) == ("release", "toolu_9", "a1")
 
 
 def test_classify_release_on_subagent_stop_without_id():
-    assert children_ledger._classify({"hook_event_name": "SubagentStop"}) == ("release", None)
+    assert children_ledger._classify({"hook_event_name": "SubagentStop"}) == (
+        "release",
+        None,
+        None,
+    )
 
 
 def test_classify_drops_non_dispatch_pretooluse():
@@ -120,6 +135,24 @@ def test_release_posts_without_child_id(monkeypatch):
     payload = post.call_args[1]["json"]
     assert payload["op"] == "release"
     assert "child_id" not in payload
+
+
+def test_release_posts_agent_id_as_release_token_not_child_id(monkeypatch):
+    """D17: a SubagentStop's agent_id goes on the wire as release_token, never
+    as child_id — the P-B id-mismatch fix, on the transport side."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+    event = {"hook_event_name": "SubagentStop", "agent_id": "agent-42", "stop_hook_active": True}
+    response = MagicMock()
+    with (
+        patch.object(children_ledger, "get_local_bearer", return_value=None),
+        patch.object(children_ledger.cao_http, "post", return_value=response) as post,
+    ):
+        assert _run(event) == 0
+    payload = post.call_args[1]["json"]
+    assert payload["op"] == "release"
+    assert "child_id" not in payload
+    assert payload["release_token"] == "agent-42"
 
 
 def test_dropped_event_no_post(monkeypatch):
