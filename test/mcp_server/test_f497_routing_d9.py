@@ -270,10 +270,20 @@ def test_ac18_certified_gate_cell_binds(tmp_path):
     assert res.fallback_profile is None
 
 
-def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path):
-    """A non-PASS NON-gate cell substitutes <provider>_general with a
-    fallback_profile + a fallback_cell for the [COLD-FALLBACK position=] field."""
+def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch):
+    """A non-PASS NON-gate cell substitutes the installed general ALIAS STUB
+    (stem ``<short>_general``) with a fallback_profile + a fallback_cell for the
+    [COLD-FALLBACK position=] field. F613 #469: the fallback is now the resolved
+    alias stub, not the raw ``f"{provider}_general"`` — so the flat store must
+    carry the (general, provider) stub."""
     positions = _build_store(tmp_path)
+    # F613: seed the installed general alias stub for (general, codex). Its stem
+    # (codex_general) is what the resolver must return.
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
+    _write(
+        tmp_path / "agent-store" / "codex_general.md",
+        "---\nextends: general\nname: codex_general\nprovider: codex\n---\n# codex general\n",
+    )
     # Add a non-gate position 'dev' that carries only the worker clauses, and a
     # proper dev [required] row in the clause table.
     _write(
@@ -329,6 +339,12 @@ def test_ac18_assign_non_gate_fallback_preamble(tmp_path, monkeypatch):
     )
     _write(overlays / "codex.md", "## Provider notes (codex)\nq.\n")
     _certify(positions, "general", "codex", "PASS")
+    # F613 #469: seed the installed general alias stub so the non-gate fallback
+    # resolves to the stub stem (codex_general), not the raw f-string.
+    _write(
+        home / "agent-store" / "codex_general.md",
+        "---\nextends: general\nname: codex_general\nprovider: codex\n---\n# codex general\n",
+    )
 
     rt = tmp_path / "routing.toml"
     _write(
