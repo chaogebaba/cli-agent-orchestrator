@@ -20,15 +20,43 @@ terminal A doesn't block writes for terminal B.
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.settings_service import get_logs_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+
+def _rotate_if_needed(path: Path, max_bytes: int) -> None:
+    """Roll ``path`` -> ``path.1`` when it has reached ``max_bytes`` (F619 #475).
+
+    Keeps exactly ONE backup: an existing ``<path>.1`` is replaced (os.replace
+    is atomic on the same filesystem), then the full ``<path>`` is moved onto
+    it, leaving a fresh empty active file to be re-created by the next append.
+    A non-positive ``max_bytes`` disables rotation (guarded by the caller, which
+    only passes a validated positive cap). Any OS error is swallowed with a
+    WARNING: a failed rotation must never stop log persistence or crash the
+    writer loop — the size cap is best-effort housekeeping, not correctness.
+    """
+    if max_bytes <= 0:
+        return
+    try:
+        if path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return  # file does not exist yet / cannot stat — nothing to rotate
+    backup = path.with_name(path.name + ".1")
+    try:
+        os.replace(path, backup)
+    except OSError as e:
+        logger.warning("Failed to rotate terminal log %s: %s", path, e)
+
 
 # Cap on events drained before flushing. Higher = better throughput under
 # burst, at the cost of larger latency between an output chunk landing and
@@ -75,13 +103,19 @@ class LogWriter:
                     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
                     grouped[log_path].append(event["data"]["data"])
 
+                # Resolve the rotation cap ONCE per batch (not per write): the
+                # toml read is cheap but not free, and a batch is the natural
+                # granularity — every file in this flush uses the same cap.
+                # A bad/missing value already resolved to the default upstream.
+                max_bytes = int(get_logs_settings()["max_file_mb"]) * 1024 * 1024
+
                 # One thread hop per unique file, not per event. Schedule the
                 # per-file writes concurrently (gather) so a large batch for
                 # terminal A doesn't serialize ahead of terminal B's write —
                 # each is an independent append to a distinct path.
                 await asyncio.gather(
                     *(
-                        asyncio.to_thread(self._write, path, "".join(chunks))
+                        asyncio.to_thread(self._write, path, "".join(chunks), max_bytes)
                         for path, chunks in grouped.items()
                     )
                 )
@@ -91,7 +125,12 @@ class LogWriter:
                 logger.error(f"Failed to write log: {e}")
 
     @staticmethod
-    def _write(path: Path, data: str) -> None:
+    def _write(path: Path, data: str, max_bytes: int = 0) -> None:
+        # Rotate BEFORE appending so the active file never grows unbounded
+        # within a single batch: if it has already reached the cap, roll it to
+        # <path>.1 and start fresh, then append this batch to the new file.
+        # (F619 #475 — the incident was a single .log at 322M.)
+        _rotate_if_needed(path, max_bytes)
         # Explicit UTF-8: the platform default encoding can be non-UTF-8
         # (e.g. POSIX/C locale), and a single unencodable chunk would raise
         # UnicodeEncodeError and stop log persistence for the terminal.
