@@ -104,7 +104,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
-from cli_agent_orchestrator.services import base_digest_service, worktree_service
+from cli_agent_orchestrator.services import base_digest_service, laptop_shim, worktree_service
 from cli_agent_orchestrator.services.deferred_dispatcher import (
     DeferredCall,
     DeferredExecutorSaturated,
@@ -2335,6 +2335,26 @@ async def create_terminal(
                         if key != "CAO_ARTIFACTS_DIR"
                     }
                     extra_env = {**session_floor, **window_overlay}
+                    # F620 (#476): for WORKER terminals only, prepend the
+                    # laptop-shim dir to PATH so pytest/mypy/uv-sync are denied
+                    # on the laptop when this repo has an active offload box.
+                    # A worker is an existing-session create with a caller_id
+                    # (mirrors the F439 worker-cap predicate); the supervisor
+                    # (caller_id=None) and operator new-session launches are
+                    # never shimmed. Repo root is resolved from the terminal's
+                    # own working directory; a non-repo cwd resolves to no shim.
+                    if caller_id:
+                        try:
+                            _shim_repo_root: Optional[str] = worktree_service.find_repo_root(
+                                resolved_working_directory
+                            )
+                        except worktree_service.WorktreeError:
+                            _shim_repo_root = None
+                        laptop_shim.maybe_shim_env(
+                            extra_env,
+                            is_worker=True,
+                            repo_root=_shim_repo_root,
+                        )
                     try:
                         _created_window_name = get_backend().create_window(
                             session_name,
@@ -3148,7 +3168,10 @@ async def create_terminal(
             # `git worktree remove` is a blocking subprocess call and this
             # `except` block still runs on the shared event loop.
             await asyncio.to_thread(
-                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+                worktree_service.remove_worktree,
+                worktree_repo_root,
+                terminal_id,
+                working_directory,
             )
         raise
     finally:
@@ -7492,11 +7515,40 @@ def _delete_terminal_under_lease(
         # Mismatched parses now fall through as a no-op leak (Phase 3
         # territory) instead of destroying another terminal's checkout.
         if metadata is not None:
-            parsed = worktree_service.parse_worktree_path(live_working_directory)
-            if parsed is not None:
-                worktree_repo_root, worktree_terminal_id = parsed
-                if worktree_terminal_id == terminal_id:
-                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
+            # F620 (#476): prefer CAO's stored worktree_info (authoritative
+            # repo_root + terminal_id) over parsing the pane cwd. Since the
+            # worktree checkout can now live off-repo (e.g. under
+            # /data/cao-scratch/worktrees/<repo>), its path no longer contains
+            # the in-repo `.cao/worktrees` marker parse_worktree_path keys on,
+            # so path-parsing alone would leak off-repo worktrees. The stored
+            # record names the real repo_root, so `git worktree remove` runs
+            # from the repo whose `.git/worktrees` bookkeeping owns this
+            # checkout -- git's own truth, independent of physical location.
+            # The path-parse remains as a fallback for the in-repo case and for
+            # any pre-F620 terminal with no stored worktree_info.
+            worktree_info = metadata.get("worktree_info")
+            removed_from_info = False
+            if isinstance(worktree_info, dict):
+                info_repo_root = worktree_info.get("repo_root")
+                info_terminal_id = worktree_info.get("terminal_id")
+                if (
+                    isinstance(info_repo_root, str)
+                    and info_repo_root
+                    and info_terminal_id == terminal_id
+                ):
+                    info_path = worktree_info.get("worktree_path")
+                    worktree_service.remove_worktree(
+                        info_repo_root,
+                        terminal_id,
+                        worktree_path=info_path if isinstance(info_path, str) else None,
+                    )
+                    removed_from_info = True
+            if not removed_from_info:
+                parsed = worktree_service.parse_worktree_path(live_working_directory)
+                if parsed is not None:
+                    worktree_repo_root, worktree_terminal_id = parsed
+                    if worktree_terminal_id == terminal_id:
+                        worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
         # Grok cleanup can be deferred when a private-home owner cannot yet be
         # inspected/stopped.  Keep both the provider mapping and DB metadata so

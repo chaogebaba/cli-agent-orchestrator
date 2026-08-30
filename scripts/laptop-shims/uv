@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# F620 (#476) laptop shim: uv.
+#
+# CAO prepends scripts/laptop-shims to a WORKER terminal's PATH when the repo
+# has an active offload-box row in scripts/boxes.tsv and LAPTOP_OK is unset.
+#
+# Unlike the pytest/mypy shims, uv is a general-purpose tool a worker legitimately
+# needs on the laptop (uv pip show, uv lock, uv tree, ...). This shim therefore
+# PASSES THROUGH to the real uv for everything EXCEPT the heavy operations that
+# caused the F620 incident:
+#
+#   uv sync            -> DENIED  (builds a .venv, hundreds of MB on `/`)
+#   uv venv            -> DENIED  (creates a .venv)
+#   uv run pytest ...  -> DENIED  (runs the suite on the laptop)
+#   uv run mypy ...    -> DENIED  (type-checks on the laptop)
+#
+# Denied invocations print the standard LAPTOP-DENIED message and exit 97.
+# Everything else execs the real uv unchanged.
+#
+# Override any denial for a one-off local run: set LAPTOP_OK=1 in the
+# environment (then even the heavy operations pass through).
+set -u
+
+_shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_find_real() {
+  # Rebuild PATH without this shim's directory, then locate the real binary.
+  local name="$1" newpath="" entry
+  local IFS=:
+  for entry in $PATH; do
+    if [ "$entry" != "$_shim_dir" ]; then
+      newpath="${newpath:+$newpath:}$entry"
+    fi
+  done
+  PATH="$newpath" command -v "$name" 2>/dev/null
+}
+
+_deny() {
+  echo "LAPTOP-DENIED: run on a grok box via scripts/box-run.sh (set LAPTOP_OK=1 to override)" >&2
+  exit 97
+}
+
+_passthrough() {
+  local real
+  real="$(_find_real uv)"
+  if [ -z "$real" ]; then
+    echo "laptop-shim: no real uv found on PATH" >&2
+    exit 127
+  fi
+  exec "$real" "$@"
+}
+
+# LAPTOP_OK short-circuits every check: behave exactly like the real uv.
+if [ "${LAPTOP_OK:-}" != "" ]; then
+  _passthrough "$@"
+fi
+
+# Find the first non-option token: the uv subcommand. Global flags before the
+# subcommand (e.g. `uv --quiet run ...`) are skipped so detection is robust.
+_subcmd=""
+_run_target=""
+_seen_run=0
+for arg in "$@"; do
+  case "$arg" in
+    -*)
+      continue
+      ;;
+    *)
+      if [ "$_seen_run" -eq 1 ] && [ -z "$_run_target" ]; then
+        _run_target="$arg"
+        break
+      fi
+      if [ -z "$_subcmd" ]; then
+        _subcmd="$arg"
+        if [ "$_subcmd" = "run" ]; then
+          _seen_run=1
+          continue
+        fi
+        break
+      fi
+      ;;
+  esac
+done
+
+case "$_subcmd" in
+  sync|venv)
+    _deny
+    ;;
+  run)
+    case "$_run_target" in
+      pytest|mypy)
+        _deny
+        ;;
+    esac
+    ;;
+esac
+
+_passthrough "$@"

@@ -37,6 +37,27 @@ logger = logging.getLogger(__name__)
 WORKTREE_SUBDIR = ".cao/worktrees"
 BRANCH_PREFIX = "cao/"
 
+# F620 (#476): where lane checkouts (and any venv they build) physically land.
+# The incident: reviewer/dev lanes provisioned worktrees under the repo on `/`,
+# built .venvs inside them, and filled `/`. Doctrine puts scratch on
+# `/data/cao-scratch/`; this makes the worktree root honour that by default.
+#
+# Precedence (highest first):
+#   1. env  CAO_WORKTREE_ROOT
+#   2. providers.toml  [worktrees] root
+#   3. default  /data/cao-scratch/worktrees/<repo-basename>  -- only when
+#      /data/cao-scratch exists AND is writable
+#   4. in-repo fallback  <repo_root>/.cao/worktrees  -- today's behaviour,
+#      used whenever /data/cao-scratch is absent/unwritable and nothing is
+#      configured.
+#
+# git's own `.git/worktrees` bookkeeping remains the single source of truth for
+# list/cleanup/teardown regardless of where the checkout physically lives, so
+# moving the root off-repo does not change how a worktree is found at teardown
+# (teardown resolves repo_root from CAO's stored worktree_info, then runs
+# `git worktree remove` from that real repo root -- see terminal_service).
+_DATA_SCRATCH_WORKTREES = "/data/cao-scratch/worktrees"
+
 # Local-only git operations (add/remove/list); generous but bounded so a
 # hung git process cannot hang terminal creation/deletion indefinitely.
 _GIT_TIMEOUT_SECONDS = 30
@@ -95,8 +116,90 @@ def find_repo_root(start_path: str) -> str:
     return stdout.strip()
 
 
+def _providers_toml_worktree_root() -> Optional[str]:
+    """Read ``[worktrees] root`` from providers.toml, or ``None``.
+
+    Lazy import + broad tolerance: a missing file, invalid TOML, a missing
+    ``[worktrees]`` table, or a non-string/empty ``root`` all resolve to
+    ``None`` (fall through to the next precedence tier). Never raises -- root
+    resolution runs on the terminal-creation hot path and must not fail a
+    spawn over a malformed config file.
+    """
+    try:
+        import tomllib
+
+        from cli_agent_orchestrator.services.settings_service import (
+            PROVIDER_DEFAULTS_FILE,
+        )
+
+        if not PROVIDER_DEFAULTS_FILE.exists():
+            return None
+        data = tomllib.loads(PROVIDER_DEFAULTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    section = data.get("worktrees")
+    if not isinstance(section, dict):
+        return None
+    root = section.get("root")
+    if isinstance(root, str) and root.strip():
+        return root.strip()
+    return None
+
+
+def _data_scratch_writable() -> bool:
+    """True iff ``/data/cao-scratch`` exists as a directory and is writable.
+
+    The default off-repo tier is only chosen when this holds; otherwise root
+    resolution falls back to the in-repo ``.cao/worktrees`` (today's
+    behaviour) so a machine without a ``/data`` mount is unaffected.
+    """
+    base = os.path.dirname(_DATA_SCRATCH_WORKTREES)  # /data/cao-scratch
+    return os.path.isdir(base) and os.access(base, os.W_OK)
+
+
+def resolve_worktree_root(repo_root: str) -> tuple[str, bool]:
+    """Resolve the directory under which this repo's worktrees are provisioned.
+
+    Returns ``(root, in_repo)`` where ``root`` is the parent directory a new
+    worktree checkout is created under and ``in_repo`` is True only for the
+    in-repo ``<repo_root>/.cao/worktrees`` fallback (the sole case that also
+    writes a ``.gitignore``). Precedence, highest first:
+
+    1. env ``CAO_WORKTREE_ROOT``
+    2. providers.toml ``[worktrees] root``
+    3. ``/data/cao-scratch/worktrees/<repo-basename>`` when ``/data/cao-scratch``
+       exists and is writable
+    4. ``<repo_root>/.cao/worktrees`` (in-repo fallback)
+
+    The configured tiers (1, 2) are used verbatim, not per-repo namespaced:
+    an operator who points ``CAO_WORKTREE_ROOT`` somewhere has chosen that
+    directory. The default tier (3) namespaces by ``<repo-basename>`` so
+    multiple repos sharing ``/data/cao-scratch`` do not collide.
+    """
+    env_root = os.environ.get("CAO_WORKTREE_ROOT")
+    if env_root and env_root.strip():
+        return env_root.strip(), False
+
+    toml_root = _providers_toml_worktree_root()
+    if toml_root:
+        return toml_root, False
+
+    if _data_scratch_writable():
+        repo_basename = os.path.basename(os.path.normpath(repo_root)) or "repo"
+        return os.path.join(_DATA_SCRATCH_WORKTREES, repo_basename), False
+
+    return os.path.join(repo_root, WORKTREE_SUBDIR), True
+
+
 def worktree_path_for(repo_root: str, terminal_id: str) -> str:
-    return os.path.join(repo_root, WORKTREE_SUBDIR, terminal_id)
+    """The physical checkout path for ``terminal_id`` under the resolved root.
+
+    Honours F620's configurable root. For the in-repo fallback this is
+    ``<repo_root>/.cao/worktrees/<terminal_id>`` (unchanged); for an off-repo
+    root it is ``<root>/<terminal_id>``.
+    """
+    root, _in_repo = resolve_worktree_root(repo_root)
+    return os.path.join(root, terminal_id)
 
 
 def branch_for(terminal_id: str) -> str:
@@ -120,12 +223,29 @@ def create_worktree(repo_root: str, terminal_id: str) -> str:
     """
     path = worktree_path_for(repo_root, terminal_id)
     branch = branch_for(terminal_id)
+    root, in_repo = resolve_worktree_root(repo_root)
+    # `git worktree add` creates the leaf checkout directory itself, but will
+    # NOT create missing PARENT directories of an off-repo root (e.g. the
+    # first worktree under /data/cao-scratch/worktrees/<repo>). Create the
+    # root up front; best-effort, git surfaces a clear error if it truly
+    # cannot be made. The in-repo case's parent (.cao/) is created the same
+    # way for symmetry (git already tolerates it existing).
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as e:
+        raise WorktreeError(
+            f"could not create worktree root {root!r} for terminal {terminal_id}: {e}"
+        ) from e
     result = _run_git(["worktree", "add", "-b", branch, path], cwd=repo_root)
     if result.returncode != 0:
         raise WorktreeError(
             f"'git worktree add' failed for terminal {terminal_id}: {result.stderr.strip()}"
         )
-    _ensure_worktree_subdir_gitignored(repo_root)
+    # Gitignore write is only meaningful (and only correct) for the in-repo
+    # fallback: an off-repo root is not tracked by the repo at all, so there is
+    # nothing for the main checkout's `git status`/`git add -A` to see.
+    if in_repo:
+        _ensure_worktree_subdir_gitignored(repo_root)
     return path
 
 
@@ -151,7 +271,7 @@ def _ensure_worktree_subdir_gitignored(repo_root: str) -> None:
         logger.warning("worktree setup: failed to write %s: %s", gitignore_path, e)
 
 
-def remove_worktree(repo_root: str, terminal_id: str) -> None:
+def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[str] = None) -> None:
     """Best-effort teardown: ``git worktree remove --force`` (agents commonly
     leave modified/untracked files behind, so a plain ``remove`` would
     refuse) followed by a SAFE branch delete (``git branch -d``, not
@@ -172,8 +292,15 @@ def remove_worktree(repo_root: str, terminal_id: str) -> None:
     and the failure-cleanup path in ``create_terminal``) that must not fail
     the terminal's own deletion/rollback over a worktree cleanup issue.
     Failures are logged, not swallowed silently.
+
+    ``worktree_path`` (F620 #476): when the caller knows the exact checkout
+    path (from CAO's stored ``worktree_info``), pass it so removal targets the
+    physical checkout git recorded at creation time -- robust even if the
+    configurable root changed between create and teardown. Omitted, the path
+    is recomputed from the current root resolution (the in-repo/unchanged
+    case).
     """
-    path = worktree_path_for(repo_root, terminal_id)
+    path = worktree_path if worktree_path else worktree_path_for(repo_root, terminal_id)
     branch = branch_for(terminal_id)
     result = _run_git(["worktree", "remove", "--force", path], cwd=repo_root)
     if result.returncode != 0:
@@ -264,7 +391,6 @@ def parse_worktree_path(path: object) -> tuple[str, str] | None:
     return repo_root, terminal_id
 
 
-
 # --------------------------------------------------------------------------
 # F121: Worktree Branch Integrity — verification at settlement checkpoints
 # --------------------------------------------------------------------------
@@ -294,9 +420,7 @@ class WorktreeIntegrityResult:
     error: Optional[str] = None
 
 
-def _run_git_bounded(
-    args: list[str], cwd: str, remaining: float
-) -> subprocess.CompletedProcess:
+def _run_git_bounded(args: list[str], cwd: str, remaining: float) -> subprocess.CompletedProcess:
     """Run git with at most ``remaining`` seconds budget. Never raises."""
     if remaining <= 0:
         return subprocess.CompletedProcess(

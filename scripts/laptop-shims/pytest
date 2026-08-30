@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# F620 (#476) laptop shim: pytest.
+#
+# CAO prepends scripts/laptop-shims to a WORKER terminal's PATH when the repo
+# has an active offload-box row in scripts/boxes.tsv and LAPTOP_OK is unset.
+# Running pytest on the laptop is what filled `/` in the F620 incident; heavy
+# suites belong on a grok box via scripts/box-run.sh.
+#
+# Override for a one-off local run: set LAPTOP_OK=1 in the environment. When
+# LAPTOP_OK is set this shim transparently execs the real pytest (found by
+# stripping this shim's own directory from PATH).
+set -u
+
+_shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_find_real() {
+  # Rebuild PATH without this shim's directory, then locate the real binary.
+  local name="$1" newpath="" entry
+  local IFS=:
+  for entry in $PATH; do
+    if [ "$entry" != "$_shim_dir" ]; then
+      newpath="${newpath:+$newpath:}$entry"
+    fi
+  done
+  PATH="$newpath" command -v "$name" 2>/dev/null
+}
+
+if [ "${LAPTOP_OK:-}" != "" ]; then
+  real="$(_find_real pytest)"
+  if [ -z "$real" ]; then
+    echo "laptop-shim: LAPTOP_OK set but no real pytest found on PATH" >&2
+    exit 127
+  fi
+  exec "$real" "$@"
+fi
+
+echo "LAPTOP-DENIED: run on a grok box via scripts/box-run.sh (set LAPTOP_OK=1 to override)" >&2
+exit 97

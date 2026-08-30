@@ -121,9 +121,7 @@ async def test_blocked_deferred_assign_suppresses_notice_when_gate_cleared():
 
     # Only the blocked_queue enqueue should happen; no notice to supervisor
     assert create_message.call_count == 1
-    create_message.assert_called_once_with(
-        "caller01", "worker99", shaped, OrchestrationType.ASSIGN
-    )
+    create_message.assert_called_once_with("caller01", "worker99", shaped, OrchestrationType.ASSIGN)
 
 
 @pytest.mark.asyncio
@@ -161,6 +159,7 @@ async def test_blocked_deferred_assign_enqueue_failure_reports_undelivered():
 
     claim_and_settle.assert_awaited_once()
     assert claim_and_settle.call_args.args[3] == "deferred_init_internal"
+
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
@@ -1305,9 +1304,14 @@ class TestCreateTerminalWorktree:
                 use_worktree=True,
             )
 
-        mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
-
-    # --- F452 (#307): CAO_WORKTREE env export ---
+        # F620 (#476): the rollback now forwards the created worktree path as a
+        # third positional arg so teardown targets the exact checkout git
+        # recorded (robust to a configurable-root change between create and
+        # rollback). create_worktree returned str(worktree_dir), which becomes
+        # the terminal's working_directory and thus this arg.
+        mock_worktree_service.remove_worktree.assert_called_once_with(
+            "/repo", "test1234", str(worktree_dir)
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -1762,7 +1766,14 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_success(
-        self, mock_get_metadata, mock_tmux, mock_pm, mock_preserve, mock_update, mock_status_monitor, mock_memory_service
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_preserve,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
     ):
         """Test sending input successfully."""
         mock_memory_service.return_value.get_curated_memory_context.return_value = ""
@@ -1943,8 +1954,8 @@ class TestSendInput:
         # In production, _arm_dispatch_locked (inside begin_dispatch) sets
         # _task_dispatched=True BEFORE send_keys. The explicit mark_input call
         # is a mocked-monitor fallback fired during commit (after send_keys).
-        assert (
-            ordered.index("clear") < ordered.index("send_keys")
+        assert ordered.index("clear") < ordered.index(
+            "send_keys"
         ), f"clear must precede send_keys; got order {ordered}"
         assert "mark_input" in ordered, "mark_input_received must be called"
 
@@ -2656,10 +2667,10 @@ class TestDeleteTerminalWorktree:
         mock_validate_lease,
         mock_db_delete,
     ):
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
         from cli_agent_orchestrator.services.worktree_service import (
             parse_worktree_path as real_parse_worktree_path,
         )
-        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
 
         mock_get_metadata.return_value = {
             "id": "test1234",
@@ -3116,7 +3127,6 @@ class TestDeferredInitWaitingUserAnswerSurvival:
         mock_confirm.assert_called_once()
         assert mock_confirm.call_args.args[4] == OrchestrationType.ASSIGN
         mock_settle.assert_not_called()
-
 
 
 # --- F238: Rebind/launch instruction consistency ---

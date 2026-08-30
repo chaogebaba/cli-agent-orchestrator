@@ -28,6 +28,7 @@ from cli_agent_orchestrator.services.worktree_service import (
     list_worktrees,
     parse_worktree_path,
     remove_worktree,
+    resolve_worktree_root,
     worktree_path_for,
 )
 
@@ -41,6 +42,28 @@ def _git_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _git_available(), reason="git executable required")
+
+
+@pytest.fixture(autouse=True)
+def _force_in_repo_worktree_root(monkeypatch):
+    """Default every test to the in-repo worktree root (F620 #476).
+
+    Root resolution now consults ``CAO_WORKTREE_ROOT`` / providers.toml /
+    ``/data/cao-scratch`` writability, all of which are ambient on the host
+    running the suite. Pin them off by default so ``worktree_path_for`` and the
+    real-git create/list tests behave exactly as before F620 regardless of the
+    box's environment. Tests that exercise the precedence opt back in with
+    their own monkeypatches (which override these).
+    """
+    monkeypatch.delenv("CAO_WORKTREE_ROOT", raising=False)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+        lambda: False,
+    )
 
 
 def _init_repo(path: Path) -> None:
@@ -322,3 +345,132 @@ class TestParseWorktreePath:
             "/home/user/myrepo/.cao/worktrees/term_a",
             "term_b",
         )
+
+
+class TestResolveWorktreeRoot:
+    """F620 (#476): worktree root precedence — env > toml > /data default > in-repo."""
+
+    _REPO = "/home/user/myrepo"
+
+    def test_env_var_wins_over_everything(self, monkeypatch) -> None:
+        # Case 1: CAO_WORKTREE_ROOT set — used verbatim, off-repo, even when
+        # a toml root and a writable /data would otherwise apply.
+        monkeypatch.setenv("CAO_WORKTREE_ROOT", "/custom/env/root")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: "/from/toml",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: True,
+        )
+        root, in_repo = resolve_worktree_root(self._REPO)
+        assert root == "/custom/env/root"
+        assert in_repo is False
+
+    def test_providers_toml_wins_when_env_unset(self, monkeypatch) -> None:
+        # Case 2: no env, providers.toml [worktrees] root set — used verbatim.
+        monkeypatch.delenv("CAO_WORKTREE_ROOT", raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: "/from/toml",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: True,
+        )
+        root, in_repo = resolve_worktree_root(self._REPO)
+        assert root == "/from/toml"
+        assert in_repo is False
+
+    def test_data_scratch_default_when_writable_and_nothing_configured(self, monkeypatch) -> None:
+        # Case 3: no env, no toml, /data/cao-scratch writable — namespaced by
+        # repo basename under /data/cao-scratch/worktrees.
+        monkeypatch.delenv("CAO_WORKTREE_ROOT", raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: True,
+        )
+        root, in_repo = resolve_worktree_root(self._REPO)
+        assert root == "/data/cao-scratch/worktrees/myrepo"
+        assert in_repo is False
+
+    def test_in_repo_fallback_when_data_absent_and_nothing_configured(self, monkeypatch) -> None:
+        # Case 4: no env, no toml, /data/cao-scratch NOT writable — falls back
+        # to the pre-F620 in-repo <repo>/.cao/worktrees (in_repo=True).
+        monkeypatch.delenv("CAO_WORKTREE_ROOT", raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: False,
+        )
+        root, in_repo = resolve_worktree_root(self._REPO)
+        assert root == "/home/user/myrepo/.cao/worktrees"
+        assert in_repo is True
+
+    def test_empty_env_var_is_ignored(self, monkeypatch) -> None:
+        # A blank CAO_WORKTREE_ROOT must not be treated as a configured root.
+        monkeypatch.setenv("CAO_WORKTREE_ROOT", "   ")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: False,
+        )
+        root, in_repo = resolve_worktree_root(self._REPO)
+        assert in_repo is True
+
+
+class TestOffRepoWorktreeLifecycle:
+    """F620: a create+teardown cycle with the checkout physically off-repo."""
+
+    def test_create_places_checkout_off_repo_and_teardown_uses_git_truth(
+        self, repo: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Point the root at an off-repo scratch dir (mimics /data/cao-scratch).
+        scratch_root = tmp_path / "scratch" / "worktrees" / "myrepo"
+        monkeypatch.setenv("CAO_WORKTREE_ROOT", str(scratch_root))
+
+        terminal_id = "offrepo1"
+        path = create_worktree(str(repo), terminal_id)
+
+        # Checkout landed under the off-repo root, NOT inside the repo.
+        assert path == str(scratch_root / terminal_id)
+        assert Path(path).is_dir()
+        assert not (repo / ".cao" / "worktrees").exists()  # no in-repo dir
+        # No .gitignore is written for an off-repo root.
+        assert not (scratch_root / ".gitignore").exists()
+
+        # git's own bookkeeping (.git/worktrees) is the truth: the worktree
+        # appears in `git worktree list` run from the real repo root.
+        listed = [w.get("worktree") for w in list_worktrees(str(repo))]
+        assert any(str(scratch_root / terminal_id) in str(p) for p in listed)
+
+        # Teardown from the real repo root (passing the stored path) removes it.
+        remove_worktree(str(repo), terminal_id, worktree_path=path)
+        assert not Path(path).exists()
+        listed_after = [w.get("worktree") for w in list_worktrees(str(repo))]
+        assert not any(str(scratch_root / terminal_id) in str(p) for p in listed_after)
+
+    def test_in_repo_case_still_writes_gitignore(self, repo: Path, monkeypatch) -> None:
+        # Force in-repo resolution; the .gitignore write must still happen.
+        monkeypatch.delenv("CAO_WORKTREE_ROOT", raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._providers_toml_worktree_root",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.worktree_service._data_scratch_writable",
+            lambda: False,
+        )
+        create_worktree(str(repo), "inrepo01")
+        assert (repo / ".cao" / "worktrees" / ".gitignore").read_text() == "*\n"
