@@ -1,9 +1,9 @@
 
 
-cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯
 
-cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯ >....
 `orchestrator/MISTAKES.md` (headers), `ls orchestrator/blueprints/`, `ls scripts/`,
 `ls /data/cao-scratch/*gate-report*.md` (gate reports live outside the repo). Then send_message to your caller:

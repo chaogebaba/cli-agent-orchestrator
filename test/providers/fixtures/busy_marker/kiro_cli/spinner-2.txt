@@ -1,0 +1,124 @@
+  [48;2;45;58;48m   4[38;2;128;255;181m+[39m  2026-08-30 04:10Z recurrence on seat dc8f42a8, decisions log
+[49m  [48;2;45;58;48m   5[38;2;128;255;181m+[39m  `~/.aws/cli-agent-orchestrator/logs/auto-answers/dc8f42a8.decisions.log`, and
+[49m  [48;2;45;58;48m   6[38;2;128;255;181m+[39m  issue #386 comment `issuecomment-5466720205`.
+[49m  [48;2;45;58;48m   7[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m   8[38;2;128;255;181m+[39m  ## Method
+[49m  [48;2;45;58;48m   9[38;2;128;255;181m+[39m  Read the seat's own decisions log (the record `AutoResponder.match_verdict`
+[49m  [48;2;45;58;48m  10[38;2;128;255;181m+[39m  writes at services/auto_responder.py; the per-rule reject diagnostic and the
+[49m  [48;2;45;58;48m  11[38;2;128;255;181m+[39m  `region_dump` / `firing` / `settled` outcomes). Tallied outcomes and the
+[49m  [48;2;45;58;48m  12[38;2;128;255;181m+[39m  firing window. (No pane bytes reproduced here — the raw `window=` / `canonical=`
+[49m  [48;2;45;58;48m  13[38;2;128;255;181m+[39m  fields carry seat scrollback incl. a real email/token; only outcomes + timing
+[49m  [48;2;45;58;48m  14[38;2;128;255;181m+[39m  are recorded.)
+[49m  [48;2;45;58;48m  15[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m  16[38;2;128;255;181m+[39m  ## Evidence (verbatim outcome tally, `grep -oE 'outcome=... reason=...'| sort | uniq -c`)
+[49m  [48;2;45;58;48m  17[38;2;128;255;181m+[39m  ```
+[49m  [48;2;45;58;48m  18[38;2;128;255;181m+[39m       26 outcome=matched reason=firing rule=codex-resume-workdir-card
+[49m  [48;2;45;58;48m  19[38;2;128;255;181m+[39m        1 outcome=matched reason=settled rule=codex-resume-workdir-card
+[49m  [48;2;45;58;48m  20[38;2;128;255;181m+[39m       35 outcome=no_match reason=no_rule_matched
+[49m  [48;2;45;58;48m  21[38;2;128;255;181m+[39m       18 outcome=no_match reason=region_dump
+[49m  [48;2;45;58;48m  22[38;2;128;255;181m+[39m        1 outcome=not_running reason=empty_region
+[49m  [48;2;45;58;48m  23[38;2;128;255;181m+[39m  ```
+[49m  [48;2;45;58;48m  24[38;2;128;255;181m+[39m  Firing window (first→last `reason=firing`):
+[49m  [48;2;45;58;48m  25[38;2;128;255;181m+[39m  ```
+[49m  [48;2;45;58;48m  26[38;2;128;255;181m+[39m  2026-08-30T04:10:07.143353+00:00 rule=codex-resume-workdir-card
+[49m  [48;2;45;58;48m  27[38;2;128;255;181m+[39m  2026-08-30T04:10:20.907960+00:00 rule=codex-resume-workdir-card
+[49m  [48;2;45;58;48m  28[38;2;128;255;181m+[39m  ```
+[49m  [48;2;45;58;48m  29[38;2;128;255;181m+[39m  `settled` once at `2026-08-30T04:10:07.655464+00:00 rule=codex-resume-workdir-card`.
+[49m  [48;2;45;58;48m  30[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m  31[38;2;128;255;181m+[39m  ## Finding (names the failing stage, Do-NOT 26)
+[49m  [48;2;45;58;48m  32[38;2;128;255;181m+[39m  The `codex-resume-workdir-card` rule **matched and fired** — 26 firing events over
+[49m  [48;2;45;58;48m  33[38;2;128;255;181m+[39m  ~13.8s plus a `settled` outcome. The matcher regex is therefore **correct**; the
+[49m  [48;2;45;58;48m  34[38;2;128;255;181m+[39m  `no_match reason=no_rule_matched` entries all precede 04:10:07 and their
+[49m  [48;2;45;58;48m  35[38;2;128;255;181m+[39m  `region_dump`s contain only pre-render scrollback (shell prompt, the codex resume
+[49m  [48;2;45;58;48m  36[38;2;128;255;181m+[39m  command line, mcp-server config), NOT the workdir/trust card text. The card
+[49m  [48;2;45;58;48m  37[38;2;128;255;181m+[39m  appears in the region only at/after 04:10:07, at which point the rule fires.
+[49m  [48;2;45;58;48m  38[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m  39[38;2;128;255;181m+[39m  Therefore the failing stage is NOT region extraction (`dialog_region`), whitespace
+[49m  [48;2;45;58;48m  40[38;2;128;255;181m+[39m  collapse (`normalize_screen`), occurrence counting (`rule.matches`), nor the D6
+[49m  [48;2;45;58;48m  41[38;2;128;255;181m+[39m  banner-mark short-circuit — every one of those succeeded once the card rendered.
+[49m  [48;2;45;58;48m  42[38;2;128;255;181m+[39m  The failure is an **ARMING / TIMING gap**: per the supervisor's correction, the
+[49m  [48;2;45;58;48m  43[38;2;128;255;181m+[39m  responder evaluated only during the ~12s `f491_dialog_clear` window, the chooser
+[49m  [48;2;45;58;48m  44[38;2;128;255;181m+[39m  rendered after that window closed, and no `region_dump` inside the evaluated
+[49m  [48;2;45;58;48m  45[38;2;128;255;181m+[39m  window ever contained the dialog text. On this recurrence the card DID eventually
+[49m  [48;2;45;58;48m  46[38;2;128;255;181m+[39m  get evaluated and fired (the seat had a live evaluation at 04:10:07), but the
+[49m  [48;2;45;58;48m  47[38;2;128;255;181m+[39m  #386 class is the case where the render lands after evaluation stops.
+[49m  [48;2;45;58;48m  48[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m  49[38;2;128;255;181m+[39m  ## Divergence from blueprint text (report in Deviations)
+[49m  [48;2;45;58;48m  50[38;2;128;255;181m+[39m  Frozen blueprint D21 (`wp-status-truth.md`) calls #386 "the #386 matcher defect …
+[49m  [48;2;45;58;48m  51[38;2;128;255;181m+[39m  a rule that textually matches and does not fire is the bug, not the rule" and lists
+[49m  [48;2;45;58;48m  52[38;2;128;255;181m+[39m  `dialog_region` tail-composition as the leading hypothesis. The 2026-08-30 evidence
+[49m  [48;2;45;58;48m  53[38;2;128;255;181m+[39m  CONTRADICTS the matcher-defect framing: the rule matches AND fires. Per the
+[49m  [48;2;45;58;48m  54[38;2;128;255;181m+[39m  supervisor's explicit instruction, D21's fix therefore targets the **polling
+[49m  [48;2;45;58;48m  55[38;2;128;255;181m+[39m  lifetime** (keep evaluating until the first IDLE/PROCESSING, or re-arm on the f524
+[49m  [48;2;45;58;48m  56[38;2;128;255;181m+[39m  stall surfacing), NOT the matcher. Do not invent a matcher bug to satisfy the row's
+[49m  [48;2;45;58;48m  57[38;2;128;255;181m+[39m  wording. This divergence is recorded rather than papered over.
+[49m  [48;2;45;58;48m  58[38;2;128;255;181m+[39m
+[49m  [48;2;45;58;48m  59[38;2;128;255;181m+[39m  ## Status
+[49m  [48;2;45;58;48m  60[38;2;128;255;181m+[39m  D21 IMPLEMENTATION remains DEFERRED in this slice (option B): the AC8 fire-once /
+[49m  [48;2;45;58;48m  61[38;2;128;255;181m+[39m  twice-→wait arms require the byte-exact F530 18:20Z pane and the kiro F589 screen,
+[49m  [48;2;45;58;48m  62[38;2;128;255;181m+[39m  which are not staged. This attribution is the Do-NOT 26 pre-fix step, completed and
+[49m  [48;2;45;58;48m  63[38;2;128;255;181m+[39m  recorded; the arming/timing fix + AC8 land in the capture-gated follow-up.
+
+[49m  D21 attribution done and recorded. Now let me build the unblocked rows, starting with [1mD17[0m (largest, most self-contained server-side logic). Let me read the relevant DB functions in full.
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/clients/database.py (L3721-3900)[39m
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/clients/database.py (L3901-3970)[39m
+
+  I now have the full D17 picture on the DB side. This is a very substantial migration. D17 requires:
+
+  1. [38;2;0;135;255mregister_terminal_child[39m / [38;2;0;135;255mrelease_terminal_child[39m → write through [38;2;0;135;255mmerge_terminal_system_metadata[39m (RMW into [38;2;0;135;255mcao.children[39m), delete the free-form [38;2;0;135;255mmeta.pop[39m/[38;2;0;135;255mmetadata_json=None[39m branch, write
+  emptied ledger as [38;2;0;135;255m[][39m.
+  2. Release-edge: [38;2;0;135;255mrelease_token[39m (agent_id) → [38;2;0;135;255mchildren_released[39m ring (≤16), duplicate token = no-op logging [38;2;0;135;255mchildren_release_duplicate[39m, unmatched child_id = pop-oldest logging
+  [38;2;0;135;255mchildren_release_unmatched[39m.
+  3. Both readers ([38;2;0;135;255mfleet_service._children_count_from_row[39m, [38;2;0;135;255mpane_liveness._children_count_from_metadata[39m) read [38;2;0;135;255mcao.children[39m with fallback to free-form.
+  4. Hook [38;2;0;135;255m_classify[39m: emit child_id only for tool-call keys, else None (stop sending agent_id as the key); carry agent_id as observability + release_token.
+  5. Prune: new publish trigger + K-non-PROCESSING conjunct.
+
+  Given the depth and the multi-subsystem risk, and that I'm one worker building 5 rows, I'll implement carefully and verify each on the box. Given the size of D17 alone, let me be efficient
+  and delegate the parallelizable, well-specified rows to grunt-lane workers while I own the highest-risk row (D17). Actually — the steering says I'm the dev; spawning sub-workers from a
+  worker is not my role here and risks the parallel-edit race on this worktree. I'll build sequentially myself.
+
+  Let me read the two readers and the hook [38;2;0;135;255m_classify[39m before writing D17.
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/services/fleet_service.py (L132-161)[39m
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/services/pane_liveness.py (L126-155)[39m
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/hooks/children_ledger.py[39m
+
+  I now have the complete D17 surface. This is a large, careful change. Let me also find the API endpoint that calls [38;2;0;135;255mrelease_terminal_child[39m/[38;2;0;135;255mregister_terminal_child[39m (api/main.py
+  children-ledger route) and the status-publish site where the new prune trigger goes. Let me locate them.
+[38;2;0;215;135m●[39m Shell[38;2;0;135;255m cd /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16 && grep -rn[39m
+  [38;2;0;135;255m"release_terminal_child\|register_terminal_child\|children-ledger\|children_release" src/cli_agent_orchestrator/api/main.py | head && echo "=== status publish sites (D3 K / non-PROCESSING)[39m
+  [38;2;0;135;255m===" && grep -n "def _publish\|publish_status\|K_TICKS\|non_processing\|def _apply_detection\|consecutive" src/cli_agent_orchestrator/services/status_monitor.py | head[39m
+    [38;2;158;158;158m╰ run_in_background=false[39m
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/api/main.py (L4677-4731)[39m
+
+  I have the full D17 picture. This is a large, careful, multi-file change with a genuine risk of breaking existing D12a tests. Let me find the [38;2;0;135;255mChildrenLedgerRequest[39m model (to add
+  [38;2;0;135;255mrelease_token[39m/[38;2;0;135;255magent_id[39m) and check existing D12a tests I must keep green.
+[38;2;0;215;135m●[39m Shell[38;2;0;135;255m cd /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16 && grep -rn "class ChildrenLedgerRequest" src/ && echo "=== existing D12a/children tests[39m
+  [38;2;0;135;255m===" && grep -rln "children_ledger\|register_terminal_child\|release_terminal_child\|_children_count_from\|children-ledger" test/ | head -30[39m
+    [38;2;158;158;158m╰ run_in_background=false[39m
+[38;2;0;215;135m●[39m Read[38;2;0;135;255m /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16/src/cli_agent_orchestrator/api/main.py (L1138-1167)[39m
+
+  I now have the complete D17 surface across DB, API, hook, and both readers, plus the existing tests I must not break. This is a big implementation. Let me write it carefully.
+
+  [1mD17 DB layer first.[0m I'll rewrite the two mutators to use [38;2;0;135;255mmerge_terminal_system_metadata[39m (RMW into [38;2;0;135;255mcao.children[39m), add the [38;2;0;135;255mchildren_released[39m ring + [38;2;0;135;255mrelease_token[39m handling with
+  duplicate/unmatched logging, delete the free-form pop/null branch, and add a [38;2;0;135;255m_CHILDREN_RELEASED_RING_MAX = 16[39m. I need a logger. Let me check imports at top of database.py.
+[38;2;0;215;135m[48;2;0;215;135m●[39m[49m Shell[38;2;0;135;255m cd /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-d16 && grep -n[39m
+[48;2;0;215;135m [49m [38;2;0;135;255m"^import\|^from\|^logger\|logging.getLogger\|_CHILDREN_RELEASED\|children_released" src/cli_agent_orchestrator/clients/database.py | head -30[39m
+[48;2;0;215;135m [49m   [38;2;158;158;158m╰ run_in_background=false[39m
+[48;2;0;215;135m [49m   3:import hashlib
+[48;2;0;215;135m [49m   4:import json
+[48;2;0;215;135m [49m   5:import logging
+[48;2;0;215;135m [49m   6:import os
+[48;2;0;215;135m [49m   7:import re
+[48;2;0;215;135m [49m   [38;2;128;128;128m...+20 lines (ctrl+o to toggle)[39m
+
+[48;2;175;135;0m [49m Good — [38;2;0;135;255mlogger[39m, [38;2;0;135;255mjson[39m, [38;2;0;135;255mtime[39m, [38;2;0;135;255mList/Dict/Any/Optional[39m all available. Now let me rewrite the D17 DB layer. I'll add the constants and read helper for the migrated location, then rewrite both
+[48;2;175;135;0m [49m mutators. First the constants block near [38;2;0;135;255m_CHILDREN_LEDGER_KEY[39m:
+
+[48;2;38;38;38m [1m◐ 11 tasks remaining[0m[48;2;38;38;38m · ctrl+x expand
+[38;2;38;38;38m[49m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [33mTrust All Tools active, confirmations are off[38;2;128;128;128m · /quit to exit[39m
+[38;2;38;38;38m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;2;175;135;0mkiro_dev[39m [38;2;128;128;128m·[39m Auto [38;2;128;128;128m·[39m [38;2;0;215;135m◔[39m [38;2;0;215;135m21%[39m                                                                    [38;2;193;154;255m~/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-build[39m [38;2;128;128;128m·[39m [38;2;128;128;128m([39mcao/f582-d14d15[38;2;128;128;128m)
+
+[39m [38;2;158;158;158mKiro is working · Type to steer · Ctrl+S to queue[39m
+

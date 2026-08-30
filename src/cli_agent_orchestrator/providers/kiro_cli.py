@@ -126,6 +126,39 @@ TUI_INITIALIZING_PATTERN = (
 )
 
 
+# F581 D16: busy-marker veto hook for rule 3a (same contract as claude_code's
+# ``rule3a_busy_marker``). The kiro TUI shows two provable "the agent's own turn
+# is live" markers — the footer ghost text (``Kiro is working`` / ``Thinking...``)
+# and the spinner status line (``◐ N tasks remaining · …``, animated braille/moon
+# glyph). These are proven from the byte-exact captured panes under
+# ``test/providers/fixtures/busy_marker/kiro_cli/``. Anchored so agent output that
+# merely quotes the phrase cannot flip the verdict.
+KIRO_BUSY_MARKER_PATTERN = re.compile(
+    r"Kiro is working|Thinking\.\.\.|[◐◓◑◒⣾⣽⣻⢿⡿⣟⣯⣷]\s+\d+\s+task(?:s)? remaining"
+)
+
+
+def kiro_busy_marker_live(text: str) -> bool | None:
+    """F581 D16: is the kiro seat's own TUI activity marker live in ``text``?
+
+    Truth table (same as D12d / claude_code):
+      * ``True``  — a busy marker (``Kiro is working`` / ``Thinking...`` / the
+        ``◐ N tasks remaining`` spinner status line) is present.
+      * ``False`` — no busy marker BUT the idle prompt placeholder is present
+        (the seat's own turn is over): veto this sample's upgrade.
+      * ``None``  — no identifiable kiro TUI (no marker, no idle prompt): legacy
+        rule 3a applies unchanged.
+
+    Operates on the plain (escape-stripped) pane string; no second capture.
+    """
+    clean = strip_terminal_escapes(text)
+    if KIRO_BUSY_MARKER_PATTERN.search(clean):
+        return True
+    if re.search(NEW_TUI_IDLE_PATTERN, clean):
+        return False
+    return None
+
+
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
 # Kiro 2.11 renders the same three-way choice with different wording for
@@ -770,6 +803,17 @@ class KiroCliProvider(BaseProvider):
             timeout=remaining,
             blocked_policy=blocked_policy,
         )
+
+    def rule3a_busy_marker(self, snapshot: str) -> bool | None:
+        """F581 D16 busy-marker for rule 3a: is the kiro seat's own TUI activity
+        marker live? Delegates to the shared pure helper ``kiro_busy_marker_live``.
+
+        ``snapshot`` is the plain pane string the liveness sampler already holds;
+        no second capture. Returns ``True``/``False``/``None`` per the D12d truth
+        table (see the helper). Proven from the byte-exact fixtures under
+        ``test/providers/fixtures/busy_marker/kiro_cli/``.
+        """
+        return kiro_busy_marker_live(snapshot)
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
