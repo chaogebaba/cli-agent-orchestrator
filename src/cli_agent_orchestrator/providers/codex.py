@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import time
 from collections import Counter
@@ -2075,6 +2076,185 @@ class CodexProvider(BaseProvider):
                 return True
         return False
 
+    def _thread_history_dbs(self) -> "list[Path]":
+        """F643b (#498): locate this terminal's codex thread-history SQLite DB(s).
+
+        codex-cli 0.151.0 changed session persistence: interactive turns from a
+        `codex resume` are written to a SQLite store at the CODEX_HOME ROOT
+        (``thread_history_<shard>.sqlite``), NOT to the ``sessions/**/rollout-*.jsonl``
+        file — which is now only the legacy ``codex exec`` seed artifact. This
+        returns every ``thread_history_*.sqlite`` under the per-terminal codex
+        home, newest-first, so the SQLite confirmation path can content-match the
+        dispatched user turn regardless of shard.
+
+        Returns [] when the home is unresolvable or no such DB exists (older
+        codex that still writes only JSONL) — the caller then relies on the
+        JSONL paths, so this is additive and fail-safe.
+        """
+        try:
+            home = _resolved_codex_home(getattr(self, "terminal_id", None))
+        except Exception:
+            return []
+        try:
+            dbs = list(home.glob("thread_history_*.sqlite"))
+        except OSError:
+            return []
+
+        def _mtime(p: "Path") -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        return sorted(dbs, key=_mtime, reverse=True)
+
+    @classmethod
+    def _sqlite_item_json_matches(cls, item_json: str, message: str) -> bool:
+        """Content-match a thread_items.item_json userMessage against ``message``.
+
+        The 0.151.0 userMessage shape is
+        ``{"type":"userMessage","content":[{"type":"text","text":"…"}]}``. Uses
+        the SAME whitespace-normalized containment test as the rollout matcher
+        (``_rollout_has_user_event``) so a task pasted-and-submitted confirms
+        identically whichever substrate codex wrote it to.
+        """
+        try:
+            record = json.loads(item_json)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        norm_msg = cls._normalize_for_match(message)
+        if not norm_msg:
+            return False
+        content = record.get("content")
+        texts: list[str] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+        # Some shapes carry a bare top-level "text"/"message" too.
+        for key in ("text", "message"):
+            if isinstance(record.get(key), str):
+                texts.append(record[key])
+        for text in texts:
+            norm_candidate = cls._normalize_for_match(text)
+            if not norm_candidate:
+                continue
+            # Prefix/containment either direction (rollout truncation parity).
+            if norm_msg in norm_candidate or norm_candidate in norm_msg:
+                return True
+        return False
+
+    def _sqlite_has_user_event(
+        self,
+        session_uuid: str | None,
+        message: str,
+        baseline_wall: float,
+    ) -> bool:
+        """F643b (#498): confirm delivery via the codex 0.151.0 SQLite store.
+
+        Queries ``thread_items`` for a ``userMessage`` row on the resumed
+        thread whose content matches the dispatched ``message`` and that was
+        created AT/AFTER the dispatch baseline. Two facts make this precise and
+        robust where the JSONL path is not:
+
+          * ``thread_id`` == the codex session uuid CAO pins as
+            ``provider_session_id`` — a resume writes to the SAME thread it
+            resumed, so there is no "forked to a new id" pinning gap here.
+          * ``created_at_ms >= baseline_wall*1000`` excludes the pre-existing
+            seed turn (the ``Reply … SEED_OK`` userMessage), so only THIS
+            dispatch's turn can confirm.
+
+        Opens each DB read-only (``mode=ro``) and tolerates the WAL. Returns
+        False on any error, missing DB, unset baseline, or no match — never a
+        false confirm. Additive: does nothing on older codex with no SQLite DB.
+        """
+        if not session_uuid or not message or baseline_wall <= 0.0:
+            return False
+        baseline_ms = int(baseline_wall * 1000)
+        for db in self._thread_history_dbs():
+            uri = f"file:{db}?mode=ro"
+            try:
+                con = sqlite3.connect(uri, uri=True, timeout=0.5)
+            except sqlite3.Error:
+                continue
+            try:
+                cur = con.cursor()
+                # item_type column exists in 0.151.0; filter to userMessage and
+                # the resumed thread, bounded by the dispatch baseline.
+                cur.execute(
+                    "SELECT item_json FROM thread_items "
+                    "WHERE thread_id = ? AND item_type = 'userMessage' "
+                    "AND created_at_ms >= ?",
+                    (session_uuid, baseline_ms),
+                )
+                for (item_json,) in cur.fetchall():
+                    if self._sqlite_item_json_matches(item_json, message):
+                        logger.info(
+                            "F643b SQLite confirm: terminal %s task confirmed in "
+                            "%s (thread %s) — codex wrote the turn to SQLite, not "
+                            "a rollout JSONL",
+                            getattr(self, "terminal_id", "?"),
+                            db.name,
+                            session_uuid,
+                        )
+                        return True
+            except sqlite3.Error:
+                continue
+            finally:
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
+        return False
+
+    def _pane_submission_verdict(
+        self,
+        backend: Any,
+        session: str,
+        window: str,
+        message: str | None,
+        baseline: "CodexSubmitBaseline | None" = None,
+    ) -> str:
+        """F643b (#498) safety net (B): last-resort pane read when NO durable
+        substrate (JSONL or SQLite) could confirm delivery.
+
+        A healthy terminal must not be torn down merely because verify went
+        blind (e.g. a future codex persistence change we don't yet read). But we
+        must NOT false-confirm a paste that never submitted — an idle composer
+        showing no task text is AMBIGUOUS (submitted-and-cleared vs never-pasted
+        vs pasted-then-lost), so bare absence is NOT accepted.
+
+        Returns ``CODEX_SUBMIT_STATE_SUBMITTED`` only on POSITIVE evidence: the
+        pane shows a NEW submitted user turn attributable to this dispatch
+        (``_pane_shows_new_submitted_task`` against the pre-send baseline). This
+        is the same dispatch-relative signal F435 already trusts as a fast-path
+        hint; here it is the confirmation of last resort when every durable
+        store is silent. Any other state (including an unreadable or idle-empty
+        composer, or a task still drafted) returns ``""`` so the caller keeps
+        deferring/retrying the SUBMIT rather than tearing down or false-confirming.
+        """
+        if baseline is None or not baseline.captured_ok:
+            # Without a dispatch-relative reference we cannot prove a NEW turn;
+            # refuse to confirm (fall through to raise / defer).
+            return ""
+        try:
+            captured = backend.get_history(
+                session, window, tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False
+            )
+        except Exception:
+            return ""
+        if not isinstance(captured, str) or not captured:
+            return ""
+        try:
+            if (
+                self._pane_shows_new_submitted_task(captured, message, baseline)
+                == CODEX_SUBMIT_STATE_SUBMITTED
+            ):
+                return CODEX_SUBMIT_STATE_SUBMITTED
+        except Exception:
+            return ""
+        return ""
+
     @classmethod
     def _rollout_has_user_event(
         cls,
@@ -3476,15 +3656,27 @@ class CodexProvider(BaseProvider):
             return None
 
         def _rollout_confirms() -> bool:
-            """Check if rollout has a matching user event after baseline offset."""
+            """Confirm the dispatched user turn landed, across all substrates.
+
+            Ordered checks (cheapest/most-specific first):
+              1. pinned rollout JSONL after baseline offset (classic F435),
+              2. F643 (#498) forked-rollout JSONL fallback (codex resume that
+                 forks the transcript to a NEW rollout file),
+              3. F643b (#498) SQLite thread-history store (codex 0.151.0 writes
+                 interactive turns to ``thread_history_*.sqlite``, not JSONL).
+            Any one confirming is sufficient; all are content-matched on the
+            dispatched message and bounded by the dispatch baseline.
+            """
             rp = _ensure_rollout_path()
             if self._rollout_has_user_event(rp, rollout_offset, message or ""):
                 return True
-            # F643 (#498): the pinned (seed-uuid) rollout may be stale because
-            # codex resume forked the transcript into a NEW rollout file. Confirm
-            # delivery in a sibling file written for THIS dispatch instead.
             baseline_wall = baseline.baseline_wall if baseline else 0.0
-            return self._forked_rollout_match(rp, message or "", baseline_wall)
+            # F643 (#498): pinned (seed-uuid) rollout may be stale because codex
+            # resume forked the transcript into a NEW rollout file.
+            if self._forked_rollout_match(rp, message or "", baseline_wall):
+                return True
+            # F643b (#498): codex >=0.151.0 writes the turn to SQLite, not JSONL.
+            return self._sqlite_has_user_event(session_uuid, message or "", baseline_wall)
 
         def _pane_hint_submitted() -> bool:
             """Fast-path pane hint: check if pane clearly shows submission.
@@ -3833,11 +4025,41 @@ class CodexProvider(BaseProvider):
             )
             return
 
+        # F643b (#498) safety net (B), SCOPED to the codex-persistence world we
+        # have proven moved (OPTION 2, user ruling 2026-08-30): fire ONLY when a
+        # thread_history_*.sqlite EXISTS for this codex-home (⇒ codex >=0.151.0,
+        # which records interactive turns in SQLite, not JSONL) AND that store is
+        # silent for this dispatch AND the pane affirmatively shows submission.
+        # In the old JSONL world (no SQLite DB) pane-silence still means RAISE,
+        # exactly as F435 B1 / r7 encode — the anti-false-confirm guard is only
+        # relaxed where the durable substrate is known to have moved.
+        sqlite_present = bool(self._thread_history_dbs())
+        if sqlite_present:
+            pane_verdict = self._pane_submission_verdict(
+                backend, session, window, message, baseline
+            )
+            if pane_verdict == CODEX_SUBMIT_STATE_SUBMITTED:
+                # Name all THREE facts so a future forensics pass can count these.
+                logger.warning(
+                    "F435/F643b submit-verify: terminal %s confirmed-by-pane "
+                    "(sqlite-present=True, sqlite-silent=True, pane-submitted=True): "
+                    "a thread_history SQLite store exists but recorded no matching "
+                    "user turn for this dispatch, yet the pane shows the task "
+                    "submitted — treating as delivered to avoid tearing down a "
+                    "healthy codex>=0.151.0 terminal on verify blindness. Rollout "
+                    "JSONL offset %s, forked JSONL, and SQLite were all silent.",
+                    self.terminal_id,
+                    rollout_offset,
+                )
+                return
+
         raise CodexSubmitStuckError(
             f"Codex terminal {self.terminal_id} did not confirm submission of the "
             f"pasted task after {CODEX_SUBMIT_VERIFY_MAX_RETRIES} recovery attempts; "
-            f"the rollout JSONL has no matching user-turn record after offset "
-            f"{rollout_offset}, so delivery is structurally unconfirmed"
+            f"no matching user-turn record in the rollout JSONL (after offset "
+            f"{rollout_offset}), a forked rollout, or the SQLite thread-history "
+            f"store, and the composer still holds the unsubmitted task — delivery "
+            f"is structurally unconfirmed"
         )
 
     @staticmethod
