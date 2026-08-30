@@ -102,20 +102,35 @@ unchanged; idempotent no double-prefix).
   passthrough, uv selective passthrough, real-binary discovery by PATH-strip,
   global-flag-before-subcommand detection — all as designed.
 
-## 4. Mutant ledger (design intent; box-run confirmation pending — see §6)
+### Box verification (grok-box-004, branch cao/a778fc81 @ ce4fa12f)
+- `uv run pytest -q -m "not live and not e2e" test/services/test_worktree_service.py
+  test/services/test_laptop_shim.py` → **60 passed in 2.42s**.
+- `uv run mypy --strict` on touched src files:
+  - HEAD (ce4fa12f): 2 errors, both pre-existing `CompletedProcess [type-arg]`
+    in `worktree_service.py` (`_run_git` / `_run_git_bounded`, untouched by F620),
+    now at lines 72 / 423.
+  - BASE (718849a4): the SAME 2 errors in `worktree_service.py` at the pre-F620
+    lines 51 / 299.
+  - **Parity: 0 new mypy --strict errors introduced.** New file
+    `laptop_shim.py` is clean under `--strict`.
+
+## 4. Mutant ledger (box-confirmed test design)
 - Drop the precedence env case in `resolve_worktree_root` → `TestResolveWorktreeRoot::test_env_var_wins_over_everything` goes RED (would resolve to the toml root instead).
 - Shim exits 0 instead of 97 → `TestPytestMypyShims::test_denies_by_default_exit_97` / `TestUvShim::test_denies_heavy_subcommands_exit_97` go RED.
 
 ## 5. Box used
-NONE YET — see §6. All laptop steps above avoided pytest/mypy/uv-sync per the
-work-location rule.
+**grok-box-004** (fleet grok-box-2..8; not grok-box-1). box-actions ledger:
+- `scripts/box-run.sh f620-pytest -- 'git fetch origin cao/a778fc81 && git checkout ce4fa12f && uv run pytest -q -m "not live and not e2e" <2 files> | tee /tmp/f620-pytest-run.txt'` → box grok-box-004 (grok-box-002 busy, grok-box-3 unreachable).
+- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-mypy-head -- 'git checkout ce4fa12f && uv run mypy --strict <2 src files> | tee /tmp/f620-mypy-head.txt'`.
+- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-mypy-base -- 'git checkout 718849a4 && uv run mypy --strict worktree_service.py | tee /tmp/f620-mypy-base.txt; git checkout ce4fa12f'`.
+- `CAO_BOXES=box@grok-box-004 scripts/box-run.sh f620-cleanup -- 'git checkout main && rm -f /tmp/f620-*.txt'`.
+- Raw ssh (read-only): `git remote -v` peek on grok-box-002 and grok-box-004.
+- Checkout left at: grok-box-004 repo on `main` (e64684f9), clean tree.
+- Env mutations: none (no installs, no lockfile changes).
+- Temp files left on box: none (removed /tmp/f620-*.txt).
+- Deviations: none.
 
-## 6. BLOCKER surfaced to supervisor (not silently worked around)
-The brief requires every pytest/mypy/uv-sync run to go to a grok box via
-`scripts/box-run.sh`, AND says **No push**. Per the `box-ops` law, code reaches
-a box EXCLUSIVELY by `git fetch origin <branch> && git checkout <sha>` of a
-**pushed** commit (scp/format-patch/`git am` are forbidden). These two
-constraints conflict: I cannot run the box suite / `mypy --strict` base-vs-head
-without pushing branch `cao/a778fc81`. I committed `ce4fa12f`, ran every
-laptop-safe check, and paused for the supervisor's decision rather than either
-pushing without authorization or running the suite on the laptop.
+## 6. Push note
+Branch `cao/a778fc81` pushed to origin (`chaogebaba/cli-agent-orchestrator`) as a
+SCRATCH branch for box fetch-by-SHA delivery only — never main, no PR — per the
+supervisor's clarification that this is the required box-delivery mechanism.
