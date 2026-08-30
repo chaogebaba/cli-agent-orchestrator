@@ -1,0 +1,18 @@
+> You are in <REDACTED_HOME>/VScode_projects/grok-box-setup/.cao/worktrees/15a6fa21
+
+  Note: You’re in a subdirectory of a Git project. Trusting will apply to the repository root: <REDACTED_HOME>/VScode_projects/grok-box-setup
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection. Trusting the directory allows project-local config, hooks, and exec
+  policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+╭──────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.150.1)                               │
+│                                                          │
+│ model:       loading   /model to change                  │
+│ directory:   ~/VScode_projects/…/.cao/worktrees/15a6fa21 │
+│ permissions: YOLO mode                                   │
+╰──────────────────────────────────────────────────────────╯

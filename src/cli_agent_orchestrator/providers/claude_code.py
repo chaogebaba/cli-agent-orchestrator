@@ -51,6 +51,76 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# F582 D18 (F575 #432): persona-seat credential readiness vocabulary.
+# ---------------------------------------------------------------------------
+# D18's fail-closed init branch (E-PERSONA-UNAUTHENTICATED for a persona whose
+# plane has no credential) MUST NOT ship until the credential KEY NAME is
+# confirmed against a live, known-authenticated persona ``.claude.json``. This
+# build's keys-only probe (2026-08-30) of the live production plane
+# ``~/.claude/.claude.json`` found NO ``oauthAccount`` key at all (8 top-level
+# keys; only ``userID`` is auth-like) — so the blueprint's cited marker
+# (``oauthAccount`` absent ⇒ unauthenticated, D18 SHOULD-2) is UNVERIFIED on this
+# build and cannot be trusted as the discriminator. Per D18's own rule ("until
+# confirmed, a missing key yields ``persona_unverified`` in the assign result,
+# never ``E-PERSONA-UNAUTHENTICATED``") the shipped classifier returns
+# ``persona_unverified`` whenever the credential key is UNCONFIRMED, and only
+# yields the fail-closed code once a build has CONFIRMED the key name. No other
+# markers are guessed (Do-NOT 19: never auto-answer login; the seat stays alive
+# for a human). See f582-sliceb-build-report.md Deviations.
+PERSONA_UNVERIFIED = "persona_unverified"
+PERSONA_UNAUTHENTICATED = "E-PERSONA-UNAUTHENTICATED"
+
+# The credential key D18 cites. NOT confirmed on this build (keys-only probe
+# above) — so ``_PERSONA_CREDENTIAL_KEY_CONFIRMED`` is False and the fail-closed
+# branch is inert until a live authenticated persona fixture confirms it.
+_PERSONA_CREDENTIAL_KEY = "oauthAccount"
+_PERSONA_CREDENTIAL_KEY_CONFIRMED = False
+
+
+def classify_persona_credential(
+    credential_present: bool | None,
+    *,
+    key_confirmed: bool = _PERSONA_CREDENTIAL_KEY_CONFIRMED,
+) -> str:
+    """F582 D18: map a persona plane's credential-probe result to a marker.
+
+    * ``key_confirmed`` False (this build)     → ``persona_unverified`` ALWAYS —
+      the discriminator key is unverified, so a missing/present probe result is
+      not trusted to fail a seat closed.
+    * ``key_confirmed`` True, credential absent → ``E-PERSONA-UNAUTHENTICATED``.
+    * ``key_confirmed`` True, credential present→ empty string (no marker; the
+      seat is considered authenticated).
+
+    ``credential_present`` is the keys-only probe verdict (True/False), or None
+    when the plane's ``.claude.json`` could not be read — an unreadable plane is
+    also ``persona_unverified``, never fail-closed. Never reads pane text; never
+    logs or returns the credential VALUE (only presence).
+    """
+    if not key_confirmed:
+        return PERSONA_UNVERIFIED
+    if credential_present is None:
+        return PERSONA_UNVERIFIED
+    return "" if credential_present else PERSONA_UNAUTHENTICATED
+
+
+def _persona_credential_present(config_path: Path) -> bool | None:
+    """Keys-only probe: is the D18 credential key present in ``config_path``?
+
+    Returns True/False for key presence, or None when the file is absent or
+    unparseable. Reads ONLY key presence — the credential value is never read
+    into a return, a log, or an exception (PII/secret discipline)."""
+    try:
+        if not config_path.exists():
+            return None
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _PERSONA_CREDENTIAL_KEY in data
+
+
 # Serializes concurrent _ensure_skip_bypass_prompt_setting() read-modify-writes to
 # ~/.claude/settings.json -- after the async conversion, N concurrent inits can run this
 # in N threads (via asyncio.to_thread), and an unlocked read-modify-write can race: one
