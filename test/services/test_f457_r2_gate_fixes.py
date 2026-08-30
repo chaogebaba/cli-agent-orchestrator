@@ -242,12 +242,17 @@ class TestB2AttemptRung1Gates:
 
 
 class TestS1FailOpenDbError:
-    """A DB exception in get_pending_messages_by_ids must not suppress the push —
-    fall back to the original messages list (fail-open)."""
+    """F476 r3 (#388): the pull-mode gate no longer calls attempt_teammate_push
+    directly — it routes through request_delivery so the wake goes through the
+    single wake cursor (claim_unnotified_wake/commit_wake). The former F457-r2
+    fail-open DB-recheck concern now lives inside the cursor-gated runner, not in
+    deliver_pending. This test pins the new routing: the gate signals
+    request_delivery exactly once and never calls attempt_teammate_push."""
 
-    def test_db_error_falls_back_to_original_messages(self):
-        """When get_pending_messages_by_ids raises, push is still attempted
-        with the original messages list."""
+    def test_pull_gate_routes_through_request_delivery(self):
+        """The supervisor pull-mode gate signals request_delivery (cursor path)
+        and does NOT call attempt_teammate_push (the bypass that re-emitted
+        acked ids)."""
         service = InboxService.__new__(InboxService)
         service._delivery_loop = MagicMock()
         service._delivery_tasks = set()
@@ -262,14 +267,11 @@ class TestS1FailOpenDbError:
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal"
             ) as mock_pull,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
-            ) as mock_should,
-            patch(
                 "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
             ) as mock_push,
             patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get"
-            ) as mock_config_get,
+                "cli_agent_orchestrator.services.inbox_service.request_delivery"
+            ) as mock_req_del,
             patch(
                 "cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}
             ),
@@ -277,9 +279,6 @@ class TestS1FailOpenDbError:
                 "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
                 MagicMock(),
             ),
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.get_pending_messages_by_ids"
-            ) as mock_recheck,
         ):
             mock_lock = MagicMock()
             mock_lock.acquire.return_value = True
@@ -288,24 +287,9 @@ class TestS1FailOpenDbError:
             mock_meta.return_value = {"recovery_state": None}
             mock_pending.return_value = [_msg(800)]
             mock_pull.return_value = True
-            mock_should.return_value = True
-
-            # ConfigService.get responses
-            def _config_get(key, default=None):
-                if key == "supervisor.wake.native":
-                    return True
-                if key == "supervisor.teammate_push":
-                    return True
-                return default
-            mock_config_get.side_effect = _config_get
-
-            # DB error on recheck
-            mock_recheck.side_effect = RuntimeError("DB connection lost")
 
             service.deliver_pending(_TERMINAL_ID)
 
-            # Push must still fire with the original messages (fail-open)
-            mock_push.assert_called_once()
-            pushed_messages = mock_push.call_args[0][1]
-            assert len(pushed_messages) == 1
-            assert pushed_messages[0].id == 800
+            # r3: route through the cursor, never the direct bypass.
+            mock_req_del.assert_called_once_with(_TERMINAL_ID)
+            mock_push.assert_not_called()

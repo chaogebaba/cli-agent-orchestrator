@@ -180,100 +180,36 @@ class TestF158R5SingleArbitration:
             ws_doorbell._connections.pop(terminal_id, None)
 
     def test_no_coexistence_frame_and_fallback(self):
-        """REGRESSION: cancellation-resistant send emits frame, but function
-        returns True, so _f413_after_commit marks it as delivered and F136
-        skips the native ring. Frame + native fallback NEVER coexist."""
-        from cli_agent_orchestrator.services import ws_doorbell
-        from cli_agent_orchestrator.services.ws_doorbell import (
-            _ws_delivered,
-            _ws_delivered_lock,
-            consume_ws_delivered,
-            mark_ws_delivered,
-        )
-        from cli_agent_orchestrator.clients.database import (
-            _F413_DOORBELL_STASH_KEY,
-            _F413_DOORBELL_SNAPSHOT_KEY,
-            _f413_after_commit,
-        )
+        """F476 r3 (#388): the WS frame and native fallback NEVER coexist for one
+        id. Under r3 the WS frame is fired inside the cursor-gated runner (not the
+        _f413_after_commit insert hook), and its result is carried on
+        outcome._ws_fired. _f136_post_delivery submits the native ring ONLY when
+        _ws_fired is False. This asserts: _ws_fired=True → zero coalesce submits."""
         from cli_agent_orchestrator.services.inbox_service import (
             CallbackRunOutcome,
             inbox_service,
         )
 
-        loop = asyncio.new_event_loop()
-        t = threading.Thread(target=loop.run_forever, daemon=True)
-        t.start()
-
         terminal_id = "term_nocoexist"
         row_id = 5004
-        frames_emitted: list[str] = []
+        coalesce_calls: list = []
 
-        with _ws_delivered_lock:
-            _ws_delivered.pop((terminal_id, row_id), None)
+        # The runner reports the WS frame already fired for this id.
+        outcome = CallbackRunOutcome(
+            written=1,
+            max_written_row_id=row_id,
+            reason="ok",
+            _ws_fired=True,
+        )
 
-        try:
-            async def resistant_send_text(text):
-                try:
-                    await asyncio.sleep(2.0)
-                except asyncio.CancelledError:
-                    pass
-                frames_emitted.append(text)
+        with patch(
+            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
+            side_effect=lambda *a, **kw: coalesce_calls.append((a, kw)),
+        ):
+            inbox_service._f136_post_delivery(terminal_id, outcome)
 
-            mock_ws = AsyncMock()
-            mock_ws.send_text = resistant_send_text
-            ws_doorbell._connections[terminal_id] = mock_ws
-
-            session = MagicMock()
-            session.in_nested_transaction.return_value = False
-            session.info = {
-                _F413_DOORBELL_STASH_KEY: [(terminal_id, row_id, "w1", "callback")],
-                _F413_DOORBELL_SNAPSHOT_KEY: None,
-            }
-
-            from cli_agent_orchestrator.services import inbox_service as inbox_mod
-            orig_loop = inbox_mod.inbox_service._delivery_loop
-            inbox_mod.inbox_service._delivery_loop = loop
-
-            delivery_calls = []
-            coalesce_calls = []
-
-            with patch.object(ws_doorbell, "is_ws_monitor_enabled", return_value=True):
-                with patch(
-                    "cli_agent_orchestrator.services.inbox_service.request_delivery",
-                    side_effect=lambda tid: delivery_calls.append(tid),
-                ):
-                    _f413_after_commit(session)
-
-            # The frame was emitted (cancellation-resistant send)
-            assert len(frames_emitted) == 1
-
-            # push_doorbell_frame_sync returned True → ws_fired=True
-            # So _f413_after_commit called mark_ws_delivered
-            # F136 post-delivery should consume the mark and skip native ring
-            outcome = CallbackRunOutcome(
-                written=1,
-                max_written_row_id=row_id,
-                reason="ok",
-            )
-
-            with patch(
-                "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
-                side_effect=lambda *a, **kw: coalesce_calls.append((a, kw)),
-            ):
-                inbox_service._f136_post_delivery(terminal_id, outcome)
-
-            inbox_mod.inbox_service._delivery_loop = orig_loop
-
-            # ASSERTION: frame emitted AND no native ring submitted
-            # (frame + fallback do NOT coexist)
-            assert len(frames_emitted) == 1  # frame emitted
-            assert len(coalesce_calls) == 0  # no native ring
-
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            t.join(timeout=2)
-            loop.close()
-            ws_doorbell._connections.pop(terminal_id, None)
+        # WS won → native ring suppressed (frame + fallback never coexist).
+        assert len(coalesce_calls) == 0
 
 
 class TestF158R5RealF136PostDelivery:
@@ -281,19 +217,21 @@ class TestF158R5RealF136PostDelivery:
     and observe the doorbell_coalesce_service.submit boundary."""
 
     def test_ws_delivered_suppresses_coalesce_submit(self):
-        """mark_ws_delivered + _f136_post_delivery → no coalesce submit."""
+        """F476 r3 (#388): when the runner fired the WS frame (outcome._ws_fired
+        =True), _f136_post_delivery suppresses the native coalesce submit — at
+        most one wake transport per id."""
         from cli_agent_orchestrator.services.inbox_service import (
             CallbackRunOutcome,
             inbox_service,
         )
-        from cli_agent_orchestrator.services.ws_doorbell import mark_ws_delivered
 
         terminal_id = "term_f136_ws_r5"
         row_id = 6001
 
-        mark_ws_delivered(terminal_id, row_id)
-
-        outcome = CallbackRunOutcome(written=1, max_written_row_id=row_id, reason="ok")
+        # r3: the WS-fired signal is carried on the outcome, not a side-table.
+        outcome = CallbackRunOutcome(
+            written=1, max_written_row_id=row_id, reason="ok", _ws_fired=True
+        )
         submit_calls = []
         with patch(
             "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",

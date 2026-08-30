@@ -496,6 +496,10 @@ class CallbackRunOutcome:
     retry_delay_s: float | None = None
     reason: str = ""
     max_written_row_id: int = 0  # F168 D4: highest row id written this run
+    # F476 r3 (#388): WS advisory frame was emitted for max_written_row_id inside
+    # the runner thread (the cursor-gated single wake). When True, _f136_post_delivery
+    # MUST suppress the native ring — at most one wake transport per id (blueprint D8).
+    _ws_fired: bool = False
     # fx168 FIX-2: stale path heal data (mailbox_id, terminal_id, generation, new_path)
     _fx168_stale_heal: tuple[str, str, int, str] | None = None
     # F459: last written row's message body and sender display name for native bridge
@@ -1036,6 +1040,42 @@ class InboxService:
 
             _failure_streaks.pop(terminal_id, None)
 
+            # F476 r3 (#388): fire the WS advisory frame HERE, in the runner
+            # thread (this method runs via asyncio.to_thread, OFF the delivery
+            # loop, so push_doorbell_frame_sync can post to the loop and
+            # arbitrate the WS/native winner). Blueprint D8: the WS doorbell is a
+            # transport of THIS cursor-gated push cycle, not the ungated
+            # insert-commit hook. Only a row we actually wrote this cycle
+            # (written>0) is wake-eligible, so an acked/aged id never reaches
+            # here. When WS wins, _f136_post_delivery suppresses the native ring.
+            _ws_fired = False
+            if written > 0 and _max_written_row_id > 0:
+                try:
+                    from cli_agent_orchestrator.services.ws_doorbell import (
+                        is_armed,
+                        is_ws_monitor_enabled,
+                        mark_ws_delivered,
+                        push_doorbell_frame_sync,
+                    )
+
+                    if is_ws_monitor_enabled() and is_armed(terminal_id):
+                        _ws_preview = (_f459_last_body or "").split("\n", 1)[0]
+                        _ws_sender = (_f459_last_sender or "")[:8]
+                        _ws_fired = push_doorbell_frame_sync(
+                            terminal_id,
+                            _max_written_row_id,
+                            _ws_sender,
+                            _ws_preview,
+                        )
+                        if _ws_fired:
+                            try:
+                                mark_ws_delivered(terminal_id, _max_written_row_id)
+                            except Exception:
+                                pass
+                except Exception as _ws_exc:
+                    logger.debug("f476r3_ws_frame_error terminal=%s: %s", terminal_id, _ws_exc)
+                    _ws_fired = False
+
             return CallbackRunOutcome(
                 selected=len(claim.rows),
                 processed=len(claim.rows),
@@ -1045,6 +1085,7 @@ class InboxService:
                 needs_immediate_wake=False,
                 reason="ok",
                 max_written_row_id=_max_written_row_id,
+                _ws_fired=_ws_fired,
                 _f459_message_body=_f459_last_body,
                 _f459_sender_display_name=_f459_last_sender,
             )
@@ -1170,47 +1211,45 @@ class InboxService:
         # F168 D2 / F461: ring the doorbell before entering _delivery_seq_guard.
         # F461: route through coalesce service to merge near-simultaneous callbacks.
         # D3: best-effort, isolated — exceptions never propagate.
-        # F158-R2: Skip native ring when WS advisory already delivered for this row
-        # (consume_ws_delivered returns True → WS woke the supervisor, no dup ring).
-        if outcome.written > 0 and outcome.max_written_row_id > 0:
-            _f158_ws_already_delivered = False
+        #
+        # F476 r3 (#388): This is the SINGLE wake-transport arbitration point and it
+        # runs only on a cursor-confirmed wake (outcome.written > 0, i.e.
+        # claim_unnotified_wake + commit_wake advanced the cursor for this row).
+        # Blueprint D8: the WS doorbell is a transport of the push cycle, not an
+        # independent waker. The WS advisory frame is attempted inside the runner
+        # thread (_f136_run_callback_delivery, off the delivery loop so
+        # push_doorbell_frame_sync can arbitrate) and its result is carried on
+        # outcome._ws_fired. Here we fire the native ring ONLY when WS did not —
+        # at most one transport per id. An already-acked / aged id never reaches
+        # here because the claim returns empty / superseded and written stays 0.
+        if outcome.written > 0 and outcome.max_written_row_id > 0 and not outcome._ws_fired:
             try:
-                from cli_agent_orchestrator.services.ws_doorbell import consume_ws_delivered
+                # F459: resolve worker display name for from-name in native bridge
+                _f459_display = outcome._f459_sender_display_name
+                if _f459_display:
+                    try:
+                        from cli_agent_orchestrator.utils.terminal import display_name as _dn
 
-                _f158_ws_already_delivered = consume_ws_delivered(
-                    terminal_id, outcome.max_written_row_id
+                        _f459_display = _dn(_f459_display)
+                    except Exception:
+                        pass
+
+                # F461: submit to coalesce buffer instead of ringing directly
+                from cli_agent_orchestrator.services.doorbell_coalesce import (
+                    doorbell_coalesce_service,
                 )
-            except Exception:
-                pass
 
-            if not _f158_ws_already_delivered:
-                try:
-                    # F459: resolve worker display name for from-name in native bridge
-                    _f459_display = outcome._f459_sender_display_name
-                    if _f459_display:
-                        try:
-                            from cli_agent_orchestrator.utils.terminal import display_name as _dn
-
-                            _f459_display = _dn(_f459_display)
-                        except Exception:
-                            pass
-
-                    # F461: submit to coalesce buffer instead of ringing directly
-                    from cli_agent_orchestrator.services.doorbell_coalesce import (
-                        doorbell_coalesce_service,
-                    )
-
-                    doorbell_coalesce_service.submit(
-                        terminal_id,
-                        outcome.max_written_row_id,
-                        written_count=outcome.written,
-                        message_body=outcome._f459_message_body,
-                        sender_display_name=_f459_display,
-                    )
-                except Exception as _bell_exc:
-                    logger.debug(
-                        "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
-                    )
+                doorbell_coalesce_service.submit(
+                    terminal_id,
+                    outcome.max_written_row_id,
+                    written_count=outcome.written,
+                    message_body=outcome._f459_message_body,
+                    sender_display_name=_f459_display,
+                )
+            except Exception as _bell_exc:
+                logger.debug(
+                    "f461_coalesce_submit_error terminal=%s: %s", terminal_id, _bell_exc
+                )
 
         post_immediate = False
         arm_delayed: float | None = None
@@ -2342,58 +2381,28 @@ class InboxService:
             )
 
             if is_supervisor_mailbox_pull_terminal(terminal_id):
-                # WP-W2M-PUSH-BRIDGE: attempt teammate-push notification (best-effort).
-                from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-                from cli_agent_orchestrator.services.config_service import ConfigService as _CS
-                from cli_agent_orchestrator.services.teammate_push_service import (
-                    _should_teammate_push,
-                    attempt_teammate_push,
-                )
-
-                # F457: unified gate — wake.native=false suppresses teammate push
-                # (same gate the doorbell native ring honors).
-                if not _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT):
+                # F476 r3 (#388): the supervisor teammate-push wake MUST route
+                # through the single wake cursor, never attempt_teammate_push
+                # directly. Calling attempt_teammate_push here bypassed
+                # claim_unnotified_wake/commit_wake, so an already-acked id was
+                # re-emitted as a "Message N ready. Drain" teammate replay
+                # (issue #388 samples 3-17). Instead signal request_delivery,
+                # which arms the F136 runner: it claims wake-eligible rows above
+                # the cursor, commits, then emits ONCE (teammate/native) and
+                # rings the doorbell from _f136_post_delivery. Acked/aged ids are
+                # gated by the cursor and never re-surface.
+                #
+                # The prior wake.native / _should_teammate_push / F457
+                # pending-recheck gates are now enforced inside the runner and
+                # ring_supervisor_doorbell, so they are not duplicated here.
+                try:
+                    request_delivery(terminal_id)
+                except Exception as _rd_exc:  # best-effort, mirrors prior contract
                     logger.debug(
-                        "f457_push_suppressed terminal=%s reason=wake_native_disabled",
+                        "f476r3_request_delivery_failed terminal=%s: %s",
                         terminal_id,
+                        _rd_exc,
                     )
-                    return
-
-                if _should_teammate_push(terminal_id):
-                    # F457: acked-row dedupe — re-verify messages are still PENDING
-                    # before pushing (kills late/duplicate pings for consumed rows).
-                    # F457-r2 S1: fail-open on DB errors — fall back to original
-                    # messages list, mirroring _is_row_still_pending's fail-open.
-                    try:
-                        still_pending = get_pending_messages_by_ids(
-                            terminal_id, [m.id for m in messages]
-                        )
-                    except Exception as _db_exc:
-                        logger.debug(
-                            "f457_recheck_db_error terminal=%s error=%s "
-                            "action=fail_open_with_original_messages",
-                            terminal_id,
-                            _db_exc,
-                        )
-                        still_pending = messages
-                    if not still_pending:
-                        logger.debug(
-                            "f457_push_suppressed terminal=%s decision=skipped_acked "
-                            "reason=rows_not_pending ids=%s",
-                            terminal_id,
-                            [m.id for m in messages],
-                        )
-                        return
-
-                    try:
-                        attempt_teammate_push(terminal_id, still_pending)
-                        # fx168 FIX-4: Removed dead D9 doorbell call. deliver_pending
-                        # holds delivery_lock here; ring_supervisor_doorbell's G1 gate
-                        # tries the same non-reentrant lock → always "skipped_gate".
-                        # The F136 runner's doorbell in _f136_post_delivery (armed by
-                        # FIX-1's request_delivery signal) is the correct path.
-                    except Exception as _push_exc:
-                        logger.debug(f"teammate_push side-effect failed: {_push_exc}")
                 return
             # --- end WP-MAILBOX-CHANNEL gate ---
 

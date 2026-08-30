@@ -157,13 +157,24 @@ class TestAC1RawAdd:
     ):
         """AC1: a raw db.add(InboxModel) — with NO producer helper — yields exactly
         one OPEN DeliveryObligationModel row, one fx191.accept trace event, sentinel
-        file touched, and one doorbell emit after commit."""
+        file touched, and (F476 r3 #388) a request_delivery signal after commit.
+
+        F476 r3: the WS advisory frame is NO LONGER fired from _f413_after_commit
+        (that insert-commit emit was ungated by the single wake cursor, blueprint
+        D8). The hook only signals request_delivery; the cursor-gated F136 runner
+        emits at most one wake transport. So push_doorbell_frame_sync must NOT be
+        called here, and request_delivery MUST be signaled exactly once."""
         db_factory = supervisor_setup
         doorbell_emits = []
+        delivery_signals = []
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
             lambda *a, **kw: doorbell_emits.append(a),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda tid: delivery_signals.append(tid),
         )
 
         with db_factory() as db:
@@ -202,15 +213,15 @@ class TestAC1RawAdd:
             # Sentinel touched
             assert len(db_factory._f413_flag_calls) == 1
 
-            # Doorbell not yet emitted (before commit)
-            assert len(doorbell_emits) == 0
+            # Before commit: nothing signaled yet
+            assert len(delivery_signals) == 0
 
             db.commit()
 
-        # After commit: doorbell emitted
-        assert len(doorbell_emits) == 1
-        assert doorbell_emits[0][0] == "sup_0001"  # terminal_id
-        assert doorbell_emits[0][1] == row_id  # row_id
+        # F476 r3: after commit the hook signals request_delivery (once, for the
+        # terminal), and NEVER fires the WS frame on insert.
+        assert len(doorbell_emits) == 0, "F476 r3: WS frame must not fire from insert hook"
+        assert delivery_signals == ["sup_0001"], "F476 r3: exactly one request_delivery signal"
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +233,19 @@ class TestAC2Rollback:
     """Rolled-back insert: obligation absent, no doorbell, stash cleared."""
 
     def test_rollback_clears_obligation_and_doorbell(self, supervisor_setup, monkeypatch):
-        """AC2: After rollback, no obligation row, no doorbell emit, stash cleared."""
+        """AC2: After rollback, no obligation row, no doorbell emit, no delivery
+        signal, stash cleared (F476 r3: hook signals request_delivery, not WS)."""
         db_factory = supervisor_setup
         doorbell_emits = []
+        delivery_signals = []
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
             lambda *a, **kw: doorbell_emits.append(a),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda tid: delivery_signals.append(tid),
         )
 
         with db_factory() as db:
@@ -245,8 +262,9 @@ class TestAC2Rollback:
             row_id = int(row.id)
             db.rollback()
 
-        # No doorbell emitted
+        # No doorbell emitted, no delivery signal (rolled back)
         assert len(doorbell_emits) == 0
+        assert len(delivery_signals) == 0
 
         # Obligation absent (rolled back — data not in DB)
         with db_factory() as db:
@@ -495,10 +513,15 @@ class TestAC5NonSupervisor:
         """AC5: Message to non-supervisor terminal gets no obligation."""
         db_factory = supervisor_setup
         doorbell_emits = []
+        delivery_signals = []
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
             lambda *a, **kw: doorbell_emits.append(a),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda tid: delivery_signals.append(tid),
         )
 
         # Reset flag call counter
@@ -528,8 +551,9 @@ class TestAC5NonSupervisor:
 
         # No sentinel touch
         assert len(db_factory._f413_flag_calls) == 0
-        # No doorbell
+        # No doorbell, no delivery signal (non-supervisor row never stashed)
         assert len(doorbell_emits) == 0
+        assert len(delivery_signals) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -541,13 +565,20 @@ class TestD3NestedTxGuard:
     """D3: nested-tx guard prevents spurious doorbell on nested commit."""
 
     def test_nested_commit_does_not_emit_doorbell(self, supervisor_setup, monkeypatch):
-        """Nested commit within begin_nested() does NOT emit doorbell."""
+        """Nested commit within begin_nested() does NOT drain the stash; the outer
+        commit drains it exactly once. F476 r3: drain now signals request_delivery
+        (not a WS frame), so we observe request_delivery as the drain proxy."""
         db_factory = supervisor_setup
+        delivery_signals = []
         doorbell_emits = []
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
             lambda *a, **kw: doorbell_emits.append(a),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda tid: delivery_signals.append(tid),
         )
 
         with db_factory() as db:
@@ -562,21 +593,32 @@ class TestD3NestedTxGuard:
                 )
                 db.add(row)
                 db.flush()
-            # After nested commit: no doorbell yet
-            assert len(doorbell_emits) == 0
+            # After nested commit: no drain yet
+            assert len(delivery_signals) == 0
             db.commit()
 
-        # After outer commit: doorbell emitted
-        assert len(doorbell_emits) == 1
+        # After outer commit: drained once (request_delivery), never a WS frame
+        assert delivery_signals == ["sup_0001"]
+        assert len(doorbell_emits) == 0
 
     def test_nested_rollback_preserves_earlier_stash(self, supervisor_setup, monkeypatch):
-        """D3 snapshot-restore: nested rollback does not lose earlier stash entries."""
+        """D3 snapshot-restore: nested rollback does not lose earlier stash entries.
+
+        F476 r3: the drain signals request_delivery (per terminal, deduped) rather
+        than firing a WS frame. Both rows target sup_0001, so the earlier
+        successful stash entry surviving the second nested rollback yields exactly
+        one request_delivery("sup_0001") after the outer commit."""
         db_factory = supervisor_setup
+        delivery_signals = []
         doorbell_emits = []
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
             lambda *a, **kw: doorbell_emits.append(a),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda tid: delivery_signals.append(tid),
         )
 
         with db_factory() as db:
@@ -612,9 +654,11 @@ class TestD3NestedTxGuard:
 
             db.commit()
 
-        # Only first row's doorbell should have emitted
-        assert len(doorbell_emits) == 1
-        assert doorbell_emits[0][0] == "sup_0001"
+        # F476 r3: only the first (surviving) stash entry drains, as one
+        # request_delivery signal; the rolled-back second entry does not. Never a
+        # WS frame from the insert hook.
+        assert delivery_signals == ["sup_0001"]
+        assert len(doorbell_emits) == 0
 
 
 # ---------------------------------------------------------------------------

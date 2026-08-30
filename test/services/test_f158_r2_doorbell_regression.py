@@ -94,8 +94,11 @@ class TestF158R2_ArmedButSendFails:
             ws_doorbell._connections.pop("term_hang", None)
 
     def test_after_commit_ws_fail_triggers_request_delivery(self):
-        """When push_doorbell_frame_sync returns False (send failed),
-        _f413_after_commit calls request_delivery (which triggers F136 ring)."""
+        """F476 r3 (#388): _f413_after_commit no longer fires a WS frame on insert
+        (that was ungated by the wake cursor, blueprint D8). It ONLY signals
+        request_delivery; the cursor-gated F136 runner emits the WS/native wake.
+        So push_doorbell_frame_sync must NOT be called from the hook, and
+        request_delivery MUST be called once."""
         from cli_agent_orchestrator.clients.database import (
             _F413_DOORBELL_STASH_KEY,
             _F413_DOORBELL_SNAPSHOT_KEY,
@@ -111,14 +114,13 @@ class TestF158R2_ArmedButSendFails:
 
         with patch(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=False,
         ) as mock_ws, patch(
             "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_req:
             _f413_after_commit(session)
 
-            mock_ws.assert_called_once_with("term_fail", 42, "sender", "hello")
-            # No direct ring_supervisor_doorbell call from the hook
+            # r3: hook never fires WS on insert; it only signals delivery.
+            mock_ws.assert_not_called()
             mock_req.assert_called_once_with("term_fail")
 
     def test_after_commit_ws_fail_no_direct_ring(self):
@@ -235,7 +237,11 @@ class TestF158R2_WsDeliveredNoDuplicateRing:
     ring is suppressed — no duplicate wake."""
 
     def test_ws_success_marks_delivered(self):
-        """push_doorbell_frame_sync returns True → mark_ws_delivered is called."""
+        """F476 r3 (#388): _f413_after_commit no longer fires the WS frame on
+        insert, so it does NOT call mark_ws_delivered either — it only signals
+        request_delivery. The WS delivery marking now happens inside the
+        cursor-gated F136 runner. This test pins that the hook signals delivery
+        and touches neither WS primitive."""
         from cli_agent_orchestrator.clients.database import (
             _F413_DOORBELL_STASH_KEY,
             _F413_DOORBELL_SNAPSHOT_KEY,
@@ -251,14 +257,15 @@ class TestF158R2_WsDeliveredNoDuplicateRing:
 
         with patch(
             "cli_agent_orchestrator.services.ws_doorbell.push_doorbell_frame_sync",
-            return_value=True,
-        ), patch(
+        ) as mock_ws, patch(
             "cli_agent_orchestrator.services.ws_doorbell.mark_ws_delivered"
         ) as mock_mark, patch(
             "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ):
+        ) as mock_req:
             _f413_after_commit(session)
-            mock_mark.assert_called_once_with("term_ok", 200)
+            mock_ws.assert_not_called()
+            mock_mark.assert_not_called()
+            mock_req.assert_called_once_with("term_ok")
 
     def test_consume_ws_delivered_returns_true_after_mark(self):
         """consume_ws_delivered returns True after mark_ws_delivered was called."""
