@@ -141,3 +141,63 @@ grok-box-1.
 Box left clean: checkout at `b1a36627`, only the disposable per-worktree `.venv`
 from `uv sync --frozen`; mypy base temp dir under `~/box-scratch` removed; no
 apt/pip/global installs.
+
+
+---
+
+## r2 fold — golden drift + rebase onto moved fork main
+
+Supervisor follow-up: fold the previously-flagged composition-golden drift into
+this lane and rebase onto the moved fork main before gating.
+
+### Golden drift fix (test_f497_composition[codex_empirical_reviewer])
+
+- **Correction to the r1 note:** the failing test does NOT read the installed
+  ``~/.aws`` store. ``test_ac1_narrowed_extracted_profile_matches_golden_except_body``
+  compares a COMMITTED golden fixture (``test/utils/f497_golden/<name>.md``)
+  against a profile composed from the ROOT repo's ``profiles/`` corpus (copied
+  into a tmp agent-store by ``_install_ephemeral_stores``; ``_PROFILES`` is the
+  ROOT ``profiles/`` dir, auto-discovered as an ancestor). So there is **no
+  live-store-read design smell** — the harness is correctly fixture-vs-source.
+- **The drift was legitimate and one field only:** the committed golden's
+  ``contextPolicy.extraLeaves`` still carried the stale ``"gpt-unrestricted.md"``
+  leaf, which the ROOT ``profiles/`` source of truth has since dropped
+  (``profiles/positions/empirical_reviewer.md`` certification evidence records
+  "extraLeaves gpt-unrestricted all fixed"). The current ROOT composition yields
+  ``contextPolicy = {scope: persona, memoryTypes: [project], memoryNames: [],
+  globalClaudeMd: false, extraLeaves: []}``.
+- **Fix:** regenerated the golden's ``contextPolicy`` from the CURRENT ROOT
+  ``profiles/`` composition — ``extraLeaves: ["gpt-unrestricted.md"]`` →
+  ``extraLeaves: []`` in ``test/utils/f497_golden/codex_empirical_reviewer.md``.
+  The ``kiro_reviewer`` golden had NO drift and is unchanged. The test's
+  comparison logic is untouched. (ROOT ``profiles/`` was read-only; not modified.)
+
+### Rebase onto fork main (slice A + B merged)
+
+- Fork main moved to ``e64684f901edc7a3b2b98982e976544c41918798`` ("Merge
+  'cao/f582-sliceb' into main"), which descends from this lane's original base
+  ``b2814464``.
+- ``git rebase e64684f9`` replayed the three F613 commits with **no conflicts**
+  (the F613 diff touches ``routing.py`` / ``server.py`` / F497 tests + one golden;
+  the F582 merges touched status_monitor / inbox / providers — disjoint).
+- Post-rebase the F613 fixes are intact (``_find_alias_for_cell`` /
+  ``E_ALIAS_MISSING`` in routing.py; ``provided_provider`` /
+  ``provider=_resolved_provider`` in server.py; golden ``extraLeaves: []``); the
+  diff vs ``e64684f9`` is exactly the six F613 files.
+- New branch HEAD: **``bc18bf541715b19896028b8ccd9fd64ce04d8118``** (force-pushed
+  with ``--force-with-lease``).
+
+### Fresh box evidence (grok-box-005, SHA bc18bf54, base e64684f9)
+
+- ``pytest`` scope ``test/mcp_server/test_f613_position_alias.py
+  test/mcp_server/test_f497_routing_d9.py test/utils/test_f497_composition.py
+  test/utils/test_f497_resolver.py`` → **67 passed, 15 skipped**. The
+  previously-drifting selector
+  ``test_ac1_narrowed_extracted_profile_matches_golden_except_body`` → **2 passed**.
+- Both F613 mutants **re-confirmed KILLED** post-rebase (F613-bug1-raw-fstring,
+  F613-bug2-drop-passthrough).
+- black / isort ``-l 100``: clean.
+- ``mypy --strict`` parity vs ``e64684f9`` on the two touched source files:
+  HEAD **35** == BASE **35**, **delta 0**.
+- Box repo left clean at ``bc18bf54``; mypy base temp dir removed; no installs.
+  (Box selected in the grok-box-2..8 range; never grok-box-1.)
