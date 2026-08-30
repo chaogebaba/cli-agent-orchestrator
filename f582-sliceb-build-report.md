@@ -8,7 +8,8 @@
   sha `36f35495440e12cdcaff5c042e05f25c706c57b895f1ad58ac40a15b70e5d287` is the
   sha256 of `INDEX.md` (verified byte-exact).
 - Base: `4bf27b92` (slice A tip on `cao/f582-sliceb`, over `main@b2814464` = D14/D15 merge).
-- Branch: `cao/f582-sliceb`.
+- Branch: `cao/f582-sliceb` (final tip `7042a160`; code + tests `5be189a1`,
+  fmt `213af958`, D21 test hardening `7042a160`).
 - Result: slice B covers **D16-codex**, **D21-impl codex half** (arming/timing fix),
   **D20 cline finding** (mcp_unverified), **D18 persona_unverified** (finding),
   **D22 root-hook idempotency guard** (diff for the supervisor to land), and
@@ -153,32 +154,39 @@ Out-of-tree artifact (supervisor lands):
 
 ## Verification (box)
 
-> Filled from the box run (see Box-actions ledger). Slice-B AC scope:
-> `test/providers/test_codex_busy_marker.py`,
-> `test/services/test_f582_d21_dialog_clear_lifetime.py`,
-> `test/auto_answers/test_f530_corpus.py`,
-> `test/providers/test_mcp_ready_evidence.py`,
-> `test/providers/test_persona_credential_unverified.py`,
-> plus the slice-A regression suites the touched files affect
-> (`test/providers/test_kiro_busy_marker.py`, `test/services/test_auto_responder.py`).
+All verification ran on `box@grok-box-004` (pinned; never grok-box-1 which is
+frozen). None on the laptop. Verified SHA `7042a160b9de8bd99dc4d6b5301df90086f143fb`.
 
-- pytest (AC scope + affected): **<filled from box>**.
-- black `--check --line-length 100`: **<filled from box>**.
-- isort `--check-only --line-length 100`: **<filled from box>**.
-- mypy `--strict` parity (head vs base, touched source files): **<filled from box>**.
+Slice-B AC scope + affected regression suites:
+```text
+test/providers/test_codex_busy_marker.py
+test/services/test_f582_d21_dialog_clear_lifetime.py
+test/auto_answers/test_f530_corpus.py
+test/providers/test_mcp_ready_evidence.py
+test/providers/test_persona_credential_unverified.py
+test/providers/test_kiro_busy_marker.py
+```
+- pytest: **43 passed, 2 xfailed** in ~1.9s. (The 2 xfailed are pre-existing
+  F530-corpus `xfail(strict)` cases; the slice-B fixture `05-…` is a PASS pin.)
+- black `--check --line-length 100`: **7 files unchanged** (pass).
+- isort `--check-only --line-length 100`: **pass** (clean).
+- mypy `--strict` parity (touched source files
+  `providers/codex.py`, `providers/claude_code.py`, `services/terminal_service.py`,
+  same box): HEAD `7042a160` **117 errors in 3 files** == BASE `4bf27b92`
+  **117 errors in 3 files**. **Delta 0** (the 117 are pre-existing baseline debt in
+  these large files; this slice introduces no new strict error).
 
 ## Mutation ledger
 
-One mutant per built arm (test_rc=1 with the mutant; pre/post revert rc=0):
+One mutant per built arm — each applied at the verified tip on box-004
+(python-patch → named test → revert → clean). **4/4 KILLED.**
 
-| Mutant | Applied edit | Named selector | Expected |
+| Mutant | Applied edit | Named selector | Result |
 |---|---|---|---|
-| D16-codex-never-busy | `codex_busy_marker_live` returns `None` instead of `True` (drop the marker branch) | `test/providers/test_codex_busy_marker.py::test_helper_true_on_live_codex_busy_fixtures` | test_rc=1 |
-| D21-fixed-window | Revert the loop to `while time.monotonic() - start < timeout` (drop the lifetime extension) | `test/services/test_f582_d21_dialog_clear_lifetime.py::test_late_render_after_base_timeout_still_clears` | test_rc=1 |
-| D20-cline-declares | Make `ClineCliProvider.mcp_ready_evidence` return a declared+connected `MCPEvidence` | `test/providers/test_mcp_ready_evidence.py::test_cline_provider_is_exempt_unverified_no_durable_artifact` | test_rc=1 |
-| D18-failclosed-when-unconfirmed | `classify_persona_credential` returns `PERSONA_UNAUTHENTICATED` on absent credential even while `key_confirmed=False` | `test/providers/test_persona_credential_unverified.py::test_unconfirmed_key_missing_credential_is_unverified_not_failclosed` | test_rc=1 |
-
-> Mutation run results: **<filled from box>**.
+| D16-codex-never-busy | `codex_busy_marker_live` returns `None` instead of `True` on the marker branch | `test_codex_busy_marker.py::test_helper_true_on_live_codex_busy_fixtures` | pre_rc=0 test_rc=1 post_revert_rc=0 — KILLED |
+| D21-fixed-window | Revert the loop to `while time.monotonic() - start < timeout` (drop the lifetime extension) | `test_f582_d21_dialog_clear_lifetime.py::…::test_late_render_after_base_timeout_still_clears` | pre_rc=0 test_rc=1 post_revert_rc=0 — KILLED |
+| D20-cline-declares | `ClineCliProvider.mcp_ready_evidence` returns a declared+connected `MCPEvidence` | `test_mcp_ready_evidence.py::test_cline_provider_is_exempt_unverified_no_durable_artifact` | pre_rc=0 test_rc=1 post_revert_rc=0 — KILLED |
+| D18-failclosed-when-unconfirmed | `classify_persona_credential` fails closed on absent credential even while `key_confirmed=False` | `test_persona_credential_unverified.py::test_unconfirmed_key_missing_credential_is_unverified_not_failclosed` | pre_rc=0 test_rc=1 post_revert_rc=0 — KILLED |
 
 ## Deviations and deferred rows (every deferral with its named gap)
 
@@ -228,4 +236,25 @@ One mutant per built arm (test_rc=1 with the mutant; pre/post revert rc=0):
 
 ## Box-actions ledger
 
-> Filled from the box run.
+All invocations used `CAO_BOXES="box@grok-box-004" bash scripts/box-run.sh
+<label> -- '<cmd>'` from `/home/chao/VScode_projects/cli-subagents` (root repo).
+box@grok-box-1 was never used (frozen; auto-refused). No laptop suite/mypy runs.
+
+| Label | Box command / action | Result |
+|---|---|---|
+| `f582-sliceb-verify` | fetch+checkout `5be189a1`; uv sync --frozen; black/isort --check; pytest AC scope | black 3 files would-reformat, pytest 43 passed/2 xfailed (fmt fixed in `213af958`) |
+| `f582-sliceb-fmtdiff` | checkout `5be189a1`; black/isort `--diff` | captured exact fmt diffs (3 test files); applied locally |
+| `f582-sliceb-verify2` | fetch+checkout `213af958`; uv sync --frozen; black/isort --check; pytest AC scope | black 7 unchanged; isort clean; pytest 43 passed/2 xfailed |
+| `f582-sliceb-mypy` | checkout head `213af958` then base `4bf27b92`; `uv run mypy --strict` on the 3 touched source files (same box A/B) | HEAD 117 == BASE 117 (delta 0); left box at head |
+| `f582-sliceb-mutants` | checkout `213af958`; 4 designed mutants (python-patch → named test → `git checkout` revert) via `~/box-scratch/f582-mutants.sh` (removed after) | D16/D20/D18 KILLED; D21 REVIEW (test not discriminating — fixed in `7042a160`) |
+| `f582-check-mut` | read-only `sed -n` of the D21 loop region (diagnosing the D21 REVIEW) | confirmed source matched; the test, not the mutation, was the gap |
+| `f582-d21-recheck` | fetch+checkout `7042a160`; black/isort d21 test; pytest d21; re-run D21 mutant | black/isort clean; 3 passed; D21 mutant pre_rc=0 test_rc=1 post_revert_rc=0 — KILLED |
+
+- Raw ssh: none (all through box-run.sh).
+- Checkout SHA left on box-004: `7042a160` (head), clean working tree after each
+  run (every mutant reverted with `git checkout`; mypy A/B restored to head).
+- Environment mutations: only the disposable per-worktree `.venv` from
+  `uv sync --frozen`. No apt/pip/global installs; no lockfile change.
+- Temp files: `/tmp/f582-*.txt` on the box (transient); `~/box-scratch/f582-mutants.sh`
+  removed at end of its run. None left outside /tmp.
+- Deviations from box-ops rules: none.
