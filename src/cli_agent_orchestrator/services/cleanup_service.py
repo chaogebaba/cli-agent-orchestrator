@@ -6,7 +6,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-
 from cli_agent_orchestrator.clients.database import (
     CallbackBarrierMemberModel,
     CallbackBarrierModel,
@@ -15,8 +14,8 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     SessionLocal,
     TerminalModel,
-    delete_terminal_and_warm_intent,
     _utcnow,
+    delete_terminal_and_warm_intent,
 )
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -28,9 +27,152 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.memory_format import parse_index_entry
+from cli_agent_orchestrator.services.settings_service import get_logs_settings
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
+
+# Terminal-log file suffixes managed by the F619 (#475) retention machinery.
+# The active pipe-pane byte log and its single rotation backup. The delete-time
+# ``.scrollback`` / ``.snapshot.json`` restore artifacts are deliberately NOT
+# in this set: those are the debugging/restore snapshot and are aged out by the
+# separate RETENTION_DAYS sweep in cleanup_old_data, not by the log caps here.
+_TERMINAL_LOG_SUFFIXES = (".log", ".log.1")
+
+
+def _terminal_id_from_log_name(name: str) -> str:
+    """Return the terminal id encoded in a managed log filename.
+
+    ``<id>.log`` and ``<id>.log.1`` both map back to ``<id>``. A name that
+    matches neither suffix returns ``""`` (caller skips it).
+    """
+    if name.endswith(".log.1"):
+        return name[: -len(".log.1")]
+    if name.endswith(".log"):
+        return name[: -len(".log")]
+    return ""
+
+
+def _iter_terminal_log_files() -> list[Path]:
+    """Return every managed terminal-log file (``*.log`` and ``*.log.1``)."""
+    if not TERMINAL_LOG_DIR.exists():
+        return []
+    files: list[Path] = []
+    for suffix in _TERMINAL_LOG_SUFFIXES:
+        files.extend(TERMINAL_LOG_DIR.glob(f"*{suffix}"))
+    return files
+
+
+def _live_terminal_ids() -> set[str]:
+    """Return the id of every terminal that still has a DB row.
+
+    A log whose terminal id is in this set belongs to a LIVE (still-tracked)
+    terminal and is never pruned by age or by the total-size cap, regardless of
+    mtime — pruning it would delete the log of a running agent (F619 #475).
+    A DB read failure raises to the caller, which treats it as "cannot prove
+    dead" and prunes nothing (fail-safe).
+    """
+    with SessionLocal() as db:
+        return {row.id for row in db.query(TerminalModel.id).all()}
+
+
+def prune_terminal_log(terminal_id: str) -> int:
+    """Remove a single terminal's managed log files (``.log`` + ``.log.1``).
+
+    Called from the ``delete_terminal`` teardown path so a reaped terminal's
+    (potentially large) pipe-pane byte log does not linger until the retention
+    sweep. Returns the number of files removed. Best-effort and exception-safe:
+    a failure to unlink is logged and swallowed so it can never fail a delete.
+    """
+    removed = 0
+    if not terminal_id:
+        return 0
+    for suffix in _TERMINAL_LOG_SUFFIXES:
+        path = TERMINAL_LOG_DIR / f"{terminal_id}{suffix}"
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to prune terminal log %s: %s", path, e)
+    if removed:
+        logger.info("Pruned %d log file(s) for terminal %s", removed, terminal_id)
+    return removed
+
+
+def prune_terminal_logs_at_startup() -> dict[str, int]:
+    """Prune dead-terminal logs by age, then enforce the whole-dir size cap.
+
+    Two passes over ``TERMINAL_LOG_DIR`` (F619 #475), both skipping any file
+    whose terminal id still has a DB row (LIVE — never touched):
+
+    1. AGE: delete a dead terminal's log when its mtime is older than
+       ``logs.retention_hours``.
+    2. TOTAL CAP: if the surviving dead-terminal logs still exceed
+       ``logs.max_total_mb`` in aggregate, delete them OLDEST-mtime-FIRST until
+       the total is back under the cap.
+
+    Returns a small counters dict for the startup log line. Fully exception-safe:
+    any failure degrades to a no-op with a WARNING rather than blocking boot.
+    """
+    counters = {"pruned_age": 0, "pruned_total_cap": 0}
+    try:
+        settings = get_logs_settings()
+        retention_hours = float(settings["retention_hours"])
+        max_total_bytes = int(settings["max_total_mb"]) * 1024 * 1024
+
+        try:
+            live_ids = _live_terminal_ids()
+        except Exception as e:
+            logger.warning("Startup log prune skipped — cannot read live terminals: %s", e)
+            return counters
+
+        cutoff = (_utcnow() - timedelta(hours=retention_hours)).timestamp()
+
+        # Pass 1 — age. Collect (path, mtime, size) for dead-terminal logs that
+        # survive the age cut so pass 2 can enforce the total cap on them.
+        survivors: list[tuple[Path, float, int]] = []
+        for path in _iter_terminal_log_files():
+            tid = _terminal_id_from_log_name(path.name)
+            if not tid or tid in live_ids:
+                continue  # unrecognized name, or LIVE terminal — never touch
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_mtime < cutoff:
+                try:
+                    path.unlink()
+                    counters["pruned_age"] += 1
+                except OSError as e:
+                    logger.warning("Failed to age-prune terminal log %s: %s", path, e)
+            else:
+                survivors.append((path, st.st_mtime, st.st_size))
+
+        # Pass 2 — total cap. Oldest-first over the age-pass survivors (all
+        # dead-terminal). Live-terminal logs were never added, so their bytes
+        # are intentionally NOT counted against the cap and never deleted here.
+        total = sum(size for _, _, size in survivors)
+        if total > max_total_bytes:
+            for path, _mtime, size in sorted(survivors, key=lambda t: t[1]):
+                if total <= max_total_bytes:
+                    break
+                try:
+                    path.unlink()
+                    total -= size
+                    counters["pruned_total_cap"] += 1
+                except OSError as e:
+                    logger.warning("Failed to total-cap-prune terminal log %s: %s", path, e)
+
+        logger.info(
+            "startup_terminal_log_prune pruned_age=%d pruned_total_cap=%d",
+            counters["pruned_age"],
+            counters["pruned_total_cap"],
+        )
+    except Exception as e:
+        logger.warning("Startup terminal-log prune failed; continuing: %s", e)
+    return counters
 
 
 def cleanup_old_data():

@@ -1236,6 +1236,21 @@ async def _handoff_impl(
     try:
         if working_directory is None:
             working_directory = strict_supervisor_cwd()
+        # F619 (#475): refuse to spawn when free disk on the worktree-root or
+        # logs filesystem is below the [disk] min_free_gb floor. Checked BEFORE
+        # any terminal is created (the run-step endpoint creates it), so a full
+        # disk stops the handoff cleanly with the typed E_DISK_LOW error instead
+        # of letting the worker ENOSPC-truncate a file.
+        from cli_agent_orchestrator.utils.disk_guard import check_spawn_disk
+
+        _disk_low = check_spawn_disk(working_directory)
+        if _disk_low is not None:
+            return HandoffResult(
+                success=False,
+                message=f"Handoff failed: {_disk_low}",
+                output=None,
+                terminal_id=None,
+            )
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
         # prompt-shaping can both run caller-side before the single combined
@@ -1917,6 +1932,21 @@ def _assign_impl(
                 )
         elif working_directory is None:
             working_directory = strict_supervisor_cwd()
+        # F619 (#475): refuse to spawn when the filesystem holding the worktree
+        # root or the logs dir is below the [disk] min_free_gb floor. A full
+        # disk stops the fleet CLEANLY here instead of letting the worker
+        # ENOSPC-truncate a source file mid-edit. Checked BEFORE any terminal is
+        # created so no orphan window is left behind.
+        from cli_agent_orchestrator.utils.disk_guard import check_spawn_disk
+
+        _disk_low = check_spawn_disk(working_directory)
+        if _disk_low is not None:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "error": _disk_low,
+                "message": f"Assignment failed: {_disk_low}",
+            }
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch

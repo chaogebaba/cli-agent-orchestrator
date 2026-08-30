@@ -71,3 +71,15 @@ model = "auto"
 api_provider = "cline-pass"
 model = "deepseek/deepseek-v4-flash"
 thinking = "high"
+
+# Terminal-log retention + disk guard (F619 / issue #475). Read via the same
+# loader as the provider sections above (settings_service.get_logs_settings /
+# get_disk_settings). Every value falls back to the built-in default shown when
+# absent, the wrong type, or non-positive — a typo can never disable a cap.
+# [logs]
+# max_file_mb = 50        # rotate a terminal's .log -> .log.1 at this size (1 backup kept)
+# retention_hours = 24    # prune a DEAD terminal's logs older than this (mtime); live logs never touched
+# max_total_mb = 2048     # whole logs/terminal dir cap; startup deletes oldest-first over this
+
+# [disk]
+# min_free_gb = 5         # assign/handoff refuse (E_DISK_LOW) below this free space on worktree-root or logs FS

@@ -7402,6 +7402,18 @@ def _delete_terminal_under_lease(
             except Exception as e:
                 logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
+            # F619 (#475): remove this terminal's pipe-pane byte log(s) now that
+            # its scrollback/snapshot restore artifacts are captured above. The
+            # .log (and its .log.1 rotation backup) is the file that grew to
+            # 322M in the incident; the restore artifacts are aged out separately
+            # by the RETENTION_DAYS sweep. Best-effort — never fails the delete.
+            try:
+                from cli_agent_orchestrator.services.cleanup_service import prune_terminal_log
+
+                prune_terminal_log(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to prune log for terminal {terminal_id}: {e}")
+
             # Ordinary deletion detaches observation before killing. Confirmed-death
             # rollback keeps it attached until death is proven so an uncertain live
             # owner remains observable and diagnostically authoritative.

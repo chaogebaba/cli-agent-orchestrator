@@ -910,3 +910,95 @@ def get_tui_ensure_script() -> str:
     except Exception as e:
         logger.warning(f"Failed to read tui.ensure_script, using default: {e}")
         return _TUI_DEFAULTS["ensure_script"]
+
+
+# =============================================================================
+# Terminal-log retention + disk-guard settings (F619 / issue #475)
+# =============================================================================
+# The 2026-08-30 incident: ``logs/terminal/<id>.log`` are never rotated or
+# pruned, so dead-terminal logs (single files up to 322M) accumulate until ``/``
+# fills, a subsequent str_replace ENOSPC-truncates a source file, and git itself
+# fails on ``index.lock``. These knobs encode the caps that stop that.
+#
+# Config lives in ``providers.toml`` under ``[logs]`` / ``[disk]`` — the SAME
+# loader (:func:`get_provider_defaults`) the rest of the provider config uses,
+# NOT settings.json. Every value is validated and coerced back to its default
+# when missing, the wrong type, or out of range, so a hand-edited toml typo can
+# never disable a cap or (worse) set one to zero and delete everything.
+
+_LOGS_DEFAULTS: Dict[str, Any] = {
+    # Per-terminal .log rotation threshold (MB). The writer rolls .log -> .log.1
+    # (keeping exactly ONE backup) once the active file reaches this size.
+    "max_file_mb": 50,
+    # Dead-terminal logs older than this (mtime age) are pruned on delete and at
+    # server startup. Live-terminal logs are NEVER pruned regardless of age.
+    "retention_hours": 24,
+    # Whole-directory cap (MB) across all terminal .log/.log.1 files. Startup
+    # enforcement deletes oldest-first (by mtime) until the total is under this.
+    "max_total_mb": 2048,
+}
+
+_DISK_DEFAULTS: Dict[str, Any] = {
+    # assign/handoff refuse to spawn (typed E_DISK_LOW error) when free space on
+    # the filesystem holding the worktree root OR the logs dir is below this.
+    "min_free_gb": 5,
+}
+
+
+def _coerce_positive_number(value: Any, default: Any, *, label: str) -> Any:
+    """Return ``value`` when it is a positive real number, else ``default``.
+
+    Rejects bool (``isinstance(True, int)`` is True in Python), non-numeric
+    types, and non-positive values — a zero/negative cap would turn a retention
+    knob into a "delete everything" or "never rotate" switch, which is exactly
+    the failure this feature exists to prevent. A rejected value logs a WARNING
+    and falls back to the built-in default rather than propagating.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        logger.warning(
+            "Invalid %s=%r (expected positive number); using default %r", label, value, default
+        )
+        return default
+    if not value > 0:
+        logger.warning("Invalid %s=%r (must be > 0); using default %r", label, value, default)
+        return default
+    return value
+
+
+def get_logs_settings() -> Dict[str, Any]:
+    """Return terminal-log retention settings from ``providers.toml`` ``[logs]``.
+
+    Keys (defaults shown): ``max_file_mb`` (50), ``retention_hours`` (24),
+    ``max_total_mb`` (2048). Missing file, invalid TOML, missing/malformed
+    section, or a per-key bad value all resolve to the built-in default for
+    that key. Values are validated to be positive numbers (see
+    :func:`_coerce_positive_number`).
+    """
+    try:
+        section = get_provider_defaults("logs")
+    except Exception as e:  # defensive: loader is already exception-safe
+        logger.warning("Failed to read [logs] settings, using defaults: %s", e)
+        section = {}
+    result = dict(_LOGS_DEFAULTS)
+    for key, default in _LOGS_DEFAULTS.items():
+        if key in section:
+            result[key] = _coerce_positive_number(section[key], default, label=f"logs.{key}")
+    return result
+
+
+def get_disk_settings() -> Dict[str, Any]:
+    """Return disk-guard settings from ``providers.toml`` ``[disk]``.
+
+    Keys (defaults shown): ``min_free_gb`` (5). Same missing/invalid ->
+    default semantics as :func:`get_logs_settings`.
+    """
+    try:
+        section = get_provider_defaults("disk")
+    except Exception as e:  # defensive: loader is already exception-safe
+        logger.warning("Failed to read [disk] settings, using defaults: %s", e)
+        section = {}
+    result = dict(_DISK_DEFAULTS)
+    for key, default in _DISK_DEFAULTS.items():
+        if key in section:
+            result[key] = _coerce_positive_number(section[key], default, label=f"disk.{key}")
+    return result

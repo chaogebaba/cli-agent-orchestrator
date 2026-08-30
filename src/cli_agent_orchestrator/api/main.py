@@ -1742,6 +1742,22 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # F619 (#475): prune dead-terminal logs by age + enforce the whole-dir size
+    # cap at startup, so a fleet that filled the disk before a restart is
+    # reclaimed on boot (the incident's manual `find … -delete` encoded). Runs
+    # off-thread and is fully exception-safe; a live terminal's log is never
+    # touched (see prune_terminal_logs_at_startup). Also log a WARNING now if
+    # free disk is already below the spawn floor, so the condition is visible in
+    # the boot log rather than only surfacing on the next assign/handoff.
+    from cli_agent_orchestrator.services.cleanup_service import prune_terminal_logs_at_startup
+
+    asyncio.create_task(asyncio.to_thread(prune_terminal_logs_at_startup))
+    try:
+        from cli_agent_orchestrator.utils.disk_guard import warn_if_disk_low_at_startup
+
+        warn_if_disk_low_at_startup()
+    except Exception:
+        logger.warning("Startup disk-space check failed; continuing", exc_info=True)
     # Workflow run-journal retention (#504, NFR-SEC-3). Without this the sweep
     # had NO production caller and the advertised age/run-count retention never
     # ran, so the event log grew without bound. Startup-time and best-effort,
