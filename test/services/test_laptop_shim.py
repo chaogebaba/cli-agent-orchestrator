@@ -237,3 +237,63 @@ class TestBoxesTsvParsing:
         p = tmp_path / "boxes.tsv"
         p.write_text("# header\n\n   \n# another\n")
         assert laptop_shim._boxes_tsv_has_active_row(str(p)) is False
+
+
+class TestNestedBoxesTsvResolution:
+    """F636 (#491): the roster lives in the ROOT repo; the shim dir in the
+    nested FORK. ``_active_boxes_tsv_for`` must find the roster one level up,
+    and ``should_inject_shim`` must fire for a worker whose ``repo_root`` is the
+    fork (the production shape that F620's single-root suite never built)."""
+
+    def _nested(self, tmp_path: Path, root_tsv: str | None) -> tuple[Path, Path]:
+        """Return (root, fork). Root owns scripts/boxes.tsv; fork owns
+        scripts/laptop-shims. Neither has the other's file."""
+        root = tmp_path / "root"
+        (root / "scripts").mkdir(parents=True)
+        if root_tsv is not None:
+            (root / "scripts" / "boxes.tsv").write_text(root_tsv)
+        fork = root / "fork"
+        (fork / "scripts" / "laptop-shims").mkdir(parents=True)
+        return root, fork
+
+    def test_resolver_finds_parent_repo_roster(self, tmp_path: Path) -> None:
+        root, fork = self._nested(tmp_path, _ACTIVE_TSV)
+        found = laptop_shim._active_boxes_tsv_for(str(fork))
+        assert found == os.path.join(str(root), "scripts", "boxes.tsv")
+
+    def test_resolver_prefers_own_root_when_present(self, tmp_path: Path) -> None:
+        # Both levels have an active roster: the resolved root wins (checked
+        # first), so a self-contained checkout never reaches up unnecessarily.
+        root, fork = self._nested(tmp_path, _ACTIVE_TSV)
+        (fork / "scripts" / "boxes.tsv").write_text(_ACTIVE_TSV)
+        found = laptop_shim._active_boxes_tsv_for(str(fork))
+        assert found == os.path.join(str(fork), "scripts", "boxes.tsv")
+
+    def test_resolver_none_when_neither_active(self, tmp_path: Path) -> None:
+        root, fork = self._nested(tmp_path, _ALL_FROZEN_TSV)
+        assert laptop_shim._active_boxes_tsv_for(str(fork)) is None
+
+    def test_resolver_walks_up_only_one_level(self, tmp_path: Path) -> None:
+        # Roster two levels up (grandparent) must NOT satisfy the guard.
+        grand = tmp_path / "grand"
+        (grand / "scripts").mkdir(parents=True)
+        (grand / "scripts" / "boxes.tsv").write_text(_ACTIVE_TSV)
+        mid = grand / "mid"
+        mid.mkdir()
+        leaf = mid / "leaf"
+        (leaf / "scripts" / "laptop-shims").mkdir(parents=True)
+        assert laptop_shim._active_boxes_tsv_for(str(leaf)) is None
+
+    def test_should_inject_shim_true_for_nested_fork_worker(self, tmp_path: Path) -> None:
+        root, fork = self._nested(tmp_path, _ACTIVE_TSV)
+        assert (
+            laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={})
+            is True
+        )
+
+    def test_should_inject_shim_false_when_parent_all_frozen(self, tmp_path: Path) -> None:
+        root, fork = self._nested(tmp_path, _ALL_FROZEN_TSV)
+        assert (
+            laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={})
+            is False
+        )
