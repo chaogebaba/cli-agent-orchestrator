@@ -323,3 +323,81 @@ class TestDiskGuard:
         monkeypatch.setattr(disk_guard, "TERMINAL_LOG_DIR", tmp_path)
         monkeypatch.setattr(disk_guard.shutil, "disk_usage", lambda p: self._usage(1))
         assert disk_guard.check_spawn_disk(str(tmp_path)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Ordering: snapshot/scrollback capture MUST happen BEFORE prune_terminal_log
+# ---------------------------------------------------------------------------
+class TestDeletePruneOrdering:
+    """Guards the delete-path invariant: the .log is captured into the restore
+    snapshot BEFORE it is pruned.
+
+    The prune call sits just after the scrollback/snapshot block in
+    ``_delete_terminal_under_lease``. If a refactor moved the prune ABOVE that
+    block, the pipe-pane byte log would be deleted before it could be captured
+    — silently losing the very evidence the snapshot exists to preserve — and
+    the plain snapshot test would NOT notice (it never reads the .log).
+
+    This test makes the two observably dependent: the mocked ``get_history``
+    (which feeds the scrollback snapshot) reads the on-disk ``<id>.log``. In the
+    correct order the log is still present, so the scrollback captures its
+    content; under the prune-first mutation the log is already gone, so the
+    captured scrollback is empty -> the assertion below goes RED.
+    """
+
+    def test_scrollback_captures_log_before_prune(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import cleanup_service as cs
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        term_id = "abc12345"
+        log_content = "PIPE-PANE-LOG-BYTES-marker-line1\nmarker-line2\n"
+        (tmp_path / f"{term_id}.log").write_text(log_content, encoding="utf-8")
+
+        # BOTH modules resolve the log dir to the SAME real tmp dir: the snapshot
+        # writes via terminal_service.TERMINAL_LOG_DIR, the prune reads via
+        # cleanup_service.TERMINAL_LOG_DIR. Real Paths (not a MagicMock) so
+        # os.replace/unlink/stat behave normally.
+        monkeypatch.setattr(ts, "TERMINAL_LOG_DIR", tmp_path)
+        monkeypatch.setattr(cs, "TERMINAL_LOG_DIR", tmp_path)
+
+        # get_history reads the on-disk <id>.log — this is what couples snapshot
+        # ordering to the prune. Missing file (prune ran first) -> "".
+        def _get_history(session, window, strip_escapes=True, full_history=True):
+            p = tmp_path / f"{term_id}.log"
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        backend = MagicMock()
+        backend.get_history.side_effect = _get_history
+        backend.get_pane_working_directory.return_value = "/home/user/project"
+
+        meta = {
+            "id": term_id,
+            "tmux_session": "cao-test",
+            "tmux_window": "dev-abc1",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "allowed_tools": None,
+        }
+
+        with (
+            patch("cli_agent_orchestrator.backends.registry._backend", backend),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=meta,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+                return_value={"terminal_deleted": True, "intent_deleted": False},
+            ),
+        ):
+            ts._delete_terminal_core(term_id)
+
+        # Snapshot ran BEFORE prune: scrollback captured the log content...
+        scrollback = (tmp_path / f"{term_id}.scrollback").read_text(encoding="utf-8")
+        assert scrollback == log_content, (
+            "scrollback must capture the .log BEFORE prune_terminal_log removes it; "
+            "an empty scrollback means the prune ran first (ordering mutation)"
+        )
+        # ...and the prune DID subsequently remove the .log (feature still works).
+        assert not (tmp_path / f"{term_id}.log").exists()
