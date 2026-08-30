@@ -75,11 +75,15 @@ class TestF582D21DialogClearLifetime:
         _install_clock_and_sleep(monkeypatch, clock)
 
         on_screen_fires: list[float] = []
+        # The dialog clears only at t≈20s — WELL past the 5s base timeout, so a
+        # fixed-window loop (the mutant) provably abandons at ~5s with the dialog
+        # still up, while the lifetime fix runs until it clears.
+        clear_at = 20.0
 
         class FakeStatusMonitor:
             def get_status(self, tid):
-                # Dialog present (WAITING) until the fire takes at t≈8s.
-                if clock.t < 8.0:
+                # Dialog present (WAITING) until the fire takes at clear_at.
+                if clock.t < clear_at:
                     return TerminalStatus.WAITING_USER_ANSWER
                 return TerminalStatus.IDLE
 
@@ -92,7 +96,7 @@ class TestF582D21DialogClearLifetime:
 
             def match_verdict(self, provider_name, lines, terminal_id=None):
                 # A whitelisted dialog is pending until the fire takes.
-                return object() if clock.t < 8.0 else None
+                return object() if clock.t < clear_at else None
 
             def on_screen(self, tid, provider, lines):
                 on_screen_fires.append(clock.t)
@@ -110,12 +114,17 @@ class TestF582D21DialogClearLifetime:
 
         await ts._wait_for_auto_responder_dialog_clear("term1", "gen1", None, timeout=5.0)
 
-        # The loop kept re-arming on_screen PAST the 5s base timeout (the #386
-        # class), and at least one re-arm landed after t=5s.
-        assert any(
-            t >= 5.0 for t in on_screen_fires
-        ), f"lifetime did not extend past base timeout; fires at {on_screen_fires}"
-        # It stopped once the dialog cleared (well under the hard cap).
+        # The lifetime stayed open until the dialog CLEARED at t≈20s — far past
+        # the 5s base timeout. A fixed-window loop (the D21 mutant) abandons at
+        # ~5s with the dialog still up (clock.t << clear_at), which is exactly
+        # the #386 stall this fix closes.
+        assert clock.t >= clear_at, (
+            f"loop abandoned before the dialog cleared (clock.t={clock.t}, "
+            f"clear_at={clear_at}); fixed-window regression"
+        )
+        # It re-armed on_screen past the base timeout on the way there.
+        assert any(t >= 5.0 for t in on_screen_fires), on_screen_fires
+        # And stopped once cleared, under the hard cap.
         assert clock.t < ts._F491_DIALOG_CLEAR_MAX_LIFETIME
 
     @pytest.mark.asyncio
