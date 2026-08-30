@@ -234,7 +234,8 @@ def test_monitor_carries_no_abort_evidence_state() -> None:
         r"channel|channels|reported_occ|reported_at|retry_armed|epoch|hwm)\w*",
         source,
     )
-    assert [name for name in forbidden if name not in allowed_abort_names] == [], (
+    forbidden_found = [name for name in forbidden if name not in allowed_abort_names]
+    assert forbidden_found == [], (
         f"monitor gained forbidden abort-evidence name(s): {sorted(set(forbidden))} (Do-NOT 27)"
     )
 
