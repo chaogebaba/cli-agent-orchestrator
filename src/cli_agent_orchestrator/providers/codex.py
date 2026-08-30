@@ -1507,7 +1507,14 @@ class CodexProvider(BaseProvider):
             argv.extend(["--model", model])
         for key, value in config.items():
             argv.extend(["-c", _toml_override(key, value)])
-        argv.append("Say hello.")
+        # User order 2026-08-30 (supersedes F587 'Say hello.'): the seed reply must
+        # carry a required literal marker so the seed can positively verify the model
+        # actually answered, not just that codex exited 0 with a session id. F587/F588
+        # (#445) recorded that the *phrasing* "Reply exactly: SEED_OK then stop." was
+        # refused by the Codex content classifier ("flagged for possible cybersecurity
+        # risk"); this phrasing avoids the flagged "exactly:" colon form and the
+        # "then stop" imperative while still requiring the SEED_OK literal.
+        argv.append("Reply with exactly the text SEED_OK and nothing else.")
         logger.info(f"codex seed_resume_identity: starting seed for {agent_profile} in {cwd}")
         try:
             completed = subprocess.run(
@@ -1541,6 +1548,19 @@ class CodexProvider(BaseProvider):
                 f"{agent_profile}; last {_SEED_FAILURE_TAIL_LINES} stdout lines:\n{tail}"
             )
             raise RuntimeError(f"seed_exec_failed rc={completed.returncode}: {tail[-400:]}")
+        # User order 2026-08-30: the seed succeeds only if the required SEED_OK
+        # marker actually appears in the model's reply (stdout tail / pane). rc==0
+        # alone is not enough — a refusal or empty answer can still exit 0. On a
+        # missing marker, surface the same bounded, secret-scrubbed stdout tail
+        # F587 introduced so the failure names its cause.
+        seed_stdout = completed.stdout or ""
+        if "SEED_OK" not in seed_stdout:
+            tail = _seed_failure_tail(seed_stdout)
+            logger.error(
+                f"codex seed_resume_identity: SEED_OK marker missing for "
+                f"{agent_profile}; last {_SEED_FAILURE_TAIL_LINES} stdout lines:\n{tail}"
+            )
+            raise RuntimeError(f"seed_marker_missing: {tail[-400:]}")
         matches: set[str] = set(
             re.findall(
                 r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",

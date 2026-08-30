@@ -5200,21 +5200,24 @@ class TestMCPInterruptNotBlockingIdle:
 
 
 class TestCodexSeedResumeIdentity:
-    """F587 #445: seed prompt must be 'Say hello.' and rc!=0 must surface stdout tail."""
+    """User order 2026-08-30 (supersedes F587 'Say hello.'): seed prompt must require
+    the SEED_OK marker, the seed must verify SEED_OK is present, and rc!=0 must surface
+    the stdout tail."""
 
     @patch("cli_agent_orchestrator.providers.codex.CodexProvider.validate_session_artifact")
     @patch("cli_agent_orchestrator.providers.codex._resolved_codex_profile_config")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.subprocess.run")
-    def test_seed_argv_uses_say_hello_not_seed_ok(
+    def test_seed_argv_requires_seed_ok_not_say_hello(
         self, mock_run, mock_load, mock_cfg, mock_validate
     ):
-        """(a) The argv passed to subprocess.run contains 'Say hello.' and not 'SEED_OK'."""
+        """(a) The argv passed to subprocess.run requires the SEED_OK literal and is not
+        the F587 'Say hello.' prompt. Kills a mutant that reverts the prompt."""
         mock_load.return_value = MagicMock()
         mock_cfg.return_value = (None, {})
         mock_run.return_value = SimpleNamespace(
             returncode=0,
-            stdout="session id: 12345678-1234-1234-1234-1234567890ab\n",
+            stdout="SEED_OK\nsession id: 12345678-1234-1234-1234-1234567890ab\n",
         )
 
         result = CodexProvider.seed_resume_identity("/some/cwd", "codex_dev")
@@ -5222,8 +5225,41 @@ class TestCodexSeedResumeIdentity:
         assert result == "12345678-1234-1234-1234-1234567890ab"
         mock_run.assert_called_once()
         argv = mock_run.call_args.args[0]
-        assert "Say hello." in argv
-        assert not any("SEED_OK" in str(tok) for tok in argv)
+        prompt = argv[-1]
+        assert "SEED_OK" in prompt
+        assert "Say hello." not in argv
+        # Guard the F587/F588-refused phrasing does not creep back.
+        assert "exactly:" not in prompt.lower()
+        assert "then stop" not in prompt.lower()
+
+    @patch("cli_agent_orchestrator.providers.codex.CodexProvider.validate_session_artifact")
+    @patch("cli_agent_orchestrator.providers.codex._resolved_codex_profile_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.subprocess.run")
+    def test_seed_missing_marker_raises_even_when_rc_zero(
+        self, mock_run, mock_load, mock_cfg, mock_validate, caplog
+    ):
+        """rc==0 but no SEED_OK in stdout must FAIL. Kills a mutant that drops the marker
+        check and trusts rc==0 + a parseable session id alone."""
+        mock_load.return_value = MagicMock()
+        mock_cfg.return_value = (None, {})
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            # A valid session id is present, so only the marker check can reject this.
+            stdout="Hello there!\nsession id: 12345678-1234-1234-1234-1234567890ab\n",
+        )
+
+        with caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.providers.codex"):
+            with pytest.raises(RuntimeError) as excinfo:
+                CodexProvider.seed_resume_identity("/some/cwd", "codex_dev")
+
+        assert "seed_marker_missing" in str(excinfo.value)
+        # The session artifact validator must never be reached on a missing marker.
+        mock_validate.assert_not_called()
+        assert any(
+            record.levelno == logging.ERROR and "SEED_OK marker missing" in record.getMessage()
+            for record in caplog.records
+        )
 
     @patch("cli_agent_orchestrator.providers.codex._resolved_codex_profile_config")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
