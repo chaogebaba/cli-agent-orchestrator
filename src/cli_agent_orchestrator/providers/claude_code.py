@@ -598,6 +598,8 @@ def _is_ink_selection_waiting(rendered: str) -> bool:
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
+    condition_provider_key = "claude_code"  # F611 #467
+
     composer_stash_keys = ["C-s"]
     composer_clear_keys = ["C-u"]
     composer_stashed_chip_pattern = CLAUDE_STASHED_CHIP_PATTERN

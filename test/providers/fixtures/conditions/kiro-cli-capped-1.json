@@ -1,0 +1,11 @@
+{
+  "provider": "kiro_cli",
+  "condition": "CAPPED",
+  "subtype": "monthly_usage_limit",
+  "reset_hint_raw": "return next month",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/08d5f3d2.scrollback",
+  "source_line_range": "9021-9032",
+  "captured_at": "2026-08-29T05:48:54Z (scrollback mtime)",
+  "sha256": "d37cbcefb79173ecf63c4a28cc1ee718e2b49891a5dc7899486c9a3b76aedd50",
+  "note": "credits row + banner x2 + full kiro footer"
+}

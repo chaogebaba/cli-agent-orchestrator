@@ -1454,6 +1454,7 @@ class ProviderError(Exception):
 
 
 class CodexProvider(BaseProvider):
+    condition_provider_key = "codex"  # F611 #467
     supports_fork_context = True
     supports_seed_resume_identity = True
     supports_reauth_rebind = True

@@ -1,0 +1,11 @@
+{
+  "provider": "grok_cli",
+  "condition": "CAPPED",
+  "subtype": "weekly_limit_choice",
+  "reset_hint_raw": "Try Again once you have usage again",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/fcbb00dc.scrollback",
+  "source_line_range": "89-96",
+  "captured_at": "2026-08-30T04:57:42Z (scrollback mtime)",
+  "sha256": "171314f85772e73113e99b093238593e64890a422bfd40ddf87a2c9a90da2d64",
+  "note": "grok weekly-limit card: upgrade/credits/try-again"
+}

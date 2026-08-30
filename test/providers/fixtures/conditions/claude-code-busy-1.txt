@@ -1,0 +1,9 @@
+✻ Waiting for 1 background agent to finish
+
+● Agent "Sleep probe" finished · 24s
+
+  Called cao-mcp-server
+
+● done
+
+✻ Cooked for 32s · done 2:38 PM

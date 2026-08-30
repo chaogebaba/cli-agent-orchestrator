@@ -1,0 +1,12 @@
+▸ Credits: 23.20 • Time: 15m 7s
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 13be1c4b-fb19-49ac-abf9-bf46f784aa66)
+
+● You've reached your monthly usage limit. Please return next month to continue building. (Request ID: 13be1c4b-fb19-49ac-abf9-bf46f784aa66)
+ ◐ 3 tasks remaining · ctrl+x expand
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Trust All Tools active, confirmations are off · /quit to exit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+kiro_dev · Auto · ◔ 17%                                                                                                                               ~/VScode_projects/grok-box-setup · (main)
+
+ ask a question or describe a task ↵

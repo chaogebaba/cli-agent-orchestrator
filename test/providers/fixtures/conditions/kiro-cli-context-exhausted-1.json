@@ -1,0 +1,11 @@
+{
+  "provider": "kiro_cli",
+  "condition": "CONTEXT_EXHAUSTED",
+  "subtype": "low_context_tip",
+  "reset_hint_raw": "/compact",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/a6da8e75.scrollback",
+  "source_line_range": "13-20",
+  "captured_at": "2026-08-29T06:54:28Z (scrollback mtime)",
+  "sha256": "6baa0d0a5b76e3a0f9e72627cd746a8a82389f3f6b25cf3c72f70dc7cef0c9cf",
+  "note": "kiro low-context tip on welcome screen"
+}

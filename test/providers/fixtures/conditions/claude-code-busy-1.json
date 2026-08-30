@@ -1,0 +1,11 @@
+{
+  "provider": "claude_code",
+  "condition": "BUSY",
+  "subtype": "asterisk_spinner",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/82b743ab.scrollback",
+  "source_line_range": "19-27",
+  "captured_at": "2026-08-29T18:42:42Z (scrollback mtime)",
+  "sha256": "6b29b25c3549241feeee6f78e0cae8536a9bd956f1b58a48865de6bdb84e750a",
+  "note": "claude ✻ spinner rows (Waiting/Cooked)"
+}

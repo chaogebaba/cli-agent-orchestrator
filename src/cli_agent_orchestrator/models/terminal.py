@@ -107,6 +107,14 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    condition: Optional[str] = Field(
+        None,
+        description=(
+            "F611 (#467) typed provider condition label (CAPPED/BLOCKED/AUTH/…), "
+            "a read-only projection DISTINCT from `status`. None when no "
+            "condition is detected; never a TerminalStatus member (D1)."
+        ),
+    )
     input_gen: int = Field(
         0,
         description=(

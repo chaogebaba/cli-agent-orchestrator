@@ -226,6 +226,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         else:
             since_last_input = None
         window = windows.get(row["tmux_window"], {})
+        # F611 (#467) B2: project the live condition onto the fleet row so
+        # /sessions/{name}/fleet carries it (blueprint §3 surface 1). Additive
+        # sibling key like fusion_reason/delegating — SEPARATE from `status`
+        # (D1), never derived from or feeding fusion. None when no condition.
+        condition = status_monitor.get_condition(row["id"])
         projected.append(
             {
                 "id": row["id"],
@@ -241,6 +246,10 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "depth": depths[row["id"]],
                 "orphan": orphan,
                 "status": status.value,
+                # F611 (#467): typed provider condition label (CAPPED/BLOCKED/
+                # AUTH/…) or None. The fleet TUI renders it in the condition
+                # cell; distinct from `status`.
+                "condition": condition,
                 # F506 §8: the fleet TUI status cell renders `<status>*` when
                 # fusion_changed is True (the fused status differs from the
                 # provider-published one); fusion_reason shows in the row detail.

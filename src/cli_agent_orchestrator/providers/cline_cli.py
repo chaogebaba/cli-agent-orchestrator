@@ -212,6 +212,8 @@ class ClineCliProvider(BaseProvider):
     processing, shell baseline = error/exited.
     """
 
+    condition_provider_key = "cline_cli"  # F611 #467
+
     def __init__(
         self,
         terminal_id: str,

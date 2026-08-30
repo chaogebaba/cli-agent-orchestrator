@@ -1,0 +1,11 @@
+{
+  "provider": "kiro_cli",
+  "condition": "BUSY",
+  "subtype": "thinking_spinner",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/28b50b67.scrollback",
+  "source_line_range": "531-539",
+  "captured_at": "2026-08-29T19:11:20Z (scrollback mtime)",
+  "sha256": "d33d0b9d0467d6743cd50f9367abb152adf64079870dc2b35c0496aa514b1489",
+  "note": "braille spinner '⠹ Thinking... (esc to cancel)' + kiro footer"
+}

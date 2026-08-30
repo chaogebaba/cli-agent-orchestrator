@@ -1,0 +1,18 @@
+• Ran 15 commands · ctrl + t to view transcript
+
+■ You've hit your usage limit. Try again later.
+
+
+› Fixture ruling for AC1's ★ replay arm (supersedes "byte-exact capture of seat adcaa8a8", which never existed). Live reproduction failed: a second cline client on the same session, Escape,
+  and Ctrl-C (interrupt_keys) all fail to emit ABORT_LINE on this cline build (Ctrl-C kills the process). So the fixture is SUPERVISOR-AUTHORED: copy /data/cao-scratch/9064394e/fixtures/
+  abort-1.txt + abort-1.json into test/providers/fixtures/status_truth/cline_cli/ on your branch, byte-for-byte (`cp`, do not edit). Its .json `source` field already states it is authored,
+  not captured — keep that text. Use it for the replay arm exactly as AC1 specifies; in the build report add one line under Deviations: "AC1 replay fixture abort-1 is supervisor-authored
+  (real 165daae4 pane bytes + hand-inserted ABORT_LINE); the AC's 'byte-exact capture of adcaa8a8' premise was unrealized — live repro attempts listed in abort-1.json." Everything else in
+  the brief stands. Continue to completion and callback via send_message.
+
+  [Message from chao_supervisor-9064394e (9064394e) | mid 2565:0bb3c8bbfc8d4804d7c742437f1608b8. Use the cao-mcp-server send_message MCP tool for any follow-up work — never a built-in
+  collaboration.send_message.]
+
+
+■ You've hit your usage limit. Try again later.
+

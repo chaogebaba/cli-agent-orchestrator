@@ -324,6 +324,14 @@ class StatusMonitor:
         self._provider_not_found_count: Dict[str, int] = {}
         self._dropped_not_found: set[str] = set()
 
+        # F611 (#467): condition detection state. `_last_condition` is the live
+        # fleet-field projection (label or None), read by terminal_service at
+        # egress exactly like fused status — SEPARATE from `_last_status`, never
+        # feeds fuse_status (D1/AC2). `_condition_delivery` is the ONE fan-out
+        # seam (D4); its sinks are wired lazily to avoid import cycles.
+        self._last_condition: Dict[str, Optional[str]] = {}
+        self._condition_delivery: Optional[Any] = None
+
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
         """Return this monitor's process-local observation store."""
@@ -1251,6 +1259,24 @@ class StatusMonitor:
                 logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
+            # F611 (#467): a published status transition is EXACTLY the "one
+            # event per terminal transition" seam (§3/D4). Classify the current
+            # pane for a provider condition and fan the ONE result to the three
+            # surfaces (fleet field / supervisor inbox / CLI). SEPARATE from the
+            # status publish above — never touches fuse_status (D1/AC2). Runs
+            # off the lock; any failure is swallowed inside the helper.
+            try:
+                with self._lock:
+                    cond_buffer = self._buffers.get(terminal_id, "")
+                cond_provider = None
+                try:
+                    cond_provider = provider_manager.get_provider(terminal_id)
+                except Exception:
+                    cond_provider = None
+                self._classify_and_deliver_condition(terminal_id, cond_provider, cond_buffer)
+            except Exception:
+                logger.debug("condition detection at transition failed", exc_info=True)
+
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
     def _resolve_screen_size(self, terminal_id: str) -> Optional[Tuple[int, int]]:
@@ -1758,6 +1784,118 @@ class StatusMonitor:
             return None
         with self._lock:
             return self._status_gen.get(terminal_id, 0)
+
+    def get_condition(self, terminal_id: str) -> Optional[str]:
+        """F611 (#467): return the live condition fleet label, or None.
+
+        Read at egress by ``terminal_service.get_terminal`` to populate
+        ``Terminal.condition`` — a SEPARATE projection from status fusion. Pure
+        read; never invokes detection or captures. ``None`` = no condition.
+        """
+        with self._lock:
+            return self._last_condition.get(terminal_id)
+
+    def _get_condition_delivery(self) -> Any:
+        """Lazily build the ONE condition-delivery seam with production sinks.
+
+        Wired here (not at import) to avoid an import cycle: the inbox sink pulls
+        in ``inbox_service``/``api`` layers that import back into providers. The
+        three sinks PERFORM the §3 fan-out — fleet field, one supervisor inbox
+        push, and the bus/CLI projection — from ONE event (D4).
+        """
+        if self._condition_delivery is not None:
+            return self._condition_delivery
+        from cli_agent_orchestrator.providers.condition import ConditionDelivery
+
+        self._condition_delivery = ConditionDelivery(
+            fleet_sink=self._condition_fleet_sink,
+            inbox_sink=self._condition_inbox_sink,
+            cli_sink=self._condition_cli_sink,
+        )
+        return self._condition_delivery
+
+    def _condition_fleet_sink(self, terminal_id: str, label: Optional[str]) -> None:
+        """§3 surface 1: set the live fleet ``condition`` field (or clear it)."""
+        with self._lock:
+            if label is None:
+                self._last_condition.pop(terminal_id, None)
+            else:
+                self._last_condition[terminal_id] = label
+
+    def _condition_inbox_sink(self, terminal_id: str, cond: Any) -> None:
+        """§3 surface 2: ONE structured supervisor inbox push on the transition.
+
+        Routes the typed event to the terminal's recorded caller (the same
+        direct-terminal enqueue the POST endpoint uses). Best-effort: a missing
+        caller or enqueue failure never breaks the status transition.
+        """
+        caller_id = None
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            meta = get_terminal_metadata(terminal_id)
+            if meta:
+                caller_id = meta.get("caller_id")
+        except Exception:
+            caller_id = None
+        if not caller_id:
+            return  # no supervisor to notify; fleet field + CLI still carry it
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+        create_inbox_message(terminal_id, caller_id, cond.render_event(terminal_id))
+        try:
+            request_delivery(caller_id)
+        except Exception:
+            pass  # deliver-on-next-idle is the fallback
+
+    def _condition_cli_sink(self, terminal_id: str, cond: Any, label: str) -> None:
+        """§3 surface 3: project the condition on the status bus for ``cao``.
+
+        Publishes a distinct ``terminal.{id}.condition`` frame so the fleet TUI /
+        ``cao fleet`` render the typed condition without opening the seat. This
+        NEVER touches the ``terminal.{id}.status`` frame or fuse_status (D1).
+        """
+        try:
+            from cli_agent_orchestrator.services.event_bus import bus
+
+            bus.publish(
+                f"terminal.{terminal_id}.condition",
+                {
+                    "condition": label,
+                    "kind": cond.kind.value,
+                    "subtype": cond.subtype,
+                    "confidence": cond.confidence.value,
+                },
+            )
+        except Exception:
+            pass
+
+    def _classify_and_deliver_condition(self, terminal_id: str, provider: Any, buffer: str) -> None:
+        """F611 (#467): detection + ONE-event delivery at a status transition.
+
+        Called from the published-transition seam in ``_apply_detection``. Runs
+        the provider's ``classify_condition`` on the current pane buffer and
+        hands the result to the ONE delivery seam, de-duped per dispatch epoch
+        (D4). SEPARATE from status/fusion (D1); a failure here never disturbs the
+        status publish that triggered it.
+        """
+        if provider is None:
+            return
+        classify = getattr(provider, "classify_condition", None)
+        if classify is None:
+            return
+        try:
+            cond = classify(buffer)
+        except Exception:
+            logger.debug("condition classify failed for %s", terminal_id, exc_info=True)
+            return
+        with self._lock:
+            epoch = self._buffer_epochs.get(terminal_id, 0)
+        try:
+            self._get_condition_delivery().deliver(terminal_id, cond, epoch=epoch)
+        except Exception:
+            logger.debug("condition delivery failed for %s", terminal_id, exc_info=True)
 
     def get_published_status(self, terminal_id: str) -> Optional[TerminalStatus]:
         """Return the pre-fusion latched status, or None if never published.

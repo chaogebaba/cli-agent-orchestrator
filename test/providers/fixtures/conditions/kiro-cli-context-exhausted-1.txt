@@ -1,0 +1,8 @@
+                                                                                    Welcome to Kiro CLI V3!
+
+                                                                What's new: Specs, expanded hooks, and an improved trust model.
+                                                                Upgrade your V2 agent configurations to V3 with /upgrade-agent
+                                                                                 https://kiro.dev/docs/cli/v3/
+
+                                                  Tip: Running low on context? Type /compact to summarize the conversation and free up space.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

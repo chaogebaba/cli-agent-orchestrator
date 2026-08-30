@@ -212,6 +212,7 @@ E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
 
 
 class KiroCliProvider(BaseProvider):
+    condition_provider_key = "kiro_cli"  # F611 #467
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
     # F566 (fixes F560): kiro session identity is HARVESTED, never minted.
     # Empirical rule (kiro-cli 2.20.1, probe report

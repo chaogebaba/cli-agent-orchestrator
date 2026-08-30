@@ -1,0 +1,11 @@
+{
+  "provider": "grok_cli",
+  "condition": "DIALOG_BLOCKED",
+  "subtype": "trust_dir_dialog",
+  "reset_hint_raw": "Enter or y to trust · n or Esc to quit",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/fcbb00dc.scrollback",
+  "source_line_range": "51-60",
+  "captured_at": "2026-08-30T04:57:42Z (scrollback mtime)",
+  "sha256": "f3479955a120adb94586ec7755f7ebed483281e28e681d521293d101579a15da",
+  "note": "grok trust-dir y/n dialog"
+}

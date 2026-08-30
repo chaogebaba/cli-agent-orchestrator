@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "CAPPED",
+  "subtype": "usage_limit_hard",
+  "reset_hint_raw": "try again at 4:39 AM",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/7403413e.scrollback",
+  "source_line_range": "66-80",
+  "captured_at": "2026-08-29T05:57:42Z (scrollback mtime)",
+  "sha256": "6cccd0891eafd0bd60b3d1af89a370c52df0b258676ad263e5a250615e50fad7",
+  "note": "upgrade card + composer + status footer"
+}
