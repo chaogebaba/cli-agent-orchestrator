@@ -10,6 +10,44 @@ laptop for WORKER terminals when an offload box is active.
 
 ---
 
+## Post-gate commit 9626456e: reason + box evidence
+
+**Protocol note:** commit `9626456e` landed on `cao/a778fc81` AFTER the gate had
+reviewed `463e06f0`, which reset the vote (E-TIP-MOVED). It should not have been
+committed without supervisor request; recorded here for the re-gate at the new
+tip.
+
+**Why it was needed.** The FULL `test/services` box run (grok-box-006, label
+`f620-services-final`) — which ran only after the gate saw `463e06f0` — surfaced
+failures the earlier two-file run had not exercised:
+- `test/services/test_worktree_branch_integrity.py` — **14 ERRORS**. Root cause:
+  F620's new `/data/cao-scratch/worktrees/<repo-basename>` default. Every fixture
+  repo in that file is named `repo`, so on a box with a writable `/data` they all
+  resolved to the SAME `/data/cao-scratch/worktrees/repo/<terminal_id>` and
+  collided across tests / xdist workers (`git worktree add ... already exists`).
+- `test/services/test_terminal_service_full.py::TestCreateTerminalWorktree::test_use_worktree_rolls_back_the_worktree_on_a_later_failure`
+  — **1 FAILURE**. The rollback now forwards the created checkout path, so the
+  call is `remove_worktree("/repo", "test1234", <worktree_path>)`; the assertion
+  still expected the 2-arg form.
+
+Both are PRE-EXISTING tests broken by intended F620 semantics, not new tests.
+
+**The fix (9626456e).**
+- `test_worktree_branch_integrity.py`: autouse fixture pins `CAO_WORKTREE_ROOT`
+  to a per-test tmp dir — exactly the knob F620 adds, restoring per-test
+  isolation regardless of host `/data` writability.
+- `test_terminal_service_full.py`: assertion updated to the 3-arg
+  `remove_worktree` call.
+
+**Box evidence for 9626456e** (grok-box-004, label `f620-postgate`, checkout
+`9626456e`): `uv run pytest -q -m "not live and not e2e"
+test/services/test_worktree_branch_integrity.py
+test/services/test_terminal_service_full.py` → **106 passed, 4 skipped,
+1 xfailed in 6.32s**. (Earlier at `463e06f0`/`ce4fa12f`-tree the same files gave
+14 errors + 1 failure.)
+
+---
+
 ## 1. Files written / touched
 
 All code + commits are under the assigned worktree root
