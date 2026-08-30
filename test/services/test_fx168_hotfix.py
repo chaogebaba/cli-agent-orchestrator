@@ -22,7 +22,6 @@ import pytest
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.inbox_service import CallbackRunOutcome
 
-
 _NOW = datetime(2026, 8, 13, 2, 27, 34, tzinfo=timezone.utc)
 _TERMINAL_ID = "69200c40"
 _MAILBOX_ID = "mb_d176ebe0"
@@ -65,9 +64,9 @@ class TestFix1PostArmsF136:
         # Find the fx168 FIX-1 comment — this marks our addition
         assert "fx168 FIX-1" in source, "FIX-1 comment missing from endpoint"
         # The request_delivery call should reference inbox_msg.receiver_id
-        assert "request_delivery(inbox_msg.receiver_id)" in source, (
-            "request_delivery(inbox_msg.receiver_id) missing from endpoint"
-        )
+        assert (
+            "request_delivery(inbox_msg.receiver_id)" in source
+        ), "request_delivery(inbox_msg.receiver_id) missing from endpoint"
 
     def test_request_delivery_wrapped_in_try_except(self):
         """request_delivery is wrapped in try/except to not break the endpoint."""
@@ -141,15 +140,9 @@ class TestFix2StalePathSelfHeal:
                 "cli_agent_orchestrator.services.mailbox_service.get_mailbox_authority_lock"
             ) as mock_al,
             patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session,
-            patch(
-                "cli_agent_orchestrator.clients.database.claim_unnotified_wake"
-            ) as mock_claim,
-            patch(
-                "cli_agent_orchestrator.clients.database.commit_wake"
-            ) as mock_commit,
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_metadata"
-            ) as mock_meta,
+            patch("cli_agent_orchestrator.clients.database.claim_unnotified_wake") as mock_claim,
+            patch("cli_agent_orchestrator.clients.database.commit_wake") as mock_commit,
+            patch("cli_agent_orchestrator.clients.database.get_terminal_metadata") as mock_meta,
         ):
             # Setup locks
             mock_lock = MagicMock()
@@ -168,6 +161,7 @@ class TestFix2StalePathSelfHeal:
 
             # F476: claim returns rows with the stale inbox_path
             from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
+
             mock_claim.return_value = WakeClaimResult(
                 kind="claimed",
                 rows=(FakeBatchRow(),),
@@ -264,15 +258,9 @@ class TestFix2StalePathSelfHeal:
                 "cli_agent_orchestrator.services.mailbox_service.get_mailbox_authority_lock"
             ) as mock_al,
             patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session,
-            patch(
-                "cli_agent_orchestrator.clients.database.claim_unnotified_wake"
-            ) as mock_claim,
-            patch(
-                "cli_agent_orchestrator.clients.database.commit_wake"
-            ) as mock_commit,
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_metadata"
-            ) as mock_meta,
+            patch("cli_agent_orchestrator.clients.database.claim_unnotified_wake") as mock_claim,
+            patch("cli_agent_orchestrator.clients.database.commit_wake") as mock_commit,
+            patch("cli_agent_orchestrator.clients.database.get_terminal_metadata") as mock_meta,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.write_supervisor_callback_notification"
             ) as mock_write,
@@ -331,6 +319,7 @@ class TestFix3StartupReconciler:
     @pytest.mark.asyncio
     async def test_reconciles_stale_path(self):
         """When cc_inbox_path differs from metadata, set_supervisor_callback_inbox_path is called."""
+
         @dataclass
         class FakeMailbox:
             current_terminal_id: str = _TERMINAL_ID
@@ -357,9 +346,13 @@ class TestFix3StartupReconciler:
             }
 
             from cli_agent_orchestrator.services.mailbox_service import PathUpdateResult
+
             mock_set_path.return_value = PathUpdateResult(kind="updated", path_version=2)
 
-            from cli_agent_orchestrator.api.main import _f150_reconcile_supervisor_inbox_paths_at_startup
+            from cli_agent_orchestrator.api.main import (
+                _f150_reconcile_supervisor_inbox_paths_at_startup,
+            )
+
             await _f150_reconcile_supervisor_inbox_paths_at_startup()
 
             mock_set_path.assert_called_once_with(
@@ -372,6 +365,7 @@ class TestFix3StartupReconciler:
     @pytest.mark.asyncio
     async def test_skips_when_metadata_absent(self):
         """When terminal metadata has no cc_team_inbox_path, skip (no-op)."""
+
         @dataclass
         class FakeMailbox:
             current_terminal_id: str = _TERMINAL_ID
@@ -396,7 +390,10 @@ class TestFix3StartupReconciler:
             # No cc_team_inbox_path in metadata
             mock_meta.return_value = {"metadata": {}}
 
-            from cli_agent_orchestrator.api.main import _f150_reconcile_supervisor_inbox_paths_at_startup
+            from cli_agent_orchestrator.api.main import (
+                _f150_reconcile_supervisor_inbox_paths_at_startup,
+            )
+
             await _f150_reconcile_supervisor_inbox_paths_at_startup()
 
             mock_set_path.assert_not_called()
@@ -404,6 +401,7 @@ class TestFix3StartupReconciler:
     @pytest.mark.asyncio
     async def test_skips_when_paths_already_match(self):
         """When cc_inbox_path already matches metadata, skip."""
+
         @dataclass
         class FakeMailbox:
             current_terminal_id: str = _TERMINAL_ID
@@ -430,7 +428,10 @@ class TestFix3StartupReconciler:
                 "metadata": {"cc_team_inbox_path": _FRESH_PATH},
             }
 
-            from cli_agent_orchestrator.api.main import _f150_reconcile_supervisor_inbox_paths_at_startup
+            from cli_agent_orchestrator.api.main import (
+                _f150_reconcile_supervisor_inbox_paths_at_startup,
+            )
+
             await _f150_reconcile_supervisor_inbox_paths_at_startup()
 
             mock_set_path.assert_not_called()
@@ -442,10 +443,13 @@ class TestFix3StartupReconciler:
 
 
 class TestFix4DeadD9Removed:
-    """deliver_pending's mailbox-pull branch no longer calls ring_supervisor_doorbell."""
+    """deliver_pending's mailbox-pull branch routes through the wake cursor
+    (request_delivery), never a direct teammate push or doorbell ring (F476 r3)."""
 
     def test_deliver_pending_mailbox_pull_no_doorbell(self):
-        """When is_supervisor_mailbox_pull_terminal=True, ring_supervisor_doorbell is NOT called."""
+        """F476 r3 (#388): when is_supervisor_mailbox_pull_terminal=True, the gate
+        signals request_delivery (cursor path) and calls neither attempt_teammate_push
+        (the closed bypass) nor ring_supervisor_doorbell directly."""
         from cli_agent_orchestrator.services.inbox_service import InboxService
 
         service = InboxService.__new__(InboxService)
@@ -456,34 +460,27 @@ class TestFix4DeadD9Removed:
 
         with (
             patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,
-            patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages") as mock_pending,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages"
+            ) as mock_pending,
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal"
             ) as mock_pull,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
-            ) as mock_should,
-            patch(
                 "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
             ) as mock_push,
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req_del,
             patch(
                 "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
             ) as mock_doorbell,
-            patch(
-                "cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}
-            ),
+            patch("cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
                 MagicMock(),
             ),
-            patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda k, default=None: True if k == "supervisor.wake.native" else default,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.get_pending_messages_by_ids"
-            ) as mock_recheck,
         ):
             mock_lock = MagicMock()
             mock_lock.acquire.return_value = True
@@ -492,13 +489,10 @@ class TestFix4DeadD9Removed:
             mock_meta.return_value = {"recovery_state": None}
             mock_pending.return_value = [_msg()]
             mock_pull.return_value = True
-            mock_should.return_value = True
-            mock_push.return_value = True  # push succeeded
-            mock_recheck.return_value = [_msg()]  # F457: rows still pending
 
             service.deliver_pending(_TERMINAL_ID)
 
-            # Push was called
-            mock_push.assert_called_once()
-            # Doorbell was NOT called (removed in FIX 4)
+            # r3: route through the cursor, not the direct bypass or a direct ring.
+            mock_req_del.assert_called_once_with(_TERMINAL_ID)
+            mock_push.assert_not_called()
             mock_doorbell.assert_not_called()
