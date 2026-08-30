@@ -60,7 +60,6 @@ def test_evidence_source_is_never_pane_text_by_contract():
     assert classify_mcp_readiness(ev2) == MCP_UNAVAILABLE
 
 
-
 # ---------------------------------------------------------------------------
 # F582 slice B — D20 cline leg (#393): cline stays mcp_unverified (no artifact)
 # ---------------------------------------------------------------------------

@@ -112,9 +112,9 @@ class TestF582D21DialogClearLifetime:
 
         # The loop kept re-arming on_screen PAST the 5s base timeout (the #386
         # class), and at least one re-arm landed after t=5s.
-        assert any(t >= 5.0 for t in on_screen_fires), (
-            f"lifetime did not extend past base timeout; fires at {on_screen_fires}"
-        )
+        assert any(
+            t >= 5.0 for t in on_screen_fires
+        ), f"lifetime did not extend past base timeout; fires at {on_screen_fires}"
         # It stopped once the dialog cleared (well under the hard cap).
         assert clock.t < ts._F491_DIALOG_CLEAR_MAX_LIFETIME
 

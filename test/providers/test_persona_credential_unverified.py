@@ -16,14 +16,13 @@ it fires correctly once a build flips the flag.
 import json
 
 from cli_agent_orchestrator.providers.claude_code import (
+    _PERSONA_CREDENTIAL_KEY,
+    _PERSONA_CREDENTIAL_KEY_CONFIRMED,
     PERSONA_UNAUTHENTICATED,
     PERSONA_UNVERIFIED,
     _persona_credential_present,
-    _PERSONA_CREDENTIAL_KEY,
-    _PERSONA_CREDENTIAL_KEY_CONFIRMED,
     classify_persona_credential,
 )
-
 
 # ---- The finding: the credential key is NOT confirmed on this build ----------
 
