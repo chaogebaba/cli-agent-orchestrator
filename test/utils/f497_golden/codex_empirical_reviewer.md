@@ -10,7 +10,7 @@ contextPolicy:
   memoryTypes: [project]
   memoryNames: []
   globalClaudeMd: false
-  extraLeaves: ["gpt-unrestricted.md"]
+  extraLeaves: []
 mcpServers:
   cao-mcp-server:
     type: stdio
