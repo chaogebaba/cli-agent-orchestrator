@@ -29,8 +29,8 @@
 › Message from @b93613da: [cao] Callback from b93613da (message id 1969). Run any command to surface and ack it. (ctrl+o to expand)
 
 ● Calling cao-mcp-server 2 times, running 4 shell commands · 3s…
-  ⎿  $ git -C /home/chao/VScode_projects/cli-subagents checkout -q quirks-merge-train && git -C /home/chao/VScode_projects/cli-subagents merge -q --ff-only 43fec01 && git -C
-     /home/chao/VScode_projects/cli-subagents add orchestrator/MERGE-OVERRIDES.md && git -C /home/chao/VScode_projects/cli-subagents co…
+  ⎿  $ git -C /home/user/VScode_projects/cli-subagents checkout -q quirks-merge-train && git -C /home/user/VScode_projects/cli-subagents merge -q --ff-only 43fec01 && git -C
+     /home/user/VScode_projects/cli-subagents add orchestrator/MERGE-OVERRIDES.md && git -C /home/user/VScode_projects/cli-subagents co…
 
 ● Monitor event: "CAO supervisor doorbell (callbacks)"
 

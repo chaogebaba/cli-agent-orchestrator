@@ -562,6 +562,8 @@ def _create_logical_inbox_message_inner(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> tuple[InboxMessage, str | None]:
     """Holder (d): resolve, guard, and insert one logical row under one authority.
 
@@ -604,6 +606,8 @@ def _create_logical_inbox_message_inner(
                     orchestration_type=orchestration_type,
                     dispatch_barrier=dispatch_barrier,
                     park_warm=park_warm,
+                    expire_after_s=expire_after_s,
+                    supersede_key=supersede_key,
                 )
                 db.flush()  # ensure row.id is assigned before obligation
 
@@ -635,11 +639,11 @@ def _create_logical_inbox_message_inner(
     # F158-R3: Drain deferred doorbell stash OUTSIDE the lock.
     # This mirrors _f413_after_commit's logic but runs without the authority lock.
     if _deferred_stash:
+        from cli_agent_orchestrator.services.inbox_service import request_delivery as _req_del
         from cli_agent_orchestrator.services.ws_doorbell import (
             mark_ws_delivered,
             push_doorbell_frame_sync,
         )
-        from cli_agent_orchestrator.services.inbox_service import request_delivery as _req_del
 
         for entry in _deferred_stash:
             if len(entry) == 4:
@@ -676,6 +680,8 @@ def create_logical_inbox_message(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> InboxMessage:
     """Public wrapper: insert + signal delivery (D7)."""
     result, signal_terminal = _create_logical_inbox_message_inner(
@@ -686,6 +692,8 @@ def create_logical_inbox_message(
         orchestration_type=orchestration_type,
         dispatch_barrier=dispatch_barrier,
         park_warm=park_warm,
+        expire_after_s=expire_after_s,
+        supersede_key=supersede_key,
     )
     # F413: delivery signal + WS doorbell now handled by the after_commit ORM listener.
 

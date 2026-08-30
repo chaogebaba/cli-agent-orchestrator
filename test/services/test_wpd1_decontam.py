@@ -11,7 +11,6 @@ import pytest
 
 from cli_agent_orchestrator.services import wpd1_decontam as service
 
-
 FIXTURES = Path(__file__).parents[1] / "providers" / "fixtures"
 POSITIVE = FIXTURES / "wpd1_artifact_refusal_echo_positive_2026_07_17.jsonl"
 CONTROL = FIXTURES / "wpd1_artifact_conversation_zero_2026_07_17.jsonl"
@@ -48,9 +47,7 @@ def _record(family, variant=None, *, include_optional=False):
 
 
 ALL_SHAPES = [
-    (family, variant)
-    for family, variants in service.SCHEMA_0144.items()
-    for variant in variants
+    (family, variant) for family, variants in service.SCHEMA_0144.items() for variant in variants
 ]
 OPTIONAL_SHAPES = [
     (family, variant)
@@ -61,8 +58,14 @@ OPTIONAL_SHAPES = [
 
 def test_frozen_schema_table_cardinality():
     assert len(service.SCHEMA_0144) == 7
-    assert sum(len(v) for family, v in service.SCHEMA_0144.items()
-               if family in {"event_msg", "response_item"}) == 22
+    assert (
+        sum(
+            len(v)
+            for family, v in service.SCHEMA_0144.items()
+            if family in {"event_msg", "response_item"}
+        )
+        == 22
+    )
     assert len(OPTIONAL_SHAPES) == 8
 
 
@@ -83,7 +86,8 @@ def test_each_shape_rejects_missing_required_unknown_extra_and_wrong_type(family
     missing = json.loads(json.dumps(record))
     del missing["payload"][required]
     missing_error = (
-        "nested_discriminator_missing" if required == "type" and variant is not None
+        "nested_discriminator_missing"
+        if required == "type" and variant is not None
         else "required_payload_field_missing"
     )
     with pytest.raises(service.DecontaminationError, match=missing_error):
@@ -99,7 +103,8 @@ def test_each_shape_rejects_missing_required_unknown_extra_and_wrong_type(family
     if "object" in service.SCHEMA_0144[family][variant]["required"][required]:
         wrong["payload"][required] = "wrong"
     wrong_error = (
-        "nested_discriminator_missing" if required == "type" and variant is not None
+        "nested_discriminator_missing"
+        if required == "type" and variant is not None
         else "payload_field_type_invalid"
     )
     with pytest.raises(service.DecontaminationError, match=wrong_error):
@@ -130,10 +135,10 @@ def test_version_mismatch_fails_closed():
 
 def test_tracked_fixture_hashes_and_artifact_rule_controls():
     assert hashlib.sha256(POSITIVE.read_bytes()).hexdigest() == (
-        "5bc0f81ae6770713565ed0b6ccd73b7f11140a7de4cf8e91e6298d819fdf6e07"
+        "03d8b6c89974e20f40d7c74072f319a49d95d74cf5783df3ac9a8fa24e9ae217"
     )
     assert hashlib.sha256(CONTROL.read_bytes()).hexdigest() == (
-        "b012a58b0a8c95cd230d54ba69be2aa32bbc21877e225c7d64934a37060154b4"
+        "70132dc917c1a22d298049f883b619f8fcaab626528265a7d43a27c847d79611"
     )
     positive_records = service.validate_artifact_bytes(
         POSITIVE.read_bytes(), POSITIVE_UUID, f"rollout-{POSITIVE_UUID}.jsonl"
@@ -143,9 +148,7 @@ def test_tracked_fixture_hashes_and_artifact_rule_controls():
     )
     positive_spans = service.discover_artifact_spans(positive_records)
     assert len(positive_spans) >= 1
-    assert {span.rule_id for span in positive_spans} == {
-        service.CONTENT_POLICY_ARTIFACT_RULE_ID
-    }
+    assert {span.rule_id for span in positive_spans} == {service.CONTENT_POLICY_ARTIFACT_RULE_ID}
     assert service.discover_artifact_spans(control_records) == ()
 
 
@@ -153,8 +156,11 @@ def test_denied_sibling_content_is_not_an_artifact_candidate():
     records = service.validate_artifact_bytes(
         POSITIVE.read_bytes(), POSITIVE_UUID, f"rollout-{POSITIVE_UUID}.jsonl"
     )
-    source = next(value for _, _, value in service._decoded_candidates(records)
-                  if service._artifact_pattern().search(value))
+    source = next(
+        value
+        for _, _, value in service._decoded_candidates(records)
+        if service._artifact_pattern().search(value)
+    )
     denied = _record("event_msg", "agent_message")
     denied["payload"]["message"] = source
     assert service.discover_artifact_spans([denied]) == ()
@@ -164,8 +170,11 @@ def test_artifact_match_overflow_rejects_the_whole_plan():
     records = service.validate_artifact_bytes(
         POSITIVE.read_bytes(), POSITIVE_UUID, f"rollout-{POSITIVE_UUID}.jsonl"
     )
-    source = next(value for _, _, value in service._decoded_candidates(records)
-                  if service._artifact_pattern().search(value))
+    source = next(
+        value
+        for _, _, value in service._decoded_candidates(records)
+        if service._artifact_pattern().search(value)
+    )
     record = _record("response_item", "custom_tool_call")
     record["payload"]["input"] = " ".join([source] * 65)
     with pytest.raises(service.DecontaminationError, match="match_limit"):
@@ -186,13 +195,15 @@ def _incident(*, status="not_attempted", skip=None, message_id=None, stage="back
         "gating_basis": "test",
         "force": False,
         "prior_incident": None,
-        "attempts": [{
-            "started_at": "2026-01-01T00:00:00+00:00",
-            "finished_at": None,
-            "final_stage": stage,
-            "result": "aborted",
-            "scrub_summary": None,
-        }],
+        "attempts": [
+            {
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": None,
+                "final_stage": stage,
+                "result": "aborted",
+                "scrub_summary": None,
+            }
+        ],
         "nudge_status": status,
         "nudge_skip_reason": skip,
         "nudge_message_id": message_id,
@@ -309,7 +320,10 @@ def test_incident_mutations_compose_under_flock(tmp_path):
 
     first = threading.Thread(target=update_field, args=("invoker", "supervisor"))
     second = threading.Thread(target=update_field, args=("gating_basis", "basis"))
-    first.start(); second.start(); first.join(); second.join()
+    first.start()
+    second.start()
+    first.join()
+    second.join()
     record = json.loads((incident_dir / "incident.json").read_text())
     assert record["invoker"] == "supervisor"
     assert record["gating_basis"] == "basis"
@@ -320,7 +334,9 @@ def _install_fixture_home(monkeypatch, tmp_path):
     sessions.mkdir(parents=True)
     artifact = sessions / f"rollout-{POSITIVE_UUID}.jsonl"
     shutil.copyfile(POSITIVE, artifact)
-    monkeypatch.setattr(service, "provider_home", lambda _provider: SimpleNamespace(sessions=sessions))
+    monkeypatch.setattr(
+        service, "provider_home", lambda _provider: SimpleNamespace(sessions=sessions)
+    )
     return artifact
 
 
@@ -350,16 +366,25 @@ def test_prepare_install_backup_audit_and_repeated_success_fence(monkeypatch, tm
         assert prepared.backup_path.read_bytes() == POSITIVE.read_bytes()
         assert stat.S_IMODE(prepared.incident_path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(prepared.backup_path.stat().st_mode) == 0o600
-        assert stat.S_IMODE((prepared.incident_path.parent / "incident.lock").stat().st_mode) == 0o600
+        assert (
+            stat.S_IMODE((prepared.incident_path.parent / "incident.lock").stat().st_mode) == 0o600
+        )
         service.mark_recovery_complete(prepared)
     finally:
         service.release_prepared_recovery(prepared)
     with pytest.raises(service.RepeatedIncident):
         service.prepare_content_recovery(
-            terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-            invoker="supervisor", caller_mailbox_id="mb_1",
-            caller_terminal_id="caller", gating_basis="retry", force=False,
-            show=False, use_cpa=False, log_dir=tmp_path / "logs",
+            terminal_id="term",
+            lifecycle_generation=1,
+            session_uuid=POSITIVE_UUID,
+            invoker="supervisor",
+            caller_mailbox_id="mb_1",
+            caller_terminal_id="caller",
+            gating_basis="retry",
+            force=False,
+            show=False,
+            use_cpa=False,
+            log_dir=tmp_path / "logs",
         )
 
 
@@ -374,10 +399,17 @@ def test_failed_and_aborted_attempts_do_not_fence(monkeypatch, tmp_path, prior_r
     service.mutate_incident(incident_dir, lambda _current: prior)
 
     prepared = service.prepare_content_recovery(
-        terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-        invoker="supervisor", caller_mailbox_id="mb_1",
-        caller_terminal_id="caller", gating_basis="retry", force=False,
-        show=False, use_cpa=False, log_dir=log_dir,
+        terminal_id="term",
+        lifecycle_generation=1,
+        session_uuid=POSITIVE_UUID,
+        invoker="supervisor",
+        caller_mailbox_id="mb_1",
+        caller_terminal_id="caller",
+        gating_basis="retry",
+        force=False,
+        show=False,
+        use_cpa=False,
+        log_dir=log_dir,
     )
     try:
         record = json.loads(prepared.incident_path.read_text())
@@ -400,9 +432,16 @@ def test_force_override_and_new_generation_bypass_only_the_exact_fence(monkeypat
     assert artifact.read_bytes() == POSITIVE.read_bytes()
 
     forced = service.prepare_content_recovery(
-        terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-        invoker="human-cli", caller_mailbox_id="mb_1", caller_terminal_id="caller",
-        gating_basis="human-force", force=True, show=False, use_cpa=False,
+        terminal_id="term",
+        lifecycle_generation=1,
+        session_uuid=POSITIVE_UUID,
+        invoker="human-cli",
+        caller_mailbox_id="mb_1",
+        caller_terminal_id="caller",
+        gating_basis="human-force",
+        force=True,
+        show=False,
+        use_cpa=False,
         log_dir=tmp_path / "logs",
     )
     try:
@@ -414,9 +453,16 @@ def test_force_override_and_new_generation_bypass_only_the_exact_fence(monkeypat
         service.release_prepared_recovery(forced)
 
     next_generation = service.prepare_content_recovery(
-        terminal_id="term", lifecycle_generation=2, session_uuid=POSITIVE_UUID,
-        invoker="supervisor", caller_mailbox_id="mb_1", caller_terminal_id="caller",
-        gating_basis="new-generation", force=False, show=False, use_cpa=False,
+        terminal_id="term",
+        lifecycle_generation=2,
+        session_uuid=POSITIVE_UUID,
+        invoker="supervisor",
+        caller_mailbox_id="mb_1",
+        caller_terminal_id="caller",
+        gating_basis="new-generation",
+        force=False,
+        show=False,
+        use_cpa=False,
         log_dir=tmp_path / "logs",
     )
     try:
@@ -475,9 +521,16 @@ def test_plan_replace_drift_two_actor_barrier_aborts_without_overwrite(monkeypat
     def scrubber():
         try:
             service.prepare_content_recovery(
-                terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-                invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
-                gating_basis="race", force=False, show=False, use_cpa=False,
+                terminal_id="term",
+                lifecycle_generation=1,
+                session_uuid=POSITIVE_UUID,
+                invoker="supervisor",
+                caller_mailbox_id=None,
+                caller_terminal_id=None,
+                gating_basis="race",
+                force=False,
+                show=False,
+                use_cpa=False,
                 log_dir=tmp_path / "logs",
             )
         except Exception as exc:
@@ -522,9 +575,16 @@ def test_artifact_lease_two_actor_race_allows_exactly_one_scrub(monkeypatch, tmp
         prepared = None
         try:
             prepared = service.prepare_content_recovery(
-                terminal_id=name, lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-                invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
-                gating_basis="race", force=False, show=False, use_cpa=False,
+                terminal_id=name,
+                lifecycle_generation=1,
+                session_uuid=POSITIVE_UUID,
+                invoker="supervisor",
+                caller_mailbox_id=None,
+                caller_terminal_id=None,
+                gating_basis="race",
+                force=False,
+                show=False,
+                use_cpa=False,
                 log_dir=tmp_path / "logs",
             )
             results.append(name)
@@ -568,9 +628,16 @@ def test_lease_lost_after_plan_two_actor_barrier_aborts_before_replace(monkeypat
     def scrubber():
         try:
             service.prepare_content_recovery(
-                terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-                invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
-                gating_basis="lease-loss", force=False, show=False, use_cpa=False,
+                terminal_id="term",
+                lifecycle_generation=1,
+                session_uuid=POSITIVE_UUID,
+                invoker="supervisor",
+                caller_mailbox_id=None,
+                caller_terminal_id=None,
+                gating_basis="lease-loss",
+                force=False,
+                show=False,
+                use_cpa=False,
                 log_dir=tmp_path / "logs",
             )
         except Exception as exc:
@@ -601,7 +668,9 @@ def test_symlink_artifact_is_rejected(monkeypatch, tmp_path):
     target = tmp_path / "real.jsonl"
     shutil.copyfile(POSITIVE, target)
     (sessions / f"rollout-{POSITIVE_UUID}.jsonl").symlink_to(target)
-    monkeypatch.setattr(service, "provider_home", lambda _provider: SimpleNamespace(sessions=sessions))
+    monkeypatch.setattr(
+        service, "provider_home", lambda _provider: SimpleNamespace(sessions=sessions)
+    )
     with pytest.raises(service.DecontaminationError, match="regular_file_required"):
         service.find_artifact(POSITIVE_UUID)
 
@@ -622,17 +691,30 @@ def test_cpa_proposals_are_locally_resolved_and_replacement_is_ignored(monkeypat
     )
     candidate = service._decoded_candidates(records)[0][2]
     digest = hashlib.sha256(candidate[:1].encode()).hexdigest()
-    response = json.dumps({"proposals": [
-        {"candidate_index": 0, "start": 0, "end": 1,
-         "preimage_sha256": digest, "replacement": "ignored"},
-        {"candidate_index": 0, "start": 0, "end": 99,
-         "preimage_sha256": digest},
-    ]}).encode()
+    response = json.dumps(
+        {
+            "proposals": [
+                {
+                    "candidate_index": 0,
+                    "start": 0,
+                    "end": 1,
+                    "preimage_sha256": digest,
+                    "replacement": "ignored",
+                },
+                {"candidate_index": 0, "start": 0, "end": 99, "preimage_sha256": digest},
+            ]
+        }
+    ).encode()
 
     class FakeResponse:
-        def __enter__(self): return self
-        def __exit__(self, *_args): return False
-        def read(self, _limit): return response
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return response
 
     config = tmp_path / "providers.json"
     config.write_text(json.dumps({"cpa": {"url": "https://example.invalid"}}))
@@ -659,15 +741,24 @@ def test_cpa_proposal_overflow_forces_human_gate(monkeypatch, tmp_path):
     )
     candidate = service._decoded_candidates(records)[0][2]
     digest = hashlib.sha256(candidate[:1].encode()).hexdigest()
-    response = json.dumps({"proposals": [
-        {"candidate_index": 0, "start": 0, "end": 1, "preimage_sha256": digest}
-        for _ in range(65)
-    ]}).encode()
+    response = json.dumps(
+        {
+            "proposals": [
+                {"candidate_index": 0, "start": 0, "end": 1, "preimage_sha256": digest}
+                for _ in range(65)
+            ]
+        }
+    ).encode()
 
     class FakeResponse:
-        def __enter__(self): return self
-        def __exit__(self, *_args): return False
-        def read(self, _limit): return response
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return response
 
     config = tmp_path / "providers.json"
     config.write_text(json.dumps({"cpa": {"url": "https://example.invalid"}}))

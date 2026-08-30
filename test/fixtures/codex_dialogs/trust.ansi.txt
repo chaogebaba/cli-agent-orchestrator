@@ -1,4 +1,4 @@
-> [1mYou are in [0m/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator
+> [1mYou are in [0m/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator
 
   Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt
   injection. Trusting the directory allows project-local config, hooks, and exec policies to load.

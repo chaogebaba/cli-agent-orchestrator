@@ -1,4 +1,4 @@
-> You are in /home/chao/project
+> You are in /home/user/project
 
   Do you trust the contents of this directory? Working with untrusted
   contents comes with higher risk of prompt injection.

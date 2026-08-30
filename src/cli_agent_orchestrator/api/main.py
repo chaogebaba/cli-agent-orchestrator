@@ -7935,6 +7935,8 @@ async def create_inbox_message_endpoint(
     barrier: Optional[str] = None,
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
+    expire_after_s: Optional[int] = None,
+    supersede_key: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -8130,6 +8132,11 @@ async def create_inbox_message_endpoint(
                     "timeout_seconds": barrier_timeout_seconds,
                     "member_key": barrier_member_key,
                 }
+            # F578 D23: opt-in delivery controls threaded to the logical path.
+            if expire_after_s is not None:
+                logical_kwargs["expire_after_s"] = int(expire_after_s)
+            if supersede_key is not None:
+                logical_kwargs["supersede_key"] = supersede_key
             inbox_msg = await asyncio.to_thread(
                 create_logical_inbox_message,
                 sender_id=sender_id,
@@ -8201,6 +8208,12 @@ async def create_inbox_message_endpoint(
                 "timeout_seconds": barrier_timeout_seconds,
                 "member_key": barrier_member_key,
             }
+        # F578 D23: opt-in delivery controls threaded to the direct-terminal path
+        # (create_inbox_message -> _create_inbox_message_unfenced -> DB seam).
+        if expire_after_s is not None:
+            raw_kwargs["expire_after_s"] = int(expire_after_s)
+        if supersede_key is not None:
+            raw_kwargs["supersede_key"] = supersede_key
         # F158-R3: Move create_inbox_message off the event-loop thread.
         # The after-commit ORM hook (F413) calls push_doorbell_frame_sync which
         # schedules a coroutine on this same loop and blocks — deadlock if inline.

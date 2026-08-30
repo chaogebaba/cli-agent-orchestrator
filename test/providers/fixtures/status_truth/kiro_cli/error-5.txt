@@ -17,7 +17,7 @@
     31+  print("max spinner distance-from-end:", best[0], best[1])
 ● Shell ls /data/cao-scratch/4fd45dca/f568cap_r2/ | wc -l; uv run python /data/cao-scratch/4fd45dca/scan_r2.py /data/cao-scratch/4fd45dca/f568cap_r2; uv run python
   /data/cao-scratch/4fd45dca/maxdist.py /data/cao-scratch/4fd45dca/f568cap_r2
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false
 
   The capture finished (416 frames) and the max spinner distance is only 2. The natural layout on these seats keeps the spinner within 2 rows above the composer's chrome-trailing. To get
   distance ≥4, I must induce multiple stacked callback › pushes while the seat spins.
@@ -75,7 +75,7 @@
   Spawned claude worker e3441b17. Let me wait for it to start spinning, then send it multiple messages to stack › push rows above its composer, and densely capture. First let me wait for it
   to be processing.
 ● Shell sleep 25; tmux list-panes -a -F '#{session_name}:#{window_name}' 2>&1 | grep e3441b17
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=40000
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=40000
 ● peek_terminal
     ╰ terminal_id=e3441b17, lines=20
 
@@ -93,7 +93,7 @@
   Actually, the most reliable inducement: send multiple messages to the worker e3441b17 right now — they'll queue and render as › push rows. But it needs to be spinning first. Let me wait for
   it to clear setup and start the task, then flood + capture. Let me poll it.
 ● Shell sleep 40; tmux capture-pane -p -S -45 -t cao-claude-orch5:claude_blueprint_maker_tester-e3441b17 | tail -20
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=55000
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/4fd45dca, run_in_background=false, timeout=55000
 
 ▸ Credits: 12.47 • Time: 6m 31s
 

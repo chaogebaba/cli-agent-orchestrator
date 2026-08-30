@@ -3,5 +3,11 @@
   "terminal": "0c63413e",
   "window": "kiro_dev-0c63413e",
   "captured_at": "2026-08-30T04:59:01Z",
-  "note": "Follow-up capture ~34s after kiro-spinner-1, worker still mid-task. Busy markers visible: '\u25d0 11 tasks remaining \u00b7 ctrl+x expand' and footer 'Kiro is working \u00b7 Type to steer \u00b7 Ctrl+S to queue'; header now 'kiro_dev \u00b7 Auto \u00b7 \u25d4 21%'. On-screen: agent rewriting the D17 DB layer in src/cli_agent_orchestrator/clients/database.py, ran a Shell grep for imports/logger and is proceeding to add constants + rewrite the two mutators."
+  "note": "Follow-up capture ~34s after kiro-spinner-1, worker still mid-task. Busy markers visible: '\u25d0 11 tasks remaining \u00b7 ctrl+x expand' and footer 'Kiro is working \u00b7 Type to steer \u00b7 Ctrl+S to queue'; header now 'kiro_dev \u00b7 Auto \u00b7 \u25d4 21%'. On-screen: agent rewriting the D17 DB layer in src/cli_agent_orchestrator/clients/database.py, ran a Shell grep for imports/logger and is proceeding to add constants + rewrite the two mutators.",
+  "pii_redaction": {
+    "redacted": true,
+    "home_paths": "The captured builder home path segments were replaced with the same-width synthetic placeholder '/home/user' (the 4-char real username -> 'user', 4->4 chars). Pane column geometry and line count (125) unchanged.",
+    "email_token_prose": "Transcript prose line that REFERENCED a real email/token in seat scrollback (never a literal one here) was neutralized: 'incl. a real email/token'->'(redacted-out here)'. D17 identifiers such as 'release_token'/'children_release_duplicate'/'agent_id' are technical field names, not PII, and are kept. No busy-marker or footer/status row was touched.",
+    "verified_by": "test/test_fixtures_no_personal_pii.py (home-path + token-like + personal-email guards)"
+  }
 }

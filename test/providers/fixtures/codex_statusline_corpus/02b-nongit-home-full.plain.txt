@@ -8,7 +8,7 @@
   Tip: Use the OpenAI docs MCP for API questions; enable it with codex mcp add openaiDeveloperDocs --url
   https://developers.openai.com/mcp.
 
-⚠ Ignored unsupported project-local config keys in /home/chao/.codex/config.toml: model_provider, model_providers. If
+⚠ Ignored unsupported project-local config keys in /home/user/.codex/config.toml: model_provider, model_providers. If
   you want these settings to apply, manually set them in your user-level config.toml.
 
 
