@@ -27,7 +27,6 @@ from cli_agent_orchestrator.services.worktree_service import (
 )
 
 
-
 def _git_available() -> bool:
     try:
         subprocess.run(["git", "--version"], capture_output=True, check=True, timeout=2)
@@ -39,12 +38,30 @@ def _git_available() -> bool:
 pytestmark = pytest.mark.skipif(not _git_available(), reason="git executable required")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_worktree_root(tmp_path: Path, monkeypatch):
+    """Pin the worktree root to a per-test dir (F620 #476).
+
+    Root resolution now prefers ``/data/cao-scratch/worktrees/<repo-basename>``
+    when that path is writable (the F620 default). Every ``repo`` fixture here
+    is named ``repo``, so on a host with a writable ``/data/cao-scratch`` (e.g.
+    the grok boxes) all these tests would provision into the SAME
+    ``/data/cao-scratch/worktrees/repo/<terminal_id>`` and collide across tests
+    and xdist workers. Pinning ``CAO_WORKTREE_ROOT`` to a unique per-test tmp
+    dir keeps ``create_worktree`` isolated regardless of the host, matching the
+    pre-F620 in-repo isolation these tests assumed.
+    """
+    monkeypatch.setenv("CAO_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+
+
 def _init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True, capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@f121.com"],
-        cwd=path, check=True, capture_output=True,
+        cwd=path,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "F121"], cwd=path, check=True, capture_output=True
@@ -54,7 +71,6 @@ def _init_repo(path: Path) -> None:
     subprocess.run(
         ["git", "commit", "-q", "-m", "initial"], cwd=path, check=True, capture_output=True
     )
-
 
 
 @pytest.fixture
@@ -77,7 +93,6 @@ def worktree_setup(repo: Path):
         "provisioned_at": "2026-08-10T00:00:00+00:00",
     }
     return repo, terminal_id, wt_path, info
-
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +122,6 @@ class TestVerifyDetectsCwdEscape:
         assert result.cwd_escaped is True
 
 
-
 # ---------------------------------------------------------------------------
 # AC4: Verify detects branch escape (Class B)
 # ---------------------------------------------------------------------------
@@ -117,7 +131,9 @@ class TestVerifyDetectsBranchEscape:
         # Switch to a different branch inside the worktree
         subprocess.run(
             ["git", "checkout", "-b", "other-branch"],
-            cwd=wt_path, check=True, capture_output=True,
+            cwd=wt_path,
+            check=True,
+            capture_output=True,
         )
         result = verify_worktree_integrity(wt_path, info)
         assert result.ok is False
@@ -134,13 +150,14 @@ class TestVerifyDetectsDetachedHead:
         repo, terminal_id, wt_path, info = worktree_setup
         subprocess.run(
             ["git", "checkout", "--detach"],
-            cwd=wt_path, check=True, capture_output=True,
+            cwd=wt_path,
+            check=True,
+            capture_output=True,
         )
         result = verify_worktree_integrity(wt_path, info)
         assert result.ok is False
         assert result.branch_escaped is True
         assert result.actual_branch is None
-
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +191,6 @@ class TestVerifyFailsClosedOnGitError:
         result = verify_worktree_integrity(str(plain_dir), info)
         assert result.ok is False
         assert result.error is not None
-
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +235,6 @@ class TestProvisionPersistedDedicatedWorktreeInfo:
         assert "worktree_info" not in (meta["metadata"] or {})
 
 
-
 # ---------------------------------------------------------------------------
 # AC10: WorktreeInfo is immutable and worker-inaccessible
 # ---------------------------------------------------------------------------
@@ -243,7 +258,11 @@ class TestWorktreeInfoImmutability:
             "provisioned_at": "2026-08-10T00:00:00+00:00",
         }
         create_terminal(
-            terminal_id, "s", "w", "kiro_cli", worktree_info=wt_info,
+            terminal_id,
+            "s",
+            "w",
+            "kiro_cli",
+            worktree_info=wt_info,
         )
         # Worker replaces metadata entirely
         update_terminal_metadata(terminal_id, {"attacker": "payload"})
@@ -269,7 +288,11 @@ class TestWorktreeInfoImmutability:
             "provisioned_at": "2026-08-10T00:00:00+00:00",
         }
         create_terminal(
-            terminal_id, "s", "w", "kiro_cli", worktree_info=wt_info,
+            terminal_id,
+            "s",
+            "w",
+            "kiro_cli",
+            worktree_info=wt_info,
         )
         # Identical retry succeeds (idempotent)
         set_terminal_worktree_info(terminal_id, wt_info)
@@ -277,7 +300,6 @@ class TestWorktreeInfoImmutability:
         different = {**wt_info, "repo_root": "/somewhere/else"}
         with pytest.raises(ValueError, match="already set"):
             set_terminal_worktree_info(terminal_id, different)
-
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +337,11 @@ class TestTerminalWorktreeInfoMigration:
             "provisioned_at": "2026-08-10T00:00:00+00:00",
         }
         create_terminal(
-            terminal_id, "s", "w", "kiro_cli", worktree_info=wt_info,
+            terminal_id,
+            "s",
+            "w",
+            "kiro_cli",
+            worktree_info=wt_info,
         )
         # Raw SQLite UPDATE should be rejected by the trigger
         conn = sqlite3.connect(str(DATABASE_FILE))
@@ -329,14 +355,11 @@ class TestTerminalWorktreeInfoMigration:
             conn.close()
 
 
-
 # ---------------------------------------------------------------------------
 # AC7: Teardown snapshot includes branch_integrity
 # ---------------------------------------------------------------------------
 class TestTeardownSnapshotIncludesIntegrity:
-    def test_teardown_snapshot_includes_integrity(
-        self, worktree_setup, tmp_path: Path
-    ) -> None:
+    def test_teardown_snapshot_includes_integrity(self, worktree_setup, tmp_path: Path) -> None:
         """delete_terminal on a worktree-backed terminal writes integrity to snapshot."""
         repo, terminal_id, wt_path, info = worktree_setup
 
@@ -366,9 +389,7 @@ class TestTeardownSnapshotIncludesIntegrity:
 # AC8: Teardown logs WARNING on escape
 # ---------------------------------------------------------------------------
 class TestTeardownLogsWarningOnEscape:
-    def test_teardown_logs_warning_on_escape(
-        self, worktree_setup, caplog
-    ) -> None:
+    def test_teardown_logs_warning_on_escape(self, worktree_setup, caplog) -> None:
         """WARNING log is emitted when teardown verification finds ok=False."""
         repo, terminal_id, wt_path, info = worktree_setup
 
@@ -378,9 +399,7 @@ class TestTeardownLogsWarningOnEscape:
 
         # Simulate the logger.warning call from terminal_service
         with caplog.at_level(logging.WARNING):
-            logging.getLogger(
-                "cli_agent_orchestrator.services.terminal_service"
-            ).warning(
+            logging.getLogger("cli_agent_orchestrator.services.terminal_service").warning(
                 "F121 branch integrity ESCAPE detected at teardown for "
                 "terminal %s: expected_branch=%s, actual_branch=%s, "
                 "expected_worktree_path=%s, actual_toplevel=%s, "
@@ -398,7 +417,6 @@ class TestTeardownLogsWarningOnEscape:
         assert any("cwd_escaped=True" in r.message for r in caplog.records)
 
 
-
 # ---------------------------------------------------------------------------
 # AC9: get_terminal response includes full branch_integrity
 # ---------------------------------------------------------------------------
@@ -410,9 +428,15 @@ class TestGetTerminalIncludesFullIntegrity:
         d = asdict(result)
         # Check all expected fields are present
         expected_fields = {
-            "ok", "expected_branch", "expected_worktree_path",
-            "actual_toplevel", "actual_common_dir", "actual_branch",
-            "cwd_escaped", "branch_escaped", "error",
+            "ok",
+            "expected_branch",
+            "expected_worktree_path",
+            "actual_toplevel",
+            "actual_common_dir",
+            "actual_branch",
+            "cwd_escaped",
+            "branch_escaped",
+            "error",
         }
         assert set(d.keys()) == expected_fields
         assert d["ok"] is True
@@ -430,7 +454,6 @@ class TestGetTerminalIncludesFullIntegrity:
         elapsed = time.monotonic() - start
         assert elapsed < 5.0
         assert result.ok is True
-
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +486,11 @@ class TestMutationKillers:
             "provisioned_at": "2026-08-10T00:00:00+00:00",
         }
         create_terminal(
-            terminal_id, "s", "w", "kiro_cli", worktree_info=wt_info,
+            terminal_id,
+            "s",
+            "w",
+            "kiro_cli",
+            worktree_info=wt_info,
         )
         stored = get_terminal_worktree_info(terminal_id)
         # This assertion kills the mutation
@@ -476,7 +503,6 @@ class TestMutationKillers:
         result = verify_worktree_integrity(wt_path, info)
         # Kills: if verify always returns ok=False
         assert result.ok is True
-
 
     def test_mut_ac3_skip_toplevel_comparison(self, worktree_setup) -> None:
         """Mutation: skip toplevel check → cwd_escaped always False."""
@@ -492,7 +518,9 @@ class TestMutationKillers:
         repo, terminal_id, wt_path, info = worktree_setup
         subprocess.run(
             ["git", "checkout", "-b", "attacker-branch"],
-            cwd=wt_path, check=True, capture_output=True,
+            cwd=wt_path,
+            check=True,
+            capture_output=True,
         )
         result = verify_worktree_integrity(wt_path, info)
         # Kills: if symbolic-ref comparison is skipped
@@ -513,7 +541,6 @@ class TestMutationKillers:
         assert result.ok is False
         assert result.error is not None
 
-
     def test_mut_ac7_omit_integrity_from_snapshot(self, worktree_setup, tmp_path) -> None:
         """Mutation: omit worktree_branch_integrity from snapshot dict → AC7 fails."""
         repo, terminal_id, wt_path, info = worktree_setup
@@ -530,9 +557,7 @@ class TestMutationKillers:
         assert result.ok is False
 
         with caplog.at_level(logging.WARNING):
-            logging.getLogger(
-                "cli_agent_orchestrator.services.terminal_service"
-            ).warning(
+            logging.getLogger("cli_agent_orchestrator.services.terminal_service").warning(
                 "F121 branch integrity ESCAPE detected at teardown for "
                 "terminal %s: expected_branch=%s, actual_branch=%s, "
                 "expected_worktree_path=%s, actual_toplevel=%s, "
@@ -550,7 +575,6 @@ class TestMutationKillers:
         # Kills: if log level is changed to DEBUG, no WARNING records found
         assert len(warning_records) > 0
         assert any("F121" in r.message for r in warning_records)
-
 
     def test_mut_ac10_store_in_metadata_json(self, repo: Path) -> None:
         """Mutation: store authority in worker-writable metadata_json → AC10 fails."""
@@ -572,7 +596,11 @@ class TestMutationKillers:
             "provisioned_at": "2026-08-10T00:00:00+00:00",
         }
         create_terminal(
-            terminal_id, "s", "w", "kiro_cli", worktree_info=wt_info,
+            terminal_id,
+            "s",
+            "w",
+            "kiro_cli",
+            worktree_info=wt_info,
         )
         # Worker full-replace metadata
         update_terminal_metadata(terminal_id, {"overwritten": True})
@@ -600,14 +628,11 @@ class TestMutationKillers:
         assert os.path.realpath(result.actual_common_dir) == expected_common
 
 
-
 # ---------------------------------------------------------------------------
 # S1 delta: warm-intent/fork path persists worktree_info via same-INSERT
 # ---------------------------------------------------------------------------
 class TestWarmIntentForkPathPersistsWorktreeInfo:
-    def test_create_terminal_with_warm_intent_persists_worktree_info(
-        self, repo: Path
-    ) -> None:
+    def test_create_terminal_with_warm_intent_persists_worktree_info(self, repo: Path) -> None:
         """create_terminal_with_warm_intent writes worktree_info to dedicated column."""
         from cli_agent_orchestrator.clients.database import (
             create_terminal_with_warm_intent,
@@ -669,7 +694,6 @@ class TestWarmIntentForkPathPersistsWorktreeInfo:
         assert stored is None
 
 
-
 # ---------------------------------------------------------------------------
 # S1 delta: production-path combined test (use_worktree + fork_context)
 # Exercises terminal_service.create_terminal → create_terminal_with_warm_intent
@@ -679,17 +703,14 @@ class TestWarmIntentForkPathPersistsWorktreeInfo:
 class TestProductionPathForkPlusWorktree:
     """Full create_terminal path: use_worktree=True + fork_context propagates worktree_info."""
 
-    def test_create_terminal_fork_worktree_propagates_worktree_info(
-        self, tmp_path: Path
-    ) -> None:
+    def test_create_terminal_fork_worktree_propagates_worktree_info(self, tmp_path: Path) -> None:
         """create_terminal with use_worktree + fork_context passes worktree_info to DB."""
         import asyncio
         from types import SimpleNamespace
         from unittest.mock import AsyncMock
 
         from cli_agent_orchestrator.models.terminal import ForkContext
-        from cli_agent_orchestrator.services import terminal_service
-        from cli_agent_orchestrator.services import worktree_service
+        from cli_agent_orchestrator.services import terminal_service, worktree_service
 
         # Fake worktree provisioning
         fake_repo_root = str(tmp_path / "repo")
@@ -739,9 +760,9 @@ class TestProductionPathForkPlusWorktree:
             initial_preamble="",
         )
 
-        import cli_agent_orchestrator.backends.registry as backend_registry
-
         from unittest.mock import patch as _patch
+
+        import cli_agent_orchestrator.backends.registry as backend_registry
 
         with (
             _patch.object(worktree_service, "find_repo_root", fake_find_repo_root),
@@ -751,7 +772,8 @@ class TestProductionPathForkPlusWorktree:
                 terminal_service, "create_terminal_with_warm_intent", capturing_publisher
             ),
             _patch.object(
-                terminal_service, "db_create_terminal",
+                terminal_service,
+                "db_create_terminal",
                 lambda *a, **kw: {"id": "test1234"},
             ),
             _patch.object(
@@ -803,9 +825,9 @@ class TestProductionPathForkPlusWorktree:
             )
 
         # Verify worktree_info was propagated to the fork publish path
-        assert "worktree_info" in captured_kwargs, (
-            "create_terminal_with_warm_intent must receive worktree_info kwarg"
-        )
+        assert (
+            "worktree_info" in captured_kwargs
+        ), "create_terminal_with_warm_intent must receive worktree_info kwarg"
         wt_info = captured_kwargs["worktree_info"]
         assert wt_info is not None, "worktree_info must not be None when use_worktree=True"
         assert wt_info["repo_root"] == fake_repo_root
