@@ -268,6 +268,13 @@ class StatusMonitor:
         # (1→2→4→8s cap, max 6 per silence episode). Reset edge is the chunk
         # path _schedule_screen_detection; purged in clear_terminal.
         self._retry_backoff_step: Dict[str, int] = {}
+        # D15: status-stream loss recovery state. A status publish snapshots
+        # the event-bus drop level; the independent pane-sampler tick can then
+        # force a re-derivation when that level changes.
+        self._drop_seq_at_publish: Dict[str, int] = {}
+        self._last_publish_monotonic: Dict[str, float] = {}
+        self._last_level_resync_monotonic: Dict[str, float] = {}
+        self._status_fusion_reason: Dict[str, str] = {}
         # The event loop that owns the quiescence timers. Captured when the
         # first timer is scheduled (on the loop thread). clear_terminal /
         # reset_buffer can run OFF that thread (cleanup_old_data is dispatched
@@ -1143,6 +1150,8 @@ class StatusMonitor:
                             pass_outcome = pass_outcome_for_source(pass_source, "no_change")
                         else:
                             self._last_status[terminal_id] = detected
+                            if pass_source == "inline":
+                                self._status_fusion_reason.pop(terminal_id, None)
                             if detected == TerminalStatus.PROCESSING:
                                 self._processing_gen[terminal_id] = self._input_gen.get(
                                     terminal_id, 0
@@ -1197,7 +1206,14 @@ class StatusMonitor:
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
         if publish_external:
-            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+            with self._lock:
+                self._drop_seq_at_publish[terminal_id] = bus.get_drop_seq(terminal_id)
+                self._last_publish_monotonic[terminal_id] = _clock()
+                fusion_reason = self._status_fusion_reason.get(terminal_id)
+            payload = {"status": detected.value}
+            if fusion_reason is not None:
+                payload["fusion_reason"] = fusion_reason
+            bus.publish(f"terminal.{terminal_id}.status", payload)
             __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
             if screen_spinner_override is not None:
                 logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
@@ -1574,14 +1590,23 @@ class StatusMonitor:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 return  # provider gone: NO-OP (r3-S5)
-            self._arm_quiesce_timer(
-                loop,
-                terminal_id,
-                self._on_screen_quiescent,
-                provider,
-                chunk_seq,
-                delay=delay_s,
-            )
+            if CAO_PYTE_STATUS and getattr(provider, "supports_screen_detection", False):
+                self._arm_quiesce_timer(
+                    loop,
+                    terminal_id,
+                    self._on_screen_quiescent,
+                    provider,
+                    chunk_seq,
+                    delay=delay_s,
+                )
+            else:
+                self._arm_quiesce_timer(
+                    loop,
+                    terminal_id,
+                    self._on_raw_quiescent,
+                    chunk_seq,
+                    delay=delay_s,
+                )
         except Exception:
             # Precedent status_monitor.py:1292-1299 — a retry-request failure must
             # never raise into or alter the caller's on_screen path.
@@ -1830,6 +1855,8 @@ class StatusMonitor:
             # F506: fuse at read time (D2). fuse_status re-acquires the RLock
             # (safe) and only READS question_state/pane_liveness — no capture.
             fused_status, fusion_reason = self.fuse_status(terminal_id, published)
+            if fusion_reason is None:
+                fusion_reason = self._status_fusion_reason.get(terminal_id)
             if fused_status is None:
                 fused_status = published
             # fusion_changed is set HERE from the status delta (R6-S5): the
@@ -1898,6 +1925,58 @@ class StatusMonitor:
             logger.error(f"Error detecting status for {terminal_id}: {e}")
             return TerminalStatus.UNKNOWN
 
+    @staticmethod
+    def _resync_interval_s() -> float:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        try:
+            return float(ConfigService.get("liveness.resync_interval_s", 60.0))
+        except Exception:
+            return 60.0
+
+    def resync_from_pane_tail(
+        self, terminal_id: str, filtered_tail: str, *, now: float | None = None
+    ) -> bool:
+        """D15: re-derive status from the pane sampler's retained level.
+
+        Returns whether a forced pass ran. This method never captures the pane;
+        the caller supplies the sample already produced by pane_liveness.
+        """
+        now = _clock() if now is None else now
+        drop_seq = bus.get_drop_seq(terminal_id)
+        with self._lock:
+            published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            published_drop_seq = self._drop_seq_at_publish.get(terminal_id, 0)
+            published_at = self._last_publish_monotonic.get(terminal_id, now)
+            last_resync = self._last_level_resync_monotonic.get(terminal_id)
+            interval_s = self._resync_interval_s()
+            dropped = drop_seq != published_drop_seq
+            periodic = (
+                published == TerminalStatus.PROCESSING
+                and now - published_at >= interval_s
+                and (last_resync is None or now - last_resync >= interval_s)
+            )
+            if not dropped and not periodic:
+                return False
+            self._last_level_resync_monotonic[terminal_id] = now
+
+        provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
+            return False
+        try:
+            detected = provider.get_status(filtered_tail)
+        except Exception:
+            logger.debug("D15 pane-tail resync failed for %s", terminal_id, exc_info=True)
+            return False
+        if dropped:
+            with self._lock:
+                self._status_fusion_reason[terminal_id] = "resync_after_drop"
+        else:
+            with self._lock:
+                self._status_fusion_reason.pop(terminal_id, None)
+        self._apply_detection(terminal_id, detected, pass_source="forced")
+        return True
+
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
@@ -1919,6 +1998,10 @@ class StatusMonitor:
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
             self._retry_backoff_step.pop(terminal_id, None)
+            self._drop_seq_at_publish.pop(terminal_id, None)
+            self._last_publish_monotonic.pop(terminal_id, None)
+            self._last_level_resync_monotonic.pop(terminal_id, None)
+            self._status_fusion_reason.pop(terminal_id, None)
             self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)
@@ -2003,6 +2086,10 @@ class StatusMonitor:
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
             self._status_gen.pop(terminal_id, None)
+            self._drop_seq_at_publish.pop(terminal_id, None)
+            self._last_publish_monotonic.pop(terminal_id, None)
+            self._last_level_resync_monotonic.pop(terminal_id, None)
+            self._status_fusion_reason.pop(terminal_id, None)
             self._new_epoch_locked(terminal_id)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.

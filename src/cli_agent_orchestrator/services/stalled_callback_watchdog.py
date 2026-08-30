@@ -697,6 +697,13 @@ class StalledCallbackWatchdog:
                 # Nothing to reconcile — matches the pre-F506 `continue`.
                 continue
 
+            # D15: re-derive from the independent pane sample after a signalled
+            # stream drop, plus the low-frequency PROCESSING backstop. This adds
+            # no capture: observe() already supplied filtered_tail.
+            status_monitor.resync_from_pane_tail(
+                terminal_id, observation.filtered_tail, now=now
+            )
+
             # F507: reconcile the question marker for terminals holding an open
             # marker or classified WAITING (level-triggered, D9). Cheap and
             # sampler-independent.

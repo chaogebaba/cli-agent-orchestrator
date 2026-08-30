@@ -112,8 +112,9 @@ ERROR_PATTERN = (
 # not be reported COMPLETED.
 ABORT_LINE = "[abort] aborted by another client"
 
-# How far back in the pane tail to look for ABORT_LINE.
-_ABORT_SCAN_LINES = 40
+# Keep an abort visible for two full agent-step polling periods before closing
+# the run as IDLE. The provider owns this report/hold state.
+_ABORT_REPORT_HOLD_S = 2.0
 
 # F345: Default MCP connect timeout (ms) for cline workers.  The cline CLI
 # uses MCP_CONNECT_TIMEOUT_MS to bound the MCP server initialization handshake.
@@ -229,6 +230,9 @@ class ClineCliProvider(BaseProvider):
         self._session_id: Optional[str] = None
         self._message_count = 0
         self._pre_run_history_ids: set[str] = set()
+        self._abort_reported_occ = 0
+        self._abort_reported_at: float | None = None
+        self._abort_retry_armed = False
 
     @property
     def resolved_model(self) -> Optional[str]:
@@ -340,6 +344,13 @@ class ClineCliProvider(BaseProvider):
                 logger.debug("Failed to send EOF to dispatcher: %s", exc)
 
         threading.Thread(target=_send_eof, daemon=True).start()
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Start a fresh abort-evidence epoch with the monitor byte buffer."""
+        del epoch
+        self._abort_reported_occ = 0
+        self._abort_reported_at = None
+        self._abort_retry_armed = False
 
     def _resolve_model(self) -> Optional[str]:
         """Resolve model: spawn override > providers.toml > profile field.
@@ -690,19 +701,36 @@ class ClineCliProvider(BaseProvider):
         # Dispatcher idle: cat is waiting for input.
         if current_cmd == DISPATCHER_IDLE_CMD:
             if self._task_dispatched_flag:
-                # A run that printed ABORT_LINE produced no answer.  The pane
-                # looks identical to a clean completion, so scan the tail —
-                # otherwise a dead lane is reported COMPLETED and its abort
-                # notice is handed to the supervisor as the worker's reply.
-                tail = strip_terminal_escapes(output or "").splitlines()
-                if any(ABORT_LINE in line for line in tail[-_ABORT_SCAN_LINES:]):
+                from cli_agent_orchestrator.services.pane_liveness import (
+                    PANE_LIVENESS_TAIL_LINES,
+                )
+
+                lines = strip_terminal_escapes(output or "").splitlines()
+                occurrences = sum(ABORT_LINE in line for line in lines)
+                now = time.monotonic()
+                if (
+                    len(lines) > PANE_LIVENESS_TAIL_LINES
+                    and occurrences > self._abort_reported_occ
+                ):
+                    self._abort_reported_occ = occurrences
+                    self._abort_reported_at = now
                     logger.warning(
                         "cline worker %s: run aborted (cline reported %r); "
                         "no answer was produced",
                         self.terminal_id,
                         ABORT_LINE,
                     )
-                    return TerminalStatus.ERROR
+                if self._abort_reported_at is not None:
+                    if now - self._abort_reported_at < _ABORT_REPORT_HOLD_S:
+                        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                        status_monitor.schedule_detection_retry(
+                            self.terminal_id, delay_s=_ABORT_REPORT_HOLD_S
+                        )
+                        self._abort_retry_armed = True
+                        return TerminalStatus.ERROR
+                    # A reported abort closes without a reply to harvest.
+                    return TerminalStatus.IDLE
                 # Correlate session ID on first completion detection.
                 if self._session_id is None and self._message_count > 0:
                     self._session_id = self._correlate_session_id()

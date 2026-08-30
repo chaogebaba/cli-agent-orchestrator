@@ -15,7 +15,6 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.cline_cli import (
-    _ABORT_SCAN_LINES,
     ABORT_LINE,
     DISPATCHER_IDLE_CMD,
     ClineCliProvider,
@@ -186,7 +185,7 @@ class TestAbortStatusDetection:
         mock_backend.get_pane_current_command.return_value = DISPATCHER_IDLE_CMD
 
         # Simulated pane output with abort line.
-        output_lines = [
+        output_lines = ["authoritative filler"] * 46 + [
             "[run_commands] sleep 28; ssh box@cursor-1 'pgrep ...'",
             "   ⎿ ok",
             ABORT_LINE,
@@ -230,15 +229,16 @@ class TestAbortStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    def test_abort_line_beyond_scan_window_not_detected(self, provider: ClineCliProvider) -> None:
-        """ABORT_LINE more than _ABORT_SCAN_LINES back is NOT detected."""
+    def test_abort_line_anywhere_in_authoritative_buffer_is_detected(
+        self, provider: ClineCliProvider
+    ) -> None:
+        """The cumulative counting path has no sliding scan window."""
         provider._task_dispatched_flag = True
         provider._message_count = 1
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = DISPATCHER_IDLE_CMD
 
-        # Put the abort line far above the scan window, then pad with good output.
-        output_lines = [ABORT_LINE] + ["normal output line"] * (_ABORT_SCAN_LINES + 10)
+        output_lines = [ABORT_LINE] + ["normal output line"] * 60
         output = "\n".join(output_lines)
 
         with (
@@ -253,7 +253,7 @@ class TestAbortStatusDetection:
         ):
             status = provider.get_status(output)
 
-        assert status == TerminalStatus.COMPLETED
+        assert status == TerminalStatus.ERROR
 
     def test_abort_line_with_escape_sequences(self, provider: ClineCliProvider) -> None:
         """ABORT_LINE detection works even when wrapped in ANSI escapes."""
@@ -263,7 +263,7 @@ class TestAbortStatusDetection:
 
         # Simulate cline's dim styling: \x1b[2m prefix, \x1b[0m suffix.
         styled_abort = f"\x1b[2m{ABORT_LINE}\x1b[0m"
-        output = f"some output\n{styled_abort}\n"
+        output = "\n".join(["authoritative filler"] * 46 + [styled_abort])
 
         with patch(
             "cli_agent_orchestrator.providers.cline_cli.get_backend",

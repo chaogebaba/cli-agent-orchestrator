@@ -13,6 +13,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,19 @@ class EventBus:
         # {topic: (dropped_since_last_log, last_log_monotonic)}
         self._drop_counts: Dict[str, int] = {}
         self._drop_last_logged: Dict[str, float] = {}
+        self._drop_seq: Dict[str, int] = {}
+        self._drop_seq_lock = threading.Lock()
+
+    @staticmethod
+    def _drop_terminal_id(topic: str) -> str | None:
+        if not topic.startswith("terminal.") or topic.count(".") < 2:
+            return None
+        return terminal_id_from_topic(topic)
+
+    def get_drop_seq(self, terminal_id: str) -> int:
+        """Return the monotonic queue-drop level for one terminal."""
+        with self._drop_seq_lock:
+            return self._drop_seq.get(terminal_id, 0)
 
     def set_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
         """Register the asyncio event loop (required for thread-safe publishing).
@@ -124,6 +138,10 @@ class EventBus:
         for t in stale:
             self._drop_last_logged.pop(t, None)
             self._drop_counts.pop(t, None)
+            terminal_id = self._drop_terminal_id(t)
+            if terminal_id is not None:
+                with self._drop_seq_lock:
+                    self._drop_seq.pop(terminal_id, None)
 
     def _record_drop(self, topic: str) -> None:
         """Track a drop for ``topic`` and log a rate-limited summary.
@@ -135,6 +153,10 @@ class EventBus:
         ``_DROP_LOG_INTERVAL_SECS`` are counted and rolled up.
         """
         now = time.monotonic()
+        terminal_id = self._drop_terminal_id(topic)
+        if terminal_id is not None:
+            with self._drop_seq_lock:
+                self._drop_seq[terminal_id] = self._drop_seq.get(terminal_id, 0) + 1
 
         # Evict stale topics before inserting a new one so the maps stay bounded
         # even on a server that churns through thousands of short-lived
