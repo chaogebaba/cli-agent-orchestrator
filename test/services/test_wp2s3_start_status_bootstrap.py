@@ -603,7 +603,9 @@ def test_codex_seed_and_interactive_share_resolved_model_config(monkeypatch):
     captured = {}
     completed = SimpleNamespace(
         returncode=0,
-        stdout="session id: 12345678-1234-1234-1234-123456789abc\n",
+        # Real codex 0.151.0 emits the SEED_OK marker in its reply; the marker
+        # gate in seed_resume_identity (codex.py) requires it in stdout.
+        stdout="session id: 12345678-1234-1234-1234-123456789abc\nSEED_OK\n",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.codex.subprocess.run",
