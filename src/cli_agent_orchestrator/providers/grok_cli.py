@@ -103,6 +103,7 @@ class ProviderError(Exception):
 
 
 class GrokCliProvider(BaseProvider):
+    condition_provider_key = "grok_cli"  # F611 #467
     supports_fork_context = True
     supports_reauth_rebind = True
     """Provider for Grok Build's interactive CLI."""

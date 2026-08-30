@@ -1,0 +1,11 @@
+{
+  "provider": "claude_code",
+  "condition": "DIALOG_BLOCKED",
+  "subtype": "login_wizard",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/e3441b17.scrollback",
+  "source_line_range": "31-37",
+  "captured_at": "2026-08-29T05:43:48Z (scrollback mtime)",
+  "sha256": "822be4c2ff788ccf7acaee927579a7527d4458c88246697e7df884923dcfefe2",
+  "note": "login-method selection wizard (blocked dialog)"
+}

@@ -1,0 +1,8 @@
+• Ran 2 commands · ctrl + t to view transcript
+
+• Working (28s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  ~/VScode_projects/cli-subagents/cli-agent-orchestrator · main · gpt-5.6-sol high · Context 77% left · 5h 12% left

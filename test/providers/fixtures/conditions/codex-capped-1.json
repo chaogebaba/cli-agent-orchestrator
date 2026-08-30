@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "CAPPED",
+  "subtype": "usage_limit_hard",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/16073a9e.scrollback",
+  "source_line_range": "552-569",
+  "captured_at": "2026-08-30T04:31:05Z (scrollback mtime)",
+  "sha256": "94d1a3a979462481754df3c41e9c67932c5f196ee01980e4eaaa45417e92fde3",
+  "note": "usage-limit banner x2 (Try again later) around worker turns"
+}

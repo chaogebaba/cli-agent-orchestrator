@@ -1,0 +1,11 @@
+{
+  "provider": "cline_cli",
+  "condition": "PROC_EXITED",
+  "subtype": "command_exit_code",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/0b970e6c.scrollback",
+  "source_line_range": "72-75",
+  "captured_at": "2026-08-29T18:09:14Z (scrollback mtime)",
+  "sha256": "baedd3768dbc5fcda7ac0a71b63637042be002ab3ab36b98fa531e9863e479b9",
+  "note": "cline '[Command exited with code 2]' result row"
+}

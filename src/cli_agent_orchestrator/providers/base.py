@@ -331,6 +331,43 @@ class BaseProvider(ABC):
         """
         pass
 
+    # F611 (#467) D1: the condition-classifier provider key. A provider with a
+    # calibrated anchor table (blueprint §2.1) sets this to its ProviderType
+    # value ("codex", "kiro_cli", …); the default None means the provider ships
+    # no condition classifier yet and classify_condition returns None. This is a
+    # NEW read-time projection BESIDE get_status — it never feeds fuse_status.
+    condition_provider_key: str | None = None
+
+    def classify_condition(
+        self,
+        pane: str,
+        *,
+        proc_exited: bool = False,
+        host: str | None = None,
+        credential_plane: str | None = None,
+    ) -> "object | None":
+        """F611 D1/D2/D5: classify a provider condition from a pane buffer.
+
+        Returns a ``providers.condition.Condition`` (typed) or ``None`` when
+        nothing in the closed taxonomy matched. SEPARATE from ``get_status`` and
+        the frozen fusion plane — a condition is never a ``TerminalStatus``
+        member. Providers opt in by setting ``condition_provider_key``; the
+        shared engine owns the taxonomy so no provider re-implements an anchor
+        already cited in the blueprint §2.1 table.
+        """
+        key = type(self).condition_provider_key
+        if key is None:
+            return None
+        from cli_agent_orchestrator.providers.condition import classify_condition
+
+        return classify_condition(
+            pane,
+            key,
+            proc_exited=proc_exited,
+            host=host,
+            credential_plane=credential_plane,
+        )
+
     def rule3a_busy_marker(self, snapshot: str) -> bool | None:
         """F568 D12d busy-marker veto hook for rule 3a. Default: no signal.
 

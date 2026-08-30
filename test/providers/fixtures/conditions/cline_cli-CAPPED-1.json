@@ -1,0 +1,10 @@
+{
+ "provider": "cline_cli",
+ "condition": "CAPPED",
+ "subtype": "usage_limit_monthly",
+ "reset_hint_raw": "The limit resets in 6d 22h",
+ "source_path": "/data/cao-scratch/9064394e/smoke-logs/cline-pane.txt",
+ "captured_at": "2026-08-30T06:46Z",
+ "sha256": "95877860250f3f0ddaddcd67b5690e20018efdd0142beabc67cf953f7b83ab01",
+ "note": "AC15 smoke on grok-box-006, terminal b3251b0b; error: ClinePass limit reached; fills the INDEX GAP cline_cli x CAPPED; credential plane = grok-box-006 copied ~/.cline/data \u2014 laptop cline NOT capped at the same minute (SEED_OK). Detection must attribute CAPPED to the host/credential plane, not the provider globally."
+}

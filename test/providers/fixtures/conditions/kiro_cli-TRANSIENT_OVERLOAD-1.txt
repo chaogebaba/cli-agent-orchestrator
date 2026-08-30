@@ -1,0 +1,104 @@
+
+  This is a large surface. The blueprint gives me two options for the fix ("keep evaluating until the first IDLE/PROCESSING, or re-arm on the f524 stall surfacing"). Given scope discipline
+  (Do exactly what's asked; no drive-by), the minimal, well-attributed fix that matches the attribution is in _wait_for_auto_responder_dialog_clear: the polling lifetime ends prematurely.
+
+  But this is exactly the kind of change that needs care — it's a live delivery path. Before I write code, I need the AC8 arms. AC8 says: byte-exact fixture screens for BOTH F589 and F530 →
+  rule fires once, seat proceeds, cert record counts one occurrence; the F530 fixture is the pane captured 2026-08-29 18:20Z (currently NOT matched — test must fail on pre-fix matcher). Two
+  fires without clearing → waiting_user_answer.
+
+  Critical: the attribution says the matcher is correct and fires — it's the arming/timing that fails. But AC8 says "currently NOT matched — the test must fail on the pre-fix matcher." This
+  is a tension. Let me re-read the attribution's precise finding and check what the codex-dialog-blocked-1 fixture contains vs the in-tree trust.ansi.txt, and whether the existing rule
+  matches it.
+● Shell cd <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb && echo "===== codex-dialog-blocked-1.txt =====" && cat -A
+  /data/cao-scratch/9064394e/fixtures/conditions/codex-dialog-blocked-1.txt && echo "" && echo "===== .json =====" && cat
+  /data/cao-scratch/9064394e/fixtures/conditions/codex-dialog-blocked-1.json && echo "" && echo "===== in-tree trust.ansi.txt =====" && ls -la test/fixtures/codex_dialogs/ 2>/dev/null &&
+  sha256sum test/fixtures/codex_dialogs/trust.ansi.txt 2>/dev/null
+    ╰ run_in_background=false
+
+  There's a quoted-trust-stall.ansi.txt — that name matches the #386 scenario exactly (the F530 18:20Z stall). The blueprint's D21 note mentions the byte-exact 2026-08-29 18:20Z pane. Let me
+  check that fixture and the codex rules yaml to understand the matcher, and reconcile the AC8 "must fail on pre-fix matcher" tension with the attribution's "matcher is correct."
+
+  The key reconciliation: the AC8 fixture is the 18:20Z pane which is the stalled pane. The attribution replayed the 04:10Z recurrence (a different seat/time) where the rule DID fire. The
+  18:20Z pane may be a different render where the matcher genuinely fails on the composed region (dialog_region tail-composition — the leading hypothesis). Let me look at both the
+  quoted-trust-stall fixture and the codex auto-answers yaml.
+● Shell cd <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb && echo "===== quoted-trust-stall.ansi.txt (strip escapes view) =====" && python3 -c
+  "import re,sys; t=open('test/fixtures/codex_dialogs/quoted-trust-stall.ansi.txt','rb').read().decode('utf-8','replace'); print(re.sub(r'\x1b\[[0-9;?]*[A-Za-z]','',t))" && echo "=====
+  FIXTURE-SOURCES.md =====" && cat test/fixtures/codex_dialogs/FIXTURE-SOURCES.md
+    ╰ run_in_background=false
+
+  The quoted-trust-stall.ansi.txt is NOT the trust dialog — it's a codex agent transcript that quotes trust-regex source code (a red herring / false-positive guard fixture). This is the
+  "quoted" case that should NOT match.
+
+  The actual byte-exact 18:20Z trust-stall pane is the codex-dialog-blocked-1 fixture from the corpus (from seat 15a6fa21). That's the real F530 dialog: Do you trust the contents of this
+  directory? ... Trusting will apply to the repository root ... Press enter to continue.
+
+  Now let me look at the codex auto-answers rule and dialog_region/match_verdict to test whether it matches this fixture. This tells me whether the pre-fix defect is matcher (dialog_region
+  tail-composition) or arming. Let me read the codex.yaml rule and the dialog_region + match_verdict body.
+● Shell cd <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb && echo "=== find codex auto-answers yaml (repo seed + install) ===" && find . -path
+  '*/auto-answers/*' -name '*.yaml' 2>/dev/null; find . -name 'codex.yaml' 2>/dev/null | head; ls ~/.aws/cli-agent-orchestrator/auto-answers/ 2>/dev/null && echo "=== seed rules location ==="
+  && grep -rn "resume-workdir-card\|Trusting will apply\|trust the contents\|Press enter to continue\|repository root" src/ | grep -i "yaml\|seed\|rule" | head
+    ╰ run_in_background=false
+
+  The rule files live at ~/.aws/cli-agent-orchestrator/auto-answers/. Let me read the codex.yaml rules and the seed source (there may be a seeder module). Bounded search includes
+  ~/.aws/cli-agent-orchestrator, so this is allowed.
+● Shell cat ~/.aws/cli-agent-orchestrator/auto-answers/codex.yaml
+    ╰ run_in_background=false
+
+  Now I understand the matcher landscape precisely. There are TWO relevant rules for the F530 trust dialog:
+
+  - codex-trust-dir-card (regex Do\W+you\W+trust..., options=["continue"]) — matches the corpus fixture's Do you trust the contents of this directory? line + continue.
+  - codex-trust-dir-subdir (contains subdirectory of a Git project. Trusting will apply to the repository root, options=["Press enter to continue"]).
+
+  The corpus codex-dialog-blocked-1.txt contains BOTH: "subdirectory of a Git project. Trusting will apply to the repository root" AND "Do you trust the contents of this directory?" AND
+  "Press enter to continue". So the matcher should match.
+
+  The attribution (04:10Z) was about codex-resume-workdir-card, which fired. The AC8 F530 fixture (18:20Z) is the trust dialog. Per the attribution, the matcher is correct. So the AC8 "must
+  fail on pre-fix matcher" clause is genuinely in tension with the attribution.
+
+  This is a checkpoint. The attribution (supervisor-authorized, mid-2629 correction) explicitly overrides the blueprint's "matcher defect" framing and directs the fix at the polling lifetime.
+  The blueprint AC8 wording ("currently NOT matched — the test must fail on the pre-fix matcher") predates that correction. I must not invent a matcher bug to satisfy AC8's wording (the
+  attribution says so explicitly, and Do-NOT 26 requires the attribution to govern).
+
+  Let me verify empirically whether the current matcher matches the corpus fixture — this decides how I write the AC8 test (against the arming defect, not a matcher defect). Let me read
+  dialog_region, normalize_screen, match_verdict, and Rule.matches and run the matcher against the fixture.
+● Read <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb/src/cli_agent_orchestrator/services/auto_responder.py (L201-330)
+
+  DIALOG_REGION_LINES tail-composition is the leading hypothesis in the blueprint. The corpus fixture has the trust dialog followed by a startup card (OpenAI Codex (v0.150.1) box) — the
+  dialog text may be pushed OUT of the DIALOG_REGION_LINES tail by the card rows below it. That would be the matcher failing on tail-composition, consistent with AC8. But the attribution
+  replayed a different pane (04:10Z, resume-workdir-card) which fired.
+
+  I need empirical ground truth. Let me run the actual matcher against the corpus fixture to see whether it matches — this is the deciding evidence. I need the venv though. Let me check
+  DIALOG_REGION_LINES and match_verdict, then run the matcher inline by importing the module (pure logic, may work with stdlib + pyyaml only).
+● Read <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb/src/cli_agent_orchestrator/services/auto_responder.py (L717-836)
+
+  I now understand match_verdict: it computes dialog_region(lines) (no chrome patterns → default), matches rules against region.normalized. The critical question is whether the corpus
+  fixture's dialog text survives the DIALOG_REGION_LINES tail slice. Let me empirically run the matcher. First check if pyyaml is importable and DIALOG_REGION_LINES value.
+● Shell cd <REDACTED_HOME>/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb && grep -n "DIALOG_REGION_LINES\s*="
+  src/cli_agent_orchestrator/services/auto_responder.py && grep -n "^def canonicalize\b\|^def canonicalize_light\|def canonicalize" src/cli_agent_orchestrator/services/auto_responder.py |
+  head && python3 -c "import yaml; print('pyyaml OK', yaml.__version__)" 2>&1 | head -1
+    ╰ run_in_background=false
+
+  DIALOG_REGION_LINES = 20. The corpus fixture has ~26 lines (dialog + a big startup card box below). The dialog text ("Do you trust...", "Trusting will apply...") is in the TOP portion, and
+  the box card is at the BOTTOM. With a 20-line tail slice, the top dialog rows get pushed out — leaving only the card box in the region → no match. This is the tail-composition matcher
+  failure the blueprint predicted, and it's consistent with AC8 ("currently NOT matched").
+
+  But the attribution says the 04:10Z pane (resume-workdir-card) did fire. Both can be true: different panes compose differently. Let me get definitive empirical evidence by running the
+  actual matcher against the corpus fixture. Let me try importing the module (it may pull heavy deps; I'll try minimally).
+● Shell
+    Encountered unexpectedly high load when processing the request, please try again.
+
+▸ Credits: 13.89 • Time: 10m 6s
+
+● The model you've selected is experiencing a high volume of traffic. Try changing the model and re-running your prompt. (Request ID: 97d6ee28-a972-4835-8b3c-85dac47b1e08)
+
+● The model you've selected is experiencing a high volume of traffic. Try changing the model and re-running your prompt. (Request ID: 97d6ee28-a972-4835-8b3c-85dac47b1e08)
+ ◐ 8 tasks remaining · ctrl+x expand
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Trust All Tools active, confirmations are off · /quit to exit
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+kiro_dev · Auto · ◔ 18%                                                                   ~/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f582-sliceb · (cao/f582-sliceb)
+
+ ask a question or describe a task ↵
+                                                                                                                                                                            /copy to clipboard
+
+

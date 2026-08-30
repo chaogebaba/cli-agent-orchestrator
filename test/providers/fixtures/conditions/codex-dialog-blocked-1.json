@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "DIALOG_BLOCKED",
+  "subtype": "trust_dir_dialog",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/15a6fa21.scrollback",
+  "source_line_range": "16-33",
+  "captured_at": "2026-08-29T14:35:52Z (scrollback mtime)",
+  "sha256": "8332f9d8116ed3d97875bbcf83b844fe24066c3fd8f6891ec93ec855df138b35",
+  "note": "codex trust-dir dialog + startup card"
+}

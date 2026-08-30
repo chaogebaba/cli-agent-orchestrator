@@ -2919,6 +2919,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             status=initial_status,
+            condition=None,
             last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
         )
@@ -5770,6 +5771,9 @@ def get_terminal(terminal_id: str) -> Dict:
         status = status_monitor.get_status(terminal_id).value
         input_gen = status_monitor.get_input_gen(terminal_id)
         status_gen = status_monitor.get_status_gen(terminal_id)
+        # F611 (#467): live condition fleet field — a SEPARATE projection from
+        # status fusion (D1). None when no condition is detected.
+        condition = status_monitor.get_condition(terminal_id)
 
         result = {
             "id": metadata["id"],
@@ -5786,6 +5790,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,
+            "condition": condition,
             "input_gen": input_gen,
             "status_gen": 0 if status_gen is None else status_gen,
             "last_active": metadata["last_active"],

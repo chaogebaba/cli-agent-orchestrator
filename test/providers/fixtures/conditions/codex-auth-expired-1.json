@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "AUTH_EXPIRED",
+  "subtype": "token_refresh_failed",
+  "reset_hint_raw": "Please sign in again",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/b343aee0.scrollback",
+  "source_line_range": "203-221",
+  "captured_at": "2026-08-29T21:04:13Z (scrollback mtime)",
+  "sha256": "fb91dbb2e5b949896a319f271aad643a94c9c76cd0c158121e3c680e248de501",
+  "note": "refresh-fail banner x2 with composer"
+}

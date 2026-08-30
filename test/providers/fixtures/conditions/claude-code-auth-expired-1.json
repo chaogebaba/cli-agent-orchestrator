@@ -1,0 +1,11 @@
+{
+  "provider": "claude_code",
+  "condition": "AUTH_EXPIRED",
+  "subtype": "oauth_expired",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/d0c39c30.scrollback",
+  "source_line_range": "1460-1466",
+  "captured_at": "2026-08-28T08:50:54Z (scrollback mtime)",
+  "sha256": "3bb056fa1b3bd062a5ec462cd1b7d9501aa824fbdd1a44e6d5cebbf148e79429",
+  "note": "claude -p OAuth-expired on box (relayed in grok worker pane via box-run)"
+}
