@@ -15,17 +15,21 @@ acked ids. Named "F476 r3 build (blueprint r4)" to keep lineage honest.
 
 ## Worktree / branch / commits
 
-- **Worktree:** `/data/cao-scratch/60f65f33/f476-r4`
-- **Branch:** `cao/60f65f33` (pushed to origin as a scratch branch; never main)
-- **Base:** `e64684f9` (fork main HEAD at task start; note origin/main is *behind*
-  this at `b2814464` — a pre-existing local-ahead-of-origin state)
-- **HEAD:** `306178da2eb4f7c9f86e3ba4c76718f0b86d43cc`
-- Commits (on top of e64684f9):
-  - `0a411258` F476 r3 (#388): route deliver_pending push + WS doorbell through the wake cursor
-  - `c21ba8cd` F476 r3 (#388): black --line-length 100 formatting
-  - `306178da` F476 r3 (#388): update f158_doorbell_fallback + fx168_hotfix tests for cursor-routed wake
-- **Base ref pushed for A/B:** `cao/60f65f33-base` → `e64684f9` (deleted from boxes
-  after use; still on origin for audit).
+- **Worktree:** `/data/cao-scratch/60f65f33/f476-r4` (branch `cao/60f65f33`)
+- **Branch:** `cao/60f65f33` (pushed to origin as a scratch branch; never main; no PR)
+- **Base:** `718849a4` (fork main after F613 + SEED_OK merged; REBASED onto this from
+  the original build base `e64684f9` — rebase was clean, zero conflicts)
+- **HEAD:** `5fe336279bdbe322982cf3d81b7ecdecbae820b1`
+- Original build base (pre-rebase): `e64684f9`; original pre-rebase HEAD: `6d5c6c61`.
+- Commits (on top of base):
+  - `684f705f` F476 r3 (#388): route deliver_pending push + WS doorbell through the wake cursor
+  - `1321206f` F476 r3 (#388): black --line-length 100 formatting
+  - `623ef641` F476 r3 (#388): update f158_doorbell_fallback + fx168_hotfix tests for cursor-routed wake
+  - `97c93f81` F476 r3 (#388): build report
+  - `5fe33627` F476 r3 (#388): build report — correct new-test count
+  (SHAs above are post-rebase onto 718849a4.)
+- **Base ref pushed for A/B:** `cao/60f65f33-base` → `e64684f9` (original build base;
+  used for the pre-rebase same-box A/B; still on origin for audit).
 
 ## Contract implemented
 
@@ -110,6 +114,20 @@ Tests (6):
 
 ## Verification (ALL on grok boxes via scripts/box-run.sh — laptop suites forbidden)
 
+### Post-rebase re-verification (base 718849a4, HEAD 5fe33627) — grok-box-002
+
+After rebasing onto fork main `718849a4` (F613 + SEED_OK), re-ran on grok-box-002
+via box-run.sh (label `f476r3-rebased`), targeted set = new test file + the 6
+updated test files + `test_f158_doorbell_fallback.py` + `test_fx168_hotfix.py` +
+`test/services/test_inbox_service.py`:
+- **Targeted tests: 115 passed** (0 failed).
+- **black --line-length 100 --check: PASS** (12 files unchanged).
+- **isort --profile black --line-length 100 --check-only: PASS** (clean).
+Rebase was clean (zero conflicts); no regression in the touched area against the
+new base.
+
+### Original full-suite verification (pre-rebase, base e64684f9, HEAD 306178da)
+
 Boxes used: **grok-box-002** (fmt/mypy/targeted A/B), **grok-box-004** (final full
 suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
 
@@ -157,8 +175,11 @@ suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
     error detail of the base-drift failures.
   - `f476r3-truebase` (box-002) — the 15 failing tests at TRUE base e64684f9
     (`cao/60f65f33-base`): 8 fail / 11 pass (proves the 8 pre-exist).
-  - `f476r3-suite2` (box-004) — final full test/services run at HEAD 306178da:
-    8 fail / 7165 pass (only the pre-existing 8).
+  - `f476r3-suite2` (box-004) — final full test/services run at pre-rebase HEAD
+    306178da: 8 fail / 7165 pass (only the pre-existing 8).
+  - `f476r3-rebased` (box-002) — post-rebase (base 718849a4, HEAD 5fe33627):
+    targeted set (new file + 6 updated + f158_doorbell_fallback + fx168_hotfix +
+    test_inbox_service.py) = 115 passed; black --check + isort --check PASS.
 - **raw ssh:** none (all via box-run.sh).
 - **checkout SHA left on boxes:** box-002 and box-004 each left at
   `cao/60f65f33` (306178da), clean; temp probe branches (`_base_probe`,
@@ -177,7 +198,23 @@ suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
      satisfied (no such artifact); scope was re-confirmed with the supervisor
      (decision: option A) before building.
 
-## Laptop-suite steer compliance
+## Laptop-load / work-location compliance
 
-Local `.venv` deleted; local suite run was killed per the user order. All suites,
-black/isort, and mypy after the steer ran on grok boxes via scripts/box-run.sh.
+Local `.venv` deleted; verified NO `.venv` remains anywhere under
+`/data/cao-scratch/60f65f33`. No pytest/mypy/uv process ran on the laptop after the
+steer (the only such processes observed were OTHER lanes' box-run.sh jobs). All
+suites, black/isort, and mypy ran on grok boxes via scripts/box-run.sh.
+
+Work-location contract honored:
+- Code + commits: the `cao/60f65f33` worktree at
+  `/data/cao-scratch/60f65f33/f476-r4` (the supervisor's rebase command targeted
+  this exact path).
+- Scratch + this report: under `/data/cao-scratch/60f65f33/` only.
+- Boxes used: **grok-box-002** (fmt/mypy/targeted A/B + post-rebase re-verify),
+  **grok-box-004** (pre-rebase full suite). grok-box-1 never used; grok-box-3 was
+  unreachable/auto-suspended and skipped.
+- Paths written under (laptop): `/data/cao-scratch/60f65f33/f476-r4/` (worktree
+  tree: source edits, test files, `f476-r3-build-report.md`). Nothing written
+  outside `/data/cao-scratch/60f65f33/`.
+- Paths written on boxes: `/tmp/f476r3-*.txt`, `/tmp/f619|f620` (other lanes),
+  box `.venv` via `uv sync` (from committed lockfile).
