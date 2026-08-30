@@ -73,7 +73,27 @@ id; an acked/aged id yields `written==0` → zero WS, zero native.
 `api/main.py` already only called `request_delivery` (F158-R3 removed its
 redundant WS push); its stale comments were updated.
 
-## Files changed (vs base e64684f9)
+## Files changed — `git diff --name-status 718849a4..9e7c408b` (13 paths, verbatim)
+
+```
+A	f476-r3-build-report.md
+M	src/cli_agent_orchestrator/api/main.py
+M	src/cli_agent_orchestrator/clients/database.py
+M	src/cli_agent_orchestrator/services/inbox_service.py
+M	src/cli_agent_orchestrator/services/mailbox_service.py
+M	test/services/test_f158_doorbell_fallback.py
+M	test/services/test_f158_r2_doorbell_regression.py
+M	test/services/test_f158_r5_e2e_doorbell_race.py
+M	test/services/test_f413_orm_listeners.py
+M	test/services/test_f457_r2_gate_fixes.py
+M	test/services/test_f457_wake_gate_dedupe.py
+A	test/services/test_f476_r3_bypass_closure.py
+M	test/services/test_fx168_hotfix.py
+```
+
+That is **4 source (M) + 8 test files (7 M + 1 A) + 1 report (A) = 13 paths.**
+(Correction from an earlier draft that said "6 updated tests": the true count is 7
+MODIFIED test files + 1 NEW = 8 test files; `test_fx168_hotfix.py` is the 8th.)
 
 Source (4):
 - `src/cli_agent_orchestrator/services/inbox_service.py` — deliver_pending gate →
@@ -86,13 +106,64 @@ Source (4):
 - `src/cli_agent_orchestrator/api/main.py` — comment accuracy only (behavior already
   request_delivery-only).
 
-Tests (6):
-- `test/services/test_f476_r3_bypass_closure.py` (NEW) — 10 tests (see below).
-- Updated to the r3 contract (blueprint Test-break list — old-behavior pins):
+Test files (8):
+- `test/services/test_f476_r3_bypass_closure.py` (NEW/A) — 10 tests (see below).
+- Updated (M) to the r3 contract (blueprint Test-break list — old-behavior pins):
   `test_f413_orm_listeners.py`, `test_f158_r2_doorbell_regression.py`,
   `test_f158_r5_e2e_doorbell_race.py`, `test_f158_doorbell_fallback.py`,
   `test_f457_r2_gate_fixes.py`, `test_f457_wake_gate_dedupe.py`,
-  `test_fx168_hotfix.py`.
+  `test_fx168_hotfix.py` (7 files).
+
+Report (1, A): `f476-r3-build-report.md`.
+
+## Mutation recipe (reproducible — apply, run the node, revert)
+
+Each mutant below is a single content-anchored edit on `HEAD 9e7c408b`
+(`src/cli_agent_orchestrator/services/inbox_service.py` unless noted). Apply with
+the `python -c` snippet (portable across the line drift a reviewer's checkout may
+have), run the named pytest node, confirm it goes **RED**, then revert with
+`git checkout -- <file>`. Run from the fork root
+(`~/cli-subagents/cli-agent-orchestrator`) on a box, e.g.
+`uv run pytest "<node>" -q -p no:cacheprovider`.
+
+**M1 — drop the wake-cursor advance** (the commit_wake `through_id`): the runner
+must advance `callback_notified_through_id` to the forward high-water. Force it to
+0 so the cursor never moves:
+```
+python -c "import pathlib,re; f=pathlib.Path('src/cli_agent_orchestrator/services/inbox_service.py'); s=f.read_text(); s=s.replace('through_id = forward_high_water if forward_high_water > 0 else claim.claimed_high_water','through_id = 0  # MUTANT M1',1); f.write_text(s)"
+```
+- MUST go RED: `test/services/test_f476_r3_bypass_closure.py::TestMutantLedger::test_real_commit_advances_cursor_mutant_baseline`
+  (asserts `_cursor(...) == 1`; under the mutant the cursor stays 0).
+- Also caught by: `...::TestAckedIdNeverReemitted::test_bridge_replay_of_acked_ids_zero_emits`
+  and `...::TestOneWakePerIdNative::test_second_run_same_row_no_reemit` (a cursor
+  that never advances re-emits acked/replayed ids).
+
+**M2 — emit on BOTH surfaces** (remove the `not outcome._ws_fired` guard in
+`_f136_post_delivery`): the native ring must be suppressed when WS already fired.
+Drop the guard so native is submitted even after WS won:
+```
+python -c "import pathlib; f=pathlib.Path('src/cli_agent_orchestrator/services/inbox_service.py'); s=f.read_text(); s=s.replace('if outcome.written > 0 and outcome.max_written_row_id > 0 and not outcome._ws_fired:','if outcome.written > 0 and outcome.max_written_row_id > 0:  # MUTANT M2',1); f.write_text(s)"
+```
+- MUST go RED: `test/services/test_f476_r3_bypass_closure.py::TestMutantLedger::test_mutant_emit_on_both_surfaces_is_red`
+  (asserts WS∩native == ∅ and exactly one transport; the mutant puts the id on both
+  probes).
+- Also caught by: `...::TestOneWakePerIdWsWins::test_ws_fires_native_suppressed`
+  and `test/services/test_f158_r5_e2e_doorbell_race.py::TestF158R5RealF136PostDelivery::test_ws_delivered_suppresses_coalesce_submit`.
+
+**M3 — restore the deliver_pending bypass** (the pull-mode gate must route through
+the cursor via `request_delivery`, not signal nothing / push directly). Neuter the
+routing call so the gate no longer wakes through the cursor:
+```
+python -c "import pathlib; f=pathlib.Path('src/cli_agent_orchestrator/services/inbox_service.py'); s=f.read_text(); s=s.replace('                    request_delivery(terminal_id)\n','                    pass  # MUTANT M3 (dropped request_delivery)\n',1); f.write_text(s)"
+```
+(The anchor `                    request_delivery(terminal_id)` occurs exactly ONCE
+in the file — the deliver_pending pull-mode gate — so `count=1` is unambiguous;
+`git diff` will show only that line changed.)
+- MUST go RED: `test/services/test_fx168_hotfix.py::TestFix4DeadD9Removed::test_deliver_pending_mailbox_pull_no_doorbell`
+  and `test/services/test_f457_r2_gate_fixes.py::TestS1FailOpenDbError::test_pull_gate_routes_through_request_delivery`
+  (both assert `request_delivery` is called once from the gate).
+
+Revert any mutant: `git checkout -- src/cli_agent_orchestrator/services/inbox_service.py`.
 
 ## New tests (test_f476_r3_bypass_closure.py) — drive the real runner
 
@@ -126,7 +197,42 @@ updated test files + `test_f158_doorbell_fallback.py` + `test_fx168_hotfix.py` +
 Rebase was clean (zero conflicts); no regression in the touched area against the
 new base.
 
-### Original full-suite verification (pre-rebase, base e64684f9, HEAD 306178da)
+### AUTHORITATIVE S1 — post-rebase full-suite same-box A/B (grok-box-002)
+
+Both sides run on the SAME box (grok-box-002), `uv run pytest test/services/ -q`,
+captured once each:
+
+| side | commit | result |
+|------|--------|--------|
+| BASE | `718849a4` | **9 failed, 7154 passed**, 19 skipped, 3 xfailed |
+| HEAD | `9e7c408b` | **9 failed, 7164 passed**, 19 skipped, 3 xfailed |
+
+Delta: **+10 passes** (exactly this build's 10 new tests in
+`test_f476_r3_bypass_closure.py`), **+0 failures**. The failing set is **byte-identical
+across base and HEAD** — 9 nodes:
+
+```
+test/services/test_f516_d2.py::test_d2_fast_path_waiting_fires_on_first_eval
+test/services/test_f516_fixtures.py::test_chooser_fixtures_render_the_resume_cwd_dialog_in_region
+test/services/test_session_brief_contract.py::test_absent_field_keeps_generated_settings_literal_bytes
+test/services/test_stage0_flip_machinery.py::test_trace_manifest_is_byte_exact_and_has_36_hits
+test/services/test_stage0b_receiver_evidence.py::test_d6_auto_responder_publishes_full_frame_then_reclassifies_region[False]
+test/services/test_stage0b_receiver_evidence.py::test_d6_auto_responder_publishes_full_frame_then_reclassifies_region[True]
+test/services/test_wp2s3_start_status_bootstrap.py::test_codex_seed_and_interactive_share_resolved_model_config
+test/services/test_wp_watchdog_delegation.py::test_legacy_inbox_migration_and_null_park_warm_are_false
+test/services/test_wpdt_delivery_truth.py::TestAC7DoctrineArmingStep::test_doctrine_arming_section_exists
+```
+
+This matches the EMPIRICAL gate's own observation (7164/7154, identical 9-node set,
+incl. the `wp2s3` SEED_OK stub introduced by the 718849a4 base). Every failure is
+present at the base 718849a4 and is therefore NOT introduced by this build; my diff
+(4 src + 8 test files) references none of the failing tests' code paths
+(expire_after_s / _migrate_ / session_brief / auto_responder / park_warm / SEED_OK
+model resolution). box-run labels: `f476r3-ab-head`, `f476r3-ab-base`.
+
+### Historical full-suite verification (pre-rebase, base e64684f9, HEAD 306178da)
+
+Superseded by the post-rebase A/B above; retained for the record.
 
 Boxes used: **grok-box-002** (fmt/mypy/targeted A/B), **grok-box-004** (final full
 suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
@@ -139,22 +245,16 @@ suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
   - `services/inbox_service.py`: 57 → 57 (unchanged)
   - My edited line ranges in inbox_service.py produce ZERO mypy errors. Pre-existing
     errors are SQLAlchemy `Column[...]` typing noise in unrelated functions.
-  - **Net new mypy --strict errors introduced: 0.**
+  - **Net new mypy --strict errors introduced: 0.** (NOTE: the EMPIRICAL gate flagged
+    S2 mypy parity as the reviewer's own incomplete re-run — box contention + command
+    quoting — to be re-run by a fresh reviewer; the numbers above are this build's
+    pre-rebase measurement and should be re-confirmed at HEAD 9e7c408b.)
 - **test/services/ full suite** at HEAD 306178da (grok-box-004):
-  **8 failed, 7165 passed, 19 skipped, 3 xfailed** (191s).
-  - All 8 failures are PRE-EXISTING at base e64684f9 (verified same-box A/B: the same
-    8 fail at `cao/60f65f33-base`): `test_f516_d2`, `test_f516_fixtures`,
-    `test_session_brief_contract`, `test_stage0_flip_machinery`,
-    `test_stage0b_receiver_evidence[False/True]`, `test_wp_watchdog_delegation`,
-    `test_wpdt_delivery_truth::...doctrine_arming`. Root causes observed:
-    hook-count fixture drift, `sqlite3.OperationalError: no such column:
-    inbox.expire_after_s` (F578 migration in the test's own DB setup), byte-exact
-    trace-manifest drift, missing `doctrine/sections/shared/ws-arming.md`, tmux
-    region rendering. My commits touch NONE of these code paths (diff vs e64684f9
-    is 4 source + 6 test files; references zero of expire_after_s/_migrate_/
-    session_brief/auto_responder/park_warm).
+  **8 failed, 7165 passed, 19 skipped, 3 xfailed** (191s). (Pre-rebase base
+  e64684f9 had a different failing set — the F578 `expire_after_s` migration and
+  base drift; superseded by the post-rebase 9-node A/B above.)
   - All tests affected by MY change pass (f158_doorbell_fallback, fx168_hotfix,
-    f158_r2, f158_r5, f457×2, f413, and the 11 new r3 tests).
+    f158_r2, f158_r5, f457×2, f413, and the 10 new r3 tests).
 
 ## Box-actions ledger
 
@@ -178,12 +278,17 @@ suite). box-1 never used; box-3 was unreachable/auto-suspended and skipped.
   - `f476r3-suite2` (box-004) — final full test/services run at pre-rebase HEAD
     306178da: 8 fail / 7165 pass (only the pre-existing 8).
   - `f476r3-rebased` (box-002) — post-rebase (base 718849a4, HEAD 5fe33627):
-    targeted set (new file + 6 updated + f158_doorbell_fallback + fx168_hotfix +
-    test_inbox_service.py) = 115 passed; black --check + isort --check PASS.
+    targeted set (new file + 7 updated + test_inbox_service.py) = 115 passed;
+    black --check + isort --check PASS.
+  - `f476r3-ab-head` (box-002) — post-rebase full test/services at HEAD 9e7c408b:
+    9 failed / 7164 passed (AUTHORITATIVE S1 head side).
+  - `f476r3-ab-base` (box-002) — post-rebase full test/services at base 718849a4:
+    9 failed / 7154 passed (AUTHORITATIVE S1 base side; identical 9-node set → my
+    build adds +10 passes, 0 new failures).
 - **raw ssh:** none (all via box-run.sh).
-- **checkout SHA left on boxes:** box-002 and box-004 each left at
-  `cao/60f65f33` (306178da), clean; temp probe branches (`_base_probe`,
-  `cao/60f65f33-base`) deleted on the box after use.
+- **checkout SHA left on boxes:** box-002 and box-004 left at `cao/60f65f33` HEAD,
+  clean; temp probe branches (`_base_probe`, `_ab_base`, `cao/60f65f33-base`)
+  deleted on the box after use.
 - **env mutations:** `uv sync --group dev` created/updated the box `.venv` from the
   committed lockfile (no lockfile change). No apt/pip/version bumps.
 - **temp files on box:** `/tmp/f476r3-suite-run.txt`, `/tmp/f476r3-suite2.txt`,
