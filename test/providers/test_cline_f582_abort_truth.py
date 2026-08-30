@@ -235,9 +235,9 @@ def test_monitor_carries_no_abort_evidence_state() -> None:
         source,
     )
     forbidden_found = [name for name in forbidden if name not in allowed_abort_names]
-    assert forbidden_found == [], (
-        f"monitor gained forbidden abort-evidence name(s): {sorted(set(forbidden))} (Do-NOT 27)"
-    )
+    assert (
+        forbidden_found == []
+    ), f"monitor gained forbidden abort-evidence name(s): {sorted(set(forbidden))} (Do-NOT 27)"
 
 
 def test_abort_1_fixture_is_the_accepted_sub_floor_residual(
