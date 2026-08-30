@@ -3,7 +3,7 @@ Reading additional input from stdin...
 2026-07-13T06:51:40.690673Z ERROR codex_models_manager::manager: failed to refresh available models: stream disconnected before completion: failed to decode models response: missing field `models` at line 1 column 1118; body: {"data":[{"id":"gpt-5.5-openai-compact","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.4-mini","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.4","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.4-openai-compact","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.6-terra","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.6-luna","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"codex-auto-review","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.5","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]},{"id":"gpt-5.6-sol","object":"model","created":1626777600,"owned_by":"openai","supported_endpoint_types":["openai"]}],"object":"list","success":true}
 OpenAI Codex v0.144.1
 --------
-workdir: /home/chao/VScode_projects/cli-subagents/tmp/orch/drain-wp2s3/scratch/c1-prodseed2
+workdir: /home/user/VScode_projects/cli-subagents/tmp/orch/drain-wp2s3/scratch/c1-prodseed2
 model: gpt-5.6-sol
 provider: custom
 approval: never

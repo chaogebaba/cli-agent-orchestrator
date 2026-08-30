@@ -1,5 +1,5 @@
 Run Grok Build in a project directory?
 
-  Use current directory: /home/chao/project
+  Use current directory: /home/user/project
 
   Enter:submit   Esc:cancel

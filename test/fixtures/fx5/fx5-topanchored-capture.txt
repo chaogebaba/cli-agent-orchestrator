@@ -7,7 +7,7 @@
 │                                                               ⠐⠁⠀⠈⠉⠉⠉⠀⠀⠀                                                                │
 │                                                                                                                                         │
 │ Grok Build  v0.2.93                                                                                                                     │
-│ /home/chao/VScode_projects/cli-subagents                                                                                                │
+│ /home/user/VScode_projects/cli-subagents                                                                                                │
 │ Model · Grok 4.5                                                                                                                        │
 │ /help for commands                                                                                                                      │
 │                                                                                                                                         │

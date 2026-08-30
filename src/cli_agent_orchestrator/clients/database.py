@@ -378,6 +378,13 @@ class InboxModel(Base):
     owner_generation = deferred(Column(Integer, nullable=True))
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
+    # F578 D23: opt-in per-message delivery controls. Both default NULL and a
+    # row without them behaves byte-identically to today. `expire_after_s` is a
+    # seconds offset from created_at after which an undelivered row transitions
+    # to `expired` (never delivered). `supersede_key` scopes supersession within
+    # a (receiver, key): a newer pending row expires earlier undelivered peers.
+    expire_after_s = deferred(Column(Integer, nullable=True))
+    supersede_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     __table_args__ = (Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),)
 
@@ -3803,10 +3810,60 @@ def read_terminal_system_metadata(terminal_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _CHILDREN_LEDGER_KEY = "children"
+# F579 D17: the ledger MIGRATES from the free-form top-level key into the
+# reserved system namespace ``metadata_json["cao"]["children"]`` so worker
+# full-replace (update_terminal_metadata) can never clobber it. The free-form
+# key name is retained ONLY as the sub-key inside the ``cao`` namespace and as
+# the pre-migration fallback both readers still consult.
+# The release path is idempotent per stop event: each successful pop stamps its
+# opaque ``release_token`` (the observability id the hook always carries, e.g.
+# a SubagentStop ``agent_id``) into a bounded sibling ring at
+# ``metadata_json["cao"]["children_released"]`` — a re-fired stop whose token is
+# already in the ring is a no-op (cannot pop a live child).
+_CHILDREN_RELEASED_KEY = "children_released"
+_CHILDREN_RELEASED_RING_MAX = 16
 # Default staleness bound. Deliberately generous: a legitimate in-harness Agent
 # can run for many minutes (the motivating incident had a 10+ min subagent). The
 # bound only exists so a MISSED release cannot pin the row indefinitely.
 _CHILDREN_LEDGER_MAX_AGE_S = 3600.0
+
+
+def _read_children_ledger(terminal_id: str) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Return ``(children, released_ring)`` from the migrated ``cao`` namespace,
+    falling back to the pre-migration free-form ``metadata_json["children"]``
+    for rows written before D17. Malformed/absent → empty lists."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal or not terminal.metadata_json:
+            return [], []
+        try:
+            meta = _json.loads(str(terminal.metadata_json))
+        except (ValueError, TypeError):
+            return [], []
+        if not isinstance(meta, dict):
+            return [], []
+        cao_ns = meta.get(_SYSTEM_KEY)
+        children_raw: Any = None
+        released_raw: Any = None
+        if isinstance(cao_ns, dict) and _CHILDREN_LEDGER_KEY in cao_ns:
+            children_raw = cao_ns.get(_CHILDREN_LEDGER_KEY)
+            released_raw = cao_ns.get(_CHILDREN_RELEASED_KEY)
+        else:
+            # Pre-migration fallback: read the old free-form top-level key.
+            children_raw = meta.get(_CHILDREN_LEDGER_KEY)
+        children = (
+            [e for e in children_raw if isinstance(e, dict)]
+            if isinstance(children_raw, list)
+            else []
+        )
+        released = (
+            [t for t in released_raw if isinstance(t, str)]
+            if isinstance(released_raw, list)
+            else []
+        )
+        return children, released
 
 
 def _children_ledger_max_age_s() -> float:
@@ -3857,11 +3914,13 @@ def register_terminal_child(
 ) -> Optional[int]:
     """Append one ``{id, started_at}`` entry to the terminal's children ledger.
 
-    Returns the new children count, or ``None`` if the terminal does not exist.
-    Idempotent on ``child_id``: a duplicate ``PreToolUse`` edge for the same
-    dispatch does not double-count. Prunes stale entries first (staleness bound).
+    D17: writes through :func:`merge_terminal_system_metadata` into
+    ``metadata_json["cao"]["children"]`` (a system-namespace RMW that a
+    concurrent worker full-replace cannot lose). Returns the new children count,
+    or ``None`` if the terminal does not exist. Idempotent on ``child_id``: a
+    duplicate ``PreToolUse`` edge for the same dispatch does not double-count.
+    Prunes stale entries first (staleness bound).
     """
-    import json as _json
     import time as _time
 
     now_ts = _time.time() if started_at is None else float(started_at)
@@ -3869,61 +3928,140 @@ def register_terminal_child(
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             return None
-        meta = _load_free_form_metadata(terminal)
-        raw = meta.get(_CHILDREN_LEDGER_KEY)
-        children: List[Dict[str, Any]] = list(raw) if isinstance(raw, list) else []
-        children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
-        if not any(isinstance(e, dict) and e.get("id") == child_id for e in children):
-            children.append({"id": child_id, "started_at": now_ts})
-        meta[_CHILDREN_LEDGER_KEY] = children
-        terminal.metadata_json = _json.dumps(meta)
-        db.commit()
-    invalidate_terminal_metadata_cache(terminal_id)
+    children, released = _read_children_ledger(terminal_id)
+    children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+    if not any(isinstance(e, dict) and e.get("id") == child_id for e in children):
+        children.append({"id": child_id, "started_at": now_ts})
+    ok = merge_terminal_system_metadata(
+        terminal_id,
+        {_CHILDREN_LEDGER_KEY: children, _CHILDREN_RELEASED_KEY: released},
+    )
+    if not ok:
+        return None
     return len(children)
 
 
-def release_terminal_child(terminal_id: str, child_id: Optional[str] = None) -> Optional[int]:
-    """Remove one entry from the terminal's children ledger.
+def release_terminal_child(
+    terminal_id: str, child_id: Optional[str] = None, release_token: Optional[str] = None
+) -> Optional[int]:
+    """Remove one entry from the terminal's children ledger (D17).
 
-    Returns the new children count, or ``None`` if the terminal does not exist.
-    When ``child_id`` is given the matching entry is removed; a ``SubagentStop``
-    that carries no reliable id (id fields vary across Claude Code versions)
-    passes ``None`` and the OLDEST entry is popped — count-correct because Claude
-    Code pairs each dispatch with exactly one stop. A release with no matching
-    entry (empty ledger, unknown id) is a no-op that still returns the count.
+    Writes through :func:`merge_terminal_system_metadata` into
+    ``metadata_json["cao"]["children"]``. Returns the new children count, or
+    ``None`` if the terminal does not exist.
+
+    Idempotency (P-B = release-lost by id mismatch): ``release_token`` is the
+    opaque observability id the hook always carries (a ``SubagentStop``
+    ``agent_id``). A release whose token is already recorded in the sibling ring
+    ``metadata_json["cao"]["children_released"]`` is a **no-op** (logs
+    ``children_release_duplicate``) — a re-fired ``SubagentStop`` can never pop a
+    live child. A first-seen token is stamped into the ring (bounded to the last
+    ``_CHILDREN_RELEASED_RING_MAX``) alongside the pop.
+
+    Matching: when ``child_id`` names a live entry it is removed; otherwise (no
+    id, or an id in a namespace no entry carries — the exact P-B failure) the
+    OLDEST entry is popped and ``children_release_unmatched`` is logged. A
+    release can never leave the count unchanged while entries exist. The emptied
+    ledger is written as ``[]`` (never by nulling the column — that would destroy
+    the whole ``cao`` namespace, ``children_released`` included).
     """
-    import json as _json
     import time as _time
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             return None
-        meta = _load_free_form_metadata(terminal)
-        raw = meta.get(_CHILDREN_LEDGER_KEY)
-        children: List[Dict[str, Any]] = (
-            [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    children, released = _read_children_ledger(terminal_id)
+    children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+
+    # Idempotent per stop event: a token already in the ring is a no-op.
+    if release_token is not None and release_token in released:
+        logger.info(
+            "children_release_duplicate terminal=%s token=%s count=%d",
+            terminal_id,
+            release_token,
+            len(children),
         )
-        children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+        merge_terminal_system_metadata(
+            terminal_id,
+            {_CHILDREN_LEDGER_KEY: children, _CHILDREN_RELEASED_KEY: released},
+        )
+        return len(children)
+
+    popped = False
+    if child_id is not None:
+        for idx, entry in enumerate(children):
+            if entry.get("id") == child_id:
+                del children[idx]
+                popped = True
+                break
+    if not popped and children:
+        # No matching id (or none supplied) — pop the oldest (count-correct).
+        oldest = min(range(len(children)), key=lambda i: children[i].get("started_at", 0.0))
+        del children[oldest]
+        popped = True
         if child_id is not None:
-            for idx, entry in enumerate(children):
-                if entry.get("id") == child_id:
-                    del children[idx]
-                    break
-        elif children:
-            # No id: pop the oldest by started_at (FIFO), count-correct pairing.
-            oldest = min(
-                range(len(children)),
-                key=lambda i: children[i].get("started_at", 0.0),
+            logger.info(
+                "children_release_unmatched terminal=%s child_id=%s count=%d",
+                terminal_id,
+                child_id,
+                len(children),
             )
-            del children[oldest]
-        if children:
-            meta[_CHILDREN_LEDGER_KEY] = children
-        else:
-            meta.pop(_CHILDREN_LEDGER_KEY, None)
-        terminal.metadata_json = _json.dumps(meta) if meta else None
-        db.commit()
-    invalidate_terminal_metadata_cache(terminal_id)
+
+    if popped and release_token is not None:
+        released = [*released, release_token][-_CHILDREN_RELEASED_RING_MAX:]
+
+    ok = merge_terminal_system_metadata(
+        terminal_id,
+        {_CHILDREN_LEDGER_KEY: children, _CHILDREN_RELEASED_KEY: released},
+    )
+    if not ok:
+        return None
+    return len(children)
+
+
+def reconcile_children_on_publish(
+    terminal_id: str, published_status: str, non_processing_streak: int, k_ticks: int
+) -> Optional[int]:
+    """F579 D17 prune conjuncts, run on every status publish for the terminal.
+
+    Two additions over the register/release-edge age-out (`_prune_stale_children`):
+      (i)  NEW TRIGGER — the same age-out runs here, so a seat with a lost
+           ``SubagentStop`` and no further ledger edges is still reconciled (the
+           firing-15 defect).
+      (ii) NEW CONJUNCT — when the seat has published a NON-PROCESSING status for
+           at least ``k_ticks`` consecutive ticks (D3's K), ALL entries are
+           dropped regardless of age, so a lost ``SubagentStop`` cannot pin a seat
+           at ``delegating``. A seat still PROCESSING (or under the K threshold)
+           is NEVER cleared here — a live long delegation past ``max_age_s`` is
+           not dropped by this path (the age-out alone governs that).
+
+    Returns the new children count, or ``None`` if the terminal does not exist or
+    has no ledger to touch (no write taken in that case — this path must be a
+    zero-cost no-op for the overwhelming majority of publishes that have no
+    children). The emptied ledger is written as ``[]`` (never nulled).
+    """
+    import time as _time
+
+    children, released = _read_children_ledger(terminal_id)
+    if not children:
+        # Zero-cost: no ledger, no write. (A row with children_released but no
+        # children keeps its ring untouched.)
+        return 0
+    before = len(children)
+    if published_status != TerminalStatus.PROCESSING.value and non_processing_streak >= k_ticks:
+        children = []
+    else:
+        children = _prune_stale_children(children, _time.time(), _children_ledger_max_age_s())
+    if len(children) == before:
+        # No change — avoid a needless write/cache-evict.
+        return before
+    ok = merge_terminal_system_metadata(
+        terminal_id,
+        {_CHILDREN_LEDGER_KEY: children, _CHILDREN_RELEASED_KEY: released},
+    )
+    if not ok:
+        return None
     return len(children)
 
 
@@ -5877,6 +6015,63 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
+def list_expired_pending_rows(now: datetime | None = None) -> List[int]:
+    """F578 D23: PENDING row ids whose per-row expiry has elapsed.
+
+    A row expires when it carries a non-NULL ``expire_after_s`` and
+    ``created_at + expire_after_s < now``. PENDING only, ALL receivers — this is
+    a per-row absolute-deadline pass, NOT gated by the receiver loop's
+    ``INBOX_RECONCILE_GRACE_SECONDS`` (that grace is a delivery re-attempt guard
+    and must not gate expiry). Returns row ids so the caller transitions each to
+    ``expired`` (audit-visible, never delivered). Rows without ``expire_after_s``
+    are never returned (opt-in; byte-identical to today).
+    """
+    now_ts = _utcnow() if now is None else now
+    # created_at is naive-UTC-at-rest; normalise both sides to naive UTC so the
+    # comparison never mixes aware/naive (TypeError).
+    if now_ts.tzinfo is not None:
+        now_ts = now_ts.astimezone(timezone.utc).replace(tzinfo=None)
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.id, InboxModel.created_at, InboxModel.expire_after_s)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.expire_after_s.isnot(None),
+            )
+            .all()
+        )
+    expired: List[int] = []
+    for row_id, created_at, expire_after_s in rows:
+        if created_at is None or expire_after_s is None:
+            continue
+        ca = created_at.replace(tzinfo=None) if created_at.tzinfo is not None else created_at
+        deadline = ca + timedelta(seconds=int(expire_after_s))
+        if deadline < now_ts:
+            expired.append(int(row_id))
+    return expired
+
+
+def expire_pending_rows(row_ids: List[int]) -> int:
+    """Transition the given PENDING rows to ``expired`` (D23). Returns the count
+    actually transitioned (rows that raced to a non-PENDING state are skipped)."""
+    if not row_ids:
+        return 0
+    with SessionLocal() as db:
+        updated = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(row_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update(
+                {InboxModel.status: MessageStatus.EXPIRED.value},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+    return int(updated)
+
+
 def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMessage]:
     """List aged PENDING messages routed straight at a terminal (F524).
 
@@ -6229,6 +6424,8 @@ def _inbox_message_from_row(row: Any) -> InboxMessage:
         owner_generation=row.owner_generation,
         barrier_id=row.barrier_id,
         barrier_member_key=row.barrier_member_key,
+        expire_after_s=getattr(row, "expire_after_s", None),
+        supersede_key=getattr(row, "supersede_key", None),
         created_at=row.created_at,
     )
 
@@ -6783,6 +6980,8 @@ def _insert_routed_inbox_row(
     dispatch_barrier: dict[str, Any] | None = None,
     profile_name: str | None = None,
     created_at: datetime | None = None,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> Any:
     """The single raw/logical insert choke point for WPQ7 routing.
 
@@ -6911,9 +7110,39 @@ def _insert_routed_inbox_row(
             "barrier_id": barrier_id,
             "barrier_member_key": barrier_member_key,
             "callback_dedup_key": content_hash,
+            **({"expire_after_s": int(expire_after_s)} if expire_after_s is not None else {}),
+            **({"supersede_key": supersede_key} if supersede_key is not None else {}),
             **({"created_at": created_at} if created_at is not None else {}),
         },
     )
+    # F578 D23: supersession at enqueue — earlier UNDELIVERED rows with the same
+    # (effective receiver, supersede_key) transition to `superseded` immediately
+    # (audit-visible, never delivered). Only PENDING/HELD rows are superseded;
+    # already-terminal rows are untouched. Opt-in: no key ⇒ no supersession.
+    if supersede_key is not None:
+        effective_receiver = logical_receiver_id or receiver_id
+        receiver_filter = (
+            InboxModel.logical_receiver_id == logical_receiver_id
+            if logical_receiver_id is not None
+            else InboxModel.receiver_id == receiver_id
+        )
+        (
+            db.query(InboxModel)
+            .filter(
+                receiver_filter,
+                InboxModel.supersede_key == supersede_key,
+                InboxModel.status.in_([MessageStatus.PENDING.value, MessageStatus.HELD.value]),
+            )
+            .update(
+                {InboxModel.status: MessageStatus.SUPERSEDED.value},
+                synchronize_session=False,
+            )
+        )
+        logger.info(
+            "d23_supersede receiver=%s key=%s",
+            effective_receiver,
+            supersede_key,
+        )
     row = InboxModel(**fields)
     db.add(row)
     db.flush()
@@ -7318,6 +7547,8 @@ def create_inbox_message(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> InboxMessage:
     from cli_agent_orchestrator.services.stalled_callback_watchdog import (
         stalled_callback_watchdog,
@@ -7331,6 +7562,8 @@ def create_inbox_message(
             orchestration_type,
             dispatch_barrier=dispatch_barrier,
             park_warm=park_warm,
+            expire_after_s=expire_after_s,
+            supersede_key=supersede_key,
         )
 
 
@@ -7406,6 +7639,8 @@ def _create_inbox_message_unfenced(
     *,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
@@ -7436,6 +7671,8 @@ def _create_inbox_message_unfenced(
             orchestration_type=orchestration_type,
             dispatch_barrier=dispatch_barrier,
             park_warm=park_warm,
+            expire_after_s=expire_after_s,
+            supersede_key=supersede_key,
         )
         db.commit()
         db.refresh(inbox_msg)

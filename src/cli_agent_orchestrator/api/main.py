@@ -1148,6 +1148,9 @@ class ChildrenLedgerRequest(BaseModel):
     terminal_id: str
     op: Literal["register", "release"]
     child_id: Optional[str] = None
+    # F579 D17: opaque per-stop idempotency/observability token (a SubagentStop
+    # agent_id). Never used as the ledger key — only to dedup a re-fired stop.
+    release_token: Optional[str] = None
     event: str = ""
     ts: Optional[str] = None
     nonce: Optional[str] = None
@@ -4708,7 +4711,7 @@ async def push_children_ledger(
             )
         count = register_terminal_child(terminal_id, body.child_id)
     else:
-        count = release_terminal_child(terminal_id, body.child_id)
+        count = release_terminal_child(terminal_id, body.child_id, body.release_token)
     if count is None:
         # Terminal vanished between the existence check and the mutation.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
@@ -4718,6 +4721,70 @@ async def push_children_ledger(
         "op": body.op,
         "children_count": count,
     }
+
+
+class InboxDrainRequest(BaseModel):
+    """F543 D22 supervisor drain/ack edge body (overlay-composed hook)."""
+
+    terminal_id: str
+    ts: Optional[str] = None
+
+
+@app.post("/terminals/{terminal_id}/inbox/drain")
+async def supervisor_drain_endpoint(
+    terminal_id: TerminalId,
+    body: InboxDrainRequest,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F543 D22: the overlay-composed supervisor-drain hook's server edge.
+
+    Relocation target for the drain hook (Do-NOT 20: never ~/.claude). The hook
+    fires on the seat's SessionStart; this edge triggers a drain of any PENDING
+    inbox rows for the terminal through the EXISTING delivery seam
+    (``inbox_service.deliver_pending``). The richer F476 wake-cursor drain
+    (D1/D3/D5/D8) is NOT duplicated here (SHOULD-5); when it lands it supersedes
+    this best-effort trigger. Idempotent: deliver_pending only re-delivers rows
+    the IDLE gate accepts. 404 on an unknown terminal.
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_inbox_drain: terminal_id does not match route",
+        )
+    try:
+        await asyncio.to_thread(
+            inbox_service.deliver_pending, terminal_id, registry=get_plugin_registry(request)
+        )
+    except Exception:
+        logger.debug("d22 supervisor drain best-effort failed", exc_info=True)
+    return {"success": True, "terminal_id": terminal_id, "op": "drain"}
+
+
+@app.post("/terminals/{terminal_id}/inbox/drain-ack")
+async def supervisor_drain_ack_endpoint(
+    terminal_id: TerminalId,
+    body: InboxDrainRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F543 D22: the paired ack edge for the overlay-composed supervisor hooks.
+
+    Location-only relocation (SHOULD-5): the delivered-state cursor semantics are
+    F476's and not duplicated here. This edge is a best-effort, idempotent
+    acknowledgement seam so the ack hook has a real, non-``~/.claude`` target;
+    the F476 wake-cursor commit supersedes it when it lands (debt on #331).
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_inbox_drain_ack: terminal_id does not match route",
+        )
+    logger.debug("d22 supervisor drain-ack terminal=%s", terminal_id)
+    return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
 
 
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")
@@ -7868,6 +7935,8 @@ async def create_inbox_message_endpoint(
     barrier: Optional[str] = None,
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
+    expire_after_s: Optional[int] = None,
+    supersede_key: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
@@ -8063,6 +8132,11 @@ async def create_inbox_message_endpoint(
                     "timeout_seconds": barrier_timeout_seconds,
                     "member_key": barrier_member_key,
                 }
+            # F578 D23: opt-in delivery controls threaded to the logical path.
+            if expire_after_s is not None:
+                logical_kwargs["expire_after_s"] = int(expire_after_s)
+            if supersede_key is not None:
+                logical_kwargs["supersede_key"] = supersede_key
             inbox_msg = await asyncio.to_thread(
                 create_logical_inbox_message,
                 sender_id=sender_id,
@@ -8134,6 +8208,12 @@ async def create_inbox_message_endpoint(
                 "timeout_seconds": barrier_timeout_seconds,
                 "member_key": barrier_member_key,
             }
+        # F578 D23: opt-in delivery controls threaded to the direct-terminal path
+        # (create_inbox_message -> _create_inbox_message_unfenced -> DB seam).
+        if expire_after_s is not None:
+            raw_kwargs["expire_after_s"] = int(expire_after_s)
+        if supersede_key is not None:
+            raw_kwargs["supersede_key"] = supersede_key
         # F158-R3: Move create_inbox_message off the event-loop thread.
         # The after-commit ORM hook (F413) calls push_doorbell_frame_sync which
         # schedules a coroutine on this same loop and blocks — deadlock if inline.

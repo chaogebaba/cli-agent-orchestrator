@@ -1,9 +1,9 @@
 
 
-cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯
 
-cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [!⇡] via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯ >....
 `orchestrator/MISTAKES.md` (headers), `ls orchestrator/blueprints/`, `ls scripts/`,
 `ls /data/cao-scratch/*gate-report*.md` (gate reports live outside the repo). Then send_message to your caller:
@@ -48,7 +48,7 @@ hese skills are not accessible through provider-native skill commands or directo
 - **cao-worker-protocols**: Worker-side callback and completion rules for assigned and handed-off tasks in CAO' --data-dir /data/cao-scratch/cline-home/231f1de1 "$(cat "$_cao_msgfile")"
 done
 
-You are the warm READ-ONLY secretary desk for supervisor b93613da (session cao-claude-orch5). Repos: root /home/chao/VScode_projects/cli-subagents and fork /home/chao/VScode_projects/cli-suba
+You are the warm READ-ONLY secretary desk for supervisor b93613da (session cao-claude-orch5). Repos: root /home/user/VScode_projects/cli-subagents and fork /home/user/VScode_projects/cli-suba
 gents/cli-agent-orchestrator; tracker: `gh issue list -R chaogebaba/cli-subagents`. Answer queries with file:line facts, never edit, never grep/find outside the two repos, /data/cao-scratch a
 nd ~/.aws/cli-agent-orchestrator; never touch ~/.claude or ~/sudo_passwd.txt. Prefer `firecrawl` for web lookups. FIRST: reply via the cao-mcp-server MCP `send_message` tool (omit receiver_id
 ) with exactly `SECRETARY-READY mcp=ok` — if that MCP tool is NOT in your toolset, type `SECRETARY-READY mcp=MISSING` into your pane and stop. Then park and wait for queries.
@@ -58,9 +58,9 @@ nd ~/.aws/cli-agent-orchestrator; never touch ~/.claude or ~/sudo_passwd.txt. Pr
    ⎿ {"content":[{"text":"{\"success\":true,\"message_id\":1953,\"sender_id\":\"231f1de1\",\"receiver_...
 [thinking] Ready message sent. Now I should do my ingest per system prompt? The system prompt says on spawn, read and index ORCH_MAP.md etc. Let me do that quickly so I'm prepared, then park.
  Actually the user prompt says "Then park and wait for queries." But my system prompt says ingest on spawn. I'll do a light ingest to be ready, then park. Let me read the key files quickly.
-[run_commands] ls /home/chao/VScode_projects/cli-subagents/ | head -50; ls /home/chao/VScode_projects/cli-subagents/orchestrator/ 2>...
+[run_commands] ls /home/user/VScode_projects/cli-subagents/ | head -50; ls /home/user/VScode_projects/cli-subagents/orchestrator/ 2>...
    ⎿ AGENTS.md CLAUDE.md cli-agent-orchestrator cli-subagents docs-archive docs-ca... (+4 more)
-[run_commands] grep -n -A3 'pending\|PENDING\|live ledger\|Live Ledger' /home/chao/VScode_projects/cli-subagents/orchestrator/HANDOF...
+[run_commands] grep -n -A3 'pending\|PENDING\|live ledger\|Live Ledger' /home/user/VScode_projects/cli-subagents/orchestrator/HANDOF...
    ⎿ 10:BUILD AUTHORIZED + IN FLIGHT: kiro_dev-3ff35106 (fork worktree, blueprint ... (+5 more)
 [thinking] Ingest done. I've sent SECRETARY-READY already. Note my system prompt said to send "SECRETARY READY" + pending line — but the user prompt demanded exactly `SECRETARY-READY mcp=ok`,
  which I did. Now park and wait. I can append a note? Not requested. Just idle now. I should respond to the user turn minimally and park.

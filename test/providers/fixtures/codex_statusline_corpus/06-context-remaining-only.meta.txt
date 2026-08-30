@@ -1,5 +1,5 @@
 name=06-context-remaining-only
-cwd=/home/chao/VScode_projects/cli-subagents
+cwd=/home/user/VScode_projects/cli-subagents
 config=["context-remaining"]
 cols=120
 busy=0

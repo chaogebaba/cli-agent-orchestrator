@@ -1,0 +1,13 @@
+{
+  "source": "LIVE tmux capture-pane",
+  "terminal": "0c63413e",
+  "window": "kiro_dev-0c63413e",
+  "captured_at": "2026-08-30T04:58:27Z",
+  "note": "Kiro CLI worker mid-task. Busy markers visible: status line '\u25d0 11 tasks remaining \u00b7 ctrl+x expand' and footer 'Kiro is working \u00b7 Type to steer \u00b7 Ctrl+S to queue'. Header shows 'kiro_dev \u00b7 Auto \u00b7 \u25d4 20%'. On-screen content is the agent reasoning about a D17 register_terminal_child/release_terminal_child metadata plan (cao.children ledger) in worktree cao/f582-d14d15.",
+  "pii_redaction": {
+    "redacted": true,
+    "home_paths": "The captured builder home path segments were replaced with the same-width synthetic placeholder '/home/user' (the 4-char real username -> 'user', 4->4 chars). Pane column geometry and line count (125) unchanged.",
+    "email_token_prose": "Transcript prose lines that merely REFERENCED a real email/token/secret residing in seat scrollback (never a literal address or token here) were neutralized: 'email/secret material.'->'sensitive-log material.', 'embedded email/tokens'->'embedded sensitive data', 'incl. a real email/token'->'(redacted-out here)'. No busy-marker or footer/status row was touched; 'Kiro is working' and the spinner status line remain byte-authentic.",
+    "verified_by": "test/test_fixtures_no_personal_pii.py (home-path + token-like + personal-email guards)"
+  }
+}

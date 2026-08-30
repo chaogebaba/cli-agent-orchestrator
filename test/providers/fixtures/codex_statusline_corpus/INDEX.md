@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | `01-git-master-full` | full 5-element | `~/VScode_projects/cli-subagents` | `master` | `~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 100% left` |
 | `02-nongit-tmpx-full` | full 5-element | `/tmp/x` | non-git | `/tmp/x · gpt-5.6-sol high · Context 100% left` |
-| `02b-nongit-home-full` | full 5-element | `~` (`/home/chao`) | non-git | `~ · gpt-5.6-sol high · Context 100% left` |
+| `02b-nongit-home-full` | full 5-element | `~` (`/home/user`) | non-git | `~ · gpt-5.6-sol high · Context 100% left` |
 | `03-deep-path-full` | full 5-element | deep `/tmp/deep/.../abcdefghijklmnopqrstuvwxyz` (cols=120) | non-git | `/tmp/deep/path/that/is/quite/long/and/maybe/truncates/status/line/segment/abcdefghijklmnopqrstuvwxyz · gpt-5.6-sol hi…` |
 | `03b-deep-path-narrow60` | full 5-element | same deep path (cols=60) | non-git | `/tmp/deep/path/that/is/quite/long/and/maybe/truncates/sta…` |
 | `04-special-path-dot-full` | full 5-element | `/tmp/fx a·b` (space + middle-dot in path) | non-git | `/tmp/fx a·b · gpt-5.6-sol high · Context 100% left` |

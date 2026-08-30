@@ -3526,6 +3526,23 @@ class InboxService:
         messages — it only adopts ones they have already missed.
         """
         self.reconcile_pending_orphans()
+        # F578 D23: row-level expiry pass — UNCONDITIONAL and ahead of the
+        # receiver loop's INBOX_RECONCILE_GRACE_SECONDS floor (that grace guards
+        # delivery re-attempts, not expiry). A PENDING row whose per-row
+        # expire_after_s has elapsed transitions to `expired` (audit-visible,
+        # never delivered), so it leaves every pending-row surface at once.
+        try:
+            from cli_agent_orchestrator.clients.database import (
+                expire_pending_rows,
+                list_expired_pending_rows,
+            )
+
+            expired_ids = list_expired_pending_rows()
+            if expired_ids:
+                n = expire_pending_rows(expired_ids)
+                logger.info("d23_expiry_pass expired=%d", n)
+        except Exception as e:
+            logger.debug("d23 expiry pass failed: %s", e)
         for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
             try:
                 self.deliver_pending(terminal_id, registry=registry)

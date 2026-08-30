@@ -1,7 +1,7 @@
-cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+cd /home/user/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
 
 cli-subagents on  master [!?] on ☁️  user@example.com 
-❯ cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","m
+❯ cd /home/user/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","m
 odel-with-reasoning","context-remaining","five-hour-limit"]'
 ╭────────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.145.0)                     │

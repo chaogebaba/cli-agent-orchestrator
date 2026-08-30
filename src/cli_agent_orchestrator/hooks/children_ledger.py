@@ -128,12 +128,21 @@ def _deadletter(terminal_id: str, event_source: str, error_class: str, error: ob
             os.close(lock_fd)
 
 
-def _classify(event: dict[str, Any]) -> tuple[str, str | None] | None:
-    """Map one CC hook event to ``(op, child_id)`` or ``None`` to drop it.
+def _classify(event: dict[str, Any]) -> tuple[str, str | None, str | None] | None:
+    """Map one CC hook event to ``(op, child_id, release_token)`` or ``None``.
 
     ``op`` is ``"register"`` or ``"release"``. Returns ``None`` (drop, no POST,
-    not an error) for any event that is not a recognised dispatch/stop edge —
-    e.g. a ``PreToolUse`` on a non-dispatch tool.
+    not an error) for any event that is not a recognised dispatch/stop edge.
+
+    F579/#425 D17 release-edge fix (P-B = release-lost by id mismatch): a
+    ``SubagentStop`` carries ``agent_id``/``agent_type``/``stop_hook_active`` and
+    **no** ``tool_use_id``/``tool_call_id``; register stores the ``PreToolUse``
+    ``toolu_…`` tool_use_id. The two id namespaces never meet, so the release
+    branch emits ``child_id`` ONLY when a tool-call-namespace key is actually
+    present, else ``None`` — restoring the ``None → pop-oldest`` count-correct
+    contract that the always-present ``agent_id`` had been suppressing. The
+    subagent-lifecycle id is still carried, as ``release_token`` (an
+    observability + idempotency field), NEVER as the ledger key.
     """
     event_name = str(event.get("hook_event_name") or event.get("hookEventName") or "")
     tool_name = event.get("tool_name") or event.get("toolName")
@@ -149,19 +158,20 @@ def _classify(event: dict[str, Any]) -> tuple[str, str | None] | None:
                 or event.get("tool_use_id")
                 or uuid.uuid4().hex
             )
-            return "register", str(child_id)
+            return "register", str(child_id), None
         return None
     if event_name == "SubagentStop":
-        # SubagentStop id fields vary across CC versions; pass whatever is
-        # present, else None (server pops the oldest — count-correct).
-        child_id = (
-            event.get("tool_call_id")
-            or event.get("toolCallId")
-            or event.get("agent_id")
-            or event.get("subagent_id")
-            or event.get("subagentId")
+        # Emit child_id ONLY for a tool-call-namespace key (never agent_id):
+        # a SubagentStop never carries one, so this is None in production and the
+        # server pops the oldest entry (count-correct). agent_id travels as the
+        # release_token — the idempotency/observability field, not the key.
+        child_id = event.get("tool_call_id") or event.get("toolCallId") or event.get("tool_use_id")
+        release_token = event.get("agent_id") or event.get("subagent_id") or event.get("subagentId")
+        return (
+            "release",
+            (str(child_id) if child_id is not None else None),
+            (str(release_token) if release_token is not None else None),
         )
-        return "release", (str(child_id) if child_id is not None else None)
     return None
 
 
@@ -179,7 +189,7 @@ def main() -> int:
         classified = _classify(event)
         if classified is None:
             return 0
-        op, child_id = classified
+        op, child_id, release_token = classified
 
         base_url = (
             os.environ.get("CAO_ENDPOINT")
@@ -195,6 +205,8 @@ def main() -> int:
         }
         if child_id is not None:
             payload["child_id"] = child_id
+        if release_token is not None:
+            payload["release_token"] = release_token
         headers = {}
         token = get_local_bearer()
         if token:

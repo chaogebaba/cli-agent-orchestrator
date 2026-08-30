@@ -136,17 +136,22 @@ def _is_wedge_suspect(row: dict[str, Any]) -> bool | None:
 
 
 def _children_count_from_row(row: dict[str, Any]) -> int:
-    """F568 D12a/D12c: length of the children ledger on the fleet row.
+    """F568 D12a/D12c + F579 D17: length of the children ledger on the fleet row.
 
-    The ledger lives at the free-form top-level ``children`` key on the parsed
-    ``metadata_json`` dict — the SAME list D12d's liveness READ side counts. The
-    fleet loop already holds this dict (``row["metadata"]``), so no extra DB read
-    is taken here (D12c: "no schema change and no watchdog coupling"). Absent /
-    malformed → 0.
+    D17 migrated the ledger into the reserved system namespace
+    ``metadata_json["cao"]["children"]``; this reader prefers that location and
+    falls back to the pre-migration free-form top-level ``children`` key for rows
+    written before the migration. The fleet loop already holds this dict
+    (``row["metadata"]``), so no extra DB read is taken here. Absent / malformed
+    → 0. The sibling ``cao["children_released"]`` ring is never counted.
     """
     metadata = row.get("metadata")
     if not isinstance(metadata, dict):
         return 0
+    cao_ns = metadata.get("cao")
+    if isinstance(cao_ns, dict) and "children" in cao_ns:
+        children = cao_ns.get("children")
+        return len(children) if isinstance(children, list) else 0
     children = metadata.get("children")
     return len(children) if isinstance(children, list) else 0
 

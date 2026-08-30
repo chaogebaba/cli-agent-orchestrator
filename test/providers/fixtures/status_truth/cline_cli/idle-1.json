@@ -3,5 +3,6 @@
   "state": "idle",
   "source": "tmux capture-pane -p -S -100 -t cao-claude-orch5:3 (live CAO pane secretary-231f1de1, terminal 231f1de1, provider cline_cli per fleet API)",
   "captured_at": "2026-08-29T05:46:57Z",
+  "pii_redaction": "The authenticated account email in the starship shell prompt (2 occurrences, a personal gmail address) was replaced with the same-width placeholder `usr@example.invalid` (19 chars, pane geometry unchanged). All other bytes verbatim.",
   "notes": "Secretary seat parked after completed turn: final message 'Parking for queries.', no in-flight tool rows; fleet API status=completed. Mid-file contains a kiro_dev statusline echo from its ingest output — quoted content, not seat state."
 }

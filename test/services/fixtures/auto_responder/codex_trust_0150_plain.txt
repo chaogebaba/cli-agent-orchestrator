@@ -1,4 +1,4 @@
-> You are running Codex in /home/chao/VScode_projects/cli-subagents
+> You are running Codex in /home/user/VScode_projects/cli-subagents
 
   Do you trust the contents of this directory? Working with untrusted
   contents comes with higher risk of prompt injection. Trusting the

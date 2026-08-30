@@ -1,9 +1,9 @@
 
 
-/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯
 
-/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  usr@example.invalid
 ❯ >....
    pause. Never auto-reroute work to another lane.
 8. A human may type into your terminal mid-run - treat their input as authoritative

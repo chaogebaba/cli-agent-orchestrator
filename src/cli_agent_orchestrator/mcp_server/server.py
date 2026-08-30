@@ -895,6 +895,8 @@ def _send_to_inbox(
     message: str,
     refresh_ingest: bool = False,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -920,6 +922,12 @@ def _send_to_inbox(
     }
     if park_warm:
         params["park_warm"] = True
+    # F578 D23: opt-in per-message delivery controls. Only forwarded when set so
+    # an unset send is byte-identical to today's request.
+    if expire_after_s is not None:
+        params["expire_after_s"] = int(expire_after_s)
+    if supersede_key is not None:
+        params["supersede_key"] = supersede_key
 
     # F332: Attach terminal token header for sender authentication
     headers: dict[str, str] = {}
@@ -2330,6 +2338,8 @@ def _send_message_impl(
     barrier_timeout_seconds: int | None = None,
     barrier_member_key: str | None = None,
     park_warm: bool = False,
+    expire_after_s: int | None = None,
+    supersede_key: str | None = None,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
@@ -2427,9 +2437,15 @@ def _send_message_impl(
                 barrier_timeout_seconds=barrier_timeout_seconds,
                 barrier_member_key=barrier_member_key,
             )
-        send_kwargs = {"refresh_ingest": refresh_ingest}
+        send_kwargs: dict[str, Any] = {"refresh_ingest": refresh_ingest}
         if park_warm:
             send_kwargs["park_warm"] = True
+        # F578 D23: opt-in per-message delivery controls (AC10). Threaded to the
+        # inbox POST only when set; an unset send is unchanged.
+        if expire_after_s is not None:
+            send_kwargs["expire_after_s"] = int(expire_after_s)
+        if supersede_key is not None:
+            send_kwargs["supersede_key"] = supersede_key
         return _send_to_inbox(receiver_id, message, **send_kwargs)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
@@ -2665,6 +2681,22 @@ async def send_message(
         default=False,
         description="Deliver without arming a receiver callback watchdog episode",
     ),
+    expire_after_s: Optional[int] = Field(
+        default=None,
+        description=(
+            "F578 D23: opt-in. Seconds after enqueue after which an UNDELIVERED "
+            "row transitions to `expired` (audit-visible, never delivered). "
+            "Omit for today's behaviour."
+        ),
+    ),
+    supersede_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "F578 D23: opt-in. Enqueuing a row with this key marks earlier "
+            "UNDELIVERED rows to the same receiver+key `superseded` "
+            "(only the latest delivers). Omit for today's behaviour."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -2690,6 +2722,8 @@ async def send_message(
         barrier_timeout_seconds,
         barrier_member_key,
         park_warm,
+        expire_after_s,
+        supersede_key,
     )
 
 

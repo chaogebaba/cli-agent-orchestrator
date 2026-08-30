@@ -27,6 +27,11 @@ class MessageStatus(str, Enum):
     DIGESTED = "digested"
     PARKED = "parked"
     CANCELLED = "cancelled"
+    # F578 D23: opt-in delivery-control terminal states (audit-visible, never
+    # delivered). A row leaves status='pending' for one of these on expiry /
+    # supersession.
+    EXPIRED = "expired"
+    SUPERSEDED = "superseded"
 
 
 class InboxMessage(BaseModel):
@@ -68,5 +73,11 @@ class InboxMessage(BaseModel):
     barrier_id: int | None = Field(default=None, description="Callback barrier owning this row")
     barrier_member_key: str | None = Field(
         default=None, description="Callback barrier member that produced this row"
+    )
+    expire_after_s: int | None = Field(
+        default=None, description="F578 D23: seconds after created_at to expire an undelivered row"
+    )
+    supersede_key: str | None = Field(
+        default=None, description="F578 D23: (receiver, key) supersession scope"
     )
     created_at: datetime = Field(..., description="Creation timestamp")

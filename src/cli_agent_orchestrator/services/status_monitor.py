@@ -183,6 +183,11 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# F579 D17: consecutive non-PROCESSING status publishes after which the
+# children-ledger publish-time reconcile drops all entries (D3's K). A lost
+# SubagentStop cannot pin a seat at delegating beyond this many ticks.
+_CHILDREN_RECONCILE_K_TICKS = 3
+
 
 @dataclass(frozen=True)
 class BoundaryObservation:
@@ -274,6 +279,10 @@ class StatusMonitor:
         self._drop_seq_seen: Dict[str, int] = {}
         self._last_publish_monotonic: Dict[str, float] = {}
         self._last_level_resync_monotonic: Dict[str, float] = {}
+        # F579 D17: per-terminal count of CONSECUTIVE non-PROCESSING status
+        # publishes. Feeds the children-ledger publish-time reconcile conjunct
+        # (a lost SubagentStop cannot pin a seat at delegating past K ticks).
+        self._non_processing_streak: Dict[str, int] = {}
         self._status_fusion_reason: Dict[str, str] = {}
         # The event loop that owns the quiescence timers. Captured when the
         # first timer is scheduled (on the loop thread). clear_terminal /
@@ -1215,6 +1224,29 @@ class StatusMonitor:
                 payload["fusion_reason"] = fusion_reason
             bus.publish(f"terminal.{terminal_id}.status", payload)
             __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
+            # F579 D17: publish-time children-ledger reconcile. Track the
+            # consecutive non-PROCESSING streak and drop stranded ledger entries
+            # once a lost SubagentStop has held the seat non-PROCESSING for K
+            # ticks; also runs the age-out on every publish (the firing-15 fix).
+            try:
+                if detected == TerminalStatus.PROCESSING:
+                    self._non_processing_streak[terminal_id] = 0
+                else:
+                    self._non_processing_streak[terminal_id] = (
+                        self._non_processing_streak.get(terminal_id, 0) + 1
+                    )
+                from cli_agent_orchestrator.clients.database import (
+                    reconcile_children_on_publish,
+                )
+
+                reconcile_children_on_publish(
+                    terminal_id,
+                    detected.value,
+                    self._non_processing_streak.get(terminal_id, 0),
+                    _CHILDREN_RECONCILE_K_TICKS,
+                )
+            except Exception:
+                logger.debug("children reconcile on publish failed", exc_info=True)
             if screen_spinner_override is not None:
                 logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")

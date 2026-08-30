@@ -6,11 +6,11 @@
   for k,v in sorted(b.items()): print(' ', k, v)
   print('ALL LINTS PASS')
   "
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
     Traceback (most recent call last):
       File "<string>", line 7, in <module>
         res = lint_positions(pos)
-      File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4/src/cli_agent_orchestrator/utils/clause_lint.py", line 231, in lint_positions
+      File "/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4/src/cli_agent_orchestrator/utils/clause_lint.py", line 231, in lint_positions
         required_ids = _position_required_ids(table, pos, extra_ids)
     Command failed (Exit Code: 1)
 
@@ -32,7 +32,7 @@
   for k,v in sorted(b.items()): print(' ', k, v)
   print('ALL LINTS PASS')
   "
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
 
   All AC14 clause lints and AC17 budget lints pass across every position and every composed cell. Note the composed cells apply overlays cross-product (the lint measures every provider that
   has any overlay against every position), which confirms budgets hold even for unintended cells — all within budget.
@@ -58,7 +58,7 @@
       body = (p.system_prompt or '')
       print(f'{n:22} name={p.name:22} provider={p.provider} role={p.role} body={len(body.encode())}B')
   "
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
     Tool execution failed
 
   Shell-var in cp target is blocked. Let me use literal paths.
@@ -104,7 +104,7 @@
       print(f'{n:22} name={str(p.name):22} provider={str(p.provider):10} role={p.role} body={len(body.encode())}B')
   print('ALL 12 STUBS RESOLVE')
   "
-    ╰ cwd=/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
+    ╰ cwd=/home/user/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/f1d255f4, run_in_background=false
 
   All 12 alias stubs resolve through the D5 merge engine with correct name/provider/role and composed bodies. The composition machinery works end-to-end for every P4 family.
 
@@ -114,7 +114,7 @@
   the fork test test_r9_recorded_position_sha_matches_helper pass (it only checks position_sha matches, not outcome).
 
   Let me generate the patch from the current root empirical_reviewer.md. First read its exact cert block lines to craft a precise patch.
-● Read /home/chao/VScode_projects/cli-subagents/profiles/positions/empirical_reviewer.md (L1-40)
+● Read /home/user/VScode_projects/cli-subagents/profiles/positions/empirical_reviewer.md (L1-40)
 
   Now I'll write the cert-fix.patch. The position_sha updates to f03740a66e019558 for both rows. Per AC15, a moved position_sha invalidates the row — so both become uncertified pending the
   box re-run. I'll update sha and set both to reflect they need re-run: kiro→UNCERTIFIED (was PASS, sha moved), codex stays needs-re-run (was FAIL). But actually the cleanest honest recording
@@ -123,7 +123,7 @@
 
   Let me generate a proper unified diff by writing the fixed file and diffing.
 ● Shell mkdir -p /data/cao-scratch/f497-p4-root/patches
-  cp -f /home/chao/VScode_projects/cli-subagents/profiles/positions/empirical_reviewer.md /data/cao-scratch/f497-p4-root/patches/empirical_reviewer.orig.md
+  cp -f /home/user/VScode_projects/cli-subagents/profiles/positions/empirical_reviewer.md /data/cao-scratch/f497-p4-root/patches/empirical_reviewer.orig.md
   echo "orig copied"
     ╰ run_in_background=false
 

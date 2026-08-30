@@ -133,16 +133,21 @@ class _CaptureResult:
 
 
 def _children_count_from_metadata(metadata: dict[str, object]) -> int:
-    """Length of the D12a children ledger on the terminal's free-form metadata.
+    """Length of the D12a children ledger (F579 D17: migrated location).
 
-    The ledger lives under the parsed ``metadata`` sub-dict (the JSON-decoded
-    ``metadata_json`` column, where the D12a hooks write ``children`` via the
-    metadata endpoint). Absent / malformed → 0. The hook WRITERS are the later
-    D12a lane; only the READ side lands here.
+    D17 moved the ledger to the reserved system namespace
+    ``metadata["metadata"]["cao"]["children"]``; this reader prefers that and
+    falls back to the pre-migration free-form ``metadata["metadata"]["children"]``
+    for rows written before the migration. Absent / malformed → 0. The sibling
+    ``cao["children_released"]`` ring is never counted.
     """
     try:
         free_form = metadata.get("metadata")
         if isinstance(free_form, dict):
+            cao_ns = free_form.get("cao")
+            if isinstance(cao_ns, dict) and "children" in cao_ns:
+                children = cao_ns.get("children")
+                return len(children) if isinstance(children, list) else 0
             children = free_form.get("children")
             if isinstance(children, list):
                 return len(children)

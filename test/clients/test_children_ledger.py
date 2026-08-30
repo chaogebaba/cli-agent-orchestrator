@@ -1,10 +1,14 @@
-"""F568 D12a children-ledger DB mutators — arithmetic, idempotence, staleness.
+"""F568 D12a + F579 D17 children-ledger DB mutators.
 
-The ledger lives at the free-form ``metadata_json["children"]`` top-level key —
-the SAME list D12d's frozen READ side (``pane_liveness._children_count_from_metadata``)
-counts. These tests pin the register/decrement lifecycle, the no-double-count
-idempotence, the FIFO release, the staleness prune, and the sibling-key
-preservation (the ledger write must not clobber other metadata).
+D17 MIGRATED the ledger from the free-form ``metadata_json["children"]`` key
+into the reserved system namespace ``metadata_json["cao"]["children"]`` so a
+worker full-replace can never clobber it, and changed the empty-ledger
+representation to an explicit ``[]`` (never nulling the column — that would
+destroy the whole ``cao`` namespace incl. the ``children_released`` ring).
+These tests pin the register/decrement lifecycle at the migrated location, the
+no-double-count idempotence, the FIFO release, the staleness prune, the
+sibling-key preservation, the release_token dedup ring, and the publish-time
+reconcile conjuncts.
 """
 
 import pytest
@@ -17,6 +21,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     create_terminal,
     get_terminal_metadata,
+    reconcile_children_on_publish,
     register_terminal_child,
     release_terminal_child,
 )
@@ -38,11 +43,16 @@ def _seed(terminal_id="t1", metadata=None):
     create_terminal(terminal_id, "cao-t", f"w-{terminal_id}", "claude_code", metadata=metadata)
 
 
-def _children(terminal_id="t1"):
+def _cao(terminal_id="t1"):
+    """The migrated ``cao`` namespace sub-dict on the terminal's metadata."""
     meta = get_terminal_metadata(terminal_id)
     assert meta is not None
     free_form = meta.get("metadata") or {}
-    return free_form.get("children") or []
+    return free_form.get("cao") or {}
+
+
+def _children(terminal_id="t1"):
+    return _cao(terminal_id).get("children") or []
 
 
 # ---- register / release arithmetic ---------------------------------------
@@ -62,8 +72,9 @@ def test_release_decrements_count(db_env):
     assert release_terminal_child("t1", "c1") == 1
     assert [e["id"] for e in _children()] == ["c2"]
     assert release_terminal_child("t1", "c2") == 0
-    # Empty ledger drops the key entirely (does not leave [] behind).
+    # D17: empty ledger is written as an explicit [] (never nulls the column).
     assert _children() == []
+    assert "children" in _cao()
 
 
 def test_register_idempotent_on_child_id(db_env):
@@ -86,11 +97,14 @@ def test_release_without_id_pops_oldest_fifo(db_env):
     assert [e["id"] for e in _children()] == ["c2"]
 
 
-def test_release_unknown_id_is_noop(db_env):
+def test_release_unknown_id_pops_oldest_d17(db_env):
+    """D17/P-B: an unmatched child_id no longer no-ops — it falls back to
+    pop-oldest (a release can never leave the count unchanged while entries
+    exist). Was a no-op pre-D17."""
     _seed()
     register_terminal_child("t1", "c1")
-    assert release_terminal_child("t1", "does-not-exist") == 1
-    assert [e["id"] for e in _children()] == ["c1"]
+    assert release_terminal_child("t1", "does-not-exist") == 0
+    assert _children() == []
 
 
 def test_release_on_empty_ledger_is_noop(db_env):
@@ -114,8 +128,11 @@ def test_register_preserves_sibling_free_form_keys(db_env):
     _seed(metadata={"note": "keep me", "children": [{"id": "pre", "started_at": now - 1.0}]})
     register_terminal_child("t1", "c1")
     meta = get_terminal_metadata("t1")["metadata"]
+    # Free-form sibling keys are untouched by the cao-namespace RMW.
     assert meta["note"] == "keep me"
-    assert [e["id"] for e in meta["children"]] == ["pre", "c1"]
+    # D17: the pre-migration free-form entry is read via fallback and the new
+    # entry is written to the migrated cao.children location.
+    assert [e["id"] for e in meta["cao"]["children"]] == ["pre", "c1"]
 
 
 def test_release_preserves_sibling_free_form_keys(db_env):
@@ -126,7 +143,8 @@ def test_release_preserves_sibling_free_form_keys(db_env):
     release_terminal_child("t1", "c1")
     meta = get_terminal_metadata("t1")["metadata"]
     assert meta["note"] == "keep me"
-    assert "children" not in meta
+    # D17: emptied ledger is [] at the migrated location (never nulled).
+    assert meta["cao"]["children"] == []
 
 
 # ---- staleness bound ------------------------------------------------------
@@ -166,3 +184,148 @@ def test_write_path_is_read_by_frozen_d12d_counter(db_env):
     register_terminal_child("t1", "c2")
     meta = get_terminal_metadata("t1")
     assert _children_count_from_metadata(meta) == 2
+
+
+# ---- F579 D17: migration, release_token ring, reconcile conjuncts ---------
+
+
+def test_ledger_written_to_cao_namespace(db_env):
+    """D17: register/release write the migrated metadata_json["cao"]["children"]."""
+    _seed()
+    register_terminal_child("t1", "c1")
+    cao = _cao()
+    assert "children" in cao
+    assert [e["id"] for e in cao["children"]] == ["c1"]
+
+
+def test_pre_migration_free_form_row_still_counts(db_env):
+    """Fallback arm: a row written before the migration (free-form children,
+    no cao.children) is still counted by both readers."""
+    import time as _time
+
+    from cli_agent_orchestrator.services.fleet_service import _children_count_from_row
+    from cli_agent_orchestrator.services.pane_liveness import _children_count_from_metadata
+
+    now = _time.time()
+    _seed(
+        metadata={
+            "children": [
+                {"id": "old1", "started_at": now},
+                {"id": "old2", "started_at": now},
+            ]
+        }
+    )
+    meta = get_terminal_metadata("t1")
+    # pane_liveness reads metadata["metadata"]["children"] (fallback).
+    assert _children_count_from_metadata(meta) == 2
+    # fleet_service reads row["metadata"]["children"] (fallback).
+    assert _children_count_from_row({"metadata": meta["metadata"]}) == 2
+
+
+def test_migrated_row_counts_from_cao_not_free_form(db_env):
+    """After a write, both readers prefer cao.children over any free-form key."""
+    from cli_agent_orchestrator.services.fleet_service import _children_count_from_row
+    from cli_agent_orchestrator.services.pane_liveness import _children_count_from_metadata
+
+    _seed()
+    register_terminal_child("t1", "c1")
+    meta = get_terminal_metadata("t1")
+    assert _children_count_from_metadata(meta) == 1
+    assert _children_count_from_row({"metadata": meta["metadata"]}) == 1
+
+
+def test_duplicate_release_token_is_noop(db_env):
+    """AC4 duplicate arm: two SubagentStops with the same release_token leave
+    the count unchanged (the second is a dedup no-op); a genuine second child's
+    stop with a different token still pops."""
+    _seed()
+    register_terminal_child("t1", "c1")
+    register_terminal_child("t1", "c2")
+    # First stop with token A pops one (oldest, no matching child_id).
+    assert release_terminal_child("t1", None, release_token="agentA") == 1
+    # Re-fired stop with the SAME token A must NOT pop the live child.
+    assert release_terminal_child("t1", None, release_token="agentA") == 1
+    assert len(_children()) == 1
+    # A different token still pops.
+    assert release_terminal_child("t1", None, release_token="agentB") == 0
+
+
+def test_release_token_ring_bounded_and_survives_empty_ledger(db_env):
+    """The children_released ring holds tokens, is bounded, and survives the
+    ledger going empty (so a late duplicate stop cannot pop the next child)."""
+    _seed()
+    register_terminal_child("t1", "c1")
+    release_terminal_child("t1", None, release_token="agentA")
+    cao = _cao()
+    assert cao["children"] == []
+    assert "agentA" in cao["children_released"]
+    # Register a new child; a stale re-fire of agentA must not pop it.
+    register_terminal_child("t1", "c2")
+    assert release_terminal_child("t1", None, release_token="agentA") == 1
+
+
+def test_release_token_ring_is_bounded_to_max(db_env):
+    from cli_agent_orchestrator.clients.database import _CHILDREN_RELEASED_RING_MAX
+
+    _seed()
+    for i in range(_CHILDREN_RELEASED_RING_MAX + 5):
+        register_terminal_child("t1", f"c{i}")
+        release_terminal_child("t1", None, release_token=f"agent{i}")
+    ring = _cao()["children_released"]
+    assert len(ring) == _CHILDREN_RELEASED_RING_MAX
+
+
+def test_unmatched_child_id_pops_oldest(db_env):
+    """AC4/P-B: a release with a child_id in a namespace no entry carries (the
+    exact id-mismatch defect) falls back to pop-oldest, never a silent no-op."""
+    import time as _time
+
+    now = _time.time()
+    _seed()
+    register_terminal_child("t1", "toolu_1", started_at=now - 20.0)
+    register_terminal_child("t1", "toolu_2", started_at=now - 10.0)
+    # agent_id namespace never matches a tool_use_id entry → pop oldest.
+    assert release_terminal_child("t1", "agent_xyz", release_token="agent_xyz") == 1
+    assert [e["id"] for e in _children()] == ["toolu_2"]
+
+
+def test_reconcile_drops_entries_after_k_non_processing(db_env):
+    """Reconcile arm: a stranded child (suppressed SubagentStop) is dropped on a
+    publish once the seat has been non-PROCESSING for K ticks."""
+    _seed()
+    register_terminal_child("t1", "stuck")
+    # Under K: not dropped.
+    assert reconcile_children_on_publish("t1", "idle", 1, 3) == 1
+    assert reconcile_children_on_publish("t1", "idle", 2, 3) == 1
+    # At K: dropped.
+    assert reconcile_children_on_publish("t1", "idle", 3, 3) == 0
+    assert _children() == []
+
+
+def test_reconcile_does_not_drop_live_processing_delegation(db_env):
+    """A live delegation with the seat still PROCESSING is NOT dropped by the
+    publish reconcile, regardless of streak."""
+    _seed()
+    register_terminal_child("t1", "live")
+    assert reconcile_children_on_publish("t1", "processing", 99, 3) == 1
+    assert [e["id"] for e in _children()] == ["live"]
+
+
+def test_reconcile_is_noop_without_children(db_env):
+    _seed()
+    assert reconcile_children_on_publish("t1", "idle", 5, 3) == 0
+    # No cao.children key created by a no-children reconcile.
+    assert _cao().get("children") in (None, [])
+
+
+def test_shape_invariant_metadata_never_absent_after_release(db_env):
+    """AC4 shape arm: after the last child is released the ledger reads as an
+    empty JSON list, cao keys are intact, and get_terminal_metadata is non-None."""
+    _seed()
+    register_terminal_child("t1", "c1")
+    release_terminal_child("t1", None, release_token="agentA")
+    meta = get_terminal_metadata("t1")
+    assert meta is not None
+    cao = meta["metadata"]["cao"]
+    assert isinstance(cao["children"], list) and cao["children"] == []
+    assert isinstance(cao["children_released"], list)

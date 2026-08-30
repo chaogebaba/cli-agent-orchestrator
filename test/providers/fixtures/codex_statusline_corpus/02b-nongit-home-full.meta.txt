@@ -1,5 +1,5 @@
 name=02b-nongit-home-full
-cwd=/home/chao
+cwd=/home/user
 config=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]
 cols=120
 busy=0
@@ -10,7 +10,7 @@ codex=0.145.0
 observed_tail:
 |   Tip: Use the OpenAI docs MCP for API questions; enable it with codex mcp add openaiDeveloperDocs --url
 |   https://developers.openai.com/mcp.
-| ⚠ Ignored unsupported project-local config keys in /home/chao/.codex/config.toml: model_provider, model_providers. If
+| ⚠ Ignored unsupported project-local config keys in /home/user/.codex/config.toml: model_provider, model_providers. If
 |   you want these settings to apply, manually set them in your user-level config.toml.
 | › Explain this codebase
 |   ~ · gpt-5.6-sol high · Context 100% left
