@@ -117,13 +117,23 @@ Restored source SHA-256 values at `80cde2ab`:
 
 ## Fixture provenance and deviations
 
-AC1 replay fixture abort-1 is supervisor-authored (real 165daae4 pane bytes + hand-inserted ABORT_LINE); the AC's 'byte-exact capture of adcaa8a8' premise was unrealized — live repro attempts listed in abort-1.json.
+AC1 replay fixture abort-1 is supervisor-authored (real 165daae4 pane bytes + hand-inserted ABORT_LINE); the AC's 'byte-exact capture of adcaa8a8' premise was unrealized — live repro attempts listed in abort-1.json. Its JSON `source` string, reproduced VERBATIM:
 
-- `abort-2` is likewise supervisor-authored as stated in its JSON `source`: real pane bytes with a hand-inserted `ABORT_LINE`; it supplies the authoritative greater-than-45-line replay arm.
-- Both fixture pairs were copied byte-for-byte from `/data/cao-scratch/9064394e/fixtures/` and were not edited.
+> SUPERVISOR-AUTHORED, NOT A LIVE CAPTURE. Surrounding pane text is a verbatim tmux capture of CAO seat cline_dev-165daae4 (2026-08-30T03:35Z, ClinePass TUI, 28s tick run); the `[abort] aborted by another client` line (cline_cli.py:113 ABORT_LINE) was inserted by hand at the position cline prints a run's finishReason=aborted fallback (cline_cli.py:104-111), replacing the answer.
+
+- `abort-2` is likewise supervisor-authored; its JSON `source` string, reproduced VERBATIM:
+
+> SUPERVISOR-AUTHORED, NOT A LIVE CAPTURE. Bytes are a verbatim `tmux capture-pane -p -S -200 -t cao-claude-orch5:4` of CAO seat cline_dev-f7b445dc (2026-08-30T03:45Z, ClinePass TUI; filler job printed `line 01`..`line 60` then a 25s tick run) with ONE edit: the final `ANSWER: done` line was replaced by `[abort] aborted by another client` (cline_cli.py:113 ABORT_LINE), the position cline prints a run's finishReason=aborted fallback instead of an answer (cline_cli.py:104-111). Raw capture kept as raw-f7b445dc.txt in supervisor scratch (not committed).
+
+- `abort-2` supplies the authoritative greater-than-45-line replay arm.
+- Both fixture `.txt` pairs were copied byte-for-byte from `/data/cao-scratch/9064394e/fixtures/` and were not edited. In R2, `abort-1.json`'s metadata was corrected (S1 fix, below); the `.txt` pane bytes were NOT touched.
+- R2 (empirical-gate r1 remediation):
+  - B1 — the AC1/Do-NOT 27 grep arm now has a load-bearing test. `test/providers/test_cline_f582_abort_truth.py::test_monitor_carries_no_abort_evidence_state` reads `services/status_monitor.py` source and asserts the monitor carries NO abort-evidence state (no `self._abort*`; no abort counter/mark/notify-channel name; allowed set is empty). It kills the reviewer's surviving mutant (`self._abort_evidence_counter = 0` in `StatusMonitor.__init__`). D15's `_drop_seq_seen` watermark is a lost-stream signal, not abort evidence, and is not caught (it is not an `abort` name).
+  - S1 — `abort-1.json`'s stale `notes` verdict was corrected: the fixture is the ACCEPTED sub-floor residual R2 (frozen AC1, wp-status-truth.md:235), whose expected provider verdict is COMPLETED (a sub-floor ≤45-line pane is non-authoritative ⇒ no ERROR ⇒ the seat publishes COMPLETED), as asserted by `test_abort_1_fixture_is_the_accepted_sub_floor_residual`. A `state_note` field was added to disambiguate the top-level `"state": "error"` as the #439 incident's live latched state at capture, NOT the expected post-D14 verdict.
+- AC-coverage claim (amended): every AC1 arm now maps to a passing test, INCLUDING the Do-NOT 27 grep arm, which is enforced by the new `test_monitor_carries_no_abort_evidence_state`. The r1 gate's sole BLOCKER (B1, an unguarded grep arm whose forbidden monitor counter survived all 27 D14 tests) is closed by that test.
 - Fixture hashes:
   - `abort-1.txt`: `2892ff8a9bb2af44436178542ca10b1797cd2c6c0c025768e49a5a3e60217984`
-  - `abort-1.json`: `d9e9adbb40679e36451b3ba1fa3008e9cf24407c520c13eed20fc9e28231191e`
+  - `abort-1.json`: `869d2f6beead49637fad79ed3e88cb500699aa47ae360022d441d4a4b8ff2864`
   - `abort-2.txt`: `f616d80b8899c1d404ba81fef417d0d762d421b63b970348c3ede448a7bd3daf`
   - `abort-2.json`: `2b377bc8ff30a1c8ab36996927ed7233d700948c82521af63b18df89a2eccd74`
 - The frozen blueprint's cited D14/D15 source seams matched the `6f6ae605` tree materially; no design-around was needed.

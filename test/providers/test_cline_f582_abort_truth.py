@@ -1,6 +1,7 @@
 """F582 D14: provider-local, epoch-attributed Cline abort truth."""
 
 import asyncio
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -199,6 +200,44 @@ def test_abort_path_uses_only_the_permitted_state_and_monitor_api() -> None:
     assert "len(lines) <= PANE_LIVENESS_TAIL_LINES" in abort_rule
     assert "schedule_detection_retry" in abort_rule
     assert "recovery_state" not in get_status
+
+
+def test_monitor_carries_no_abort_evidence_state() -> None:
+    """Do-NOT 27 (wp-status-truth.md:225, AC1 :235): abort staleness is the
+    producer's own state; the monitor gains no counters, marks or notify
+    channels FOR ABORT EVIDENCE. Its one D14 delta is routing the existing
+    re-arm inside ``schedule_detection_retry`` — no abort state at all. (D15's
+    ``_drop_seq_seen`` watermark is a different fact — a lost-stream signal,
+    NOT run/abort evidence — and is not an ``abort`` name, so it is not caught
+    by this grep.) Grep-shaped kill for the forbidden ``self._abort*`` monitor
+    counter that survived every behavioural D14 arm."""
+    source = Path("src/cli_agent_orchestrator/services/status_monitor.py").read_text(
+        encoding="utf-8"
+    )
+
+    # The blueprint authorizes ZERO abort-evidence state names in the monitor;
+    # enumerate the allowed set explicitly so a future authorized name is a
+    # deliberate edit here, not a silent survivor.
+    allowed_abort_names: set[str] = set()
+
+    # No `self._abort...` attribute (assignment or read) may appear.
+    self_abort = re.findall(r"self\._abort\w*", source)
+    assert set(self_abort) <= allowed_abort_names, (
+        f"monitor gained forbidden abort-evidence attribute(s): "
+        f"{sorted(set(self_abort) - allowed_abort_names)} (Do-NOT 27)"
+    )
+
+    # No abort-evidence counter / mark / notify-channel identifier of any
+    # spelling may appear (bare or self-qualified).
+    forbidden = re.findall(
+        r"\b(?:self\.)?_?abort_(?:evidence|counter|count|mark|marks|notify|"
+        r"channel|channels|reported_occ|reported_at|retry_armed|epoch|hwm)\w*",
+        source,
+    )
+    assert [name for name in forbidden if name not in allowed_abort_names] == [], (
+        f"monitor gained forbidden abort-evidence name(s): {sorted(set(forbidden))} "
+        f"(Do-NOT 27)"
+    )
 
 
 def test_abort_1_fixture_is_the_accepted_sub_floor_residual(
