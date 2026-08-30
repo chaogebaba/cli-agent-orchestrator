@@ -121,6 +121,46 @@ _ABORT_SCAN_LINES = 40
 # (Python startup + HTTP round-trip to CAO API).  30 s is generous but bounded.
 _DEFAULT_MCP_CONNECT_TIMEOUT_MS = "30000"
 
+# F537 (#393): Per-server MCP init timeout (SECONDS) written into
+# cline_mcp_settings.json. cline hard-times-out the MCP `initialize` handshake
+# at its built-in 3 s default and SKIPS the server; the fix is the per-server
+# "timeout" field in cline_mcp_settings.json (units: seconds). cao-mcp-server
+# startup (Python import + HTTP round-trip to the CAO API) can exceed 3 s under
+# concurrent worker load, so we widen it to 60 s. Overridable via providers.toml
+# ([cline_cli] mcp_init_timeout_s) using the same get_provider_defaults knob the
+# provider already reads for model/thinking/api_provider; floored at 30 s.
+CLINE_MCP_INIT_TIMEOUT_S = 60
+
+# Never accept a materialized timeout below this floor: below ~30 s the same
+# race F537 fixes can reappear under load.
+_CLINE_MCP_INIT_TIMEOUT_FLOOR_S = 30
+
+
+def _resolve_cline_mcp_init_timeout_s() -> int:
+    """Resolve the cline MCP init timeout (seconds) from providers.toml.
+
+    Reads ``[cline_cli] mcp_init_timeout_s`` via the same ``get_provider_defaults``
+    knob the provider already uses for other options. Falls back to
+    ``CLINE_MCP_INIT_TIMEOUT_S`` when unset or invalid, and floors the result at
+    ``_CLINE_MCP_INIT_TIMEOUT_FLOOR_S`` so an operator cannot re-introduce the
+    F537 handshake race with too small a value.
+    """
+    value: int = CLINE_MCP_INIT_TIMEOUT_S
+    try:
+        raw = get_provider_defaults("cline_cli").get("mcp_init_timeout_s")
+    except Exception:
+        raw = None
+    if isinstance(raw, bool):
+        # bool is an int subclass; a TOML boolean is not a valid timeout.
+        raw = None
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        value = int(raw.strip())
+    if value < _CLINE_MCP_INIT_TIMEOUT_FLOOR_S:
+        value = _CLINE_MCP_INIT_TIMEOUT_FLOOR_S
+    return value
+
 
 def _build_dispatcher_script(
     cline_binary: str,
@@ -400,7 +440,8 @@ class ClineCliProvider(BaseProvider):
 
         The entry uses resolve_cao_mcp_command(persisted=True) for the binary path
         and injects this worker's CAO_TERMINAL_ID + CAO_TERMINAL_TOKEN into the
-        env block.
+        env block. A per-server ``timeout`` (seconds) is written so cline does not
+        skip the server on its 3 s init default (F537 #393).
         """
         profile = None
         if self._agent_profile:
@@ -438,6 +479,9 @@ class ClineCliProvider(BaseProvider):
                     "args": args,
                     "env": env_block,
                     "disabled": False,
+                    # F537 (#393): per-server MCP init timeout in SECONDS. Without
+                    # it cline uses its built-in 3 s default and skips the server.
+                    "timeout": _resolve_cline_mcp_init_timeout_s(),
                 }
             }
         }

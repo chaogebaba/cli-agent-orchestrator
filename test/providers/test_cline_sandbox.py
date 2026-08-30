@@ -10,7 +10,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -57,7 +57,9 @@ class TestAC7_DataDirInSubprocessCalls:
             result.stderr = "not found"
             return result
 
-        with patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run", side_effect=fake_run):
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.subprocess.run", side_effect=fake_run
+        ):
             cline_provider._snapshot_history_ids()
 
         assert "--data-dir" in captured_args
@@ -76,23 +78,31 @@ class TestAC8_MaterializedMCPSettings:
         SENTINEL_CMD = "/resolved/by/mcp_resolution/cao-mcp-server"
         SENTINEL_ARGS = ["--resolved-arg"]
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", tmp_path
-        ), patch(
-            "cli_agent_orchestrator.providers.cline_cli._CLINE_USER_DATA",
-            tmp_path / "fake_user_data",
-        ), patch.dict(os.environ, {
-            "CAO_TERMINAL_TOKEN": "test_token_xyz",
-            "CAO_INSTANCE_ID": "inst_1",
-        }), patch(
-            "cli_agent_orchestrator.utils.http.resolve_endpoint",
-            return_value="http://localhost:9889",
-        ), patch(
-            "cli_agent_orchestrator.providers.cline_cli.load_agent_profile",
-            side_effect=FileNotFoundError,
-        ), patch(
-            "cli_agent_orchestrator.providers.cline_cli.resolve_cao_mcp_command",
-            return_value=(SENTINEL_CMD, SENTINEL_ARGS),
+        with (
+            patch("cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", tmp_path),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli._CLINE_USER_DATA",
+                tmp_path / "fake_user_data",
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    "CAO_TERMINAL_TOKEN": "test_token_xyz",
+                    "CAO_INSTANCE_ID": "inst_1",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.utils.http.resolve_endpoint",
+                return_value="http://localhost:9889",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.load_agent_profile",
+                side_effect=FileNotFoundError,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.resolve_cao_mcp_command",
+                return_value=(SENTINEL_CMD, SENTINEL_ARGS),
+            ),
         ):
             dd = tmp_path / cline_provider.terminal_id
             dd.mkdir(parents=True)
@@ -116,6 +126,109 @@ class TestAC8_MaterializedMCPSettings:
         assert entry["env"]["CAO_TERMINAL_TOKEN"] == "test_token_xyz"
         assert entry["env"]["CAO_ENDPOINT"] == "http://localhost:9889"
 
+    def test_mcp_settings_includes_init_timeout(self, cline_provider, tmp_path):
+        """F537 (#393): the cao-mcp-server entry carries a per-server ``timeout``.
+
+        Without it cline uses its built-in 3 s MCP init default and SKIPS the
+        server, so the worker never attaches cao-mcp-server.
+        """
+        with (
+            patch("cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", tmp_path),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli._CLINE_USER_DATA",
+                tmp_path / "fake_user_data",
+            ),
+            patch.dict(os.environ, {"CAO_TERMINAL_TOKEN": "tok"}),
+            patch(
+                "cli_agent_orchestrator.utils.http.resolve_endpoint",
+                return_value="http://localhost:9889",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.load_agent_profile",
+                side_effect=FileNotFoundError,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.resolve_cao_mcp_command",
+                return_value=("cao-mcp-server", []),
+            ),
+        ):
+            dd = tmp_path / cline_provider.terminal_id
+            dd.mkdir(parents=True)
+            (dd / "settings").mkdir(parents=True)
+            cline_provider._materialize_mcp_settings(dd)
+
+        settings = json.loads((dd / "settings" / "cline_mcp_settings.json").read_text())
+        entry = settings["mcpServers"]["cao-mcp-server"]
+
+        assert "timeout" in entry, "cao-mcp-server entry is missing the F537 timeout key"
+        timeout = entry["timeout"]
+        # Units are SECONDS (cline's cline_mcp_settings.json convention), and an
+        # int — never a stringified value or milliseconds.
+        assert isinstance(timeout, int) and not isinstance(timeout, bool)
+        assert timeout >= 30, f"timeout {timeout} below the 30 s floor re-opens the F537 race"
+
+
+class TestF537_MCPInitTimeoutResolution:
+    """F537 (#393): _resolve_cline_mcp_init_timeout_s knob + floor behavior."""
+
+    def test_default_is_module_constant(self):
+        from cli_agent_orchestrator.providers.cline_cli import (
+            CLINE_MCP_INIT_TIMEOUT_S,
+            _resolve_cline_mcp_init_timeout_s,
+        )
+
+        assert CLINE_MCP_INIT_TIMEOUT_S == 60
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults",
+            return_value={},
+        ):
+            assert _resolve_cline_mcp_init_timeout_s() == 60
+
+    def test_providers_toml_int_override(self):
+        from cli_agent_orchestrator.providers.cline_cli import (
+            _resolve_cline_mcp_init_timeout_s,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults",
+            return_value={"mcp_init_timeout_s": 90},
+        ):
+            assert _resolve_cline_mcp_init_timeout_s() == 90
+
+    def test_providers_toml_string_digit_override(self):
+        from cli_agent_orchestrator.providers.cline_cli import (
+            _resolve_cline_mcp_init_timeout_s,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults",
+            return_value={"mcp_init_timeout_s": "120"},
+        ):
+            assert _resolve_cline_mcp_init_timeout_s() == 120
+
+    def test_override_below_floor_is_clamped(self):
+        from cli_agent_orchestrator.providers.cline_cli import (
+            _resolve_cline_mcp_init_timeout_s,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults",
+            return_value={"mcp_init_timeout_s": 5},
+        ):
+            assert _resolve_cline_mcp_init_timeout_s() == 30
+
+    def test_invalid_override_falls_back_to_default(self):
+        from cli_agent_orchestrator.providers.cline_cli import (
+            _resolve_cline_mcp_init_timeout_s,
+        )
+
+        for bad in ("abc", True, 1.5, None):
+            with patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults",
+                return_value={"mcp_init_timeout_s": bad},
+            ):
+                assert _resolve_cline_mcp_init_timeout_s() == 60
+
 
 class TestAC15_CleanupSandboxDir:
     """AC15: cleanup() deletes sandbox dir and nothing outside it."""
@@ -136,12 +249,8 @@ class TestAC15_CleanupSandboxDir:
         user_secrets.write_text('{"key": "value"}')
         (dd / "secrets.json").symlink_to(user_secrets)
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", sandbox_root
-        ):
-            with patch(
-                "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
-            ):
+        with patch("cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", sandbox_root):
+            with patch("cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path):
                 cline_provider.cleanup()
 
         # Sandbox dir is gone
@@ -160,15 +269,12 @@ class TestAC15_CleanupSandboxDir:
         dd.mkdir()
         (dd / "marker.txt").write_text("should be removed via rmtree")
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", sandbox_root
-        ), patch(
-            "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
-        ), patch(
-            "cli_agent_orchestrator.providers.cline_cli.shutil.rmtree"
-        ) as mock_rmtree, patch(
-            "cli_agent_orchestrator.providers.cline_cli.subprocess.run"
-        ) as mock_run:
+        with (
+            patch("cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", sandbox_root),
+            patch("cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path),
+            patch("cli_agent_orchestrator.providers.cline_cli.shutil.rmtree") as mock_rmtree,
+            patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run") as mock_run,
+        ):
             cline_provider.cleanup()
 
         mock_rmtree.assert_called_once_with(dd)
@@ -193,12 +299,8 @@ class TestAC15_CleanupSandboxDir:
         different_root = tmp_path / "different-root"
         different_root.mkdir()
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", different_root
-        ):
-            with patch(
-                "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
-            ):
+        with patch("cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", different_root):
+            with patch("cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path):
                 # _data_dir() = different_root / terminal_id (doesn't exist)
                 # But we need _data_dir() to point at dd for the guard to fire.
                 # So patch it directly:
@@ -206,15 +308,11 @@ class TestAC15_CleanupSandboxDir:
 
         # Better approach: override _data_dir() to return dd, but set
         # CLINE_SANDBOX_ROOT to something different from dd's parent.
-        with patch.object(
-            cline_provider, "_data_dir", return_value=dd
-        ):
+        with patch.object(cline_provider, "_data_dir", return_value=dd):
             with patch(
                 "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", different_root
             ):
-                with patch(
-                    "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
-                ):
+                with patch("cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path):
                     cline_provider.cleanup()
 
         # Dir still exists — guard refused deletion because
