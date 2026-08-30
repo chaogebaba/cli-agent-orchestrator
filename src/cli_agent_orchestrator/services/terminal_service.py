@@ -5114,6 +5114,19 @@ async def _confirm_launch_health(terminal_id: str, provider) -> None:
 # ---------------------------------------------------------------------------
 _F491_DIALOG_CLEAR_POLL_INTERVAL = 0.5
 _F491_DIALOG_CLEAR_INITIAL_GRACE = 1.0
+# F582 D21 (#386/#530): the base ``timeout`` is the window in which we EXPECT a
+# late dialog to render. The #386 recurrence class is a dialog that renders
+# AFTER that window closes (the responder was proven to match-and-fire on the
+# byte-exact pane — attribution /data/cao-scratch/9064394e/f582-d21-attribution.md
+# — so the defect is arming/timing, not the matcher): on a static pane no new
+# output re-arms quiescence detection, so once this loop abandons at ``timeout``
+# the responder never re-evaluates and ``send_input`` races into an unanswered
+# dialog. The fix keeps the polling LIFETIME open past ``timeout`` for as long as
+# a whitelisted dialog is PROVABLY still on screen (``_responder_dialog_pending``),
+# bounded by this hard safety cap so a genuinely stuck seat still proceeds. The
+# base ``timeout`` still governs the no-dialog common case (we never sleep past
+# it when nothing is pending).
+_F491_DIALOG_CLEAR_MAX_LIFETIME = 45.0
 
 
 async def _wait_for_auto_responder_dialog_clear(
@@ -5175,7 +5188,18 @@ async def _wait_for_auto_responder_dialog_clear(
     await asyncio.sleep(_F491_DIALOG_CLEAR_INITIAL_GRACE)
 
     start = time.monotonic()
-    while time.monotonic() - start < timeout:
+    while True:
+        elapsed = time.monotonic() - start
+        # F582 D21: the base ``timeout`` bounds the wait ONLY while no whitelisted
+        # dialog is provably on screen. Past ``timeout``, keep the polling lifetime
+        # open (up to the hard cap) for as long as the responder still sees a
+        # matchable dialog — the #386 class is a dialog that renders after the
+        # base window closes, which a static pane never re-arms detection for.
+        if elapsed >= timeout:
+            if elapsed >= _F491_DIALOG_CLEAR_MAX_LIFETIME:
+                break
+            if not _responder_dialog_pending():
+                break
         current_status = status_monitor.get_status(terminal_id)
         if current_status != TerminalStatus.WAITING_USER_ANSWER and not _responder_dialog_pending():
             logger.debug(
@@ -5215,9 +5239,11 @@ async def _wait_for_auto_responder_dialog_clear(
         await asyncio.sleep(_F491_DIALOG_CLEAR_POLL_INTERVAL)
 
     logger.warning(
-        "f491_dialog_clear terminal=%s — timeout after %.1fs, proceeding with send_input",
+        "f491_dialog_clear terminal=%s — timeout after %.1fs (lifetime cap %.1fs), "
+        "proceeding with send_input",
         terminal_id,
         timeout,
+        _F491_DIALOG_CLEAR_MAX_LIFETIME,
     )
 
 

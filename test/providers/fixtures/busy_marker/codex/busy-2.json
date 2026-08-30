@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "BUSY",
+  "subtype": "working_marker",
+  "reset_hint_raw": "",
+  "source_path": "/home/chao/.aws/cli-agent-orchestrator/logs/terminal/c24be4dc.scrollback",
+  "source_line_range": "533-543",
+  "captured_at": "2026-08-29T21:46:54Z (scrollback mtime)",
+  "sha256": "c631bce2be9867da512f98d66beed396c6095fe84ca087be9900c00479568a67",
+  "note": "codex busy marker 1m59s variant"
+}

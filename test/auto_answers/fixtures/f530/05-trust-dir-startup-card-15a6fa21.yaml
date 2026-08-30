@@ -1,0 +1,5 @@
+expected_rule: codex-trust-dir
+occurrence: 1
+terminal: 15a6fa21
+provenance: "F582 D21 (#386/#530) condition corpus codex-dialog-blocked-1 (scrollback 15a6fa21.scrollback:16-33, captured 2026-08-29T14:35:52Z; escape-stripped display form, home path REDACTED). The byte-exact trust-dir stall pane: the trust prompt renders ABOVE the OpenAI Codex startup card. Empirically the dialog text (18 source rows) fits within DIALOG_REGION_LINES=20, so the startup card does NOT push it out of the match tail — the matcher+classifier FIRE on this pane (codex-trust-dir matches the chrome-filtered region AND the frame classifies WAITING_USER_ANSWER). This is the PASS regression pin proving the #386 defect is NOT tail-composition on this fixture but the arming/timing gap (see f582-sliceb-build-report.md Deviations; attribution /data/cao-scratch/9064394e/f582-d21-attribution.md)."
+xfail: false

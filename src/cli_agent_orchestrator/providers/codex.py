@@ -254,6 +254,40 @@ _TUI_PATH_TRUNCATED_RE = re.compile(r"^[~/][^\n›]*…$")
 TUI_PROGRESS_PATTERN = r"•.*\([^)]*\besc to interrupt\)"
 SCREEN_FALLBACK_PROCESSING_PATTERN = re.compile(r"\A[\s\S]*\Z")
 
+# F581 D16 (codex leg): busy-marker veto hook for rule 3a — same contract as
+# claude_code's ``rule3a_busy_marker`` and the kiro leg's ``kiro_busy_marker_live``.
+# The codex TUI's provable "the agent's own turn is live" marker is the Working/
+# Thinking spinner line "• Working (28s • esc to interrupt)" — the interrupt hint
+# is the stable anchor (prefix text and elapsed-time format vary; see
+# TUI_PROGRESS_PATTERN above). Proven from the byte-exact captured panes under
+# ``test/providers/fixtures/busy_marker/codex/`` (busy-1: "• Working (28s • esc to
+# interrupt)"; busy-2: "• Working (1m 59s • esc to interrupt)"). Anchored on the
+# interrupt hint so agent output that merely quotes "Working" cannot flip it.
+CODEX_BUSY_MARKER_PATTERN = re.compile(TUI_PROGRESS_PATTERN)
+
+
+def codex_busy_marker_live(text: str) -> bool | None:
+    """F581 D16: is the codex seat's own TUI activity marker live in ``text``?
+
+    Truth table (same as D12d / claude_code / the kiro leg):
+      * ``True``  — the Working/Thinking spinner with the "esc to interrupt"
+        hint is present (the agent's turn is live).
+      * ``False`` — no busy marker BUT the idle composer placeholder
+        ("Ask Codex to do anything") is present: the seat's own turn is over,
+        so veto this sample's upgrade.
+      * ``None``  — no identifiable codex TUI (no marker, no idle composer):
+        legacy rule 3a applies unchanged.
+
+    Operates on the plain (escape-stripped) pane string; no second capture.
+    """
+    clean = strip_terminal_escapes(text)
+    if CODEX_BUSY_MARKER_PATTERN.search(clean):
+        return True
+    if "Ask Codex to do anything" in clean:
+        return False
+    return None
+
+
 # Workspace trust/approval prompt shown when Codex opens a new directory
 TRUST_PROMPT_PATTERN = (
     r"(?:allow Codex to work in this folder" r"|Do you trust the contents of this directory)"
@@ -1427,6 +1461,16 @@ class CodexProvider(BaseProvider):
     def capture_shell_baseline(self) -> str | None:
         """Capture through this module's backend seam before Codex starts."""
         return get_backend().get_pane_current_command(self.session_name, self.window_name)
+
+    def rule3a_busy_marker(self, snapshot: str) -> bool | None:
+        """F581 D16 (codex leg): is the codex TUI's own activity marker live?
+
+        Delegates to the shared pure helper ``codex_busy_marker_live``. Same
+        contract as claude_code / kiro: True on the byte-exact Working/Thinking
+        spinner ("• Working (28s • esc to interrupt)"), False when only the idle
+        composer placeholder is present, None on an unidentifiable pane.
+        """
+        return codex_busy_marker_live(snapshot)
 
     """Provider for Codex CLI tool integration."""
 
