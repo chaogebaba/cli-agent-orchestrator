@@ -169,3 +169,17 @@ removed — will remove when a slot is free.
 
 ## Box used
 - **box@grok-box-002** (only box; box-1 frozen/skipped, box-005/006 busy/loaded).
+
+## r2 fold — gate r1 S2 (snapshot-before-prune ordering)
+
+**Finding (gate r1, S2):** "No test asserts that snapshot/scrollback capture occurs before `prune_terminal_log`".
+
+**New test node:** `test/services/test_f619_log_retention.py::TestDeletePruneOrdering::test_scrollback_captures_log_before_prune` (class `TestDeletePruneOrdering`, line 331).
+
+**Commits e3198d27..HEAD:**
+- `044eeb1e` F619 #475: S2 test — assert scrollback captures .log BEFORE prune (ordering guard)
+- `a646a94f` F619 #475: S2 test — import MagicMock
+
+**Box evidence (verbatim):** GREEN on correct code: 1 passed (box-2, box-run f619-s2-green). Mutant (prune_terminal_log injected at the top of the snapshot try-block before get_history, box-run f619-s2-mutant on a throwaway box worktree): 1 failed — `assert '' == 'PIPE-PANE-LOG...marker-line2'` — scrollback empty because the .log was pruned before capture; worktree discarded.
+
+Gate r1 S1 (environmental) unchanged per the r1 ruling.
