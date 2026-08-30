@@ -112,6 +112,10 @@ class _PaneState:
     busy_marker: bool | None = None
     children_count: int = 0
     marker_rows: tuple[str, ...] = ()
+    # F521 D15: the last admitted filtered tail, retained so a forced
+    # re-detect after a signalled stream drop has an input independent of
+    # the dropped event stream. No new capture — observe() already built it.
+    filtered_tail: str = ""
     # F568 AC-7 veto-defect episode clock — independent of downgrade_since.
     veto_episode_open: bool = False
     veto_warned_at: float | None = None
@@ -351,6 +355,7 @@ class PaneLivenessService:
             state.busy_marker = captured.busy_marker
             state.children_count = captured.children_count
             state.marker_rows = captured.marker_rows
+            state.filtered_tail = filtered_tail
 
             # Usable sample: advance the debounce counter.
             if state.fp is None:
@@ -558,7 +563,7 @@ class PaneLivenessService:
                 pane_hold_expired=state.pane_hold_expired,
                 fingerprint=state.fp,
                 fp_changed=False,
-                filtered_tail="",
+                filtered_tail=state.filtered_tail,
                 busy_marker=state.busy_marker,
                 children_count=state.children_count,
                 marker_rows=state.marker_rows,

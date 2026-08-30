@@ -12,12 +12,14 @@ from cli_agent_orchestrator.services import status_monitor as sm
 class _FakeLoop:
     def __init__(self):
         self.delays = []
+        self.callbacks = []
 
     def call_soon_threadsafe(self, fn):
         fn()
 
     def call_later(self, delay, callback, *args):
         self.delays.append(delay)
+        self.callbacks.append((callback, args))
         return MagicMock()
 
 
@@ -88,3 +90,27 @@ def test_clear_terminal_resets_backoff(monkeypatch):
     loop.delays.clear()
     monitor.schedule_detection_retry("term1")
     assert loop.delays == [1.0]
+
+
+def test_retry_routes_screen_provider_to_screen_callback(monkeypatch):
+    loop = _FakeLoop()
+    provider = MagicMock()
+    provider.supports_screen_detection = True
+    monitor = _monitor_with_loop(monkeypatch, loop, provider=provider)
+
+    monitor.schedule_detection_retry("term1", delay_s=0.5)
+
+    callback, args = loop.callbacks[-1]
+    assert callback == monitor._on_screen_quiescent
+    assert args == ("term1", provider, 0)
+
+
+def test_retry_routes_raw_provider_to_raw_callback(monkeypatch):
+    loop = _FakeLoop()
+    monitor = _monitor_with_loop(monkeypatch, loop, provider=object())
+
+    monitor.schedule_detection_retry("term1", delay_s=0.5)
+
+    callback, args = loop.callbacks[-1]
+    assert callback == monitor._on_raw_quiescent
+    assert args == ("term1", 0)

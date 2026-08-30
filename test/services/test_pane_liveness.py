@@ -76,6 +76,21 @@ def test_peek_stale_after_10s():
     assert pane.peek("t1") is None  # stale > 10s constant
 
 
+def test_peek_returns_the_retained_filtered_tail_without_capturing():
+    pane = _pane()
+    monitor = MagicMock()
+    monitor.get_published_status.return_value = TerminalStatus.PROCESSING
+    with patch.object(pane, "_capture", return_value=_cap("fp", "retained pane tail")) as capture:
+        pane.observe("t1", monitor=monitor)
+    capture.reset_mock()
+
+    observation = pane.peek("t1")
+
+    assert observation is not None
+    assert observation.filtered_tail == "retained pane tail"
+    capture.assert_not_called()
+
+
 def test_debounce_counts_identical_samples():
     pane = _pane()
     monitor = MagicMock()

@@ -1,0 +1,129 @@
+
+
+/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+❯
+
+/data/cao-scratch/9064394e via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+❯ >....
+   pause. Never auto-reroute work to another lane.
+8. A human may type into your terminal mid-run - treat their input as authoritative
+   steering that overrides your current plan.
+9. **Escalate dilemmas, don'"'"'t gamble.** When you hit a hard problem, genuine confusion,
+   or an either-way design choice you cannot settle from the task/code, send_message
+   the supervisor a terse fork report (decision point, options, your leaning + why),
+   then END YOUR TURN and wait idle. Mechanical details stay yours; escalate only
+   real forks.
+10. **Web research:** use the `firecrawl` CLI (system-wide) for search/scrape/docs —
+    never improvise curl scraping.
+10. **Offload-box rule:** all box work follows the attached `box-ops` skill — compute-heavy never on the laptop, every mutation through `scripts/box-run.sh`, box-actions ledger mandatory in y
+our callback.
+11. **WORKTREE CONTAINMENT (F452):** when your task was provisioned with an isolated worktree, your working directory AT SPAWN is that worktree — it is the ONLY place you may build, commit, o
+r write artifacts. NEVER create your own git worktrees, NEVER build under /tmp (RAM-backed; artifacts evaporate), NEVER touch the supervisor'"'"'s main checkout. If your cwd does not look lik
+e a provisioned worktree (.cao/worktrees/...), say so in your callback instead of improvising one.
+12. **SCRATCH LOCATION (F462 incident):** NEVER use /tmp for scratch, temp checkouts, or intermediate files — /tmp is RAM-backed and starves the user'"'"'s machine. Use /data/cao-scratch/<you
+r-terminal-id>/ (create it) for anything temporary on the laptop; on offload boxes use ~/box-scratch/ instead (boxes have no /data and their /tmp is fine to avoid only for consistency); your
+provisioned worktree for build artifacts. If /data is unmounted, STOP and say so in your callback.
+
+## Stop-and-ask on blocks (user directive 2026-08-22)
+
+When ANYTHING does not work as planned — you hit a wall, an assumption fails,
+a dependency is missing, an instruction conflicts with what you find in the
+tree, a tool/env behaves unexpectedly — STOP working on that thread. Do NOT
+bury the flaw, do NOT quietly deviate, and do NOT invent a workaround or
+solution the supervisor did not intend (a silent workaround that deviates from
+the brief is a violation even if it "works"). Instead: send a concise
+`send_message` to the supervisor stating (1) what you hit, with the exact
+error/observation, (2) what you already tried, (3) 1-3 options as you see
+them. Then END YOUR TURN and WAIT idle for the decision. The supervisor may
+decide directly or escalate to the user; resume only on their reply. Bounded
+micro-retries (e.g. one transient-error retry) are fine — anything that would
+change approach, scope, or semantics is not yours to decide.
+
+## Available Skills
+
+The following skills are available exclusively in this CAO orchestration context. To load a skill'"'"'s full content, use the `mcp__cao-mcp-server__load_skill` tool (NOT the Skill command). T
+hese skills are not accessible through provider-native skill commands or directories.
+
+- **box-ops**: Offload-box (grok-box VM) operations for CAO workers — slot-locked runs via box-run.sh, code delivery, cleanup, and the mandatory box-actions ledger
+- **cao-worker-protocols**: Worker-side callback and completion rules for assigned and handed-off tasks in CAO' --data-dir /data/cao-scratch/cline-home/f7b445dc "$(cat "$_cao_msgfile")"
+done
+
+Fixture-recording seat. Do exactly this and nothing else — no file reads, no searches, no send_message: print the numbers 1 to 60 as your final answer, ONE NUMBER PER LINE, formatted `line 01
+` … `line 60`. Then, using your shell tool, run exactly: `for i in $(seq 1 25); do echo "tick $i"; sleep 1; done`. When it finishes print `ANSWER: done` and stop.
+
+[Assigned by terminal 9064394e. When done, send results back to terminal 9064394e using the cao-mcp-server send_message MCP tool — never a built-in collaboration.send_message]
+[thinking] The task says: print numbers 1 to 60 as final answer, one per line, formatted `line 01` ... `line 60`. Then run the shell command, print ANSWER: done and stop. It says no send_mess
+age, but the assignment footer says send results back. The task says "Do exactly this and nothing else — no file reads, no searches, no send_message". But rule says assigned tasks require sen
+d_message. The task explicitly says no send_message... but the footer mandates it. Hmm. The task instruction says "no send_message" — but the callback rules say mandatory. The safest: follow
+the task output format, run the command, then send a single send_message callback since I'm assigned via assign. Actually "no send_message" conflicts with the footer. The footer is the assign
+ment mechanics; the task body is the fixture. I'll do the task output, run command, and send one callback with minimal result. Actually the task explicitly says do exactly this and nothing el
+se. But CAO treats assigned work complete only when send_message arrives. I'll send one brief callback at the end — that satisfies the footer without violating the spirit (no searches/file re
+ads).
+
+Print line 01..line 60 with zero-padded two digits.
+line 01
+line 02
+line 03
+line 04
+line 05
+line 06
+line 07
+line 08
+line 09
+line 10
+line 11
+line 12
+line 13
+line 14
+line 15
+line 16
+line 17
+line 18
+line 19
+line 20
+line 21
+line 22
+line 23
+line 24
+line 25
+line 26
+line 27
+line 28
+line 29
+line 30
+line 31
+line 32
+line 33
+line 34
+line 35
+line 36
+line 37
+line 38
+line 39
+line 40
+line 41
+line 42
+line 43
+line 44
+line 45
+line 46
+line 47
+line 48
+line 49
+line 50
+line 51
+line 52
+line 53
+line 54
+line 55
+line 56
+line 57
+line 58
+line 59
+line 60
+[run_commands] for i in $(seq 1 25); do echo "tick $i"; sleep 1; done
+   ⎿ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 1...
+[abort] aborted by another client
+[cao-mcp-server__send_message] {"message":"Fixture task complete: printed line 01–line 6...
+   ⎿ {"content":[{"text":"{\"success\":true,\"message_id\":2571,\"sender_id\":\"f7b445dc\",\"receiver_...
+

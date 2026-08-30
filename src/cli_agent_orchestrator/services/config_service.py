@@ -253,6 +253,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     # F506/F507: pane-delta liveness fusion + question-marker durability
     "CAO_LIVENESS_STABLE_SAMPLES": ("liveness.stable_samples", "int", 3),
     "CAO_LIVENESS_PANE_DELTA_MAX_HOLD_S": ("liveness.pane_delta_max_hold_s", "float", 300.0),
+    "CAO_LIVENESS_RESYNC_INTERVAL_S": ("liveness.resync_interval_s", "float", 60.0),
     "CAO_LIVENESS_QUESTION_MARKER_TTL_S": ("liveness.question_marker_ttl_s", "float", 300.0),
     "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
     "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
