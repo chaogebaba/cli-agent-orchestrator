@@ -2437,7 +2437,7 @@ def _send_message_impl(
                 barrier_timeout_seconds=barrier_timeout_seconds,
                 barrier_member_key=barrier_member_key,
             )
-        send_kwargs = {"refresh_ingest": refresh_ingest}
+        send_kwargs: dict[str, Any] = {"refresh_ingest": refresh_ingest}
         if park_warm:
             send_kwargs["park_warm"] = True
         # F578 D23: opt-in per-message delivery controls (AC10). Threaded to the
