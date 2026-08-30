@@ -11,15 +11,23 @@ but ONLY when the offload fleet is actually in use for this repo:
 
 * the terminal is a WORKER (supervisor/operator terminals are never shimmed —
   a human at the supervisor must keep unrestricted local tooling);
-* ``<repo_root>/scripts/boxes.tsv`` exists AND has at least one ACTIVE box row
+* ``scripts/boxes.tsv`` exists AND has at least one ACTIVE box row
   (an all-frozen or absent fleet means there is nowhere to offload to, so the
   laptop is the only option and the shim would be pure obstruction);
 * ``LAPTOP_OK`` is unset in the composed environment (explicit operator
   override in the brief).
 
-The shim directory and ``boxes.tsv`` are BOTH resolved relative to the repo
-root the terminal runs in, so the mechanism is self-contained per checkout and
-trivially testable.
+F636 (#491) — nested-checkout resolution. The shim wrappers
+(``scripts/laptop-shims``) ship in the CAO FORK, but ``scripts/boxes.tsv`` (the
+live offload-fleet roster) lives only in the ROOT repo that the fork is nested
+inside. ``repo_root`` is ``git rev-parse --show-toplevel`` from the worker's
+cwd, which stops at the FORK's own ``.git`` — so a single-root lookup found the
+shims but never the roster, and the F620 guard was inert for every worker
+everywhere. ``boxes.tsv`` is therefore resolved against ``repo_root`` AND its
+immediate parent directory (walk up ONE level max, explicit); the shim
+directory stays fork-relative (that is where the wrappers physically are). The
+non-nested case (both files under one root) is unchanged: the ``repo_root``
+lookup matches first.
 """
 
 from __future__ import annotations
@@ -58,6 +66,33 @@ def _boxes_tsv_has_active_row(boxes_tsv_path: str) -> bool:
     return False
 
 
+def _active_boxes_tsv_for(repo_root: str) -> Optional[str]:
+    """Path to an active ``scripts/boxes.tsv`` for ``repo_root``, else ``None``.
+
+    F636 (#491): checks ``<repo_root>/scripts/boxes.tsv`` first, then — because
+    the roster lives only in the ROOT repo the CAO fork is nested inside, while
+    ``repo_root`` resolves to the fork's own toplevel — the SAME relative path
+    under ``repo_root``'s immediate parent directory. The walk-up is exactly ONE
+    level (a directly-nested fork is a child of its root); it never ascends
+    further, so an unrelated grandparent repo can never satisfy the guard.
+
+    Returns the first path whose ``boxes.tsv`` has an active row; ``None`` if
+    neither does. ``os.path.dirname`` on a normalized root yields the parent;
+    at a filesystem root ``dirname`` is idempotent (``"/"`` -> ``"/"``), so the
+    parent check simply re-probes the same nonexistent path and still returns
+    ``None`` — no infinite ascent, no special-casing.
+    """
+    candidates = [repo_root]
+    parent = os.path.dirname(os.path.normpath(repo_root))
+    if parent and parent != os.path.normpath(repo_root):
+        candidates.append(parent)
+    for root in candidates:
+        boxes_tsv = os.path.join(root, _BOXES_TSV_SUBDIR)
+        if _boxes_tsv_has_active_row(boxes_tsv):
+            return boxes_tsv
+    return None
+
+
 def should_inject_shim(
     *,
     is_worker: bool,
@@ -67,8 +102,9 @@ def should_inject_shim(
     """Decide whether the laptop-shim PATH prefix applies for this terminal.
 
     All four conditions must hold: worker terminal, a resolvable repo root, an
-    active box row in ``<repo_root>/scripts/boxes.tsv``, and ``LAPTOP_OK`` unset
-    in ``env``.
+    active box row in ``scripts/boxes.tsv`` (resolved against ``repo_root`` or
+    its immediate parent — see ``_active_boxes_tsv_for``, F636 #491), and
+    ``LAPTOP_OK`` unset in ``env``.
     """
     if not is_worker:
         return False
@@ -76,8 +112,7 @@ def should_inject_shim(
         return False
     if env.get("LAPTOP_OK", "") != "":
         return False
-    boxes_tsv = os.path.join(repo_root, _BOXES_TSV_SUBDIR)
-    if not _boxes_tsv_has_active_row(boxes_tsv):
+    if _active_boxes_tsv_for(repo_root) is None:
         return False
     shim_dir = os.path.join(repo_root, _SHIM_SUBDIR)
     if not os.path.isdir(shim_dir):
