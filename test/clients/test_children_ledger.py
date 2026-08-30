@@ -295,10 +295,10 @@ def test_reconcile_drops_entries_after_k_non_processing(db_env):
     _seed()
     register_terminal_child("t1", "stuck")
     # Under K: not dropped.
-    assert reconcile_children_on_publish("t1", "IDLE", 1, 3) == 1
-    assert reconcile_children_on_publish("t1", "IDLE", 2, 3) == 1
+    assert reconcile_children_on_publish("t1", "idle", 1, 3) == 1
+    assert reconcile_children_on_publish("t1", "idle", 2, 3) == 1
     # At K: dropped.
-    assert reconcile_children_on_publish("t1", "IDLE", 3, 3) == 0
+    assert reconcile_children_on_publish("t1", "idle", 3, 3) == 0
     assert _children() == []
 
 
@@ -307,13 +307,13 @@ def test_reconcile_does_not_drop_live_processing_delegation(db_env):
     publish reconcile, regardless of streak."""
     _seed()
     register_terminal_child("t1", "live")
-    assert reconcile_children_on_publish("t1", "PROCESSING", 99, 3) == 1
+    assert reconcile_children_on_publish("t1", "processing", 99, 3) == 1
     assert [e["id"] for e in _children()] == ["live"]
 
 
 def test_reconcile_is_noop_without_children(db_env):
     _seed()
-    assert reconcile_children_on_publish("t1", "IDLE", 5, 3) == 0
+    assert reconcile_children_on_publish("t1", "idle", 5, 3) == 0
     # No cao.children key created by a no-children reconcile.
     assert _cao().get("children") in (None, [])
 
