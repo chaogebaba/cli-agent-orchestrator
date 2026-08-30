@@ -1,0 +1,39 @@
+box-run: acquired box@grok-box-004 for 'f618-mutant'
+box-run: box@grok-box-004 fork checkout at ddd615f7
+=== apply MUTANT: remove init_db registration line only ===
+registration removed; remaining defs: 1
+=== run guard+migration tests (EXPECT guard RED) ===
+    
+        This is the mutant-catching test: dropping ``_migrate_f582_d23_inbox_expiry``
+        from ``init_db``'s registration makes ``create_all`` skip the (already
+        existing) inbox table, leaving it missing the two D23 columns and turning
+        this assertion RED.
+        """
+        db_file = tmp_path / "cli-agent-orchestrator.db"
+        engine = create_engine(f"sqlite:///{db_file}")
+        with engine.begin() as connection:
+            connection.execute(text(_LEGACY_INBOX_DDL))
+    
+        # Point BOTH the ORM engine (which the ALTER migrations bind) and the
+        # DATABASE_FILE (which the self-connecting migrations open) at the same
+        # legacy database, so init_db operates on one consistent file.
+        monkeypatch.setattr(db_mod, "engine", engine)
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=True)
+    
+        db_mod.init_db()
+    
+        present = _inbox_columns(engine)
+        mapped = {column.name for column in InboxModel.__table__.columns}
+        missing = mapped - present
+>       assert not missing, f"inbox table is missing mapped InboxModel columns: {sorted(missing)}"
+E       AssertionError: inbox table is missing mapped InboxModel columns: ['expire_after_s', 'supersede_key']
+E       assert not {'expire_after_s', 'supersede_key'}
+
+test/clients/test_f618_inbox_expiry_migration.py:159: AssertionError
+=========================== short test summary info ============================
+FAILED test/clients/test_f618_inbox_expiry_migration.py::test_all_inbox_model_columns_present_after_migrations
+1 failed, 3 passed in 1.44s
+PYTEST_RC=0
+=== revert mutant ===
+reverted; registration count:
+2
