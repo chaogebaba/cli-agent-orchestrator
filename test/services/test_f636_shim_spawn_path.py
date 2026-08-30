@@ -269,6 +269,9 @@ async def test_operator_new_session_launch_is_not_shimmed(
     worker create_window path never being reached at all."""
     captured: dict = {}
     seam, backend = _spawn_seam(captured=captured)
+    # Operator launch creates a NEW session, so the backend must report it does
+    # not yet exist (else create_terminal raises "already exists").
+    backend.session_exists.return_value = False
     l1, l2 = _lease_patches()
     with seam, l1, l2, patch(
         "cli_agent_orchestrator.backends.registry._backend", backend
