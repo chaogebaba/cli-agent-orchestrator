@@ -1681,16 +1681,38 @@ class AutoResponder:
         # back to the viewport tail only when no composite is available (preserving
         # prior behaviour for tests/paths without a live composite). The raw
         # viewport ``region`` is still used for the provider ``status`` classify.
+        viewport_match_region = (
+            self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
+        )
         composite_match_region = self._barrier_composite_region(terminal_id, chrome_patterns)
         if composite_match_region is not None:
             match_region = composite_match_region
         else:
-            match_region = (
-                self._region_from_capture(fresh, chrome_patterns) if chrome_patterns else region
-            )
+            match_region = viewport_match_region
         status = self._classify_region(terminal_id, provider, region)
         if not rule.matches(match_region):
             return False  # dialog cleared / no longer matches — no retry
+        # F640 #495: the SETTLE-digest comparison below runs in the composite
+        # domain (F635's #490 fix — settle_digest is composite-seeded), but the
+        # FIRE decision must ALSO be corroborated by the LIVE tmux viewport. The
+        # composite retains text the viewport does not — the width-retained tail
+        # of a line wider than the pane AND stale palimpsest rows when the pyte
+        # screen size and the real pane disagree (see
+        # ``status_monitor._resolve_screen_size``). Without this gate F635 fired a
+        # rule's answer keys on a match present ONLY in the composite: during
+        # codex init those keys landed in a mid-render/palimpsest frame or the
+        # wrong widget, leaving codex with no ``›`` composer, so the deferred-init
+        # send read an unreadable composer and the worker was torn down
+        # (deferred_init_internal — the #495 signature). The genuine #490 chooser
+        # is unaffected: its option LABELS are short and visible in the viewport;
+        # only the long ``(path)`` tails truncate. When no composite is available
+        # ``match_region`` IS the viewport region, so this gate is a no-op there.
+        if composite_match_region is not None and not rule.matches(viewport_match_region):
+            # Uncorroborated composite-only match — withhold the send. Re-arm a
+            # detection tick: a genuine dialog will corroborate once the live
+            # viewport catches up to the composite.
+            self._request_detection_retry(terminal_id)
+            return False
         if self._busy_veto(status):
             self._request_detection_retry(terminal_id)
             return False

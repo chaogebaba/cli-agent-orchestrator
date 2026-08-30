@@ -119,9 +119,10 @@ def test_all_rule_match_call_sites_receive_a_dialog_region_value():
         and node.func.attr == "matches"
     ]
 
-    # Settle (pt2) added two sites; all pass a region (Name) or a *.normalized
-    # attribute — never *.rows.
-    assert len(calls) == 8
+    # Settle (pt2) added two sites; F640 #495 added one (the barrier viewport
+    # corroboration gate). All pass a region (Name) or a *.normalized attribute —
+    # never *.rows.
+    assert len(calls) == 9
     for call in calls:
         assert len(call.args) == 1
         arg = call.args[0]
