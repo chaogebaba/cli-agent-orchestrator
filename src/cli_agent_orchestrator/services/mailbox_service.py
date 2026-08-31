@@ -947,6 +947,7 @@ def list_messages(
     original_receiver_id: str | None = None,
     audit_browse: bool = False,
     unconsumed_only: bool = False,
+    claim: str | None = None,
 ) -> dict[str, Any]:
     if (
         status == MessageStatus.PARKED
@@ -1048,6 +1049,28 @@ def list_messages(
                         and int(current_generation) != row.owner_generation
                     )
             items.append(item)
+        # F642 §7/D3/AC18: the hook's READ is its CLAIM. When ``claim`` names a
+        # carrier, insert a delivery_emission (claim) for each listed id inside
+        # THIS same call and return ONLY the ids this carrier won — an id another
+        # carrier already claimed is filtered out, so the caller (e.g.
+        # supervisor-inbox-drain.sh) prints nothing for it. Opt-in only: without
+        # ``claim`` the read is a pure read (no mutation), preserving GET semantics.
+        if claim is not None and items:
+            from cli_agent_orchestrator.clients.database import hook_claim_ids
+            from cli_agent_orchestrator.clients.delivery_ledger import Carrier
+
+            if claim != Carrier.HOOK.value:
+                # Only the hook's read-as-claim path is defined by the spine
+                # (§7/D3); other carriers claim before they speak on their own
+                # emit path, not through this read.
+                raise MailboxDomainError(
+                    "unsupported_claim_carrier",
+                    f"--claim only supports '{Carrier.HOOK.value}' (the read-as-claim path)",
+                )
+            candidate_ids = [int(item["id"]) for item in items]
+            won = set(hook_claim_ids(db, candidate_ids=candidate_ids))
+            db.commit()
+            items = [item for item in items if int(item["id"]) in won]
         return {
             "items": items,
             "next_after_id": rows[-1].id if has_more else None,

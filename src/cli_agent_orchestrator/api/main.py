@@ -8397,6 +8397,7 @@ async def list_messages_endpoint(
     original_receiver_id: Optional[TerminalId] = None,
     audit_browse: bool = False,
     unconsumed_only: bool = Query(default=False),
+    claim: Optional[str] = Query(default=None),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> Dict:
     """Replay a deterministic logical or incarnation-provenance message page."""
@@ -8435,6 +8436,19 @@ async def list_messages_endpoint(
             kwargs["audit_browse"] = True
         if unconsumed_only:
             kwargs["unconsumed_only"] = True
+        if claim is not None:
+            # --claim MUTATES (inserts a delivery_emission claim, §7/D3), so it
+            # requires write/admin, not merely read. A read-scoped token may list
+            # but not claim.
+            if SCOPE_WRITE not in _scopes and SCOPE_ADMIN not in _scopes:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "code": "claim_requires_write",
+                        "message": "--claim requires write or admin scope",
+                    },
+                )
+            kwargs["claim"] = claim
         return await asyncio.to_thread(list_messages, to, **kwargs)
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
