@@ -10,6 +10,7 @@ F123 insert-path direct append (attempt_teammate_push_on_insert) is retired.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,90 @@ from cli_agent_orchestrator.services.nudge_discipline import JitterRNG, _Default
 _push_rng: JitterRNG = _DefaultRNG()
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# F656 (#511): team-inbox mutation instrumentation — EVIDENCE ONLY.
+#
+# The post-ack resurrection race (id re-injected ~41s after ack, ~1/299) is a
+# file-level race on team-lead.json between this fork's writers and the drain
+# hook's scrub. Neither writer logs today, so the record cannot distinguish
+# the interleaving. This instrumentation adds a single structured DEBUG line
+# at every atomic write/scrub of the inbox file, capturing enough to
+# reconstruct the interleaving after the fact:
+#   pid, monotonic_ns, entries_before/after, msg_ids added/removed,
+#   mtime+size before/after, and a content hash of the bytes written.
+#
+# HARD CONSTRAINT (instrumentation only): this must NOT change behavior and
+# must NOT widen the read-modify-write window. All "before" values are derived
+# from data ALREADY read inside the lock (the parsed `entries` list and the
+# `raw` string) plus at most one cheap metadata `os.stat` (NOT a content read).
+# The content hash is computed over the `data` bytes already held in memory —
+# never a re-read. All "after" observation happens AFTER os.replace, i.e.
+# outside the read-filter-replace critical section.
+# ---------------------------------------------------------------------------
+
+_inbox_race_logger = logging.getLogger("cao.inbox_race")
+
+
+def _stat_size_mtime(path: Path) -> tuple[Optional[int], Optional[float]]:
+    """Cheap metadata probe: (size_bytes, mtime) or (None, None) if absent.
+
+    A single os.stat — a metadata syscall, NOT a content read — so it does not
+    widen the read-modify-write window that the F656 race lives in.
+    """
+    try:
+        st = os.stat(str(path))
+        return st.st_size, st.st_mtime
+    except OSError:
+        return None, None
+
+
+def _log_inbox_mutation(
+    *,
+    op: str,
+    inbox_path: Path,
+    entries_before: int,
+    entries_after: int,
+    msg_ids_added: List[str],
+    msg_ids_removed: List[str],
+    size_before: Optional[int],
+    mtime_before: Optional[float],
+    size_after: Optional[int],
+    mtime_after: Optional[float],
+    content_hash: Optional[str],
+    outcome: str,
+) -> None:
+    """Emit one structured DEBUG line describing a team-inbox mutation (F656).
+
+    Best-effort and DEBUG-gated: a logging failure must never affect the write
+    path, and the payload is only assembled when DEBUG is enabled for the
+    dedicated ``cao.inbox_race`` logger.
+    """
+    try:
+        if not _inbox_race_logger.isEnabledFor(logging.DEBUG):
+            return
+        _inbox_race_logger.debug(
+            "f656_inbox_mutation op=%s outcome=%s pid=%d mono_ns=%d path=%s "
+            "entries_before=%d entries_after=%d added=%s removed=%s "
+            "size_before=%s mtime_before=%s size_after=%s mtime_after=%s hash=%s",
+            op,
+            outcome,
+            os.getpid(),
+            time.monotonic_ns(),
+            inbox_path,
+            entries_before,
+            entries_after,
+            msg_ids_added,
+            msg_ids_removed,
+            size_before,
+            mtime_before,
+            size_after,
+            mtime_after,
+            content_hash,
+        )
+    except Exception:  # pragma: no cover - instrumentation must never break writes
+        pass
+
 
 # D11: Pinned deterministic namespace (frozen forever).
 # Derivation: UUID5 of "https://github.com/awslabs/cli-agent-orchestrator/f136-supervisor-callback"
@@ -145,6 +230,10 @@ def write_supervisor_callback_notification(
     try:
         # Read existing array
         entries: List[Dict[str, Any]] = []
+        # F656: capture pre-mutation file metadata alongside the existing read.
+        # os.stat is a metadata syscall, not a content read, so the
+        # read-modify-write window is unchanged.
+        size_before, mtime_before = _stat_size_mtime(inbox_path)
         if inbox_path.exists():
             try:
                 raw = inbox_path.read_text(encoding="utf-8")
@@ -184,6 +273,7 @@ def write_supervisor_callback_notification(
                     )
 
         # D12 step 7: append and atomic durable write
+        entries_before = len(entries)
         entries.append(entry)
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
@@ -203,6 +293,23 @@ def write_supervisor_callback_notification(
                 pass
             return NativeInboxWriteResult(kind="retryable_failure", reason=f"write: {e}")
 
+        # F656: post-replace observation (outside the read-filter-replace
+        # critical section). Hash is over the `data` bytes already in memory.
+        size_after, mtime_after = _stat_size_mtime(inbox_path)
+        _log_inbox_mutation(
+            op="append",
+            inbox_path=inbox_path,
+            entries_before=entries_before,
+            entries_after=len(entries),
+            msg_ids_added=[msg_id],
+            msg_ids_removed=[],
+            size_before=size_before,
+            mtime_before=mtime_before,
+            size_after=size_after,
+            mtime_after=mtime_after,
+            content_hash=hashlib.sha256(data).hexdigest(),
+            outcome="written",
+        )
         return NativeInboxWriteResult(kind="written")
     finally:
         _release_lockfile(fd, lock_path)
@@ -467,6 +574,7 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
         return False
     try:
         entries_list: List[Dict[str, Any]] = []
+        size_before, mtime_before = _stat_size_mtime(inbox_path)
         if inbox_path.exists():
             try:
                 raw = inbox_path.read_text(encoding="utf-8")
@@ -486,10 +594,12 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
                     # Already present — idempotent success
                     return True
 
+        entries_before = len(entries_list)
         entries_list.append(entry)
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
-            tmp_path.write_text(json.dumps(entries_list, indent=2), encoding="utf-8")
+            payload = json.dumps(entries_list, indent=2)
+            tmp_path.write_text(payload, encoding="utf-8")
             os.replace(str(tmp_path), str(inbox_path))
         except OSError:
             try:
@@ -497,6 +607,22 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
             except OSError:
                 pass
             return False
+        # F656: post-replace observation (legacy pull-gate writer).
+        size_after, mtime_after = _stat_size_mtime(inbox_path)
+        _log_inbox_mutation(
+            op="append_legacy",
+            inbox_path=inbox_path,
+            entries_before=entries_before,
+            entries_after=len(entries_list),
+            msg_ids_added=[entry_msg_id] if entry_msg_id else [],
+            msg_ids_removed=[],
+            size_before=size_before,
+            mtime_before=mtime_before,
+            size_after=size_after,
+            mtime_after=mtime_after,
+            content_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            outcome="written",
+        )
         return True
     finally:
         _release_lockfile(fd, lock_path)
@@ -628,6 +754,7 @@ def mark_cc_inbox_entries_read(
         if not inbox_path.exists():
             return 0
 
+        size_before, mtime_before = _stat_size_mtime(inbox_path)
         try:
             raw = inbox_path.read_text(encoding="utf-8")
             if not raw.strip():
@@ -639,8 +766,11 @@ def mark_cc_inbox_entries_read(
             logger.debug("f178: malformed cc inbox file, skipping: %s", e)
             return 0
 
+        entries_before = len(entries)
+
         # Mark matching entries as read
         marked = 0
+        marked_msg_ids: List[str] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -649,6 +779,7 @@ def mark_cc_inbox_entries_read(
                 if entry.get("from") == _TEAMMATE_FROM and not entry.get("read"):
                     entry["read"] = True
                     marked += 1
+                    marked_msg_ids.append(entry_msg_id)
 
         if marked == 0:
             return 0
@@ -672,6 +803,27 @@ def mark_cc_inbox_entries_read(
             except OSError:
                 pass
             return 0
+
+        # F656: post-replace observation of the scrub/read-mark mutation.
+        # This writer flips `read` flags rather than adding/removing rows, so
+        # `removed` carries the msg_ids whose flag was scrubbed to read=True
+        # (entries_before == entries_after by construction). Hash is over the
+        # `data` bytes already in memory.
+        size_after, mtime_after = _stat_size_mtime(inbox_path)
+        _log_inbox_mutation(
+            op="scrub_read_mark",
+            inbox_path=inbox_path,
+            entries_before=entries_before,
+            entries_after=len(entries),
+            msg_ids_added=[],
+            msg_ids_removed=marked_msg_ids,
+            size_before=size_before,
+            mtime_before=mtime_before,
+            size_after=size_after,
+            mtime_after=mtime_after,
+            content_hash=hashlib.sha256(data).hexdigest(),
+            outcome=f"marked={marked}",
+        )
 
         logger.debug("f178: marked %d cc inbox entries read for mailbox %s", marked, mailbox_id)
         return marked
