@@ -95,6 +95,18 @@ def _resolve_me(value: str) -> str:
 @click.option("--generation")
 @click.option("--original-receiver-id")
 @click.option("--audit-browse", is_flag=True)
+@click.option(
+    "--claim",
+    "claim",
+    type=click.Choice(["hook"]),
+    help=(
+        "F642 §7/D3: claim each listed id for CARRIER server-side in the same "
+        "call (the read IS the claim) and return only the ids this carrier won. "
+        "Ids another carrier already claimed are omitted. Currently only 'hook' "
+        "is supported (the supervisor-inbox-drain read-as-claim path). Requires "
+        "write/admin scope."
+    ),
+)
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable compact JSON output.")
 def list_cmd(
     receiver: str,
@@ -105,6 +117,7 @@ def list_cmd(
     generation: str | None,
     original_receiver_id: str | None,
     audit_browse: bool,
+    claim: str | None,
     as_json: bool,
 ) -> None:
     """List durable inbox messages in ascending id order."""
@@ -121,6 +134,8 @@ def list_cmd(
         params["original_receiver_id"] = original_receiver_id
     if audit_browse:
         params["audit_browse"] = True
+    if claim is not None:
+        params["claim"] = claim
     try:
         response = cao_http.get(
             f"/messages",
