@@ -101,20 +101,24 @@ def write_supervisor_callback_notification(
     inbox_path = inbox_path.resolve()
     msg_id = callback_notification_id(mailbox_id, message.id)
 
-    # Shape immutable entry content
+    # Shape immutable entry content.
+    # F654 D1: contentless wake entry. No preview substring of the message body
+    # appears anywhere in the entry — the authoritative full body is read from
+    # the drain-hook digest. `text` is a fixed-format pointer; `summary` is
+    # non-empty ("Message <id> ready") so summary-keyed listings don't render a
+    # blank row. msg_id derivation, from-name, lockfile, dedup, read-marking,
+    # and return kinds are all untouched.
     worker_name = message.sender_id
-    message_preview = message.message.split("\n", 1)[0] if message.message else ""
     created_at_str = (
         message.created_at.isoformat()
         if message.created_at
         else datetime.now(timezone.utc).isoformat()
     )
     text_body = (
-        f"[CAO:{worker_name}] {message_preview[:_TEXT_PREVIEW_CHARS]}\n\n"
-        f"---\nMessage {message.id} ready. Drain: list_messages -> ack_messages"
+        f"[CAO] Message {message.id} ready from {worker_name}. "
+        f"Drain: list_messages -> ack_messages"
     )
-    summary_raw = f"{worker_name}: {message_preview[:80]}"
-    summary = summary_raw[:_SUMMARY_MAX_CHARS]
+    summary = f"Message {message.id} ready"
 
     entry = {
         "type": "message",
