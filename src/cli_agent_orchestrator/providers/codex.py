@@ -628,6 +628,50 @@ CODEX_ROLLOUT_POLL_INTERVAL_SECONDS = 0.3
 # where the file may not exist at dispatch time yet).
 CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS = 8.0
 
+# ---------------------------------------------------------------------------
+# F643c (#498) — DELIVERY READINESS GATE on a resuming TUI.
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (instrumented probe 6351a149): CAO delivers the first task while
+# the codex 0.151.0 resume TUI is still initializing. The startup card renders
+# "model:       loading" and "Resuming session…" while a trust-directory dialog
+# may interpose; the submit Enter is consumed/dropped during that init window
+# and the task text sits UNSUBMITTED in the composer. The fix gates the first
+# paste on TUI readiness: wait (bounded) until the loading banner clears and the
+# footer/status line renders, then proceed. If readiness never resolves inside
+# the bound we proceed ANYWAY with a WARN — the gate must never permanently
+# withhold a delivery; the F435 verify/recovery path remains the backstop.
+#
+# "model:   loading" — the startup card's model row before the model resolves.
+# "Resuming session" — codex resume's transient banner while it replays history.
+CODEX_TUI_LOADING_BANNER_PATTERN = re.compile(
+    r"(?i)(?:^\s*(?:│\s*)?model:\s+loading\b|\bResuming session\b)",
+    re.MULTILINE,
+)
+# The TUI is READY once its footer/status line renders (the same predicate the
+# startup-readiness path uses) AND the loading banner is gone. STARTUP_FOOTER_
+# PATTERN matches "? for shortcuts", the context-left status, and the
+# "path · model" status bar — any of which only appear once the composer is live.
+CODEX_TUI_READY_FOOTER_RE = re.compile(STARTUP_FOOTER_PATTERN)
+# Bounded wait for readiness before the first paste. Generous because a cold
+# resume that replays a long transcript can take several seconds; the gate is a
+# no-op the instant the footer is present, so a warm/ready pane never waits.
+CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS = 12.0
+# Interval between readiness re-checks (seconds).
+CODEX_DELIVERY_READINESS_POLL_INTERVAL_SECONDS = 0.3
+
+
+def _codex_tui_is_ready_for_submit(rendered: str) -> bool:
+    """F643c: is the codex TUI past init and ready to accept a submitted paste?
+
+    Ready ⇔ the footer/status line is present AND no loading/resuming banner is
+    still on screen. Operates on the plain (escape-stripped) rendered pane text;
+    a pure predicate so it is trivially unit-testable against fixture screens.
+    """
+    clean = strip_terminal_escapes(rendered)
+    if CODEX_TUI_LOADING_BANNER_PATTERN.search(clean):
+        return False
+    return bool(CODEX_TUI_READY_FOOTER_RE.search(clean))
+
 
 @dataclass(frozen=True)
 class CodexSubmitBaseline:
@@ -1478,6 +1522,67 @@ class CodexProvider(BaseProvider):
         composer placeholder is present, None on an unidentifiable pane.
         """
         return codex_busy_marker_live(snapshot)
+
+    def pre_paste_gate(self) -> None:
+        """F643c (#498): gate the first paste until the resume TUI is ready.
+
+        ROOT CAUSE: codex 0.151.0 resume delivers the first task while the TUI
+        still shows "model: loading" / "Resuming session…" (a trust-directory
+        dialog may interpose); the submit Enter is dropped and the task sits
+        UNSUBMITTED in the composer, then F435 verify honestly reports
+        "structurally unconfirmed" → teardown of a healthy terminal.
+
+        This polls the rendered pane and returns the instant the TUI footer is
+        present with no loading banner. It is a NO-OP on a warm/ready pane (no
+        wait). If readiness never resolves inside the bound, it proceeds ANYWAY
+        with a WARN — a readiness gate must never permanently withhold a
+        delivery; the F435 verify + recovery path (including the F643c
+        composer-holds-draft re-Enter leg) is the backstop. This method NEVER
+        raises: any capture failure degrades to "proceed" so a transient read
+        error cannot block delivery.
+
+        B1 INVARIANT: this is a delivery-side readiness check, not a submission
+        confirmation. It gates WHEN we paste; it never asserts the paste landed.
+        """
+        backend = get_backend()
+        deadline = time.monotonic() + CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS
+        waited = False
+        while True:
+            try:
+                rendered = backend.get_history(
+                    self.session_name,
+                    self.window_name,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+            except Exception:
+                # Capture failure must not block delivery — proceed, let the
+                # F435 verify/recovery path handle a dropped submit.
+                logger.debug(
+                    "F643c readiness gate: pane read failed for %s; proceeding",
+                    self.terminal_id,
+                    exc_info=True,
+                )
+                return
+            if isinstance(rendered, str) and _codex_tui_is_ready_for_submit(rendered):
+                if waited:
+                    logger.info(
+                        "F643c readiness gate: terminal %s TUI ready; proceeding "
+                        "with paste",
+                        self.terminal_id,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "F643c readiness gate: terminal %s TUI not ready after %.1fs "
+                    "(loading banner or missing footer); proceeding anyway — F435 "
+                    "verify/recovery is the backstop",
+                    self.terminal_id,
+                    CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS,
+                )
+                return
+            waited = True
+            time.sleep(CODEX_DELIVERY_READINESS_POLL_INTERVAL_SECONDS)
 
     """Provider for Codex CLI tool integration."""
 
@@ -3757,6 +3862,41 @@ class CodexProvider(BaseProvider):
                     )
             return True
 
+        def _composer_holds_own_draft() -> bool:
+            """F643c (#498): does the live composer still hold OUR task text?
+
+            The F643c failure mode is distinct from the stuck-CHIP mode: on a
+            resuming codex 0.151.0 TUI the submit Enter is dropped during init
+            and the delivered task sits UNSUBMITTED in the composer as raw text
+            (or a chip). ``_pane_shows_stuck_chip`` only recognizes the collapsed
+            paste-chip shape, so this reads the composer draft directly and
+            confirms it carries a distinctive signature of the dispatched
+            message. Match is by CONTENT (normalized signature prefix), never by
+            length, so an unrelated draft cannot satisfy it.
+
+            Returns False (never raises) on any capture/read failure — a blind
+            re-Enter must require positive evidence the composer holds our text.
+            """
+            signature = self._task_echo_signature(message)
+            if signature is None:
+                # Too short / no message to form a low-false-positive signature.
+                return False
+            try:
+                captured = backend.get_history(
+                    session,
+                    window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+                if not isinstance(captured, str):
+                    return False
+                draft = self.read_composer_draft(captured.splitlines())
+            except Exception:
+                return False
+            if not draft:
+                return False
+            return signature in self._normalize_pane_text(draft)
+
         # --- Main verification loop ---
         time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
 
@@ -3901,9 +4041,55 @@ class CodexProvider(BaseProvider):
 
         for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
             if not _pane_shows_stuck_chip():
-                # No stuck chip visible — cannot recover with Enter. The task
-                # may have submitted but the rollout flush is slow, OR the pane
-                # is in an indeterminate state. Re-check rollout one more time.
+                # No stuck chip visible — the classic F435 stuck-CHIP recovery
+                # cannot fire. But F643c (#498): on a resuming codex 0.151.0 TUI
+                # the dropped submit Enter leaves OUR task text sitting in the
+                # composer as an unsubmitted DRAFT (raw text, not a collapsed
+                # chip). Recover it here: re-check rollout first (double-send
+                # guard — if the original submit just landed we must NOT Enter),
+                # and only if rollout is still negative AND the composer plainly
+                # holds our draft, re-send Enter. Re-sending Enter is an ACTION,
+                # never a confirmation (B1 invariant): the loop re-verifies via
+                # rollout afterwards and only success returns.
+                if _rollout_confirms():
+                    logger.info(
+                        "F435/F643c submit-verify: terminal %s confirmed via "
+                        "rollout re-check before composer-draft recovery (race "
+                        "avoided)",
+                        self.terminal_id,
+                    )
+                    return
+                if _composer_holds_own_draft():
+                    logger.warning(
+                        "F643c submit-verify: terminal %s composer still holds "
+                        "the delivered task as an unsubmitted draft, no chip "
+                        "(attempt %d/%d, rollout negative); re-sending Enter",
+                        self.terminal_id,
+                        attempt,
+                        CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+                    )
+                    try:
+                        backend.send_special_key(session, window, "Enter")
+                    except Exception as exc:
+                        logger.warning(
+                            "F643c submit-verify: re-Enter failed for terminal "
+                            "%s: %s",
+                            self.terminal_id,
+                            exc,
+                        )
+                    time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                    if _rollout_confirms():
+                        logger.info(
+                            "F643c submit-verify: terminal %s confirmed via "
+                            "rollout after composer-draft recovery Enter",
+                            self.terminal_id,
+                        )
+                        return
+                    continue
+                # No stuck chip AND no owned draft: cannot recover with Enter.
+                # The task may have submitted but the rollout flush is slow, OR
+                # the pane is in an indeterminate state. Re-check rollout once
+                # more with an extended wait.
                 logger.warning(
                     "F435 submit-verify: terminal %s no stuck chip visible "
                     "(attempt %d/%d); re-checking rollout",
