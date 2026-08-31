@@ -521,6 +521,37 @@ InboxSink = Callable[[str, "Condition"], None]  # (terminal_id, condition) -> on
 CliSink = Callable[[str, "Condition", str], None]  # (terminal_id, condition, fleet_label)
 
 
+# ─── F642 D5/D7: durable condition-decision log integration ─────────────────────
+# The store is injected so production wires the DB-backed ``condition_ledger``
+# (durable across a cao-server restart, AC9) while tests wire a fake or a real
+# DB. When NO store is present, ``ConditionDelivery`` falls back to the in-memory
+# ``_last`` dict — byte-identical to F611's behaviour, so nothing that does not
+# opt into the spine changes.
+class ConditionLogStore:
+    """Protocol for the durable decision log (F642 §2, D7). A production impl
+    wraps ``clients.database.suppress_condition_by_log`` /
+    ``record_condition_decision``; a test impl can be an in-memory list."""
+
+    def should_suppress(self, terminal_id: str, kind: str, subtype: str, epoch: int) -> bool:
+        """D7: read the latest memory-updating row and decide suppression."""
+        raise NotImplementedError
+
+    def record(
+        self,
+        *,
+        terminal_id: str,
+        decision: str,
+        kind: Optional[str],
+        subtype: Optional[str],
+        epoch: Optional[int],
+        surfaces: Optional[str] = None,
+        suppressed_reason: Optional[str] = None,
+        inbox_message_id: Optional[int] = None,
+    ) -> None:
+        """Append one decision row (one per ``deliver()`` exit, D5/AC20/AC24)."""
+        raise NotImplementedError
+
+
 class ConditionDelivery:
     """The single delivery seam (D4, blueprint §3).
 
@@ -537,6 +568,12 @@ class ConditionDelivery:
     A ``None`` sink is a no-op leg (e.g. a caller that only wants the fleet
     field). Sink exceptions are swallowed so a delivery failure never breaks the
     status transition that triggered it.
+
+    F642: when a :class:`ConditionLogStore` is injected, de-dup consults the
+    DURABLE log (surviving a restart, AC9) instead of the in-memory dict, the
+    kind→surfaces map (D5) gates the INBOX leg (BUSY-class kinds fire fleet+bus
+    but NOT inbox), and EVERY ``deliver()`` exit writes a decision row —
+    including the confidence gate (AC24), the one otherwise-invisible outcome.
     """
 
     def __init__(
@@ -545,12 +582,14 @@ class ConditionDelivery:
         fleet_sink: Optional[FleetSink] = None,
         inbox_sink: Optional[InboxSink] = None,
         cli_sink: Optional[CliSink] = None,
+        log_store: Optional[ConditionLogStore] = None,
     ) -> None:
         # terminal_id -> last delivered (kind, subtype, epoch)
         self._last: Dict[str, Tuple[str, str, int]] = {}
         self._fleet_sink = fleet_sink
         self._inbox_sink = inbox_sink
         self._cli_sink = cli_sink
+        self._log_store = log_store
 
     def deliver(self, terminal_id: str, cond: Optional[Condition], *, epoch: int) -> DeliveryResult:
         if cond is None:
@@ -558,25 +597,123 @@ class ConditionDelivery:
             # row stops rendering a stale CAPPED/BLOCKED. No inbox/CLI on a clear.
             self._set_fleet(terminal_id, None)
             self._last.pop(terminal_id, None)
+            # F642 D7: a clear writes an explicit `cleared` decision row (NULL
+            # tuple), mirroring the pop at the in-memory path — the durable memory
+            # is re-armed without losing the history (AC21(c)).
+            self._record(terminal_id, "cleared", None, None, None)
             return DeliveryResult(False, None, 0, "no_condition")
         if not should_deliver(cond):
             # D3: low confidence logs but never surfaces on ANY of the three.
+            # F642 AC24: the gate still writes a `gated` decision row — the one
+            # routing outcome that would otherwise be invisible everywhere. It is
+            # SKIPPED by the de-dup comparison (it moves no memory).
+            self._record(
+                terminal_id, "gated", cond.kind.value, cond.subtype, epoch
+            )
             return DeliveryResult(False, None, 0, "confidence_below_gate")
         label = self._fleet_label(cond)
         key = (cond.kind.value, cond.subtype, epoch)
-        prev = self._last.get(terminal_id)
-        if prev == key:
-            # D4: same tuple within the same epoch → suppress the repeat. The
-            # fleet field is idempotently re-affirmed (cheap, no new event); the
-            # inbox push and CLI projection are NOT re-fired.
+        if self._is_duplicate(terminal_id, cond, epoch, key):
+            # D4/D7: same tuple as the latest DELIVERED row → suppress the repeat.
+            # The fleet field is idempotently re-affirmed; the inbox push and CLI
+            # projection are NOT re-fired. A `deduped` audit row is written
+            # (AC20) and SKIPPED by future comparisons.
             self._set_fleet(terminal_id, label)
+            self._record(
+                terminal_id,
+                "deduped",
+                cond.kind.value,
+                cond.subtype,
+                epoch,
+                suppressed_reason="dedup_epoch",
+            )
             return DeliveryResult(False, label, 0, "deduped_same_epoch")
         self._last[terminal_id] = key
         # ONE event → three surfaces, fanned out here (never three producers).
         self._set_fleet(terminal_id, label)
-        pushes = self._push_inbox(terminal_id, cond)
+        # F642 D5: the kind→surfaces map gates the INBOX leg. A BUSY-class kind
+        # fires fleet+bus but declines the inbox push; the memory is STILL set
+        # (this stays a `delivered` decision), so the row stays inside the de-dup
+        # comparison (r3/B1) — recorded via suppressed_reason='busy_class'.
+        inbox_declined = self._inbox_declined(cond.kind.value)
+        pushes = 0 if inbox_declined else self._push_inbox(terminal_id, cond)
         self._project_cli(terminal_id, cond, label)
+        self._record(
+            terminal_id,
+            "delivered",
+            cond.kind.value,
+            cond.subtype,
+            epoch,
+            surfaces=self._surfaces_str(cond.kind.value),
+            suppressed_reason="busy_class" if inbox_declined else None,
+        )
         return DeliveryResult(True, label, pushes, "delivered")
+
+    # ── F642 helpers ──────────────────────────────────────────────────────────
+    def _is_duplicate(
+        self,
+        terminal_id: str,
+        cond: "Condition",
+        epoch: int,
+        key: Tuple[str, str, int],
+    ) -> bool:
+        if self._log_store is not None:
+            return self._log_store.should_suppress(
+                terminal_id, cond.kind.value, cond.subtype, epoch
+            )
+        return self._last.get(terminal_id) == key
+
+    def _inbox_declined(self, kind: str) -> bool:
+        """D5: does the kind→surfaces map decline the inbox leg? Only consulted
+        when a log store is wired (spine active); otherwise F611's fan-out is
+        unchanged."""
+        if self._log_store is None:
+            return False
+        from cli_agent_orchestrator.clients.delivery_ledger import busy_class_declines_inbox
+
+        return busy_class_declines_inbox(kind)
+
+    @staticmethod
+    def _surfaces_str(kind: str) -> str:
+        from cli_agent_orchestrator.clients.delivery_ledger import surfaces_for_kind
+
+        surf = surfaces_for_kind(kind)
+        parts = []
+        if surf.fleet:
+            parts.append("fleet")
+        if surf.bus:
+            parts.append("bus")
+        if surf.inbox:
+            parts.append("inbox")
+        return ",".join(parts)
+
+    def _record(
+        self,
+        terminal_id: str,
+        decision: str,
+        kind: Optional[str],
+        subtype: Optional[str],
+        epoch: Optional[int],
+        *,
+        surfaces: Optional[str] = None,
+        suppressed_reason: Optional[str] = None,
+        inbox_message_id: Optional[int] = None,
+    ) -> None:
+        if self._log_store is None:
+            return
+        try:
+            self._log_store.record(
+                terminal_id=terminal_id,
+                decision=decision,
+                kind=kind,
+                subtype=subtype,
+                epoch=epoch,
+                surfaces=surfaces,
+                suppressed_reason=suppressed_reason,
+                inbox_message_id=inbox_message_id,
+            )
+        except Exception:  # audit write must never break the transition
+            pass
 
     def _set_fleet(self, terminal_id: str, label: Optional[str]) -> None:
         if self._fleet_sink is None:

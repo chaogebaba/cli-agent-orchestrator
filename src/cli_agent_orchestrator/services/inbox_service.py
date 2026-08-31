@@ -115,6 +115,30 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+
+def _f642_record_blocked_awaiting_idle(message_ids: list[int]) -> None:
+    """F642 D12: record ``blocked_reason='awaiting_idle'`` for held ids.
+
+    Best-effort and self-sessioned: opens its own short transaction so a ledger
+    write never entangles the delivery path. A failure is swallowed — the wait
+    record is an observability aid, never a delivery precondition.
+    """
+    if not message_ids:
+        return
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            SessionLocal,
+            record_blocked_awaiting_idle,
+        )
+
+        with SessionLocal() as db:
+            for mid in message_ids:
+                record_blocked_awaiting_idle(db, message_id=int(mid))
+            db.commit()
+    except Exception:
+        logger.debug("f642_record_blocked_failed", exc_info=True)
+
+
 # F162 D10: rate-limited gate5 WARN state — {terminal_id: last_warn_time}
 _fx158_gate5_last_warn: dict[str, float] = {}
 _FX158_GATE5_WARN_INTERVAL_S: float = 60.0
@@ -2570,6 +2594,13 @@ class InboxService:
                                     )
                                     return
                             if not eager_eligible:
+                                # F642 D12: the delivery gate declines to deliver
+                                # because the receiver is not IDLE — record the
+                                # WAIT (blocked_reason='awaiting_idle', aging
+                                # blocked_since), a DIFFERENT fact from a decline.
+                                # A stuck receiver is then visible as a growing
+                                # wait rather than as silence (upstream PR #712).
+                                _f642_record_blocked_awaiting_idle(message_ids)
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)
                     resolution = resolve_session_transcript(metadata)

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, cast
 
 from sqlalchemy import (
     JSON,
@@ -46,6 +46,21 @@ from cli_agent_orchestrator.constants import (
     DATABASE_URL,
     DB_DIR,
     DEFAULT_PROVIDER,
+)
+from cli_agent_orchestrator.clients.delivery_ledger import (
+    AckActor,
+    BlockedReason,
+    Carrier,
+    ConditionDecision,
+    ConditionLogRow,
+    ConditionTuple,
+    EmissionOutcome,
+    EmissionView,
+    LedgerState,
+    SuppressedReason,
+    UndeliverableReason,
+    carriers_exhausted,
+    should_suppress_condition,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
@@ -387,6 +402,94 @@ class InboxModel(Base):
     supersede_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     __table_args__ = (Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),)
+
+
+class DeliveryLedgerModel(Base):
+    """F642 (blueprint §2, D1) — the per-id delivery AUTHORITY, PK ``message_id``.
+
+    One authoritative row per message id: the thing the five partial delivery
+    stores (two watermarks, ``status``, an in-memory dict, the replay queue)
+    could not express. ``applicable_carriers`` is the carrier set computed ONCE
+    at routing time (D2) and stored as a comma-separated list, so exhaustion is
+    evaluated against a stated domain.
+    """
+
+    __tablename__ = "delivery_ledger"
+    message_id = Column(Integer, ForeignKey("inbox.id"), primary_key=True)
+    receiver_id = Column(String, nullable=False)
+    mailbox_id = Column(String, nullable=True)
+    # D2: comma-separated Carrier values computed once at routing time.
+    applicable_carriers = Column(String, nullable=False, default="", server_default="")
+    # LedgerState value; starts 'pending'.
+    state = Column(String, nullable=False, default="pending", server_default="pending")
+    first_emitted_at = Column(DateTime(timezone=True), nullable=True)
+    first_carrier = Column(String, nullable=True)
+    acked_at = Column(DateTime(timezone=True), nullable=True)
+    acked_by = Column(String, nullable=True)  # AckActor value
+    emission_count = Column(Integer, nullable=False, default=0, server_default="0")
+    suppressed_reason = Column(String, nullable=True)  # SuppressedReason value
+    undeliverable_reason = Column(String, nullable=True)  # UndeliverableReason value
+    # D12: waiting (not-yet-eligible) is a DIFFERENT fact from a decline.
+    blocked_reason = Column(String, nullable=True)  # BlockedReason value
+    blocked_since = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    __table_args__ = (Index("ix_delivery_ledger_receiver", "receiver_id"),)
+
+
+class DeliveryEmissionModel(Base):
+    """F642 (blueprint §2, D2/D3) — the append-only carrier log.
+
+    ``UNIQUE(message_id, carrier)`` is the design: a legitimate fallback is a
+    DIFFERENT carrier and inserts cleanly, while a repeat by the SAME carrier
+    cannot be written at all. The row is the CLAIM; the ``outcome`` is the RESULT
+    (D3/S2) — a carrier that fails keeps its claim and retries by updating its own
+    row, so a dropped socket does not burn the carrier, but it can never speak
+    twice.
+    """
+
+    __tablename__ = "delivery_emission"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("inbox.id"), nullable=False)
+    carrier = Column(String, nullable=False)  # Carrier value
+    emitted_at = Column(DateTime(timezone=True), nullable=True)
+    outcome = Column(
+        String, nullable=False, default="pending", server_default="pending"
+    )  # EmissionOutcome value
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    claimed_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        UniqueConstraint("message_id", "carrier", name="uq_emission_message_carrier"),
+        Index("ix_delivery_emission_message", "message_id"),
+    )
+
+
+class ConditionLedgerModel(Base):
+    """F642 (blueprint §2, D7) — condition-class DECISION LOG, append-only.
+
+    NOT keyed on the de-dup tuple (r2's retracted PK). PK is an autoincrement
+    ``id`` so the SECOND arrival of a tuple is a writable row rather than a
+    constraint violation — which is what lets a ``dedup_epoch`` suppression be a
+    durable row instead of an absence (AC20). ``kind``/``subtype`` are NULL on a
+    ``cleared`` row (``deliver(cond=None)``); the de-dup rule never compares them.
+    """
+
+    __tablename__ = "condition_ledger"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
+    kind = Column(String, nullable=True)  # NULL on cleared
+    subtype = Column(String, nullable=True)  # NULL on cleared
+    epoch = Column(Integer, nullable=True)  # NULL on cleared
+    decision = Column(String, nullable=False)  # ConditionDecision value
+    surfaces = Column(String, nullable=True)  # comma-separated fleet/bus/inbox
+    suppressed_reason = Column(String, nullable=True)  # annotation, not a decision
+    inbox_message_id = Column(Integer, nullable=True)  # set only when a push happened
+    decided_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        Index("ix_condition_ledger_terminal", "terminal_id", "id"),
+    )
 
 
 class CallbackBarrierModel(Base):
@@ -1502,6 +1605,11 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    # F642 delivery-ledger spine. Three brand-new tables (delivery_ledger,
+    # delivery_emission, condition_ledger), no rebuild of inbox/mailboxes — the
+    # additive migration D11 promises. Disjoint from every table above, so
+    # registry order is immaterial; appended LAST.
+    _migrate_f642_delivery_ledger()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -2159,6 +2267,95 @@ def _migrate_workflow_plan_approval() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_plan_approval migration skipped: {e}")
+
+
+def _migrate_f642_delivery_ledger() -> None:
+    """F642: create the delivery-ledger spine tables if missing (blueprint D11).
+
+    THREE brand-new tables, no rebuild of ``inbox`` or ``mailboxes`` — the
+    additive migration D11 promises, so nothing in the hot path changes shape and
+    the 2974 existing rows are untouched (AC12). Pre-existing rows get no ledger
+    row; a surface that finds none treats the id as ``pending`` for emission
+    purposes and, because every such id is already below both watermarks, no
+    historical message is re-emitted (D11).
+
+    * ``delivery_ledger`` — PK ``message_id`` (D1).
+    * ``delivery_emission`` — ``UNIQUE(message_id, carrier)`` (D2), the unique
+      constraint that makes a repeat by the same carrier UNWRITABLE.
+    * ``condition_ledger`` — autoincrement PK, append-only decision log (D7), so
+      the second arrival of a de-dup tuple is a writable audit row (AC20).
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never
+    propagated, matching every migrator above.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_ledger ("
+                "message_id INTEGER PRIMARY KEY, "
+                "receiver_id TEXT NOT NULL, "
+                "mailbox_id TEXT, "
+                "applicable_carriers TEXT NOT NULL DEFAULT '', "
+                "state TEXT NOT NULL DEFAULT 'pending', "
+                "first_emitted_at DATETIME, "
+                "first_carrier TEXT, "
+                "acked_at DATETIME, "
+                "acked_by TEXT, "
+                "emission_count INTEGER NOT NULL DEFAULT 0, "
+                "suppressed_reason TEXT, "
+                "undeliverable_reason TEXT, "
+                "blocked_reason TEXT, "
+                "blocked_since DATETIME, "
+                "created_at DATETIME NOT NULL, "
+                "updated_at DATETIME NOT NULL, "
+                "FOREIGN KEY(message_id) REFERENCES inbox(id)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_delivery_ledger_receiver "
+                "ON delivery_ledger(receiver_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_emission ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "message_id INTEGER NOT NULL, "
+                "carrier TEXT NOT NULL, "
+                "emitted_at DATETIME, "
+                "outcome TEXT NOT NULL DEFAULT 'pending', "
+                "attempts INTEGER NOT NULL DEFAULT 0, "
+                "claimed_at DATETIME NOT NULL, "
+                "FOREIGN KEY(message_id) REFERENCES inbox(id), "
+                "UNIQUE(message_id, carrier)"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_delivery_emission_message "
+                "ON delivery_emission(message_id)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS condition_ledger ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "terminal_id TEXT NOT NULL, "
+                "kind TEXT, "
+                "subtype TEXT, "
+                "epoch INTEGER, "
+                "decision TEXT NOT NULL, "
+                "surfaces TEXT, "
+                "suppressed_reason TEXT, "
+                "inbox_message_id INTEGER, "
+                "decided_at DATETIME NOT NULL"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_condition_ledger_terminal "
+                "ON condition_ledger(terminal_id, id)"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"f642_delivery_ledger migration skipped: {e}")
 
 
 def _restrict_db_file_permissions() -> None:
@@ -4545,7 +4742,9 @@ def settle_terminal_rebound(
                     cursor_val = int(mb.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(
+                        # F642 D6: ledger-gate the enqueue — an already-acked id
+                        # is refused and recorded, never re-queued.
+                        enqueue_callback_replay_gated(
                             db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
                         )
         _f138_old_inc_id = _old_inc.id if _old_inc is not None else None
@@ -4749,7 +4948,8 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
                     cursor_val = int(mb_row.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(
+                        # F642 D6: ledger-gate the enqueue.
+                        enqueue_callback_replay_gated(
                             db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
                         )
         # S4: query child IDs before bulk update so we can invalidate their caches
@@ -5064,6 +5264,7 @@ def delete_terminal_and_warm_intent(
         )
         prefix = f"[released from {terminal_id} ({profile or 'unknown'}) — terminal reaped]\n"
         _reap_flipped_rows: list[tuple[str, int, str | None]] = []
+        _f642_reparented_ids: list[int] = []  # moved to target receiver
         for row in held.all():
             row.message = prefix + row.message
             if target_id is None:
@@ -5078,6 +5279,7 @@ def delete_terminal_and_warm_intent(
                 _reap_flipped_rows.append(
                     (MessageStatus.PENDING.value, int(row.id), target_mailbox_id)
                 )
+                _f642_reparented_ids.append(int(row.id))
         # F413 D7b: create obligations for flipped rows
         if _reap_flipped_rows:
             db.flush()
@@ -5147,6 +5349,23 @@ def delete_terminal_and_warm_intent(
             intent_deleted = (
                 db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
             )
+        # F642 D8/S1 (AC22): the departed-receiver detector fires HERE, in the
+        # SAME transaction as the delete — not on a later sweep. Reparented rows
+        # follow their message to the target receiver; every other undelivered
+        # ledger row for this reaped receiver reaches undeliverable(receiver_gone).
+        try:
+            if _f642_reparented_ids and target_id is not None:
+                (
+                    db.query(DeliveryLedgerModel)
+                    .filter(DeliveryLedgerModel.message_id.in_(_f642_reparented_ids))
+                    .update(
+                        {DeliveryLedgerModel.receiver_id: target_id},
+                        synchronize_session=False,
+                    )
+                )
+            mark_receiver_gone(db, receiver_id=terminal_id)
+        except Exception:
+            logger.debug("f642_receiver_gone_failed", exc_info=True)
         terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
     # F351: evict from metadata cache after deletion
     invalidate_terminal_metadata_cache(terminal_id)
@@ -6076,6 +6295,17 @@ def expire_pending_rows(row_ids: List[int]) -> int:
     if not row_ids:
         return 0
     with SessionLocal() as db:
+        # F642 D13: capture the ids about to expire so their ledger rows can be
+        # write-through transitioned in the SAME transaction/session.
+        _expiring_ids = [
+            int(r.id)
+            for r in db.query(InboxModel.id)
+            .filter(
+                InboxModel.id.in_(row_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .all()
+        ]
         updated = (
             db.query(InboxModel)
             .filter(
@@ -6087,6 +6317,10 @@ def expire_pending_rows(row_ids: List[int]) -> int:
                 synchronize_session=False,
             )
         )
+        if _expiring_ids:
+            write_through_terminal_state(
+                db, message_ids=_expiring_ids, state=LedgerState.EXPIRED
+            )
         db.commit()
     return int(updated)
 
@@ -6852,6 +7086,18 @@ def _fire_open_barrier_in_db(
         message=_render_callback_barrier(db, barrier, members, now),
         orchestration_type=OrchestrationType.SEND_MESSAGE,
     )
+    # F642 D13: capture the HELD member rows about to be digested so their ledger
+    # rows write-through to `superseded` (a digested row is undeliverable on its
+    # own — its content lives in the combined row) in the SAME transaction.
+    _digested_ids = [
+        int(r.id)
+        for r in db.query(InboxModel.id)
+        .filter(
+            InboxModel.barrier_id == barrier.id,
+            InboxModel.status == MessageStatus.HELD.value,
+        )
+        .all()
+    ]
     db.query(InboxModel).filter(
         InboxModel.barrier_id == barrier.id,
         InboxModel.status == MessageStatus.HELD.value,
@@ -6862,6 +7108,10 @@ def _fire_open_barrier_in_db(
         },
         synchronize_session=False,
     )
+    if _digested_ids:
+        write_through_terminal_state(
+            db, message_ids=_digested_ids, state=LedgerState.SUPERSEDED
+        )
     db.query(CallbackBarrierModel).filter_by(id=barrier.id).update(
         {CallbackBarrierModel.combined_message_id: combined.id},
         synchronize_session=False,
@@ -7145,6 +7395,20 @@ def _insert_routed_inbox_row(
             if logical_receiver_id is not None
             else InboxModel.receiver_id == receiver_id
         )
+        # F642 D13: capture the ids about to be superseded BEFORE the update so
+        # their ledger rows can be write-through transitioned in the SAME
+        # transaction — otherwise N ledger rows would read `pending` forever for
+        # messages that can never be delivered.
+        _superseded_ids = [
+            int(r.id)
+            for r in db.query(InboxModel.id)
+            .filter(
+                receiver_filter,
+                InboxModel.supersede_key == supersede_key,
+                InboxModel.status.in_([MessageStatus.PENDING.value, MessageStatus.HELD.value]),
+            )
+            .all()
+        ]
         (
             db.query(InboxModel)
             .filter(
@@ -7157,6 +7421,10 @@ def _insert_routed_inbox_row(
                 synchronize_session=False,
             )
         )
+        if _superseded_ids:
+            write_through_terminal_state(
+                db, message_ids=_superseded_ids, state=LedgerState.SUPERSEDED
+            )
         logger.info(
             "d23_supersede receiver=%s key=%s",
             effective_receiver,
@@ -7165,6 +7433,21 @@ def _insert_routed_inbox_row(
     row = InboxModel(**fields)
     db.add(row)
     db.flush()
+    # F642 D1/D8: the authoritative ledger row is created in the SAME transaction
+    # as the InboxModel row — a send that writes no ledger row created no message.
+    # The applicable-carrier set is computed once here (D2); absent runtime
+    # signals default to the full set so exhaustion is never falsely reached.
+    try:
+        create_delivery_ledger_row(
+            db,
+            message_id=int(row.id),
+            receiver_id=receiver_id,
+            mailbox_id=logical_receiver_id,
+            applicable_carriers=list(Carrier),
+            created_at=created_at,
+        )
+    except Exception:  # ledger write is best-effort at wiring layer; never break enqueue
+        logger.debug("f642_ledger_insert_failed", exc_info=True)
     if match is not None:
         barrier, member = match
         if member.state == "AWAITING":
@@ -11861,4 +12144,599 @@ def f138_get_incarnation_by_terminal_generation(
             "terminal_generation": inc.terminal_generation,
             "state": inc.state,
             "token_hash": inc.token_hash,
+        }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F642 — delivery-ledger spine operations (blueprint §3 write ownership)
+#
+# These wrap the pure logic in ``clients.delivery_ledger`` and compose against a
+# caller-owned ``Session`` so a ledger write lands in the SAME transaction as the
+# message-state change it mirrors (D8/D13). Functions that manage their own
+# session are named ``*_txn`` for clarity.
+# ─────────────────────────────────────────────────────────────────────────────
+def _carriers_to_str(carriers: "Iterable[Carrier]") -> str:
+    return ",".join(c.value for c in carriers)
+
+
+def _carriers_from_str(value: str | None) -> list[Carrier]:
+    if not value:
+        return []
+    return [Carrier(part) for part in value.split(",") if part]
+
+
+def create_delivery_ledger_row(
+    db: Session,
+    *,
+    message_id: int,
+    receiver_id: str,
+    mailbox_id: str | None,
+    applicable_carriers: "Iterable[Carrier]",
+    created_at: datetime | None = None,
+) -> "DeliveryLedgerModel":
+    """D1/D8: create the authoritative ledger row for a message.
+
+    Called from ``_insert_routed_inbox_row`` in the SAME transaction as the
+    ``InboxModel`` insert (§3): a send that creates no ledger row created no
+    message. Idempotent on ``message_id`` (a re-call updates the applicable set)
+    so repeated wiring never raises.
+    """
+    now = created_at or _utcnow()
+    row = db.get(DeliveryLedgerModel, message_id)
+    if row is None:
+        row = DeliveryLedgerModel(
+            message_id=message_id,
+            receiver_id=receiver_id,
+            mailbox_id=mailbox_id,
+            applicable_carriers=_carriers_to_str(applicable_carriers),
+            state=LedgerState.PENDING.value,
+            emission_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.flush()
+    else:
+        row.applicable_carriers = _carriers_to_str(applicable_carriers)
+        row.updated_at = now
+    return row
+
+
+def claim_emission(
+    db: Session,
+    *,
+    message_id: int,
+    carrier: Carrier,
+) -> bool:
+    """D3: a carrier CLAIMS before it speaks — insert the emission row first.
+
+    Returns True iff THIS caller won the claim (the insert landed). A later caller
+    for the same ``(message_id, carrier)`` loses on the ``UNIQUE`` constraint and
+    gets False — it must NOT emit (D2). The claim is taken inside a SAVEPOINT so a
+    losing insert rolls back only itself, never the caller's pending work.
+
+    The winner leaves the row at ``outcome='pending'``; it records the real
+    outcome afterwards via :func:`record_emission_outcome`.
+    """
+    now = _utcnow()
+    nested = db.begin_nested()
+    try:
+        db.execute(
+            insert(DeliveryEmissionModel).values(
+                message_id=message_id,
+                carrier=carrier.value,
+                outcome=EmissionOutcome.PENDING.value,
+                attempts=0,
+                claimed_at=now,
+            )
+        )
+        nested.commit()
+        return True
+    except IntegrityError:
+        nested.rollback()
+        return False
+
+
+def record_emission_outcome(
+    db: Session,
+    *,
+    message_id: int,
+    carrier: Carrier,
+    outcome: EmissionOutcome,
+) -> None:
+    """D3/S2: record the RESULT on a held claim, incrementing ``attempts``.
+
+    A ``failed`` carrier keeps its claim and may retry under the same row (a
+    dropped socket does not burn the surface). A ``succeeded`` first emission
+    stamps ``first_emitted_at``/``first_carrier`` and advances ``state`` to
+    ``emitted`` (unless already terminal), bumping ``emission_count``.
+    """
+    now = _utcnow()
+    emission = (
+        db.query(DeliveryEmissionModel)
+        .filter(
+            DeliveryEmissionModel.message_id == message_id,
+            DeliveryEmissionModel.carrier == carrier.value,
+        )
+        .one_or_none()
+    )
+    if emission is None:
+        return
+    emission.outcome = outcome.value
+    emission.attempts = int(emission.attempts) + 1
+    if outcome is EmissionOutcome.SUCCEEDED:
+        emission.emitted_at = now
+        ledger = db.get(DeliveryLedgerModel, message_id)
+        if ledger is not None:
+            ledger.emission_count = int(ledger.emission_count) + 1
+            if ledger.first_emitted_at is None:
+                ledger.first_emitted_at = now
+                ledger.first_carrier = carrier.value
+            if ledger.state == LedgerState.PENDING.value:
+                ledger.state = LedgerState.EMITTED.value
+                # An admitted emission clears any recorded wait (D12).
+                ledger.blocked_reason = None
+                ledger.blocked_since = None
+            ledger.updated_at = now
+
+
+def emit_via_carrier(
+    db: Session,
+    *,
+    message_id: int,
+    carrier: Carrier,
+    speak: "Callable[[], bool]",
+) -> bool:
+    """D3 convenience: claim, then speak, then record — the whole discipline.
+
+    ``speak`` performs the real utterance and returns True on success. Returns
+    True iff this call both won the claim AND spoke successfully. If the claim is
+    lost, ``speak`` is never called (the loser emits nothing). If ``speak``
+    raises or returns False, the outcome is recorded ``failed`` (claim retained).
+    """
+    if not claim_emission(db, message_id=message_id, carrier=carrier):
+        return False
+    ok = False
+    try:
+        ok = bool(speak())
+    except Exception:
+        ok = False
+    record_emission_outcome(
+        db,
+        message_id=message_id,
+        carrier=carrier,
+        outcome=EmissionOutcome.SUCCEEDED if ok else EmissionOutcome.FAILED,
+    )
+    return ok
+
+
+def mark_carrier_unavailable(
+    db: Session,
+    *,
+    message_id: int,
+    carrier: Carrier,
+) -> None:
+    """D2/S2 (AC23): a carrier in the stored set is no longer applicable at emit
+    time. Claim the row (so it exists) and stamp the TERMINAL, non-retryable
+    ``carrier_unavailable`` outcome — it counts toward exhaustion but is never
+    attempted again."""
+    claim_emission(db, message_id=message_id, carrier=carrier)
+    emission = (
+        db.query(DeliveryEmissionModel)
+        .filter(
+            DeliveryEmissionModel.message_id == message_id,
+            DeliveryEmissionModel.carrier == carrier.value,
+        )
+        .one_or_none()
+    )
+    if emission is not None:
+        emission.outcome = EmissionOutcome.CARRIER_UNAVAILABLE.value
+
+
+def maybe_mark_undeliverable(
+    db: Session,
+    *,
+    message_id: int,
+    max_attempts: int = 1,
+) -> bool:
+    """D2/S2/D8: transition to ``undeliverable(carriers_exhausted)`` when every
+    APPLICABLE carrier holds a terminal outcome and the id is still unacked.
+
+    ``max_attempts`` bounds how many times a ``failed`` carrier may retry before
+    its failure counts as terminal (a failed row with ``attempts >= max_attempts``
+    is no longer retryable). Returns True iff the transition fired.
+    """
+    ledger = db.get(DeliveryLedgerModel, message_id)
+    if ledger is None:
+        return False
+    if ledger.state in (
+        LedgerState.ACKED.value,
+        LedgerState.SUPERSEDED.value,
+        LedgerState.EXPIRED.value,
+        LedgerState.UNDELIVERABLE.value,
+    ):
+        return False
+    applicable = _carriers_from_str(ledger.applicable_carriers)
+    emissions = (
+        db.query(DeliveryEmissionModel)
+        .filter(DeliveryEmissionModel.message_id == message_id)
+        .all()
+    )
+    views: list[EmissionView] = []
+    for e in emissions:
+        outcome = EmissionOutcome(e.outcome)
+        retryable = (
+            outcome is EmissionOutcome.FAILED and int(e.attempts) < max_attempts
+        )
+        views.append(EmissionView(Carrier(e.carrier), outcome, retryable))
+    acked = ledger.acked_at is not None
+    if carriers_exhausted(applicable, views, acked=acked):
+        ledger.state = LedgerState.UNDELIVERABLE.value
+        ledger.undeliverable_reason = UndeliverableReason.CARRIERS_EXHAUSTED.value
+        ledger.blocked_reason = None
+        ledger.blocked_since = None
+        ledger.updated_at = _utcnow()
+        return True
+    return False
+
+
+def ack_delivery_ledger(
+    db: Session,
+    *,
+    message_ids: "Iterable[int]",
+    actor: AckActor,
+) -> int:
+    """D4: transition ledger rows to ``acked`` recording the ACTOR, and D6: prune
+    any queued replay for those ids. Composes in the ack transaction (§3) so the
+    watermark update and the ledger transition land together.
+
+    Returns the number of ledger rows transitioned to ``acked``.
+    """
+    now = _utcnow()
+    ids = [int(m) for m in message_ids]
+    if not ids:
+        return 0
+    acked = 0
+    rows = (
+        db.query(DeliveryLedgerModel)
+        .filter(DeliveryLedgerModel.message_id.in_(ids))
+        .all()
+    )
+    for row in rows:
+        if row.acked_at is None:
+            row.acked_at = now
+            row.acked_by = actor.value
+            row.state = LedgerState.ACKED.value
+            # A terminal transition clears any recorded wait (D12).
+            row.blocked_reason = None
+            row.blocked_since = None
+            row.updated_at = now
+            acked += 1
+    # D6: ack prunes queued replays for these ids (no more re-emission).
+    db.query(CallbackReplayQueueModel).filter(
+        CallbackReplayQueueModel.inbox_row_id.in_(ids)
+    ).delete(synchronize_session=False)
+    return acked
+
+
+def write_through_terminal_state(
+    db: Session,
+    *,
+    message_ids: "Iterable[int]",
+    state: LedgerState,
+) -> None:
+    """D13: mirror a terminal ``InboxModel.status`` transition (superseded /
+    expired / digested) onto the ledger IN THE SAME TRANSACTION as the status
+    update. A row that reaches a terminal message state must not be left reading
+    ``pending`` forever. Also clears any recorded wait (D12)."""
+    now = _utcnow()
+    ids = [int(m) for m in message_ids]
+    if not ids:
+        return
+    rows = (
+        db.query(DeliveryLedgerModel)
+        .filter(DeliveryLedgerModel.message_id.in_(ids))
+        .all()
+    )
+    for row in rows:
+        # Never clobber an ack (a consumed message stays consumed).
+        if row.state == LedgerState.ACKED.value:
+            continue
+        row.state = state.value
+        row.blocked_reason = None
+        row.blocked_since = None
+        row.updated_at = now
+
+
+def record_blocked_awaiting_idle(
+    db: Session,
+    *,
+    message_id: int,
+) -> None:
+    """D12: the delivery gate's early return declines to deliver — record the WAIT
+    (not a decline). Sets ``blocked_reason='awaiting_idle'`` and stamps
+    ``blocked_since`` once (a subsequent gate hit does not reset the age, so the
+    wait AGES and a wedge is visible). Only a non-terminal, un-emitted row is
+    marked."""
+    now = _utcnow()
+    row = db.get(DeliveryLedgerModel, message_id)
+    if row is None:
+        return
+    if row.state != LedgerState.PENDING.value:
+        return
+    if row.blocked_reason is None:
+        row.blocked_reason = BlockedReason.AWAITING_IDLE.value
+        row.blocked_since = now
+        row.updated_at = now
+
+
+def mark_receiver_gone(
+    db: Session,
+    *,
+    receiver_id: str,
+) -> int:
+    """D8/S1 (AC22): a receiver was reaped or reclaimed — transition its
+    undelivered ledger rows to ``undeliverable(receiver_gone)`` in the SAME
+    transaction as the delete, not on a later sweep. Acked/terminal rows are
+    untouched. Returns the count transitioned."""
+    now = _utcnow()
+    rows = (
+        db.query(DeliveryLedgerModel)
+        .filter(
+            DeliveryLedgerModel.receiver_id == receiver_id,
+            DeliveryLedgerModel.state.in_(
+                [LedgerState.PENDING.value, LedgerState.EMITTED.value]
+            ),
+        )
+        .all()
+    )
+    count = 0
+    for row in rows:
+        row.state = LedgerState.UNDELIVERABLE.value
+        row.undeliverable_reason = UndeliverableReason.RECEIVER_GONE.value
+        row.blocked_reason = None
+        row.blocked_since = None
+        row.updated_at = now
+        count += 1
+    return count
+
+
+def enqueue_callback_replay_gated(
+    db: Session,
+    *,
+    mailbox_id: str,
+    inbox_row_ids: "list[int]",
+) -> dict[str, list[int]]:
+    """D6: replay enqueue is LEDGER-GATED. An id whose ledger row is already
+    ``acked`` is REFUSED and recorded ``suppressed_reason='already_acked'`` rather
+    than queued; only un-acked ids reach ``enqueue_callback_replay``.
+
+    Returns ``{"enqueued": [...], "refused": [...]}``.
+    """
+    if not inbox_row_ids:
+        return {"enqueued": [], "refused": []}
+    ids = [int(r) for r in inbox_row_ids]
+    ledger_rows = {
+        int(row.message_id): row
+        for row in db.query(DeliveryLedgerModel)
+        .filter(DeliveryLedgerModel.message_id.in_(ids))
+        .all()
+    }
+    enqueued: list[int] = []
+    refused: list[int] = []
+    for rid in ids:
+        row = ledger_rows.get(rid)
+        if row is not None and row.state == LedgerState.ACKED.value:
+            row.suppressed_reason = SuppressedReason.ALREADY_ACKED.value
+            row.updated_at = _utcnow()
+            refused.append(rid)
+        else:
+            enqueued.append(rid)
+    if enqueued:
+        enqueue_callback_replay(db, mailbox_id=mailbox_id, inbox_row_ids=enqueued)
+    return {"enqueued": enqueued, "refused": refused}
+
+
+def record_condition_decision(
+    db: Session,
+    *,
+    terminal_id: str,
+    decision: ConditionDecision,
+    kind: str | None,
+    subtype: str | None,
+    epoch: int | None,
+    surfaces: str | None = None,
+    suppressed_reason: str | None = None,
+    inbox_message_id: int | None = None,
+) -> "ConditionLedgerModel":
+    """D5/D7/AC20/AC24: append ONE decision row per ``deliver()`` exit.
+
+    Every routing decision writes a row — including ``gated`` (which moves no
+    fleet field, fires no bus frame and creates no inbox row) so the one
+    otherwise-invisible outcome has a durable trace (AC24). ``kind``/``subtype``
+    are NULL on a ``cleared`` row.
+    """
+    row = ConditionLedgerModel(
+        terminal_id=terminal_id,
+        kind=kind,
+        subtype=subtype,
+        epoch=epoch,
+        decision=decision.value,
+        surfaces=surfaces,
+        suppressed_reason=suppressed_reason,
+        inbox_message_id=inbox_message_id,
+        decided_at=_utcnow(),
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def condition_log_rows(db: Session, terminal_id: str) -> list[ConditionLogRow]:
+    """Read the terminal's ``condition_ledger`` rows as pure projections for the
+    de-dup rule (D7). Survives a ``cao-server`` restart because the rows do — the
+    durability AC9 asserts."""
+    rows = (
+        db.query(ConditionLedgerModel)
+        .filter(ConditionLedgerModel.terminal_id == terminal_id)
+        .order_by(ConditionLedgerModel.id.asc())
+        .all()
+    )
+    projections: list[ConditionLogRow] = []
+    for row in rows:
+        decision = ConditionDecision(row.decision)
+        if row.kind is None or row.subtype is None or row.epoch is None:
+            tuple_ = None
+        else:
+            tuple_ = ConditionTuple(row.kind, row.subtype, int(row.epoch))
+        projections.append(ConditionLogRow(int(row.id), decision, tuple_))
+    return projections
+
+
+def suppress_condition_by_log(
+    db: Session,
+    *,
+    terminal_id: str,
+    kind: str,
+    subtype: str,
+    epoch: int,
+) -> bool:
+    """D7 durable de-dup, read against the log (AC9/AC21). Returns True iff the
+    incoming condition should be SUPPRESSED given the terminal's decision
+    history."""
+    incoming = ConditionTuple(kind, subtype, epoch)
+    return should_suppress_condition(incoming, condition_log_rows(db, terminal_id))
+
+
+def hook_claim_ids(
+    db: Session,
+    *,
+    candidate_ids: "list[int]",
+) -> list[int]:
+    """D3/AC18: the hook's READ is its CLAIM. Given the ids the drain hook would
+    print, return ONLY the ids the hook WON — those with no prior emission by ANY
+    other carrier — inserting a ``hook`` emission (claim) for each winner in the
+    SAME call. An id another carrier already claimed is returned NOT at all, so
+    ``supervisor-inbox-drain.sh`` prints nothing for it while still acking.
+
+    This is #709's pick-and-mark-in-one-statement applied to the hook's existing
+    read: the hook needs no new verb and cannot print an id another carrier
+    already carried (#488's first complaint).
+    """
+    if not candidate_ids:
+        return []
+    ids = [int(r) for r in candidate_ids]
+    # ids already claimed by a DIFFERENT carrier (native/doorbell/replay) — the
+    # hook must not reprint these.
+    already = {
+        int(row.message_id)
+        for row in db.query(DeliveryEmissionModel.message_id)
+        .filter(
+            DeliveryEmissionModel.message_id.in_(ids),
+            DeliveryEmissionModel.carrier != Carrier.HOOK.value,
+        )
+        .all()
+    }
+    won: list[int] = []
+    for mid in ids:
+        if mid in already:
+            continue
+        if claim_emission(db, message_id=mid, carrier=Carrier.HOOK):
+            won.append(mid)
+    return won
+
+
+
+class DbConditionLogStore:
+    """F642 production :class:`~cli_agent_orchestrator.providers.condition.ConditionLogStore`.
+
+    Backs the durable ``condition_ledger`` (D7, AC9). Each call opens its own
+    short session so the condition-delivery seam stays decoupled from any ambient
+    transaction — a decision write is append-only and independent of the fleet /
+    bus / inbox side effects it annotates.
+    """
+
+    def should_suppress(self, terminal_id: str, kind: str, subtype: str, epoch: int) -> bool:
+        with SessionLocal() as db:
+            return suppress_condition_by_log(
+                db, terminal_id=terminal_id, kind=kind, subtype=subtype, epoch=epoch
+            )
+
+    def record(
+        self,
+        *,
+        terminal_id: str,
+        decision: str,
+        kind: str | None,
+        subtype: str | None,
+        epoch: int | None,
+        surfaces: str | None = None,
+        suppressed_reason: str | None = None,
+        inbox_message_id: int | None = None,
+    ) -> None:
+        with SessionLocal() as db:
+            record_condition_decision(
+                db,
+                terminal_id=terminal_id,
+                decision=ConditionDecision(decision),
+                kind=kind,
+                subtype=subtype,
+                epoch=epoch,
+                surfaces=surfaces,
+                suppressed_reason=suppressed_reason,
+                inbox_message_id=inbox_message_id,
+            )
+            db.commit()
+
+
+
+def delivery_ledger_dispute_view(message_id: int) -> dict[str, Any]:
+    """D4/#488 (AC15): answer "did this arrive twice, by what, and who acked it?"
+    as ONE query rather than a transcript hunt.
+
+    Returns the ledger row's state/ack facts plus every carrier's emission with
+    its timestamp and outcome. This is the projection ``list_messages`` gains
+    (``carriers``, ``acked_at``/``acked_by``) exposed as a focused query so the
+    watermark-paginated ``list_messages`` return shape is left untouched (AC14).
+    """
+    with SessionLocal() as db:
+        ledger = db.get(DeliveryLedgerModel, int(message_id))
+        emissions = (
+            db.query(DeliveryEmissionModel)
+            .filter(DeliveryEmissionModel.message_id == int(message_id))
+            .order_by(DeliveryEmissionModel.id.asc())
+            .all()
+        )
+        carriers = [
+            {
+                "carrier": e.carrier,
+                "outcome": e.outcome,
+                "attempts": int(e.attempts),
+                "emitted_at": e.emitted_at,
+                "claimed_at": e.claimed_at,
+            }
+            for e in emissions
+        ]
+        if ledger is None:
+            return {
+                "message_id": int(message_id),
+                "found": False,
+                "carriers": carriers,
+            }
+        return {
+            "message_id": int(message_id),
+            "found": True,
+            "state": ledger.state,
+            "applicable_carriers": ledger.applicable_carriers,
+            "first_carrier": ledger.first_carrier,
+            "first_emitted_at": ledger.first_emitted_at,
+            "emission_count": int(ledger.emission_count),
+            "acked_at": ledger.acked_at,
+            "acked_by": ledger.acked_by,
+            "suppressed_reason": ledger.suppressed_reason,
+            "undeliverable_reason": ledger.undeliverable_reason,
+            "blocked_reason": ledger.blocked_reason,
+            "blocked_since": ledger.blocked_since,
+            "carriers": carriers,
         }
