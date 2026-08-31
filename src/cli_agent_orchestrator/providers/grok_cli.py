@@ -97,6 +97,22 @@ EMPTY_DRAFT_PLACEHOLDERS = {
     "",
 }
 
+# F655 (#510): grok CLI 1.0.13 writes these seed artifacts into the per-session
+# directory at session-create time (~1s after launch), independent of whether a
+# turn has completed. ``chat_history.jsonl`` is intentionally NOT the sole gate:
+# 1.0.13 defers it until the first completed turn (and on some hosts it did not
+# appear before the artifact-sync deadline at all), which deterministically failed
+# every grok spawn. Any ONE of these present-and-non-empty proves grok created the
+# session. ``chat_history.jsonl`` is kept in the set so a host that DOES seed it
+# early still validates on the richest artifact.
+GROK_SESSION_LIVENESS_ARTIFACTS = (
+    "chat_history.jsonl",
+    "summary.json",
+    "prompt_context.json",
+    "system_prompt.txt",
+    "events.jsonl",
+)
+
 
 class ProviderError(Exception):
     """Exception raised for Grok provider-specific errors."""
@@ -328,16 +344,38 @@ class GrokCliProvider(BaseProvider):
         return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
-        path = (
+        """Confirm grok materialized this session's on-disk state.
+
+        F655: grok CLI 1.0.13 does NOT write ``chat_history.jsonl`` reliably at
+        session-create time. Empirically the per-``<quote(cwd)>/<uuid>`` session
+        directory and its seed artifacts (``summary.json``, ``prompt_context.json``,
+        ``system_prompt.txt``, ``events.jsonl``) appear together ~1s after launch,
+        while ``chat_history.jsonl`` may lag until the first completed turn — or, on
+        some hosts, not appear at all before the artifact-sync deadline. Requiring
+        ``chat_history.jsonl`` specifically therefore made every 1.0.13 spawn expire
+        the bounded wait (issue #510). Liveness only needs proof that grok created
+        the session, so validate on the session directory plus ANY non-empty seed
+        artifact grok writes at startup.
+        """
+        session_dir = (
             Path.home()
             / ".grok"
             / "sessions"
             / quote(cwd, safe="")
             / session_uuid
-            / "chat_history.jsonl"
         )
-        if not path.is_file() or path.stat().st_size == 0:
+        # The directory itself is the earliest liveness signal grok emits; before
+        # it exists the session has not started, so keep retrying until the deadline.
+        if not session_dir.is_dir():
             raise RetryableArtifactValidation("session_artifact_missing_or_inert")
+        for name in GROK_SESSION_LIVENESS_ARTIFACTS:
+            candidate = session_dir / name
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return
+            except OSError:
+                continue
+        raise RetryableArtifactValidation("session_artifact_missing_or_inert")
 
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants
