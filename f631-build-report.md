@@ -1,9 +1,18 @@
-# F631 slice 1 — build report
+# F631 slice 1 — build report (**r2**)
 
 **Issue:** #486 (F631). **Authority:** `orchestrator/blueprints/f631-terminal-identity-registry.md`
 (DRAFT r6), read in full before building. **Branch:** `f631-slice1-identity`.
-**Base:** fork `main` @ `5d39ec7f`. **Tip:** see the last commit on the branch (this
-report is the final commit, so the reviewed tip IS the merge ref's tip).
+**Base:** fork `main` @ `5d39ec7f`. **Tip:** this report is the last commit on the
+branch, so the reviewed tip IS the merge ref's tip.
+
+**Lineage:** r1 **GATE-NO**, 2 blockers (report
+`/data/cao-scratch/f631-gate-report-r1.md`, sha
+`a468495400f1a55bccd8c9085679005c0a77b8bf1b98bcd93a30f1cd6b35b767`, reviewed tip
+`15b874f9`). Both blockers are accepted as correct and fixed in §0 below. The gate
+also confirmed sound and unchanged here: the M10 atomicity arm, the corrected M4
+rerun, the D1/D2/D10 schema, the slice boundary, the §7 deferral audit, the mypy
+delta, and both team-lead rulings (`readopt_service.py:242` stays out; the three
+unwritten columns are acceptable under D10).
 
 Commits:
 
@@ -13,6 +22,73 @@ Commits:
 | `1237f258` | annotate identity helpers for mypy --strict |
 | `bcb1c626` | cast the widened delete result at the bool seam (mypy delta 0) |
 | `b89c5166` | widen the WPM4-a exact-dict delete assertion for resume_key |
+| `3bc008fa` | **r2:** remove both catch-alls; arm the failed identity write |
+| `f9202775` | **r2:** collapse the dedented query to black's line (fmt delta 0) |
+
+---
+
+## 0. r2 — the two GATE-NO blockers
+
+### 0.1 Decision on the `except` clauses: **removed, not narrowed**
+
+Both blockers are the same defect on the two lifecycle helpers, and both are real.
+The reviewer's probes reproduce exactly:
+
+```text
+CREATE_TERMINAL_ROWS=1   CREATE_IDENTITY_ROWS=0
+REAP_RESULT={'terminal_deleted': True, 'intent_deleted': False, 'resume_key': None}
+REAP_TERMINAL_ROWS=0   REAP_IDENTITY_LIFECYCLE=live   REAP_IDENTITY_REAPED_AT=None
+```
+
+I wrote those handlers on the reasoning "identity registration must never be able to
+fail a terminal create." That reasoning is wrong, and the record says why: §3's promise
+is not call ordering, it is that **a laptop-created terminal is never unregistered**. A
+swallowed write failure does not protect the create — it makes the one forbidden state
+an intentional success path, and does it silently.
+
+I considered narrowing rather than removing and rejected it, deliberately: **there is no
+exception these bodies can raise that is benign.** Every one of them (`IntegrityError`,
+`OperationalError`, a mapper failure, anything else) means the identity row was not
+written, which is precisely the state that must abort the operation. Any class I chose
+to tolerate would reinstate the blocker for that class. And the one case that genuinely
+*must* be tolerated — a lane with no identity row, i.e. the pre-registry case D10
+supports — was never an exception in the first place: it is control flow
+(`one_or_none()` → early return on the reap side, the insert-if-absent early return on
+the create side). Removing the handlers therefore preserves it untouched, which
+`test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception` asserts as an
+explicit negative control on the removal itself.
+
+So both `try/except` blocks are gone. `create_terminal` now propagates a registration
+failure and its transaction never commits; `delete_terminal_and_warm_intent` propagates
+a retirement failure and `SessionLocal.begin()` rolls back the hard delete with it.
+
+**One consequence I am naming rather than leaving for the gate to find:** the migrator
+`_migrate_f631_terminal_identity()` swallows its own failure (matching every migrator in
+`init_db`). If the migration ever failed, `create_terminal` would now fail loudly on
+every call instead of running unregistered. That is the correct direction under §3 — an
+unregistered fleet is the failure this slice exists to prevent — but it is a behaviour
+change worth a reviewer's eye.
+
+### 0.2 The two new arms are siblings of M10, not replacements
+
+M10 is kept **exactly as the gate confirmed it**. It forces `create_terminal` to raise
+between the identity insert and `db.commit()` and asserts both rows are absent — the
+*outer abort* path. A swallowed exception never reaches that path: the transaction is
+never told anything went wrong and commits normally. M10 cannot see it by construction,
+which is why the fix needed its own arms rather than a stronger M10.
+
+Fault injection is a mapper-level listener on `TerminalIdentityModel`
+(`before_insert` / `before_update`) that raises at flush — the exception surfaces from
+the `db.flush()` **inside the helper**, where a real DB fault would, rather than from a
+monkeypatched call site.
+
+| New arm | Asserts |
+|---|---|
+| `test_a_failed_identity_insert_aborts_the_whole_create` | the create **raises**, and `(terminals, identities) == (0, 0)` — never the reviewer's `1, 0` |
+| `test_a_failed_identity_retirement_aborts_the_whole_reap` | the reap **raises**; the terminals row **survives**; the identity row is still `live` with `reaped_at is None`; and a subsequent clean reap still returns the real key, so it was never silently discarded |
+| `test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception` | negative control on the removal — the supported no-row case still reaps cleanly to `resume_key: None` |
+
+Focused arms: **23 passed** (was 20; +3).
 
 ---
 
@@ -87,24 +163,24 @@ gate reads §3's "terminal create" as covering readopt, that is a one-call addit
 ## 3. The diff
 
 ```
- src/cli_agent_orchestrator/clients/database.py             | 248 +++++++++-
+ src/cli_agent_orchestrator/clients/database.py             | 258 ++++++++++-
  src/cli_agent_orchestrator/services/terminal_service.py    |  14 +-
- test/clients/test_f631_terminal_identity.py                | 414 ++++++++++++++++
- test/services/test_f631_reap_resume_key.py                 | 205 ++++++++
+ test/clients/test_f631_terminal_identity.py                | 507 +++++++++++++++++
+ test/services/test_f631_reap_resume_key.py                 | 205 +++++++++
  test/services/test_wpm4a_deferred_init_hardening.py        |   3 +
- 5 files changed, 877 insertions(+), 7 deletions(-)
+ 5 files changed, 980 insertions(+), 7 deletions(-)   (excl. this report)
 ```
 
 `clients/database.py`
 
 - `TerminalIdentityModel` — the new table (D1/D2).
 - `_migrate_f631_terminal_identity()` + its registration, appended LAST in `init_db()` (D10).
-- `_register_terminal_identity(db, …)` — insert-if-absent, in the caller's transaction.
-  Insert-if-absent rather than upsert because the PK already gives one-row-per-terminal
-  and flipping an existing `reaped` row back to `live` would resurrect an identity the
-  delete path deliberately retired. Wrapped so identity registration can never fail a
-  terminal create.
-- `_mark_terminal_identity_reaped(db, …)` — flip + stamp + return the key.
+- `_register_terminal_identity(db, …)` — insert-if-absent, in the caller's transaction,
+  **unguarded** (§0.1). Insert-if-absent rather than upsert because the PK already gives
+  one-row-per-terminal and flipping an existing `reaped` row back to `live` would
+  resurrect an identity the delete path deliberately retired.
+- `_mark_terminal_identity_reaped(db, …)` — flip + stamp + return the key, **unguarded**
+  (§0.1); the pre-registry no-row case stays as an `one_or_none()` early return.
 - `get_terminal_identity(terminal_id)` — the read accessor the ACs and later slices need.
 - Both create writers call the register helper; `delete_terminal_and_warm_intent` calls
   the reap helper and returns `resume_key`; its annotation widens `Dict[str, bool]` →
@@ -128,7 +204,7 @@ old two-key contract. D4 widens that contract on purpose; the assertion now incl
 
 | Check | HEAD (`b89c5166`) | BASE (`5d39ec7f`) | Verdict |
 |---|---|---|---|
-| `pytest` new arms (`test_f631_terminal_identity.py` + `test_f631_reap_resume_key.py`) | **20 passed** in 2.78s | n/a (files are new) | green |
+| `pytest` new arms (`test_f631_terminal_identity.py` + `test_f631_reap_resume_key.py`) | **23 passed** in 3.02s (r1: 20) | n/a (files are new) | green |
 | `mypy --strict` on the two touched source files | **148 errors** | **148 errors** | **delta 0** |
 | `black --check` on the 2 new test files + `terminal_service.py` | clean | clean | green |
 | `black --check src/…/database.py` | would-reformat | would-reformat | **pre-existing**; `black --diff` output is line-for-line identical HEAD vs BASE |
@@ -146,8 +222,10 @@ Two clean runs per side on **grok-box-002**, each preceded by an explicit
 
 | Side | sha | run 1 | run 2 |
 |---|---|---|---|
-| HEAD | `b89c5166` | **9 failed, 7767 passed**, 25 skipped, 3 xfailed | **9 failed, 7767 passed**, 25 skipped, 3 xfailed |
-| BASE | `5d39ec7f` | **9 failed, 7747 passed**, 25 skipped, 3 xfailed | 10 failed, 7746 passed, 25 skipped, 3 xfailed |
+| HEAD **r2** | `f9202775` | **9 failed, 7770 passed**, 25 skipped, 3 xfailed | **9 failed, 7770 passed**, 25 skipped, 3 xfailed |
+| BASE | `5d39ec7f` | 10 failed, 7746 passed (the 9 + one base-only flake, `test_recovery_decision_intake…`) | — |
+| HEAD r1 | `b89c5166` | 9 failed, 7767 passed | 9 failed, 7767 passed |
+| BASE r1 | `5d39ec7f` | **9 failed, 7747 passed** | 10 failed, 7746 passed (base-only flake, `test_fx191…test_escalation_produces_trace`) |
 
 The **9-failure set is byte-identical on both sides** — all pre-existing on `main`:
 
@@ -163,7 +241,14 @@ test/services/test_wp_watchdog_delegation.py::test_legacy_inbox_migration_and_nu
 test/services/test_wpdt_delivery_truth.py::TestAC7DoctrineArmingStep::test_doctrine_arming_section_exists
 ```
 
-**Failure delta: 0. Passed delta: +20**, exactly this slice's new arms.
+**Failure delta: 0** (r2 HEAD is strictly below BASE this round; the 9-name set is
+identical). **Passed delta: +23**, exactly this slice's new arms. Removing both
+catch-alls broke nothing elsewhere: no fixture in `test/clients` or `test/services`
+creates a terminal against a database without the `terminal_identity` table.
+
+Each round's BASE leg produced its own extra failure under a *different* name
+(`test_fx191…`, then `test_recovery_decision_intake…`), which is the flake population
+speaking, not this slice.
 
 **BASE run 2's 10th failure** is `test_fx191_convergent_delivery.py::TestAC13TraceEmitCount::test_escalation_produces_trace`
 — on the **base**, with none of my code present. That names the suite's pre-existing
@@ -191,6 +276,14 @@ D4 widens by design. Fixed in `b89c5166` by widening the assertion.
 
 ## 5. Mutation ledger
 
+**r2 note.** Removing the two `try/except` wrappers dedented six of the eleven r1
+anchors, so the r1 ledger no longer applied verbatim to the reviewed tip. Rather than
+carry the r1 numbers forward, I re-anchored and **re-ran all eleven at `f9202775`** —
+including M10, whose old anchor named the removed `except` and is now the equivalent
+premature-`db.commit()` inside the unguarded helper. All eleven kill again, with the
+same arms and controls. N1/N2 below are the two new blocker mutations.
+
+
 Driver: apply an exact source edit → run the **named arm** (must go RED) → run the
 **negative controls** (must stay GREEN) → `git checkout --` the file → re-run the named
 arm (must be GREEN again). A mutation counts as KILLED only when all four hold. Every
@@ -211,8 +304,24 @@ is no text-presence assertion anywhere in either test file.
 | M10 | the identity row is committed OUTSIDE the terminals transaction | `test_ac1_identity_row_is_written_in_the_terminals_transaction` | 0 → 1 → 0 (2 passed) → 0 | **KILLED** |
 | M11 | create fabricates a `provider_session_id` when the provider mints none | `test_nothing_fabricates_a_provider_session_id` | 0 → 1 → 0 (2 passed) → 0 | **KILLED** |
 
-**11/11 killed.** Full driver output is reproduced from the box runs
-`f631-s1-mutants` and `f631-s1-m4`.
+**11/11 killed at `f9202775`** (box run `f631-r2-mutants-full`; worktree clean after).
+
+### 5.0 r2 blocker mutations — reintroducing each GATE-NO defect
+
+| # | Mutation | Named arm | pre → mutated → controls → post-revert | Verdict |
+|---|---|---|---|---|
+| N1 | restore the create-side catch-all (blocker 1) | `test_a_failed_identity_insert_aborts_the_whole_create` | 0 → 1 → 0 (4 passed) → 0 | **KILLED** |
+| N2 | restore the reap-side catch-all (blocker 2) | `test_a_failed_identity_retirement_aborts_the_whole_reap` | 0 → 1 → 0 (4 passed) → 0 | **KILLED** |
+
+**N1's control set deliberately includes M10's arm**
+(`test_ac1_identity_row_is_written_in_the_terminals_transaction`), and it stayed GREEN
+while the new arm went RED. That is the ledger's own proof of the gate's diagnosis: M10
+observes the outer abort path, the swallow bypasses it, and only the new arm sees the
+difference. N1's other controls: AC1's create arm, N2's arm, and the pre-registry
+control. N2's controls: AC2's survival arm, `test_reap_returns_the_resume_key`, N1's
+arm, and the pre-registry control.
+
+**Ledger total: 13/13 killed.**
 
 Negative controls per mutation (each stayed GREEN while the named arm was RED):
 
@@ -287,7 +396,11 @@ touched (frozen; the wrapper refuses it anyway). No laptop pytest/mypy/black/bui
 | `f631-s1-isort` | grok-box-010 | isort A/B on `database.py` (pre-existing both sides) |
 | `f631-s1-regress` / `-regress2` / `-regress3` | grok-box-010 | full `test/clients` + `test/services` A/B (found the wpm4a contract regression) |
 | `f631-s1-flake` | (invalid — no fetch; excluded, see §4.1) | killed |
-| `f631-s1-flake2` | grok-box-002 | final 2×HEAD + 2×BASE full A/B with sha echo |
+| `f631-s1-flake2` | grok-box-002 | r1 final 2×HEAD + 2×BASE full A/B with sha echo |
+| `f631-r2-arms` | grok-box-004 | r2 focused arms (**23 passed**) + fmt gate |
+| `f631-r2-mutants` | grok-box-004 | N1/N2 blocker mutations (2/2 killed) + black A/B |
+| `f631-r2-mutants-full` | grok-box-010 | re-anchored M1–M11 re-run at the r2 tip (11/11) |
+| `f631-r2-regress` | grok-box-010 | r2 full A/B ×2 HEAD + BASE, plus mypy A/B |
 | `f631-s1-triage` / `f631-s1-triage2` | grok-box-010 | isolating the head-only failures |
 
 - Raw ssh: none.
@@ -302,11 +415,11 @@ touched (frozen; the wrapper refuses it anyway). No laptop pytest/mypy/black/bui
 
 ## 7. What a reviewer should look at hardest
 
-1. **`_register_terminal_identity` swallows every exception.** Deliberate — identity
-   registration must never be able to fail a terminal create — but it means a broken
-   insert degrades to "no identity row", which is indistinguishable from a pre-registry
-   lane. M1 proves the happy path is armed; nothing arms the swallow. If the gate wants
-   it loud, the change is one line.
+1. **The migrator still swallows its own failure** (§0.1, last paragraph). Both helper
+   catch-alls are gone, so a failed `_migrate_f631_terminal_identity()` would now turn
+   every `create_terminal` into a hard failure rather than a silently unregistered
+   fleet. I believe that is the right direction under §3, but it is the one remaining
+   place where a swallowed error still decides behaviour, and it is unarmed.
 2. **The `readopt_service` seam** (§2, last paragraph) — a judgement call I made
    explicitly rather than silently.
 3. **`create_terminal_with_warm_intent` writes `provider_session_id=None`** because that
