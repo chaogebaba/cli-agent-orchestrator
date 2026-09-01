@@ -6814,10 +6814,14 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
 
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata and its warm intent through the universal seam."""
-    return delete_terminal_and_warm_intent(
-        terminal_id,
-        preserve_warm_intent=False,
-    )["terminal_deleted"]
+    # cast: the result widened to Dict[str, Any] when F631 added `resume_key`.
+    return cast(
+        bool,
+        delete_terminal_and_warm_intent(
+            terminal_id,
+            preserve_warm_intent=False,
+        )["terminal_deleted"],
+    )
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
