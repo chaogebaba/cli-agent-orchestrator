@@ -98,6 +98,7 @@ def should_inject_shim(
     is_worker: bool,
     repo_root: Optional[str],
     env: Mapping[str, str],
+    is_box_hosted: bool = False,
 ) -> bool:
     """Decide whether the laptop-shim PATH prefix applies for this terminal.
 
@@ -105,7 +106,19 @@ def should_inject_shim(
     active box row in ``scripts/boxes.tsv`` (resolved against ``repo_root`` or
     its immediate parent — see ``_active_boxes_tsv_for``, F636 #491), and
     ``LAPTOP_OK`` unset in ``env``.
+
+    F634 (D16) — ``is_box_hosted`` makes the predicate HOST-AWARE. The four
+    conditions above key on repo CONTENTS, never on where the lane runs, and
+    ``box-setup.sh`` rsyncs the root repo (active-row ``boxes.tsv``) together
+    with the nested fork (``scripts/laptop-shims``) onto every box. So a
+    box-hosted worker satisfies every one of them and would be hard-denied
+    ``pytest``/``mypy``/``uv`` (exit 97) on the very machine the work was
+    relocated to. A box lane is therefore never shimmed; the laptop's own
+    workers keep the F620 guard unchanged. The default is False, so every
+    existing caller composes exactly as before.
     """
+    if is_box_hosted:
+        return False
     if not is_worker:
         return False
     if not repo_root:
@@ -146,6 +159,7 @@ def maybe_shim_env(
     is_worker: bool,
     repo_root: Optional[str],
     base_path: Optional[str] = None,
+    is_box_hosted: bool = False,
 ) -> dict[str, str]:
     """Return ``extra_env`` with a shim-prefixed ``PATH`` when applicable.
 
@@ -153,13 +167,22 @@ def maybe_shim_env(
     defaults to the server's own ``PATH`` (what a worker inherits). When the
     shim does not apply, ``extra_env`` is returned unchanged (no ``PATH`` key
     added), so a non-worker/absent-fleet terminal composes exactly as before.
+
+    ``is_box_hosted`` (F634 D16) is forwarded to ``should_inject_shim``; this
+    is the wiring call the create path uses, so the flag must be threaded here
+    or the predicate never sees it.
     """
     # LAPTOP_OK is read from the composed env first, else the process env — a
     # worker inherits the server env, so an operator export reaches here even
     # when it is not threaded through extra_env explicitly.
     effective_env = dict(os.environ)
     effective_env.update(extra_env)
-    if not should_inject_shim(is_worker=is_worker, repo_root=repo_root, env=effective_env):
+    if not should_inject_shim(
+        is_worker=is_worker,
+        repo_root=repo_root,
+        env=effective_env,
+        is_box_hosted=is_box_hosted,
+    ):
         return extra_env
     assert repo_root is not None  # narrowed by should_inject_shim
     shim_dir = shim_dir_for(repo_root)

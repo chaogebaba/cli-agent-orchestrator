@@ -75,6 +75,7 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
     register_terminal_child,
     release_terminal_child,
+    terminal_exists,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -164,6 +165,7 @@ from cli_agent_orchestrator.services.agent_step import (
     resolve_effective_working_directory,
     run_agent_step,
 )
+from cli_agent_orchestrator.services.box_plane import BoxPlaneRecoveryRefused
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -223,7 +225,11 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import generate_window_name, validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import (
+    generate_window_name,
+    is_raw_terminal_id,
+    validate_tmux_name,
+)
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
@@ -515,6 +521,51 @@ def _validate_model_id(value: str) -> None:
         raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
     if not re.fullmatch(MODEL_ID_RE, value):
         raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
+def _admit_supplied_terminal_id(terminal_id: Optional[str]) -> None:
+    """Admit (or refuse) a caller-supplied ``terminal_id`` at the create boundary.
+
+    F634 (D15). ``terminal_id`` was a server-private parameter of
+    ``terminal_service.create_terminal``; F634 makes it a PUBLIC create-route
+    field so the laptop can allocate one id namespace across every host (D11:
+    a lane must stay nameable and resumable while its box is unreachable).
+    The semantics are explicit and identical on all three amended routes:
+
+    * absent -> today's server-side allocation, byte-identical to now;
+    * present and unknown -> adopted;
+    * present and already known on THIS server -> refused as a CONFLICT (409),
+      never silently re-used, so a retried create is idempotent rather than
+      id-stealing.
+
+    The shape check is the boundary consequence of making the field public:
+    every id resolver in the tree (``resolve_terminal_id``, the
+    ``<profile>-<id>`` display form, ``generate_window_name``'s tmux name)
+    assumes ``generate_terminal_id``'s 8-hex form, so an off-shape id would be
+    adopted here and become unresolvable later. Refused with 400 up front.
+    """
+    if terminal_id is None:
+        return
+    if not is_raw_terminal_id(terminal_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"terminal_id {terminal_id!r} is invalid: expected 8 lowercase hex "
+                "characters (the generate_terminal_id form)"
+            ),
+        )
+    if terminal_exists(terminal_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "terminal_id_conflict",
+                "terminal_id": terminal_id,
+                "message": (
+                    f"terminal_id {terminal_id!r} already exists on this server; "
+                    "a supplied id is adopted only when unknown"
+                ),
+            },
+        )
 
 
 class UpdateGroupBody(BaseModel):
@@ -3618,6 +3669,8 @@ async def create_session(
     # {"env_vars": {...}} wire shape is unchanged either way.
     allow_incomplete_brief: bool = False,
     resume_session_id: Optional[str] = None,
+    terminal_id: Optional[str] = None,
+    is_box_hosted: bool = False,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3650,10 +3703,18 @@ async def create_session(
     the initial terminal at creation time (``group`` is also updatable later
     via ``PATCH /terminals/{id}/group``, ``metadata`` via the
     ``update_metadata`` MCP tool).
+
+    ``terminal_id``/``is_box_hosted`` are F634's create amendment (D15/D16) —
+    routing fields, so query params alongside ``model`` and
+    ``resume_session_id``. Omitted, this route behaves byte-identically to
+    before. See ``_admit_supplied_terminal_id`` for the id semantics.
     """
     # Re-threaded onto the body model; the artifact-dir override must still be
     # validated at the boundary regardless of how env_vars is bound.
     _validate_artifacts_dir_override(body.env_vars if body else None)
+    # F634 (D15): admitted BEFORE the try below — that block maps a bare
+    # Exception to 500, which would swallow the typed 400/409 refusals.
+    _admit_supplied_terminal_id(terminal_id)
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
     # Structural caps on group/metadata (call-me-ram, PR #433 review) are
@@ -3716,6 +3777,8 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -3776,10 +3839,19 @@ async def start_session_endpoint(
     memory: bool = False,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
     allow_incomplete_brief: bool = False,
+    terminal_id: Optional[str] = None,
+    is_box_hosted: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Canonical lifecycle start endpoint."""
+    """Canonical lifecycle start endpoint.
+
+    ``terminal_id``/``is_box_hosted`` are amended here for SURFACE UNIFORMITY
+    with the other two create routes (F634 D15/D16). This route creates only a
+    session's FIRST terminal, which under D10 is the laptop-only supervisor
+    seat, so no box lane is ever born here.
+    """
     _validate_artifacts_dir_override(env_vars)
+    _admit_supplied_terminal_id(terminal_id)
     try:
         resolved_provider = provider or resolve_provider(
             agent_profile, fallback_provider="kiro_cli"
@@ -3794,6 +3866,8 @@ async def start_session_endpoint(
             registry=get_plugin_registry(request),
             env_vars=env_vars,
             allow_incomplete_brief=allow_incomplete_brief,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -4085,6 +4159,14 @@ async def recover_session(
                 acknowledge_ownership=body.acknowledge_ownership,
             )
         return await _apply_recovery_nudges(request, result, reason=body.reason, nudge=body.nudge)
+    except BoxPlaneRecoveryRefused as exc:
+        # F634 (D15): this server is box-plane, so server-side auto-recovery is
+        # refused and NO replacement terminal was created — the laptop catalog
+        # still resolves the original id. Typed (409 + code) so the CALLER can
+        # branch on it and relay; it reaps and cold-redispatches. Must precede
+        # the ValueError arm: this is not a bad request, it is a capability the
+        # serving plane does not offer.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail())
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
@@ -4194,6 +4276,8 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: Optional[bool] = None,
+    terminal_id: Optional[str] = None,
+    is_box_hosted: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4225,6 +4309,15 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``terminal_id`` (F634 D15) lets the CALLER allocate the id, so one id
+    namespace spans every host and a lane stays nameable while its box is
+    unreachable. ``is_box_hosted`` (F634 D16) says this lane's host is a grok
+    box, which disarms the F620 laptop shim for it. Both are routing flags, so
+    they stay query params. This is the route ``assign`` actually posts to —
+    ``_assign_impl`` branches on the caller's ``CAO_TERMINAL_ID`` and a
+    supervisor always has one — and the only one where ``caller_id`` is set,
+    which is the flag that arms the shim block at all.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -4232,6 +4325,7 @@ async def create_terminal_in_session(
             _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    _admit_supplied_terminal_id(terminal_id)
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -4313,6 +4407,8 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             authority_files=body.authority_files if body else None,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
         return result
     except HTTPException:

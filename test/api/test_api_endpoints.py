@@ -354,6 +354,11 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            # F634 (D15/D16): the create amendment. Both default to today's
+            # behaviour — the server allocates the id, and the lane is not
+            # box-hosted, so the F620 shim decision is unchanged.
+            terminal_id=None,
+            is_box_hosted=False,
         )
 
     def test_create_session_passes_explicit_kiro_engine(self, client):

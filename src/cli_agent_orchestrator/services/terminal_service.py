@@ -1684,6 +1684,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    is_box_hosted: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1735,6 +1736,13 @@ async def create_terminal(
         metadata: Free-form JSON describing what this terminal is doing.
             Also updatable later by the running agent via the
             ``update_metadata`` MCP tool.
+        is_box_hosted: F634 (D16). True when this lane's HOST is a grok box,
+            so the F620 laptop shim must not apply -- the shim's predicate
+            keys on repo contents, which are identical on a box, and denying
+            ``pytest``/``mypy``/``uv`` there would defeat the relocation. The
+            value is sourced from the laptop-side host catalog and rides the
+            create route, because this decision executes inside the BOX
+            server. Default False = laptop behaviour, unchanged.
 
     Returns:
         Terminal object with all metadata populated
@@ -2350,10 +2358,18 @@ async def create_terminal(
                             )
                         except worktree_service.WorktreeError:
                             _shim_repo_root = None
+                        # F634 (D16): host-aware. A box-hosted lane is never
+                        # shimmed — box-setup.sh rsyncs boxes.tsv AND the shim
+                        # dir onto every box, so the repo-contents predicate
+                        # above fires there too and would deny the suites F634
+                        # exists to relocate. The flag rides the create route
+                        # (D15's amendment) because this decision runs inside
+                        # the BOX server, while the host catalog is laptop-side.
                         laptop_shim.maybe_shim_env(
                             extra_env,
                             is_worker=True,
                             repo_root=_shim_repo_root,
+                            is_box_hosted=is_box_hosted,
                         )
                     try:
                         _created_window_name = get_backend().create_window(

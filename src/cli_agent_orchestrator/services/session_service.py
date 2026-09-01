@@ -209,6 +209,8 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    terminal_id: str | None = None,
+    is_box_hosted: bool = False,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -227,6 +229,10 @@ async def create_session(
     terminal at creation time (``group`` is also updatable later via
     ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
     MCP tool).
+
+    ``terminal_id``/``is_box_hosted`` are F634's create amendment (D15/D16),
+    forwarded verbatim to ``create_terminal``: None/False reproduce today's
+    server-side allocation and today's shim decision exactly.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -281,6 +287,8 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        terminal_id=terminal_id,
+        is_box_hosted=is_box_hosted,
     )
     # F360 (#215): the terminal id is now allocated and fully registered. Any
     # exception from here on unwinds that registration (deregister + monitor

@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.manager import get_provider_class
+from cli_agent_orchestrator.services.box_plane import refuse_recovery_on_box_plane
 from cli_agent_orchestrator.services.epoch_recovery_lease import (
     acquire_epoch_recovery_lease,
     release_epoch_recovery_lease,
@@ -330,6 +331,10 @@ async def _recover_row(row, session_name):
 
 
 async def recover_epoch(session_name: str, base_names: list[str] | None = None) -> dict:
+    # F634 (D15): server-side recovery is refused on a box-plane cao-server,
+    # BEFORE any session probe or replacement create. The caller relays the
+    # typed refusal and cold-redispatches. No-op on a laptop server.
+    refuse_recovery_on_box_plane("epoch")
     if not get_backend().session_exists(session_name):
         raise ValueError("session_missing")
     started = datetime.now(timezone.utc).isoformat()
