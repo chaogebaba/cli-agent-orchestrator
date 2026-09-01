@@ -959,6 +959,64 @@ class AuthorityPinModel(Base):
     )
 
 
+class TerminalIdentityModel(Base):
+    """F631 (#486/#492): one durable identity row per terminal, written at
+    CREATE and OUTLIVING the terminal.
+
+    Deliberately NOT ``provider_sessions`` (blueprint D1): that table is the
+    curated fork-base registry, with a ``name`` namespace, a unique-when-ready
+    index, a supersede-on-write transaction and two CHECK constraints
+    (``status``/``kind``) that reject an at-create identity row three ways.
+    Identity (every terminal that ever existed) and base-candidacy (a curated,
+    superseding registry) are different facts with different lifetimes, so this
+    is a NEW, additive table (D10) — no rebuild of ``provider_sessions``.
+
+    Column set is derived from what the resume consumer dereferences off a
+    resolved row (``mcp_server/server.py`` :1818-:1932 and
+    ``fork_context_service.resolve_base``), not from what looks tidy (r2/B3).
+    """
+
+    __tablename__ = "terminal_identity"
+
+    # The durable handle a reaped lane is named by; PK gives one-row-per-terminal
+    # by construction (r1/S1), rather than resting on the nullable/unindexed
+    # provider_sessions.source_terminal_id.
+    terminal_id = Column(Text, primary_key=True)
+    provider = Column(Text, nullable=False)
+    agent_profile = Column(Text, nullable=True)
+    cwd = Column(Text, nullable=True)
+    session_name = Column(Text, nullable=True)
+    # The provider session uuid. THIS IS the resume_key (D4); exposed to the
+    # consumer as ``session_uuid``. Nullable at create (D3): only a provider that
+    # mints one sets it here; capture may later move it NULL->set, never
+    # overwrite a non-NULL value. Indexed because D4 serves the by-uuid resume
+    # path from it.
+    provider_session_id = Column(Text, nullable=True)
+    # Exposed as ``row["name"]``, dereferenced unconditionally on every live
+    # resume path. For an identity row it is the terminal_id itself — identity
+    # rows live in their own table, so they never enter uq_provider_sessions_ready.
+    base_name = Column(Text, nullable=False)
+    # The retained codex persona home (D11); without it validate_base_source
+    # raises session_file_missing on resume. Written by reap-time retention.
+    retained_persona_home = Column(Text, nullable=True)
+    # Two-value lifecycle (D2): ``live`` at create, ``reaped`` at delete. A CHECK
+    # on a NEW table collides with nothing (contrast D1).
+    lifecycle = Column(Text, nullable=False, default="live", server_default="live")
+    # Forkability snapshot (D4), nullable: absent means "no snapshot taken" and
+    # staleness degrades explicitly rather than lying.
+    git_sha = Column(Text, nullable=True)
+    dirty_hashes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    reaped_at = Column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle IN ('live','reaped')",
+            name="ck_terminal_identity_lifecycle",
+        ),
+        Index("ix_terminal_identity_provider_session_id", "provider_session_id"),
+    )
+
+
 class MemoryMetadataModel(Base):
     """SQLAlchemy model for memory metadata (Phase 2 U1).
 
@@ -1610,6 +1668,14 @@ def init_db() -> None:
     # additive migration D11 promises. Disjoint from every table above, so
     # registry order is immaterial; appended LAST.
     _migrate_f642_delivery_ledger()
+    # F631 terminal_identity. ONE brand-new table (blueprint D1/D10), no rebuild
+    # of provider_sessions or terminals — the additive migration D10 promises.
+    # Disjoint from every table above, so registry order is immaterial; appended
+    # LAST. Skipping this call is AC15's migration-skip mutant: create_all still
+    # covers a FRESH DB, so a fresh-DB test hides the failure, but an EXISTING DB
+    # opened without it has no terminal_identity table and AC15's existing-DB arm
+    # goes RED.
+    _migrate_f631_terminal_identity()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -2356,6 +2422,56 @@ def _migrate_f642_delivery_ledger() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
         logger.debug(f"f642_delivery_ledger migration skipped: {e}")
+
+
+def _migrate_f631_terminal_identity() -> None:
+    """F631 (#486/#492): create the ``terminal_identity`` table if missing (D10).
+
+    ONE brand-new table (blueprint D1), no rebuild of ``provider_sessions`` — the
+    ADDITIVE migration D10 promises. On a FRESH DB ``Base.metadata.create_all``
+    above already created it; this function is the path for an EXISTING DB, where
+    ``create_all`` also creates a missing table but we mirror the F642/F218 idiom
+    of an explicit ``CREATE TABLE IF NOT EXISTS`` so the migration is legible and
+    testable in isolation. Pre-existing terminals get NO identity row and resolve
+    to the typed ``terminal_reaped_unregistered`` (D4/D10) — a correct answer, not
+    a wrong one; a first-boot backfill is deliberately OUT of scope (§7).
+
+    The DDL MUST mirror ``TerminalIdentityModel`` exactly, so a fresh-DB schema
+    (built by ``create_all``) and an existing-DB schema (built here) are
+    byte-identical. Idempotent, zero-arg, self-connecting; failure logged at
+    debug and never propagated, matching every migrator above.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS terminal_identity ("
+                "terminal_id TEXT NOT NULL PRIMARY KEY, "
+                "provider TEXT NOT NULL, "
+                "agent_profile TEXT, "
+                "cwd TEXT, "
+                "session_name TEXT, "
+                "provider_session_id TEXT, "
+                "base_name TEXT NOT NULL, "
+                "retained_persona_home TEXT, "
+                "lifecycle TEXT NOT NULL DEFAULT 'live', "
+                "git_sha TEXT, "
+                "dirty_hashes TEXT, "
+                "created_at DATETIME NOT NULL, "
+                "reaped_at DATETIME, "
+                "CONSTRAINT ck_terminal_identity_lifecycle "
+                "CHECK (lifecycle IN ('live','reaped'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+                "ON terminal_identity(provider_session_id)"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"f631_terminal_identity migration skipped: {e}")
 
 
 def _restrict_db_file_permissions() -> None:
@@ -3492,6 +3608,44 @@ def _receiver_is_terminal_or_mailbox_address(db: Any, receiver_id: str | None) -
     return _mailbox_id_for_terminal(db, receiver_id) is not None
 
 
+def _insert_terminal_identity_row(
+    db: Session,
+    *,
+    terminal_id: str,
+    provider: str,
+    agent_profile: Optional[str],
+    cwd: Optional[str],
+    session_name: Optional[str],
+    provider_session_id: Optional[str],
+) -> None:
+    """F631 (D1/D2/D3): write the durable identity row in the SAME transaction as
+    the terminals row, so a laptop-created terminal is never unregistered (§3).
+
+    ``lifecycle="live"`` at create; ``provider_session_id`` is set only when the
+    provider minted one (D3 — capability is declared, never inferred here), and
+    stays NULL otherwise (AC7). ``base_name`` is the ``terminal_id`` itself, so an
+    identity row never enters the ``uq_provider_sessions_ready`` namespace (D4).
+    The forkability snapshot (``git_sha``/``dirty_hashes``) is left NULL at create
+    and back-filled by capture/mark_ready (D4); a NULL snapshot reads as degraded
+    staleness rather than lying.
+
+    Idempotent by PK: a re-create for the same id would raise on the PK, but the
+    caller inserts exactly once per terminal create, so this is not guarded here.
+    """
+    db.add(
+        TerminalIdentityModel(
+            terminal_id=terminal_id,
+            provider=provider,
+            agent_profile=agent_profile,
+            cwd=cwd,
+            session_name=session_name,
+            provider_session_id=provider_session_id,
+            base_name=terminal_id,
+            lifecycle="live",
+        )
+    )
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -3549,6 +3703,16 @@ def create_terminal(
         )
         db.add(terminal)
         db.flush()
+        # F631 (D1/D2/D3): durable identity row in the SAME transaction.
+        _insert_terminal_identity_row(
+            db,
+            terminal_id=terminal_id,
+            provider=provider,
+            agent_profile=agent_profile,
+            cwd=working_directory,
+            session_name=tmux_session,
+            provider_session_id=provider_session_id,
+        )
         db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
             {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
             synchronize_session=False,
@@ -3692,6 +3856,18 @@ def create_terminal_with_warm_intent(
         )
         db.add(terminal)
         db.flush()
+        # F631 (D1/D2/D3): durable identity row in the SAME transaction. This
+        # fork-only path takes no provider_session_id at create; a mint/capture
+        # moves it NULL->set later (D3), so a fresh row is NULL here (AC7 shape).
+        _insert_terminal_identity_row(
+            db,
+            terminal_id=terminal_id,
+            provider=provider,
+            agent_profile=agent_profile,
+            cwd=working_directory,
+            session_name=tmux_session,
+            provider_session_id=None,
+        )
         db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
             {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
             synchronize_session=False,
@@ -5239,8 +5415,13 @@ def delete_terminal_and_warm_intent(
     *,
     preserve_warm_intent: bool = False,
     reparent_target_id: str | None = None,
-) -> Dict[str, bool]:
-    """Settle terminal-owned state and delete the row in one transaction."""
+) -> Dict[str, Any]:
+    """Settle terminal-owned state and delete the row in one transaction.
+
+    F631 (D4): the result also carries ``resume_key`` — the reaped lane's
+    ``provider_session_id`` (or None for a pre-registry / uuid-less lane) — so
+    ``delete_terminal`` returns the resume key (§3).
+    """
     with SessionLocal.begin() as db:
         terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
         profile = terminal.agent_profile if terminal is not None else None
@@ -5366,6 +5547,19 @@ def delete_terminal_and_warm_intent(
             mark_receiver_gone(db, receiver_id=terminal_id)
         except Exception:
             logger.debug("f642_receiver_gone_failed", exc_info=True)
+        # F631 (D4): the identity row OUTLIVES the terminal. Flip it to
+        # ``reaped``, stamp ``reaped_at``, and capture its ``provider_session_id``
+        # as the returned ``resume_key`` — BEFORE the terminals row hard-delete
+        # below (which is unchanged, D1). A pre-registry lane (no identity row)
+        # yields resume_key=None and the flip is a no-op.
+        resume_key: str | None = None
+        identity_row = (
+            db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
+        )
+        if identity_row is not None:
+            resume_key = identity_row.provider_session_id
+            identity_row.lifecycle = "reaped"
+            identity_row.reaped_at = _utcnow()
         terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
     # F351: evict from metadata cache after deletion
     invalidate_terminal_metadata_cache(terminal_id)
@@ -5375,6 +5569,9 @@ def delete_terminal_and_warm_intent(
     return {
         "terminal_deleted": terminal_deleted,
         "intent_deleted": intent_deleted,
+        # F631 (D4): the provider session uuid the reaped lane resumes by, or None
+        # for a pre-registry / uuid-less lane.
+        "resume_key": resume_key,
     }
 
 

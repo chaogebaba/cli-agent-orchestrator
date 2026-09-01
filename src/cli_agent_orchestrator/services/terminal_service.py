@@ -7687,9 +7687,10 @@ def _delete_terminal_under_lease(
                     f"non-durable. Terminal retained for manual review.",
                 )
                 # Fake a "not deleted" result to preserve the terminal
-                deletion = {
+                deletion: dict[str, Any] = {
                     "terminal_deleted": False,
                     "intent_deleted": False,
+                    "resume_key": None,
                 }
             else:
                 deletion_kwargs: dict[str, Any] = {
@@ -7702,6 +7703,8 @@ def _delete_terminal_under_lease(
             delivery_lock.release()
         deleted = deletion["terminal_deleted"]
         intent_deleted = deletion["intent_deleted"]
+        # F631 (D4): the resume_key the reaped lane resumes by (or None).
+        resume_key = deletion.get("resume_key")
         intent_error = None
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
@@ -7721,6 +7724,7 @@ def _delete_terminal_under_lease(
             "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
             "rollback_kill_uncertain": False,
             "persona_retention_error": persona_retention_error,
+            "resume_key": resume_key,
         }
 
     except Exception as e:
