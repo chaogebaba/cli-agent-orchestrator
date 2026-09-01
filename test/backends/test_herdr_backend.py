@@ -70,6 +70,7 @@ class TestHerdrBackendABC:
             "send_keys",
             "send_special_key",
             "get_history",
+            "capture_viewport",
             "get_pane_working_directory",
             "get_pane_current_command",
             "attach_session",
@@ -529,6 +530,52 @@ class TestHerdrBackendCommands:
 
         cmd = mock_run.call_args_list[-1][0][0]
         assert "--format" not in cmd
+
+    @patch("subprocess.run")
+    def test_capture_viewport_reads_visible_source_as_text(self, mock_run, backend):
+        """capture_viewport must not inherit base's fail-closed raise (F674 #529).
+
+        Mutant: dropping the override (or sending --source recent / omitting
+        --format text) breaks one of the three contract properties and fails here.
+        """
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="viewport rows"),  # pane read
+        ]
+
+        result = backend.capture_viewport("cao-test", "window-0")
+
+        assert result == "viewport rows"
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "pane" in cmd
+        assert "read" in cmd
+        # viewport only, no scrollback
+        assert cmd[cmd.index("--source") + 1] == "visible"
+        assert "--lines" not in cmd
+        # escape-normalized
+        assert cmd[cmd.index("--format") + 1] == "text"
+
+    @patch("subprocess.run")
+    def test_capture_viewport_fails_closed_on_read_error(self, mock_run, backend):
+        """A failed herdr read yields "" so the pre-open probe still vetoes."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="", returncode=1),  # pane read fails
+        ]
+
+        assert backend.capture_viewport("cao-test", "window-0") == ""
 
     @patch("subprocess.run")
     def test_get_pane_working_directory(self, mock_run, backend):
