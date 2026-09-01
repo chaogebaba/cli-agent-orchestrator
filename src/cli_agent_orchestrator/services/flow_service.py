@@ -14,7 +14,9 @@ import frontmatter  # type: ignore
 from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import _utcnow
+from cli_agent_orchestrator.clients.database import (
+    _utcnow,
+)
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
@@ -279,8 +281,22 @@ async def execute_flow(name: str) -> bool:
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
+            #
+            # Index 0 is the oldest surviving terminal -- normally the conductor
+            # -- per the ordering contract documented on
+            # ``list_terminals_by_session``; do not restate the rule here, and do
+            # not reorder that read. This is the consumer with real blast radius:
+            # if index 0 is a quiet WORKER rather than the conductor, the busy
+            # check passes and the kill_session below tears down a session whose
+            # conductor is mid-run. Two documented ways index 0 can be a worker
+            # (both pre-existing, both listed on that function): the conductor's
+            # own row was deleted, or a row was inserted during flow recycling,
+            # which does not hold ``session_lifecycle_lock``.
             conductor = terminals[0] if terminals else None
-            if conductor and _is_terminal_busy(conductor["id"]):
+            # Off the loop: get_status() can fork a tmux capture-pane for a
+            # PROCESSING terminal (status_monitor.py's stale-PROCESSING
+            # fallback), and execute_flow runs on the shared event loop.
+            if conductor and await asyncio.to_thread(_is_terminal_busy, conductor["id"]):
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             from cli_agent_orchestrator.services import terminal_service

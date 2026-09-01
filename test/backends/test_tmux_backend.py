@@ -148,6 +148,7 @@ class TestTmuxBackendDelegation:
             tail_lines=50,
             strip_escapes=False,
             full_history=False,
+            visible_only=False,
         )
         assert result == "output text"
 
@@ -156,6 +157,19 @@ class TestTmuxBackendDelegation:
         result = backend.capture_viewport("cao-test", "window-0")
         mock_client.capture_viewport.assert_called_once_with("cao-test", "window-0")
         assert result == "visible output"
+
+    def test_get_history_delegates_visible_only(self, backend, mock_client):
+        mock_client.get_history.return_value = "viewport text"
+        result = backend.get_history("cao-test", "window-0", visible_only=True)
+        mock_client.get_history.assert_called_once_with(
+            "cao-test",
+            "window-0",
+            tail_lines=None,
+            strip_escapes=False,
+            full_history=False,
+            visible_only=True,
+        )
+        assert result == "viewport text"
 
     def test_get_pane_working_directory_delegates(self, backend, mock_client):
         mock_client.get_pane_working_directory.return_value = "/home/user"

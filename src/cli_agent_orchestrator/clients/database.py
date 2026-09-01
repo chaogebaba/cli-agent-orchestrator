@@ -32,6 +32,7 @@ from sqlalchemy import (
     exists,
     func,
     insert,
+    literal_column,
     or_,
     select,
     text,
@@ -41,12 +42,6 @@ from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred,
 from sqlalchemy.orm.exc import DetachedInstanceError, ObjectDeletedError, StaleDataError
 from tzlocal import get_localzone
 
-from cli_agent_orchestrator.constants import (
-    CAO_DB_BUSY_TIMEOUT_MS,
-    DATABASE_URL,
-    DB_DIR,
-    DEFAULT_PROVIDER,
-)
 from cli_agent_orchestrator.clients.delivery_ledger import (
     AckActor,
     BlockedReason,
@@ -61,6 +56,12 @@ from cli_agent_orchestrator.clients.delivery_ledger import (
     UndeliverableReason,
     carriers_exhausted,
     should_suppress_condition,
+)
+from cli_agent_orchestrator.constants import (
+    CAO_DB_BUSY_TIMEOUT_MS,
+    DATABASE_URL,
+    DB_DIR,
+    DEFAULT_PROVIDER,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
@@ -424,6 +425,59 @@ class TranscriptBindingModel(Base):
         Index("ix_transcript_bindings_terminal_received", "terminal_id", "received_at", "id"),
     )
 
+    # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
+    # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
+    # so index 0 of a session's terminals is its OLDEST SURVIVING row.
+    # (``list_siblings_by_group_prefix`` also reads this table by session and is
+    # deliberately NOT ordered: its consumer matches on group prefixes and does
+    # not take a first element. Order it too if that ever changes.) Several consumers
+    # treat that as the session's conductor and one of them kills sessions on it.
+    # rowid is not declared above, so the dependency is invisible here. Three
+    # things break it SILENTLY:
+    #   * an ``INSERT OR REPLACE``/upsert against terminals -- a replace deletes
+    #     and re-inserts, so the row gets a NEW rowid and jumps to the end of its
+    #     session. Nothing does this today and
+    #     ``test_no_upsert_against_the_terminals_table`` fails the build if it
+    #     starts; use an UPDATE.
+    #   * writing ``rowid`` explicitly (``INSERT (rowid, ...) VALUES (-5, ...)``).
+    #   * giving ``id`` INTEGER affinity, which makes rowid an alias for it and
+    #     hands the order back to a random uuid.
+    # Declaring the table WITHOUT ROWID also breaks it but fails LOUDLY
+    # (``no such column: terminals.rowid``), as does reading it through
+    # ``aliased()`` or ``union()``.
+    #
+    # New rows sort after existing ones because SQLite assigns ``max(rowid)+1``
+    # among surviving rows -- so deleting rows recycles values but cannot reorder
+    # the ones still present. The exception is a table holding a row at
+    # 2**63-1, where SQLite picks random unused rowids and within-session order
+    # scrambles; unreachable without an explicit rowid write.
+    #
+    # Deliberately NOT a ``created_at`` column: rowid already records insertion
+    # order exactly and correctly for every row in every existing database,
+    # whereas a new column has to invent the value for rows that predate it, and
+    # there is no honest source for it -- ``last_active`` is written only on
+    # input delivery (send_input/send_special_key), so it is LATEST for the
+    # busiest terminal, which is usually the conductor, and backfilling from it
+    # inverts the very order this contract exists to preserve.
+    #
+    # Deliberately NOT ``caller_id`` either, and this one was priced rather than
+    # dismissed. A conductor created through ``create_session`` records no
+    # caller while an MCP-spawned worker records its supervisor, so
+    # ``caller_id IS NOT NULL`` looks like root-terminal identity. On its own it
+    # is not total -- ``caller_id`` is an optional parameter of the agent-step
+    # create path, so a root carrying an explicit caller would be outranked by a
+    # later terminal without one. It CAN be made total by also requiring the
+    # parent to be in the same session (a correlated ``EXISTS`` on
+    # ``tmux_session``, which is immutable after insert, so a root's caller can
+    # never be in its own session). Measured, that costs ~+29% on this read
+    # (50 sessions over 5k rows: 9.0ms -> 11.6ms) and couples the conductor pick
+    # to referential integrity nothing enforces -- there is no FK on
+    # ``caller_id`` and ghost terminals are deleted in three places, so a
+    # deleted root leaves every worker's caller dangling. Rejected on that cost
+    # and coupling, for a hazard the upsert guard above already turns into a red
+    # build. ``caller_id`` is still the right thing to read for a specific
+    # terminal's spawn parent; it is not worth its price as a sort key.
+
 
 class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
@@ -491,9 +545,7 @@ class DeliveryLedgerModel(Base):
     blocked_reason = Column(String, nullable=True)  # BlockedReason value
     blocked_since = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
-    )
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (Index("ix_delivery_ledger_receiver", "receiver_id"),)
 
 
@@ -545,9 +597,7 @@ class ConditionLedgerModel(Base):
     suppressed_reason = Column(String, nullable=True)  # annotation, not a decision
     inbox_message_id = Column(Integer, nullable=True)  # set only when a push happened
     decided_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-    __table_args__ = (
-        Index("ix_condition_ledger_terminal", "terminal_id", "id"),
-    )
+    __table_args__ = (Index("ix_condition_ledger_terminal", "terminal_id", "id"),)
 
 
 class CallbackBarrierModel(Base):
@@ -4679,7 +4729,49 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session (F351: TTL-cached)."""
+    """List a tmux session's terminals, oldest first.
+
+    **Index 0 is the session's oldest surviving terminal -- normally its
+    conductor.** That is a contract, not an accident of the query plan:
+    ``flow_service`` decides whether to kill a session by whether index 0 is
+    busy, ``cao session status``/``list`` label index 0 as the Conductor over
+    HTTP, and ``session_service`` derives a session's reported profile and
+    directory from the earliest terminal that HAS either (#497) -- a first-match
+    scan rather than a bare index, so a conductor row with both fields NULL
+    still cedes ownership to a worker. Callers should cite this docstring rather
+    than restate the rule.
+
+    Ordered by ``rowid``, which is insertion order, and normally creation order:
+    every row is written at one site (``db_create_terminal``, called from
+    ``terminal_service.create_terminal``), and a worker's row cannot precede its
+    conductor's because the MCP handoff either resolves a caller that already
+    has a row (``GET /terminals/{caller_id}``, which raises if the id is stale)
+    or, when it is running outside a CAO terminal, records no caller at all and
+    starts a NEW session in which the worker is itself the conductor. Reuse
+    after deletion does not reorder surviving rows -- see ``TerminalModel`` for
+    the mechanism and its limits.
+
+    Two known gaps, both pre-existing and neither introduced here:
+
+    * ``session_lifecycle_lock`` serialises creation against teardown, but it is
+      a ``threading.Lock`` and therefore per-PROCESS. ``cao schedule run`` calls
+      ``execute_flow`` in the CLI process, and ``flow_service`` does not take the
+      lock at all, so its kill-and-recreate is not serialised against cao-server.
+      A worker insert landing inside that window can take index 0.
+    * Index 0 is the oldest SURVIVING row, which is not the conductor once the
+      conductor's own row is gone -- ``DELETE /terminals/{id}`` has no guard, the
+      MCP tool exposes it, and ghost-terminal cleanup deletes rows while the
+      session lives on.
+
+    Both mean consumers should treat index 0 as best-effort, which is what
+    ``_enrich_session_ownership`` already does. The ordering is what makes it
+    *predictable*; it does not make it an identity.
+
+    This ORDER BY does not change what this function returned before it was
+    added -- an unordered scan of a rowid table already yielded rowid order.
+    It states the order instead of inheriting it, so an index added later
+    cannot quietly change which terminal is the conductor.
+    """
     now = time.monotonic()
     cache_key = f"__session__{tmux_session}"
     entry = _terminal_metadata_cache.get(cache_key)
@@ -4687,7 +4779,15 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         return entry[1]
 
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            # Upstream #703/#629: index 0 must be the session's OLDEST terminal
+            # (its conductor). rowid is insertion order; without this the order
+            # is whatever plan the engine picks.
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
         results = []
         for t in terminals:
             try:
@@ -5907,6 +6007,64 @@ def list_terminals_by_provider_session_id(session_uuid: str) -> List[Dict[str, A
         ]
 
 
+def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]:
+    """List terminals for several tmux sessions in one query.
+
+    Exists so ``list_sessions`` can enrich N sessions without N queries (issue
+    #629) while still reading only the rows it will use. ``list_all_terminals``
+    would also collapse the query count, but its cost scales with the whole
+    table — including rows for sessions tmux no longer reports, which accumulate
+    because ``cleanup_service.cleanup_old_data`` only runs at server startup, so
+    a long-uptime server never sweeps them. Bounding the read by the live
+    session names keeps the cost proportional to the workload instead of to the
+    leak.
+
+    Ordered by ``rowid``, identically to ``list_terminals_by_session`` -- see
+    that function for the index-0-is-the-conductor contract and why rowid
+    expresses creation order. The two MUST order the same way: the caller picks
+    a session's "first known terminal", so the pick is order-sensitive, and an
+    ordered batched read beside an unordered per-session read is what let this
+    function silently disagree with the one it replaced.
+
+    The ORDER BY is not decoration. Without it the order is whatever the engine
+    plans: today every plan is a rowid scan (there is no index on
+    ``tmux_session``), but adding one -- the obvious reaction to a slow
+    per-session lookup -- reorders the probe. Measured, a plain ASC index on
+    ``(tmux_session, id)`` makes an unordered read return a worker ahead of the
+    session creator; ordering here is what keeps the conductor first.
+
+    Ordering by ``id`` would NOT do that: ``id`` is ``uuid4().hex[:8]``
+    (utils/terminal.generate_terminal_id), so it makes the conductor a
+    deterministic *random* terminal, and a session whose creator happens to sort
+    above one of its own workers advertises the worker's profile and directory as
+    the session's.
+
+    Returns an empty list without querying when given no session names.
+    """
+    if not tmux_sessions:
+        return []
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session.in_(tmux_sessions))
+            .order_by(literal_column("terminals.rowid"))
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
@@ -6560,9 +6718,7 @@ def expire_pending_rows(row_ids: List[int]) -> int:
             )
         )
         if _expiring_ids:
-            write_through_terminal_state(
-                db, message_ids=_expiring_ids, state=LedgerState.EXPIRED
-            )
+            write_through_terminal_state(db, message_ids=_expiring_ids, state=LedgerState.EXPIRED)
         db.commit()
     return int(updated)
 
@@ -7355,9 +7511,7 @@ def _fire_open_barrier_in_db(
         synchronize_session=False,
     )
     if _digested_ids:
-        write_through_terminal_state(
-            db, message_ids=_digested_ids, state=LedgerState.SUPERSEDED
-        )
+        write_through_terminal_state(db, message_ids=_digested_ids, state=LedgerState.SUPERSEDED)
     db.query(CallbackBarrierModel).filter_by(id=barrier.id).update(
         {CallbackBarrierModel.combined_message_id: combined.id},
         synchronize_session=False,
@@ -12393,7 +12547,6 @@ def f138_get_incarnation_by_terminal_generation(
         }
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # F642 — delivery-ledger spine operations (blueprint §3 write ownership)
 #
@@ -12605,16 +12758,12 @@ def maybe_mark_undeliverable(
         return False
     applicable = _carriers_from_str(ledger.applicable_carriers)
     emissions = (
-        db.query(DeliveryEmissionModel)
-        .filter(DeliveryEmissionModel.message_id == message_id)
-        .all()
+        db.query(DeliveryEmissionModel).filter(DeliveryEmissionModel.message_id == message_id).all()
     )
     views: list[EmissionView] = []
     for e in emissions:
         outcome = EmissionOutcome(e.outcome)
-        retryable = (
-            outcome is EmissionOutcome.FAILED and int(e.attempts) < max_attempts
-        )
+        retryable = outcome is EmissionOutcome.FAILED and int(e.attempts) < max_attempts
         views.append(EmissionView(Carrier(e.carrier), outcome, retryable))
     acked = ledger.acked_at is not None
     if carriers_exhausted(applicable, views, acked=acked):
@@ -12644,11 +12793,7 @@ def ack_delivery_ledger(
     if not ids:
         return 0
     acked = 0
-    rows = (
-        db.query(DeliveryLedgerModel)
-        .filter(DeliveryLedgerModel.message_id.in_(ids))
-        .all()
-    )
+    rows = db.query(DeliveryLedgerModel).filter(DeliveryLedgerModel.message_id.in_(ids)).all()
     for row in rows:
         if row.acked_at is None:
             row.acked_at = now
@@ -12680,11 +12825,7 @@ def write_through_terminal_state(
     ids = [int(m) for m in message_ids]
     if not ids:
         return
-    rows = (
-        db.query(DeliveryLedgerModel)
-        .filter(DeliveryLedgerModel.message_id.in_(ids))
-        .all()
-    )
+    rows = db.query(DeliveryLedgerModel).filter(DeliveryLedgerModel.message_id.in_(ids)).all()
     for row in rows:
         # Never clobber an ack (a consumed message stays consumed).
         if row.state == LedgerState.ACKED.value:
@@ -12731,9 +12872,7 @@ def mark_receiver_gone(
         db.query(DeliveryLedgerModel)
         .filter(
             DeliveryLedgerModel.receiver_id == receiver_id,
-            DeliveryLedgerModel.state.in_(
-                [LedgerState.PENDING.value, LedgerState.EMITTED.value]
-            ),
+            DeliveryLedgerModel.state.in_([LedgerState.PENDING.value, LedgerState.EMITTED.value]),
         )
         .all()
     )
@@ -12893,7 +13032,6 @@ def hook_claim_ids(
     return won
 
 
-
 class DbConditionLogStore:
     """F642 production :class:`~cli_agent_orchestrator.providers.condition.ConditionLogStore`.
 
@@ -12934,7 +13072,6 @@ class DbConditionLogStore:
                 inbox_message_id=inbox_message_id,
             )
             db.commit()
-
 
 
 def delivery_ledger_dispute_view(message_id: int) -> dict[str, Any]:

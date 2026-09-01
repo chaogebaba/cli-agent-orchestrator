@@ -309,7 +309,15 @@ class CopilotCliProvider(BaseProvider):
         likewise blocking. All three are offloaded via ``asyncio.to_thread``
         so building and sending the launch command can't block the shared
         event loop under concurrent session creation. ``status_monitor.
-        get_status`` stays inline -- it is in-memory only, no blocking I/O.
+        get_status`` is offloaded too: it is NOT in-memory only -- for a
+        terminal stuck in PROCESSING it can fork a real tmux capture-pane
+        subprocess (status_monitor.py's stale-PROCESSING fallback), and this
+        provider's own get_status falls back to ``self._history()`` (another
+        capture-pane) when the buffer has no visible text. Copilot init is
+        exactly the regime that trips the fallback -- cached status PROCESSING
+        while the CLI boots, pane quiet during auth/MCP startup -- and this
+        loop polls every second for up to 60s, multiplied by concurrent
+        session creations.
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -340,7 +348,7 @@ class CopilotCliProvider(BaseProvider):
         iterations = 0
         while time.time() < deadline and iterations < max_iterations:
             iterations += 1
-            status = status_monitor.get_status(self.terminal_id)
+            status = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
                 await self._accept_trust_prompts(timeout=5.0)
                 await asyncio.sleep(1.0)
@@ -548,6 +556,7 @@ class CopilotCliProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002g")
         return IDLE_PROMPT_PATTERN_LOG
 

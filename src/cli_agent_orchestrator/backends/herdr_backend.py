@@ -342,7 +342,15 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values))
+        args.extend(
+            self._build_env_args(
+                terminal_id,
+                session_name,
+                extra_env,
+                terminal_token=terminal_token,
+                allowed_blocked_values=allowed_blocked_values,
+            )
+        )
 
         result = self._run_herdr(args)
 
@@ -500,7 +508,15 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values))
+        args.extend(
+            self._build_env_args(
+                terminal_id,
+                session_name,
+                extra_env,
+                terminal_token=terminal_token,
+                allowed_blocked_values=allowed_blocked_values,
+            )
+        )
 
         result = self._run_herdr(args)
 
@@ -638,12 +654,20 @@ class HerdrBackend(TerminalBackend):
         tail_lines: Optional[int] = None,
         strip_escapes: bool = False,
         full_history: bool = False,
+        visible_only: bool = False,
     ) -> str:
         """Read pane output via herdr pane read."""
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]
-        if full_history:
+        if visible_only:
+            # herdr has no viewport/scrollback split; approximate the "current
+            # screen" contract with a small bounded recent read. In practice this
+            # arm is unreachable from the one visible_only caller (the stale-
+            # PROCESSING capture fallback): event-inbox backends return from
+            # get_status() before that fallback is reached.
+            args.extend(["--source", "recent", "--lines", "50"])
+        elif full_history:
             pass  # no flags — returns full scrollback
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
@@ -735,6 +759,7 @@ class HerdrBackend(TerminalBackend):
                 foreground_process = cast(str | None, pane_info.get("foreground_process"))
             except (json.JSONDecodeError, AttributeError):
                 from cli_agent_orchestrator.utils.tombstones import tombstone
+
                 tombstone("TS-0006")
                 foreground_process = None
         marker = service.read_identity_marker(terminal_id)
@@ -874,12 +899,14 @@ class HerdrBackend(TerminalBackend):
         # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
             from cli_agent_orchestrator.utils.tombstones import tombstone
+
             tombstone("TS-0004")
             pane_id, cached_at = self._pane_cache[terminal_id]
             if time.time() - cached_at < _PANE_CACHE_TTL:
                 return pane_id
         if session_name and window_name:
             from cli_agent_orchestrator.utils.tombstones import tombstone
+
             tombstone("TS-0005")
             return self._resolve_pane_id_from_window(session_name, window_name)
 

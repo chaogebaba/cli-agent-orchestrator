@@ -304,6 +304,21 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 WAITING_USER_ANSWER_PATTERN = r"(?:↑/↓|Tab/Arrow keys) to navigate|Enter to confirm[ \t]*·"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+# Bedrock model-upgrade nudge, e.g.
+#
+#   Newer Opus model available
+#   Currently pinned: Opus 4.6
+#   Latest available: Opus 5 (au.anthropic.claude-opus-5)
+#   Update settings to use Opus 5? Claude Code will restart to apply.
+#   ❯ 1. Yes
+#     2. No
+#
+# Shown once per tier when the pinned ANTHROPIC_*_MODEL is older than the CLI's
+# own default AND the account can actually invoke that newer model, so it is
+# specific to Bedrock deployments that pin their models — exactly what a
+# containerized fleet does. The title is matched (not the option labels) because
+# the tier name varies and up to three of these can queue up back to back.
+MODEL_UPGRADE_PROMPT_PATTERN = r"Newer \S+ model available"
 EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
@@ -1355,7 +1370,7 @@ class ClaudeCodeProvider(BaseProvider):
     async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
-        """Auto-accept startup prompts that may appear before the REPL is ready.
+        """Answer startup prompts that may appear before the REPL is ready.
 
         Claude Code may show up to three prompts during startup:
 
@@ -1369,6 +1384,10 @@ class ClaudeCodeProvider(BaseProvider):
            seat — F548 #404). Handled via ``_select_menu_affirmative``.
         3. **External CLAUDE.md import dialog** – reject external imports so an
            isolated provider pane cannot read configuration from production home.
+            4. **Bedrock model-upgrade nudge** – offers to repoint a pinned
+               ``ANTHROPIC_*_MODEL`` at a newer default. DECLINED with ``Esc``: its
+               default selection is "1. Yes", so a blind ``Enter`` would rewrite the
+               deployment's model pins and restart the CLI mid-init (upstream #712).
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -1416,6 +1435,12 @@ class ClaudeCodeProvider(BaseProvider):
         reject_external_imports = (
             provider_home("claude_code").classification == "shared-auth-read-only"
         )
+        # Keyed on the matched title ("Newer Opus model available"), not a bool:
+        # one nudge can be shown PER TIER, so a single flag would swallow the
+        # second and third and leave init blocked behind an unanswered dialog.
+        # Keying on the title also stops the dismissed dialog's own text, which
+        # stays in the capture buffer, from being answered again forever.
+        upgrade_declined: set[str] = set()
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -1527,6 +1552,39 @@ class ClaudeCodeProvider(BaseProvider):
                 trust_accepted = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()
+
+            # 3) Decline the Bedrock model-upgrade nudge. Checked BEFORE the
+            #    banner below because this dialog renders in place of the banner,
+            #    not alongside it — the REPL only draws once it is answered.
+            #    finditer, not search: a second tier's nudge renders BELOW the
+            #    already-answered first one, which stays in the capture buffer.
+            #    re.search would keep returning that stale first title, find it
+            #    in upgrade_declined, and skip — leaving the live dialog
+            #    unanswered until init timed out. The LAST unanswered match is
+            #    taken because the live dialog is the bottom-most one.
+            title = next(
+                (
+                    m.group(0)
+                    for m in reversed(list(re.finditer(MODEL_UPGRADE_PROMPT_PATTERN, clean_output)))
+                    if m.group(0) not in upgrade_declined
+                ),
+                None,
+            )
+            if title is not None:
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Model upgrade nudge detected (%s), declining", title)
+                # Esc, NOT Enter: "1. Yes" is the pre-selected option, so Enter
+                # would accept the upgrade and restart the CLI. Esc is also
+                # preferred over Down+Enter because it does not depend on the
+                # option ordering staying "Yes" first.
+                status_monitor.notify_input_sent(self.terminal_id)
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Escape"
+                )
+                upgrade_declined.add(title)
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset — another tier may follow
                 await asyncio.sleep(1.0)
                 continue
 
@@ -1906,6 +1964,12 @@ class ClaudeCodeProvider(BaseProvider):
         ) and not (
             re.search(TRUST_PROMPT_PATTERN, _exclusion_tail)
             or re.search(BYPASS_PROMPT_PATTERN, _exclusion_tail)
+            # Same reason as trust/bypass (upstream #712): _handle_startup_prompts
+            # declines the model-upgrade nudge itself, so surfacing it as
+            # WAITING_USER_ANSWER would ask an operator to answer a dialog that is
+            # about to answer itself. Its footer is "Enter to confirm · Esc to
+            # cancel", which WAITING_USER_ANSWER_PATTERN would otherwise hit.
+            or re.search(MODEL_UPGRADE_PROMPT_PATTERN, _exclusion_tail)
         )
         if waiting_candidate:
             # Prefer StatusMonitor's incremental screen; replaying the rolling

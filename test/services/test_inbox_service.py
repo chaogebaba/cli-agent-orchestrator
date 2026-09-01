@@ -45,12 +45,14 @@ def _make_message(
 def _terminal_service_mock():
     mock = MagicMock()
     mock.prepare_input.side_effect = lambda _terminal_id, text, *_args, **_kwargs: text
+
     class _PreparedSendMock(MagicMock):
         def assert_called_once_with(self, *args, **kwargs):
             self.assert_called_once()
-            assert self.call_args.args[:len(args)] == args
+            assert self.call_args.args[: len(args)] == args
             for key, value in kwargs.items():
                 assert self.call_args.kwargs[key] == value
+
     mock.send_prepared_input = _PreparedSendMock()
     return mock
 
@@ -59,19 +61,38 @@ def _terminal_service_mock():
 def _msgtrace_pipeline_defaults():
     """Run legacy delivery cases through the honest trace pipeline by default."""
     attempt = {
-        "attempt_uuid": "attempt-1", "started_at": "2026-07-11T00:00:00+00:00",
+        "attempt_uuid": "attempt-1",
+        "started_at": "2026-07-11T00:00:00+00:00",
         "evidence": {},
     }
     with (
-        patch("cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts", return_value=0),
-        patch("cli_agent_orchestrator.services.inbox_service.list_message_attempts", return_value=[]),
-        patch("cli_agent_orchestrator.services.inbox_service.confirm_batch_from_prior_attempt",
-              return_value=True),
-        patch("cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt", return_value="attempt-1"),
-        patch("cli_agent_orchestrator.services.inbox_service.get_message_trace", return_value={"attempts": [attempt]}),
-        patch("cli_agent_orchestrator.services.inbox_service.confirm_delivery", return_value=("unverified", {"kind": "send_returned_unverified"})),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts", return_value=0
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.list_message_attempts", return_value=[]
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.confirm_batch_from_prior_attempt",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
+            return_value="attempt-1",
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_message_trace",
+            return_value={"attempts": [attempt]},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+            return_value=("unverified", {"kind": "send_returned_unverified"}),
+        ),
         patch("cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt"),
-        patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata", return_value={"provider": "event"}),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+            return_value={"provider": "event"},
+        ),
     ):
         yield
 
@@ -81,7 +102,10 @@ class TestDeliverPending:
 
     @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.inbox_service.create_inbox_message")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -126,7 +150,10 @@ class TestDeliverPending:
 
     @pytest.mark.parametrize("registry", [None, MagicMock()])
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_default_mode_identity_with_and_without_registry(
@@ -208,7 +235,9 @@ class TestDeliverPending:
         )
         InboxService().deliver_pending("queued", registry=registry)
 
-        pasted = [entry.args[2] for entry in mock_backend_factory.return_value.send_keys.call_args_list]
+        pasted = [
+            entry.args[2] for entry in mock_backend_factory.return_value.send_keys.call_args_list
+        ]
         assert pasted == ["memory|MCP-shaped assigned task|contract"] * 2
         events = [entry.args[2] for entry in mock_dispatch.call_args_list]
         assert [event.message for event in events] == [raw, raw]
@@ -220,7 +249,10 @@ class TestDeliverPending:
         assert mock_memory.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_mixed_modes_same_sender_preserve_fifo_as_separate_sends(
@@ -244,7 +276,10 @@ class TestDeliverPending:
         ] == [OrchestrationType.ASSIGN, None]
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_time_input_block_returns_remaining_batch_to_pending(
@@ -263,7 +298,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_message_when_idle(self, mock_get, mock_monitor, mock_term_svc, mock_update):
@@ -281,7 +319,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_message_when_completed(
@@ -301,7 +342,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_skips_when_no_pending_messages(
@@ -316,7 +360,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_skips_when_processing(self, mock_get, mock_monitor, mock_term_svc, mock_update):
@@ -330,7 +377,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_skips_when_unknown(self, mock_get, mock_monitor, mock_term_svc, mock_update):
@@ -344,7 +394,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_multiple_messages_concatenated(
@@ -408,12 +461,13 @@ class TestDeliverPending:
             "normal",
             "parked-a\nparked-b",
         ]
-        watchdog.record_inbound_task.assert_called_once_with(
-            "term-1", "sender-1", "developer"
-        )
+        watchdog.record_inbound_task.assert_called_once_with("term-1", "sender-1", "developer")
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivers_all_when_num_messages_zero(
@@ -435,7 +489,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
@@ -450,7 +507,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_marks_delivered_before_send_input(
@@ -468,7 +528,9 @@ class TestDeliverPending:
 
         order = []
         mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
-        mock_term_svc.send_prepared_input.side_effect = lambda *args, **kwargs: order.append(("send", args))
+        mock_term_svc.send_prepared_input.side_effect = lambda *args, **kwargs: order.append(
+            ("send", args)
+        )
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -476,7 +538,10 @@ class TestDeliverPending:
         assert order == [("send", ("term-1", "hello"))]
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_resolution_failure_leaves_message_pending(
@@ -499,7 +564,10 @@ class TestDeliverPending:
         # Trace settlement owns DELIVERING -> PENDING, never legacy direct updates.
         mock_update.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -512,11 +580,7 @@ class TestDeliverPending:
 
         def get_pending(*args, **kwargs):
             with state_lock:
-                snapshot = (
-                    [message]
-                    if statuses[message.id] == MessageStatus.PENDING
-                    else []
-                )
+                snapshot = [message] if statuses[message.id] == MessageStatus.PENDING else []
                 if snapshot:
                     statuses[message.id] = MessageStatus.DELIVERING
             time.sleep(0.2)
@@ -552,7 +616,10 @@ class TestDeliverPending:
         assert statuses[message.id] == MessageStatus.DELIVERING
 
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -565,9 +632,7 @@ class TestDeliverPending:
             TerminalStatus.IDLE,
             TerminalStatus.WAITING_USER_ANSWER,
         ]
-        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = (
-            True
-        )
+        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = True
 
         InboxService().deliver_pending("term-1")
 
@@ -576,7 +641,10 @@ class TestDeliverPending:
         assert mock_monitor.get_status.call_count == 3
 
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -593,18 +661,20 @@ class TestDeliverPending:
             TerminalStatus.IDLE,
             TerminalStatus.WAITING_USER_ANSWER,
         ]
-        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = (
-            True
-        )
+        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = True
 
         InboxService().deliver_pending("term-1", num_messages=0)
 
         mock_term_svc.send_prepared_input.assert_not_called()
         assert mock_update.call_args_list == [
-            call(1, MessageStatus.PENDING), call(2, MessageStatus.PENDING)
+            call(1, MessageStatus.PENDING),
+            call(2, MessageStatus.PENDING),
         ]
 
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -620,7 +690,10 @@ class TestDeliverPending:
         mock_update.assert_not_called()
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -643,6 +716,58 @@ class TestDeliverPending:
         )
         mock_update.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """deliver_pending is read(PENDING) -> status check -> mark DELIVERED -> send,
+        with no atomic claim at the DB layer. Its callers genuinely overlap on worker
+        threads (the status-event consumer, the immediate POST path, the OpenCode poller,
+        the reconcile sweep), and two calls both reading the same oldest row before
+        either marks it would execute one agent task twice. The per-terminal lock must
+        serialize the whole sequence: with the mark artificially slowed to hold the
+        read->mark window open, two racing threads must produce exactly one send."""
+        import threading
+        import time
+
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        message = _make_message()
+        store = {"status": MessageStatus.PENDING}
+        store_guard = threading.Lock()
+
+        def read_pending(terminal_id, limit=1):
+            with store_guard:
+                return [message] if store["status"] == MessageStatus.PENDING else []
+
+        def slow_mark(message_id, status):
+            # Hold the read->mark window open long enough that an unserialized second
+            # thread would re-read the row as PENDING.
+            time.sleep(0.15)
+            with store_guard:
+                store["status"] = status
+
+        mock_get.side_effect = read_pending
+        mock_update.side_effect = slow_mark
+
+        svc = InboxService()
+        start = threading.Barrier(2)
+
+        def race():
+            start.wait(timeout=5)
+            svc.deliver_pending("term-1")
+
+        threads = [threading.Thread(target=race) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert mock_term_svc.send_prepared_input.call_count == 1
+        assert store["status"] == MessageStatus.DELIVERED
+
 
 class TestEagerInboxDelivery:
     """Tests for eager inbox delivery (CAO_EAGER_INBOX_DELIVERY).
@@ -653,7 +778,10 @@ class TestEagerInboxDelivery:
     """
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -674,7 +802,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -695,7 +826,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -727,7 +861,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -749,7 +886,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -771,7 +911,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -792,7 +935,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -814,7 +960,10 @@ class TestEagerInboxDelivery:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -834,7 +983,10 @@ class TestEagerInboxDelivery:
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
@@ -855,7 +1007,10 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
-    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")

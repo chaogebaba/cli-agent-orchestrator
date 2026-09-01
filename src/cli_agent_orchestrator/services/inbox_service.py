@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Dict, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
 
@@ -656,6 +656,14 @@ def _defer_messages(terminal_id: str, messages) -> None:
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
+    def _delivery_lock(self, terminal_id: str) -> threading.Lock:
+        with self._delivery_locks_guard:
+            lock = self._delivery_locks.get(terminal_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._delivery_locks[terminal_id] = lock
+            return lock
+
     # --- F74: message-state authority helper ---
     @staticmethod
     def _message_statuses(message_ids: list[int]) -> dict[int, str]:
@@ -677,6 +685,14 @@ class InboxService:
         return {int(row_id): status for row_id, status in rows}
 
     def __init__(self) -> None:
+        # deliver_pending is read(PENDING) → status check → mark DELIVERED → send,
+        # with no atomic claim at the DB layer, so two concurrent calls for the
+        # SAME terminal can both read the same oldest row before either marks it
+        # and deliver one task twice (upstream #712). Serialize the whole
+        # read→mark→send sequence per terminal; as a side effect this also keeps
+        # two pastes from ever interleaving in one pane.
+        self._delivery_locks_guard = threading.Lock()
+        self._delivery_locks: Dict[str, threading.Lock] = {}
         self._defer_attempts: dict[int, int] = {}
         self._defer_notified: set[int] = set()
         self._defer_lock = threading.Lock()
@@ -2217,7 +2233,19 @@ class InboxService:
         When a plugin registry is supplied, the originating sender and a
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
+
+        Safe to call from any thread: the whole read→mark→send sequence is
+        serialized per terminal (see __init__ for why that is load-bearing).
         """
+        with self._delivery_lock(terminal_id):
+            self._deliver_pending_locked(terminal_id, num_messages, registry)
+
+    def _deliver_pending_locked(
+        self,
+        terminal_id: str,
+        num_messages: int,
+        registry: PluginRegistry | None,
+    ) -> None:
         # F339: skip delivery for terminals already abandoned as ghosts.
         if self._f339_is_abandoned(terminal_id):
             return
