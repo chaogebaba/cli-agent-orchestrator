@@ -3611,7 +3611,7 @@ def _receiver_is_terminal_or_mailbox_address(db: Any, receiver_id: str | None) -
 
 
 def _register_terminal_identity(
-    db,
+    db: Session,
     *,
     terminal_id: str,
     provider: str,
@@ -3659,7 +3659,7 @@ def _register_terminal_identity(
         logger.debug("f631_identity_register_failed terminal=%s", terminal_id, exc_info=True)
 
 
-def _mark_terminal_identity_reaped(db, terminal_id: str) -> Optional[str]:
+def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[str]:
     """F631 D2/D4: flip the identity row to ``reaped`` and return the resume key.
 
     Runs in the SAME transaction as the ``terminals`` hard delete. The identity
@@ -3677,7 +3677,7 @@ def _mark_terminal_identity_reaped(db, terminal_id: str) -> Optional[str]:
         row.lifecycle = "reaped"
         row.reaped_at = _utcnow()
         db.flush()
-        return row.provider_session_id
+        return cast(Optional[str], row.provider_session_id)
     except Exception:  # noqa: BLE001 — never fail a reap on identity bookkeeping
         logger.debug("f631_identity_reap_failed terminal=%s", terminal_id, exc_info=True)
         return None
