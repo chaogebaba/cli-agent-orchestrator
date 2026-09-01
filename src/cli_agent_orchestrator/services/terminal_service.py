@@ -7187,7 +7187,14 @@ def _delete_terminal_inner(
                 reaped.append({"id": node_id, "status": "cleanup_deferred"})
                 continue
             disposition = "killed_while_busy" if busy else "reaped"
-            reaped.append({"id": node_id, "status": disposition})
+            # F631 D4: the cascade result used to carry no resume key at all
+            # (§1) — the 19:19Z incident's operator had nothing to resume by.
+            # Each reaped node now reports the handle its identity row holds.
+            entry: dict[str, str] = {"id": node_id, "status": disposition}
+            node_resume_key = result.get("resume_key")
+            if node_resume_key:
+                entry["resume_key"] = node_resume_key
+            reaped.append(entry)
             parent_writer = getattr(get_backend(), "set_window_parent", None)
             if callable(parent_writer):
                 for child in terminals:
@@ -7737,6 +7744,11 @@ def _delete_terminal_under_lease(
             "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
             "rollback_kill_uncertain": False,
             "persona_retention_error": persona_retention_error,
+            # F631 D4: the reaped lane's resume key, surfaced so the operator
+            # who reaps a lane is handed the handle it can be resumed by.
+            # `.get` because the F138 non-durable-force branch above fabricates
+            # a "not deleted" result that never reached the DB writer.
+            "resume_key": deletion.get("resume_key"),
         }
 
     except Exception as e:
