@@ -96,20 +96,20 @@ def _lease_patches():
     )
 
 
-async def _create(*, terminal_id):
+async def _create(*, terminal_id, working_directory):
     return await ts.create_terminal(
         provider="mock_cli",
         agent_profile="developer",
         session_name="cao-f634",
         new_session=False,
         caller_id=SUPERVISOR,
-        working_directory="/tmp",
+        working_directory=working_directory,
         terminal_id=terminal_id,
     )
 
 
 @pytest.mark.asyncio
-async def test_known_terminal_id_is_refused():
+async def test_known_terminal_id_is_refused(tmp_path):
     """AC20 conflict clause / MUTANT SENTINEL. A supplied id this server already
     holds (get_terminal_metadata non-None) → TerminalIdConflict, before any
     window/db create. Dropping the raise makes this go RED."""
@@ -123,7 +123,7 @@ async def test_known_terminal_id_is_refused():
         patch.object(ts, "get_terminal_metadata", lambda tid: {"id": tid}),
     ):
         with pytest.raises(TerminalIdConflict) as ei:
-            await _create(terminal_id="deadbeef")
+            await _create(terminal_id="deadbeef", working_directory=str(tmp_path))
     assert ei.value.terminal_id == "deadbeef"
     assert ei.value.code == "E-TERMINAL-ID-CONFLICT"
     # No terminal was created — the refusal precedes the window/db seam.
@@ -131,14 +131,13 @@ async def test_known_terminal_id_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_unknown_terminal_id_is_adopted():
+async def test_unknown_terminal_id_is_adopted(tmp_path):
     """A supplied id this server does NOT hold (get_terminal_metadata None) is
     adopted, not refused — the create proceeds and the adopted id reaches the
     window/db seam. Models the epoch-recovery fresh-id adopt precedent."""
     seam, backend = _spawn_seam()
     l1, l2 = _lease_patches()
     created_ids: list = []
-    orig_window = backend.create_window.side_effect
 
     def _record_window(session, window, terminal_id, *a, **kw):
         created_ids.append(terminal_id)
@@ -152,6 +151,6 @@ async def test_unknown_terminal_id_is_adopted():
         patch("cli_agent_orchestrator.backends.registry._backend", backend),
         patch.object(ts, "get_terminal_metadata", lambda tid: None),
     ):
-        await _create(terminal_id="deadbeef")
+        await _create(terminal_id="deadbeef", working_directory=str(tmp_path))
     # The adopted id (not a freshly generated one) reached the create seam.
     assert "deadbeef" in created_ids
