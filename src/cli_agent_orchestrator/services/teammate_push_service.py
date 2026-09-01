@@ -10,6 +10,7 @@ F123 insert-path direct append (attempt_teammate_push_on_insert) is retired.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,121 @@ from cli_agent_orchestrator.services.nudge_discipline import JitterRNG, _Default
 _push_rng: JitterRNG = _DefaultRNG()
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# F656 (#511): team-inbox mutation instrumentation — EVIDENCE ONLY.
+#
+# The post-ack resurrection race (id re-injected ~41s after ack, ~1/299) is a
+# file-level race on team-lead.json between this fork's writers and the drain
+# hook's scrub. Neither writer logs today, so the record cannot distinguish
+# the interleaving. This instrumentation adds a single structured DEBUG line
+# at every atomic write/scrub of the inbox file, capturing enough to
+# reconstruct the interleaving after the fact:
+#   pid, monotonic_ns, entries_before/after, msg_ids added/removed,
+#   mtime+size before/after, and a content hash of the bytes written.
+#
+# HARD CONSTRAINT (instrumentation only): this must NOT change behavior and
+# must NOT widen the lock-hold window. Gate r1 (EMPIRICAL-GATE-NO) established
+# that even a pre-read or post-replace `os.stat`, the sha256 evaluation, and
+# the logger call all counted as widening because they ran while the lockfile
+# was still held (before the writer's existing `finally` released it).
+#
+# The discipline enforced here:
+#   * Inside the held lock, capture ONLY cheap in-memory values that already
+#     exist there — entry counts, the msg_ids, and a REFERENCE to the `data`
+#     bytes that were written (the bytes are already in memory; no re-read, no
+#     copy, no hashing while locked).
+#   * The "before" file stat is taken BEFORE lock acquisition, outside the
+#     critical section entirely.
+#   * The "after" stat, the sha256 of the captured bytes, and the emit ALL run
+#     AFTER `_release_lockfile`, wrapped whole in one best-effort try, so no
+#     stat/hash/log failure can affect the write's return value or timing while
+#     the lock is held.
+# ---------------------------------------------------------------------------
+
+_inbox_race_logger = logging.getLogger("cao.inbox_race")
+
+
+def _stat_size_mtime(path: Path) -> tuple[Optional[int], Optional[float]]:
+    """Cheap metadata probe: (size_bytes, mtime) or (None, None) if absent.
+
+    A single os.stat — a metadata syscall, NOT a content read. Callers MUST
+    only invoke it OUTSIDE the held lock (before acquisition for the "before"
+    snapshot, after release for the "after" snapshot) so it never widens the
+    lock-hold window that the F656 race lives in.
+    """
+    try:
+        st = os.stat(str(path))
+        return st.st_size, st.st_mtime
+    except OSError:
+        return None, None
+
+
+def _emit_inbox_mutation(
+    *,
+    op: str,
+    inbox_path: Path,
+    entries_before: int,
+    entries_after: int,
+    msg_ids_added: List[str],
+    msg_ids_removed: List[str],
+    size_before: Optional[int],
+    mtime_before: Optional[float],
+    data: "bytes | str | None",
+    outcome: str,
+) -> None:
+    """Emit one structured DEBUG line describing a team-inbox mutation (F656).
+
+    MUST be called AFTER the writer has released its lockfile. Everything that
+    could touch the filesystem, allocate, or fail — the "after" stat, the UTF-8
+    ENCODE of a ``str`` payload, the sha256, and the logger call — happens here,
+    inside one best-effort ``try``. A failure of any of them can therefore never
+    affect the write's success return or widen the lock window; the lock is
+    already gone by the time this runs.
+
+    ``data`` accepts whatever the writer already holds with NO in-lock cost:
+    the native/scrub writers pass a REFERENCE to the exact ``bytes`` object they
+    wrote (no copy); the legacy writer passes a REFERENCE to its ``str`` payload
+    and the O(n) ``encode`` is deferred to here (gate r2 finding 1 — the encode
+    must not run while the lock is held).
+
+    DEBUG-gated: when the dedicated ``cao.inbox_race`` logger is not enabled for
+    DEBUG, this returns before performing the "after" stat, the encode, or the
+    hash, so an instrumentation-off process pays only a cheap ``isEnabledFor``
+    check here and no allocation.
+    """
+    try:
+        if not _inbox_race_logger.isEnabledFor(logging.DEBUG):
+            return
+        size_after, mtime_after = _stat_size_mtime(inbox_path)
+        if data is None:
+            content_hash = None
+        else:
+            # Deferred encode (post-release): the legacy writer hands us a str.
+            data_bytes = data.encode("utf-8") if isinstance(data, str) else data
+            content_hash = hashlib.sha256(data_bytes).hexdigest()
+        _inbox_race_logger.debug(
+            "f656_inbox_mutation op=%s outcome=%s pid=%d mono_ns=%d path=%s "
+            "entries_before=%d entries_after=%d added=%s removed=%s "
+            "size_before=%s mtime_before=%s size_after=%s mtime_after=%s hash=%s",
+            op,
+            outcome,
+            os.getpid(),
+            time.monotonic_ns(),
+            inbox_path,
+            entries_before,
+            entries_after,
+            msg_ids_added,
+            msg_ids_removed,
+            size_before,
+            mtime_before,
+            size_after,
+            mtime_after,
+            content_hash,
+        )
+    except Exception:  # pragma: no cover - instrumentation must never break writes
+        pass
+
 
 # D11: Pinned deterministic namespace (frozen forever).
 # Derivation: UUID5 of "https://github.com/awslabs/cli-agent-orchestrator/f136-supervisor-callback"
@@ -137,11 +253,22 @@ def write_supervisor_callback_notification(
     except OSError as e:
         return NativeInboxWriteResult(kind="retryable_failure", reason=f"mkdir: {e}")
 
+    # F656: "before" file metadata is sampled BEFORE lock acquisition, so the
+    # os.stat never runs inside the held-lock window (gate r1). It is a cheap
+    # metadata syscall; the tiny staleness (a hook could touch the file between
+    # this stat and lock acquisition) is acceptable for forensic evidence.
+    size_before, mtime_before = _stat_size_mtime(inbox_path)
+
     lock_path = Path(str(inbox_path) + ".lock")
     fd = _acquire_lockfile_deadline(lock_path, deadline_mono)
     if fd is None:
         return NativeInboxWriteResult(kind="retryable_failure", reason="lock_timeout")
 
+    # F656: emission payload assembled from cheap in-memory values captured
+    # INSIDE the lock, but the stat/hash/log emission happens AFTER release.
+    emit_data: Optional[bytes] = None
+    entries_before = 0
+    result: NativeInboxWriteResult
     try:
         # Read existing array
         entries: List[Dict[str, Any]] = []
@@ -184,6 +311,7 @@ def write_supervisor_callback_notification(
                     )
 
         # D12 step 7: append and atomic durable write
+        entries_before = len(entries)
         entries.append(entry)
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
@@ -203,9 +331,30 @@ def write_supervisor_callback_notification(
                 pass
             return NativeInboxWriteResult(kind="retryable_failure", reason=f"write: {e}")
 
-        return NativeInboxWriteResult(kind="written")
+        # F656: keep only a reference to the already-written bytes (no hash, no
+        # stat, no log while the lock is held). Emission happens post-release.
+        emit_data = data
+        result = NativeInboxWriteResult(kind="written")
     finally:
         _release_lockfile(fd, lock_path)
+
+    # F656: post-release emission (lock is gone). All stat/hash/log work — and
+    # any failure of it — is now outside the lock window and inside the helper's
+    # best-effort try, so it cannot affect this return or widen the lock.
+    if emit_data is not None:
+        _emit_inbox_mutation(
+            op="append",
+            inbox_path=inbox_path,
+            entries_before=entries_before,
+            entries_after=entries_before + 1,
+            msg_ids_added=[msg_id],
+            msg_ids_removed=[],
+            size_before=size_before,
+            mtime_before=mtime_before,
+            data=emit_data,
+            outcome="written",
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +610,16 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
     except OSError as e:
         logger.warning(f"teammate_push: cannot create inbox dir {inbox_path.parent}: {e}")
         return False
+    # F656: "before" stat taken before lock acquisition (never in-lock).
+    size_before, mtime_before = _stat_size_mtime(inbox_path)
     fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 1.0)
     if fd is None:
         logger.warning(f"teammate_push: failed to acquire lock {lock_path} after retries")
         return False
+    emit_data: "bytes | str | None" = None
+    entries_before = 0
+    entry_msg_id = entry.get("msg_id")
+    result = False
     try:
         entries_list: List[Dict[str, Any]] = []
         if inbox_path.exists():
@@ -479,17 +634,18 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
                 return False
 
         # F175: file-level dedup by msg_id — prevent duplicate appends
-        entry_msg_id = entry.get("msg_id")
         if entry_msg_id:
             for existing in entries_list:
                 if existing.get("msg_id") == entry_msg_id:
                     # Already present — idempotent success
                     return True
 
+        entries_before = len(entries_list)
         entries_list.append(entry)
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
-            tmp_path.write_text(json.dumps(entries_list, indent=2), encoding="utf-8")
+            payload = json.dumps(entries_list, indent=2)
+            tmp_path.write_text(payload, encoding="utf-8")
             os.replace(str(tmp_path), str(inbox_path))
         except OSError:
             try:
@@ -497,9 +653,29 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
             except OSError:
                 pass
             return False
-        return True
+        # F656: keep only a REFERENCE to the str payload we already built; the
+        # O(n) UTF-8 encode + hash is deferred to _emit_inbox_mutation, after
+        # the lock is released (gate r2 finding 1).
+        emit_data = payload
+        result = True
     finally:
         _release_lockfile(fd, lock_path)
+
+    # F656: post-release emission (legacy pull-gate writer).
+    if emit_data is not None:
+        _emit_inbox_mutation(
+            op="append_legacy",
+            inbox_path=inbox_path,
+            entries_before=entries_before,
+            entries_after=entries_before + 1,
+            msg_ids_added=[entry_msg_id] if entry_msg_id else [],
+            msg_ids_removed=[],
+            size_before=size_before,
+            mtime_before=mtime_before,
+            data=emit_data,
+            outcome="written",
+        )
+    return result
 
 
 # Legacy aliases kept for tests
@@ -619,11 +795,17 @@ def mark_cc_inbox_entries_read(
     target_msg_ids = {callback_notification_id(mailbox_id, row_id) for row_id in acked_row_ids}
 
     lock_path = Path(str(inbox_path) + ".lock")
+    # F656: "before" stat taken before lock acquisition (never in-lock).
+    size_before, mtime_before = _stat_size_mtime(inbox_path)
     fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 2.0)
     if fd is None:
         logger.debug("f178: lock timeout marking cc inbox entries read")
         return 0
 
+    emit_data: Optional[bytes] = None
+    entries_before = 0
+    marked = 0
+    marked_msg_ids: List[str] = []
     try:
         if not inbox_path.exists():
             return 0
@@ -639,8 +821,9 @@ def mark_cc_inbox_entries_read(
             logger.debug("f178: malformed cc inbox file, skipping: %s", e)
             return 0
 
+        entries_before = len(entries)
+
         # Mark matching entries as read
-        marked = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -649,6 +832,7 @@ def mark_cc_inbox_entries_read(
                 if entry.get("from") == _TEAMMATE_FROM and not entry.get("read"):
                     entry["read"] = True
                     marked += 1
+                    marked_msg_ids.append(entry_msg_id)
 
         if marked == 0:
             return 0
@@ -673,7 +857,29 @@ def mark_cc_inbox_entries_read(
                 pass
             return 0
 
+        # F656: keep only a reference to the written bytes; emit post-release.
+        emit_data = data
         logger.debug("f178: marked %d cc inbox entries read for mailbox %s", marked, mailbox_id)
         return marked
     finally:
         _release_lockfile(fd, lock_path)
+        # F656: post-release emission of the scrub/read-mark mutation. This
+        # writer flips `read` flags rather than adding/removing rows, so
+        # `removed` carries the msg_ids whose flag was scrubbed to read=True
+        # (entries_before == entries_after by construction). All stat/hash/log
+        # work runs here — after the lock is released and inside the helper's
+        # best-effort try — so it never widens the lock window. Placing it in
+        # `finally` (after release) preserves the early `return marked` above.
+        if emit_data is not None:
+            _emit_inbox_mutation(
+                op="scrub_read_mark",
+                inbox_path=inbox_path,
+                entries_before=entries_before,
+                entries_after=entries_before,
+                msg_ids_added=[],
+                msg_ids_removed=marked_msg_ids,
+                size_before=size_before,
+                mtime_before=mtime_before,
+                data=emit_data,
+                outcome=f"marked={marked}",
+            )
