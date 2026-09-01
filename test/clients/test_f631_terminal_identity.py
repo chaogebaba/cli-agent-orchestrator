@@ -7,9 +7,12 @@ D10 (the additive migration) and §3's create/reap write ownership, including
 D4's reap half — ``delete_terminal`` returns the resume key.
 
 Arms: AC1, AC2, AC14, AC15, plus D2's CHECK and D4's reap-side return, plus
-(r2) the two fault-injection arms that hold §3's atomicity guarantee when the
+the two fault-injection arms that hold §3's atomicity guarantee when the
 identity write itself FAILS — the case a swallowed exception hid from M10, which
-can only observe the outer abort path. Every
+can only observe the outer abort path. Those two are **state-only by
+construction** (r3): they make no assertion about which exception propagates, or
+whether one does, and their fault is injected PRE-FLUSH so the swallowed-success
+state is actually reachable. Every
 assertion runs against the real SQLAlchemy tables / real DB operations, never a
 mocked surface. The ``db_env`` fixture mirrors
 ``test/clients/test_f642_delivery_ledger.py``.
@@ -193,70 +196,130 @@ def test_ac1_identity_row_is_written_in_the_terminals_transaction(db_env):
 
 
 @contextmanager
-def _identity_write_fails(when):
-    """Force the identity row's own write to fail, at flush time.
+def _identity_row_construction_fails():
+    """PRE-FLUSH fault on the create side: the model constructor raises.
 
-    A mapper-level listener is the fault injection that matches the claim under
-    test: not "the helper was called in the wrong order" (M10 owns that), but
-    "the identity write itself failed". The exception surfaces from the
-    ``db.flush()`` inside the helper, exactly where a real IntegrityError or
-    OperationalError would.
+    The injection point matters more than the fault (r3). A mapper
+    ``before_insert`` listener — what r2 used — raises *during* ``Session.flush()``,
+    which poisons the transaction; the outer commit then fails on its own and the
+    forbidden state is never reachable, so restoring the swallow could not be
+    caught by durable state at all. This fault is pure Python, raised while
+    building the row and before any DB interaction, so the caller's transaction
+    stays healthy and a swallowed failure really does commit the terminals row
+    alone — the exact state the r1 probe recorded as ``1, 0``.
+
+    ``terminal_id`` is the real instrumented attribute so the helper's
+    existence query is unaffected; only construction fails.
     """
+    real = database.TerminalIdentityModel
 
-    def boom(mapper, connection, target):
-        raise RuntimeError(f"identity_{when}_failed")
+    class _RaisingIdentity:
+        terminal_id = real.terminal_id
 
-    event.listen(TerminalIdentityModel, when, boom)
+        def __init__(self, **kwargs):
+            raise RuntimeError("identity_row_construction_failed")
+
+    setattr(database, "TerminalIdentityModel", _RaisingIdentity)
     try:
         yield
     finally:
-        event.remove(TerminalIdentityModel, when, boom)
+        setattr(database, "TerminalIdentityModel", real)
+
+
+@contextmanager
+def _identity_retirement_fails():
+    """PRE-FLUSH fault on the reap side: assigning ``lifecycle`` raises.
+
+    An attribute ``set`` event fires synchronously in Python during
+    ``row.lifecycle = "reaped"``, before any flush, so — as above — the
+    transaction is still usable and a swallowed failure really does commit the
+    hard delete while leaving the identity row live.
+    """
+
+    def boom(target, value, oldvalue, initiator):
+        raise RuntimeError("identity_retirement_failed")
+
+    event.listen(TerminalIdentityModel.lifecycle, "set", boom)
+    try:
+        yield
+    finally:
+        event.remove(TerminalIdentityModel.lifecycle, "set", boom)
 
 
 def test_a_failed_identity_insert_aborts_the_whole_create(db_env):
     """§3/AC1: registration failure must roll the terminal back, not fail open.
 
+    STATE-ONLY BY CONSTRUCTION (r3). This arm makes no assertion whatsoever
+    about which exception propagates, or whether one propagates at all — the
+    call is wrapped in a bare catch and the verdict is read entirely off the
+    database afterwards. There is therefore no exception matcher to broaden: the
+    only thing that can turn this arm red is the forbidden durable state.
+
     The guarantee §3 makes is not call ordering — M10 already covers the outer
     abort path — it is that a laptop-created terminal is NEVER unregistered. A
-    swallowed write failure defeats that without ever reaching the outer path:
-    the transaction is simply never told anything went wrong, and commits one
-    terminals row with zero identity rows.
+    swallowed failure defeats that without ever reaching the outer path: the
+    transaction is never told anything went wrong and commits one terminals row
+    with zero identity rows.
     """
-    with _identity_write_fails("before_insert"):
-        with pytest.raises(RuntimeError, match="identity_before_insert_failed"):
+    with _identity_row_construction_fails():
+        try:
             _make_lane("lane0008")
+        except Exception:
+            pass  # deliberately unexamined — see the docstring
 
     with db_env() as db:
-        assert db.query(TerminalModel).filter_by(id="lane0008").one_or_none() is None
-        assert db.query(TerminalIdentityModel).filter_by(terminal_id="lane0008").count() == 0
-    # The forbidden state in full: never one terminals row with no identity row.
-    with db_env() as db:
-        assert (db.query(TerminalModel).count(), db.query(TerminalIdentityModel).count()) == (0, 0)
+        state = (db.query(TerminalModel).count(), db.query(TerminalIdentityModel).count())
+    assert state == (0, 0), f"F631-N1-STATE: terminals,identities = {state}, want (0, 0)"
 
 
 def test_a_failed_identity_retirement_aborts_the_whole_reap(db_env):
     """D2/D4/§3/AC2: retirement failure must abort the delete, not fail open.
 
+    STATE-ONLY BY CONSTRUCTION (r3), for the same reason as the create-side arm.
+
     Failing open here is worse than losing the key: the terminals row is hard
     deleted while the durable identity stays ``live`` with no ``reaped_at`` — a
-    reaped lane that reads as live — and the caller is handed ``resume_key=None``,
-    which is indistinguishable from a lane that never had a key.
+    reaped lane that reads as live. The discriminator is therefore the TERMINALS
+    row (deleted when the failure is swallowed, alive when it propagates); the
+    identity row reads ``live``/unstamped either way, which is precisely why
+    asserting only on the identity row would prove nothing.
     """
     _make_lane()
 
-    with _identity_write_fails("before_update"):
-        with pytest.raises(RuntimeError, match="identity_before_update_failed"):
+    with _identity_retirement_fails():
+        try:
             delete_terminal_and_warm_intent("lane0001")
+        except Exception:
+            pass  # deliberately unexamined — see the docstring
 
-    # The terminal survived: the hard delete was in the aborted transaction.
     with db_env() as db:
-        assert db.query(TerminalModel).filter_by(id="lane0001").one_or_none() is not None
+        survived = db.query(TerminalModel).filter_by(id="lane0001").one_or_none() is not None
+    assert survived, "F631-N2-STATE: the terminals row was hard-deleted despite a failed retirement"
     row = get_terminal_identity("lane0001")
-    assert row["lifecycle"] == "live"
-    assert row["reaped_at"] is None
+    assert (row["lifecycle"], row["reaped_at"]) == ("live", None), (
+        f"F631-N2-STATE: identity is {row['lifecycle']}/{row['reaped_at']}, want live/None"
+    )
     # …and the real key was never silently discarded — a second, clean reap
     # still returns it.
     assert delete_terminal_and_warm_intent("lane0001")["resume_key"] == "uuid-lane0001"
+
+
+def test_a_failed_identity_write_propagates_rather_than_returning(db_env):
+    """Companion to the two arms above — NOT one of them.
+
+    The blocker arms deliberately say nothing about exceptions, so this records
+    the propagation property separately. It is documented as unable to kill the
+    catch-all mutation (under the swallow nothing propagates and this test fails
+    for a non-state reason), which is exactly why it is kept apart from them.
+    """
+    with _identity_row_construction_fails():
+        with pytest.raises(Exception):
+            _make_lane("lane0010")
+
+    _make_lane("lane0011", uuid_value="uuid-lane0011")
+    with _identity_retirement_fails():
+        with pytest.raises(Exception):
+            delete_terminal_and_warm_intent("lane0011")
 
 
 def test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception(db_env):
