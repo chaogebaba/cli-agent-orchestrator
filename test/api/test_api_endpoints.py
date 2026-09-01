@@ -761,6 +761,115 @@ class TestCreateSession:
         mock_svc.create_terminal.assert_not_called()
 
 
+class TestStartSessionMemorySidecar:
+    """F670 (#525): the SECOND memory_manager sidecar spawn site.
+
+    ``POST /sessions/start`` carries its own sidecar closure, independent of the
+    one under ``POST /sessions``. The two share no helper, so the ``/sessions``
+    tests above prove nothing about this site: a mutant deleting only this
+    closure's ``caller_id=`` / ``is_box_hosted=`` kwargs survives them. These
+    tests pin this site directly.
+    """
+
+    @staticmethod
+    def _start_result(session_name="cao-test-session", terminal_id="sup-9999"):
+        return {
+            "schema_version": "cao.session-start/v1",
+            "session": {"session_name": session_name},
+            "supervisor_terminal": {
+                "id": terminal_id,
+                "session_name": session_name,
+                "provider": "kiro_cli",
+                "agent_profile": "developer",
+            },
+            "bootstrap": {"mode": "seed_resume", "status": "ok"},
+            "manifest": None,
+            "manifest_error": None,
+        }
+
+    def _post_start(self, client, **extra_params):
+        """Drive POST /sessions/start?memory=true, capturing the sidecar spawn."""
+        params = {
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "memory": "true",
+        }
+        params.update(extra_params)
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.start_session",
+                new=AsyncMock(return_value=self._start_result()),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal",
+                new=AsyncMock(
+                    return_value=Terminal(
+                        id="sidecar01",
+                        name="memory-window",
+                        session_name="cao-test-session",
+                        provider="kiro_cli",
+                        agent_profile="memory_manager",
+                    )
+                ),
+            ) as mock_create,
+        ):
+            response = client.post("/sessions/start", params=params)
+        return response, mock_create
+
+    def test_start_memory_sidecar_carries_supervisor_caller_id(self, client):
+        """The sidecar names the supervisor seat as its caller.
+
+        ``caller_id`` is what arms the F620 laptop shim at all
+        (terminal_service.py — "a worker is an existing-session create with a
+        caller_id"). Without it this site's sidecar is silently exempt.
+        """
+        response, mock_create = self._post_start(client)
+
+        assert response.status_code == 200
+        mock_create.assert_called_once()
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["agent_profile"] == "memory_manager"
+        assert kwargs["session_name"] == "cao-test-session"
+        assert kwargs["caller_id"] == "sup-9999"
+
+    def test_start_memory_sidecar_defaults_box_hosted_false(self, client):
+        """A laptop-hosted start passes ``is_box_hosted=False``, not nothing."""
+        _, mock_create = self._post_start(client)
+
+        assert mock_create.call_args.kwargs["is_box_hosted"] is False
+
+    def test_start_memory_sidecar_inherits_box_hosted(self, client):
+        """A box-hosted session's sidecar stays unshimmed (F634 D16)."""
+        _, mock_create = self._post_start(client, is_box_hosted="true")
+
+        assert mock_create.call_args.kwargs["is_box_hosted"] is True
+
+    def test_start_without_memory_spawns_no_sidecar(self, client):
+        """Control: no ``memory=true``, no sidecar — the assertions above mean
+        something only if the spawn is conditional."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.start_session",
+                new=AsyncMock(return_value=self._start_result()),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal",
+                new=AsyncMock(),
+            ) as mock_create,
+        ):
+            response = client.post(
+                "/sessions/start",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 200
+        mock_create.assert_not_called()
+
+
 class TestListSessions:
     """Tests for GET /sessions endpoint."""
 
