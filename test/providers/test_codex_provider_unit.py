@@ -30,6 +30,10 @@ from cli_agent_orchestrator.providers.codex import (
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
+# F700 (#555): captured BEFORE the autouse pin below replaces the attribute, so
+# TestCodexHookTrustBypass can exercise the genuine probe.
+_REAL_HOOK_TRUST_PROBE = CodexProvider.__dict__["_supports_hook_trust_bypass"].__func__
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 STATUSLINE_CORPUS_DIR = FIXTURES_DIR / "codex_statusline_corpus"
 
@@ -41,6 +45,19 @@ def _mock_resolve_binary():
         "cli_agent_orchestrator.providers.codex.resolve_provider_binary", return_value="codex"
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _hook_trust_bypass_supported(monkeypatch):
+    """F700 (#555): pin the ``--dangerously-bypass-hook-trust`` capability probe.
+
+    The probe shells out to ``codex --help``, so without this the expected
+    command string would depend on whether (and which) codex is installed on the
+    machine running the suite. Pinned True here; TestCodexHookTrustBypass
+    exercises the probe itself.
+    """
+    CodexProvider._supports_hook_trust_bypass.cache_clear()
+    monkeypatch.setattr(CodexProvider, "_supports_hook_trust_bypass", staticmethod(lambda: True))
 
 
 STATUSLINE_VARIANTS = {
@@ -130,6 +147,7 @@ class TestCodexProviderInitialization:
             "test-session",
             "window-0",
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false",
         )
@@ -224,9 +242,22 @@ class TestCodexBuildCommand:
         command = provider._build_codex_command()
         assert command == (
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false"
         )
+
+    def test_build_command_bypasses_hook_trust(self):
+        """F700 (#555): a fresh worktree is untrusted, so the hooks modal blocks init.
+
+        Mutant: dropping the `--dangerously-bypass-hook-trust` append fails here.
+        """
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        argv = shlex.split(provider._build_codex_command())
+
+        assert "--dangerously-bypass-hook-trust" in argv
+        # Must be a launch flag, not stranded after the -c overrides.
+        assert argv.index("--dangerously-bypass-hook-trust") < argv.index("-c")
 
     def test_build_command_disables_native_multi_agent(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
@@ -528,6 +559,7 @@ class TestCodexBuildCommand:
 
         assert command == (
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false"
         )
@@ -547,6 +579,7 @@ class TestCodexBuildCommand:
 
         assert command == (
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false"
         )
@@ -1132,6 +1165,7 @@ class TestCodexProviderCodexConfig:
 
         assert command == (
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false"
         )
@@ -1151,6 +1185,7 @@ class TestCodexProviderCodexConfig:
 
         assert command == (
             "codex --yolo --no-alt-screen --disable shell_snapshot"
+            " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
             " -c check_for_update_on_startup=false"
         )
@@ -5286,3 +5321,43 @@ class TestCodexSeedResumeIdentity:
             record.levelno == logging.ERROR and "flagged" in record.getMessage()
             for record in caplog.records
         )
+
+
+class TestCodexHookTrustBypass:
+    """F700 (#555): the capability probe behind ``--dangerously-bypass-hook-trust``."""
+
+    @staticmethod
+    def _probe():
+        _REAL_HOOK_TRUST_PROBE.cache_clear()
+        return _REAL_HOOK_TRUST_PROBE()
+
+    @patch("subprocess.run")
+    def test_probe_true_when_help_advertises_the_flag(self, mock_run):
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="      --dangerously-bypass-hook-trust\n          Run enabled hooks ...\n",
+            stderr="",
+        )
+        assert self._probe() is True
+
+    @patch("subprocess.run")
+    def test_probe_false_on_older_codex(self, mock_run):
+        """An older codex REJECTS an unknown argument at launch — the F509 class."""
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="      --dangerously-bypass-approvals-and-sandbox\n",
+            stderr="",
+        )
+        assert self._probe() is False
+
+    @patch("subprocess.run", side_effect=OSError("no such binary"))
+    def test_probe_false_when_binary_unavailable(self, mock_run):
+        assert self._probe() is False
+
+    def test_build_command_omits_flag_when_unsupported(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        with patch.object(
+            CodexProvider, "_supports_hook_trust_bypass", staticmethod(lambda: False)
+        ):
+            argv = shlex.split(provider._build_codex_command())
+        assert "--dangerously-bypass-hook-trust" not in argv
