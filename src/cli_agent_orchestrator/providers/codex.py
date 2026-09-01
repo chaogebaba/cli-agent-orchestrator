@@ -655,7 +655,10 @@ CODEX_TUI_READY_FOOTER_RE = re.compile(STARTUP_FOOTER_PATTERN)
 # Bounded wait for readiness before the first paste. Generous because a cold
 # resume that replays a long transcript can take several seconds; the gate is a
 # no-op the instant the footer is present, so a warm/ready pane never waits.
-CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS = 12.0
+# HOTFIX 2026-09-01 (F700 #555): 12.0s was exceeded 3/3 by codex_empirical_reviewer
+# (10 KB position prompt) on codex-cli 0.152.0 after a cold reboot -> composer unreadable
+# -> init death. A ready pane still returns instantly; only a slow one waits longer.
+CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS = 45.0
 # Interval between readiness re-checks (seconds).
 CODEX_DELIVERY_READINESS_POLL_INTERVAL_SECONDS = 0.3
 
