@@ -3553,3 +3553,100 @@ class TestF548InitDialogAndAuth:
                 await provider.initialize()
         assert exc.value.code == "E-CLAUDE-AUTH"
         assert "Not logged in" in str(exc.value)
+
+
+class TestClaudeCodeEffortPrecedence:
+    """F666 (#521): --effort must be emitted at most once, with claudeConfig.effort
+    as an explicit per-agent OVERRIDE that WINS by REPLACING the providers.toml /
+    profile.reasoningEffort value — never by appending a second --effort flag.
+
+    Every assertion is on the COMPOSED argv (shlex.split of the launch command),
+    not on source text, so it actually falsifies the duplicate-append defect.
+    """
+
+    def _build_argv(self, *, profile_effort, config):
+        """Compose the launch argv for a full-CAO-profile claude_code worker.
+
+        profile_effort -> the value resolve_provider_string_option would return
+        for reasoning_effort/reasoningEffort (the providers.toml / profile source).
+        config         -> the profile.claudeConfig dict (or None).
+
+        get_provider_defaults / get_provider_profile_defaults are pinned to {} so
+        the providers.toml layers never leak on-disk state into the arm; the first
+        effort source is supplied deterministically via profile.reasoningEffort.
+        """
+        mock_profile = MagicMock()
+        mock_profile.native_agent = None
+        mock_profile.permissionMode = None
+        mock_profile.name = "claude-effort-arm"
+        mock_profile.model = None
+        mock_profile.reasoningEffort = profile_effort
+        mock_profile.claudeConfig = config
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.inheritUserMcpServers = None
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
+
+        with (
+            _PATCH_SETTINGS,
+            patch.object(
+                ClaudeCodeProvider, "_write_terminal_settings", return_value=Path("/tmp/x.json")
+            ),
+            patch.object(ClaudeCodeProvider, "_apply_skill_prompt", side_effect=lambda p: p),
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.get_provider_defaults",
+                return_value={},
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.get_provider_profile_defaults",
+                return_value={},
+            ),
+        ):
+            command = provider._build_claude_command(profile=mock_profile)
+        return shlex.split(command)
+
+    @staticmethod
+    def _effort_values(argv):
+        """Every value that immediately follows an --effort flag in argv."""
+        return [
+            argv[i + 1] for i, tok in enumerate(argv) if tok == "--effort" and i + 1 < len(argv)
+        ]
+
+    def test_both_sources_set_claudeconfig_wins_single_flag(self):
+        """ARM 1 — both set: exactly ONE --effort, carrying the claudeConfig value."""
+        argv = self._build_argv(profile_effort="low", config={"effort": "high"})
+        assert argv.count("--effort") == 1
+        assert self._effort_values(argv) == ["high"]
+
+    def test_only_profile_source_set_emitted_unchanged(self):
+        """ARM 2 — only providers.toml/profile set: that value, emitted once."""
+        argv = self._build_argv(profile_effort="medium", config=None)
+        assert argv.count("--effort") == 1
+        assert self._effort_values(argv) == ["medium"]
+
+    def test_only_claudeconfig_set_emitted_unchanged(self):
+        """ARM 3 — only claudeConfig set: that value, emitted once."""
+        argv = self._build_argv(profile_effort=None, config={"effort": "high"})
+        assert argv.count("--effort") == 1
+        assert self._effort_values(argv) == ["high"]
+
+    def test_neither_source_set_no_effort_flag(self):
+        """ARM 4 — neither set: no --effort at all."""
+        argv = self._build_argv(profile_effort=None, config=None)
+        assert "--effort" not in argv
+        assert self._effort_values(argv) == []
+
+    def test_both_set_empty_claudeconfig_dict_keeps_profile_value(self):
+        """Guard: an empty claudeConfig dict is not an override; profile value stands, once."""
+        argv = self._build_argv(profile_effort="low", config={})
+        assert argv.count("--effort") == 1
+        assert self._effort_values(argv) == ["low"]
+
+    def test_fallback_model_from_claudeconfig_emitted_once(self):
+        """Neighbour check: --fallback-model has a single source and a single emission
+        (no duplicate-append twin of the --effort defect)."""
+        argv = self._build_argv(profile_effort=None, config={"fallback_model": "claude-fallback-x"})
+        assert argv.count("--fallback-model") == 1
+        idx = argv.index("--fallback-model")
+        assert argv[idx + 1] == "claude-fallback-x"
