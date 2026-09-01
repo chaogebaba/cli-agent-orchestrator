@@ -6,7 +6,10 @@ Blueprint: ``orchestrator/blueprints/f631-terminal-identity-registry.md``
 D10 (the additive migration) and §3's create/reap write ownership, including
 D4's reap half — ``delete_terminal`` returns the resume key.
 
-Arms: AC1, AC2, AC14, AC15, plus D2's CHECK and D4's reap-side return. Every
+Arms: AC1, AC2, AC14, AC15, plus D2's CHECK and D4's reap-side return, plus
+(r2) the two fault-injection arms that hold §3's atomicity guarantee when the
+identity write itself FAILS — the case a swallowed exception hid from M10, which
+can only observe the outer abort path. Every
 assertion runs against the real SQLAlchemy tables / real DB operations, never a
 mocked surface. The ``db_env`` fixture mirrors
 ``test/clients/test_f642_delivery_ledger.py``.
@@ -17,9 +20,10 @@ plane, D9's box lane and D11's persona-home claim re-key.
 """
 
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -186,6 +190,95 @@ def test_ac1_identity_row_is_written_in_the_terminals_transaction(db_env):
     assert get_terminal_identity("lane0003") is None
     with db_env() as db:
         assert db.query(TerminalModel).filter_by(id="lane0003").one_or_none() is None
+
+
+@contextmanager
+def _identity_write_fails(when):
+    """Force the identity row's own write to fail, at flush time.
+
+    A mapper-level listener is the fault injection that matches the claim under
+    test: not "the helper was called in the wrong order" (M10 owns that), but
+    "the identity write itself failed". The exception surfaces from the
+    ``db.flush()`` inside the helper, exactly where a real IntegrityError or
+    OperationalError would.
+    """
+
+    def boom(mapper, connection, target):
+        raise RuntimeError(f"identity_{when}_failed")
+
+    event.listen(TerminalIdentityModel, when, boom)
+    try:
+        yield
+    finally:
+        event.remove(TerminalIdentityModel, when, boom)
+
+
+def test_a_failed_identity_insert_aborts_the_whole_create(db_env):
+    """§3/AC1: registration failure must roll the terminal back, not fail open.
+
+    The guarantee §3 makes is not call ordering — M10 already covers the outer
+    abort path — it is that a laptop-created terminal is NEVER unregistered. A
+    swallowed write failure defeats that without ever reaching the outer path:
+    the transaction is simply never told anything went wrong, and commits one
+    terminals row with zero identity rows.
+    """
+    with _identity_write_fails("before_insert"):
+        with pytest.raises(RuntimeError, match="identity_before_insert_failed"):
+            _make_lane("lane0008")
+
+    with db_env() as db:
+        assert db.query(TerminalModel).filter_by(id="lane0008").one_or_none() is None
+        assert db.query(TerminalIdentityModel).filter_by(terminal_id="lane0008").count() == 0
+    # The forbidden state in full: never one terminals row with no identity row.
+    with db_env() as db:
+        assert (db.query(TerminalModel).count(), db.query(TerminalIdentityModel).count()) == (0, 0)
+
+
+def test_a_failed_identity_retirement_aborts_the_whole_reap(db_env):
+    """D2/D4/§3/AC2: retirement failure must abort the delete, not fail open.
+
+    Failing open here is worse than losing the key: the terminals row is hard
+    deleted while the durable identity stays ``live`` with no ``reaped_at`` — a
+    reaped lane that reads as live — and the caller is handed ``resume_key=None``,
+    which is indistinguishable from a lane that never had a key.
+    """
+    _make_lane()
+
+    with _identity_write_fails("before_update"):
+        with pytest.raises(RuntimeError, match="identity_before_update_failed"):
+            delete_terminal_and_warm_intent("lane0001")
+
+    # The terminal survived: the hard delete was in the aborted transaction.
+    with db_env() as db:
+        assert db.query(TerminalModel).filter_by(id="lane0001").one_or_none() is not None
+    row = get_terminal_identity("lane0001")
+    assert row["lifecycle"] == "live"
+    assert row["reaped_at"] is None
+    # …and the real key was never silently discarded — a second, clean reap
+    # still returns it.
+    assert delete_terminal_and_warm_intent("lane0001")["resume_key"] == "uuid-lane0001"
+
+
+def test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception(db_env):
+    """Negative control for both arms above.
+
+    Removing the catch-alls must not remove the one case the record DOES
+    support: a terminal with no identity row reaps cleanly, returning None. That
+    path is an ``one_or_none()`` early return, so it survives having no handler.
+    """
+    with db_env() as db:
+        db.add(
+            TerminalModel(
+                id="lane0009",
+                tmux_session=SESSION,
+                tmux_window="worker-lane0009",
+                provider="codex",
+            )
+        )
+        db.commit()
+
+    result = delete_terminal_and_warm_intent("lane0009")
+    assert result == {"terminal_deleted": True, "intent_deleted": False, "resume_key": None}
 
 
 def test_nothing_fabricates_a_provider_session_id(db_env):

@@ -3629,34 +3629,41 @@ def _register_terminal_identity(
     Insert-if-absent rather than upsert: the PK already gives
     one-row-per-terminal, and silently flipping an existing ``reaped`` row back
     to ``live`` would resurrect an identity the delete path deliberately
-    retired. Never raises — identity registration must not be able to fail a
-    terminal create.
+    retired.
+
+    **Deliberately unguarded** (r2). An earlier round wrapped this body in a
+    catch-all so identity registration "could not fail a terminal create". That
+    inverted the guarantee: §3's promise is not call ordering, it is that a
+    laptop-created terminal is **never unregistered**, and a swallowed write
+    failure makes exactly that forbidden state a silent success — one committed
+    ``terminals`` row with no identity row. There is no benign failure mode to
+    tolerate here: every exception this body can raise means the row was not
+    written, and the only correct response is to abort the create. The one case
+    that IS tolerated — a terminal that already has an identity row — is control
+    flow (the early return), never an exception.
     """
-    try:
-        exists = (
-            db.query(TerminalIdentityModel.terminal_id).filter_by(terminal_id=terminal_id).first()
+    exists = (
+        db.query(TerminalIdentityModel.terminal_id).filter_by(terminal_id=terminal_id).first()
+    )
+    if exists is not None:
+        return
+    db.add(
+        TerminalIdentityModel(
+            terminal_id=terminal_id,
+            provider=provider,
+            agent_profile=agent_profile,
+            cwd=cwd,
+            session_name=session_name,
+            # D3: nullable at create. Capture is provider-typed and lands in
+            # a later slice; nothing here fabricates an id, so a provider
+            # that persists NULL at spawn (kiro_cli) records NULL.
+            provider_session_id=provider_session_id,
+            base_name=terminal_id,
+            lifecycle="live",
+            created_at=_utcnow(),
         )
-        if exists is not None:
-            return
-        db.add(
-            TerminalIdentityModel(
-                terminal_id=terminal_id,
-                provider=provider,
-                agent_profile=agent_profile,
-                cwd=cwd,
-                session_name=session_name,
-                # D3: nullable at create. Capture is provider-typed and lands in
-                # a later slice; nothing here fabricates an id, so a provider
-                # that persists NULL at spawn (kiro_cli) records NULL.
-                provider_session_id=provider_session_id,
-                base_name=terminal_id,
-                lifecycle="live",
-                created_at=_utcnow(),
-            )
-        )
-        db.flush()
-    except Exception:  # noqa: BLE001 — never fail a terminal create on identity
-        logger.debug("f631_identity_register_failed terminal=%s", terminal_id, exc_info=True)
+    )
+    db.flush()
 
 
 def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[str]:
@@ -3669,18 +3676,23 @@ def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[st
     Returns the resume key (D4: the ``provider_session_id``), or None when the
     lane has no captured provider session or has no identity row at all (a
     pre-registry terminal).
+
+    **Deliberately unguarded** (r2), for the mirror of the reason given on
+    ``_register_terminal_identity``: a swallowed retirement failure hard-deletes
+    the ``terminals`` row while leaving the durable identity ``live`` with no
+    ``reaped_at``, and hands the caller ``resume_key=None`` — a reaped lane that
+    still reads as live, and a missing handle that reads as "this lane never had
+    one". A failure to retire an EXISTING row must abort the delete. The
+    pre-registry no-row case stays supported, and it is control flow (the
+    ``one_or_none()`` early return), not a tolerated exception.
     """
-    try:
-        row = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
-        if row is None:
-            return None
-        row.lifecycle = "reaped"
-        row.reaped_at = _utcnow()
-        db.flush()
-        return cast(Optional[str], row.provider_session_id)
-    except Exception:  # noqa: BLE001 — never fail a reap on identity bookkeeping
-        logger.debug("f631_identity_reap_failed terminal=%s", terminal_id, exc_info=True)
+    row = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
+    if row is None:
         return None
+    row.lifecycle = "reaped"
+    row.reaped_at = _utcnow()
+    db.flush()
+    return cast(Optional[str], row.provider_session_id)
 
 
 def get_terminal_identity(terminal_id: str) -> Optional[Dict[str, Any]]:
