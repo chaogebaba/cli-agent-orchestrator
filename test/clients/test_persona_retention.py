@@ -105,7 +105,13 @@ def test_resolver_finds_retained_home_after_live_manifest_is_gone(
         "provider_home",
         lambda provider: ProviderHome(provider, "production", production),
     )
+    # A RETAINED home outranks the ambient environment — it is the home this
+    # terminal's own codex was launched with. Asserted with the suite's F703
+    # (#558) CODEX_HOME pin still in force, which is the point.
     assert resolve_codex_home("terminal-one") == destination
+    # The two fallback legs are what CODEX_HOME redirects, so drop the pin to
+    # reach production underneath it.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     assert resolve_codex_home(None) == production
     assert resolve_codex_home("unknown-terminal") == production
 

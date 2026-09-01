@@ -442,6 +442,18 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     # tests that don't explicitly set one would route tmux commands to the
     # enclosing CAO session's server instead of the test's isolated server.
     monkeypatch.delenv("CAO_TMUX_SOCKET", raising=False)
+    # F703 (#558): pin the codex home into the test tree, the codex analogue of
+    # the CAO_HOME_DIR / CAO_AGENTS_DIR pins at import (F549 #405). Without it,
+    # persona_context.resolve_codex_home falls back to provider_home("codex"),
+    # i.e. the operator's REAL ~/.codex, for every terminal with no persona plan
+    # — which is every unit test that exercises CodexProvider.launch. The F597
+    # pre-trust writer then appended a [projects."…"] trust table there on each
+    # such test; 52 junk entries built up in the live config on 2026-09-01.
+    # setenv (not delenv): resolve_codex_home consults CODEX_HOME only for that
+    # production fallback, so pinning it redirects exactly the leaking path and
+    # leaves live/retained persona homes resolving as they do in production.
+    # Tests that need their own codex home still set it after fixture setup.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
 
 
 @pytest.fixture(autouse=True)

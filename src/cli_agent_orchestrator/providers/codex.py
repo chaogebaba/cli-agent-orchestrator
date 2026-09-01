@@ -107,6 +107,26 @@ def _pretrust_cwd_in_codex_home(cwd: str, codex_home: Path) -> bool:
     """
     import tomllib
 
+    # F703 (#558): admit only a real, existing, absolute directory. The caller
+    # hands us whatever the backend's get_pane_working_directory returned, and a
+    # test double is not a path: MagicMock implements __fspath__, so a mocked
+    # backend yields the RELATIVE string "MagicMock/<mock name>/<id>", which
+    # os.path.abspath below would happily anchor to the process cwd and this
+    # function would then append a [projects."…"] table for it. That is how 52
+    # junk trust tables landed in the operator's live ~/.codex/config.toml on
+    # 2026-09-01. Refusing a non-directory costs nothing in production — the
+    # pane cwd is always an existing absolute path there — and makes it
+    # impossible for a bad cwd to reach the writer at all.
+    if not isinstance(cwd, (str, os.PathLike)):
+        logger.warning("codex pre-trust: cwd is not a path (%r); not writing", type(cwd).__name__)
+        return False
+    cwd = os.fspath(cwd)
+    if not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        logger.warning(
+            "codex pre-trust: cwd %r is not an existing absolute directory; not writing", cwd
+        )
+        return False
+
     abs_cwd = os.path.abspath(cwd)
     config_path = codex_home / "config.toml"
     try:
