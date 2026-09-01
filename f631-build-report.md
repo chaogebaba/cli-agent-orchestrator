@@ -1,18 +1,26 @@
-# F631 slice 1 — build report (**r2**)
+# F631 slice 1 — build report (**r3**)
 
 **Issue:** #486 (F631). **Authority:** `orchestrator/blueprints/f631-terminal-identity-registry.md`
 (DRAFT r6), read in full before building. **Branch:** `f631-slice1-identity`.
 **Base:** fork `main` @ `5d39ec7f`. **Tip:** this report is the last commit on the
 branch, so the reviewed tip IS the merge ref's tip.
 
-**Lineage:** r1 **GATE-NO**, 2 blockers (report
+**Lineage.** r1 **GATE-NO**, 2 blockers (report
 `/data/cao-scratch/f631-gate-report-r1.md`, sha
 `a468495400f1a55bccd8c9085679005c0a77b8bf1b98bcd93a30f1cd6b35b767`, reviewed tip
-`15b874f9`). Both blockers are accepted as correct and fixed in §0 below. The gate
-also confirmed sound and unchanged here: the M10 atomicity arm, the corrected M4
-rerun, the D1/D2/D10 schema, the slice boundary, the §7 deferral audit, the mypy
-delta, and both team-lead rulings (`readopt_service.py:242` stays out; the three
-unwritten columns are acceptable under D10).
+`15b874f9`) — the two production catch-alls; fixed in §0.1. r2 **GATE-NO**, 2
+blockers (report `/data/cao-scratch/f631-gate-report-r2.md`, sha
+`679dc7e757d048b9bb98ca13328e2dc17ac8a4ff0d80142d5a6a105b696469f0`, reviewed tip
+`a7a59352`) — the r2 arms for those fixes were **false semantic kills**; fixed in
+§0.3. **r3 changes only the two arms. The production diff is byte-identical to the
+one r2 confirmed correct.**
+
+Confirmed by the gate and unchanged here: the production catch-all removal
+(independently checked for a benign reachable exception — none found), the M10
+atomicity arm, M1–M11 as 11/11 valid kills, the D1/D2/D10 schema, the slice
+boundary, the §7 deferral audit, the migrator-swallow disclosure (now empirically
+settled — see §0.4), and both team-lead rulings (`readopt_service.py:242` stays
+out; the three unwritten columns are acceptable under D10).
 
 Commits:
 
@@ -24,10 +32,12 @@ Commits:
 | `b89c5166` | widen the WPM4-a exact-dict delete assertion for resume_key |
 | `3bc008fa` | **r2:** remove both catch-alls; arm the failed identity write |
 | `f9202775` | **r2:** collapse the dedented query to black's line (fmt delta 0) |
+| `5353523b` | **r3:** state-only blocker arms with pre-flush fault injection |
+| `9534a028` | **r3:** hoist the identity-state tuple for black (fmt delta 0) |
 
 ---
 
-## 0. r2 — the two GATE-NO blockers
+## 0. The two GATE-NO rounds
 
 ### 0.1 Decision on the `except` clauses: **removed, not narrowed**
 
@@ -69,26 +79,69 @@ every call instead of running unregistered. That is the correct direction under 
 unregistered fleet is the failure this slice exists to prevent — but it is a behaviour
 change worth a reviewer's eye.
 
-### 0.2 The two new arms are siblings of M10, not replacements
+### 0.2 The blocker arms are siblings of M10, not replacements
 
-M10 is kept **exactly as the gate confirmed it**. It forces `create_terminal` to raise
-between the identity insert and `db.commit()` and asserts both rows are absent — the
-*outer abort* path. A swallowed exception never reaches that path: the transaction is
-never told anything went wrong and commits normally. M10 cannot see it by construction,
-which is why the fix needed its own arms rather than a stronger M10.
+M10 is kept **exactly as both gates confirmed it**. It forces `create_terminal` to
+raise between the identity insert and `db.commit()` and asserts both rows are absent —
+the *outer abort* path. A swallowed exception never reaches that path: the transaction
+is never told anything went wrong and commits normally. M10 cannot see it by
+construction, which is why the fix needed its own arms rather than a stronger M10.
 
-Fault injection is a mapper-level listener on `TerminalIdentityModel`
-(`before_insert` / `before_update`) that raises at flush — the exception surfaces from
-the `db.flush()` **inside the helper**, where a real DB fault would, rather than from a
-monkeypatched call site.
+### 0.3 r3 — why the r2 arms were hollow, and what changed
 
-| New arm | Asserts |
-|---|---|
-| `test_a_failed_identity_insert_aborts_the_whole_create` | the create **raises**, and `(terminals, identities) == (0, 0)` — never the reviewer's `1, 0` |
-| `test_a_failed_identity_retirement_aborts_the_whole_reap` | the reap **raises**; the terminals row **survives**; the identity row is still `live` with `reaped_at is None`; and a subsequent clean reap still returns the real key, so it was never silently discarded |
-| `test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception` | negative control on the removal — the supported no-row case still reaps cleanly to `resume_key: None` |
+The r2 gate is right and the finding is a good one. My r2 injection was a mapper
+`before_insert` / `before_update` listener. Those fire **during `Session.flush()`**,
+which poisons the SQLAlchemy transaction — so with the catch-all restored the swallow
+happened, but the outer `db.commit()` then failed **on its own**, the durable state
+stayed correct, and the arm went red only because the propagating exception class
+changed (`PendingRollbackError` / `InvalidRequestError` instead of my `RuntimeError`).
+The reviewer proved it by broadening the matcher and leaving every state assertion
+intact: `N1_STATE_ONLY_RC=0`, `N2_STATE_ONLY_RC=0`. The forbidden state was never
+reachable under that injection, so no state assertion could have caught it. A red for a
+reason connected to the change is still not a red for the reason claimed.
 
-Focused arms: **23 passed** (was 20; +3).
+Two things changed in r3, and **only the arms changed**:
+
+**(a) The injection is now PRE-FLUSH and pure Python**, so the caller's transaction
+stays healthy and a swallowed failure really does commit the forbidden state:
+
+| Side | r2 injection (poisons the transaction) | r3 injection (leaves it usable) |
+|---|---|---|
+| create | mapper `before_insert` listener raises in `flush()` | the model **constructor** raises while the row is being built — the r1 probe's own fault |
+| reap | mapper `before_update` listener raises in `flush()` | an attribute **`set` event on `lifecycle`** raises during `row.lifecycle = "reaped"` |
+
+**(b) Both arms are STATE-ONLY BY CONSTRUCTION.** Neither makes any assertion about
+which exception propagates, or whether one propagates at all: the call is wrapped in a
+bare `except Exception: pass` and the verdict is read entirely off the database
+afterwards. **There is no exception matcher left to broaden** — the reviewer's
+falsification is not merely survivable, it is inapplicable.
+
+The propagation property is not lost; it is kept in a separate companion test that is
+explicitly documented as **not** a blocker arm, because under the swallow nothing
+propagates and it fails for a non-state reason. §5.0 shows both failing side by side
+under the same mutation, which is the evidence that the two properties are cleanly
+separated.
+
+**One assertion-design note.** On the reap side the identity row reads `live` /
+`reaped_at is None` under BOTH the clean and the swallowed path, so asserting only on
+the identity row would prove nothing. The discriminator is the **terminals** row:
+hard-deleted when the failure is swallowed, alive when it propagates. The arm asserts
+that first.
+
+### 0.4 The migrator swallow — answered, not just flagged
+
+My r2 report flagged that `_migrate_f631_terminal_identity()` still swallows its own
+failure, so a failed migration would now make `create_terminal` fail loudly instead of
+running unregistered. The r2 gate settled it empirically rather than by argument: with
+the migration forced to swallow a real SQLite connect failure and the table absent,
+`create_terminal` raised `OperationalError` and the terminal count stayed 0. So the
+removal converts a missing-table migration failure into fail-closed availability loss,
+never into an unregistered terminal — the correct direction under §3. It remains a
+worthwhile later arm, and the misleading "migration succeeded" startup log is an
+availability/diagnostic follow-up, not a consistency regression.
+
+Focused arms: **24 passed** (r1: 20; r2: 23; r3 adds the companion test).
+
 
 ---
 
@@ -165,10 +218,13 @@ gate reads §3's "terminal create" as covering readopt, that is a one-call addit
 ```
  src/cli_agent_orchestrator/clients/database.py             | 258 ++++++++++-
  src/cli_agent_orchestrator/services/terminal_service.py    |  14 +-
- test/clients/test_f631_terminal_identity.py                | 507 +++++++++++++++++
+ test/clients/test_f631_terminal_identity.py                | 553 +++++++++++++++++
  test/services/test_f631_reap_resume_key.py                 | 205 +++++++++
  test/services/test_wpm4a_deferred_init_hardening.py        |   3 +
- 5 files changed, 980 insertions(+), 7 deletions(-)   (excl. this report)
+ 5 files changed, 1026 insertions(+), 7 deletions(-)  (excl. this report)
+
+r3 touches ONLY `test/clients/test_f631_terminal_identity.py`; the two production
+files are byte-identical to the r2 tip the gate confirmed correct.
 ```
 
 `clients/database.py`
@@ -204,7 +260,7 @@ old two-key contract. D4 widens that contract on purpose; the assertion now incl
 
 | Check | HEAD (`b89c5166`) | BASE (`5d39ec7f`) | Verdict |
 |---|---|---|---|
-| `pytest` new arms (`test_f631_terminal_identity.py` + `test_f631_reap_resume_key.py`) | **23 passed** in 3.02s (r1: 20) | n/a (files are new) | green |
+| `pytest` new arms (`test_f631_terminal_identity.py` + `test_f631_reap_resume_key.py`) | **24 passed** in 2.86s (r1: 20, r2: 23) | n/a (files are new) | green |
 | `mypy --strict` on the two touched source files | **148 errors** | **148 errors** | **delta 0** |
 | `black --check` on the 2 new test files + `terminal_service.py` | clean | clean | green |
 | `black --check src/…/database.py` | would-reformat | would-reformat | **pre-existing**; `black --diff` output is line-for-line identical HEAD vs BASE |
@@ -222,10 +278,13 @@ Two clean runs per side on **grok-box-002**, each preceded by an explicit
 
 | Side | sha | run 1 | run 2 |
 |---|---|---|---|
-| HEAD **r2** | `f9202775` | **9 failed, 7770 passed**, 25 skipped, 3 xfailed | **9 failed, 7770 passed**, 25 skipped, 3 xfailed |
-| BASE | `5d39ec7f` | 10 failed, 7746 passed (the 9 + one base-only flake, `test_recovery_decision_intake…`) | — |
+| HEAD **r3** | `9534a028` | **9 failed, 7771 passed**, 25 skipped, 3 xfailed | **9 failed, 7771 passed**, 25 skipped, 3 xfailed |
+| BASE **r3** | `5d39ec7f` | **9 failed, 7747 passed**, 25 skipped, 3 xfailed | — |
+| HEAD r2 | `f9202775` | 9 failed, 7770 passed | 9 failed, 7770 passed |
 | HEAD r1 | `b89c5166` | 9 failed, 7767 passed | 9 failed, 7767 passed |
-| BASE r1 | `5d39ec7f` | **9 failed, 7747 passed** | 10 failed, 7746 passed (base-only flake, `test_fx191…test_escalation_produces_trace`) |
+
+The r3 legs are the cleanest pair measured on this branch: both sides produced the
+same nine names with no extra flake on either.
 
 The **9-failure set is byte-identical on both sides** — all pre-existing on `main`:
 
@@ -241,14 +300,17 @@ test/services/test_wp_watchdog_delegation.py::test_legacy_inbox_migration_and_nu
 test/services/test_wpdt_delivery_truth.py::TestAC7DoctrineArmingStep::test_doctrine_arming_section_exists
 ```
 
-**Failure delta: 0** (r2 HEAD is strictly below BASE this round; the 9-name set is
-identical). **Passed delta: +23**, exactly this slice's new arms. Removing both
+**Failure delta: 0** — the nine-name set is byte-identical on both sides. **Passed
+delta: +24**, exactly this slice's new arms. Removing both
 catch-alls broke nothing elsewhere: no fixture in `test/clients` or `test/services`
-creates a terminal against a database without the `terminal_identity` table.
+creates a terminal against a database without the `terminal_identity` table. `mypy
+--strict` is 148/148 at the r3 tip, unchanged — r3 touches no production line.
 
-Each round's BASE leg produced its own extra failure under a *different* name
-(`test_fx191…`, then `test_recovery_decision_intake…`), which is the flake population
-speaking, not this slice.
+Earlier rounds' BASE legs each produced their own extra failure under a *different*
+name (`test_fx191…`, `test_recovery_decision_intake…`, and the r2 gate's own BASE run
+hit `test_f55…test_m4_effect_and_real_delete_terminal_are_serialized_by_delivery_lock`).
+That is the flake population speaking, not this slice; the r3 pair happened to land
+clean on both sides.
 
 **BASE run 2's 10th failure** is `test_fx191_convergent_delivery.py::TestAC13TraceEmitCount::test_escalation_produces_trace`
 — on the **base**, with none of my code present. That names the suite's pre-existing
@@ -306,22 +368,55 @@ is no text-presence assertion anywhere in either test file.
 
 **11/11 killed at `f9202775`** (box run `f631-r2-mutants-full`; worktree clean after).
 
-### 5.0 r2 blocker mutations — reintroducing each GATE-NO defect
+### 5.0 Blocker mutations — reintroducing each GATE-NO r1 defect
 
-| # | Mutation | Named arm | pre → mutated → controls → post-revert | Verdict |
-|---|---|---|---|---|
-| N1 | restore the create-side catch-all (blocker 1) | `test_a_failed_identity_insert_aborts_the_whole_create` | 0 → 1 → 0 (4 passed) → 0 | **KILLED** |
-| N2 | restore the reap-side catch-all (blocker 2) | `test_a_failed_identity_retirement_aborts_the_whole_reap` | 0 → 1 → 0 (4 passed) → 0 | **KILLED** |
+**These are the arms r2 got wrong, rebuilt.** The driver no longer accepts a return
+code as a kill: for each mutation it also requires the mutated run to have failed on
+the arm's **named state assertion**, identified by a marker string in the assertion
+message. A red without the marker is reported REVIEW, not KILLED — the r2 gate's
+falsification, mechanised.
 
-**N1's control set deliberately includes M10's arm**
-(`test_ac1_identity_row_is_written_in_the_terminals_transaction`), and it stayed GREEN
-while the new arm went RED. That is the ledger's own proof of the gate's diagnosis: M10
-observes the outer abort path, the swallow bypasses it, and only the new arm sees the
-difference. N1's other controls: AC1's create arm, N2's arm, and the pre-registry
-control. N2's controls: AC2's survival arm, `test_reap_returns_the_resume_key`, N1's
-arm, and the pre-registry control.
+| # | Mutation | Named arm | pre → mutated → controls → post-revert | State marker in the failure | Verdict |
+|---|---|---|---|---|---|
+| N1 | restore the create-side catch-all (r1 blocker 1) | `test_a_failed_identity_insert_aborts_the_whole_create` | 0 → 1 → 0 (4 passed) → 0 | **yes** | **KILLED** |
+| N2 | restore the reap-side catch-all (r1 blocker 2) | `test_a_failed_identity_retirement_aborts_the_whole_reap` | 0 → 1 → 0 (4 passed) → 0 | **yes** | **KILLED** |
 
-**Ledger total: 13/13 killed.**
+The actual failing assertions under mutation — the kill is a durable-state difference,
+and N1's is the r1 probe's `1, 0` verbatim:
+
+```text
+N1  E  AssertionError: F631-N1-STATE: terminals,identities = (1, 0), want (0, 0)
+N2  E  AssertionError: F631-N2-STATE: the terminals row was hard-deleted despite a failed retirement
+```
+
+**Self-falsification, run before reporting** (box run `f631-r3-regress2`). Under the
+same restored create-side catch-all, the blocker arm and the companion propagation test
+fail for demonstrably different reasons:
+
+```text
+[BLOCKER ARM] rc=1
+    E  AssertionError: F631-N1-STATE: terminals,identities = (1, 0), want (0, 0)
+    E  assert (1, 0) == (0, 0)
+[COMPANION]   rc=1
+    E  Failed: DID NOT RAISE <class 'Exception'>
+```
+
+That asymmetry is the point. The blocker arm dies on state; the companion dies on a
+non-state property, which is exactly why it is documented as not being one of the two
+arms. There is no matcher on the blocker arms to broaden — the r2 falsification cannot
+be applied to them.
+
+N1's control set still includes **M10's arm**
+(`test_ac1_identity_row_is_written_in_the_terminals_transaction`) and it stays green.
+In r2 I described that as "the ledger's own proof" of the swallowed-error diagnosis;
+the r2 gate correctly rejected that reading, since N1 was not observing the property at
+all. **Now it observes it**, so the control means what I claimed then: M10 stays green
+on a state difference it structurally cannot see. N1's other controls: AC1's create
+arm, N2's arm, and the pre-registry control. N2's controls: AC2's survival arm,
+`test_reap_returns_the_resume_key`, N1's arm, and the pre-registry control.
+
+**Ledger total: 13/13 killed** — 11 replayed valid at the r3 tip, plus these two, now
+state-verified.
 
 Negative controls per mutation (each stayed GREEN while the named arm was RED):
 
@@ -401,6 +496,10 @@ touched (frozen; the wrapper refuses it anyway). No laptop pytest/mypy/black/bui
 | `f631-r2-mutants` | grok-box-004 | N1/N2 blocker mutations (2/2 killed) + black A/B |
 | `f631-r2-mutants-full` | grok-box-010 | re-anchored M1–M11 re-run at the r2 tip (11/11) |
 | `f631-r2-regress` | grok-box-010 | r2 full A/B ×2 HEAD + BASE, plus mypy A/B |
+| `f631-r3-mutants` | grok-box-004 | r3 N1/N2 with state-marker verification (2/2) |
+| `f631-r3-fmt` | grok-box-004 | black diff for the rewritten arms |
+| `f631-r3-verify` | grok-box-004 | fmt + focused (**24**) + N1/N2 + M1–M11 replay (11/11) |
+| `f631-r3-regress2` | grok-box-004 | self-falsification + full A/B ×2 HEAD + BASE + mypy A/B |
 | `f631-s1-triage` / `f631-s1-triage2` | grok-box-010 | isolating the head-only failures |
 
 - Raw ssh: none.
@@ -415,16 +514,19 @@ touched (frozen; the wrapper refuses it anyway). No laptop pytest/mypy/black/bui
 
 ## 7. What a reviewer should look at hardest
 
-1. **The migrator still swallows its own failure** (§0.1, last paragraph). Both helper
-   catch-alls are gone, so a failed `_migrate_f631_terminal_identity()` would now turn
-   every `create_terminal` into a hard failure rather than a silently unregistered
-   fleet. I believe that is the right direction under §3, but it is the one remaining
-   place where a swallowed error still decides behaviour, and it is unarmed.
-2. **The `readopt_service` seam** (§2, last paragraph) — a judgement call I made
-   explicitly rather than silently.
-3. **`create_terminal_with_warm_intent` writes `provider_session_id=None`** because that
+1. **The blocker arms' fault-injection points** (§0.3). The whole r2 round turned on
+   *where* the fault is raised, not what it is: flush-time injection is unfalsifiable
+   here, pre-flush injection is the only kind under which the forbidden state is
+   reachable. If either injection is ever changed, the arms must be re-falsified — a
+   green arm is no evidence that the state it names is still observable.
+2. **The migrator still swallows its own failure** — now empirically settled as
+   fail-closed (§0.4) rather than argued, but still the one place where a swallowed
+   error decides behaviour, and still unarmed. A later slice should arm it.
+3. **The `readopt_service` seam** (§2, last paragraph) — a judgement call I made
+   explicitly rather than silently, and one the team lead has since ruled on.
+4. **`create_terminal_with_warm_intent` writes `provider_session_id=None`** because that
    writer never receives one. If the warm-fork path can supply a uuid at create, D3's
    capture slice is where it belongs, not here.
-4. **The widened `delete_terminal_and_warm_intent` contract.** One pre-existing test
+5. **The widened `delete_terminal_and_warm_intent` contract.** One pre-existing test
    pinned the exact dict; I widened the assertion rather than the reverse. Any other
    caller doing exact-equality on that result would be a latent break — I found none.
