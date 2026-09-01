@@ -354,6 +354,8 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            terminal_id=None,
+            is_box_hosted=False,
         )
 
     def test_create_session_passes_explicit_kiro_engine(self, client):
