@@ -104,6 +104,11 @@ otel = [
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
+# F702 (#557) D1/B10: the Textual fleet TUI (`cao-fleet`). Optional so a
+# server-only install carries no TUI library.
+fleet = [
+    "textual>=8,<9",
+]
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
