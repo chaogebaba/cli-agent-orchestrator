@@ -274,9 +274,12 @@ def test_atomic_delete_preserves_keep_bases_intent(isolated_db):
         parent_base_name="base",
         fork_mode="fork",
     )
+    # F631 D4 widened this result with `resume_key` — the reaped lane's
+    # provider_session_id, None for a lane whose provider minted none.
     assert db.delete_terminal_and_warm_intent("worker", preserve_warm_intent=True) == {
         "terminal_deleted": True,
         "intent_deleted": False,
+        "resume_key": None,
     }
     with sessions() as session:
         assert session.query(db.TerminalModel).count() == 0
