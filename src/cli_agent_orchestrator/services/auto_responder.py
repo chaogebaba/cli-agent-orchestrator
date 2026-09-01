@@ -124,12 +124,14 @@ SEED_RULES: Dict[str, str] = {
   answer: wait                              # human-gated: never auto-spend usage-limit resets
 - name: codex-trust-dir
   enabled: true
+  modality: hard   # F700 #555: trust-class modal - a coexisting spinner must not veto it
   match_mode: contains
   question: "Do you trust the contents of this directory?"
   options: ["Yes, continue", "No, quit"]
   answer: ["Enter"]
 - name: codex-trust-dir-subdir
   enabled: true
+  modality: hard   # F700 #555: trust-class modal - a coexisting spinner must not veto it
   match_mode: contains
   question: "subdirectory of a Git project. Trusting will apply to the repository root"
   options: ["Press enter to continue"]
@@ -381,6 +383,13 @@ class Rule:
     question: str
     options: List[str]
     answer: Any  # list[str] of tmux special-key names, or the literal "wait"
+    # F700 #555: match modality. "soft" (default) = today's behaviour, the match
+    # is subject to the busy veto. "hard" = the rule asserts that its own match
+    # PROVES the CLI is input-blocked, so a concurrently-rendered "working"
+    # spinner must not demote it (codex hooks-trust modal, trust-directory
+    # cards). A hard rule bypasses ``_busy_veto`` on the fire path; every other
+    # gate (settle, composite corroboration, consume digest, retry) is unchanged.
+    modality: str = "soft"
     # F597 #454: canonical match forms, computed in __post_init__ (not init args).
     _canon_question: str = field(init=False, repr=False, compare=False, default="")
     _canon_options: tuple[str, ...] = field(init=False, repr=False, compare=False, default=())
@@ -415,6 +424,22 @@ class Rule:
             self._canon_question = canonicalize(self.question)
             self._regex = None
         self._canon_options = tuple(canonicalize(opt) for opt in self.options)
+        # F700 #555: validate modality here so BOTH the YAML loader and direct
+        # construction land on a known value; an unknown value degrades to the
+        # safe default ("soft" = vetoable) rather than silently arming a bypass.
+        if self.modality not in ("hard", "soft"):
+            logger.warning(
+                "auto-responder: rule %r has unknown modality %r; using 'soft'",
+                self.name,
+                self.modality,
+            )
+            self.modality = "soft"
+
+    @property
+    def is_hard(self) -> bool:
+        """F700 #555: True when a match asserts input-blocked regardless of the
+        provider's single-axis screen status (i.e. bypasses the busy veto)."""
+        return self.modality == "hard"
 
     @property
     def is_wait(self) -> bool:
@@ -539,6 +564,7 @@ class _RuleStore:
                         question=item["question"],
                         options=list(item.get("options", []) or []),
                         answer=item.get("answer", "wait"),
+                        modality=item.get("modality", "soft"),
                     )
                 )
             except (KeyError, TypeError):
@@ -935,7 +961,19 @@ class AutoResponder:
                 # D4: a human-gated wait rule holds the terminal; re-arm a tick.
                 self._request_detection_retry(terminal_id)
                 return TerminalStatus.WAITING_USER_ANSWER
-            if self._busy_veto(supplied_status):
+            if rule.is_hard:
+                # F700 #555: a hard rule's match IS the input-blocked evidence;
+                # the busy veto does not apply and the veto streak is not counted
+                # for it. Record whether the veto WOULD have suppressed it so the
+                # bypass is auditable in the decision log.
+                self._log_decision(
+                    terminal_id,
+                    "matched",
+                    "modality_hard",
+                    rule.name,
+                    extra=f"modality=hard busy_bypassed={self._busy_veto(supplied_status)}",
+                )
+            elif self._busy_veto(supplied_status):
                 self._log_decision(terminal_id, "no_match", "busy_veto", rule.name)
                 # D4: a busy-veto on a MATCHED rule is a vetoed eval — request a
                 # retry (r3-B4). D6: it also counts toward the veto streak.
@@ -1713,7 +1751,9 @@ class AutoResponder:
             # viewport catches up to the composite.
             self._request_detection_retry(terminal_id)
             return False
-        if self._busy_veto(status):
+        if not rule.is_hard and self._busy_veto(status):
+            # F700 #555: soft rules only. A hard rule is not demoted by a
+            # concurrently-rendered spinner (see ``Rule.modality``).
             self._request_detection_retry(terminal_id)
             return False
         # D2(i) settle (r2-B3/r5-B1): normalized-domain digest match on the
