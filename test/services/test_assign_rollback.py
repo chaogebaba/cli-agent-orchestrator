@@ -248,3 +248,92 @@ class TestAssignAuthorityFilesRollback:
             assert len(pins) == 3
             assert all(p.frozen is True for p in pins)
             assert all(p.version == 1 for p in pins)
+
+
+class TestFrozenPinVersionCollision:
+    """F641 (#496): register_frozen_pins must not hard-code version=1.
+
+    ``UniqueConstraint(task_key, file_path, version)`` (database.py:847-852) makes
+    a literal version collide with any pin already occupying version 1 for the
+    same pair — the ordinary case being an advisory pin registered earlier
+    through ``pin_authority``.
+    """
+
+    def test_advisory_pin_on_same_path_does_not_collide(self, rollback_db, tmp_path):
+        blueprint = tmp_path / "blueprint.md"
+        blueprint.write_text("# Design doc")
+        sha = _sha(blueprint)
+
+        # An advisory (non-frozen) pin already occupies version 1 for this pair.
+        with rollback_db.begin() as db:
+            db.add(TerminalModel(
+                id="12ab34cd",
+                tmux_session="cao-test",
+                tmux_window="reviewer3",
+                provider="kiro_cli",
+                agent_profile="kiro_reviewer",
+                caller_id="aaaaaaaa",
+                lifecycle_generation=1,
+            ))
+            db.add(AuthorityPinModel(
+                task_key="12ab34cd",
+                file_path=str(blueprint),
+                sha256=sha,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=False,
+            ))
+
+        with rollback_db.begin() as db:
+            results = register_frozen_pins(
+                db,
+                task_key="12ab34cd",
+                authority_files=[{"file_path": str(blueprint), "sha256": sha}],
+                registered_by="aaaaaaaa",
+            )
+            assert results[0]["version"] == 2
+
+        with rollback_db() as db:
+            pins = (
+                db.query(AuthorityPinModel)
+                .filter_by(task_key="12ab34cd", file_path=str(blueprint))
+                .order_by(AuthorityPinModel.version)
+                .all()
+            )
+            assert [p.version for p in pins] == [1, 2]
+            assert [p.frozen for p in pins] == [False, True]
+
+    def test_continues_an_existing_chain_rather_than_restarting_it(self, rollback_db, tmp_path):
+        """A multi-version advisory chain is continued, not collided with."""
+        blueprint = tmp_path / "chain.md"
+        blueprint.write_text("# Chain")
+        sha = _sha(blueprint)
+
+        with rollback_db.begin() as db:
+            db.add(TerminalModel(
+                id="56ef78ab",
+                tmux_session="cao-test",
+                tmux_window="reviewer4",
+                provider="kiro_cli",
+                agent_profile="kiro_reviewer",
+                caller_id="aaaaaaaa",
+                lifecycle_generation=1,
+            ))
+            for version in (1, 2, 3):
+                db.add(AuthorityPinModel(
+                    task_key="56ef78ab",
+                    file_path=str(blueprint),
+                    sha256=sha,
+                    version=version,
+                    registered_by="aaaaaaaa",
+                    frozen=False,
+                ))
+
+        with rollback_db.begin() as db:
+            results = register_frozen_pins(
+                db,
+                task_key="56ef78ab",
+                authority_files=[{"file_path": str(blueprint), "sha256": sha}],
+                registered_by="aaaaaaaa",
+            )
+            assert results[0]["version"] == 4
