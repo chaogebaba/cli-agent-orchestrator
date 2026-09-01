@@ -316,6 +316,11 @@ class MiniMaxCodeProvider(BaseProvider):
         for server in servers.values():
             if server["type"] == "stdio":
                 server["env"]["CAO_TERMINAL_ID"] = self.terminal_id
+                # F332: callbacks authenticate with the terminal token, so it travels
+                # with the id whenever this process has one to hand on.
+                token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+                if token:
+                    server["env"]["CAO_TERMINAL_TOKEN"] = token
 
         manifest = {
             "schemaVersion": 1,

@@ -41,7 +41,9 @@ PROVIDER_CLASSES = {
     ProviderType.HERMES.value: HermesProvider,
     ProviderType.CURSOR_CLI.value: CursorCliProvider,
     ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+    ProviderType.OMP.value: OmpProvider,
     ProviderType.CLINE_CLI.value: ClineCliProvider,
+    ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
     ProviderType.MOCK_CLI.value: MockCliProvider,
 }
 
