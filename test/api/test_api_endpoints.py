@@ -361,6 +361,87 @@ class TestCreateSession:
             is_box_hosted=False,
         )
 
+    def test_memory_manager_sidecar_carries_caller_id(self, client):
+        """F670 (#525): the sidecar is a worker, so it must name its caller.
+
+        ``caller_id`` is the flag that arms the F620 laptop shim at all
+        (terminal_service.py:2346-2372 — "a worker is an existing-session create
+        with a caller_id"). Spawned without one the sidecar was silently exempt
+        from the shim every other worker in the same session gets.
+        """
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal",
+                new=AsyncMock(return_value=mock_terminal),
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "memory_manager": "true",
+                },
+            )
+
+        assert response.status_code == 201
+        mock_create.assert_called_once()
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["agent_profile"] == "memory_manager"
+        # The session's initial (supervisor) terminal is what the sidecar is
+        # spawned on behalf of.
+        assert kwargs["caller_id"] == "abcd1234"
+        # F634 D16 rides along: the sidecar shares the session's host.
+        assert kwargs["is_box_hosted"] is False
+
+    def test_memory_manager_sidecar_inherits_box_hosted(self, client):
+        """A box-hosted session's sidecar must stay unshimmed (F634 D16)."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="cao-test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal",
+                new=AsyncMock(return_value=mock_terminal),
+            ) as mock_create,
+        ):
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "memory_manager": "true",
+                    "is_box_hosted": "true",
+                },
+            )
+
+        assert mock_create.call_args.kwargs["is_box_hosted"] is True
+
     def test_create_session_passes_explicit_kiro_engine(self, client):
         """An explicit engine reaches the session service and the response."""
         mock_terminal = Terminal(
