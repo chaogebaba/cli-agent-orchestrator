@@ -218,7 +218,52 @@ async def test_arm2b_missing_source_terminal_row_no_shim(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Resolver unit: _recovered_caller_id maps source_terminal_id -> its caller_id.
+# ARM 3 — MALFORMED source metadata must DEGRADE, never abort recovery.
+#
+# The resolver runs before create_terminal and outside its try/except, so a
+# raise here aborts the whole row (the base is not recovered at all) instead of
+# falling back to the safe non-worker default. A truthy non-string caller_id is
+# equally unacceptable: it is handed straight to create_terminal despite the
+# declared ``str | None`` contract, so the shim guard fires on a value the rest
+# of the stack cannot use.
+# ---------------------------------------------------------------------------
+
+# id -> the object get_terminal_metadata is made to return.
+_MALFORMED_METADATA = {
+    "non_mapping_string": "src-term",
+    "non_mapping_list": ["caller_id"],
+    "non_mapping_int": 7,
+    "empty_mapping": {},
+    "caller_id_int": {"caller_id": 123},
+    "caller_id_list": {"caller_id": []},
+    "caller_id_empty_string": {"caller_id": ""},
+    "caller_id_absent": {"wrong_key": "x"},
+    "caller_id_none": {"caller_id": None},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_MALFORMED_METADATA))
+async def test_arm3_malformed_source_metadata_degrades_to_no_shim(monkeypatch, tmp_path, shape):
+    repo = _fake_offload_repo(tmp_path)
+    captured: dict = {}
+    row = _install_recovery_stubs(
+        monkeypatch, source_caller_id=None, repo_cwd=str(repo), captured=captured
+    )
+    metadata = _MALFORMED_METADATA[shape]
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata)
+
+    # Must NOT raise: recovery completes on the safe non-worker default.
+    result, _source = await service._recover_row(row, "cao-s")
+
+    assert result["status"] == "resumed"
+    assert captured["caller_id"] is None
+    assert "PATH" not in captured["extra_env"]
+
+
+# ---------------------------------------------------------------------------
+# Resolver unit: _recovered_caller_id maps source_terminal_id -> its caller_id,
+# and degrades to None for every absent/malformed shape.
 # ---------------------------------------------------------------------------
 
 
@@ -232,5 +277,23 @@ def test_recovered_caller_id_resolution(monkeypatch):
     # No source terminal id -> None (no metadata lookup needed).
     assert service._recovered_caller_id({"source_terminal_id": None}) is None
     assert service._recovered_caller_id({}) is None
-    # Source id present but row gone -> None.
+    # Source id present but row gone (deleted terminal) -> None.
     assert service._recovered_caller_id({"source_terminal_id": "ghost"}) is None
+
+
+@pytest.mark.parametrize("shape", sorted(_MALFORMED_METADATA))
+def test_recovered_caller_id_returns_none_for_malformed_metadata(monkeypatch, shape):
+    metadata = _MALFORMED_METADATA[shape]
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata)
+
+    resolved = service._recovered_caller_id({"source_terminal_id": "src"})
+
+    # Never raises, and never yields a non-string: exactly None.
+    assert resolved is None
+
+
+def test_recovered_caller_id_returns_the_string_for_a_valid_worker(monkeypatch):
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: {"caller_id": "sup-2"})
+    resolved = service._recovered_caller_id({"source_terminal_id": "src"})
+    assert resolved == "sup-2"
+    assert isinstance(resolved, str)

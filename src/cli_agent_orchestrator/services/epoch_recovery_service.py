@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -38,7 +40,7 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
     return resolved
 
 
-def _recovered_caller_id(row) -> str | None:
+def _recovered_caller_id(row: Mapping[str, Any]) -> str | None:
     """Resolve the ``caller_id`` the recovered lane must be (re-)created with.
 
     F663 (#518): the F620 laptop-shim block in ``terminal_service.create_terminal``
@@ -57,14 +59,23 @@ def _recovered_caller_id(row) -> str | None:
     had no source terminal), there is no worker identity to inherit and this
     resolves to ``None`` — exactly the non-worker default, no shim where none
     belongs.
+
+    Fail-safe by construction: recovery must never be aborted by corrupt
+    metadata, and ``create_terminal`` must never be handed a non-string
+    ``caller_id``. Anything that is not a mapping carrying a non-empty string
+    ``caller_id`` degrades to ``None`` (non-worker, no shim) instead of raising
+    or leaking a wrong-typed value.
     """
     source_terminal_id = row.get("source_terminal_id")
     if not source_terminal_id:
         return None
     metadata = get_terminal_metadata(source_terminal_id)
-    if not metadata:
+    if not isinstance(metadata, Mapping):
         return None
-    return metadata.get("caller_id")
+    caller_id = metadata.get("caller_id")
+    if isinstance(caller_id, str) and caller_id:
+        return caller_id
+    return None
 
 
 def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
