@@ -312,6 +312,15 @@ def test_broken_logger_does_not_break_write(
 # counting content reads of the inbox path that occur WHILE the writer's
 # lockfile is held, and asserting the count never exceeds the uninstrumented
 # baseline of a single read-modify-write read.
+#
+# Gate r2 finding 2: the r1 Mutation-A shape is guarded by
+# ``if _inbox_race_logger.isEnabledFor(logging.DEBUG): inbox_path.read_bytes()``
+# — i.e. the forbidden read only executes when the dedicated logger is at DEBUG.
+# A guard test that runs the writer at the default level therefore never
+# exercises the mutated path and stays green. So EACH guard test below FORCES
+# ``cao.inbox_race`` to DEBUG (via caplog.at_level) around the writer call, so
+# the forbidden read runs in an ordinary pytest invocation with no external env
+# (no --log-cli-level, no CAO env var). ``_force_race_debug`` centralizes this.
 
 
 class _InLockReadCounter:
@@ -352,63 +361,79 @@ class _InLockReadCounter:
             self.in_lock_reads += 1
 
 
+def _force_race_debug(caplog: pytest.LogCaptureFixture) -> Any:
+    """Context manager that forces the ``cao.inbox_race`` logger to DEBUG.
+
+    Any instrumentation path gated on ``_inbox_race_logger.isEnabledFor(DEBUG)``
+    — including a DEBUG-gated forbidden in-lock read (the r1 Mutation-A shape) —
+    then executes inside an ordinary pytest run, so the counter below actually
+    observes it. No external env (``--log-cli-level``, CAO vars) is required.
+    """
+    return caplog.at_level(logging.DEBUG, logger=_RACE_LOGGER)
+
+
 def test_append_no_extra_in_lock_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Native append performs no in-lock content read on a fresh file.
 
     A brand-new file skips the read entirely (baseline 0). Mutation A would add
-    an in-lock read and trip this guard.
+    an in-lock read and trip this guard. DEBUG is forced so a DEBUG-gated
+    mutation executes here.
     """
     inbox = tmp_path / "team-lead.json"
     counter = _InLockReadCounter(monkeypatch, inbox)
 
-    result = write_supervisor_callback_notification(
-        inbox_path=inbox, mailbox_id=MAILBOX_ID, message=_msg(7)
-    )
+    with _force_race_debug(caplog):
+        result = write_supervisor_callback_notification(
+            inbox_path=inbox, mailbox_id=MAILBOX_ID, message=_msg(7)
+        )
     assert result.kind == "written"
     assert counter.in_lock_reads == 0
 
 
 def test_append_existing_file_single_in_lock_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Native append over an existing file reads its contents exactly once in-lock."""
     inbox = tmp_path / "team-lead.json"
     inbox.write_text(json.dumps([_make_cao_entry(MAILBOX_ID, 1)], indent=2), encoding="utf-8")
     counter = _InLockReadCounter(monkeypatch, inbox)
 
-    result = write_supervisor_callback_notification(
-        inbox_path=inbox, mailbox_id=MAILBOX_ID, message=_msg(7)
-    )
+    with _force_race_debug(caplog):
+        result = write_supervisor_callback_notification(
+            inbox_path=inbox, mailbox_id=MAILBOX_ID, message=_msg(7)
+        )
     assert result.kind == "written"
     assert counter.in_lock_reads == 1
 
 
 def test_legacy_append_single_in_lock_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     inbox = tmp_path / "team-lead.json"
     inbox.write_text(json.dumps([_make_cao_entry(MAILBOX_ID, 1)], indent=2), encoding="utf-8")
     counter = _InLockReadCounter(monkeypatch, inbox)
 
     entry = _build_entry("worker-x", "hi", 1, mailbox_id=MAILBOX_ID, first_row_id=42)
-    ok = _write_inbox_entry(inbox, entry)
+    with _force_race_debug(caplog):
+        ok = _write_inbox_entry(inbox, entry)
     assert ok is True
     assert counter.in_lock_reads == 1
 
 
 def test_scrub_single_in_lock_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The scrub path (Mutation A's target) reads the inbox exactly once in-lock."""
     inbox = tmp_path / "team-lead.json"
     inbox.write_text(json.dumps([_make_cao_entry(MAILBOX_ID, 100)], indent=2), encoding="utf-8")
     counter = _InLockReadCounter(monkeypatch, inbox)
 
-    marked = mark_cc_inbox_entries_read(
-        inbox_path=inbox, mailbox_id=MAILBOX_ID, acked_row_ids=[100]
-    )
+    with _force_race_debug(caplog):
+        marked = mark_cc_inbox_entries_read(
+            inbox_path=inbox, mailbox_id=MAILBOX_ID, acked_row_ids=[100]
+        )
     assert marked == 1
     # Baseline is exactly one read-modify-write read; Mutation A made it two.
     assert counter.in_lock_reads == 1

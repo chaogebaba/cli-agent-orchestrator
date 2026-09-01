@@ -93,27 +93,39 @@ def _emit_inbox_mutation(
     msg_ids_removed: List[str],
     size_before: Optional[int],
     mtime_before: Optional[float],
-    data: Optional[bytes],
+    data: "bytes | str | None",
     outcome: str,
 ) -> None:
     """Emit one structured DEBUG line describing a team-inbox mutation (F656).
 
     MUST be called AFTER the writer has released its lockfile. Everything that
-    could touch the filesystem or fail (the "after" stat, the sha256 of the
-    already-in-memory ``data`` bytes, and the logger call) happens here, inside
-    one best-effort ``try``. A failure of any of them can therefore never affect
-    the write's success return or widen the lock window — the lock is already
-    gone by the time this runs.
+    could touch the filesystem, allocate, or fail — the "after" stat, the UTF-8
+    ENCODE of a ``str`` payload, the sha256, and the logger call — happens here,
+    inside one best-effort ``try``. A failure of any of them can therefore never
+    affect the write's success return or widen the lock window; the lock is
+    already gone by the time this runs.
+
+    ``data`` accepts whatever the writer already holds with NO in-lock cost:
+    the native/scrub writers pass a REFERENCE to the exact ``bytes`` object they
+    wrote (no copy); the legacy writer passes a REFERENCE to its ``str`` payload
+    and the O(n) ``encode`` is deferred to here (gate r2 finding 1 — the encode
+    must not run while the lock is held).
 
     DEBUG-gated: when the dedicated ``cao.inbox_race`` logger is not enabled for
-    DEBUG, this returns before performing the "after" stat or the hash, so an
-    instrumentation-off process pays only a cheap ``isEnabledFor`` check here.
+    DEBUG, this returns before performing the "after" stat, the encode, or the
+    hash, so an instrumentation-off process pays only a cheap ``isEnabledFor``
+    check here and no allocation.
     """
     try:
         if not _inbox_race_logger.isEnabledFor(logging.DEBUG):
             return
         size_after, mtime_after = _stat_size_mtime(inbox_path)
-        content_hash = hashlib.sha256(data).hexdigest() if data is not None else None
+        if data is None:
+            content_hash = None
+        else:
+            # Deferred encode (post-release): the legacy writer hands us a str.
+            data_bytes = data.encode("utf-8") if isinstance(data, str) else data
+            content_hash = hashlib.sha256(data_bytes).hexdigest()
         _inbox_race_logger.debug(
             "f656_inbox_mutation op=%s outcome=%s pid=%d mono_ns=%d path=%s "
             "entries_before=%d entries_after=%d added=%s removed=%s "
@@ -604,7 +616,7 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
     if fd is None:
         logger.warning(f"teammate_push: failed to acquire lock {lock_path} after retries")
         return False
-    emit_data: Optional[bytes] = None
+    emit_data: "bytes | str | None" = None
     entries_before = 0
     entry_msg_id = entry.get("msg_id")
     result = False
@@ -641,8 +653,10 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
             except OSError:
                 pass
             return False
-        # F656: keep only a reference to the written bytes; emit post-release.
-        emit_data = payload.encode("utf-8")
+        # F656: keep only a REFERENCE to the str payload we already built; the
+        # O(n) UTF-8 encode + hash is deferred to _emit_inbox_mutation, after
+        # the lock is released (gate r2 finding 1).
+        emit_data = payload
         result = True
     finally:
         _release_lockfile(fd, lock_path)
