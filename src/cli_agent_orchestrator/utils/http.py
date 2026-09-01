@@ -60,6 +60,63 @@ def instance_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
     return result
 
 
+# ── F689 (#544): Production API fence ─────────────────────────────────────────
+# F334 (#190) fenced DIRECT IN-PROCESS DB ACCESS: clients/database.py refuses to
+# bind the real DATABASE_FILE when PYTEST_CURRENT_TEST is set. That fence has a
+# hole on the other axis — a test that talks HTTP to the live server on :9889
+# never touches the fenced code path. That hole is how fixture id ``abcd1234``
+# reached the RUNNING production instance 48x in one burst (cao_2026-09-01
+# 04-28-22.log), interleaved with live status_monitor traffic for the real
+# supervisor seat.
+#
+# This is the symmetric fence, on the single choke point every product HTTP call
+# goes through (constants.API_BASE_URL is a downstream-test fixture only; product
+# code resolves at call time via cao_http). It fires ONLY when all of:
+#   1. PYTEST_CURRENT_TEST is set (pytest injects it automatically), AND
+#   2. the callable about to run IS the genuine ``requests`` verb captured at
+#      import — identity, not a heuristic. Any test that injects its own
+#      transport or patches the verb (with a mock OR a plain stub function)
+#      fails that identity check and is deliberately untouched, because nothing
+#      it does can put a packet on the wire, AND
+#   3. the resolved origin is loopback:9889, the production endpoint.
+# Override with CAO_ALLOW_PROD_API_IN_TESTS=1, mirroring
+# CAO_ALLOW_PROD_DB_IN_TESTS (contract tests only).
+_ALLOW_PROD_API_ENV = "CAO_ALLOW_PROD_API_IN_TESTS"
+
+# The genuine requests verbs, bound once at import — before any test can patch
+# them. Identity against these is what separates "a real socket is about to
+# open" from "this call is stubbed".
+_LIVE_SENDERS = {
+    verb: getattr(requests, verb) for verb in ("request", "get", "post", "put", "patch", "delete")
+}
+
+
+def _sender_is_live(transport: Any, verb: str, sender: Any) -> bool:
+    """True only when ``sender`` is the unpatched ``requests`` verb itself."""
+    if transport is not requests:
+        return False  # caller injected its own transport
+    return sender is _LIVE_SENDERS.get(verb)
+
+
+def _fence_production_api(url: str, verb: str, transport: Any, sender: Any) -> None:
+    """Raise if a test process is about to send a real request to production."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return  # not in a test — no fence
+    if os.environ.get(_ALLOW_PROD_API_ENV) == "1":
+        return  # explicit override — operator knows what they're doing
+    if not _sender_is_live(transport, verb, sender):
+        return  # stubbed: nothing leaves the process
+    parsed = urlsplit(url)
+    if parsed.port != _PRODUCTION_PORT or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return
+    raise EndpointConfigurationError(
+        f"F689 FENCE: test process attempted a live request to the PRODUCTION "
+        f"CAO server at {url}. Point the test at a fixture server (the "
+        f"``cao_server`` fixture sets CAO_ENDPOINT to a free port), or set "
+        f"{_ALLOW_PROD_API_ENV}=1 to override (contract tests only)."
+    )
+
+
 class CAOHttpClient:
     """Small requests-compatible facade bound to :func:`resolve_endpoint`."""
 
@@ -78,10 +135,19 @@ class CAOHttpClient:
             )
         return f"{selected}{path}"
 
-    def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+    def _prepare(self, verb: str, path: str, kwargs: dict[str, Any]) -> tuple[Any, str]:
+        """Bind headers, resolve the URL, and apply the F689 production fence."""
         base_url = kwargs.pop("base_url", None)
         self._bind_headers(kwargs)
-        return self._transport().request(method, self._url(path, base_url), **kwargs)
+        transport = self._transport()
+        url = self._url(path, base_url)
+        sender = getattr(transport, verb)
+        _fence_production_api(url, verb, transport, sender)
+        return sender, url
+
+    def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        sender, url = self._prepare("request", path, kwargs)
+        return sender(method, url, **kwargs)
 
     @staticmethod
     def _bind_headers(kwargs: dict[str, Any]) -> None:
@@ -96,29 +162,24 @@ class CAOHttpClient:
             kwargs.pop("headers", None)
 
     def get(self, path: str, **kwargs: Any) -> requests.Response:
-        base_url = kwargs.pop("base_url", None)
-        self._bind_headers(kwargs)
-        return self._transport().get(self._url(path, base_url), **kwargs)
+        sender, url = self._prepare("get", path, kwargs)
+        return sender(url, **kwargs)
 
     def post(self, path: str, **kwargs: Any) -> requests.Response:
-        base_url = kwargs.pop("base_url", None)
-        self._bind_headers(kwargs)
-        return self._transport().post(self._url(path, base_url), **kwargs)
+        sender, url = self._prepare("post", path, kwargs)
+        return sender(url, **kwargs)
 
     def put(self, path: str, **kwargs: Any) -> requests.Response:
-        base_url = kwargs.pop("base_url", None)
-        self._bind_headers(kwargs)
-        return self._transport().put(self._url(path, base_url), **kwargs)
+        sender, url = self._prepare("put", path, kwargs)
+        return sender(url, **kwargs)
 
     def patch(self, path: str, **kwargs: Any) -> requests.Response:
-        base_url = kwargs.pop("base_url", None)
-        self._bind_headers(kwargs)
-        return self._transport().patch(self._url(path, base_url), **kwargs)
+        sender, url = self._prepare("patch", path, kwargs)
+        return sender(url, **kwargs)
 
     def delete(self, path: str, **kwargs: Any) -> requests.Response:
-        base_url = kwargs.pop("base_url", None)
-        self._bind_headers(kwargs)
-        return self._transport().delete(self._url(path, base_url), **kwargs)
+        sender, url = self._prepare("delete", path, kwargs)
+        return sender(url, **kwargs)
 
 
 cao_http = CAOHttpClient()
