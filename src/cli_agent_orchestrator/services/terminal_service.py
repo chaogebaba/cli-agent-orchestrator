@@ -196,6 +196,36 @@ class TerminalCapExceeded(RuntimeError):
         }
 
 
+class TerminalIdConflict(RuntimeError):
+    """F634 (#489) D15: a create supplied a ``terminal_id`` this server already knows.
+
+    D15's create-route amendment adopts an OPTIONAL caller-supplied
+    ``terminal_id``: absent → today's server-side allocation, byte-identical
+    to now; present and unknown → adopted; present and ALREADY KNOWN on this
+    server → refused as a conflict, never silently re-used, so a retried
+    create is idempotent rather than id-stealing. This is the refusal. All
+    three amended create routes map it to a 409 whose ``detail`` carries
+    ``code="E-TERMINAL-ID-CONFLICT"`` plus the offending id.
+    """
+
+    code = "E-TERMINAL-ID-CONFLICT"
+
+    def __init__(self, terminal_id: str) -> None:
+        self.terminal_id = terminal_id
+        super().__init__(
+            f"terminal_id {terminal_id!r} is already known on this server; a "
+            f"supplied create id is adopted only when unknown, never re-used."
+        )
+
+    def detail(self) -> Dict[str, Any]:
+        """Structured HTTP detail body naming the conflicting id."""
+        return {
+            "code": self.code,
+            "message": str(self),
+            "terminal_id": self.terminal_id,
+        }
+
+
 class IdentityAmbiguousError(RuntimeError):
     """Raised when purge_stale_terminal_records finds multiple windows claiming the same terminal ID.
 
@@ -1684,6 +1714,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    is_box_hosted: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2046,6 +2077,16 @@ async def create_terminal(
             )
 
         # Step 1: Generate unique identifiers
+        # F634 (#489) D15: adopt/conflict semantics for a caller-supplied
+        # terminal_id. Absent → server-side allocation, byte-identical to now.
+        # Present and unknown → adopted. Present and already known on this
+        # server → refused as a conflict (never silently re-used), so a retried
+        # create is idempotent rather than id-stealing. The in-tree recovery
+        # adopt precedent (epoch_recovery_service) always supplies a FRESH id
+        # minted by generate_terminal_id(), so it is unknown by construction and
+        # never trips this refusal.
+        if terminal_id is not None and get_terminal_metadata(terminal_id) is not None:
+            raise TerminalIdConflict(terminal_id)
         terminal_id = terminal_id or generate_terminal_id()
         assert terminal_id is not None
         if lease_token is not None:
@@ -2354,6 +2395,7 @@ async def create_terminal(
                             extra_env,
                             is_worker=True,
                             repo_root=_shim_repo_root,
+                            is_box_hosted=is_box_hosted,
                         )
                     try:
                         _created_window_name = get_backend().create_window(

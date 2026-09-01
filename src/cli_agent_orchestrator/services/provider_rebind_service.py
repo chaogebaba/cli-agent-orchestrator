@@ -49,8 +49,15 @@ def _persist_recovery(terminal_id: str, state: str | None, error: str | None = N
         raise RuntimeError(f"recovery_state_persist_failed:{state}")
 
 
-def _result(terminal_id: str, status: str, *, error_code: str | None = None,
-            interrupt: bool = False, fallback=None, retryable: bool | None = None) -> dict:
+def _result(
+    terminal_id: str,
+    status: str,
+    *,
+    error_code: str | None = None,
+    interrupt: bool = False,
+    fallback=None,
+    retryable: bool | None = None,
+) -> dict:
     if retryable is None:
         retryable = RESULT_RETRYABLE[status]
     return {
@@ -62,6 +69,7 @@ def _result(terminal_id: str, status: str, *, error_code: str | None = None,
         "interrupted_turn": bool(interrupt),
         "requires_supervisor_reconciliation": bool(interrupt),
     }
+
 
 class DeliveryGuard:
     """A dedicated thread owns both acquire and release of a delivery lock."""
@@ -125,7 +133,10 @@ class DeliveryGuard:
 
 
 async def _wait_for_shell_baseline(
-    metadata: dict, baseline: str, provider=None, provider_pane_pid: int | None = None,
+    metadata: dict,
+    baseline: str,
+    provider=None,
+    provider_pane_pid: int | None = None,
 ) -> str:
     stable_since = None
     provider_seen_live = False
@@ -177,15 +188,16 @@ async def _wait_for_backend_proof(
     svc = get_herdr_inbox_service()
     if svc is None:
         raise RuntimeError("herdr_inbox_unavailable")
-    pane = backend.get_pane_id(
-        terminal_id, metadata["tmux_session"], metadata["tmux_window"]
-    )
+    pane = backend.get_pane_id(terminal_id, metadata["tmux_session"], metadata["tmux_window"])
     before_event_gen = svc.get_native_event_gen(terminal_id, pane)
     if guard is None:
         svc.register_terminal(terminal_id, pane, False)
     else:
         svc._register_terminal_under_guard(terminal_id, pane, False, guard)
-    if svc._terminal_to_pane.get(terminal_id) != pane or svc._pane_to_terminal.get(pane) != terminal_id:
+    if (
+        svc._terminal_to_pane.get(terminal_id) != pane
+        or svc._pane_to_terminal.get(pane) != terminal_id
+    ):
         raise RuntimeError("herdr_mapping_proof_failed")
     while time.monotonic() < deadline:
         if svc.get_native_event_gen(terminal_id, pane) > before_event_gen:
@@ -202,7 +214,10 @@ def _launch_context(metadata: dict) -> str | None:
             build_session_manifest,
             render_session_brief,
         )
-        brief = render_session_brief(build_session_manifest(metadata["tmux_session"], metadata["id"]))
+
+        brief = render_session_brief(
+            build_session_manifest(metadata["tmux_session"], metadata["id"])
+        )
         prompt = f"{prompt}\n\n{brief}" if prompt else brief
     return prompt or None
 
@@ -212,32 +227,39 @@ async def _fallback(metadata: dict, session_uuid: str, source_lease, lifecycle_l
 
     set_terminal_recovery_state(metadata["id"], "fallback_starting")
     context = ForkContext(
-        mode="resume", session_uuid=session_uuid, base_name="reauth-fallback",
-        provider=metadata["provider"], initial_preamble="",
+        mode="resume",
+        session_uuid=session_uuid,
+        base_name="reauth-fallback",
+        provider=metadata["provider"],
+        initial_preamble="",
     )
     cwd = get_backend().get_pane_working_directory(
-        metadata["tmux_session"], metadata["tmux_window"])
+        metadata["tmux_session"], metadata["tmux_window"]
+    )
     if cwd is None:
         # F26 AC11: never fall back to os.getcwd() for a deleted/unavailable
         # pane cwd — recreating the terminal in the wrong directory is the
         # silent wrong-repo incident class D3 rejects. Fail directed.
         return {
-            "status": "unresumable", "new_terminal_id": None,
+            "status": "unresumable",
+            "new_terminal_id": None,
             "error_code": "cwd_unavailable",
         }
     replacement = await create_terminal(
-        provider=metadata["provider"], agent_profile=metadata["agent_profile"],
-        session_name=metadata["tmux_session"], new_session=False,
+        provider=metadata["provider"],
+        agent_profile=metadata["agent_profile"],
+        session_name=metadata["tmux_session"],
+        new_session=False,
         working_directory=cwd,
-        allowed_tools=metadata.get("allowed_tools"), caller_id=metadata.get("caller_id"),
+        allowed_tools=metadata.get("allowed_tools"),
+        caller_id=metadata.get("caller_id"),
         fork_context=context,
         fallback_source_terminal_id=metadata["id"],
         fallback_source_lease_token=source_lease,
         session_lifecycle_lease_token=lifecycle_lease,
     )
     moved = settle_terminal_fallback(metadata["id"], replacement.id)
-    return {"status": "respawned", "new_terminal_id": replacement.id,
-            "moved_pending_count": moved}
+    return {"status": "respawned", "new_terminal_id": replacement.id, "moved_pending_count": moved}
 
 
 async def rebind_terminal(
@@ -250,18 +272,25 @@ async def rebind_terminal(
 ) -> dict:
     initial_metadata = get_terminal_metadata(terminal_id)
     if not initial_metadata:
-        return _result(terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt)
+        return _result(
+            terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt
+        )
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
         acquire_session_lifecycle_shared,
         release_session_lifecycle_lease,
     )
+
     lifecycle_lease = acquire_session_lifecycle_shared(initial_metadata["tmux_session"])
     if lifecycle_lease is None:
-        return _result(terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt)
+        return _result(
+            terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt
+        )
     lease = acquire_rebind_lease(terminal_id)
     if lease is None:
         release_session_lifecycle_lease(lifecycle_lease)
-        return _result(terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt)
+        return _result(
+            terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt
+        )
     guard = DeliveryGuard(terminal_id, asyncio.get_running_loop())
     watchdog_snapshot = None
     old_provider = candidate = None
@@ -279,59 +308,85 @@ async def rebind_terminal(
         phase = "p3"
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            return _result(terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt)
+            return _result(
+                terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt
+            )
         previous_state = metadata.get("recovery_state")
         if previous_state in MID_STATES:
             set_terminal_recovery_state(terminal_id, "rebind_failed", "abandoned_mid_rebind")
             previous_state = "rebind_failed"
-        if (
-            previous_state == "rebind_failed"
-            and metadata.get("recovery_error") in {"exit_failed", "exit_uncertain"}
-        ):
+        if previous_state == "rebind_failed" and metadata.get("recovery_error") in {
+            "exit_failed",
+            "exit_uncertain",
+        }:
             if not acknowledge_ownership:
                 return _result(
-                    terminal_id, "resume_failed",
-                    error_code=metadata["recovery_error"], interrupt=interrupt,
+                    terminal_id,
+                    "resume_failed",
+                    error_code=metadata["recovery_error"],
+                    interrupt=interrupt,
                     retryable=False,
                 )
             _persist_recovery(terminal_id, "rebind_failed")
             metadata["recovery_error"] = None
         if previous_state == "fallback_ready":
-            return _result(terminal_id, "unresumable", error_code="fallback_ready", interrupt=interrupt)
+            return _result(
+                terminal_id, "unresumable", error_code="fallback_ready", interrupt=interrupt
+            )
         from cli_agent_orchestrator.services.terminal_service import has_deferred_init
+
         if has_deferred_init(terminal_id) or has_unsettled_delivery_attempt(terminal_id):
-            return _result(terminal_id, "skipped_busy", error_code="obligation_in_flight", interrupt=interrupt)
+            return _result(
+                terminal_id, "skipped_busy", error_code="obligation_in_flight", interrupt=interrupt
+            )
         raw = status_monitor.get_raw_status(terminal_id)
         allowed = {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
         if interrupt:
             allowed.add(TerminalStatus.PROCESSING)
         if raw not in allowed:
-            return _result(terminal_id, "skipped_busy", error_code=f"status_{raw.value}", interrupt=interrupt)
+            return _result(
+                terminal_id, "skipped_busy", error_code=f"status_{raw.value}", interrupt=interrupt
+            )
         old_provider = provider_manager.get_provider(terminal_id)
         if not old_provider or not getattr(old_provider, "supports_reauth_rebind", False):
-            return _result(terminal_id, "unresumable", error_code="provider_unsupported", interrupt=interrupt)
+            return _result(
+                terminal_id, "unresumable", error_code="provider_unsupported", interrupt=interrupt
+            )
         baseline = metadata.get("shell_command")
         if not baseline:
-            return _result(terminal_id, "unresumable", error_code="shell_baseline_missing", interrupt=interrupt)
+            return _result(
+                terminal_id, "unresumable", error_code="shell_baseline_missing", interrupt=interrupt
+            )
         pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
-        cwd = get_backend().get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
+        cwd = get_backend().get_pane_working_directory(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
         if cwd is None:
             # F26 D5: a deleted/unavailable pane cwd must mark the rebind
             # unresumable with a directed reason, never escape as a TypeError
             # from quote(None) inside capture_session_uuid /
             # validate_session_artifact.
-            return _result(terminal_id, "unresumable", error_code="cwd_unavailable", interrupt=interrupt)
+            return _result(
+                terminal_id, "unresumable", error_code="cwd_unavailable", interrupt=interrupt
+            )
         session_uuid = metadata.get("provider_session_id")
         phase = "p4"
         if not session_uuid:
             try:
                 session_uuid = old_provider.capture_session_uuid(pid, pane_launch_epoch(pid), cwd)
             except Exception:
-                return _result(terminal_id, "capture_failed", error_code="capture_failed", interrupt=interrupt)
+                return _result(
+                    terminal_id, "capture_failed", error_code="capture_failed", interrupt=interrupt
+                )
         try:
             old_provider.validate_session_artifact(session_uuid, cwd)
         except Exception:
-            return _result(terminal_id, "unresumable", error_code="session_artifact_invalid", interrupt=interrupt)
+            return _result(
+                terminal_id,
+                "unresumable",
+                error_code="session_artifact_invalid",
+                interrupt=interrupt,
+            )
         phase = "p5"
         _persist_recovery(terminal_id, "rebind_starting")
         phase = "p6"
@@ -344,20 +399,24 @@ async def rebind_terminal(
                     terminal_id, "rebind_starting", "watchdog_pause_rollback_failed"
                 )
             return _result(
-                terminal_id, "resume_failed", error_code="watchdog_pause_failed",
+                terminal_id,
+                "resume_failed",
+                error_code="watchdog_pause_failed",
                 interrupt=interrupt,
             )
         phase = "p7_persist"
         _persist_recovery(terminal_id, "rebind_exiting")
         from cli_agent_orchestrator.services.terminal_service import exit_terminal_cli
+
         phase = "p7_send"
         exit_terminal_cli(terminal_id)
         phase = "p7_death"
         death = await _wait_for_shell_baseline(metadata, baseline, old_provider, pid)
         if death != "exit_confirmed":
             set_terminal_recovery_state(terminal_id, "rebind_failed", death)
-            return _result(terminal_id, "resume_failed", error_code=death, interrupt=interrupt,
-                           retryable=False)
+            return _result(
+                terminal_id, "resume_failed", error_code=death, interrupt=interrupt, retryable=False
+            )
         exited = True
         if reason == "content-flag":
             if metadata.get("provider") != "codex" or not isinstance(
@@ -392,12 +451,21 @@ async def rebind_terminal(
         phase = "p8"
         status_monitor.reset_buffer(terminal_id)
         before_output_gen = status_monitor.get_fifo_frame_gen(terminal_id)
-        context = ForkContext(mode="resume", session_uuid=session_uuid, base_name="reauth",
-                              provider=metadata["provider"], initial_preamble="")
+        context = ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name="reauth",
+            provider=metadata["provider"],
+            initial_preamble="",
+        )
         candidate = provider_manager.construct_provider(
-            metadata["provider"], terminal_id, metadata["tmux_session"],
-            metadata["tmux_window"], metadata.get("agent_profile"),
-            metadata.get("allowed_tools"), skill_prompt=_launch_context(metadata),
+            metadata["provider"],
+            terminal_id,
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            metadata.get("agent_profile"),
+            metadata.get("allowed_tools"),
+            skill_prompt=_launch_context(metadata),
             fork_context=context,
         )
         phase = "p9"
@@ -409,9 +477,7 @@ async def rebind_terminal(
         phase = "p10"
         provider_manager.commit_provider(terminal_id, candidate, expected_current=old_provider)
         phase = "p11"
-        await _wait_for_backend_proof(
-            terminal_id, metadata, candidate, before_output_gen, guard
-        )
+        await _wait_for_backend_proof(terminal_id, metadata, candidate, before_output_gen, guard)
         phase = "p12"
         raw = status_monitor.get_raw_status(terminal_id, provider_override=candidate)
         if raw not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
@@ -446,9 +512,7 @@ async def rebind_terminal(
                     exit_terminal_cli(terminal_id)
                     candidate_pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
                     candidate_death_confirmed = (
-                        await _wait_for_shell_baseline(
-                            metadata, baseline, candidate, candidate_pid
-                        )
+                        await _wait_for_shell_baseline(metadata, baseline, candidate, candidate_pid)
                         == "exit_confirmed"
                     )
                 except Exception:
@@ -456,11 +520,11 @@ async def rebind_terminal(
                 if candidate_death_confirmed:
                     post_initialize_failure(prepared_recovery, "settle")
                 else:
-                    mark_recovery_failure(
-                        prepared_recovery, "settle", restored=False
-                    )
+                    mark_recovery_failure(prepared_recovery, "settle", restored=False)
             result = _result(
-                terminal_id, "resume_failed", error_code="watchdog_resume_failed",
+                terminal_id,
+                "resume_failed",
+                error_code="watchdog_resume_failed",
                 interrupt=interrupt,
             )
             if prepared_recovery is not None:
@@ -475,7 +539,9 @@ async def rebind_terminal(
             guard_released = True
         except Exception:
             result = _result(
-                terminal_id, "rebound", error_code="delivery_guard_release_failed",
+                terminal_id,
+                "rebound",
+                error_code="delivery_guard_release_failed",
                 interrupt=interrupt,
             )
             if prepared_recovery is not None:
@@ -540,6 +606,7 @@ async def rebind_terminal(
             try:
                 if candidate:
                     from cli_agent_orchestrator.services.terminal_service import exit_terminal_cli
+
                     exit_terminal_cli(terminal_id)
                     candidate_pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
                     candidate_death = await _wait_for_shell_baseline(
@@ -563,9 +630,7 @@ async def rebind_terminal(
                                 mark_recovery_failure,
                             )
 
-                            mark_recovery_failure(
-                                prepared_recovery, "resume", restored=True
-                            )
+                            mark_recovery_failure(prepared_recovery, "resume", restored=True)
                         elif candidate_death_confirmed:
                             post_initialize_failure(
                                 prepared_recovery,
@@ -580,7 +645,8 @@ async def rebind_terminal(
                 set_terminal_recovery_state(terminal_id, "rebind_failed", str(fallback_exc))
                 fallback = {"status": "failed", "new_terminal_id": None}
             result = _result(
-                terminal_id, "resume_failed",
+                terminal_id,
+                "resume_failed",
                 error_code=(
                     ownership_error
                     or (
@@ -589,7 +655,8 @@ async def rebind_terminal(
                         else "resume_failed"
                     )
                 ),
-                interrupt=interrupt, fallback=fallback,
+                interrupt=interrupt,
+                fallback=fallback,
                 retryable=False if ownership_error else True,
             )
             if prepared_recovery is not None:
@@ -602,14 +669,19 @@ async def rebind_terminal(
         if metadata and phase in {"p7_send", "p7_death"}:
             set_terminal_recovery_state(terminal_id, "rebind_failed", "exit_uncertain")
             return _result(
-                terminal_id, "resume_failed", error_code="exit_uncertain",
-                interrupt=interrupt, retryable=False,
+                terminal_id,
+                "resume_failed",
+                error_code="exit_uncertain",
+                interrupt=interrupt,
+                retryable=False,
             )
         if metadata:
             set_terminal_recovery_state(terminal_id, previous_state)
         request_phase = "p7" if phase.startswith("p7_") else phase
         return _result(
-            terminal_id, "resume_failed", error_code=f"{request_phase}_request_failed",
+            terminal_id,
+            "resume_failed",
+            error_code=f"{request_phase}_request_failed",
             interrupt=interrupt,
         )
     finally:
@@ -645,12 +717,23 @@ async def rebind_terminal(
 
 
 async def recover_provider_reauth(
-    session_name: str, provider: str = "codex", terminal_ids: list[str] | None = None,
-    interrupt: bool = False, acknowledge_ownership: bool = False,
+    session_name: str,
+    provider: str = "codex",
+    terminal_ids: list[str] | None = None,
+    interrupt: bool = False,
+    acknowledge_ownership: bool = False,
     *,
     reason: str = "provider-reauth",
     content_options: dict | None = None,
 ) -> dict:
+    # F634 (#489) D15: box lanes are excluded from server-side auto-recovery.
+    # Refuse at entry — before any selection or rebind — when this serving
+    # process is box-plane, so no replacement terminal is created. This is the
+    # path genuinely broken on a box (box-side allocation forks D11's id
+    # namespace; the replacement preserves caller_id and hits exit 97).
+    from cli_agent_orchestrator.utils.server_plane import refuse_recovery_if_box_plane
+
+    refuse_recovery_if_box_plane("provider-reauth recovery")
     if acknowledge_ownership and (terminal_ids is None or len(terminal_ids) != 1):
         raise ValueError("acknowledge_ownership requires exactly one --terminal selector")
     started = datetime.now(timezone.utc).isoformat()
@@ -690,12 +773,18 @@ async def recover_provider_reauth(
     manifest_error = None
     try:
         from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+
         manifest = build_session_manifest(session_name)
     except Exception as exc:
         manifest_error = str(exc)
     return {
-        "schema_version": "cao.session-recover/v1", "session": session_name,
-        "reason": reason, "provider": provider, "started_at": started,
-        "finished_at": datetime.now(timezone.utc).isoformat(), "results": results,
-        "manifest": manifest, "manifest_error": manifest_error,
+        "schema_version": "cao.session-recover/v1",
+        "session": session_name,
+        "reason": reason,
+        "provider": provider,
+        "started_at": started,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+        "manifest": manifest,
+        "manifest_error": manifest_error,
     }

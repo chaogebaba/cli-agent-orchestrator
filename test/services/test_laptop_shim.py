@@ -286,14 +286,82 @@ class TestNestedBoxesTsvResolution:
 
     def test_should_inject_shim_true_for_nested_fork_worker(self, tmp_path: Path) -> None:
         root, fork = self._nested(tmp_path, _ACTIVE_TSV)
-        assert (
-            laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={})
-            is True
-        )
+        assert laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={}) is True
 
     def test_should_inject_shim_false_when_parent_all_frozen(self, tmp_path: Path) -> None:
         root, fork = self._nested(tmp_path, _ALL_FROZEN_TSV)
+        assert laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={}) is False
+
+
+# ---------------------------------------------------------------------------
+# F634 (#489) D16 / AC21 — shim host-awareness
+# ---------------------------------------------------------------------------
+
+
+class TestF634ShimHostAwareness:
+    """D16: ``should_inject_shim`` / ``maybe_shim_env`` gain ``is_box_hosted``.
+
+    A box-hosted lane is NEVER shimmed, EVEN when every repo-content condition
+    that fires the F620 guard for a laptop worker holds (worker, active
+    boxes.tsv, shim dir present, LAPTOP_OK unset). A laptop worker in the SAME
+    repo still gets the guard. This is the Python-seam half of AC21; the HTTP
+    end-to-end half lives in the api-level create-route test.
+    """
+
+    def test_box_hosted_worker_never_shimmed(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("LAPTOP_OK", raising=False)
+        repo = _make_repo_with_boxes(tmp_path, _ACTIVE_TSV)
+        # Same repo, same worker: laptop -> True (guard fires), box -> False.
+        assert laptop_shim.should_inject_shim(is_worker=True, repo_root=str(repo), env={}) is True
         assert (
-            laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={})
+            laptop_shim.should_inject_shim(
+                is_worker=True, repo_root=str(repo), env={}, is_box_hosted=True
+            )
             is False
         )
+
+    def test_box_hosted_nested_fork_worker_never_shimmed(self, tmp_path: Path, monkeypatch) -> None:
+        # The production shape: repo_root is the nested fork, roster one level
+        # up. Laptop worker -> shimmed; box lane -> not.
+        monkeypatch.delenv("LAPTOP_OK", raising=False)
+        root = tmp_path / "root"
+        (root / "scripts").mkdir(parents=True)
+        (root / "scripts" / "boxes.tsv").write_text(_ACTIVE_TSV)
+        fork = root / "fork"
+        (fork / "scripts" / "laptop-shims").mkdir(parents=True)
+        assert laptop_shim.should_inject_shim(is_worker=True, repo_root=str(fork), env={}) is True
+        assert (
+            laptop_shim.should_inject_shim(
+                is_worker=True, repo_root=str(fork), env={}, is_box_hosted=True
+            )
+            is False
+        )
+
+    def test_default_is_box_hosted_false_preserves_laptop_path(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Omitting is_box_hosted is byte-identical to the pre-F634 laptop path.
+        monkeypatch.delenv("LAPTOP_OK", raising=False)
+        repo = _make_repo_with_boxes(tmp_path, _ACTIVE_TSV)
+        assert laptop_shim.should_inject_shim(is_worker=True, repo_root=str(repo), env={}) is True
+
+    def test_maybe_shim_env_box_hosted_leaves_path_untouched(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("LAPTOP_OK", raising=False)
+        repo = _make_repo_with_boxes(tmp_path, _ACTIVE_TSV)
+        # Laptop worker gets the shim-prefixed PATH ...
+        laptop_out = laptop_shim.maybe_shim_env(
+            {}, is_worker=True, repo_root=str(repo), base_path="/usr/bin:/bin"
+        )
+        shim_dir = str(repo / "scripts" / "laptop-shims")
+        assert laptop_out["PATH"] == f"{shim_dir}{os.pathsep}/usr/bin:/bin"
+        # ... the box lane's env is returned unchanged, no PATH key added.
+        box_out = laptop_shim.maybe_shim_env(
+            {},
+            is_worker=True,
+            repo_root=str(repo),
+            base_path="/usr/bin:/bin",
+            is_box_hosted=True,
+        )
+        assert "PATH" not in box_out

@@ -181,15 +181,11 @@ async def _unwind_registered_terminal(
         # (e.g. the publication-failure path) already unwound the row — that
         # is success, not a leak. Anything else is logged and survived; the
         # StatusMonitor ghost-id drop (F360) is the backstop.
-        logger.warning(
-            "session_create_unwind_delete_failed terminal=%s: %s", terminal_id, exc
-        )
+        logger.warning("session_create_unwind_delete_failed terminal=%s: %s", terminal_id, exc)
     try:
         status_monitor.unregister(terminal_id)
     except Exception as exc:
-        logger.warning(
-            "session_create_unwind_monitor_failed terminal=%s: %s", terminal_id, exc
-        )
+        logger.warning("session_create_unwind_monitor_failed terminal=%s: %s", terminal_id, exc)
 
 
 async def create_session(
@@ -209,6 +205,8 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    terminal_id: str | None = None,
+    is_box_hosted: bool = False,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -281,6 +279,8 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        terminal_id=terminal_id,
+        is_box_hosted=is_box_hosted,
     )
     # F360 (#215): the terminal id is now allocated and fully registered. Any
     # exception from here on unwinds that registration (deregister + monitor

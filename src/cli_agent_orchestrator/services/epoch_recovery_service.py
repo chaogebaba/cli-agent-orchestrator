@@ -64,7 +64,10 @@ def _artifact_exists(row) -> bool:
         )
     if row["provider"] == "grok_cli":
         return (
-            provider_home("grok_cli").home / "sessions" / quote(row["cwd"], safe="") / row["session_uuid"]
+            provider_home("grok_cli").home
+            / "sessions"
+            / quote(row["cwd"], safe="")
+            / row["session_uuid"]
         ).exists()
     return False
 
@@ -281,6 +284,12 @@ async def _recover_row(row, session_name):
 
 
 async def recover_epoch(session_name: str, base_names: list[str] | None = None) -> dict:
+    # F634 (#489) D15: box lanes are excluded from server-side auto-recovery.
+    # Refuse at entry — before any selection or terminal creation — when this
+    # serving process is box-plane, so no replacement terminal is created.
+    from cli_agent_orchestrator.utils.server_plane import refuse_recovery_if_box_plane
+
+    refuse_recovery_if_box_plane("epoch recovery")
     if not get_backend().session_exists(session_name):
         raise ValueError("session_missing")
     started = datetime.now(timezone.utc).isoformat()

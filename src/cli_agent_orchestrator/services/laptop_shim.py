@@ -98,14 +98,25 @@ def should_inject_shim(
     is_worker: bool,
     repo_root: Optional[str],
     env: Mapping[str, str],
+    is_box_hosted: bool = False,
 ) -> bool:
     """Decide whether the laptop-shim PATH prefix applies for this terminal.
 
-    All four conditions must hold: worker terminal, a resolvable repo root, an
-    active box row in ``scripts/boxes.tsv`` (resolved against ``repo_root`` or
-    its immediate parent — see ``_active_boxes_tsv_for``, F636 #491), and
-    ``LAPTOP_OK`` unset in ``env``.
+    All conditions must hold: the lane is NOT box-hosted, the terminal is a
+    worker, a resolvable repo root, an active box row in ``scripts/boxes.tsv``
+    (resolved against ``repo_root`` or its immediate parent — see
+    ``_active_boxes_tsv_for``, F636 #491), and ``LAPTOP_OK`` unset in ``env``.
+
+    F634 (#489) D16: ``is_box_hosted`` makes the guard HOST-AWARE. The F620
+    predicate keys on repo CONTENTS, never on host, so a lane created by a box
+    ``cao-server`` in the box's own fork checkout (rsynced complete with
+    ``boxes.tsv`` and the shims) would otherwise be denied ``pytest``/``mypy``/
+    ``uv`` — exit 97 — on the very machine F634 relocated it to. When the lane
+    is box-hosted the shim never applies; the laptop's own workers
+    (``is_box_hosted=False``, the default) keep the guard unchanged.
     """
+    if is_box_hosted:
+        return False
     if not is_worker:
         return False
     if not repo_root:
@@ -146,20 +157,31 @@ def maybe_shim_env(
     is_worker: bool,
     repo_root: Optional[str],
     base_path: Optional[str] = None,
+    is_box_hosted: bool = False,
 ) -> dict[str, str]:
     """Return ``extra_env`` with a shim-prefixed ``PATH`` when applicable.
 
     Mutates and returns ``extra_env`` for caller convenience. ``base_path``
     defaults to the server's own ``PATH`` (what a worker inherits). When the
     shim does not apply, ``extra_env`` is returned unchanged (no ``PATH`` key
-    added), so a non-worker/absent-fleet terminal composes exactly as before.
+    added), so a non-worker/absent-fleet/box-hosted terminal composes exactly
+    as before.
+
+    F634 (#489) D16: ``is_box_hosted`` is threaded straight to
+    ``should_inject_shim`` so a box lane is never shimmed. Defaults to False,
+    preserving the laptop worker path byte-for-byte.
     """
     # LAPTOP_OK is read from the composed env first, else the process env — a
     # worker inherits the server env, so an operator export reaches here even
     # when it is not threaded through extra_env explicitly.
     effective_env = dict(os.environ)
     effective_env.update(extra_env)
-    if not should_inject_shim(is_worker=is_worker, repo_root=repo_root, env=effective_env):
+    if not should_inject_shim(
+        is_worker=is_worker,
+        repo_root=repo_root,
+        env=effective_env,
+        is_box_hosted=is_box_hosted,
+    ):
         return extra_env
     assert repo_root is not None  # narrowed by should_inject_shim
     shim_dir = shim_dir_for(repo_root)

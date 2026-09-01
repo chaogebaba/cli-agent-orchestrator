@@ -196,6 +196,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     OutputMode,
     TerminalCapExceeded,
+    TerminalIdConflict,
     TerminalInputBlockedError,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
@@ -218,6 +219,7 @@ from cli_agent_orchestrator.utils.provider_plane import (
     provider_home,
 )
 from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox, require_provider_admitted
+from cli_agent_orchestrator.utils.server_plane import BoxPlaneRecoveryRefused
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -3618,6 +3620,8 @@ async def create_session(
     # {"env_vars": {...}} wire shape is unchanged either way.
     allow_incomplete_brief: bool = False,
     resume_session_id: Optional[str] = None,
+    terminal_id: Optional[TerminalId] = None,
+    is_box_hosted: bool = False,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3716,6 +3720,8 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -3755,6 +3761,10 @@ async def create_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": e.code, "message": e.detail},
         ) from e
+    except TerminalIdConflict as e:
+        # F634 (#489) D15: a supplied terminal_id this server already holds.
+        # 409 with E-TERMINAL-ID-CONFLICT; the row is never silently re-used.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -3776,9 +3786,18 @@ async def start_session_endpoint(
     memory: bool = False,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
     allow_incomplete_brief: bool = False,
+    terminal_id: Optional[TerminalId] = None,
+    is_box_hosted: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Canonical lifecycle start endpoint."""
+    """Canonical lifecycle start endpoint.
+
+    ``terminal_id`` / ``is_box_hosted`` (F634 #489 D15/D16): amended here for
+    create-route surface uniformity. This endpoint creates only a session's
+    FIRST terminal, which under D10 is the laptop-only supervisor seat, so no
+    box lane is ever born here — the fields ride through to ``create_session``
+    for uniformity but need no arm of their own (blueprint AC20, r8/S3).
+    """
     _validate_artifacts_dir_override(env_vars)
     try:
         resolved_provider = provider or resolve_provider(
@@ -3794,6 +3813,8 @@ async def start_session_endpoint(
             registry=get_plugin_registry(request),
             env_vars=env_vars,
             allow_incomplete_brief=allow_incomplete_brief,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -4085,6 +4106,10 @@ async def recover_session(
                 acknowledge_ownership=body.acknowledge_ownership,
             )
         return await _apply_recovery_nudges(request, result, reason=body.reason, nudge=body.nudge)
+    except BoxPlaneRecoveryRefused as exc:
+        # F634 (#489) D15: server-side recovery refused on a box-plane server.
+        # Typed 409 the caller relays; NO replacement terminal was created.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail())
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
@@ -4194,6 +4219,8 @@ async def create_terminal_in_session(
     defer_init: bool = False,
     model: Optional[str] = None,
     use_worktree: Optional[bool] = None,
+    terminal_id: Optional[TerminalId] = None,
+    is_box_hosted: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4225,6 +4252,22 @@ async def create_terminal_in_session(
     ``defer_init`` rather than moving into the JSON body. Runs synchronously
     before the deferred-init background task (if any) is scheduled, so it
     applies the same way regardless of ``defer_init``.
+
+    ``terminal_id`` (F634 #489 D15): OPTIONAL caller-supplied id. Absent →
+    server-side allocation, byte-identical to today. Present and unknown →
+    adopted. Present and already known on this server → 409
+    ``E-TERMINAL-ID-CONFLICT`` (never silently re-used), so a retried create is
+    idempotent. This is the route the supervisor's ``assign`` actually posts to
+    (``caller_id`` is set on this path), so it is the one D15's id and D16's
+    ``is_box_hosted`` matter most on.
+
+    ``is_box_hosted`` (F634 #489 D16): OPTIONAL flag carried BESIDE
+    ``terminal_id``. The shim decision runs inside whichever ``cao-server``
+    creates the terminal and the D11 catalog is laptop-side, so the value must
+    ride on the create call. True unshims the lane (the box server would
+    otherwise deny ``pytest``/``mypy``/``uv`` at exit 97 via the F620 shim,
+    which keys on repo contents not host). Defaults False — the laptop worker
+    path is unchanged.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -4313,6 +4356,8 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             authority_files=body.authority_files if body else None,
+            terminal_id=terminal_id,
+            is_box_hosted=is_box_hosted,
         )
         return result
     except HTTPException:
@@ -4324,6 +4369,10 @@ async def create_terminal_in_session(
         # created. 409 Conflict with the structured E-TERMINAL-CAP detail (code,
         # current_count, cap, reap_candidates) so the supervisor can reap-then-
         # retry. No terminal row, no tmux window exists to unwind.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
+    except TerminalIdConflict as e:
+        # F634 (#489) D15: a supplied terminal_id this server already holds.
+        # 409 with E-TERMINAL-ID-CONFLICT; the row is never silently re-used.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except KiroCapabilityError as e:
         # Subclasses ValueError, so must precede the generic arm below —
