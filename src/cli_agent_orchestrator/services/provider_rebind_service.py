@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
+from cli_agent_orchestrator.services.box_plane import refuse_recovery_on_box_plane
 from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
 from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
 from cli_agent_orchestrator.services.rebind_lease import (
@@ -651,6 +652,12 @@ async def recover_provider_reauth(
     reason: str = "provider-reauth",
     content_options: dict | None = None,
 ) -> dict:
+    # F634 (D15): server-side recovery is refused on a box-plane cao-server,
+    # BEFORE any terminal is selected or replaced. This path is the genuinely
+    # broken one on a box -- it allocates the replacement id box-side (forking
+    # D11's single id namespace) and preserves caller_id, so the replacement
+    # runs the F620 predicate with no is_box_hosted and lands on exit 97.
+    refuse_recovery_on_box_plane(reason)
     if acknowledge_ownership and (terminal_ids is None or len(terminal_ids) != 1):
         raise ValueError("acknowledge_ownership requires exactly one --terminal selector")
     started = datetime.now(timezone.utc).isoformat()

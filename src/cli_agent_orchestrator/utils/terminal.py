@@ -109,6 +109,20 @@ def generate_window_name(agent_profile: str, terminal_id: str | None = None) -> 
 _RAW_TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
 
 
+def is_raw_terminal_id(value: str) -> bool:
+    """True iff *value* is a raw terminal id in ``generate_terminal_id`` form.
+
+    F634 D15 makes ``terminal_id`` a caller-supplied create-route field, so the
+    id namespace stops being server-private. Every id resolver and display form
+    in the tree assumes this exact shape — ``resolve_terminal_id`` fast-paths on
+    it and extracts it as the trailing segment of ``<profile>-<id>``, and
+    ``generate_window_name`` composes the tmux window name from it — so an
+    adopted id that is not 8 lowercase hex chars would silently produce
+    unresolvable display forms. Callers validate at the boundary with this.
+    """
+    return isinstance(value, str) and _RAW_TERMINAL_ID_RE.fullmatch(value) is not None
+
+
 def display_name(terminal_id: str, profile: str | None = None) -> str:
     """Return the user-visible display form for a terminal.
 
