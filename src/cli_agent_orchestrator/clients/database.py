@@ -3642,9 +3642,7 @@ def _register_terminal_identity(
     that IS tolerated — a terminal that already has an identity row — is control
     flow (the early return), never an exception.
     """
-    exists = (
-        db.query(TerminalIdentityModel.terminal_id).filter_by(terminal_id=terminal_id).first()
-    )
+    exists = db.query(TerminalIdentityModel.terminal_id).filter_by(terminal_id=terminal_id).first()
     if exists is not None:
         return
     db.add(
