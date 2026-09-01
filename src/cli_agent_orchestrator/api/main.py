@@ -3788,6 +3788,16 @@ async def create_session(
             registry = get_plugin_registry(request)
             sidecar_provider = resolved_provider
             sidecar_session = result.session_name
+            # F670 (#525): the sidecar is a WORKER in an existing session, so it
+            # is exactly what terminal_service's F620 predicate describes
+            # ("an existing-session create with a caller_id"). Spawned with
+            # caller_id=None it was silently exempt from the laptop shim that
+            # every other worker in the same session gets. The session's initial
+            # (supervisor) terminal is the terminal it is spawned on behalf of,
+            # so that is the caller. ``is_box_hosted`` rides along because F634
+            # D16 disarms the shim per host, and the sidecar shares the session's.
+            sidecar_caller_id = result.id
+            sidecar_is_box_hosted = is_box_hosted
 
             async def _spawn_sidecar() -> None:
                 try:
@@ -3802,6 +3812,8 @@ async def create_session(
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        caller_id=sidecar_caller_id,
+                        is_box_hosted=sidecar_is_box_hosted,
                         fork_context=sidecar_context,
                     )
                 except Exception as e:
@@ -3926,6 +3938,11 @@ async def start_session_endpoint(
     if memory:
         terminal = result["supervisor_terminal"]
         sidecar_provider = resolved_provider
+        # F670 (#525): same gap as the /sessions site above — the sidecar is a
+        # worker in an existing session and must carry the supervisor seat as its
+        # caller_id, which is what arms the F620 laptop shim at all.
+        sidecar_caller_id = terminal["id"]
+        sidecar_is_box_hosted = is_box_hosted
 
         async def _spawn_start_sidecar() -> None:
             try:
@@ -3938,6 +3955,8 @@ async def start_session_endpoint(
                     session_name=terminal["session_name"],
                     working_directory=working_directory,
                     registry=get_plugin_registry(request),
+                    caller_id=sidecar_caller_id,
+                    is_box_hosted=sidecar_is_box_hosted,
                     fork_context=context,
                 )
             except Exception as exc:
