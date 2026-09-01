@@ -662,6 +662,39 @@ class HerdrBackend(TerminalBackend):
             return ""
         return cast(str, result.stdout)
 
+    def capture_viewport(self, session_name: str, window_name: str) -> str:
+        """Capture only the current pane viewport as escape-normalized text.
+
+        Contract mirrored from ``clients/tmux.py``'s ``capture-pane -p``, whose
+        three properties are (a) viewport only, (b) no scrollback, (c) escapes
+        stripped. herdr supplies all three natively:
+
+        - ``--source visible`` is the currently rendered viewport, so no
+          scrollback rows are included (verified against the installed binary's
+          own ``herdr pane --help``, which lists
+          ``--source visible|recent|recent-unwrapped``);
+        - ``--format text`` strips ANSI, the same mechanism ``get_history``
+          already relies on for ``strip_escapes=True``.
+
+        Without this override the class inherits ``base.py``'s fail-closed
+        ``NotImplementedError``, which the pre-open safety probe turns into
+        ``probe_failure=empty_capture`` and every inbox delivery is vetoed
+        with ``safety_unverified`` (F674 #529).
+
+        A failed read still fails closed: returning ``""`` keeps the probe's
+        empty-capture veto rather than admitting an unverified injection.
+        """
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        result = self._run_herdr(
+            ["pane", "read", pane_id, "--source", "visible", "--format", "text"],
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(f"herdr capture_viewport failed: {result.stderr}")
+            return ""
+        return cast(str, result.stdout)
+
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get pane CWD via herdr pane get."""
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
