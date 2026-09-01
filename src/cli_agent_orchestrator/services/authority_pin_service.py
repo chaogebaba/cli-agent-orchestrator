@@ -307,6 +307,23 @@ class FrozenPinValidation:
     all_results: list[PinCheckResult] = field(default_factory=list)
 
 
+def _next_pin_version(db: Any, task_key: str, file_path: str) -> int:
+    """Next free version for a ``(task_key, file_path)`` pin chain.
+
+    ``UniqueConstraint(task_key, file_path, version)`` (database.py:847-852) makes
+    a literal version a latent collision: any pre-existing pin on the same pair —
+    e.g. an advisory pin registered through ``pin_authority`` — already occupies
+    version 1. Same shape as the ``next_version`` ``update_pin`` computes.
+    """
+    current = (
+        db.query(dbmod.AuthorityPinModel)
+        .filter_by(task_key=task_key, file_path=file_path)
+        .order_by(dbmod.AuthorityPinModel.version.desc())
+        .first()
+    )
+    return 1 if current is None else int(current.version) + 1
+
+
 def register_frozen_pins(
     db: Any,
     task_key: str,
@@ -332,17 +349,18 @@ def register_frozen_pins(
             raise AuthorityPinError(f"authority_hash_mismatch")
         if observed != expected_sha:
             raise AuthorityPinError("authority_hash_mismatch")
+        version = _next_pin_version(db, task_key, file_path)
         db.add(
             dbmod.AuthorityPinModel(
                 task_key=task_key,
                 file_path=file_path,
                 sha256=expected_sha,
-                version=1,
+                version=version,
                 registered_by=registered_by,
                 frozen=True,
             )
         )
-        results.append({"file_path": file_path, "sha256": expected_sha, "version": 1})
+        results.append({"file_path": file_path, "sha256": expected_sha, "version": version})
     db.flush()
     return results
 
