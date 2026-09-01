@@ -296,9 +296,8 @@ def test_a_failed_identity_retirement_aborts_the_whole_reap(db_env):
         survived = db.query(TerminalModel).filter_by(id="lane0001").one_or_none() is not None
     assert survived, "F631-N2-STATE: the terminals row was hard-deleted despite a failed retirement"
     row = get_terminal_identity("lane0001")
-    assert (row["lifecycle"], row["reaped_at"]) == ("live", None), (
-        f"F631-N2-STATE: identity is {row['lifecycle']}/{row['reaped_at']}, want live/None"
-    )
+    identity_state = (row["lifecycle"], row["reaped_at"])
+    assert identity_state == ("live", None), f"F631-N2-STATE: identity is {identity_state}"
     # …and the real key was never silently discarded — a second, clean reap
     # still returns it.
     assert delete_terminal_and_warm_intent("lane0001")["resume_key"] == "uuid-lane0001"
