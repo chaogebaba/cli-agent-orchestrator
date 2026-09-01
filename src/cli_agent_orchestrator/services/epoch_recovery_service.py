@@ -10,6 +10,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     get_provider_session_history,
     get_ready_provider_session,
+    get_terminal_metadata,
     increment_session_epoch,
     list_ready_provider_sessions_for_session,
     list_warm_intents,
@@ -35,6 +36,35 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
     if resolved == provider_plane.provider_home("codex").home:
         return provider_home("codex").home
     return resolved
+
+
+def _recovered_caller_id(row) -> str | None:
+    """Resolve the ``caller_id`` the recovered lane must be (re-)created with.
+
+    F663 (#518): the F620 laptop-shim block in ``terminal_service.create_terminal``
+    is guarded by ``if caller_id:`` — a worker (existing-session create with a
+    caller_id) is shimmed, the operator/supervisor is not. The epoch-recovery
+    path re-creates the base terminal but historically never threaded a
+    ``caller_id``, so the guard was always False and the recovered lane came
+    back UNSHIMMED regardless of whether the original was a worker.
+
+    The base was registered by its ``source_terminal_id`` (see
+    ``fork_context_service.mark_ready``). That terminal's OWN ``caller_id`` is
+    the identity the recovered lane must inherit, so the shim decision is made
+    by the same predicate as the original creation — mirroring how
+    ``provider_rebind_service`` threads the rebound terminal's own
+    ``metadata["caller_id"]``. If the source terminal row is gone (or the base
+    had no source terminal), there is no worker identity to inherit and this
+    resolves to ``None`` — exactly the non-worker default, no shim where none
+    belongs.
+    """
+    source_terminal_id = row.get("source_terminal_id")
+    if not source_terminal_id:
+        return None
+    metadata = get_terminal_metadata(source_terminal_id)
+    if not metadata:
+        return None
+    return metadata.get("caller_id")
 
 
 def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
@@ -64,7 +94,10 @@ def _artifact_exists(row) -> bool:
         )
     if row["provider"] == "grok_cli":
         return (
-            provider_home("grok_cli").home / "sessions" / quote(row["cwd"], safe="") / row["session_uuid"]
+            provider_home("grok_cli").home
+            / "sessions"
+            / quote(row["cwd"], safe="")
+            / row["session_uuid"]
         ).exists()
     return False
 
@@ -197,6 +230,10 @@ async def _recover_row(row, session_name):
             None,
         )
     try:
+        # F663 (#518): thread the recovered lane's own caller_id so the F620
+        # laptop-shim decision is made by the same predicate as its original
+        # creation. Resolved before create_terminal so the shim guard sees it.
+        recovered_caller_id = _recovered_caller_id(row)
         context = ForkContext(
             mode="resume",
             session_uuid=row["session_uuid"],
@@ -212,6 +249,7 @@ async def _recover_row(row, session_name):
                 new_session=False,
                 working_directory=row["cwd"],
                 defer_init=False,
+                caller_id=recovered_caller_id,
                 fork_context=context,
                 terminal_id=terminal_id,
                 lease_token=lease,
