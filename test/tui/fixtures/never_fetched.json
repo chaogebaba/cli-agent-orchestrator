@@ -1,0 +1,8 @@
+{
+  "__fixture__": "never_fetched",
+  "payload": null,
+  "error_class": null,
+  "error": null,
+  "consecutive_failures": 0,
+  "note": "App start, before the first fetch completes: empty table, no error banner."
+}
