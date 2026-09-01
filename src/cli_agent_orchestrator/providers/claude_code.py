@@ -870,8 +870,6 @@ class ClaudeCodeProvider(BaseProvider):
             effort = resolve_provider_string_option(
                 profile_defaults, defaults, profile, "reasoning_effort", "reasoningEffort"
             )
-            if effort:
-                command_parts.extend(["--effort", effort])
 
             # Apply Claude Code-only per-agent knobs from claudeConfig:
             #   effort         -> --effort <level>
@@ -879,14 +877,25 @@ class ClaudeCodeProvider(BaseProvider):
             # Claude analog of codexConfig: per-agent reasoning effort without
             # depending on the machine-global effortLevel in
             # ~/.claude/settings.json.
+            #
+            # F666 (#521): claudeConfig.effort is an explicit per-agent OVERRIDE.
+            # It WINS by REPLACING the value resolved above (providers.toml /
+            # profile.reasoningEffort), never by appending a second --effort. We
+            # resolve to a single effort value here, before emitting the flag, so
+            # --effort appears at most once and CAO — not the Claude CLI's
+            # duplicate-flag handling — owns the precedence.
             claude_config = getattr(profile, "claudeConfig", None)
+            fallback_model = None
             if isinstance(claude_config, dict):
-                effort = claude_config.get("effort")
-                if effort:
-                    command_parts.extend(["--effort", str(effort)])
+                config_effort = claude_config.get("effort")
+                if config_effort:
+                    effort = str(config_effort)
                 fallback_model = claude_config.get("fallback_model")
-                if fallback_model:
-                    command_parts.extend(["--fallback-model", str(fallback_model)])
+
+            if effort:
+                command_parts.extend(["--effort", effort])
+            if fallback_model:
+                command_parts.extend(["--fallback-model", str(fallback_model)])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
