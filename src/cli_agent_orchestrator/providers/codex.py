@@ -11,6 +11,7 @@ import subprocess
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -1701,6 +1702,28 @@ class CodexProvider(BaseProvider):
         """
         return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _supports_hook_trust_bypass() -> bool:
+        """Whether the INSTALLED codex accepts ``--dangerously-bypass-hook-trust``.
+
+        Feature-detected from the binary's own ``--help``, never assumed from a
+        version number: the flag arrived with the 0.152 hook-trust model and an
+        older codex would reject an unknown argument at launch, which is the
+        F509-class failure this fix exists to prevent. Cached for the process.
+        """
+        try:
+            result = subprocess.run(
+                [resolve_provider_binary("codex"), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(f"codex --help probe failed, hook-trust bypass disabled: {exc}")
+            return False
+        return "--dangerously-bypass-hook-trust" in (result.stdout or "")
+
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -1732,6 +1755,39 @@ class CodexProvider(BaseProvider):
         else:
             command_parts = [resolve_provider_binary("codex"), "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
+
+        # F700 (#555): codex 0.152.0 gates lifecycle hooks behind PER-DIRECTORY
+        # trust. This repo ships .codex/hooks.json, the main checkout is trusted,
+        # and every freshly provisioned worktree is not — so a worker launched
+        # with use_worktree renders a blocking "Hooks / 1 hook needs review"
+        # modal after its first turn. The modal hides the composer footer, the
+        # F643c readiness gate times out, the draft parser reports "Composer
+        # state is unreadable", and deferred init kills the terminal. That is
+        # every codex reviewer death on 2026-09-01 (probe 9ac2d930 pane sample);
+        # the discriminator was use_worktree, not the profile or the prompt.
+        #
+        # Answering the modal is not a fix: pressing `t` persists NOTHING on
+        # 0.152 (grok_tester probe f6abd63b, isolated CODEX_HOME — relaunch in
+        # the same worktree re-showed it), and the auto-responder's rule is
+        # vetoed by the busy classifier anyway (F530 #386 class).
+        #
+        # Pre-seeding the durable [hooks.state."<path>:pre_tool_use:0:0"]
+        # trusted_hash was the first candidate and is NOT usable: the preimage
+        # codex hashes could not be derived. The one known-good sample
+        # (sha256:915a85c1…, from ~/.codex/config.toml.bak files, identical for
+        # two different repos carrying byte-identical hooks.json) matched none
+        # of 38 candidate serializations — whole file, the matcher group, the
+        # single handler, the command string, key-prefixed and TOML forms — and
+        # 0.152 no longer writes the table, so no fresh sample can be minted.
+        #
+        # `--dangerously-bypass-hook-trust` is codex's own first-class answer,
+        # verified against the INSTALLED binary's `--help`: "Run enabled hooks
+        # without requiring persisted hook trust for this invocation. DANGEROUS.
+        # Intended only for automation that already vets hook sources." CAO is
+        # exactly that automation — the only hooks in play are the ones this
+        # repo commits, in a worktree CAO itself provisioned from this repo.
+        if self._supports_hook_trust_bypass():
+            command_parts.append("--dangerously-bypass-hook-trust")
 
         model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
         resolved_model = self._model if self._model is not None else model
@@ -2156,6 +2212,7 @@ class CodexProvider(BaseProvider):
             candidates = list(sessions_dir.glob("**/rollout-*.jsonl"))
         except OSError:
             return False
+
         # Newest first: the live forked file is the most recently written.
         def _mtime(p: "Path") -> float:
             try:
@@ -4075,8 +4132,7 @@ class CodexProvider(BaseProvider):
                         backend.send_special_key(session, window, "Enter")
                     except Exception as exc:
                         logger.warning(
-                            "F643c submit-verify: re-Enter failed for terminal "
-                            "%s: %s",
+                            "F643c submit-verify: re-Enter failed for terminal " "%s: %s",
                             self.terminal_id,
                             exc,
                         )
