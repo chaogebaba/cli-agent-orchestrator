@@ -1,7 +1,10 @@
-"""F702 (#557): Textual fleet TUI.
+"""F702 (#557): the `cao-fleet` Textual TUI package.
 
-J1 ships the read-only model (`fleet_state`) and the fetcher loop (`fetcher`).
-The Textual app, widgets and key bindings are J2; the status cell is J3.
+Modules here are deliberately import-light: :mod:`status_cell` and
+:mod:`columns` are pure and depend only on ``rich``, so they can be unit-tested
+without a Textual app, a server, or the fetcher loop. J1 ships the read-only
+model (:mod:`fleet_state`) and the fetcher loop (:mod:`fetcher`); the Textual
+app, widgets and key bindings are J2.
 """
 
 from cli_agent_orchestrator.tui.fleet_state import FleetState, TerminalState

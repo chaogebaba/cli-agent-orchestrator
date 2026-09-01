@@ -1,0 +1,8 @@
+{
+  "__fixture__": "fetch_failure",
+  "payload": null,
+  "error_class": "socket.timeout",
+  "error": "urlopen(.../sessions/f702-healthy/fleet, timeout=5) timed out",
+  "consecutive_failures": 2,
+  "note": "Renderer keeps the last good snapshot and shows a stale badge; no error rows (AC1)."
+}
