@@ -47,12 +47,14 @@ from cli_agent_orchestrator.tui.fleet_app import (
     hint_renderable,
     hint_text,
     idle_style,
+    is_working,
     parse_args,
     read_events,
     read_labels,
     render_once,
     row_values,
     sort_terminals,
+    work_age_cell,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState
 from cli_agent_orchestrator.tui.status_cell import STYLE_QUIET_TAG, status_cell
@@ -808,9 +810,14 @@ async def test_idle_cells_are_coloured_by_age(tmp_path: Path) -> None:
         idle = PARITY_VIEW.index("IDLE")
         assert plain(app.table, 0, idle) == "10m"
         assert cell(app.table, 0, idle).style == "yellow"
-        fresh = plain(app.table, 1, idle)
+        # row 2 is term-0003 (completed). Row 1 is term-0002, which is working,
+        # and a working row's IDLE cell carries the elapsed-work readout in the
+        # status colour instead of a window-activity age.
+        fresh = plain(app.table, 2, idle)
         assert fresh.endswith("s") and int(fresh[:-1]) < 5
-        assert cell(app.table, 1, idle).style == "dim"
+        assert cell(app.table, 2, idle).style == "dim"
+        assert plain(app.table, 1, idle).startswith("●")
+        assert cell(app.table, 1, idle).style == "green"
 
 
 # ── parity: the ▶ selection marker (ranked gap 4) ───────────────────────────
@@ -1281,3 +1288,122 @@ def test_a_loud_condition_tag_is_not_dimmed() -> None:
     cell = status_cell({"status": "idle", "condition": "CAPPED"})
     assert cell.style == "bold red"
     assert [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG] == []
+
+
+# ── the working-elapsed readout (F702 #557 "look" round) ─────────────────────
+#
+# "I want to see how long a subagent has been working, if it is working."
+# No server field carries the spell's start (see the readout's note in
+# fleet_app.py), so it is measured from the first poll that saw the row working
+# and marked `+` while that start is only a lower bound.
+
+
+def resting(payload: Dict[str, Any], terminal_id: str) -> Dict[str, Any]:
+    """The same payload with one terminal no longer working."""
+    copy = json.loads(json.dumps(payload))
+    for term in copy["terminals"]:
+        if term["id"] == terminal_id:
+            term["status"] = "idle"
+            term["condition"] = None
+    return copy
+
+
+def test_is_working_covers_both_signals() -> None:
+    state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
+    by_id = {term.id: term for term in state.terminals}
+    assert is_working(by_id["term-0002"]) is True  # status processing
+    assert is_working(by_id["term-0001"]) is False  # idle
+    assert is_working(by_id["term-0003"]) is False  # completed
+    # `unknown` is not a statement of rest, so BUSY breaks the tie
+    busy = FleetState.from_dict(load_payload("wake_alarm"), fetched_at=1.0)
+    assert is_working(next(t for t in busy.terminals if t.id == "term-0032")) is True
+
+
+def test_a_busy_flag_never_outranks_a_status_that_says_the_seat_is_resting() -> None:
+    """A live fleet shows `◌ idle [BUSY]`: a stale provider flag, not a turn.
+
+    The readout must never put a climbing clock next to the word "idle" one
+    column over, so `idle`, `waiting_user_answer` and `error` win outright.
+    """
+    payload = load_payload("healthy")
+    for status, expected in (
+        ("idle", False),
+        ("waiting_user_answer", False),
+        ("error", False),
+        # not statements of rest — the turn ended, or could not be read
+        ("completed", True),
+        ("unknown", True),
+        ("render_uncertain", True),
+        ("processing", True),
+    ):
+        raw = json.loads(json.dumps(payload))
+        raw["terminals"] = [raw["terminals"][1]]
+        raw["terminals"][0]["status"] = status
+        raw["terminals"][0]["condition"] = "BUSY"
+        term = FleetState.from_dict(raw, fetched_at=1.0).terminals[0]
+        assert is_working(term) is expected, status
+
+
+def test_work_age_cell_marks_an_unbounded_spell() -> None:
+    assert work_age_cell(0.0, True) == "● 0s"
+    assert work_age_cell(720.0, True) == "● 12m"
+    # `+` means "at least": the spell was already running when the app started
+    assert work_age_cell(720.0, False) == "● 12m+"
+
+
+@pytest.mark.asyncio
+async def test_a_working_row_shows_how_long_it_has_been_working(tmp_path: Path) -> None:
+    payload = load_payload("healthy")
+    app, feed, _ = make_app([payload, payload, payload], tmp_path, tick=60.0)
+    idle = PARITY_VIEW.index("IDLE")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        rows = [t.id for t in app.visible_terminals()]
+        working = rows.index("term-0002")
+        # already working when first seen, so the elapsed time is a lower bound
+        assert plain(app.table, working, idle) == "● 0s+"
+        assert cell(app.table, working, idle).style == "green"
+
+        await advance(pilot, feed, 2)
+        assert plain(app.table, working, idle) == "● 2m+"
+
+        # the rows that are not working keep their window-activity age
+        resting_row = rows.index("term-0003")
+        assert plain(app.table, resting_row, idle) == fmt_age(app._ages.get("3"))
+        assert not plain(app.table, resting_row, idle).startswith("●")
+
+
+@pytest.mark.asyncio
+async def test_a_finished_spell_is_dropped_and_restarts_from_zero(tmp_path: Path) -> None:
+    """The anti-latch invariant: a spell never outlives the work that opened it."""
+    payload = load_payload("healthy")
+    app, feed, _ = make_app([payload, resting(payload, "term-0002"), payload], tmp_path, tick=60.0)
+    idle = PARITY_VIEW.index("IDLE")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        working = [t.id for t in app.visible_terminals()].index("term-0002")
+        assert plain(app.table, working, idle) == "● 0s+"
+
+        # it stops working: the spell is dropped, not paused
+        await advance(pilot, feed)
+        assert "term-0002" not in app._work_spells
+        assert not plain(app.table, working, idle).startswith("●")
+
+        # it starts again: a new spell from zero, and now an exact one, because
+        # this app has seen the row resting
+        await advance(pilot, feed)
+        assert plain(app.table, working, idle) == "● 0s"
+        assert app._work_spells["term-0002"].exact is True
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_leaves_the_fleet_drops_its_spell(tmp_path: Path) -> None:
+    app, feed, _ = make_app(
+        [load_payload("healthy"), load_payload("wake_alarm")], tmp_path, tick=60.0
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert set(app._work_spells) == {"term-0002"}
+        await advance(pilot, feed)
+        # a different session's rows entirely; nothing from the old one survives
+        assert set(app._work_spells) == {"term-0032"}  # unknown + BUSY

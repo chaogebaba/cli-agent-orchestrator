@@ -12,7 +12,10 @@ today (root repo ``scripts/fleet-tui.py:598-619``), verbatim.
 **Renderer memory (D2).** Widgets read the current :class:`FleetState` only.
 Nothing per-terminal is derived across fetches, so #439's sticky-latch class
 cannot recur here. IDLE comes from tmux ``window_activity`` on each tick, as
-the script does (``fleet-tui.py:115-118``).
+the script does (``fleet-tui.py:115-118``). The single exception is the
+working-elapsed readout below, which remembers when a spell started because no
+server field records it; it never feeds ``status`` and a row that stops working
+drops its spell on the next frame, so it cannot latch.
 
 **Side effects (AC4).** Every subprocess goes through one injectable runner.
 Exactly one of them mutates anything: ``tmux select-window`` on jump
@@ -46,6 +49,15 @@ and ``test_the_sections_are_in_the_scripts_order_with_the_peek_last`` is what
 holds it there. Chrome is the script's too: the ``▌`` mark opens all three
 section titles, the accents are its two (``:62-65``), and no widget draws a
 border of its own, so the only horizontal lines on screen are the two rules.
+
+**Working-elapsed readout (same round).** "How long has this subagent been
+working?" is answered in the IDLE column: a working row renders ``● 12m`` in
+green instead of a window-activity age that is always near zero while output is
+flowing. The column keeps its name, its position and its idle behaviour for
+every other row. No server field carries the spell's start today — see the
+readout's own note below for the ``status_since`` key that should — so it is
+measured from the first poll that saw the row working and a spell already
+running when the app started renders ``12m+``.
 """
 
 from __future__ import annotations
@@ -60,7 +72,19 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Final, List, Mapping, Sequence, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Final,
+    List,
+    Mapping,
+    NamedTuple,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 # The Textual dependency is the optional `fleet` extra (D1/B10): a server-only
 # install carries no TUI library. Importing this module without it is a clean
@@ -96,7 +120,16 @@ from cli_agent_orchestrator.tui.fetcher import FETCH_INTERVAL, fetch_json, run_f
 from cli_agent_orchestrator.tui.fleet_state import FleetState, TerminalState
 from cli_agent_orchestrator.tui.status_cell import status_cell
 
-__all__ = ["FleetApp", "FleetUpdated", "hint_text", "main", "render_once"]
+__all__ = [
+    "FleetApp",
+    "FleetUpdated",
+    "WorkSpell",
+    "hint_text",
+    "is_working",
+    "main",
+    "render_once",
+    "work_age_cell",
+]
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9889"
 SCRATCH = Path("/data/cao-scratch")
@@ -170,6 +203,49 @@ FALLBACK_WIDTH: Final[int] = 80
 #: How many lines of section chrome the peek pane spends before the capture:
 #: the banner and the double rule.
 PEEK_CHROME_LINES: Final[int] = 2
+
+# ─── Working-elapsed readout (F702 #557 "look" round) ─────────────────────────
+# "I want to see how long a subagent has been working, if it is working." The
+# IDLE column answers that for a working seat: `● 12m` instead of a window-
+# activity age that is always near zero while output is flowing.
+#
+# **No server field carries this today.** ``build_fleet()``
+# (``services/fleet_service.py:250-300``) publishes no status-transition
+# timestamp: the closest key, ``since_last_input``, is derived from the row's
+# ``last_active``, which ``clients/database.py:4842`` writes *only on input
+# delivery* (``send_input``/``send_message``/``send_special_key``). It therefore
+# misses a seat a human drove by typing into the pane, which is exactly why
+# F467 marks it unreliable and why the retiring script refuses it outright
+# (``fleet-tui.py:21-22``). The field the server should grow is
+# ``status_since``: the UTC stamp at which ``StatusMonitor`` last changed a
+# terminal's fused status, published next to ``status`` in the projection. With
+# it this readout becomes exact and this whole cross-fetch derivation deletes.
+#
+# Until then the spell is measured from the first poll that saw the row
+# working, so it is approximate in one direction only — never longer than the
+# truth — and a spell already running when the app started renders with a
+# trailing ``+`` to say so.
+#
+# **On D2.** This is the module's one piece of per-terminal cross-fetch state.
+# It cannot recreate #439's sticky latch: it never feeds ``status``, a row that
+# stops working drops its spell on the very next frame, and a row that leaves
+# the fleet drops it too. The invariant it must keep is "no spell outlives the
+# working state that created it", which
+# ``test_a_finished_spell_is_dropped_and_restarts_from_zero`` pins.
+#: The status that means a turn is open.
+WORKING_STATUS: Final[str] = "processing"
+#: The provider condition that can mean the same, where the status is silent.
+WORKING_CONDITION: Final[str] = "BUSY"
+#: Statuses that positively assert the seat is at rest. A ``BUSY`` condition on
+#: one of these is a stale provider flag the fusion has overtaken, never a
+#: reason to start a clock — see :func:`is_working`.
+RESTING_STATUSES: Final[frozenset[str]] = frozenset({"idle", "waiting_user_answer", "error"})
+#: The glyph the STATUS cell already uses for a working seat (``:236``).
+WORKING_GLYPH: Final[str] = "●"
+#: Appended when the spell started before this app was watching.
+WORK_APPROX_SUFFIX: Final[str] = "+"
+#: The IDLE cell's style while a seat is working — the status colour.
+STYLE_WORKING: Final[str] = "green"
 
 #: The tmux verbs this app is allowed to run. Only ``select-window`` mutates
 #: anything; the rest are reads (AC4).
@@ -335,6 +411,61 @@ def idle_style(seconds: float | None) -> str:
     return ""
 
 
+def is_working(term: TerminalState) -> bool:
+    """Whether this seat is *currently working*, for the IDLE cell's purposes.
+
+    The fused ``status`` decides, and the ``BUSY`` condition (F611 #467) breaks
+    only the ties it leaves:
+
+    * ``processing`` is working, full stop;
+    * ``idle``, ``waiting_user_answer`` and ``error`` are **not**, whatever the
+      condition says. These are positive statements of rest, and a live fleet
+      does show ``◌ idle [BUSY]`` — a provider BUSY flag the fusion has already
+      overtaken. Trusting it there would put a climbing green clock next to the
+      word "idle" one column over;
+    * ``completed``, ``unknown`` and ``render_uncertain`` are not statements of
+      rest — the turn ended, or could not be read — so a ``BUSY`` condition is
+      allowed to mean the turn is in fact still open. This is the case that
+      matters: a working ``claude_code`` seat regularly renders
+      ``· completed [BUSY]`` while the fusion catches up, and an operator asking
+      "how long has this been going" wants the answer then too.
+
+    The rule's whole point is that this readout never contradicts the STATUS
+    cell beside it.
+    """
+    if term.status == WORKING_STATUS:
+        return True
+    if term.status in RESTING_STATUSES:
+        return False
+    return term.condition == WORKING_CONDITION
+
+
+def work_age_cell(seconds: float, exact: bool) -> str:
+    """The IDLE cell of a working row: ``● 12m``, or ``● 12m+`` when approximate.
+
+    The glyph is the STATUS cell's own ``●`` (``fleet-tui.py:236``), so the cell
+    says what it is measuring without the column having to be renamed. ``+``
+    marks a lower bound: the row was already working the first time this app
+    saw it, so the spell started before the readout did.
+    """
+    return f"{WORKING_GLYPH} {fmt_age(seconds)}" + ("" if exact else WORK_APPROX_SUFFIX)
+
+
+class WorkSpell(NamedTuple):
+    """One unbroken working spell of one terminal, as this app observed it.
+
+    Attributes:
+        started_at: the clock reading of the first poll that saw the spell.
+        exact: ``True`` when the app had already seen this row *not* working, so
+            the start is real to within one poll interval. ``False`` when the
+            row was working the first time it was ever seen, which makes the
+            elapsed time a lower bound.
+    """
+
+    started_at: float
+    exact: bool
+
+
 def read_labels(path: Path) -> Dict[str, str]:
     """``fleet-labels.tsv`` as ``{terminal_id: label}`` (``fleet-tui.py:172-182``).
 
@@ -427,21 +558,31 @@ def row_values(
     ages: Mapping[str, float],
     *,
     with_new_columns: bool = False,
+    work_cells: Mapping[str, str] | None = None,
 ) -> List[str]:
     """Every cell of one row as plain text, gutter excluded.
 
     Shared by the Textual table (which wraps each value in a styled
     :class:`~rich.text.Text`) and by ``--once``, so the two renderings cannot
     disagree about what a row says.
+
+    ``work_cells`` maps a terminal id to its working-elapsed readout (from
+    :func:`work_age_cell`). An id present there takes over the IDLE cell: the
+    window-activity age of a working seat is always near zero, because the seat
+    is producing the output that resets it, so it answers the wrong question.
+    ``--once`` has no fetch history and passes nothing, leaving idle ages.
     """
     default_label = "(supervisor seat)" if not term.parent_id else "(unlabeled)"
+    idle = fmt_age(ages.get(window_key(term)))
+    if work_cells is not None and term.id in work_cells:
+        idle = work_cells[term.id]
     values = [
         window_key(term),
         term.id,
         term.profile or "?",
         labels.get(term.id, default_label)[:40],
         status_cell(status_row(term)).plain,
-        fmt_age(ages.get(window_key(term))),
+        idle,
     ]
     if with_new_columns:
         values += [
@@ -454,13 +595,23 @@ def row_values(
     return values
 
 
-def row_styles(term: TerminalState, ages: Mapping[str, float], labelled: bool) -> List[str]:
+def row_styles(
+    term: TerminalState,
+    ages: Mapping[str, float],
+    labelled: bool,
+    *,
+    working: bool = False,
+) -> List[str]:
     """The per-cell styles of one row, in the order of :func:`row_values`.
 
     The colour language of ``fleet-tui.py:410-415``: a supervisor row is
     magenta with a bold id, a worker row has a dim window index and a cyan id,
     an unlabeled TASK is dim, and IDLE is coloured by age. STATUS carries its
     own style from :func:`status_cell`, so its slot here is empty.
+
+    ``working`` swaps the IDLE cell's age colouring for the status colour, so a
+    working-elapsed readout is green next to its green ``● working`` — the age
+    thresholds mean nothing for a number that counts up rather than down.
     """
     is_supervisor = not term.parent_id
     return [
@@ -469,7 +620,7 @@ def row_styles(term: TerminalState, ages: Mapping[str, float], labelled: bool) -
         STYLE_SUPERVISOR if is_supervisor else "",  # PROFILE
         "" if labelled else STYLE_DIM,  # TASK
         "",  # STATUS — status_cell owns it
-        idle_style(ages.get(window_key(term))),  # IDLE
+        STYLE_WORKING if working else idle_style(ages.get(window_key(term))),  # IDLE
     ]
 
 
@@ -600,6 +751,12 @@ class FleetApp(App[None]):
         #: Rendered column widths of the current frame, gutter first — the
         #: single source the table and its ``#table-head`` line both size from.
         self._widths: List[int] = []
+        #: Open working spells, ``{terminal_id: WorkSpell}``. The module's only
+        #: per-terminal cross-fetch state; see the readout's note above.
+        self._work_spells: Dict[str, WorkSpell] = {}
+        #: Ids this app has seen *not* working at least once, which is what
+        #: makes a later spell's start exact rather than a lower bound.
+        self._seen_resting: Set[str] = set()
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -826,6 +983,43 @@ class FleetApp(App[None]):
     def visible_terminals(self) -> List[TerminalState]:
         return sort_terminals(self.state.terminals)
 
+    # ── working-elapsed readout ──────────────────────────────────────────────
+
+    def track_work_spells(self, terminals: Sequence[TerminalState]) -> Dict[str, WorkSpell]:
+        """Open, keep or close each row's working spell against this snapshot.
+
+        Called once per frame, before the rows are built. Three rules, and the
+        second and third are what keep this from ever latching (D2):
+
+        * a row that is working and has no open spell opens one at the current
+          clock, marked *exact* only if this app has already seen the same row
+          not working;
+        * a row that is **not** working drops its spell immediately, so the next
+          spell restarts from zero rather than resuming the last one;
+        * a row that has left the fleet drops its spell and its history.
+        """
+        now = self._now()
+        present = {term.id for term in terminals}
+        for term in terminals:
+            if not is_working(term):
+                self._work_spells.pop(term.id, None)
+                self._seen_resting.add(term.id)
+                continue
+            if term.id not in self._work_spells:
+                self._work_spells[term.id] = WorkSpell(now, term.id in self._seen_resting)
+        for gone in set(self._work_spells) - present:
+            del self._work_spells[gone]
+        self._seen_resting &= present
+        return self._work_spells
+
+    def work_cells(self) -> Dict[str, str]:
+        """``{terminal_id: "● 12m"}`` for every row with an open spell."""
+        now = self._now()
+        return {
+            terminal_id: work_age_cell(max(0.0, now - spell.started_at), spell.exact)
+            for terminal_id, spell in self._work_spells.items()
+        }
+
     def row_cells(
         self,
         term: TerminalState,
@@ -840,8 +1034,14 @@ class FleetApp(App[None]):
         restored colour language is asserted.
         """
         if values is None:
-            values = row_values(term, labels, ages, with_new_columns=self.show_new_columns)
-        styles = row_styles(term, ages, term.id in labels)
+            values = row_values(
+                term,
+                labels,
+                ages,
+                with_new_columns=self.show_new_columns,
+                work_cells=self.work_cells(),
+            )
+        styles = row_styles(term, ages, term.id in labels, working=is_working(term))
         cells: List[Any] = [Text(MARKER_BLANK, style=STYLE_MARKER)]
         for index, value in enumerate(values):
             if index == PARITY_COLUMNS.index("STATUS"):
@@ -878,8 +1078,17 @@ class FleetApp(App[None]):
         labels = read_labels(self._labels_path)
         ages = self.window_ages()
         rows = self.visible_terminals()
+        self.track_work_spells(rows)
+        work_cells = self.work_cells()
         values = [
-            row_values(term, labels, ages, with_new_columns=self.show_new_columns) for term in rows
+            row_values(
+                term,
+                labels,
+                ages,
+                with_new_columns=self.show_new_columns,
+                work_cells=work_cells,
+            )
+            for term in rows
         ]
         self._install_columns(self.frame_widths(values))
         self.refresh_table_head()
