@@ -60,10 +60,18 @@ def main() -> int:
             or os.environ.get("CAO_API_BASE_URL")
             or resolve_endpoint()
         ).rstrip("/")
-        headers = {}
+        headers: dict[str, str] = {}
         token = get_local_bearer()
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        # F707 (#562): the server binds this edge to the ROUTE terminal via the
+        # existing F332 per-terminal token, so scope alone can no longer drain a
+        # foreign inbox. Every CAO terminal carries its own token in the
+        # environment; absent it the request is refused 403 (fail-open at the
+        # hook level — the warning below is printed and the seat is unharmed).
+        terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+        if terminal_token:
+            headers["X-CAO-Terminal-Token"] = terminal_token
         payload = {
             "terminal_id": terminal_id,
             "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

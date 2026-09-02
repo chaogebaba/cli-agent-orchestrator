@@ -258,6 +258,9 @@ _F352_ENFORCEMENT_MODULES = frozenset(
     (
         "test_inbox_sender_token",
         "test_f352_sender_token_injection",
+        # F707 (#562): the inbox drain edges reuse verify_sender_token to bind
+        # the caller to the route terminal — that module exercises enforcement.
+        "test_f707_drain_authz",
     )
 )
 

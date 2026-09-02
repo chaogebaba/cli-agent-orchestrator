@@ -4891,12 +4891,71 @@ class InboxDrainRequest(BaseModel):
     ts: Optional[str] = None
 
 
+def _require_caller_is_route_terminal(
+    terminal_id: str,
+    request: Request,
+    scopes: List[str],
+    *,
+    code: str,
+) -> None:
+    """F707 (#562): bind the caller of an inbox drain edge to the route terminal.
+
+    Before this guard the drain edges authorized on token SCOPE alone
+    (``SCOPE_WRITE|SCOPE_ADMIN``): ``body.terminal_id`` had to equal the route,
+    but nothing tied the CALLER to it, so any write-scope holder could drain any
+    terminal's inbox (#562 sweep, 2026-09-02).
+
+    The caller identity reused here is the EXISTING per-terminal one — the F332
+    ``X-CAO-Terminal-Token`` header, verified against ``TerminalModel.auth_token``
+    with ``verify_sender_token`` (constant-time). Every CAO terminal already has
+    the value in its environment as ``$CAO_TERMINAL_TOKEN``, so the drain/ack
+    hooks can present it with no new plumbing, and a worker — which holds only
+    its OWN token — can no longer drain the seat.
+
+    Deliberately NOT mirrored from the inbox POST path: that endpoint lets a
+    valid operator bearer bypass the terminal-token check. The drain hooks send
+    exactly that bearer, so mirroring the bypass would make this guard vacuous.
+    The ONLY bypass kept is ``SCOPE_ADMIN`` **while auth is actually enabled** —
+    i.e. an IdP-issued admin token. In the default-off posture every caller is
+    handed the full scope set (``security/auth.py``), so an unconditional admin
+    bypass would likewise disable the guard on exactly the deployment that
+    needs it.
+    """
+
+    if is_auth_enabled() and SCOPE_ADMIN in scopes:
+        return
+    presented = request.headers.get("x-cao-terminal-token")
+    with SessionLocal() as _f707_db:
+        from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
+
+        ok, _error_code = verify_sender_token(_f707_db, terminal_id, presented)
+    if ok:
+        return
+    logger.warning(
+        "inbox drain edge rejected: caller not bound to route terminal=%s presented=%s",
+        terminal_id,
+        "absent" if not presented else "mismatch",
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": code,
+            "message": (
+                "X-CAO-Terminal-Token must carry the route terminal's own token "
+                "($CAO_TERMINAL_TOKEN inside that terminal). A terminal may drain "
+                "only its own inbox."
+            ),
+            "retryable": False,
+        },
+    )
+
+
 @app.post("/terminals/{terminal_id}/inbox/drain")
 async def supervisor_drain_endpoint(
     terminal_id: TerminalId,
     body: InboxDrainRequest,
     request: Request,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
     """F543 D22: the overlay-composed supervisor-drain hook's server edge.
 
@@ -4915,6 +4974,7 @@ async def supervisor_drain_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="invalid_inbox_drain: terminal_id does not match route",
         )
+    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-CALLER")
     try:
         await asyncio.to_thread(
             inbox_service.deliver_pending, terminal_id, registry=get_plugin_registry(request)
@@ -4928,7 +4988,8 @@ async def supervisor_drain_endpoint(
 async def supervisor_drain_ack_endpoint(
     terminal_id: TerminalId,
     body: InboxDrainRequest,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    request: Request,
+    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
     """F543 D22: the paired ack edge for the overlay-composed supervisor hooks.
 
@@ -4944,6 +5005,7 @@ async def supervisor_drain_ack_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="invalid_inbox_drain_ack: terminal_id does not match route",
         )
+    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-ACK-CALLER")
     logger.debug("d22 supervisor drain-ack terminal=%s", terminal_id)
     return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
 
