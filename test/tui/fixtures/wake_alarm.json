@@ -1,0 +1,62 @@
+{
+  "session_name": "f702-wake-alarm",
+  "terminals": [
+    {
+      "id": "term-0031",
+      "profile": "chao_supervisor",
+      "provider": "claude_code",
+      "window_index": 0,
+      "window_name": "supervisor",
+      "parent_id": null,
+      "depth": 0,
+      "orphan": false,
+      "status": "idle",
+      "condition": null,
+      "fusion_changed": false,
+      "fusion_reason": null,
+      "delegating": false,
+      "children_count": 0,
+      "init_state": "ready",
+      "init_health": "ready",
+      "since_last_input": 1800.0,
+      "lifecycle": "persistent",
+      "resolved_model": "claude-opus-5",
+      "reparented_from": null,
+      "config_stale": false,
+      "wedge_suspect": false
+    },
+    {
+      "id": "term-0032",
+      "profile": "cline_grunt",
+      "provider": "cline",
+      "window_index": 2,
+      "window_name": "cline_grunt",
+      "parent_id": "term-0031",
+      "depth": 1,
+      "orphan": false,
+      "status": "unknown",
+      "condition": "BUSY",
+      "fusion_changed": false,
+      "fusion_reason": null,
+      "delegating": false,
+      "children_count": 0,
+      "init_state": "ready",
+      "init_health": "ready",
+      "since_last_input": 600.0,
+      "lifecycle": "ephemeral",
+      "resolved_model": "cline-pass/glm-5.3",
+      "reparented_from": null,
+      "config_stale": true,
+      "wedge_suspect": true
+    }
+  ],
+  "wake_exhaustion_alarms": [
+    {
+      "mailbox_id": 41,
+      "session_name": "f702-wake-alarm",
+      "role": "supervisor",
+      "stuck_row_id": 9182,
+      "wake_streak": 3
+    }
+  ]
+}

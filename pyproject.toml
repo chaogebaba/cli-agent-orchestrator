@@ -104,12 +104,20 @@ otel = [
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
+# F702 (#557) D1/B10: the Textual fleet TUI (`cao-fleet`). Optional so a
+# server-only install carries no TUI library.
+fleet = [
+    "textual>=8,<9",
+]
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
+# F702 (#557) D1: the fleet TUI. Needs the `fleet` extra for `textual`;
+# without it main() exits 1 with an install hint rather than a traceback.
+"cao-fleet" = "cli_agent_orchestrator.tui.fleet_app:main"
 
 [project.entry-points."cao.plugins"]
 claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"
@@ -377,6 +385,10 @@ dev = [
     "pytest-timeout>=2.3.1",
     "pytest-repeat>=0.9.3",
     "types-psutil>=5.9.0",
+    # F702 (#557): the `fleet` extra, dev-required for the same reason as the
+    # two above -- test/tui/test_fleet_app.py drives the app with Textual's
+    # own pilot and must not be a permanently-skipped hole in the baseline.
+    "textual>=8,<9",
 ]
 
 [tool.black]

@@ -192,9 +192,10 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         orphan = bool(parent_id and (parent is None or parent_dead))
         observation = status_monitor.get_boundary_observation(row["id"])
         status = observation.status
-        # F506 §8: surface the fusion evidence so the fleet TUI renders <status>*
-        # when the fused status differs from what the provider published, and the
-        # reason in the row detail. fusion_changed is captured BEFORE the ERROR
+        # F506 §8: surface the fusion evidence, rendered by the `cao-fleet` TUI's
+        # new columns (F702) — `*` when the fused status differs from what the
+        # provider published, and the reason in the row detail. fusion_changed is
+        # captured BEFORE the ERROR
         # overrides below so the operator sees "the fusion demoted this", not the
         # quarantine projection.
         fusion_changed = bool(getattr(observation, "fusion_changed", False))
@@ -247,17 +248,20 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "orphan": orphan,
                 "status": status.value,
                 # F611 (#467): typed provider condition label (CAPPED/BLOCKED/
-                # AUTH/…) or None. The fleet TUI renders it in the condition
-                # cell; distinct from `status`.
+                # AUTH/…) or None. Rendered by the `cao-fleet` TUI's new columns
+                # (F702) in `COND`, and appended to the status cell; distinct
+                # from `status`.
                 "condition": condition,
-                # F506 §8: the fleet TUI status cell renders `<status>*` when
-                # fusion_changed is True (the fused status differs from the
-                # provider-published one); fusion_reason shows in the row detail.
+                # F506 §8: rendered by the `cao-fleet` TUI's new columns (F702)
+                # — `*` is set when fusion_changed is True (the fused status
+                # differs from the provider-published one); fusion_reason shows
+                # in the row detail.
                 "fusion_changed": fusion_changed,
                 "fusion_reason": fusion_reason,
                 # F568 D12c: additive sibling keys — the raw `status` enum is
-                # unchanged (no new persisted status value). The TUI renders
-                # `delegating (N)` when `delegating` is True.
+                # unchanged (no new persisted status value). Rendered by the
+                # `cao-fleet` TUI's new columns (F702): `DELEG`, and
+                # `delegating (N)` in the status cell when `delegating` is True.
                 "delegating": delegating,
                 "children_count": children_count,
                 "init_state": row.get("init_state"),
