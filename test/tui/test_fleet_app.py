@@ -15,8 +15,9 @@ from typing import Any, Dict, List, Sequence
 
 import pytest
 from rich.text import Text
+from textual.containers import Vertical
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable, RichLog, Static
+from textual.widgets import DataTable, Static
 
 from cli_agent_orchestrator.tui.columns import (
     ALL_COLUMNS,
@@ -29,22 +30,34 @@ from cli_agent_orchestrator.tui.columns import (
     PARITY_VIEW,
 )
 from cli_agent_orchestrator.tui.fleet_app import (
+    ACCENT_SELECTION,
+    GUTTER_WIDTH,
     KEY_HINTS,
+    PEEK_RULE_GLYPH,
+    RULE_GLYPH,
+    SECTION_MARK,
+    STYLE_HINT_KEY,
+    STYLE_HINT_LABEL,
     FleetApp,
+    column_widths,
     detect_tmux_session,
     find_events_sync_script,
     fmt_age,
     format_frame,
+    hint_renderable,
     hint_text,
     idle_style,
+    is_working,
     parse_args,
     read_events,
     read_labels,
     render_once,
     row_values,
     sort_terminals,
+    work_age_cell,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState
+from cli_agent_orchestrator.tui.status_cell import STYLE_QUIET_TAG, status_cell
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -407,7 +420,7 @@ async def test_fetch_timeout_marker_keeps_rows_and_grows_the_stale_badge(tmp_pat
         await advance(pilot, feed, 2)
         assert app.table.row_count == 3  # rows kept, not cleared
         badge = app.badge_text()
-        assert badge.startswith("CAO fleet · f702-test · ")
+        assert badge.startswith("▌ CAO fleet · f702-test  ")
         assert " · 2 workers · fetch " in badge
         assert " · stale " in badge
         assert marker["error"] in str(app.state.last_error)
@@ -602,12 +615,26 @@ async def test_s_writes_a_snapshot_under_the_snapshot_dir(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_events_log_tail_lands_in_the_rich_log(tmp_path: Path) -> None:
+async def test_events_log_tail_lands_in_the_recent_section(tmp_path: Path) -> None:
     app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\nbravo\ncharlie\n")
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        assert app.query_one("#events", RichLog).lines
+        body = str(app.query_one("#events", Static).render())
+        for line in ("alpha", "bravo", "charlie"):
+            # each line is indented two spaces, as the script writes them
+            assert f"  {line}" in body
+        assert app.query_one("#events-title", Static).display is True
         assert read_events(app._events_path) == ["alpha", "bravo", "charlie"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_events_feed_hides_the_whole_recent_section(tmp_path: Path) -> None:
+    """The script's ``if ev:`` guard: no feed, no title and no empty box."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.query_one("#events-title", Static).display is False
+        assert app.query_one("#events", Static).display is False
 
 
 @pytest.mark.asyncio
@@ -783,9 +810,14 @@ async def test_idle_cells_are_coloured_by_age(tmp_path: Path) -> None:
         idle = PARITY_VIEW.index("IDLE")
         assert plain(app.table, 0, idle) == "10m"
         assert cell(app.table, 0, idle).style == "yellow"
-        fresh = plain(app.table, 1, idle)
+        # row 2 is term-0003 (completed). Row 1 is term-0002, which is working,
+        # and a working row's IDLE cell carries the elapsed-work readout in the
+        # status colour instead of a window-activity age.
+        fresh = plain(app.table, 2, idle)
         assert fresh.endswith("s") and int(fresh[:-1]) < 5
-        assert cell(app.table, 1, idle).style == "dim"
+        assert cell(app.table, 2, idle).style == "dim"
+        assert plain(app.table, 1, idle).startswith("●")
+        assert cell(app.table, 1, idle).style == "green"
 
 
 # ── parity: the ▶ selection marker (ranked gap 4) ───────────────────────────
@@ -950,7 +982,9 @@ async def test_the_header_carries_session_clock_worker_count_latency_and_livenes
         await settle(pilot, feed)
         badge = app.badge_text()
         clock = time.strftime("%H:%M:%S", time.localtime(feed.clock))
-        assert badge == f"CAO fleet · f702-test · {clock} · 2 workers · fetch 0ms · live"
+        # The script's header line, verbatim: the ▌ section mark, the accented
+        # title, two spaces, then the dim tail (fleet-tui.py:337-339).
+        assert badge == f"▌ CAO fleet · f702-test  {clock} · 2 workers · fetch 0ms · live"
 
 
 @pytest.mark.asyncio
@@ -1120,3 +1154,256 @@ def test_row_values_is_the_single_source_of_the_row_text() -> None:
         "◌ idle",
         "-",
     ]
+
+
+# ── the section layout contract (F702 #557 "look" round) ─────────────────────
+#
+# The retiring script's section order, top to bottom (fleet-tui.py:336-450):
+# header, blank, table, blank, recent, blank, status+hints, blank, peek. The
+# peek is LAST. These tests are the layout's only guard — a widget reordered in
+# `compose` (the peek back into the middle, most of all) fails here and only
+# here.
+
+#: Widget ids in the order `compose` yields them.
+LAYOUT_ORDER = [
+    "badge",
+    "alert",
+    "table-head",
+    "table-rule",
+    "fleet",
+    "events-title",
+    "events",
+    "debug",
+    "flash",
+    "hints",
+    "peek",
+]
+
+
+@pytest.mark.asyncio
+async def test_the_sections_are_in_the_scripts_order_with_the_peek_last(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\n")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        ids = [child.id for child in app.query_one(Vertical).children]
+        assert ids == LAYOUT_ORDER
+        assert ids[-1] == "peek", "the peek is the last section, never the middle"
+        # and it is below the table and the recent feed on screen, not just in
+        # the widget list
+        peek = app.query_one("#peek", Static)
+        for above in ("#fleet", "#events", "#hints"):
+            assert peek.region.y > app.query_one(above).region.y
+
+
+@pytest.mark.asyncio
+async def test_every_section_title_carries_the_section_mark(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\n")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.badge_text().startswith(f"{SECTION_MARK} CAO fleet")
+        assert str(app.query_one("#events-title", Static).render()).startswith(
+            f"{SECTION_MARK} recent"
+        )
+        term = app.selected_terminal()
+        assert term is not None
+        assert app.peek_title(term).startswith(f"{SECTION_MARK} peek")
+
+
+@pytest.mark.asyncio
+async def test_the_table_header_row_and_its_rule_sit_above_the_rows(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        head = str(app.query_one("#table-head", Static).render())
+        rule = str(app.query_one("#table-rule", Static).render())
+        assert head.startswith("  WIN")
+        for name in PARITY_COLUMNS:
+            assert name in head
+        assert set(rule) == {RULE_GLYPH}
+        assert len(rule) == app.frame_width()
+        # header cells line up with the table's own columns
+        widths = [int(column.width) for column in app.table.columns.values()]
+        assert head.index("ID") == widths[0] + widths[1]
+
+
+@pytest.mark.asyncio
+async def test_the_peek_banner_is_a_title_over_a_full_width_double_rule(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        banner = app.peek_banner(app.selected_terminal()).plain.splitlines()
+        assert banner[0].startswith(f"{SECTION_MARK} peek · ")
+        assert set(banner[1]) == {PEEK_RULE_GLYPH}
+        assert len(banner[1]) == app.frame_width()
+        # the banner is the head of what the peek widget actually shows
+        assert str(app.query_one("#peek", Static).render()).startswith(banner[0])
+
+
+@pytest.mark.asyncio
+async def test_the_table_columns_carry_the_scripts_two_space_gutter(tmp_path: Path) -> None:
+    """No DataTable cell padding: the widths themselves hold the gutter."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.table.cell_padding == 0
+        assert app.table.show_header is False
+        assert app.table.zebra_stripes is False
+        values = [row_values(t, {}, {}) for t in app.visible_terminals()]
+        widths = app.frame_widths(values)
+        assert widths[0] == GUTTER_WIDTH
+        # every named column is its widest cell plus the two-space gutter,
+        # except the last, which is stretched to the edge of the screen
+        expected = column_widths(PARITY_COLUMNS, values)
+        assert widths[1:-1] == expected[:-1]
+        assert sum(widths) == app.frame_width()
+
+
+def test_the_selection_bar_uses_the_scripts_accent_not_the_textual_theme() -> None:
+    """DataTable's own DEFAULT_CSS would repaint the bar in the theme accent."""
+    assert "#fleet > .datatable--cursor" in FleetApp.CSS
+    assert ACCENT_SELECTION in FleetApp.CSS
+
+
+def test_the_hint_line_is_bold_key_dim_label() -> None:
+    line = hint_renderable()
+    assert line.plain == hint_text()
+    styles = {str(span.style) for span in line.spans}
+    assert STYLE_HINT_KEY in styles and STYLE_HINT_LABEL in styles
+
+
+def test_a_busy_tag_is_dimmed_but_the_condition_still_owns_the_cell_style() -> None:
+    cell = status_cell({"status": "processing", "condition": "BUSY"})
+    assert cell.plain == "● working [BUSY]"
+    assert cell.style == "green"  # the D4/B12 contract is untouched
+    dimmed = [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG]
+    assert len(dimmed) == 1
+    assert cell.plain[dimmed[0].start : dimmed[0].end] == " [BUSY]"
+
+
+def test_a_loud_condition_tag_is_not_dimmed() -> None:
+    cell = status_cell({"status": "idle", "condition": "CAPPED"})
+    assert cell.style == "bold red"
+    assert [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG] == []
+
+
+# ── the working-elapsed readout (F702 #557 "look" round) ─────────────────────
+#
+# "I want to see how long a subagent has been working, if it is working."
+# No server field carries the spell's start (see the readout's note in
+# fleet_app.py), so it is measured from the first poll that saw the row working
+# and marked `+` while that start is only a lower bound.
+
+
+def resting(payload: Dict[str, Any], terminal_id: str) -> Dict[str, Any]:
+    """The same payload with one terminal no longer working."""
+    copy = json.loads(json.dumps(payload))
+    for term in copy["terminals"]:
+        if term["id"] == terminal_id:
+            term["status"] = "idle"
+            term["condition"] = None
+    return copy
+
+
+def test_is_working_covers_both_signals() -> None:
+    state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
+    by_id = {term.id: term for term in state.terminals}
+    assert is_working(by_id["term-0002"]) is True  # status processing
+    assert is_working(by_id["term-0001"]) is False  # idle
+    assert is_working(by_id["term-0003"]) is False  # completed
+    # `unknown` is not a statement of rest, so BUSY breaks the tie
+    busy = FleetState.from_dict(load_payload("wake_alarm"), fetched_at=1.0)
+    assert is_working(next(t for t in busy.terminals if t.id == "term-0032")) is True
+
+
+def test_a_busy_flag_never_outranks_a_status_that_says_the_seat_is_resting() -> None:
+    """A live fleet shows `◌ idle [BUSY]`: a stale provider flag, not a turn.
+
+    The readout must never put a climbing clock next to the word "idle" one
+    column over, so `idle`, `waiting_user_answer` and `error` win outright.
+    """
+    payload = load_payload("healthy")
+    for status, expected in (
+        ("idle", False),
+        ("waiting_user_answer", False),
+        ("error", False),
+        # not statements of rest — the turn ended, or could not be read
+        ("completed", True),
+        ("unknown", True),
+        ("render_uncertain", True),
+        ("processing", True),
+    ):
+        raw = json.loads(json.dumps(payload))
+        raw["terminals"] = [raw["terminals"][1]]
+        raw["terminals"][0]["status"] = status
+        raw["terminals"][0]["condition"] = "BUSY"
+        term = FleetState.from_dict(raw, fetched_at=1.0).terminals[0]
+        assert is_working(term) is expected, status
+
+
+def test_work_age_cell_marks_an_unbounded_spell() -> None:
+    assert work_age_cell(0.0, True) == "● 0s"
+    assert work_age_cell(720.0, True) == "● 12m"
+    # `+` means "at least": the spell was already running when the app started
+    assert work_age_cell(720.0, False) == "● 12m+"
+
+
+@pytest.mark.asyncio
+async def test_a_working_row_shows_how_long_it_has_been_working(tmp_path: Path) -> None:
+    payload = load_payload("healthy")
+    app, feed, _ = make_app([payload, payload, payload], tmp_path, tick=60.0)
+    idle = PARITY_VIEW.index("IDLE")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        rows = [t.id for t in app.visible_terminals()]
+        working = rows.index("term-0002")
+        # already working when first seen, so the elapsed time is a lower bound
+        assert plain(app.table, working, idle) == "● 0s+"
+        assert cell(app.table, working, idle).style == "green"
+
+        await advance(pilot, feed, 2)
+        assert plain(app.table, working, idle) == "● 2m+"
+
+        # the rows that are not working keep their window-activity age
+        resting_row = rows.index("term-0003")
+        assert plain(app.table, resting_row, idle) == fmt_age(app._ages.get("3"))
+        assert not plain(app.table, resting_row, idle).startswith("●")
+
+
+@pytest.mark.asyncio
+async def test_a_finished_spell_is_dropped_and_restarts_from_zero(tmp_path: Path) -> None:
+    """The anti-latch invariant: a spell never outlives the work that opened it."""
+    payload = load_payload("healthy")
+    app, feed, _ = make_app([payload, resting(payload, "term-0002"), payload], tmp_path, tick=60.0)
+    idle = PARITY_VIEW.index("IDLE")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        working = [t.id for t in app.visible_terminals()].index("term-0002")
+        assert plain(app.table, working, idle) == "● 0s+"
+
+        # it stops working: the spell is dropped, not paused
+        await advance(pilot, feed)
+        assert "term-0002" not in app._work_spells
+        assert not plain(app.table, working, idle).startswith("●")
+
+        # it starts again: a new spell from zero, and now an exact one, because
+        # this app has seen the row resting
+        await advance(pilot, feed)
+        assert plain(app.table, working, idle) == "● 0s"
+        assert app._work_spells["term-0002"].exact is True
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_leaves_the_fleet_drops_its_spell(tmp_path: Path) -> None:
+    app, feed, _ = make_app(
+        [load_payload("healthy"), load_payload("wake_alarm")], tmp_path, tick=60.0
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert set(app._work_spells) == {"term-0002"}
+        await advance(pilot, feed)
+        # a different session's rows entirely; nothing from the old one survives
+        assert set(app._work_spells) == {"term-0032"}  # unknown + BUSY
