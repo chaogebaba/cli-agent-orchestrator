@@ -50,16 +50,39 @@ def _rule_name(item: dict[str, Any]) -> str:
 def _rule_id(fname: str, idx: int, item: dict[str, Any]) -> str:
     """Parametrize id: the rule's name, or ``<file>:rule<N>`` for a nameless
     rule so a single bad entry cannot KeyError the whole corpus away."""
+    if _is_malformed_doc(item):
+        return f"{fname}:doc"
     return _rule_name(item) or f"{fname}:rule{idx}"
 
 
-def _enabled_rules() -> list[tuple[str, int, dict[str, Any]]]:
-    """(file basename, 0-based index within the file, rule) for every enabled rule."""
+def _is_malformed_doc(item: dict[str, Any]) -> bool:
+    return "__malformed_document__" in item
+
+
+def _enabled_rules(rules_dir: Path | str | None = None) -> list[tuple[str, int, dict[str, Any]]]:
+    """(file basename, 0-based index within the file, rule) for every enabled rule.
+
+    Collection must NEVER raise, whatever the yaml decodes to: a truthy
+    non-list top level (scalar, mapping, ...) is not iterable/enumerable
+    safely, so each such file yields ONE sentinel entry
+    (``__malformed_document__``) that ``test_every_rule_is_named`` reports as
+    a named failure (``<file>:doc``) instead of a collection TypeError.
+    A null/empty file decodes to no rules (skips), as before.
+    """
     out: list[tuple[str, int, dict[str, Any]]] = []
-    for path in sorted(glob.glob(str(AUTO_ANSWERS_DIR / "*.yaml"))):
+    for path in sorted(glob.glob(str((Path(rules_dir) if rules_dir else AUTO_ANSWERS_DIR) / "*.yaml"))):
         try:
             raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
         except Exception:
+            continue
+        if not isinstance(raw, list):
+            out.append(
+                (
+                    os.path.basename(path),
+                    -1,
+                    {"__malformed_document__": f"top-level {type(raw).__name__}, expected a list of rules"},
+                )
+            )
             continue
         for idx, item in enumerate(raw):
             if isinstance(item, dict) and item.get("enabled", True):
@@ -77,8 +100,52 @@ def test_every_rule_is_named() -> None:
     ids, so it must fail HERE as one clear listing, not a collection KeyError."""
     nameless = [(fname, idx, item) for fname, idx, item in _RULES if not _rule_name(item).strip()]
     assert not nameless, "every enabled rule must have a non-empty 'name'; offenders: " + "; ".join(
-        f"{fname}:rule{idx} -> {str(item)[:60]}" for fname, idx, item in nameless
+        f"{_rule_id(fname, idx, item)} -> {str(item)[:60]}" for fname, idx, item in nameless
     )
+
+
+SHAPES_DIR = Path(__file__).parents[1] / "fixtures" / "auto_answers_corpus_shapes"
+
+# F704 #559 round 2: every non-list top-level yaml shape must be survived by
+# the loader — never a collection TypeError; each truthy non-list document
+# (scalar, mapping, ...) becomes ONE named failing test id <file>:doc via
+# test_every_rule_is_named; null/empty files decode to no rules (skip).
+_NON_LIST_CASES = [
+    pytest.param("scalar", "int", id="scalar"),
+    pytest.param("mapping", "dict", id="mapping"),
+]
+
+
+@pytest.mark.parametrize("fixture,decoded_type", _NON_LIST_CASES)
+def test_non_list_yaml_yields_one_named_failure_not_crash(
+    fixture: str, decoded_type: str
+) -> None:
+    """A truthy non-list top level must produce exactly one malformed sentinel
+    entry that names the file — not a collection crash."""
+    rules = _enabled_rules(SHAPES_DIR / fixture)
+    assert len(rules) == 1, f"expected exactly one sentinel entry for {fixture}, got {rules!r}"
+    fname, idx, item = rules[0]
+    assert _is_malformed_doc(item)
+    assert decoded_type in str(item)
+    assert fname == "rules.yaml"
+    assert _rule_id(fname, idx, item) == f"{fname}:doc"
+
+
+@pytest.mark.parametrize("fixture", ["null", "empty"], ids=["null", "empty"])
+def test_null_or_empty_yaml_decodes_to_no_rules(fixture: str) -> None:
+    """Null/empty files stay the historical behaviour: zero rules, tests skip."""
+    assert _enabled_rules(SHAPES_DIR / fixture) == []
+
+
+def test_nameless_rule_still_yields_named_entry() -> None:
+    """Existing nameless-rule behaviour is kept: one entry, no name, id
+    <file>:rule0 (fails test_every_rule_is_named, skipped elsewhere)."""
+    rules = _enabled_rules(SHAPES_DIR / "nameless")
+    assert len(rules) == 1
+    fname, idx, item = rules[0]
+    assert not _is_malformed_doc(item)
+    assert _rule_name(item) == ""
+    assert _rule_id(fname, idx, item) == f"{fname}:rule0"
 
 
 @pytest.mark.skipif(not _RULES, reason="no live auto-answers yaml present (clean checkout)")
