@@ -28,6 +28,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "FLEET_TERMINAL_ID",
     "Confidence",
     "DecisionKind",
     "EventDraft",
@@ -37,6 +38,26 @@ __all__ = [
     "AnyKind",
     "parse_kind",
 ]
+
+#: The ``terminal_id`` for a row that is about the FLEET, not about one
+#: terminal — ``probe.failed`` is the phase-1 case, since a probe that fails
+#: names no pane (B13: a failed call is not pane absence).
+#:
+#: A sentinel rather than a nullable column: ``worker_event.terminal_id`` is
+#: ``NOT NULL`` in the audit DDL and ``EventDraft`` requires a non-empty string,
+#: so fleet-wide rows need a value, and a reserved one keeps them filterable and
+#: greppable instead of hiding behind a NULL.
+#:
+#: It lives in ``core`` because the LAYERING leaves nowhere else. The producer
+#: that writes it is an adapter and the ``cao diag`` consumer that filters it
+#: sits in ``app``/``cli``, which the ``adapters-only-via-composition-root``
+#: contract forbids from importing ``adapters`` at all. A constant both sides
+#: must agree on, with no import path between them, is a core vocabulary
+#: constant — exactly like the enums below.
+#:
+#: The double-underscore prefix is deliberate: CAO terminal ids are hex session
+#: identifiers, so this can never collide with a real one.
+FLEET_TERMINAL_ID = "__fleet__"
 
 
 class Producer(StrEnum):
