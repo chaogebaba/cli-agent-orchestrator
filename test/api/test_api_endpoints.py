@@ -948,6 +948,31 @@ class TestGetSession:
         assert response.status_code == 500
         assert "Failed to get session" in response.json()["detail"]
 
+    def test_get_session_dispatches_via_to_thread(self, client):
+        """#558: session_service.get_session() calls status_monitor.get_status() once per
+        terminal in the session, which for a PROCESSING terminal can shell out to a real
+        tmux capture-pane subprocess (the stale-PROCESSING fallback) -- a session with N
+        processing terminals would fork N times inline on the event loop per request
+        otherwise, and the web UI polls this endpoint. Pin the asyncio.to_thread wrapping
+        directly: the tests above mock session_service entirely and cannot see HOW it was
+        called, so a regression back to a bare synchronous call would stay green."""
+        mock_session = {"id": "test-session", "windows": []}
+        with (
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.asyncio.to_thread", wraps=asyncio.to_thread
+            ) as mock_to_thread,
+        ):
+            mock_svc.get_session.return_value = mock_session
+            response = client.get("/sessions/test-session")
+            get_session_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] == mock_svc.get_session
+            ]
+
+        assert response.status_code == 200
+        assert get_session_calls, "session_service.get_session was never dispatched via to_thread"
+        assert get_session_calls[0].args[1] == "test-session"
+
 
 class TestDeleteSession:
     """Tests for DELETE /sessions/{session_name} endpoint."""
@@ -1262,6 +1287,11 @@ class TestGetTerminal:
             monitor.get_status.return_value = TerminalStatus.COMPLETED
             monitor.get_input_gen.return_value = 4
             monitor.get_status_gen.return_value = monitor_status_gen
+            # Fork: get_terminal also projects F611's `condition` field, typed
+            # Optional[str] on the wire model. A bare MagicMock there fails Terminal
+            # validation and the endpoint answers 404 before the generation mapping
+            # under test is ever compared.
+            monitor.get_condition.return_value = None
             response = client.get("/terminals/abcd1234")
 
         assert response.status_code == 200

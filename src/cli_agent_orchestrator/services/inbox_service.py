@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Dict, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
 
@@ -2217,6 +2217,15 @@ class InboxService:
         When a plugin registry is supplied, the originating sender and a
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
+
+        Safe to call from any thread. Upstream #712 added a BLOCKING per-terminal
+        lock around this whole method for the same read→mark→send race; this fork
+        keeps its own non-blocking ``get_delivery_lock`` exclusion below instead,
+        which is stronger for the case that matters here: a second caller arriving
+        mid-delivery SKIPS the wake and bumps the wake generation rather than
+        queueing behind the first and delivering a second time
+        (test_message_trace_inbox_matrix::
+        test_waiter_queued_during_ambiguous_settlement_skips_same_wake).
         """
         # F339: skip delivery for terminals already abandoned as ghosts.
         if self._f339_is_abandoned(terminal_id):

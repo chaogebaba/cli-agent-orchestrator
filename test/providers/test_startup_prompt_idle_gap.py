@@ -77,6 +77,9 @@ class TestClaudeCodeIdleGap:
             35.0,  # last_prompt_time reset to 35 (trust branch)
             36.0,  # iter3: welcome banner → return (composed post-trust loop)
         ]
+        # A third frame is required because accepting trust no longer returns: the
+        # model-upgrade nudge can render AFTER the trust dialog, so the handler keeps
+        # polling until it sees the version banner. Live startups do exactly this.
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n  1. No, exit\n❯ 2. Yes, I accept\n",
             "❯ Yes, I trust this folder",

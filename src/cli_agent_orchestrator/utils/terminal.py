@@ -171,7 +171,7 @@ def resolve_terminal_id(value: str) -> str:
     if last_dash < 1:
         # Not a display form — pass through (could be a mailbox id or other).
         return value
-    candidate_id = value[last_dash + 1:]
+    candidate_id = value[last_dash + 1 :]
     if not _RAW_TERMINAL_ID_RE.fullmatch(candidate_id):
         # Suffix isn't a valid hex id — not a display form, pass through.
         return value
@@ -316,6 +316,11 @@ async def wait_until_status(
     set, pipe-pane terminals also require a ready-status generation at least
     that new; event-inbox terminals have no generation tracking and retain
     level semantics.
+
+    Each poll is offloaded via asyncio.to_thread: get_status() is no longer purely
+    in-memory (the stale-PROCESSING fallback in status_monitor.py can fork a tmux
+    capture-pane, and herdr shells out to its CLI), so blocking I/O must not run
+    on the shared event loop (upstream #712).
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -342,9 +347,13 @@ async def wait_until_status(
         if blocked_policy is not None and blocked_elapsed > blocked_policy.blocked_cap_s:
             break
         current = (
-            status_monitor.get_raw_status(terminal_id, provider_override=provider_override)
+            await asyncio.to_thread(
+                status_monitor.get_raw_status,
+                terminal_id,
+                provider_override=provider_override,
+            )
             if raw_status
-            else status_monitor.get_status(terminal_id)
+            else await asyncio.to_thread(status_monitor.get_status, terminal_id)
         )
         status_gen = status_monitor.get_status_gen(terminal_id) if min_gen is not None else None
         if current in targets and (min_gen is None or status_gen is None or status_gen >= min_gen):

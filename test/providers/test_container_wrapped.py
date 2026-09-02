@@ -212,6 +212,9 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
         35.0,  # last_prompt_time reset to 35 (trust branch)
         36.0,  # iter3: welcome banner -> return (lawful settle after trust)
     ]
+    # Third frame: accepting trust no longer returns, because the Bedrock
+    # model-upgrade nudge renders AFTER the trust dialog and would otherwise sit
+    # unanswered until init timed out. The banner is what ends the loop.
     mock_backend.get_history.side_effect = [
         "WARNING: Bypass Permissions\n  1. No, exit\n❯ 2. Yes, I accept\n",
         "❯ Yes, I trust this folder",

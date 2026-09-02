@@ -2274,8 +2274,23 @@ class TestF565PhoenixSeatContract:
         assert "--disallowedTools Bash" in command
 
 
+# Live capture from a pod running claude 2.1.235 on Bedrock with every
+# ANTHROPIC_*_MODEL pinned to Opus 4.6, in an account entitled to Opus 5.
+# Reproduced verbatim (including the pre-selected "❯ 1. Yes") because the
+# handler's whole reason for sending Esc rather than Enter is that ordering.
+_UPGRADE_NUDGE_FRAME = (
+    "Newer Opus model available\n"
+    "Currently pinned: Opus 4.6\n"
+    "Latest available: Opus 5 (au.anthropic.claude-opus-5)\n"
+    "Update settings to use Opus 5? Claude Code will restart to apply.\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+    "Enter to confirm · Esc to cancel\n"
+)
+
+
 class TestClaudeCodeProviderStartupPrompts:
-    """Tests for Claude Code startup prompt handling (trust + bypass)."""
+    """Tests for Claude Code startup prompt handling (trust + bypass + upgrade nudge)."""
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -2301,6 +2316,43 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
         # No literal-ESC arrow via send_keys any more.
         mock_tmux.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_startup_prompts_moves_from_no_to_trust(self, mock_tmux):
+        """Claude Code 2.1.250 preselects No, so CAO must move to Yes."""
+        # Fork (F548 #404): _select_menu_affirmative sends a real Down and then POLLS
+        # the pane until the ❯ marker is confirmed on the affirmative row before it
+        # presses Enter, so this handler reads more frames than upstream's blind
+        # Down+Enter did. Supply the post-Down frames, then the banner that ends the
+        # loop; a short list runs the mock dry mid-poll.
+        _no_focus = (
+            "Accessing workspace: /home/cao/workspace\n"
+            "❯ No, exit\n"
+            "  Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        _yes_focus = (
+            "Accessing workspace: /home/cao/workspace\n"
+            "  No, exit\n"
+            "❯ Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        mock_tmux.get_history.side_effect = [
+            _no_focus,
+            _yes_focus,
+            _yes_focus,
+            _yes_focus,
+            "Welcome to Claude Code v2.1.250",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        assert [call.args[2] for call in mock_tmux.send_special_key.call_args_list] == [
+            "Down",
+            "Enter",
+        ]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -2352,6 +2404,8 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
+        # Banner frame last: accepting trust keeps the loop polling (the
+        # model-upgrade nudge can follow it), so the banner is what ends it.
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
@@ -2490,6 +2544,68 @@ class TestClaudeCodeProviderStartupPrompts:
 
         mock_tmux.send_keys.assert_not_called()
         mock_tmux.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_declined_with_escape(self, mock_tmux):
+        """The Bedrock model-upgrade nudge is DECLINED, and with Esc specifically.
+
+        Live-captured frame. "1. Yes" is pre-selected, so the Enter that clears
+        the trust/bypass dialogs would instead accept the upgrade: Claude Code
+        would rewrite the deployment's ANTHROPIC_*_MODEL pins and restart itself
+        mid-initialization.
+        """
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Escape")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_handle_model_upgrade_nudge_per_tier(self, mock_tmux):
+        """One nudge per TIER, so a second must still be answered.
+
+        The dismissed dialog's text stays in the capture buffer, which is why
+        the handler tracks declined titles rather than a single bool — a bool
+        would swallow the Sonnet dialog here and leave init blocked on it, while
+        no tracking at all would re-send Esc at every poll forever.
+        """
+        sonnet_frame = _UPGRADE_NUDGE_FRAME.replace("Opus", "Sonnet")
+        mock_tmux.get_history.side_effect = [
+            _UPGRADE_NUDGE_FRAME,
+            # Both frames present: the Opus dialog has been answered but is still
+            # in the scrollback below the new Sonnet one.
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            _UPGRADE_NUDGE_FRAME + sonnet_frame,
+            "Welcome to Claude Code v2.1.235",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        await provider._handle_startup_prompts(idle_gap=5.0)
+
+        # Twice, not once (missed tier) and not four times (re-answered scrollback).
+        assert mock_tmux.send_special_key.call_count == 2
+        assert all(
+            call.args == ("test-session", "window-0", "Escape")
+            for call in mock_tmux.send_special_key.call_args_list
+        )
+
+    def test_get_status_model_upgrade_nudge_not_waiting_user_answer(self):
+        """The nudge must not surface as WAITING_USER_ANSWER.
+
+        Its footer is "Enter to confirm · Esc to cancel", which
+        WAITING_USER_ANSWER_PATTERN matches — but the handler answers this
+        dialog itself, exactly like trust/bypass, so reporting it would ask an
+        operator to answer something that is about to answer itself.
+        """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        assert provider.get_status(_UPGRADE_NUDGE_FRAME) != TerminalStatus.WAITING_USER_ANSWER
 
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""

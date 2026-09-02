@@ -72,12 +72,54 @@ def _raw_tmux_calls(tree: ast.AST) -> list[ast.AST]:
     return violations
 
 
+# Raw ``requests`` is allowed only where the callee is a FOREIGN endpoint — another
+# CAO node, the elastic broker, or a remote memory backend (upstream #693/#712).
+# cao_http exists to address THIS node's cao-server and carries its local bearer
+# and instance headers, which mean nothing off-box; sending them there would leak a
+# node-local credential. Keyed by enclosing function, not by file, so the rest of
+# each module stays under the guard.
+_CROSS_NODE_REQUEST_SITES = {
+    ("src/cli_agent_orchestrator/services/memory_gateway.py", "_post"),
+    ("src/cli_agent_orchestrator/services/terminal_service.py", "_notify_cross_node_caller"),
+    ("src/cli_agent_orchestrator/services/terminal_service.py", "_notify_elastic_terminal_ended"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_wait_remote_ready"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_resolve_remote_provider"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_cleanup_remote_terminal"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_post_cross_node"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_handoff_impl"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_assign_remote"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "_release_elastic_worker"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "assign_elastic"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "complete_assignment"),
+    ("src/cli_agent_orchestrator/mcp_server/server.py", "delete_terminal"),
+}
+
+
+def _enclosing_functions(tree: ast.AST) -> dict:
+    """Map every AST node id to the name of the function that lexically contains it."""
+    owner: dict = {}
+
+    def walk(node, current):
+        for child in ast.iter_child_nodes(node):
+            name = (
+                child.name
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else current
+            )
+            owner[id(child)] = name
+            walk(child, name)
+
+    walk(tree, None)
+    return owner
+
+
 @pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_endpoint_ast_guard_is_closed() -> None:
     request_methods = {"get", "post", "put", "patch", "delete", "request"}
     for path in _python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         relative = path.relative_to(REPO).as_posix()
+        owner = _enclosing_functions(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 assert not any(alias.name == "API_BASE_URL" for alias in node.names), relative
@@ -94,8 +136,14 @@ def test_endpoint_ast_guard_is_closed() -> None:
                 continue
             if node.func.attr not in request_methods or relative.endswith("utils/http.py"):
                 continue
+            if (relative, owner.get(id(node))) in _CROSS_NODE_REQUEST_SITES:
+                continue
             # The installer fetches a user-selected remote profile, not the CAO API.
-            assert relative.endswith("services/install_service.py"), relative
+            assert relative.endswith("services/install_service.py"), (
+                relative,
+                owner.get(id(node)),
+                node.lineno,
+            )
 
 
 @pytest.mark.slow  # F254 D19: exceeds unit budget
@@ -474,9 +522,9 @@ def test_up_reclaims_a_dead_socket_of_the_same_name(
             text=True,
             timeout=5,
         )
-        assert result.returncode == 0, (
-            f"Socket not owned by a live tmux server after reclaim: {result.stderr}"
-        )
+        assert (
+            result.returncode == 0
+        ), f"Socket not owned by a live tmux server after reclaim: {result.stderr}"
         assert bootstrap._sentinel_owned(bootstrap._load_owned(root)[0])
     finally:
         bootstrap.command_down(argparse.Namespace(root=str(root), purge=True))

@@ -1208,6 +1208,49 @@ class TestIdleCompletionSignal:
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert exc_info.value.kind == "error"
 
+    @pytest.mark.skip(
+        reason=(
+            "Fork: run_agent_step does not poll status_monitor.get_status itself — the "
+            "completion poll lives in utils.terminal.wait_until_status, which this fork "
+            "calls instead. The to_thread invariant upstream #712 pins here is covered by "
+            "test/utils/test_terminal.py::TestWaitUntilStatus::"
+            "test_wait_until_status_dispatches_get_status_via_to_thread."
+        )
+    )
+    def test_completion_poll_dispatches_get_status_via_to_thread(self):
+        """#558: status_monitor.get_status() can shell out to a real tmux capture-pane
+        subprocess (the stale-PROCESSING fallback); calling it inline in
+        _wait_for_completion's poll loop would fork tmux ON the event loop every poll.
+        Pin the asyncio.to_thread wrapping directly -- every other test here mocks
+        status_monitor.get_status itself, which cannot see HOW it was called, so a
+        regression back to a bare synchronous call would stay green."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread,
+        ):
+            from cli_agent_orchestrator.services.agent_step import status_monitor
+
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+
+            # Captured while still inside the patch context -- status_monitor.get_status
+            # is the active mock here (patched by `status` above); comparing against it
+            # after the patches unwind would compare against the restored, unpatched
+            # method instead.
+            get_status_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] == status_monitor.get_status
+            ]
+        assert get_status_calls, "status_monitor.get_status was never dispatched via to_thread"
+        assert all(c.args[1] == "abc12345" for c in get_status_calls)
+
 
 @pytest.mark.skip(
     reason="Fork: step-level re-delivery lives in terminal_service deferred-init, not run_agent_step"

@@ -33,6 +33,10 @@ from cli_agent_orchestrator.plugins.builtin.memory_file import (
     validated_target_path,
     write_marker_block,
 )
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
@@ -73,7 +77,11 @@ class CodexMemoryPlugin(CaoPlugin):
             event,
             "codex_memory",
             lambda: self._resolve_working_directory(event),
-            lambda: MemoryService().get_memory_context_for_terminal(event.terminal_id),
+            lambda: (
+                memory_context_for_terminal(event.terminal_id)
+                if remote_memory_url()
+                else MemoryService().get_memory_context_for_terminal(event.terminal_id)
+            ),
             self._validated_target_path,
             self._write_block,
             logger,

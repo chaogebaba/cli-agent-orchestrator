@@ -17,6 +17,7 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -214,6 +215,11 @@ E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
 class KiroCliProvider(BaseProvider):
     condition_provider_key = "kiro_cli"  # F611 #467
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
+    # ...but NOT for the stale-PROCESSING self-heal: on a rendered frame the composer
+    # placeholder sits below the working line and the credits line — the opposite of
+    # the byte-stream order this detector's checks were tuned against — so a busy pane
+    # reads as COMPLETED and would sticky-latch for the rest of the turn.
+    supports_stale_capture_selfheal = False
     # F566 (fixes F560): kiro session identity is HARVESTED, never minted.
     # Empirical rule (kiro-cli 2.20.1, probe report
     # /data/cao-scratch/kiro-mcp-probe/report.md): `--resume-id <id>` naming a
@@ -759,7 +765,10 @@ class KiroCliProvider(BaseProvider):
         # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
         # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
         # stray message). Low probability given the sticky latch, but explicit.
-        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+        # Off the loop: get_status() can fork a tmux capture-pane for a PROCESSING
+        # terminal (status_monitor.py's stale-PROCESSING fallback).
+        current = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
+        if current != TerminalStatus.WAITING_USER_ANSWER:
             return True
 
         # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,

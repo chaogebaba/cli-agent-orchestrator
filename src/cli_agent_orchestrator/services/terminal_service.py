@@ -32,6 +32,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, assert_never, cast
 
+import requests
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     _utcnow,
@@ -51,6 +53,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
+from cli_agent_orchestrator.clients.database import list_all_terminals
 from cli_agent_orchestrator.clients.database import (
     list_deferred_init_overdue_pending_rows,
     list_deferred_init_recovery_rows,
@@ -69,6 +72,8 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_tmux_window,
 )
 from cli_agent_orchestrator.constants import (
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
     PYTE_SCREEN_ROWS,
@@ -84,6 +89,7 @@ from cli_agent_orchestrator.models.terminal import (
     RecoveryState,
     Terminal,
     TerminalInputBlockedError,
+    TerminalLimitError,
     TerminalStatus,
 )
 from cli_agent_orchestrator.plugins import (
@@ -117,10 +123,17 @@ from cli_agent_orchestrator.services.draft_guard import (
     preserve_draft_before_send,
     stash_draft_before_send,
 )
+from cli_agent_orchestrator.services.elastic_worker_gateway import (
+    elastic_worker_gateway_headers,
+)
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.memory_gateway import (
+    memory_context_for_terminal,
+    remote_memory_url,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -130,6 +143,7 @@ from cli_agent_orchestrator.services.session_env import (
 )
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import (
+    get_max_terminals,
     get_provider_defaults,
     get_provider_profile_defaults,
     resolve_provider_string_option,
@@ -321,6 +335,12 @@ def _maybe_ensure_fleet_tui(session_name: Optional[str] = None) -> None:
     except Exception as exc:
         logger.warning("fleet-tui-ensure: failed to fire ensure script: %s", exc)
 
+
+# Timeout (seconds) for the cross-node deferred-failure notification POST to a
+# remote supervisor's inbox. Runs on a worker thread, so a slow peer only
+# delays this one notification — but still bounded so a black-holed node can't
+# pin the thread.
+CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -996,7 +1016,7 @@ def inject_memory_context(
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_curated_memory_context(), which returns a formatted
+    Calls the configured memory backend, which returns a formatted
     <cao-memory>...</cao-memory> block (or empty string if no memories exist).
     Stateless — no file mutation, no backup/restore.
 
@@ -1044,8 +1064,16 @@ def inject_memory_context(
         return frozen_memory + "\n\n" + first_message
 
     try:
-        svc = MemoryService()
-        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
+        if remote_memory_url():
+            context = memory_context_for_terminal(
+                terminal_id,
+                task_description=first_message[:200],
+            )
+        else:
+            context = MemoryService().get_curated_memory_context(
+                terminal_id,
+                task_description=first_message[:200],
+            )
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
@@ -1749,8 +1777,26 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
+            server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
+    # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
+    # window, DB row, provider process) is allocated, so a full node rejects
+    # cleanly with nothing to roll back. Best-effort under concurrency: two
+    # simultaneous creates can both pass the check (no cross-request lock),
+    # which is acceptable for the cap's placement-guard purpose.
+    max_terminals = get_max_terminals()
+    if max_terminals is not None:
+        tracked_count = len(list_all_terminals())
+        if tracked_count >= max_terminals:
+            raise TerminalLimitError(
+                f"Terminal limit reached: this node already has {tracked_count} tracked "
+                f"terminal(s) and CAO_MAX_TERMINALS/server.max_terminals is "
+                f"{max_terminals}. Delete a terminal or target a different node."
+            )
+
     require_provider_admitted(provider)
     # F439 (#294): enforce the worker-terminal cap BEFORE any resource is
     # created — no tmux window, no DB row, no worktree, no provider init — so a
@@ -3201,6 +3247,70 @@ async def create_terminal(
         # this call is a no-op and the token stays live until the backend is
         # provably gone.
         _release_cap_lock()
+
+
+def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
+    """Deliver a deferred-init failure to a CROSS-NODE supervisor, if one is recorded.
+
+    A worker created remotely (assign with ``target_host``) has no local
+    ``caller_id`` row — its supervisor's terminal lives on ANOTHER node. The
+    creating supervisor injected ``CAO_CALLBACK_URL`` / ``CAO_CALLBACK_TERMINAL_ID``
+    into the session env at creation time (persisted via ``set_session_env``),
+    so read them back and POST the failure through that callback endpoint.
+    Elastic workers use the authenticated broker gateway; ordinary remote
+    workers call the supervisor directly. Best-effort; returns True only when
+    the remote POST succeeded. Note the session-env store is process-local -
+    after a cao-server restart the route is gone and this degrades to the
+    log-only path.
+    """
+    try:
+        session_env = get_session_env(session_name)
+        callback_url = (session_env.get(CALLBACK_URL_ENV) or "").rstrip("/")
+        callback_terminal_id = session_env.get(CALLBACK_TERMINAL_ID_ENV)
+        if not callback_url or not callback_terminal_id:
+            return False
+        response = requests.post(
+            f"{callback_url}/terminals/{callback_terminal_id}/inbox/messages",
+            params={"sender_id": terminal_id, "message": message},
+            headers=elastic_worker_gateway_headers() or None,
+            timeout=CROSS_NODE_NOTIFY_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: cross-node delivery for worker %s failed: %s",
+            terminal_id,
+            exc,
+        )
+        return False
+
+
+def _notify_elastic_terminal_ended(terminal_id: str) -> None:
+    """Tell the broker that a one-shot worker terminal ended without completion."""
+    worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
+    broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
+    release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
+    if not worker_id or not broker_url or not release_token:
+        return
+    try:
+        response = requests.post(
+            f"{broker_url}/workers/{worker_id}/terminal-ended",
+            json={"terminal_id": terminal_id},
+            headers={"X-CAO-Release-Token": release_token},
+            timeout=5.0,
+        )
+        # A completion or another teardown signal may already have released the
+        # lease. In that case this notification is redundant.
+        if response.status_code != 404:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning(
+            "Could not report terminal %s ending for elastic worker %s: %s",
+            terminal_id,
+            worker_id,
+            exc,
+        )
 
 
 _PERSIST_FAILURE_CODES = {

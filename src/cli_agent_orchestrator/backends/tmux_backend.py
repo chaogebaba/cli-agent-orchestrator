@@ -48,7 +48,13 @@ class TmuxBackend(TerminalBackend):
     ) -> str:
         try:
             return self._client.create_session(
-                session_name, window_name, terminal_id, working_directory, extra_env=extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                extra_env=extra_env,
+                terminal_token=terminal_token,
+                allowed_blocked_values=allowed_blocked_values,
             )
         except Exception as e:
             raise TerminalBackendError(f"Failed to create session '{session_name}': {e}") from e
@@ -114,20 +120,30 @@ class TmuxBackend(TerminalBackend):
             # Discover which window index/id corresponds to window_name
             target_idx = self._resolve_window_index(session_name, window_name)
             if target_idx is None:
-                logger.debug("F469: _resolve_window_index returned None for %s:%s",
-                             session_name, window_name)
+                logger.debug(
+                    "F469: _resolve_window_index returned None for %s:%s", session_name, window_name
+                )
                 return  # window doesn't exist or can't be resolved — nothing to park
 
             # List clients attached to this session whose current window matches
             clients_on_target = self._clients_on_window(session_name, target_idx)
             if not clients_on_target:
-                logger.debug("F469: no clients on window idx=%s for %s:%s",
-                             target_idx, session_name, window_name)
+                logger.debug(
+                    "F469: no clients on window idx=%s for %s:%s",
+                    target_idx,
+                    session_name,
+                    window_name,
+                )
                 return  # no client viewing this window — fast path
 
             # Park each client on a stable window.
-            logger.debug("F469: parking %d client(s) off %s:%s (idx=%s)",
-                         len(clients_on_target), session_name, window_name, target_idx)
+            logger.debug(
+                "F469: parking %d client(s) off %s:%s (idx=%s)",
+                len(clients_on_target),
+                session_name,
+                window_name,
+                target_idx,
+            )
             for client_tty in clients_on_target:
                 self._park_single_client(session_name, client_tty, target_idx)
         except Exception as exc:
@@ -145,15 +161,22 @@ class TmuxBackend(TerminalBackend):
 
         proc = subprocess.run(
             tmux_argv(
-                "list-windows", "-t", session_name,
-                "-F", "#{window_name}\t#{window_index}",
+                "list-windows",
+                "-t",
+                session_name,
+                "-F",
+                "#{window_name}\t#{window_index}",
             ),
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if proc.returncode != 0:
             logger.debug(
                 "F469: list-windows failed for %s (rc=%d, stderr=%s)",
-                session_name, proc.returncode, proc.stderr.strip(),
+                session_name,
+                proc.returncode,
+                proc.stderr.strip(),
             )
             return None
         for line in proc.stdout.splitlines():
@@ -162,7 +185,9 @@ class TmuxBackend(TerminalBackend):
                 return parts[1]
         logger.debug(
             "F469: window %r not found in list-windows output for %s: %r",
-            window_name, session_name, proc.stdout,
+            window_name,
+            session_name,
+            proc.stdout,
         )
         return None
 
@@ -172,10 +197,15 @@ class TmuxBackend(TerminalBackend):
 
         proc = subprocess.run(
             tmux_argv(
-                "list-clients", "-t", session_name,
-                "-F", "#{client_tty}\t#{window_index}",
+                "list-clients",
+                "-t",
+                session_name,
+                "-F",
+                "#{client_tty}\t#{window_index}",
             ),
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if proc.returncode != 0:
             return []
@@ -186,9 +216,7 @@ class TmuxBackend(TerminalBackend):
                 result.append(parts[0])
         return result
 
-    def _park_single_client(
-        self, session_name: str, client_tty: str, killed_index: str
-    ) -> None:
+    def _park_single_client(self, session_name: str, client_tty: str, killed_index: str) -> None:
         """Move one client to a stable window via switch-client. Best-effort."""
         import subprocess
 
@@ -197,10 +225,15 @@ class TmuxBackend(TerminalBackend):
             if killed_index != "0":
                 proc = subprocess.run(
                     tmux_argv(
-                        "switch-client", "-c", client_tty,
-                        "-t", f"{session_name}:0",
+                        "switch-client",
+                        "-c",
+                        client_tty,
+                        "-t",
+                        f"{session_name}:0",
                     ),
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
                 if proc.returncode == 0:
                     return  # parked on supervisor seat
@@ -210,26 +243,34 @@ class TmuxBackend(TerminalBackend):
             if surviving is not None:
                 subprocess.run(
                     tmux_argv(
-                        "switch-client", "-c", client_tty,
-                        "-t", f"{session_name}:{surviving}",
+                        "switch-client",
+                        "-c",
+                        client_tty,
+                        "-t",
+                        f"{session_name}:{surviving}",
                     ),
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
         except Exception:
             pass  # best-effort — never block the kill
 
-    def _any_surviving_window(
-        self, session_name: str, killed_index: str
-    ) -> str | None:
+    def _any_surviving_window(self, session_name: str, killed_index: str) -> str | None:
         """Return the index of any window that isn't the one being killed."""
         import subprocess
 
         proc = subprocess.run(
             tmux_argv(
-                "list-windows", "-t", session_name,
-                "-F", "#{window_index}",
+                "list-windows",
+                "-t",
+                session_name,
+                "-F",
+                "#{window_index}",
             ),
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if proc.returncode != 0:
             return None
@@ -313,12 +354,9 @@ class TmuxBackend(TerminalBackend):
                 status, windows = self.enumerate_windows(session_name)
                 if status == "ok":
                     sibling_names = tuple(
-                        w.get("name", "") for w in (windows or [])
-                        if w.get("name") != window_name
+                        w.get("name", "") for w in (windows or []) if w.get("name") != window_name
                     )
-                    evidence_lines.append(
-                        f"enumerate[{i}]=ok siblings={len(sibling_names)}"
-                    )
+                    evidence_lines.append(f"enumerate[{i}]=ok siblings={len(sibling_names)}")
                     return ScopeProbe(
                         scope="window_gone",
                         session_present=True,
@@ -406,6 +444,7 @@ class TmuxBackend(TerminalBackend):
         tail_lines: Optional[int] = None,
         strip_escapes: bool = False,
         full_history: bool = False,
+        visible_only: bool = False,
     ) -> str:
         return self._client.get_history(
             session_name,
@@ -413,6 +452,7 @@ class TmuxBackend(TerminalBackend):
             tail_lines=tail_lines,
             strip_escapes=strip_escapes,
             full_history=full_history,
+            visible_only=visible_only,
         )
 
     def capture_viewport(self, session_name: str, window_name: str) -> str:
