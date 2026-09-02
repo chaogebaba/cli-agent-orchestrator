@@ -33,6 +33,12 @@ __all__ = [
 ]
 
 
+#: Matches the projector's placeholder.  ``worker_state_shadow.since`` is NOT
+#: NULL in the real DDL, so a fake that allowed ``None`` there would accept rows
+#: the real store rejects.
+_UNSET_SINCE = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 class FakeClock:
     """A clock the test moves by hand.
 
@@ -142,7 +148,7 @@ class Shadow:
 
     terminal_id: str
     state: WorkerState = WorkerState.STARTING
-    since: datetime | None = None
+    since: datetime = _UNSET_SINCE
     last_event_seq: int = 0
     degraded_reason: DegradedReason | None = None
     prior_state: WorkerState | None = None
@@ -187,14 +193,18 @@ class InMemoryStateStore:
         pane_pid: int | None,
         miss_count: int,
     ) -> None:
-        row = self.rows.setdefault(terminal_id, Shadow(terminal_id=terminal_id))
+        row = self.rows.setdefault(
+            terminal_id, Shadow(terminal_id=terminal_id, since=probed_at)
+        )
         row.last_probe_at = probed_at
         row.pane_present = pane_present
         row.pane_pid = pane_pid
         row.miss_count = miss_count
 
     def touch_source_probe(self, terminal_id: str, *, probed_at: datetime) -> None:
-        row = self.rows.setdefault(terminal_id, Shadow(terminal_id=terminal_id))
+        row = self.rows.setdefault(
+            terminal_id, Shadow(terminal_id=terminal_id, since=probed_at)
+        )
         row.last_source_probe_at = probed_at
 
     def all_terminals(self) -> list[StateProjection]:

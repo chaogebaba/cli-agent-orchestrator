@@ -40,15 +40,26 @@ from cli_agent_orchestrator.adapters.store.connection import ConnectionPool
 from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.findings import SqliteFindingStore
 from cli_agent_orchestrator.adapters.store.migrator import MigrationResult, migrate
+from cli_agent_orchestrator.adapters.store.readonly import ReadOnlyPool
 from cli_agent_orchestrator.adapters.store.retention import RetentionTask
-from cli_agent_orchestrator.app.worker_truth.checks import CheckRegistry
-from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore
+from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
+from cli_agent_orchestrator.app.diag.report import DiagSources
+from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
+from cli_agent_orchestrator.app.worker_truth.checks import (
+    CheckRegistry,
+    LegacyDisagreementCheck,
+    register_phase1_checks,
+)
+from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
+from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore, StateStore
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "INGEST_ENV_VAR",
     "WorkerTruthRuntime",
+    "build_readonly_diag_stores",
+    "build_terminal_scope",
     "current_runtime",
     "ingest_enabled",
     "shutdown_worker_truth",
@@ -86,6 +97,9 @@ class WorkerTruthRuntime:
     event_store: EventStore | None = None
     finding_store: FindingStore | None = None
     checks: CheckRegistry | None = None
+    state_store: StateStore | None = None
+    projector: Projector | None = None
+    sources: StaticSourceRegistry | None = None
     retention: RetentionTask | None = None
 
 
@@ -164,8 +178,23 @@ async def start_worker_truth(
 
     try:
         finding_store = SqliteFindingStore(pool, clock=resolved_clock)
-        checks = CheckRegistry(finding_store)
+        checks = register_phase1_checks(CheckRegistry(finding_store))
         event_store = SqliteEventStore(pool, clock=resolved_clock, check_runner=checks)
+        state_store = SqliteStateStore(pool)
+        # The adapters that declare an authoritative source register themselves
+        # here as they start (lane B's rollout tailer).  Empty is the correct
+        # starting point: with no tailer running, every terminal falls back to
+        # the pane, which is what phase 1 wants until a source proves itself.
+        sources = StaticSourceRegistry()
+        projector = Projector(
+            event_store,
+            state_store,
+            resolved_clock,
+            sources,
+            legacy_check=LegacyDisagreementCheck(
+                finding_store, event_store, state_store, resolved_clock
+            ),
+        )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either
@@ -183,6 +212,9 @@ async def start_worker_truth(
         event_store=event_store,
         finding_store=finding_store,
         checks=checks,
+        state_store=state_store,
+        projector=projector,
+        sources=sources,
         retention=retention,
     )
     logger.info("worker-truth ingestion ENABLED (%s=1)", INGEST_ENV_VAR)
@@ -204,3 +236,65 @@ async def shutdown_worker_truth() -> None:
             logger.warning("worker-truth retention task did not stop cleanly", exc_info=True)
     if runtime.pool is not None:
         runtime.pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Read-only wiring for ``cao diag`` (AC7).
+#
+# The CLI is a separate process and must not import ``adapters`` (AC9's fifth
+# contract), so it asks here instead.  Everything below opens the LIVE database
+# with a ``mode=ro`` URI: WAL permits the concurrent reader, and a diagnostic
+# command that could take a write lock would be able to stall the very server it
+# was called to diagnose.
+# ---------------------------------------------------------------------------
+
+
+def build_readonly_diag_stores(db_path: str | Path | None = None) -> DiagSources:
+    """The three stores ``cao diag`` reads, opened read-only.
+
+    The same store classes the server writes with, over a read-only connection.
+    A second, read-only copy of each store would be two implementations of the
+    same SELECTs, free to disagree about what a row means.
+    """
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    return DiagSources(
+        events=SqliteEventStore(pool, clock=SystemClock()),
+        states=SqliteStateStore(pool),
+        findings=SqliteFindingStore(pool, clock=SystemClock()),
+    )
+
+
+def build_terminal_scope(db_path: str | Path | None = None) -> dict[str, TerminalFacts]:
+    """Session and provider per terminal, from the legacy ``terminals`` table.
+
+    The agreement report (AC10) needs to scope by session and to know which
+    terminals are codex, and neither fact is in the event log — ``tmux_session``
+    and ``provider`` live on the legacy row.  Read here rather than in ``app``
+    for the usual reason: this is the module allowed to know about both halves.
+
+    Raw SQL rather than the SQLAlchemy model, because the model would pull the
+    fork's whole ``clients.database`` import graph into a read-only CLI path, and
+    because this connection is deliberately read-only while that module's engine
+    is not.
+
+    Returns an empty mapping when the table cannot be read.  A missing scope
+    degrades the report to fleet-wide with codex detected from the producer
+    column, which is a worse report but a real one; raising here would mean the
+    agreement command failed on a database that is otherwise perfectly readable.
+    """
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    try:
+        rows = pool.connection().execute("SELECT id, tmux_session, provider FROM terminals")
+        return {
+            row["id"]: TerminalFacts(
+                session=row["tmux_session"] or "", provider=row["provider"] or ""
+            )
+            for row in rows
+        }
+    except Exception:  # noqa: BLE001 — a missing scope degrades the report, never fails it
+        logger.warning("could not read the legacy terminals table for diag scope", exc_info=True)
+        return {}
+    finally:
+        pool.close_all()

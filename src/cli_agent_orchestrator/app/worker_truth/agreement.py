@@ -30,10 +30,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import DecisionKind, EventKind, Producer, WorkerEvent
 from cli_agent_orchestrator.core.states import WorkerState
-
-from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 
 __all__ = [
     "MIN_CODEX_TERMINALS",

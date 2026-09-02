@@ -41,11 +41,16 @@ producer of ``degraded(no_signal)``.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
 from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
+from cli_agent_orchestrator.app.worker_truth.mapping import (
+    PANE_MISSING_REASON,
+    implied_state,
+    legacy_state,
+)
 from cli_agent_orchestrator.core.events import (
     Confidence,
     DecisionKind,
@@ -64,12 +69,6 @@ from cli_agent_orchestrator.core.states import (
 )
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
-from cli_agent_orchestrator.app.worker_truth.mapping import (
-    PANE_MISSING_REASON,
-    implied_state,
-    legacy_state,
-)
-
 __all__ = [
     "DERIVED_ALWAYS_KINDS",
     "NullSourceRegistry",
@@ -86,6 +85,14 @@ logger = logging.getLogger(__name__)
 def _no_check(terminal_id: str) -> bool:
     """The default durational check: none."""
     return False
+
+
+#: ``worker_state_shadow.since`` is NOT NULL in the DDL and every projector path
+#: sets it, so this default is only ever a placeholder for the instant between
+#: constructing a row and filling it in.  A distant past rather than "now" so
+#: that a row which somehow escaped with it is obviously wrong in a diag view
+#: instead of plausibly recent.
+_UNSET_SINCE = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 #: The kinds an authoritative source CANNOT know, so a derived producer stays
@@ -159,21 +166,29 @@ class StaticSourceRegistry:
         return terminal_id in self._terminal_ids
 
 
-@dataclass(frozen=True)
+@dataclass
 class ShadowState:
     """One ``worker_state_shadow`` row, satisfying :class:`~core.ports.StateProjection`.
 
-    Frozen, and every rule below produces a new one with
-    :func:`dataclasses.replace`.  A projector that mutated a row in place would
+    Every rule below produces a NEW instance with :func:`dataclasses.replace` and
+    none of them mutates a field.  A projector that edited a row in place would
     make "what changed in this step" unanswerable, and the whole package exists
     to make that question answerable.
+
+    The class is not ``frozen`` only because ``core.ports.StateProjection``
+    declares its members as plain annotations, which mypy reads as settable
+    variables that a read-only attribute cannot satisfy.  The port would be
+    better as read-only properties — nothing ever assigns through it, since
+    ``get`` produces a row and ``upsert`` consumes one — and that change has been
+    proposed to the port's owner.  Until it lands, the immutability here is a
+    convention the code keeps rather than one the compiler enforces.
 
     Column order matches AC6's list exactly.
     """
 
     terminal_id: str
     state: WorkerState = WorkerState.STARTING
-    since: datetime | None = None
+    since: datetime = _UNSET_SINCE
     last_event_seq: int = 0
     degraded_reason: DegradedReason | None = None
     prior_state: WorkerState | None = None
@@ -383,9 +398,7 @@ class Projector:
             and reason_rises(row.degraded_reason, reason)
         ):
             previous = row.degraded_reason
-            self._states.upsert(
-                replace(row, degraded_reason=reason, last_event_seq=event.seq)
-            )
+            self._states.upsert(replace(row, degraded_reason=reason, last_event_seq=event.seq))
             decision_id = self._append_decision(
                 DecisionKind.STATUS_REASON_CHANGED,
                 event,

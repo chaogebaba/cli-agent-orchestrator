@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from test.app.fakes import (
+    FakeClock,
+    InMemoryEventStore,
+    InMemoryFindingStore,
+    InMemoryStateStore,
+)
 
 import pytest
 
@@ -20,13 +26,6 @@ from cli_agent_orchestrator.core.events import (
     EventDraft,
     Producer,
     WorkerEvent,
-)
-
-from test.app.fakes import (
-    FakeClock,
-    InMemoryEventStore,
-    InMemoryFindingStore,
-    InMemoryStateStore,
 )
 
 

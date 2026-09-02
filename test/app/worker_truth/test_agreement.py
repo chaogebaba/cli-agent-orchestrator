@@ -11,6 +11,8 @@ Two things have to be true of it, and each has its own mutant:
 
 from __future__ import annotations
 
+from test.app.conftest import Rig
+
 from cli_agent_orchestrator.app.worker_truth.agreement import (
     MIN_EVENTS,
     MIN_LEGACY_PUBLISHES,
@@ -21,8 +23,6 @@ from cli_agent_orchestrator.app.worker_truth.agreement import (
 )
 from cli_agent_orchestrator.core.events import EventKind, Producer
 from cli_agent_orchestrator.core.states import WorkerState
-
-from test.app.conftest import Rig
 
 TERMINAL = "term-g1"
 

@@ -134,9 +134,7 @@ class _DiagGroup(click.Group):
 @click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 @click.pass_context
-def diag(
-    ctx: click.Context, why_event_id: str | None, db_path: str | None, as_json: bool
-) -> None:
+def diag(ctx: click.Context, why_event_id: str | None, db_path: str | None, as_json: bool) -> None:
     """Reconstruct what happened to a worker from stored rows.
 
     \b
@@ -203,9 +201,7 @@ def diag_why(event_id: str, db_path: str | None, as_json: bool) -> None:
 @click.option("--code", "code_value", default=None, help="Only this DIAG-* code.")
 @click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
-def diag_findings(
-    state: str, code_value: str | None, db_path: str | None, as_json: bool
-) -> None:
+def diag_findings(state: str, code_value: str | None, db_path: str | None, as_json: bool) -> None:
     """List typed invariant findings, loudest first."""
     code: FindingCode | None = None
     if code_value is not None:

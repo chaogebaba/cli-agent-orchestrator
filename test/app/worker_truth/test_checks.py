@@ -7,6 +7,8 @@ sample is the one kept.
 
 from __future__ import annotations
 
+from test.app.conftest import Rig
+
 from cli_agent_orchestrator.app.worker_truth.checks import (
     EVIDENCE_REQUIRING_DECISIONS,
     ghost_transition_check,
@@ -22,8 +24,6 @@ from cli_agent_orchestrator.core.events import (
 from cli_agent_orchestrator.core.findings import FindingCode, FindingState
 from cli_agent_orchestrator.core.states import WorkerState
 from cli_agent_orchestrator.core.timing import PANE_HEARTBEAT_S
-
-from test.app.conftest import Rig
 
 TERMINAL = "term-c1"
 

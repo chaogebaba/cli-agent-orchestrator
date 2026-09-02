@@ -31,13 +31,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from cli_agent_orchestrator.app.worker_truth.agreement import AgreementReport
+from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import AnyKind, EventKind, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
 from cli_agent_orchestrator.core.ports import EventStore, FindingStore, StateStore
 from cli_agent_orchestrator.core.states import WorkerState
-
-from cli_agent_orchestrator.app.worker_truth.agreement import AgreementReport
-from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 
 __all__ = [
     "DiagSources",
@@ -226,9 +225,7 @@ def timeline_payload(
             "projected": True,
             "state": projection.state.value,
             "degraded_reason": (
-                projection.degraded_reason.value
-                if projection.degraded_reason is not None
-                else None
+                projection.degraded_reason.value if projection.degraded_reason is not None else None
             ),
             "prior_state": (
                 projection.prior_state.value if projection.prior_state is not None else None
@@ -336,8 +333,7 @@ def render_timeline(
 
     lines.append("")
     lines.append(
-        f"{'seq':>5}  {'time':<12} {'gap':>8}  {'kind':<24} "
-        f"{'producer':<8} {'conf':<14} detail"
+        f"{'seq':>5}  {'time':<12} {'gap':>8}  {'kind':<24} " f"{'producer':<8} {'conf':<14} detail"
     )
     lines.append(_SEPARATOR)
 
@@ -424,9 +420,14 @@ def render_why(sources: DiagSources, event_id: str, *, depth: int = 12) -> str:
             lines.append(f"{indent}{link['event_id']}: {link['error']}")
             continue
         label = link["decision"] or link["kind"]
+        # The id is on the line, not just in the JSON.  It is what an operator
+        # pastes into the next ``cao diag --why`` and into the issue they file,
+        # and a chain that names only kinds and sequence numbers forces them back
+        # to the timeline to look it up.
         lines.append(
             f"{indent}{'<- ' if index else ''}{label}  seq {link['seq']}  "
-            f"{link['producer']}/{link['confidence']}  {link['ingested_at']}"
+            f"{link['producer']}/{link['confidence']}  {link['ingested_at']}  "
+            f"{link['event_id']}"
         )
         detail = link["payload"]
         if detail:

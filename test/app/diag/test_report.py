@@ -9,6 +9,7 @@ omits decision rows" is one of the phase-1 mutants, and it is killed here.
 from __future__ import annotations
 
 import json
+from test.app.conftest import Rig
 
 from cli_agent_orchestrator.app.diag.report import (
     INGEST_OFF_NOTE,
@@ -25,8 +26,6 @@ from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_re
 from cli_agent_orchestrator.core.events import DecisionKind, EventKind
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
-
-from test.app.conftest import Rig
 
 TERMINAL = "term-d1"
 
@@ -77,7 +76,7 @@ def test_the_header_answers_the_four_stall_questions(rig: Rig) -> None:
 
 
 def test_timestamps_are_rendered_as_ages(rig: Rig) -> None:
-    """"70s ago" is the number an operator reasons with."""
+    """ "70s ago" is the number an operator reasons with."""
     sources = _stalled(rig)
 
     text = render_timeline(sources, TERMINAL, now=rig.clock.now())
@@ -121,9 +120,7 @@ def test_decision_rows_appear_in_the_timeline(rig: Rig) -> None:
 
 def test_the_evidence_pointer_is_visible_on_decision_rows(rig: Rig) -> None:
     sources = _stalled(rig)
-    transition = next(
-        row for row in rig.events.read(TERMINAL) if row.decision is not None
-    )
+    transition = next(row for row in rig.events.read(TERMINAL) if row.decision is not None)
 
     text = render_timeline(sources, TERMINAL, now=rig.clock.now())
 

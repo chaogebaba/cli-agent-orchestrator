@@ -13,6 +13,7 @@ makes it fail.  The blueprint's mutant list is the index:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from test.app.conftest import Rig
 
 import pytest
 
@@ -20,8 +21,6 @@ from cli_agent_orchestrator.core.events import Confidence, DecisionKind, EventKi
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.states import DegradedReason, TransitionClass, WorkerState
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S, PANE_HEARTBEAT_S
-
-from test.app.conftest import Rig
 
 TERMINAL = "term-a1"
 
@@ -180,7 +179,7 @@ def test_derived_busy_is_ignored_while_the_authoritative_source_is_healthy(rig: 
 
 
 def test_the_muted_event_is_still_logged_and_still_advances_the_sequence(rig: Rig) -> None:
-    """"Logged but not applied" is the contract, not "dropped"."""
+    """ "Logged but not applied" is the contract, not "dropped"."""
     rig.sources.add(TERMINAL)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
@@ -211,7 +210,7 @@ def test_a_terminal_with_no_authoritative_source_applies_derived_events(rig: Rig
 
 
 def test_a_source_that_never_probed_is_not_healthy(rig: Rig) -> None:
-    """"No probe yet" must not mute the fallback.
+    """ "No probe yet" must not mute the fallback.
 
     A tailer that failed to start leaves ``last_source_probe_at`` NULL forever.
     Reading that as healthy would silence the pane at exactly the moment the pane
@@ -489,7 +488,7 @@ def test_since_uses_the_server_clock_not_the_source_clock(rig: Rig) -> None:
 
 
 def test_an_unmapped_legacy_status_moves_nothing(rig: Rig) -> None:
-    """"No opinion" beats a guessed state that the agreement report would then
+    """ "No opinion" beats a guessed state that the agreement report would then
     compare against the projection."""
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
 

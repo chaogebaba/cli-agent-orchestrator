@@ -25,13 +25,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
+from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import DecisionKind, EventKind, WorkerEvent
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore, StateStore
 from cli_agent_orchestrator.core.states import TRANSITIONS, TransitionClass, WorkerState
 from cli_agent_orchestrator.core.timing import PANE_HEARTBEAT_S
-
-from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +245,7 @@ class LegacyDisagreementCheck:
         try:
             return self._evaluate(terminal_id)
         except Exception:  # noqa: BLE001 — a diagnostic must not break the fold
-            logger.warning(
-                "legacy-disagreement check failed for %s", terminal_id, exc_info=True
-            )
+            logger.warning("legacy-disagreement check failed for %s", terminal_id, exc_info=True)
             return False
 
     def _evaluate(self, terminal_id: str) -> bool:
