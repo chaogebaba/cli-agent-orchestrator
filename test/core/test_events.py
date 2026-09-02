@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from cli_agent_orchestrator.core.events import (
+    FLEET_TERMINAL_ID,
     Confidence,
     DecisionKind,
     EventDraft,
@@ -55,6 +56,25 @@ def test_event_kinds_are_exactly_the_audit_list() -> None:
     assert {kind.value for kind in EventKind} == _AUDIT_KINDS
     assert "pane.alive" not in _AUDIT_KINDS
     assert "frame.classified" not in _AUDIT_KINDS
+
+
+def test_fleet_terminal_id_is_a_usable_reserved_sentinel() -> None:
+    """Fleet-wide rows need a terminal_id, and it must not collide with a real one.
+
+    ``probe.failed`` names no pane, but the column is NOT NULL and the draft
+    requires a non-empty string. Real CAO terminal ids are hex session
+    identifiers, so a double-underscore prefix cannot collide.
+    """
+    assert FLEET_TERMINAL_ID == "__fleet__"
+    assert FLEET_TERMINAL_ID.startswith("__")
+    draft = _draft(
+        terminal_id=FLEET_TERMINAL_ID,
+        kind=DecisionKind.PROBE_FAILED,
+        decision=DecisionKind.PROBE_FAILED,
+        producer=Producer.SERVER,
+        confidence=Confidence.DERIVED,
+    )
+    assert draft.terminal_id == FLEET_TERMINAL_ID
 
 
 def test_producer_and_confidence_vocabularies() -> None:
