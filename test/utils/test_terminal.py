@@ -454,6 +454,7 @@ class TestWaitUntilStatus:
         assert type(result) is bool
         assert notified == ["update"]
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.utils.terminal.asyncio.to_thread")
     async def test_wait_until_status_dispatches_get_status_via_to_thread(self, mock_to_thread):
         """#558: status_monitor.get_status() can shell out to a real tmux capture-pane

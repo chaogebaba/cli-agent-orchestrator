@@ -44,13 +44,12 @@ def test_list_terminals_by_session_skips_stale_rows():
     )
 
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.all.return_value = [
-        good_terminal, stale_terminal
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+        good_terminal,
+        stale_terminal,
     ]
 
-    with patch(
-        "cli_agent_orchestrator.clients.database.SessionLocal"
-    ) as mock_session_local:
+    with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session_local:
         mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -66,11 +65,9 @@ def test_list_terminals_by_session_skips_stale_rows():
 def test_list_terminals_by_session_empty_session():
     """Empty session returns empty list without error."""
     mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.all.return_value = []
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
 
-    with patch(
-        "cli_agent_orchestrator.clients.database.SessionLocal"
-    ) as mock_session_local:
+    with patch("cli_agent_orchestrator.clients.database.SessionLocal") as mock_session_local:
         mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
 

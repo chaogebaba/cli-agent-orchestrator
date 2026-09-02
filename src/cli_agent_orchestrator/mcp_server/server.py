@@ -66,7 +66,7 @@ from cli_agent_orchestrator.services.settings_service import (
     is_learning_enabled,
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.http import CAOHttpClient
+from cli_agent_orchestrator.utils.http import _PRODUCTION_PORT, CAOHttpClient
 from cli_agent_orchestrator.utils.session_lookup import (
     _TERMINAL_ID_PATTERN,
     resolve_session_name,
@@ -145,7 +145,9 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 
 # Default port assumed for a bare ``target_host`` DNS name (every CAO node in
 # the k8s manifests listens on 9889; override by passing host:port or a URL).
-DEFAULT_TARGET_PORT = 9889
+# Sourced from utils/http.py rather than spelled here: the G7a AST guard pins the
+# 9889 literal to that one module (test/test_g7a_sandbox.py).
+DEFAULT_TARGET_PORT = _PRODUCTION_PORT
 
 # Connect-leg timeout (seconds) for HTTP calls to a REMOTE node. Remote calls
 # use a (connect, read) tuple so a black-holed/unreachable node fails in
@@ -1183,12 +1185,37 @@ def _send_to_inbox(
     if terminal_token:
         headers["X-CAO-Terminal-Token"] = terminal_token
 
-    response = cao_http.post(
-        f"/terminals/{receiver_id}/inbox/messages",
-        params=params,
-        headers=headers or None,
-        timeout=_mcp_timeout(),
-    )
+    # Cross-node routing (upstream #693). The callback node is a FOREIGN
+    # cao-server, so it is addressed with raw requests rather than cao_http:
+    # this node's instance/bearer headers are local credentials that mean
+    # nothing there, and an elastic worker authenticates to the broker gateway
+    # with its own per-worker headers instead.
+    callback_url, callback_terminal_id = _callback_route()
+    to_callback = bool(callback_url) and receiver_id == callback_terminal_id
+
+    def _post_cross_node() -> Any:
+        return requests.post(
+            f"{callback_url}/terminals/{receiver_id}/inbox/messages",
+            params=params,
+            headers=elastic_worker_gateway_headers() or headers or None,
+            timeout=_mcp_timeout(),
+        )
+
+    if to_callback:
+        response = _post_cross_node()
+    else:
+        response = cao_http.post(
+            f"/terminals/{receiver_id}/inbox/messages",
+            params=params,
+            headers=headers or None,
+            timeout=_mcp_timeout(),
+        )
+
+    if response.status_code == 404 and callback_url and not to_callback:
+        # Receiver unknown on this node but a cross-node supervisor is recorded —
+        # the caller likely quoted a terminal ID that lives on the supervisor's
+        # node. One retry there before failing.
+        response = _post_cross_node()
 
     # F352: On 403 E-SENDER-TOKEN with absent token, attempt one retry after
     # re-reading CAO_TERMINAL_TOKEN from the pane env (it may have been set
@@ -1202,11 +1229,15 @@ def _send_to_inbox(
                 if refreshed_token:
                     os.environ["CAO_TERMINAL_TOKEN"] = refreshed_token
                     headers["X-CAO-Terminal-Token"] = refreshed_token
-                    response = cao_http.post(
-                        f"/terminals/{receiver_id}/inbox/messages",
-                        params=params,
-                        headers=headers,
-                        timeout=_mcp_timeout(),
+                    response = (
+                        _post_cross_node()
+                        if to_callback
+                        else cao_http.post(
+                            f"/terminals/{receiver_id}/inbox/messages",
+                            params=params,
+                            headers=headers,
+                            timeout=_mcp_timeout(),
+                        )
                     )
         except Exception:
             pass  # Fall through to original response handling
@@ -1501,7 +1532,12 @@ async def _handoff_impl(
         )
 
     try:
-        if working_directory is None:
+        # Remote placement (upstream #693): working_directory is interpreted on the
+        # REMOTE filesystem and the supervisor session/caller_id/allowed-tools are
+        # local-node state the remote DB has no row for, so neither the local cwd
+        # resolution nor the local disk guard applies. Skipping them is what lets a
+        # target_host handoff run from a seat with no local supervisor context.
+        if working_directory is None and not target_host:
             working_directory = strict_supervisor_cwd()
         # F619 (#475): refuse to spawn when free disk on the worktree-root or
         # logs filesystem is below the [disk] min_free_gb floor. Checked BEFORE
@@ -1510,7 +1546,7 @@ async def _handoff_impl(
         # of letting the worker ENOSPC-truncate a file.
         from cli_agent_orchestrator.utils.disk_guard import check_spawn_disk
 
-        _disk_low = check_spawn_disk(working_directory)
+        _disk_low = None if target_host else check_spawn_disk(working_directory)
         if _disk_low is not None:
             return HandoffResult(
                 success=False,
@@ -1529,8 +1565,14 @@ async def _handoff_impl(
         # in the SAME session with #284 callback routing and tool inheritance
         # preserved (BR-8 observable-behavior parity). The endpoint then
         # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile)
-        provider = ctx.provider
+        if target_host:
+            # Fail FAST on an unreachable node: never guess a provider and then post
+            # work to a dead peer. The remote node's own profile store is authority.
+            ctx = None
+            provider = _resolve_remote_provider(base_url, agent_profile)
+        else:
+            ctx = _resolve_handoff_provider(agent_profile)
+            provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
         # check before any terminal is created (no terminal_id to surface yet).
@@ -1563,12 +1605,13 @@ async def _handoff_impl(
         }
         if use_worktree is not None:
             payload["use_worktree"] = use_worktree
-        if ctx.session_name:
-            payload["session_name"] = ctx.session_name
-        if ctx.caller_id:
-            payload["caller_id"] = ctx.caller_id
-        if ctx.allowed_tools:
-            payload["allowed_tools"] = ctx.allowed_tools
+        if ctx is not None:
+            if ctx.session_name:
+                payload["session_name"] = ctx.session_name
+            if ctx.caller_id:
+                payload["caller_id"] = ctx.caller_id
+            if ctx.allowed_tools:
+                payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -1694,6 +1737,9 @@ async def _handoff_impl(
 
         execution_time = time.time() - start_time
         dn = display_name(terminal_id, agent_profile) if terminal_id else terminal_id
+        # Upstream #693: name the node a remote worker actually ran on, so the
+        # caller can address it (delete_terminal(target_host=...)) afterwards.
+        _placement = f" on node {target_host}" if target_host else ""
         # F127: read resolved_model from DB (handoff blocks until completion, so always known)
         _f127_handoff_model = None
         if terminal_id:
@@ -1707,8 +1753,8 @@ async def _handoff_impl(
                 pass
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {dn} ({provider}) in {execution_time:.2f}s"
-            + _get_cleanup_nudge(),
+            message=f"Successfully handed off to {dn} ({provider}){_placement} "
+            f"in {execution_time:.2f}s" + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
             display_name=dn,
@@ -2201,6 +2247,10 @@ def _assign_impl(
     ``resolve_provider`` chain. A disallowed provider or a position with no
     provider is rejected BEFORE any terminal is created (named error codes).
     """
+    # Snapshot the CALLER's working_directory before any local resolution
+    # (fork/worktree/supervisor cwd) rewrites it — a remote node interprets the
+    # path on its own filesystem, where the resolved one does not exist.
+    _requested_working_directory = working_directory
     terminal_id: Optional[str] = None
     try:
         # F497 D7 — resolve the assign target: legacy name (unchanged) or a
@@ -2474,7 +2524,11 @@ def _assign_impl(
                 worker_message=worker_message,
                 current_terminal_id=current_terminal_id,
                 target_host=target_host,
-                working_directory=working_directory,
+                # The CALLER's value, not the locally resolved one: a remote node
+                # interprets the path on its own filesystem, and this supervisor's
+                # fork/worktree/cwd resolution describes a directory that does not
+                # exist there.
+                working_directory=_requested_working_directory,
                 engine=engine,
                 model=model,
                 use_worktree=use_worktree,
@@ -3888,8 +3942,12 @@ def delete_terminal(
         if not payload.get("success", True):
             return {
                 "success": False,
-                "message": _cleanup_deferred_message(terminal_id),
+                "message": _cleanup_deferred_message(terminal_id) + location,
             }
+        if location and isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            # Upstream #693: the remote node's own message says nothing about WHICH
+            # node it came from, and that is the one fact the caller needs to act on.
+            payload["message"] += location
         # F483: Remove fleet-labels.tsv rows for all reaped terminals.
         from cli_agent_orchestrator.services.fleet_labels import remove_label
 

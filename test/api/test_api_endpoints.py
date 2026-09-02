@@ -1097,6 +1097,11 @@ class TestGetTerminal:
             monitor.get_status.return_value = TerminalStatus.COMPLETED
             monitor.get_input_gen.return_value = 4
             monitor.get_status_gen.return_value = monitor_status_gen
+            # Fork: get_terminal also projects F611's `condition` field, typed
+            # Optional[str] on the wire model. A bare MagicMock there fails Terminal
+            # validation and the endpoint answers 404 before the generation mapping
+            # under test is ever compared.
+            monitor.get_condition.return_value = None
             response = client.get("/terminals/abcd1234")
 
         assert response.status_code == 200

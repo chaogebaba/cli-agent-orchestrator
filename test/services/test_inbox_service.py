@@ -720,6 +720,16 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    @pytest.mark.skip(
+        reason=(
+            "Fork: exactly-once under concurrent deliver_pending is enforced by this "
+            "fork's NON-blocking get_delivery_lock exclusion, not upstream #712's "
+            "blocking per-terminal lock — a second caller skips the wake and bumps the "
+            "wake generation instead of queueing behind the first. Covered by "
+            "test_message_trace_inbox_matrix::"
+            "test_waiter_queued_during_ambiguous_settlement_skips_same_wake."
+        )
+    )
     def test_concurrent_delivery_for_one_terminal_sends_exactly_once(
         self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):

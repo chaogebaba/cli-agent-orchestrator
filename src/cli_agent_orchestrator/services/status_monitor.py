@@ -2598,6 +2598,11 @@ class StatusMonitor:
         if provider is None:
             return None
 
+        if not getattr(provider, "supports_stale_capture_selfheal", True):
+            # Explicit opt-out: this provider's get_status is raw-stream tuned and
+            # misreads a rendered frame (see ProviderBase for the full rationale).
+            return None
+
         use_screen = getattr(provider, "supports_screen_detection", False)
         if not use_screen and not getattr(provider, "supports_direct_status_probe", False):
             # Raw-stream-tuned detector with no snapshot-safe alternative (kiro_cli,

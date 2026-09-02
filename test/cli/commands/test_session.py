@@ -407,6 +407,17 @@ class TestLegacyStatus:
         }
         mock_get.return_value = response
 
+    @pytest.mark.skip(
+        reason=(
+            "Fork: `cao session status` is the cao.session-status/v1 lifecycle "
+            "projection — the --terminal/--workers selectors this upstream test "
+            "drives were removed (see test_removed_legacy_selectors), so there is no "
+            "client-side conductor pick to pin here. The oldest-first server contract "
+            "it guards is covered by test/clients/test_database.py and "
+            "test/services/test_session_service.py::"
+            "test_list_sessions_reports_the_creator_as_owner."
+        )
+    )
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_resolves_the_conductor_from_index_zero(self, mock_get, runner):
         """``status`` must label index 0 as the Conductor, not any other terminal.
@@ -419,9 +430,21 @@ class TestLegacyStatus:
         from the client side rather than only documented.
         """
         listing = MagicMock(status_code=200)
+        # Fork: this CLI reads `status` straight off the listing rows (upstream
+        # re-fetched each terminal for it), so the listing payload must carry it.
         listing.json.return_value = [
-            {"id": "cond1234", "agent_profile": "conductor", "provider": "kiro_cli"},
-            {"id": "work5678", "agent_profile": "dev", "provider": "kiro_cli"},
+            {
+                "id": "cond1234",
+                "agent_profile": "conductor",
+                "provider": "kiro_cli",
+                "status": "idle",
+            },
+            {
+                "id": "work5678",
+                "agent_profile": "dev",
+                "provider": "kiro_cli",
+                "status": "processing",
+            },
         ]
         by_id = {
             "cond1234": {

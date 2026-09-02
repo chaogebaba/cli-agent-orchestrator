@@ -155,6 +155,12 @@ class TestCoverageMatrix:
         _KNOWN_NON_UX = {
             "memory_store", "memory_recall", "memory_forget",
             "codex_review", "emit_ui", "load_skill", "get_compact_marker",
+            # Cluster/broker plumbing from upstream #693 (one-agent-per-pod EKS
+            # topology): a lease is acquired from the elastic broker and handed
+            # back on completion. Not subagent-orchestration surfaces — the roster
+            # is frozen at 12 by the two assertions below, and these carry no UX
+            # obligation of their own.
+            "assign_elastic", "complete_assignment",
         }
 
         # Check: every extracted tool (minus known exclusions) must be rostered

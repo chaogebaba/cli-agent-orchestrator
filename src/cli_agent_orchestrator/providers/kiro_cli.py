@@ -215,6 +215,11 @@ E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
 class KiroCliProvider(BaseProvider):
     condition_provider_key = "kiro_cli"  # F611 #467
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
+    # ...but NOT for the stale-PROCESSING self-heal: on a rendered frame the composer
+    # placeholder sits below the working line and the credits line — the opposite of
+    # the byte-stream order this detector's checks were tuned against — so a busy pane
+    # reads as COMPLETED and would sticky-latch for the rest of the turn.
+    supports_stale_capture_selfheal = False
     # F566 (fixes F560): kiro session identity is HARVESTED, never minted.
     # Empirical rule (kiro-cli 2.20.1, probe report
     # /data/cao-scratch/kiro-mcp-probe/report.md): `--resume-id <id>` naming a

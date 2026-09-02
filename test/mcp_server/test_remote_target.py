@@ -262,13 +262,20 @@ class TestHandoffRemote:
         mock_ctx.return_value = HandoffContext(
             provider="mock_cli", session_name="cao-s", caller_id="a1b2c3d4", allowed_tools=None
         )
-        mock_requests.post.return_value = _response(
-            200, {"terminal_id": "t", "last_message": "ok", "status": "completed"}
-        )
-        result = asyncio.run(_handoff_impl("developer", "Do it"))
-        assert result.success is True
-        args, _ = mock_requests.post.call_args
-        assert args[0] == f"{API_BASE_URL}/terminals/run-step"
+        # Fork: the LOCAL arm posts through cao_http, and it resolves the
+        # supervisor's cwd first (a local-node requirement a remote handoff skips).
+        with (
+            patch(f"{_SRV}.strict_supervisor_cwd", return_value="/w"),
+            patch(f"{_SRV}.cao_http.post") as mock_local_post,
+        ):
+            mock_local_post.return_value = _response(
+                200, {"terminal_id": "t", "last_message": "ok", "status": "completed"}
+            )
+            result = asyncio.run(_handoff_impl("developer", "Do it"))
+        assert result.success is True, result.message
+        mock_requests.post.assert_not_called()
+        args, _ = mock_local_post.call_args
+        assert args[0] == "/terminals/run-step"
 
 
 class TestWorkerSideCallbackRouting:
@@ -507,6 +514,14 @@ class TestDeleteTerminalRemote:
     @patch(f"{_SRV}.requests.delete")
     def test_remote_delete_targets_the_remote_node(self, mock_delete):
         mock_delete.return_value.raise_for_status.return_value = None
+        # Fork: delete_terminal returns the SERVER's payload (it does not synthesize
+        # one), so the mock must answer with a real body. The node name in the
+        # message is still this fork's own doing, not the mock's.
+        mock_delete.return_value.status_code = 200
+        mock_delete.return_value.json.return_value = {
+            "success": True,
+            "message": "Terminal beef0007 deleted successfully",
+        }
         result = delete_terminal("beef0007", target_host="cao-worker-0.cao-workers")
         assert result["success"] is True
         assert "cao-worker-0.cao-workers" in result["message"]
@@ -514,13 +529,22 @@ class TestDeleteTerminalRemote:
         assert args[0] == "http://cao-worker-0.cao-workers:9889/terminals/beef0007"
         assert kwargs["timeout"] == (REMOTE_CONNECT_TIMEOUT, _mcp_timeout())
 
-    @patch(f"{_SRV}.requests.delete")
+    @patch(f"{_SRV}.cao_http.delete")
     def test_local_delete_unchanged_without_target_host(self, mock_delete):
+        """Fork: the LOCAL arm goes through cao_http (bearer/instance headers), not
+        raw requests — only the remote arm bypasses it. The contract pinned here is
+        the same one upstream pins: no target_host means the local server, addressed
+        by path, with the plain timeout."""
         mock_delete.return_value.raise_for_status.return_value = None
+        mock_delete.return_value.status_code = 200
+        mock_delete.return_value.json.return_value = {
+            "success": True,
+            "message": "Terminal beef0008 deleted successfully",
+        }
         result = delete_terminal("beef0008")
         assert result["success"] is True
         args, kwargs = mock_delete.call_args
-        assert args[0] == f"{API_BASE_URL}/terminals/beef0008"
+        assert args[0] == "/terminals/beef0008"
         assert kwargs["timeout"] == _mcp_timeout()
 
     @patch(f"{_SRV}.requests.delete")

@@ -412,6 +412,16 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # Opt OUT of the stale-PROCESSING self-heal (upstream #712). That fallback reruns
+    # ``get_status`` against a RENDERED capture-pane snapshot, and routes on
+    # ``supports_screen_detection``. In this fork that flag also means "the
+    # auto-responder may read the screen" (F110), which a provider can set while its
+    # ``get_status`` is still tuned to the raw byte stream — where a rendered frame's
+    # line ORDER is inverted and a busy pane can read as COMPLETED. Set this False on
+    # any such provider: the self-heal then leaves it PROCESSING until the pipeline
+    # resolves it, which is the fail-closed outcome.
+    supports_stale_capture_selfheal: bool = True
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).
 

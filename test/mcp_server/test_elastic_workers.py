@@ -4,6 +4,8 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
@@ -41,6 +43,14 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
     assert "complete_assignment" in assign.call_args.args[1]
 
 
+@pytest.mark.skip(
+    reason=(
+        "Fork: the deferred-init failure notify path (_notify_caller_of_deferred_failure) "
+        "was removed from terminal_service and rewritten around the dispatcher/reconciler, "
+        "so upstream #693's cross-node callback POST has no call site on this fork. "
+        "Same deviation as test/services/test_cross_node_notify.py."
+    )
+)
 def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     """Exercise the real elastic placement and deferred-session failure path."""
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")

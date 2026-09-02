@@ -2617,7 +2617,10 @@ class TestListTerminalsInSessions:
         assert [t["id"] for t in batched] == ["zzz", "aaa"]
         # Keys pinned absolutely, not just against each other — a key dropped
         # from BOTH projections would otherwise pass while breaking consumers.
-        assert set(batched[0]) == {
+        # Fork: both reads share _terminal_row_dict, whose projection is a strict
+        # SUPERSET of upstream's (init/recovery/lifecycle fields this fork adds), so
+        # the pin is a subset check — it still fails if any of these is dropped.
+        assert set(batched[0]) >= {
             "id",
             "tmux_session",
             "tmux_window",
@@ -2657,6 +2660,11 @@ class TestListTerminalsInSessions:
                 )
             )
             s.commit()
+
+        # Fork: list_terminals_by_session is TTL-cached (F351) and raw SQL bypasses
+        # every write path that invalidates it, so drop the entry explicitly — the
+        # rowid move under test is a property of the table, not of the cache.
+        database_client.invalidate_terminal_metadata_cache("f0000000")
 
         assert [t["id"] for t in list_terminals_by_session("cao-alpha")] == [
             "10000000",

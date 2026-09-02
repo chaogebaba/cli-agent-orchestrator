@@ -30,6 +30,10 @@ class TestTerminalLimitMapsTo429:
 
     def test_create_terminal_in_session_returns_429(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            # Fork: this endpoint awaits seed_resume_bootstrap before create_terminal,
+            # so the module mock must return an awaitable for it too — otherwise the
+            # handler dies on a bare MagicMock and the arm under test is never reached.
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
             mock_svc.create_terminal = AsyncMock(side_effect=_LIMIT_ERROR)
             response = client.post(
                 "/sessions/cao-test/terminals",

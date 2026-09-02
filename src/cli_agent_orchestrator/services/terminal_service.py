@@ -53,6 +53,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
+from cli_agent_orchestrator.clients.database import list_all_terminals
 from cli_agent_orchestrator.clients.database import (
     list_deferred_init_overdue_pending_rows,
     list_deferred_init_recovery_rows,
@@ -1788,7 +1789,7 @@ async def create_terminal(
     # which is acceptable for the cap's placement-guard purpose.
     max_terminals = get_max_terminals()
     if max_terminals is not None:
-        tracked_count = len(db_list_all_terminals())
+        tracked_count = len(list_all_terminals())
         if tracked_count >= max_terminals:
             raise TerminalLimitError(
                 f"Terminal limit reached: this node already has {tracked_count} tracked "

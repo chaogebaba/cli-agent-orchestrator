@@ -1208,6 +1208,15 @@ class TestIdleCompletionSignal:
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert exc_info.value.kind == "error"
 
+    @pytest.mark.skip(
+        reason=(
+            "Fork: run_agent_step does not poll status_monitor.get_status itself — the "
+            "completion poll lives in utils.terminal.wait_until_status, which this fork "
+            "calls instead. The to_thread invariant upstream #712 pins here is covered by "
+            "test/utils/test_terminal.py::TestWaitUntilStatus::"
+            "test_wait_until_status_dispatches_get_status_via_to_thread."
+        )
+    )
     def test_completion_poll_dispatches_get_status_via_to_thread(self):
         """#558: status_monitor.get_status() can shell out to a real tmux capture-pane
         subprocess (the stale-PROCESSING fallback); calling it inline in

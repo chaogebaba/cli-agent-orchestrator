@@ -2321,11 +2321,28 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_handle_startup_prompts_moves_from_no_to_trust(self, mock_tmux):
         """Claude Code 2.1.250 preselects No, so CAO must move to Yes."""
-        mock_tmux.get_history.side_effect = [
+        # Fork (F548 #404): _select_menu_affirmative sends a real Down and then POLLS
+        # the pane until the ❯ marker is confirmed on the affirmative row before it
+        # presses Enter, so this handler reads more frames than upstream's blind
+        # Down+Enter did. Supply the post-Down frames, then the banner that ends the
+        # loop; a short list runs the mock dry mid-poll.
+        _no_focus = (
             "Accessing workspace: /home/cao/workspace\n"
             "❯ No, exit\n"
             "  Yes, I trust this folder\n"
-            "Enter to confirm · Esc to cancel\n",
+            "Enter to confirm · Esc to cancel\n"
+        )
+        _yes_focus = (
+            "Accessing workspace: /home/cao/workspace\n"
+            "  No, exit\n"
+            "❯ Yes, I trust this folder\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        mock_tmux.get_history.side_effect = [
+            _no_focus,
+            _yes_focus,
+            _yes_focus,
+            _yes_focus,
             "Welcome to Claude Code v2.1.250",
         ]
 

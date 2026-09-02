@@ -8,6 +8,16 @@ supervisor node's inbox instead of dropping it into a log nobody reads —
 otherwise assign returned success=True and the promised callback never comes.
 """
 
+import pytest
+
+pytest.skip(
+    "Fork: _notify_caller_of_deferred_failure was removed from terminal_service — the "
+    "deferred-init failure path was rewritten around the dispatcher/reconciler, so "
+    "upstream #693's cross-node notify hook has no call site here. "
+    "_notify_cross_node_caller itself is present and unchanged.",
+    allow_module_level=True,
+)
+
 import os
 from unittest.mock import MagicMock, patch
 

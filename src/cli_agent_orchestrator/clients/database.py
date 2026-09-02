@@ -4728,6 +4728,44 @@ def list_siblings_by_group_prefix(
         return siblings
 
 
+def _terminal_row_dict(t: Any) -> Dict[str, Any]:
+    """Row projection shared by list_terminals_by_session and
+    list_terminals_in_sessions — the batched read must return the SAME shape
+    as the per-session read it replaces (upstream #703/#629).
+    """
+    return {
+        "id": t.id,
+        "tmux_session": t.tmux_session,
+        "tmux_window": t.tmux_window,
+        "provider": t.provider,
+        "agent_profile": t.agent_profile,
+        "working_directory": t.working_directory,
+        "allowed_tools": (
+            __import__("json").loads(t.allowed_tools)
+            if isinstance(t.allowed_tools, str) and t.allowed_tools
+            else None
+        ),
+        "shell_command": t.shell_command,
+        "caller_id": t.caller_id,
+        "caller_mailbox_id": t.caller_mailbox_id,
+        "lifecycle": t.lifecycle,
+        "reparented_from": t.reparented_from,
+        "provider_session_id": t.provider_session_id,
+        "recovery_state": t.recovery_state,
+        "recovery_error": t.recovery_error,
+        "recovery_updated_at": t.recovery_updated_at,
+        "fallback_terminal_id": t.fallback_terminal_id,
+        "init_state": t.init_state,
+        "init_started_at": t.init_started_at,
+        "init_owner_epoch": t.init_owner_epoch,
+        "init_failure_token": t.init_failure_token,
+        "init_deadline_s": t.init_deadline_s,
+        "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+        "last_active": t.last_active,
+        "metadata": (__import__("json").loads(t.metadata_json) if t.metadata_json else None),
+    }
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List a tmux session's terminals, oldest first.
 
@@ -4791,41 +4829,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         results = []
         for t in terminals:
             try:
-                results.append(
-                    {
-                        "id": t.id,
-                        "tmux_session": t.tmux_session,
-                        "tmux_window": t.tmux_window,
-                        "provider": t.provider,
-                        "agent_profile": t.agent_profile,
-                        "working_directory": t.working_directory,
-                        "allowed_tools": (
-                            __import__("json").loads(t.allowed_tools)
-                            if isinstance(t.allowed_tools, str) and t.allowed_tools
-                            else None
-                        ),
-                        "shell_command": t.shell_command,
-                        "caller_id": t.caller_id,
-                        "caller_mailbox_id": t.caller_mailbox_id,
-                        "lifecycle": t.lifecycle,
-                        "reparented_from": t.reparented_from,
-                        "provider_session_id": t.provider_session_id,
-                        "recovery_state": t.recovery_state,
-                        "recovery_error": t.recovery_error,
-                        "recovery_updated_at": t.recovery_updated_at,
-                        "fallback_terminal_id": t.fallback_terminal_id,
-                        "init_state": t.init_state,
-                        "init_started_at": t.init_started_at,
-                        "init_owner_epoch": t.init_owner_epoch,
-                        "init_failure_token": t.init_failure_token,
-                        "init_deadline_s": t.init_deadline_s,
-                        "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
-                        "last_active": t.last_active,
-                        "metadata": (
-                            __import__("json").loads(t.metadata_json) if t.metadata_json else None
-                        ),
-                    }
-                )
+                results.append(_terminal_row_dict(t))
             except (ObjectDeletedError, DetachedInstanceError, StaleDataError) as exc:
                 # F264: skip stale/zombie rows whose attribute load raises
                 # ObjectDeletedError (or similar) instead of crashing the pass
@@ -6050,19 +6054,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
             .order_by(literal_column("terminals.rowid"))
             .all()
         )
-        return [
-            {
-                "id": t.id,
-                "tmux_session": t.tmux_session,
-                "tmux_window": t.tmux_window,
-                "provider": t.provider,
-                "agent_profile": t.agent_profile,
-                "working_directory": t.working_directory,
-                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
-                "last_active": t.last_active,
-            }
-            for t in terminals
-        ]
+        return [_terminal_row_dict(t) for t in terminals]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:
