@@ -60,6 +60,18 @@ def test_same_size_rewrite_with_new_mtime_is_picked_up(toml_file: Path) -> None:
     assert ss.get_provider_defaults("codex") == {"model": "b"}
 
 
+def test_same_stat_key_rewrite_is_picked_up(toml_file: Path) -> None:
+    """Gate blocker 1: a same-size rewrite restored to the identical mtime_ns
+    (same inode) must still be observed — the content-hash component of the
+    cache key catches it."""
+    toml_file.write_text("[codex]\nmodel = 'a'\n")
+    assert ss.get_provider_defaults("codex") == {"model": "a"}
+    toml_file.write_text("[codex]\nmodel = 'b'\n")
+    st = toml_file.stat()
+    os.utime(toml_file, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert ss.get_provider_defaults("codex") == {"model": "b"}
+
+
 def test_missing_and_invalid_file(toml_file: Path) -> None:
     assert ss.get_provider_defaults("codex") == {}
     toml_file.write_text("this is = not [valid toml")

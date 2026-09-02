@@ -1,6 +1,7 @@
 """Settings service for persisting user configuration."""
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -67,10 +68,16 @@ def get_provider_defaults(provider: str) -> Dict[str, Any]:
 # Perf (2026-09-02): providers.toml was re-read and re-parsed on EVERY call —
 # the log writer calls get_logs_settings() per flush batch and provider code
 # calls get_provider_defaults() on hot paths — so parse once per file version.
-# Keyed on (path, mtime_ns, size, inode) like _server_settings_cache below; a
-# rewrite always changes at least mtime_ns, and tests that monkeypatch
-# PROVIDER_DEFAULTS_FILE to a different path miss on the path component.
-_provider_defaults_cache: Optional[Tuple[Tuple[str, int, int, int], Dict[str, Any]]] = None
+# Keyed on (path, mtime_ns, size, inode); a rewrite always changes at least
+# mtime_ns, and tests that monkeypatch PROVIDER_DEFAULTS_FILE to a different
+# path miss on the path component. The file is a few KB, so on a stat-key hit
+# we still hash the raw bytes (blake2b) and only re-parse when the hash moves:
+# a rewrite that lands within one mtime tick at the same size/inode (gate
+# blocker 1) is then caught on the next read with zero TOML-parse cost when
+# the file is unchanged.
+_provider_defaults_cache: Optional[
+    Tuple[Tuple[Tuple[str, int, int, int], bytes], Dict[str, Any]]
+] = None
 _provider_defaults_lock = threading.Lock()
 
 
@@ -82,12 +89,19 @@ def _load_provider_defaults() -> Dict[str, Any]:
         st = path.stat()
     except OSError:
         return {}
-    key = (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}
+    key = (
+        (str(path), st.st_mtime_ns, st.st_size, st.st_ino),
+        hashlib.blake2b(raw, digest_size=16).digest(),
+    )
     cached = _provider_defaults_cache
     if cached is not None and cached[0] == key:
         return cached[1]
     try:
-        data: Dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8"))
+        data: Dict[str, Any] = tomllib.loads(raw.decode("utf-8"))
     except Exception:
         data = {}
     with _provider_defaults_lock:
