@@ -133,14 +133,23 @@ def _metadata(session_uuid: str = SESSION_UUID) -> dict[str, Any]:
 
 
 def _backend_returning(*panes: str) -> MagicMock:
-    """Mock backend whose get_history returns panes in sequence (last repeats)."""
+    """Mock backend serving panes in sequence (last repeats).
+
+    Both capture seams draw from the same queue. #555 moved the
+    readiness gate off ``get_history`` — 200 rows of scrollback, where the codex
+    startup card's ``model: loading`` / ``Resuming session…`` banner survives
+    forever — and onto ``capture_viewport``, the live screen the readiness
+    predicate was always meant to judge. The verify/recovery legs below still
+    read history, which is correct: they need the submitted-turn transcript.
+    """
     backend = MagicMock()
     seq = list(panes)
 
-    def _get_history(session, window, tail_lines=None, strip_escapes=False):
+    def _next(*_args, **_kwargs):
         return seq.pop(0) if len(seq) > 1 else seq[0]
 
-    backend.get_history.side_effect = _get_history
+    backend.get_history.side_effect = _next
+    backend.capture_viewport.side_effect = _next
     return backend
 
 
@@ -208,7 +217,7 @@ class TestPrePasteGate:
         ):
             provider.pre_paste_gate()
         # A ready pane is read at least once; the gate never sends keys.
-        assert backend.get_history.called
+        assert backend.capture_viewport.called
         assert _enter_calls(backend) == 0
 
     def test_waits_through_loading_then_proceeds_when_ready(self, _fast_monotonic):
@@ -222,7 +231,7 @@ class TestPrePasteGate:
         ):
             provider.pre_paste_gate()
         # It re-read the pane until ready (more than one capture).
-        assert backend.get_history.call_count >= 3
+        assert backend.capture_viewport.call_count >= 3
 
     def test_never_ready_warn_and_proceeds_bounded(self, _fast_monotonic, caplog):
         import logging
