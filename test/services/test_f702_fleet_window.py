@@ -14,7 +14,13 @@ tmux is mocked throughout — no test here starts a tmux server or a window.
 """
 
 import contextlib
-from unittest.mock import AsyncMock, MagicMock, patch
+import importlib.util
+import shutil
+import subprocess
+from collections.abc import Iterator
+from typing import Any
+
+from unittest.mock import AsyncMock, MagicMock, _patch, patch
 
 import pytest
 
@@ -31,23 +37,25 @@ from cli_agent_orchestrator.services.session_service import create_session
 CAO_FLEET_PATH = "/usr/local/bin/cao-fleet"
 
 
-def _fleet_extra(present=True):
+def _fleet_extra(present: bool = True) -> _patch[MagicMock]:
     """Patch the ``[fleet]`` extra probe: the textual spec is there, or is not."""
     return patch.object(
-        fleet_window_service.importlib.util,
+        importlib.util,
         "find_spec",
         MagicMock(return_value=MagicMock() if present else None),
     )
 
 
-def _completed(returncode=0, stdout="", stderr=""):
+def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
     return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-def _tmux_runner(list_windows_result, new_window_result=None):
+def _tmux_runner(
+    list_windows_result: MagicMock, new_window_result: MagicMock | None = None
+) -> MagicMock:
     """Return a ``subprocess.run`` double dispatching on the tmux subcommand."""
 
-    def run(argv, **kwargs):
+    def run(argv: list[str], **kwargs: object) -> MagicMock:
         assert argv[0] == "tmux"
         if argv[1] == "list-windows":
             return list_windows_result
@@ -58,9 +66,9 @@ def _tmux_runner(list_windows_result, new_window_result=None):
     return MagicMock(side_effect=run)
 
 
-def _new_window_argv(mock_run):
+def _new_window_argv(mock_run: MagicMock) -> list[str] | None:
     for call in mock_run.call_args_list:
-        argv = call.args[0]
+        argv: list[str] = call.args[0]
         if argv[1] == "new-window":
             return argv
     return None
@@ -84,14 +92,14 @@ class TestOptOutFlag:
             ({"CAO_FLEET_TUI": "00"}, True),
         ],
     )
-    def test_flag_semantics(self, env, expected):
+    def test_flag_semantics(self, env: dict[str, str] | None, expected: bool) -> None:
         assert fleet_tui_enabled(env) is expected
 
-    def test_opt_out_touches_neither_path_nor_tmux(self):
+    def test_opt_out_touches_neither_path_nor_tmux(self) -> None:
         with (
-            patch.object(fleet_window_service.shutil, "which") as mock_which,
+            patch.object(shutil, "which") as mock_which,
             _fleet_extra() as mock_find_spec,
-            patch.object(fleet_window_service.subprocess, "run") as mock_run,
+            patch.object(subprocess, "run") as mock_run,
         ):
             assert ensure_fleet_window("cao-x", {"CAO_FLEET_TUI": "0"}) is False
 
@@ -103,12 +111,12 @@ class TestOptOutFlag:
 class TestWindowCreation:
     """Placement, idempotence and the exact tmux command line."""
 
-    def test_creates_at_index_1_when_free(self):
+    def test_creates_at_index_1_when_free(self) -> None:
         run = _tmux_runner(_completed(stdout="0 chao_supervisor-abc123\n"))
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is True
 
@@ -124,38 +132,39 @@ class TestWindowCreation:
             f"{CAO_FLEET_PATH} --session cao-foreign",
         ]
 
-    def test_appends_when_index_1_is_taken(self):
+    def test_appends_when_index_1_is_taken(self) -> None:
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n1 kiro_dev-b\n"))
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is True
 
         argv = _new_window_argv(run)
+        assert argv is not None
         # Target is the bare session: appended, never renumbering the worker
         # that already holds index 1.
         assert argv[4] == "cao-foreign"
 
-    def test_existing_fleet_window_is_left_alone(self):
+    def test_existing_fleet_window_is_left_alone(self) -> None:
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n1 fleet\n"))
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
         assert _new_window_argv(run) is None
 
-    def test_window_name_is_matched_exactly_not_by_prefix(self):
+    def test_window_name_is_matched_exactly_not_by_prefix(self) -> None:
         """A window called ``fleet-notes`` is not the fleet window."""
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n2 fleet-notes\n"))
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is True
 
@@ -165,19 +174,19 @@ class TestWindowCreation:
 class TestNeverRaises:
     """Every failure mode is a logged False, never an exception."""
 
-    def test_absent_console_script_is_a_no_op(self):
+    def test_absent_console_script_is_a_no_op(self) -> None:
         """No ``cao-fleet`` on PATH at all: tmux is untouched."""
         run = MagicMock()
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=None) as mock_which,
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(shutil, "which", return_value=None) as mock_which,
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
         mock_which.assert_called_once_with(FLEET_CONSOLE_SCRIPT)
         run.assert_not_called()
 
-    def test_absent_fleet_extra_is_a_no_op(self):
+    def test_absent_fleet_extra_is_a_no_op(self) -> None:
         """The script is on PATH but textual is not: a server-only install.
 
         pyproject declares ``cao-fleet`` unconditionally, so PATH alone does not
@@ -186,36 +195,36 @@ class TestNeverRaises:
         """
         run = MagicMock()
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(present=False) as mock_find_spec,
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
         mock_find_spec.assert_called_once_with(FLEET_TUI_MODULE)
         run.assert_not_called()
 
-    def test_list_windows_failure_creates_nothing(self):
+    def test_list_windows_failure_creates_nothing(self) -> None:
         """An unknown inventory must not be guessed at."""
         run = _tmux_runner(_completed(returncode=1, stderr="no server running"))
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
         assert _new_window_argv(run) is None
 
-    def test_new_window_failure_returns_false(self):
+    def test_new_window_failure_returns_false(self) -> None:
         run = _tmux_runner(
             _completed(stdout="0 supervisor-a\n"),
             _completed(returncode=1, stderr="can't create window"),
         )
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
@@ -227,22 +236,22 @@ class TestNeverRaises:
             RuntimeError("something unforeseen"),
         ],
     )
-    def test_subprocess_explosion_is_swallowed(self, boom):
+    def test_subprocess_explosion_is_swallowed(self, boom: Exception) -> None:
         with (
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", MagicMock(side_effect=boom)),
+            patch.object(subprocess, "run", MagicMock(side_effect=boom)),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
-    def test_which_explosion_is_swallowed(self):
+    def test_which_explosion_is_swallowed(self) -> None:
         with patch.object(
-            fleet_window_service.shutil, "which", MagicMock(side_effect=RuntimeError("boom"))
+            shutil, "which", MagicMock(side_effect=RuntimeError("boom"))
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
 
-def _supervisor_session_patches(terminal):
+def _supervisor_session_patches(terminal: MagicMock) -> tuple[_patch[Any], ...]:
     """The mock stack a supervisor ``create_session`` needs to reach the end."""
     return (
         patch.object(session_service, "create_terminal", AsyncMock(return_value=terminal)),
@@ -270,7 +279,7 @@ def _supervisor_session_patches(terminal):
 
 
 @contextlib.contextmanager
-def _supervisor_session(terminal, *extra):
+def _supervisor_session(terminal: MagicMock, *extra: _patch[Any]) -> Iterator[None]:
     """Enter the supervisor mock stack plus any test-specific patches."""
     with contextlib.ExitStack() as stack:
         for patcher in (*_supervisor_session_patches(terminal), *extra):
@@ -282,7 +291,7 @@ class TestCreateSessionWiring:
     """``create_session`` is the repo-agnostic choke point (#473)."""
 
     @pytest.mark.asyncio
-    async def test_supervisor_session_gets_the_window(self):
+    async def test_supervisor_session_gets_the_window(self) -> None:
         terminal = MagicMock(id="f7020001", session_name="cao-f702")
         ensure = MagicMock(return_value=True)
         with _supervisor_session(
@@ -308,15 +317,15 @@ class TestCreateSessionWiring:
         assert "CAO_ARTIFACTS_DIR" in env
 
     @pytest.mark.asyncio
-    async def test_opt_out_env_reaches_the_service_and_creates_nothing(self):
+    async def test_opt_out_env_reaches_the_service_and_creates_nothing(self) -> None:
         """``--env CAO_FLEET_TUI=0`` → request env_vars → no window (#473 AC3b)."""
         terminal = MagicMock(id="f7020002", session_name="cao-f702-optout")
         run = MagicMock()
         with _supervisor_session(
             terminal,
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             result = await create_session(
                 provider="kiro_cli",
@@ -328,7 +337,7 @@ class TestCreateSessionWiring:
         run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_worker_session_gets_no_window(self):
+    async def test_worker_session_gets_no_window(self) -> None:
         terminal = MagicMock(id="f7020003", session_name="cao-f702-worker")
         ensure = MagicMock(return_value=True)
         with (
@@ -350,15 +359,15 @@ class TestCreateSessionWiring:
         ensure.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_absent_fleet_extra_does_not_crash_session_creation(self):
+    async def test_absent_fleet_extra_does_not_crash_session_creation(self) -> None:
         """The real service runs: no ``cao-fleet`` binary, session still starts."""
         terminal = MagicMock(id="f7020004", session_name="cao-f702-noextra")
         run = MagicMock()
         with _supervisor_session(
             terminal,
-            patch.object(fleet_window_service.shutil, "which", return_value=None),
+            patch.object(shutil, "which", return_value=None),
             _fleet_extra(present=False),
-            patch.object(fleet_window_service.subprocess, "run", run),
+            patch.object(subprocess, "run", run),
         ):
             result = await create_session(provider="kiro_cli", agent_profile="chao_supervisor")
 
@@ -366,15 +375,15 @@ class TestCreateSessionWiring:
         run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_tmux_explosion_does_not_crash_session_creation(self):
+    async def test_tmux_explosion_does_not_crash_session_creation(self) -> None:
         """The real service runs and tmux is missing entirely: session still starts."""
         terminal = MagicMock(id="f7020005", session_name="cao-f702-notmux")
         with _supervisor_session(
             terminal,
-            patch.object(fleet_window_service.shutil, "which", return_value=CAO_FLEET_PATH),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(
-                fleet_window_service.subprocess,
+                subprocess,
                 "run",
                 MagicMock(side_effect=FileNotFoundError("tmux")),
             ),
@@ -384,7 +393,7 @@ class TestCreateSessionWiring:
         assert result is terminal
 
     @pytest.mark.asyncio
-    async def test_missing_profile_gets_no_window(self):
+    async def test_missing_profile_gets_no_window(self) -> None:
         """An unknown profile (load raises FileNotFoundError) is not a supervisor."""
         terminal = MagicMock(id="f7020006", session_name="cao-f702-noprofile")
         ensure = MagicMock(return_value=True)

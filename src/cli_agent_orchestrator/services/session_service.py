@@ -84,7 +84,9 @@ def canonical_session_env(
 
 
 def finalize_session(
-    session_name: str, registry: PluginRegistry | None = None, backend=None
+    session_name: str,
+    registry: PluginRegistry | None = None,
+    backend: TerminalBackend | None = None,
 ) -> None:
     """Kill/verify a backend session and settle shared session-level side effects.
 
@@ -359,7 +361,7 @@ async def create_session(
     return terminal
 
 
-async def start_session(**kwargs) -> dict:
+async def start_session(**kwargs: Any) -> dict[str, Any]:
     """Canonical lifecycle start over the existing create-session transaction."""
     provider = kwargs.get("provider")
     profile = kwargs["agent_profile"]
@@ -485,7 +487,7 @@ def _enrich_session_ownership(
     return enriched
 
 
-def list_sessions() -> List[Dict]:
+def list_sessions() -> List[Dict[str, Any]]:
     """List all sessions from tmux."""
     try:
         backend = get_backend()
@@ -517,7 +519,7 @@ def list_sessions() -> List[Dict]:
         return []
 
 
-def get_session(session_name: str) -> Dict:
+def get_session(session_name: str) -> Dict[str, Any]:
     """Get session with terminals, oldest first.
 
     ``terminals`` carries the same ordering contract as
@@ -560,7 +562,7 @@ def get_session(session_name: str) -> Dict:
 
 def delete_session(
     session_name: str, registry: PluginRegistry | None = None, force: bool = False
-) -> Dict:
+) -> Dict[str, Any]:
     """Delete session and cleanup, reconciling tmux and the registry atomically.
 
     Merge of the fork's lease-based teardown spine with upstream's #498 atomic
@@ -593,12 +595,13 @@ def delete_session(
     Returns:
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
     """
-    result: Dict = {"deleted": [], "errors": []}
-    leases = []
+    result: Dict[str, Any] = {"deleted": [], "errors": []}
+    leases: list[RebindLeaseToken] = []
     lifecycle_lease = None
     try:
         from cli_agent_orchestrator.services import terminal_service
         from cli_agent_orchestrator.services.rebind_lease import (
+            RebindLeaseToken,
             acquire_rebind_lease,
             release_rebind_lease,
         )
@@ -645,8 +648,10 @@ def delete_session(
             tokens = {token.terminal_id: token for token in leases}
             for terminal in terminals:
                 try:
-                    result_or_false = terminal_service._delete_terminal_under_lease(
-                        terminal["id"], tokens[terminal["id"]], registry=registry
+                    result_or_false: dict[str, Any] | bool = (
+                        terminal_service._delete_terminal_under_lease(
+                            terminal["id"], tokens[terminal["id"]], registry=registry
+                        )
                     )
                     # Deferred cleanup: provider returned False, row retained
                     if result_or_false is False or (
