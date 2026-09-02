@@ -208,15 +208,18 @@ def resolve_supervisor_target(mailbox_id: str, db: Session | None = None) -> Del
                 tmux_window=None,
                 cc_inbox_path=mailbox.cc_inbox_path,
             )
-        # Best-effort registry check (for rung 1 optimization)
+        # Best-effort registry check (for rung 1 optimization).
+        # Perf (2026-09-02): this used to call resolve_target(), whose only
+        # outcome consulted here is "no_registry_records" — a refusal it
+        # returns iff read_registry() is empty, BEFORE any of its tmux execs
+        # (first_pane + window-id lookup) and its full /proc scan. Those ran
+        # on every supervisor mailbox on every 5 s convergence tick. Reading
+        # the registry alone is the same predicate for a fraction of the cost.
         has_registry = False
         try:
-            from cli_agent_orchestrator.services.cc_session_registry import (
-                resolve_target,
-            )
+            from cli_agent_orchestrator.services.cc_session_registry import read_registry
 
-            result = resolve_target(terminal.id, terminal.tmux_session, terminal.tmux_window)
-            has_registry = result.refusal_reason != "no_registry_records"
+            has_registry = bool(read_registry())
         except Exception:
             pass
 

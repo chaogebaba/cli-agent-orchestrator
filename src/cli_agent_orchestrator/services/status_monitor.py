@@ -41,6 +41,7 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
+from cli_agent_orchestrator.utils.terminal_render import ScreenRenderCache
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,9 @@ class StatusMonitor:
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
         self._screens: Dict[str, Tuple[object, object]] = {}
+        # Perf: incremental renderer per terminal (only pyte-dirty rows are
+        # re-rendered). Always read screens through _screen_rows_locked().
+        self._screen_render: Dict[str, ScreenRenderCache] = {}
         self._bursting: Dict[str, bool] = {}
         # Monotonic per-terminal chunk generation. Quiescence detection runs in
         # a worker thread; if newer chunks arrive before it applies, its result
@@ -1419,6 +1423,14 @@ class StatusMonitor:
         scr[1].feed(chunk)
         return True
 
+    def _screen_rows_locked(self, terminal_id: str, screen: object) -> List[str]:
+        """``list(screen.display)`` via the per-terminal incremental cache. Caller holds _lock."""
+        cache = self._screen_render.get(terminal_id)
+        if cache is None:
+            cache = ScreenRenderCache()
+            self._screen_render[terminal_id] = cache
+        return cache.rows(screen)
+
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
         detected, _trusted_busy, _raw = self._detect_screen_with_trust(terminal_id, provider)
@@ -1433,7 +1445,9 @@ class StatusMonitor:
             scr = self._screens.get(terminal_id)
             buffer = self._buffers.get(terminal_id, "")
             try:
-                lines: List[str] = list(scr[0].display) if scr is not None else []
+                lines: List[str] = (
+                    self._screen_rows_locked(terminal_id, scr[0]) if scr is not None else []
+                )
             except Exception:
                 # pyte can transiently hold zero-length cell data while rendering
                 # complex TUI redraws. Fall back to raw-buffer detection instead of
@@ -2251,6 +2265,7 @@ class StatusMonitor:
             self._last_ready_seq.pop(terminal_id, None)
             self._fifo_frame_seq.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
+            self._screen_render.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
             self._retry_backoff_step.pop(terminal_id, None)
@@ -2354,6 +2369,7 @@ class StatusMonitor:
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
+            self._screen_render.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
             self._bump_chunk_seq_locked(terminal_id)
@@ -2740,7 +2756,11 @@ class StatusMonitor:
                 row_count = 0
             else:
                 screen = screen_state[0]
-                rows = list(getattr(screen, "display", []))
+                rows = (
+                    self._screen_rows_locked(terminal_id, screen)
+                    if hasattr(screen, "display")
+                    else []
+                )
                 columns = int(getattr(screen, "columns", 0))
                 row_count = int(getattr(screen, "lines", len(rows)))
 
@@ -3028,7 +3048,11 @@ class StatusMonitor:
             else:
                 screen = screen_state[0]
                 try:
-                    rows = list(getattr(screen, "display", []))
+                    rows = (
+                        self._screen_rows_locked(terminal_id, screen)
+                        if hasattr(screen, "display")
+                        else []
+                    )
                     columns = int(getattr(screen, "columns", 0))
                     row_count = int(getattr(screen, "lines", len(rows)))
                 except Exception:
@@ -3378,7 +3402,7 @@ class StatusMonitor:
             if scr is None:
                 return None
             try:
-                return list(scr[0].display)
+                return self._screen_rows_locked(terminal_id, scr[0])
             except Exception:
                 logger.exception("Error rendering screen for %s", terminal_id)
                 return None
