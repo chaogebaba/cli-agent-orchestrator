@@ -139,3 +139,38 @@ async def test_fetch_is_called_with_the_url_and_a_five_second_timeout() -> None:
         ("http://localhost:9889/sessions/orch/fleet", 5.0),
         ("http://localhost:9889/sessions/orch/fleet", 5.0),
     ]
+
+
+@pytest.mark.asyncio
+async def test_poll_interval_sets_the_cadence_and_the_backoff_floor() -> None:
+    """F702 parity: `--interval` reaches the loop and starts the ladder."""
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 4:
+            raise _Stop()
+
+    calls = {"n": 0}
+
+    def fetch(url: str, timeout: float = 5.0) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"session_name": "s", "terminals": []}
+        raise TimeoutError("down")
+
+    with pytest.raises(_Stop):
+        await run_fetch_loop(
+            "http://x/fleet",
+            lambda state: None,
+            sleep=sleep,
+            fetch=fetch,
+            now=lambda: 0.0,
+            poll_interval=30.0,
+        )
+    # 30 healthy, 30 on the first failure, then doubling capped at the cadence.
+    assert sleeps == [30.0, 30.0, 30.0, 30.0]
+
+
+class _Stop(Exception):
+    """Ends the endless loop from inside the injected sleep."""

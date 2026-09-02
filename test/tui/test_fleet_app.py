@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -17,12 +18,30 @@ from rich.text import Text
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, RichLog, Static
 
-from cli_agent_orchestrator.tui.columns import ALL_COLUMNS, NEW_COLUMNS, PARITY_COLUMNS
+from cli_agent_orchestrator.tui.columns import (
+    ALL_COLUMNS,
+    ALL_VIEW,
+    MARKER_BLANK,
+    MARKER_INDEX,
+    MARKER_SELECTED,
+    NEW_COLUMNS,
+    PARITY_COLUMNS,
+    PARITY_VIEW,
+)
 from cli_agent_orchestrator.tui.fleet_app import (
+    KEY_HINTS,
     FleetApp,
+    detect_tmux_session,
+    find_events_sync_script,
     fmt_age,
+    format_frame,
+    hint_text,
+    idle_style,
+    parse_args,
     read_events,
     read_labels,
+    render_once,
+    row_values,
     sort_terminals,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState
@@ -129,6 +148,9 @@ def make_app(
     labels: str | None = None,
     events: str | None = None,
     tick: float = 1.0,
+    poll_interval: float = 2.0,
+    sync_script: Path | None = None,
+    spawn: Any = None,
 ) -> tuple[FleetApp, Feed, FakeTmux]:
     feed = Feed(outcomes, tick=tick)
     runner = tmux or FakeTmux(activity={"0": 990, "2": 999, "3": 999})
@@ -148,8 +170,33 @@ def make_app(
         labels_path=labels_path,
         events_path=events_path,
         snapshot_dir=tmp_path / "fleet-snapshots",
+        poll_interval=poll_interval,
+        # A set-but-absent path resolves to "no sync script", so no test ever
+        # spawns a real child by accident (see the events-sync tests below).
+        sync_script=sync_script if sync_script is not None else tmp_path / "absent-sync.sh",
+        spawn=spawn if spawn is not None else Spawns(),
     )
     return app, feed, runner
+
+
+class Spawns:
+    """Records every events-sync launch; the child is never real."""
+
+    def __init__(self, *, running: bool = False) -> None:
+        self.calls: List[Path] = []
+        self._running = running
+
+    def __call__(self, script: Path) -> Any:
+        self.calls.append(script)
+        return FakeProc(running=self._running)
+
+
+class FakeProc:
+    def __init__(self, *, running: bool = False) -> None:
+        self._running = running
+
+    def poll(self) -> int | None:
+        return None if self._running else 0
 
 
 def cell(table: DataTable[Any], row: int, column: int) -> Any:
@@ -226,8 +273,10 @@ async def test_default_view_is_exactly_the_six_parity_columns(tmp_path: Path) ->
         await settle(pilot, feed)
         table = app.table
         labels = [str(col.label) for col in table.columns.values()]
-        assert labels == list(PARITY_COLUMNS)
-        assert labels == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "IDLE"]
+        assert labels == list(PARITY_VIEW)
+        # AC5: the six parity headers, verbatim, after the header-less gutter.
+        assert labels[1:] == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "IDLE"]
+        assert labels[MARKER_INDEX] == ""
 
 
 @pytest.mark.asyncio
@@ -239,18 +288,18 @@ async def test_c_reveals_the_five_new_columns_and_toggles_back(tmp_path: Path) -
         await pilot.press("c")
         await pilot.pause()
         labels = [str(col.label) for col in app.table.columns.values()]
-        assert labels == list(ALL_COLUMNS)
-        assert labels[len(PARITY_COLUMNS) :] == list(NEW_COLUMNS)
+        assert labels == list(ALL_VIEW)
+        assert labels[len(PARITY_VIEW) :] == list(NEW_COLUMNS)
 
         rows = app.visible_terminals()
         supervisor = next(i for i, t in enumerate(rows) if t.id == "term-0021")
-        assert plain(app.table, supervisor, ALL_COLUMNS.index("DELEG")) == "delegating (2)"
-        assert plain(app.table, supervisor, ALL_COLUMNS.index("LIFE")) == "persistent"
-        assert plain(app.table, supervisor, ALL_COLUMNS.index("MODEL")) == "claude-opus-5"
+        assert plain(app.table, supervisor, ALL_VIEW.index("DELEG")) == "delegating (2)"
+        assert plain(app.table, supervisor, ALL_VIEW.index("LIFE")) == "persistent"
+        assert plain(app.table, supervisor, ALL_VIEW.index("MODEL")) == "claude-opus-5"
 
         await pilot.press("c")
         await pilot.pause()
-        assert [str(c.label) for c in app.table.columns.values()] == list(PARITY_COLUMNS)
+        assert [str(c.label) for c in app.table.columns.values()] == list(PARITY_VIEW)
 
 
 # ── AC2: the seven fixtures render ───────────────────────────────────────────
@@ -281,7 +330,7 @@ async def test_healthy_fixture_status_cells_carry_glyph_and_style(tmp_path: Path
     async with app.run_test() as pilot:
         await settle(pilot, feed)
         table = app.table
-        status = PARITY_COLUMNS.index("STATUS")
+        status = PARITY_VIEW.index("STATUS")
 
         assert plain(table, 0, status) == "◌ idle"
         assert cell(table, 0, status).style == "yellow"
@@ -291,14 +340,14 @@ async def test_healthy_fixture_status_cells_carry_glyph_and_style(tmp_path: Path
         assert cell(table, 2, status).style == "dim"
 
         # Parity columns around it.
-        assert plain(table, 0, PARITY_COLUMNS.index("WIN")) == "0"
-        assert plain(table, 0, PARITY_COLUMNS.index("ID")) == "term-0001"
-        assert plain(table, 0, PARITY_COLUMNS.index("PROFILE")) == "chao_supervisor"
-        assert plain(table, 0, PARITY_COLUMNS.index("TASK")) == "(supervisor seat)"
-        assert plain(table, 1, PARITY_COLUMNS.index("TASK")) == "build the fetcher"
-        assert plain(table, 2, PARITY_COLUMNS.index("TASK")) == "(unlabeled)"
+        assert plain(table, 0, PARITY_VIEW.index("WIN")) == "0"
+        assert plain(table, 0, PARITY_VIEW.index("ID")) == "term-0001"
+        assert plain(table, 0, PARITY_VIEW.index("PROFILE")) == "chao_supervisor"
+        assert plain(table, 0, PARITY_VIEW.index("TASK")) == "(supervisor seat)"
+        assert plain(table, 1, PARITY_VIEW.index("TASK")) == "build the fetcher"
+        assert plain(table, 2, PARITY_VIEW.index("TASK")) == "(unlabeled)"
         # IDLE from tmux window_activity: window 3 was stamped at 999.
-        assert plain(table, 2, PARITY_COLUMNS.index("IDLE")) == fmt_age(feed.clock - 999)
+        assert plain(table, 2, PARITY_VIEW.index("IDLE")) == fmt_age(feed.clock - 999)
 
 
 @pytest.mark.asyncio
@@ -308,7 +357,7 @@ async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
     app, feed, _ = make_app([load_payload("error_latched")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        status = PARITY_COLUMNS.index("STATUS")
+        status = PARITY_VIEW.index("STATUS")
         assert plain(app.table, 1, status) == "· error"
         assert plain(app.table, 2, status) == "· error [CAPPED]"
         assert cell(app.table, 2, status).style == "bold red"
@@ -316,7 +365,7 @@ async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
     app2, feed2, _ = make_app([load_payload("wake_alarm")], tmp_path)
     async with app2.run_test() as pilot:
         await settle(pilot, feed2)
-        status = PARITY_COLUMNS.index("STATUS")
+        status = PARITY_VIEW.index("STATUS")
         assert plain(app2.table, 1, status) == "x WEDGE? [BUSY]"
         assert cell(app2.table, 1, status).style == "bold red"
         assert len(app2.state.wake_exhaustion_alarms) >= 1
@@ -358,7 +407,9 @@ async def test_fetch_timeout_marker_keeps_rows_and_grows_the_stale_badge(tmp_pat
         await advance(pilot, feed, 2)
         assert app.table.row_count == 3  # rows kept, not cleared
         badge = app.badge_text()
-        assert badge.startswith("CAO fleet · f702-test · 2 workers · stale ")
+        assert badge.startswith("CAO fleet · f702-test · ")
+        assert " · 2 workers · fetch " in badge
+        assert " · stale " in badge
         assert marker["error"] in str(app.state.last_error)
 
 
@@ -595,3 +646,477 @@ async def test_every_binding_names_an_action_the_app_implements(tmp_path: Path) 
         "s",
         "c",
     }
+
+
+# ── parity: on-screen key hints (ranked gap 1) ───────────────────────────────
+
+#: Which hint fragment covers each binding key. Every binding must map to a
+#: fragment that actually appears on screen — that is what stops a binding
+#: from landing without a hint, and what fails if the hint line is deleted.
+HINT_COVERAGE = {
+    "q": "q quit",
+    "up": "↑↓/jk select",
+    "down": "↑↓/jk select",
+    "k": "↑↓/jk select",
+    "j": "↑↓/jk select",
+    "g": "g/G ends",
+    "G": "g/G ends",
+    "enter": "⏎/o jump",
+    "o": "⏎/o jump",
+    "p": "p peek",
+    "plus": "+/- size",
+    "equals_sign": "+/- size",
+    "minus": "+/- size",
+    "d": "d debug",
+    "s": "s snapshot",
+    "c": "c columns",
+}
+
+
+def test_every_binding_key_is_covered_by_an_on_screen_hint() -> None:
+    """Gap 1: d/s/p/c (and the rest) are discoverable without the source."""
+    text = hint_text()
+    for binding in FleetApp.BINDINGS:
+        assert binding.key in HINT_COVERAGE, f"binding {binding.key} has no hint"
+        assert HINT_COVERAGE[binding.key] in text, binding.key
+    for key, label in KEY_HINTS:
+        assert f"{key} {label}" in text
+
+
+@pytest.mark.asyncio
+async def test_the_hint_line_is_rendered_in_the_app(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        rendered = str(app.query_one("#hints", Static).render())
+        for fragment in ("d debug", "s snapshot", "p peek", "c columns", "q quit"):
+            assert fragment in rendered
+
+
+# ── parity: loud server-down state (ranked gap 2) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_failure_raises_a_loud_unreachable_line_with_the_last_good_time(
+    tmp_path: Path,
+) -> None:
+    """Gap 2: red header line, not a subtle badge; last good fetch is named."""
+    app, feed, _ = make_app(
+        [load_payload("healthy"), TimeoutError("timed out")], tmp_path, tick=5.0
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        alert = app.query_one("#alert", Static)
+        assert app.alert_text() == ""
+        assert alert.display is False
+
+        await advance(pilot, feed)
+        text = app.alert_text()
+        assert text.startswith("fleet endpoint unreachable: timed out")
+        assert "last good " in text
+        assert "never" not in text
+        assert alert.display is True
+        assert app.table.row_count == 3  # last good rows kept
+
+
+@pytest.mark.asyncio
+async def test_the_unreachable_line_says_never_when_no_fetch_ever_succeeded(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([ConnectionRefusedError("refused")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.alert_text().endswith("· last good never")
+        assert app.query_one("#alert", Static).display is True
+
+
+# ── parity: the row colour language (ranked gap 3) ──────────────────────────
+
+
+def test_idle_style_matches_the_scripts_thresholds() -> None:
+    assert idle_style(None) == "dim"
+    assert idle_style(0.0) == "dim"
+    assert idle_style(4.9) == "dim"
+    assert idle_style(5.0) == ""
+    assert idle_style(299.0) == ""
+    assert idle_style(300.0) == "yellow"
+    assert idle_style(10_000.0) == "yellow"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_and_worker_rows_carry_the_scripts_colours(tmp_path: Path) -> None:
+    """Gap 3: supervisor magenta, worker id cyan, worker WIN dim."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        table = app.table
+        win, tid, profile = (PARITY_VIEW.index(n) for n in ("WIN", "ID", "PROFILE"))
+
+        assert cell(table, 0, win).style == "magenta"
+        assert cell(table, 0, tid).style == "bold magenta"
+        assert cell(table, 0, profile).style == "magenta"
+
+        assert cell(table, 1, win).style == "dim"
+        assert cell(table, 1, tid).style == "cyan"
+        assert cell(table, 1, profile).style == ""
+
+
+@pytest.mark.asyncio
+async def test_unlabeled_tasks_are_dim_and_labeled_ones_are_not(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, labels="term-0002\tdev lane\n")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        task = PARITY_VIEW.index("TASK")
+        assert plain(app.table, 1, task) == "dev lane"
+        assert cell(app.table, 1, task).style == ""
+        assert plain(app.table, 2, task) == "(unlabeled)"
+        assert cell(app.table, 2, task).style == "dim"
+
+
+@pytest.mark.asyncio
+async def test_idle_cells_are_coloured_by_age(tmp_path: Path) -> None:
+    """A window last active 10 min ago is yellow; a fresh one is dim."""
+    tmux = FakeTmux(activity={"0": 400, "2": 999, "3": 999})  # clock is 1000.0
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=tmux)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        idle = PARITY_VIEW.index("IDLE")
+        assert plain(app.table, 0, idle) == "10m"
+        assert cell(app.table, 0, idle).style == "yellow"
+        fresh = plain(app.table, 1, idle)
+        assert fresh.endswith("s") and int(fresh[:-1]) < 5
+        assert cell(app.table, 1, idle).style == "dim"
+
+
+# ── parity: the ▶ selection marker (ranked gap 4) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_selection_gutter_marks_exactly_the_cursor_row(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+
+        def markers() -> list[str]:
+            return [plain(app.table, i, MARKER_INDEX) for i in range(app.table.row_count)]
+
+        assert markers() == [MARKER_SELECTED, MARKER_BLANK, MARKER_BLANK]
+        await pilot.press("j")
+        assert markers() == [MARKER_BLANK, MARKER_SELECTED, MARKER_BLANK]
+        await pilot.press("G")
+        assert markers() == [MARKER_BLANK, MARKER_BLANK, MARKER_SELECTED]
+        await pilot.press("g")
+        assert markers() == [MARKER_SELECTED, MARKER_BLANK, MARKER_BLANK]
+
+
+@pytest.mark.asyncio
+async def test_the_marker_survives_a_refresh_on_the_selected_row(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")] * 3, tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        await pilot.press("G")
+        await advance(pilot, feed, 2)
+        assert app.selected_id() == "term-0003"
+        assert plain(app.table, 2, MARKER_INDEX) == MARKER_SELECTED
+        assert plain(app.table, 0, MARKER_INDEX) == MARKER_BLANK
+
+
+# ── parity: events-feed sync cadence (ranked gap 5) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_events_sync_script_fires_once_and_is_then_throttled(
+    tmp_path: Path,
+) -> None:
+    """Gap 5: fleet-events-sync.sh runs on the first frame, then ≥30 s apart."""
+    script = tmp_path / "fleet-events-sync.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    spawns = Spawns()
+    app, feed, _ = make_app(
+        [load_payload("healthy")] * 4,
+        tmp_path,
+        sync_script=script,
+        spawn=spawns,
+        tick=5.0,
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert spawns.calls == [script]  # fired on the first render
+        await advance(pilot, feed, 3)  # clock 1000 -> 1015: inside the throttle
+        assert spawns.calls == [script]
+        feed.clock += 31.0
+        app.refresh_events()
+        assert spawns.calls == [script, script]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_sync_script_is_a_silent_no_op(tmp_path: Path) -> None:
+    spawns = Spawns()
+    app, feed, _ = make_app(
+        [load_payload("healthy")], tmp_path, sync_script=tmp_path / "nope.sh", spawn=spawns
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert spawns.calls == []
+        assert app.errors == []
+
+
+@pytest.mark.asyncio
+async def test_a_still_running_sync_child_is_not_relaunched(tmp_path: Path) -> None:
+    script = tmp_path / "fleet-events-sync.sh"
+    script.write_text("#!/bin/sh\nsleep 60\n")
+    script.chmod(0o755)
+    spawns = Spawns(running=True)
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, sync_script=script, spawn=spawns)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert spawns.calls == [script]
+        feed.clock += 10_000.0
+        app.refresh_events()
+        assert spawns.calls == [script]  # the previous run has not finished
+
+
+def test_find_events_sync_script_prefers_the_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "custom-sync.sh"
+    override.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("CAO_FLEET_EVENTS_SYNC", str(override))
+    assert find_events_sync_script(tmp_path / "fleet-events.log") == override
+
+    monkeypatch.setenv("CAO_FLEET_EVENTS_SYNC", str(tmp_path / "gone.sh"))
+    assert find_events_sync_script(tmp_path / "fleet-events.log") is None
+
+
+def test_find_events_sync_script_falls_back_to_the_events_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CAO_FLEET_EVENTS_SYNC", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    assert find_events_sync_script(tmp_path / "fleet-events.log") is None
+    sibling = tmp_path / "fleet-events-sync.sh"
+    sibling.write_text("#!/bin/sh\n")
+    assert find_events_sync_script(tmp_path / "fleet-events.log") == sibling
+
+
+# ── parity: the WIN column (ranked gap 6) ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_win_renders_the_real_window_index_from_a_stringified_payload(
+    tmp_path: Path,
+) -> None:
+    """The live server sends `window_index` as a string (clients/tmux.py:1423).
+
+    Before the fix every live row rendered `?`; the fixtures used ints and hid
+    it. Window 0 must render as `0`, never as `?`.
+    """
+    payload = load_payload("healthy")
+    for row in payload["terminals"]:
+        row["window_index"] = str(row["window_index"])
+    app, feed, _ = make_app([payload], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        win = PARITY_VIEW.index("WIN")
+        assert [plain(app.table, i, win) for i in range(3)] == ["0", "2", "3"]
+        assert "?" not in [plain(app.table, i, win) for i in range(3)]
+
+
+@pytest.mark.asyncio
+async def test_win_is_a_question_mark_only_when_the_server_sends_no_window(
+    tmp_path: Path,
+) -> None:
+    payload = load_payload("healthy")
+    payload["terminals"][1]["window_index"] = None
+    payload["terminals"][2]["window_index"] = "not-a-number"
+    app, feed, _ = make_app([payload], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        win = PARITY_VIEW.index("WIN")
+        assert plain(app.table, 0, win) == "0"
+        assert {plain(app.table, 1, win), plain(app.table, 2, win)} == {"?"}
+
+
+# ── parity: header, error ring, snapshot, launch contract ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_header_carries_session_clock_worker_count_latency_and_liveness(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        badge = app.badge_text()
+        clock = time.strftime("%H:%M:%S", time.localtime(feed.clock))
+        assert badge == f"CAO fleet · f702-test · {clock} · 2 workers · fetch 0ms · live"
+
+
+@pytest.mark.asyncio
+async def test_the_error_ring_records_failures_and_the_debug_pane_shows_them(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app(
+        [load_payload("healthy"), TimeoutError("timed out"), OSError("refused")],
+        tmp_path,
+        tick=1.0,
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.errors == []
+        await advance(pilot, feed, 2)
+        messages = [message for _, message in app.errors]
+        assert messages == ["fetch: timed out", "fetch: refused"]
+        assert "fetch: timed out" in app.debug_text()
+        assert "fetch: refused" in app.debug_text()
+
+
+@pytest.mark.asyncio
+async def test_the_error_ring_is_capped_at_twenty_entries(tmp_path: Path) -> None:
+    app, _, _ = make_app([], tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for index in range(30):
+            app.record_error(f"boom {index}")
+        assert len(app.errors) == 20
+        assert app.errors[0][1] == "boom 10"
+        assert app.errors[-1][1] == "boom 29"
+        assert len(app.error_ring_lines()) == 8
+
+
+@pytest.mark.asyncio
+async def test_a_failing_tmux_read_lands_in_the_error_ring(tmp_path: Path) -> None:
+    class Dead(FakeTmux):
+        def __call__(self, args: Sequence[str]) -> str | None:
+            super().__call__(args)
+            return None
+
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=Dead())
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert any(message.startswith("tmux list-windows") for _, message in app.errors)
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_carries_the_raw_json_and_the_error_ring(tmp_path: Path) -> None:
+    app, feed, _ = make_app(
+        [load_payload("healthy")],
+        tmp_path,
+        labels="term-0002\tdev lane\n",
+        events="event one\nevent two\n",
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        app.record_error("synthetic ring entry")
+        await pilot.press("s")
+        await pilot.pause()
+    body = next((tmp_path / "fleet-snapshots").glob("fleet-*.txt")).read_text()
+    assert "== raw fleet json ==" in body
+    assert "f702-healthy" in body  # the payload itself, not just a summary
+    assert "== tui error ring ==" in body
+    assert "synthetic ring entry" in body
+    assert "(endpoint reachable)" in body
+
+
+def test_parse_args_restores_interval_and_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CAO_SESSION", raising=False)
+    args = parse_args(["--session", "s", "--interval", "7.5", "--once"])
+    assert (args.session, args.interval, args.once) == ("s", 7.5, True)
+    default = parse_args([])
+    assert default.interval == 2.0 and default.once is False
+
+
+def test_detect_tmux_session_reads_the_enclosing_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    assert detect_tmux_session(lambda args: "should-not-be-called\n") is None
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    seen: list[Sequence[str]] = []
+
+    def runner(args: Sequence[str]) -> str | None:
+        seen.append(args)
+        return "cao-claude-orch5\n"
+
+    assert detect_tmux_session(runner) == "cao-claude-orch5"
+    assert seen == [["display-message", "-p", "#S"]]
+    assert detect_tmux_session(lambda args: None) is None
+
+
+@pytest.mark.asyncio
+async def test_the_poll_interval_drives_the_loop_and_its_backoff(tmp_path: Path) -> None:
+    failures = [TimeoutError("x")] * 3
+    app, feed, _ = make_app(
+        [load_payload("healthy"), *failures], tmp_path, poll_interval=5.0, tick=1.0
+    )
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        await advance(pilot, feed, 3)
+        assert feed.sleeps == [5.0, 5.0, 10.0, 10.0]
+
+
+# ── parity: the --once frame ────────────────────────────────────────────────
+
+
+def test_render_once_prints_a_frame_with_rows_marker_and_hints(tmp_path: Path) -> None:
+    payload = load_payload("healthy")
+    labels_path = tmp_path / "labels.tsv"
+    labels_path.write_text("term-0002\tdev lane\n")
+    events_path = tmp_path / "events.log"
+    events_path.write_text("first event\nsecond event\n")
+    frame = render_once(
+        "f702-test",
+        "http://127.0.0.1:9889",
+        fetch=lambda url, timeout=5.0: payload,
+        runner=lambda args: "0 100\n2 100\n3 100\n",
+        labels_path=labels_path,
+        events_path=events_path,
+    )
+    assert "▌ CAO fleet · f702-test" in frame
+    assert "WIN" in frame and "STATUS" in frame
+    assert "▶ 0" in frame  # first row selected
+    assert "dev lane" in frame
+    assert "second event" in frame
+    assert "d debug" in frame
+
+
+def test_render_once_reports_an_unreachable_endpoint(tmp_path: Path) -> None:
+    def boom(url: str, timeout: float = 5.0) -> Any:
+        raise ConnectionRefusedError("connection refused")
+
+    frame = render_once(
+        "f702-test",
+        "http://127.0.0.1:9889",
+        fetch=boom,
+        runner=lambda args: "",
+        labels_path=tmp_path / "labels.tsv",
+        events_path=tmp_path / "events.log",
+    )
+    assert frame.startswith("fleet endpoint unreachable: connection refused")
+    assert "(no workers)" in frame
+
+
+def test_format_frame_widths_follow_the_scripts_rule(tmp_path: Path) -> None:
+    state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
+    frame = format_frame("s", state, {}, {}, [], latency_ms=12, clock="00:00:00")
+    header = next(line for line in frame.splitlines() if line.strip().startswith("WIN"))
+    rows = [line for line in frame.splitlines() if line.startswith(("▶ ", "  term"))]
+    assert header.startswith("  WIN")
+    # every ID starts at the same column as the ID header
+    id_column = header.index("ID")
+    assert all(line[id_column:].startswith("term-") for line in rows)
+
+
+def test_row_values_is_the_single_source_of_the_row_text() -> None:
+    state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
+    supervisor = next(t for t in state.terminals if not t.parent_id)
+    assert row_values(supervisor, {}, {}) == [
+        "0",
+        "term-0001",
+        "chao_supervisor",
+        "(supervisor seat)",
+        "◌ idle",
+        "-",
+    ]
