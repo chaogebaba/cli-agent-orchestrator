@@ -478,6 +478,7 @@ class HerdrInboxService:
             list_terminals_by_session,
             record_workspace_mapping,
         )
+        from cli_agent_orchestrator.services.teardown_intent_service import teardown_bracket
 
         # One socket call replaces the former pane-list + workspace-list +
         # tab-list subprocess fan-out. All three data structures below are derived
@@ -635,8 +636,19 @@ class HerdrInboxService:
 
             for session_name, remaining in remaining_by_session.items():
                 if remaining == 0 and session_name not in live_workspace_labels:
+                    # F720 (#576): mark before the kill. "No MANAGED terminal
+                    # remains" is not "no ROW remains" — a row this reconcile
+                    # did not drop (its delete raised, or it landed between the
+                    # map scan and here) would project ERROR the instant the
+                    # workspace dies. One session-scope mark per workspace,
+                    # released before the next iteration.
                     try:
-                        get_backend().kill_session(session_name)
+                        with teardown_bracket(
+                            session_name,
+                            scope_kind="session",
+                            requested_by="herdr_reconcile",
+                        ):
+                            get_backend().kill_session(session_name)
                         logger.info(f"Reconcile: killed empty workspace {session_name}")
                     except Exception as e:
                         logger.warning(f"Reconcile: failed to kill workspace {session_name}: {e}")

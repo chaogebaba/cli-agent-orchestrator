@@ -36,6 +36,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.teardown_intent_service import teardown_bracket
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
@@ -315,22 +316,30 @@ async def execute_flow(name: str) -> bool:
                     status_monitor.clear_terminal(t["id"])
                 except Exception as e:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
-            get_backend().kill_session(session_name)
-            # A provider's private state must outlive the process that owns
-            # it.  Grok cleanup confirms any escaped updater has stopped
-            # before recursively deleting its private GROK_HOME.
-            cleanup_complete = True
-            for t in terminals:
-                if provider_manager.cleanup_provider(t["id"]) is False:
-                    cleanup_complete = False
-            if not cleanup_complete:
-                logger.warning(
-                    "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
-                    name,
-                )
-                return False
-            for terminal in terminals:
-                terminal_service._delete_terminal_core(terminal["id"])
+            # F720 (#576): recycling kills the whole session while every
+            # terminal row is still live, and the rows are only purged by the
+            # ``_delete_terminal_core`` loop below — that gap is exactly when a
+            # fleet sample would stamp ERROR on rows we are deliberately
+            # reaping. The session-scope mark spans kill → row purge and is
+            # released on every exit of the block, the deferred-cleanup
+            # ``return False`` included.
+            with teardown_bracket(session_name, scope_kind="session", requested_by=f"flow:{name}"):
+                get_backend().kill_session(session_name)
+                # A provider's private state must outlive the process that owns
+                # it.  Grok cleanup confirms any escaped updater has stopped
+                # before recursively deleting its private GROK_HOME.
+                cleanup_complete = True
+                for t in terminals:
+                    if provider_manager.cleanup_provider(t["id"]) is False:
+                        cleanup_complete = False
+                if not cleanup_complete:
+                    logger.warning(
+                        "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
+                        name,
+                    )
+                    return False
+                for terminal in terminals:
+                    terminal_service._delete_terminal_core(terminal["id"])
         elif terminals:
             # Session vanished but retained terminal rows exist (from a prior
             # deferred Grok cleanup). Retry cleanup before recreating.

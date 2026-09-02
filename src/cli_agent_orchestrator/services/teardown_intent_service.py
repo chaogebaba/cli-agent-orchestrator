@@ -8,6 +8,8 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
@@ -211,3 +213,76 @@ def active_teardown_scope_keys() -> set[str]:
         logger.warning("f218_teardown_scope_keys_db_read_failed (using in-process marks): %s", e)
         return keys
     return keys | {row[0] for row in rows}
+
+
+@contextmanager
+def teardown_bracket(
+    scope_key: str,
+    *,
+    scope_kind: str = "terminal",
+    requested_by: str | None = None,
+    ttl_s: float | None = None,
+) -> Iterator[None]:
+    """F720 (#576): the F716 mark -> open -> (tmux kill) -> close -> unmark bracket.
+
+    ``delete_terminal`` open-codes this sequence (terminal_service.py, F716
+    #571). Every OTHER tmux kill site needs the same protection, and open-coding
+    it five more times is how the sites drift apart, so the sequence lives here
+    and the sites say ``with teardown_bracket(...)``.
+
+    Ordering is the whole point and matches F716 exactly: the in-process mark
+    goes first and cannot fail, so no kill inside the block can ever run
+    without SOME mark; the durable intent is opened right after and stays
+    authoritative across processes; a failure to open it is logged and the
+    block proceeds on the mark alone rather than blocking a teardown on a
+    bookkeeping table.
+
+    ``scope_kind="session"`` marks the SESSION name, which
+    ``fleet_service.build_fleet`` matches against every row of that session
+    (fleet_service.py: ``session_name in teardown_scope_keys``). Use it only
+    where the whole session is being killed -- a session-scope mark taken for
+    a single terminal's sake would also suppress the ERROR of live peers on
+    that session, which is the AC-F716-2 safety property.
+
+    Nesting the same key is tolerated: the bracket releases the in-process mark
+    only if it was the one that set it. The durable row is shared by key
+    (``open_intent`` returns the existing id), so an inner close removes the
+    outer's row and leaves it running on the in-process mark alone; no site
+    pairs this way today.
+    """
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    resolved_ttl = (
+        float(ConfigService.get("teardown.intent_ttl_s", 300.0)) if ttl_s is None else ttl_s
+    )
+    already_marked = scope_key in _active_memory_marks()
+    mark_teardown(scope_key, ttl_s=resolved_ttl)
+    intent_id: str | None = None
+    try:
+        with SessionLocal() as db:
+            intent_id = open_intent(
+                scope_kind=scope_kind,
+                scope_key=scope_key,
+                requested_by=requested_by,
+                ttl_s=resolved_ttl,
+                db=db,
+            )
+    except Exception as e:
+        logger.warning(
+            "f218_teardown_intent_open_failed scope=%s key=%s (in-process mark still set): %s",
+            scope_kind,
+            scope_key,
+            e,
+        )
+    try:
+        yield
+    finally:
+        if intent_id is not None:
+            try:
+                with SessionLocal() as db:
+                    close_intent(intent_id, db)
+            except Exception as e:
+                logger.warning("f218_teardown_intent_close_failed scope_key=%s: %s", scope_key, e)
+        if not already_marked:
+            unmark_teardown(scope_key)
