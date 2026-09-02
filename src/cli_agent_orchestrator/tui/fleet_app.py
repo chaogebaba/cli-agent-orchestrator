@@ -36,6 +36,16 @@ unlabeled task dim (``:245-250,410-415``) — the on-screen key hints
 throttled ``fleet-events-sync.sh`` trigger (``:203-226``), the 20-entry error
 ring (``:82-84``) with its debug and snapshot surfaces, and the ``--interval`` /
 ``--once`` / tmux-session-auto-detect launch contract (``:548-565``).
+
+**Section layout (F702 #557 "look" round).** The frame is the script's, section
+for section and blank line for blank line (``:336-450``): the ``▌`` header, the
+table under its own header row and thin rule, ``▌ recent``, one status line,
+the key hints, and — last, filling whatever height is left — ``▌ peek`` under
+its double rule. The peek is the *bottom* section, not a band in the middle,
+and ``test_the_sections_are_in_the_scripts_order_with_the_peek_last`` is what
+holds it there. Chrome is the script's too: the ``▌`` mark opens all three
+section titles, the accents are its two (``:62-65``), and no widget draws a
+border of its own, so the only horizontal lines on screen are the two rules.
 """
 
 from __future__ import annotations
@@ -63,7 +73,7 @@ try:  # pragma: no cover - exercised by the install path, not the suite
     from textual.containers import Vertical
     from textual.coordinate import Coordinate
     from textual.message import Message
-    from textual.widgets import DataTable, RichLog, Static
+    from textual.widgets import DataTable, Static
 except ModuleNotFoundError as exc:  # pragma: no cover - same
     raise SystemExit(
         "cao-fleet needs the 'fleet' extra (Textual is not installed).\n"
@@ -121,6 +131,46 @@ STYLE_MARKER: Final[str] = "bold"
 #: The loud server-down line (``:335``).
 STYLE_ALERT: Final[str] = "bold red"
 
+# ─── Section chrome, ported from scripts/fleet-tui.py:53-68,336-449 ───────────
+# The script's two-accent scheme: ACCENT2 titles every section, ACCENT1 (blue)
+# is the selection bar. Changing these two constants rethemes the whole view,
+# exactly as the comment at ``fleet-tui.py:62-64`` promises.
+#: ``fleet-tui.py:65`` — the user-picked light-yellow swatch, verbatim.
+ACCENT_TITLE: Final[str] = "rgb(250,242,93)"
+#: ``fleet-tui.py:63`` — the selection bar. The script writes ANSI blue under
+#: reverse video; Textual's ``ansi_blue`` is remapped by the active theme (it
+#: renders purple on the default one), so the bar names the colour outright.
+ACCENT_SELECTION: Final[str] = "#0000cd"
+#: The glyph that opens every section title (``:337,419,441``).
+SECTION_MARK: Final[str] = "▌"
+#: Section titles: ``▌ CAO fleet``, ``▌ recent``, ``▌ peek``.
+STYLE_SECTION: Final[str] = f"bold {ACCENT_TITLE}"
+#: The dim tail of the header line — clock, worker count, latency, badge.
+STYLE_SECTION_TAIL: Final[str] = "dim"
+#: The badge turns yellow once the snapshot is older than one poll interval.
+STYLE_STALE: Final[str] = "yellow"
+#: The table's own header row (``:372``) and the thin rule under it (``:373``).
+STYLE_TABLE_HEADER: Final[str] = "dim bold"
+STYLE_RULE: Final[str] = "dim"
+RULE_GLYPH: Final[str] = "─"
+#: The peek banner's double rule (``:445``), in the title accent.
+PEEK_RULE_GLYPH: Final[str] = "═"
+#: Recent-event lines: dim, indented two spaces (``:420``).
+STYLE_EVENT: Final[str] = "dim"
+EVENT_INDENT: Final[str] = "  "
+#: The key hint line (``:432``): bold key, dim label, dim separator.
+STYLE_HINT_KEY: Final[str] = "bold"
+STYLE_HINT_LABEL: Final[str] = "dim"
+HINT_SEPARATOR: Final[str] = " · "
+#: Two spaces between columns and two for the selection gutter (``:361,374``).
+COLUMN_GUTTER: Final[int] = 2
+GUTTER_WIDTH: Final[int] = 2
+#: A last-resort width when the screen has not been sized yet.
+FALLBACK_WIDTH: Final[int] = 80
+#: How many lines of section chrome the peek pane spends before the capture:
+#: the banner and the double rule.
+PEEK_CHROME_LINES: Final[int] = 2
+
 #: The tmux verbs this app is allowed to run. Only ``select-window`` mutates
 #: anything; the rest are reads (AC4).
 TMUX_READS = frozenset({"list-windows", "list-panes", "capture-pane", "display-message"})
@@ -154,7 +204,40 @@ KEY_HINTS: Final[Tuple[Tuple[str, str], ...]] = (
 
 def hint_text() -> str:
     """The one-line key hint, as the script draws it (``fleet-tui.py:432``)."""
-    return " · ".join(f"{key} {label}" for key, label in KEY_HINTS)
+    return HINT_SEPARATOR.join(f"{key} {label}" for key, label in KEY_HINTS)
+
+
+def hint_renderable() -> Text:
+    """:func:`hint_text` with the script's emphasis: bold key, dim label.
+
+    ``fleet-tui.py:432`` writes ``BOLD key`` + ``DIM label`` joined by a dim
+    ``·``. The plain text is byte-for-byte :func:`hint_text`, so the one-shot
+    frame and the live view cannot drift.
+    """
+    line = Text(no_wrap=True)
+    for index, (key, label) in enumerate(KEY_HINTS):
+        if index:
+            line.append(HINT_SEPARATOR, style=STYLE_HINT_LABEL)
+        line.append(key, style=STYLE_HINT_KEY)
+        line.append(f" {label}", style=STYLE_HINT_LABEL)
+    return line
+
+
+def column_widths(headers: Sequence[str], values: Sequence[Sequence[str]]) -> List[int]:
+    """The script's column rule: ``max(header, widest cell) + 2`` (``:361-370``).
+
+    Shared by the live table and by ``--once`` so a column can never be two
+    widths wide in the two renderings.
+    """
+    return [
+        max([len(header)] + [len(row[index]) for row in values if index < len(row)]) + COLUMN_GUTTER
+        for index, header in enumerate(headers)
+    ]
+
+
+def header_line(headers: Sequence[str], widths: Sequence[int]) -> str:
+    """The table's header row: a two-space gutter, then each name left-justified."""
+    return " " * GUTTER_WIDTH + "".join(name.ljust(width) for name, width in zip(headers, widths))
 
 
 def run_tmux(args: Sequence[str]) -> str | None:
@@ -408,17 +491,39 @@ class FleetApp(App[None]):
     behind it.
     """
 
+    # Section order and spacing are the retiring script's, line for line
+    # (``fleet-tui.py:336-450``): header, blank, table, blank, recent, blank,
+    # status+hints, blank, peek — the peek LAST, filling what is left. Every
+    # blank line is a ``margin-top: 1`` on the section that follows it, so a
+    # hidden section takes its separator with it and no stray blank is left
+    # behind. The one exception is ``#flash``: it is a *reserved* line that
+    # stays blank until a notice needs it, so it is the separator above the
+    # hints and a transient notice never shifts a section by a row.
+    # No widget draws its own border: the two rules under the table
+    # header and the peek banner are the only horizontal lines, exactly as the
+    # script draws them.
     CSS = """
     Screen { layout: vertical; }
     #badge { height: 1; }
     #alert { height: 1; color: red; text-style: bold; }
-    #flash { height: 1; color: $text-muted; }
-    #hints { height: 1; color: $text-muted; }
-    #fleet { height: auto; max-height: 1fr; }
-    #peek { height: 1fr; border-top: solid $panel; }
-    #events { height: 6; border-top: solid $panel; }
-    #debug { height: 10; border-top: solid $panel; }
-    DataTable > .datatable--cursor { text-style: bold reverse; }
+    #table-head { height: 1; margin-top: 1; }
+    #table-rule { height: 1; }
+    #fleet { height: auto; max-height: 1fr; background: transparent; }
+    #events-title { height: 1; margin-top: 1; }
+    #events { height: auto; }
+    #debug { height: auto; max-height: 12; margin-top: 1; overflow-y: hidden; }
+    #flash { height: 1; color: yellow; }
+    #hints { height: 1; }
+    #peek { height: 1fr; margin-top: 1; }
+    DataTable { background: transparent; }
+    /* An id selector: DataTable's own DEFAULT_CSS styles this component class
+       from inside a nested `DataTable { ... }` block, which outranks a plain
+       type selector and would repaint the bar in the theme's accent. */
+    #fleet > .datatable--cursor {
+        background: #0000cd;
+        color: #ffffff;
+        text-style: bold;
+    }
     """
 
     # Verbatim from scripts/fleet-tui.py:598-619, plus `c` for the new columns.
@@ -492,6 +597,9 @@ class FleetApp(App[None]):
         self._ages: Dict[str, float] = {}
         self._events_sync_last = 0.0
         self._events_sync_proc: Any = None
+        #: Rendered column widths of the current frame, gutter first — the
+        #: single source the table and its ``#table-head`` line both size from.
+        self._widths: List[int] = []
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -588,28 +696,50 @@ class FleetApp(App[None]):
     # ── composition ──────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
+        # Top to bottom, the script's order (``fleet-tui.py:336-450``). The peek
+        # is LAST: it takes every row the sections above did not use.
         with Vertical():
             yield Static(id="badge")
             yield Static(id="alert")
+            yield Static(id="table-head")
+            yield Static(id="table-rule")
             yield DataTable(id="fleet")
-            yield Static(id="peek")
-            yield RichLog(id="events", markup=False)
+            yield Static(id="events-title")
+            yield Static(id="events")
             yield Static(id="debug")
             yield Static(id="flash")
             yield Static(id="hints")
+            yield Static(id="peek")
 
     def on_mount(self) -> None:
         table = self.table
         table.cursor_type = "row"
-        table.zebra_stripes = True
+        # The script draws no stripes and no cell padding: columns are sized by
+        # :func:`column_widths`, which already carries the two-space gutter
+        # (``fleet-tui.py:361-370``). Letting ``DataTable`` add its own padding
+        # on top would shift every column two places right of the header.
+        table.zebra_stripes = False
+        table.cell_padding = 0
+        table.show_header = False  # the header is drawn as ``#table-head``
         table.can_focus = False  # every key is an app binding (AC4: one jump path)
         self._install_columns()
         self.query_one("#peek", Static).display = self.peek_visible
         self.query_one("#debug", Static).display = self.debug_visible
-        self.query_one("#hints", Static).update(hint_text())
-        self.query_one("#events", RichLog).border_title = "recent"  # ``:420``
+        self.query_one("#hints", Static).update(hint_renderable())
         self.refresh_view()
         self.fetch_worker()
+
+    def frame_width(self) -> int:
+        """Full-width for the two rules and the selection bar.
+
+        The script asks ``shutil.get_terminal_size()`` on every frame
+        (``:331``); inside Textual the screen already knows, and the shell call
+        is only the fallback for a frame drawn before the first layout.
+        """
+        width = self.size.width
+        if width <= 0:  # pragma: no cover - only before the first layout pass
+            width = shutil.get_terminal_size().columns
+        return max(FALLBACK_WIDTH // 4, width)
 
     @property
     def table(self) -> DataTable[Any]:
@@ -629,13 +759,24 @@ class FleetApp(App[None]):
         """Table index of a named column, gutter accounted for."""
         return list(self.view_columns).index(name)
 
-    def _install_columns(self) -> None:
+    def _install_columns(self, widths: Sequence[int] | None = None) -> None:
+        """(Re)install the columns at fixed widths, gutter first.
+
+        Widths are explicit rather than auto so the table lines up with the
+        ``#table-head`` line drawn above it: both come from
+        :func:`column_widths`, and the gutter is the script's two columns
+        (``fleet-tui.py:374,399``) rather than one glyph plus cell padding.
+        """
         table = self.table
         table.clear(columns=True)
-        for name in self.view_columns:
-            # The gutter is exactly one glyph wide; DataTable's own cell padding
-            # supplies the space the script wrote by hand (``fleet-tui.py:399``).
-            table.add_column(name, width=1 if name == "" else None)
+        sizes = list(widths) if widths is not None else []
+        for index, name in enumerate(self.view_columns):
+            if index < len(sizes):
+                width = sizes[index]
+            else:
+                width = GUTTER_WIDTH if name == "" else max(len(name) + COLUMN_GUTTER, 1)
+            table.add_column(name, width=width)
+        self._widths = [int(column.width) for column in table.columns.values()]
 
     # ── rendering ────────────────────────────────────────────────────────────
 
@@ -686,7 +827,11 @@ class FleetApp(App[None]):
         return sort_terminals(self.state.terminals)
 
     def row_cells(
-        self, term: TerminalState, labels: Mapping[str, str], ages: Mapping[str, float]
+        self,
+        term: TerminalState,
+        labels: Mapping[str, str],
+        ages: Mapping[str, float],
+        values: Sequence[str] | None = None,
     ) -> List[Any]:
         """One row, in the order of :attr:`view_columns`.
 
@@ -694,7 +839,8 @@ class FleetApp(App[None]):
         hands a test back both the plain value and the style — which is how the
         restored colour language is asserted.
         """
-        values = row_values(term, labels, ages, with_new_columns=self.show_new_columns)
+        if values is None:
+            values = row_values(term, labels, ages, with_new_columns=self.show_new_columns)
         styles = row_styles(term, ages, term.id in labels)
         cells: List[Any] = [Text(MARKER_BLANK, style=STYLE_MARKER)]
         for index, value in enumerate(values):
@@ -704,15 +850,41 @@ class FleetApp(App[None]):
                 cells.append(Text(value, style=styles[index] if index < len(styles) else ""))
         return cells
 
+    def frame_widths(self, values: Sequence[Sequence[str]]) -> List[int]:
+        """Gutter width, then one width per visible column, stretched to fill.
+
+        The named columns follow the script's ``max(header, cell) + 2`` rule.
+        Whatever is left of the screen is handed to the last column, so the
+        selection bar and the rule under the header end at the same place the
+        script's full-width ones do (``fleet-tui.py:373,401``).
+        """
+        widths = [GUTTER_WIDTH] + column_widths(self.columns, values)
+        spare = self.frame_width() - sum(widths)
+        if spare > 0:
+            widths[-1] += spare
+        return widths
+
+    def refresh_table_head(self) -> None:
+        """The header row and the thin rule under it (``fleet-tui.py:372-373``)."""
+        widths = self._widths[1:] if self._widths else []
+        line = header_line(self.columns, widths) if widths else ""
+        self.query_one("#table-head", Static).update(Text(line, style=STYLE_TABLE_HEADER))
+        rule = RULE_GLYPH * self.frame_width()
+        self.query_one("#table-rule", Static).update(Text(rule, style=STYLE_RULE))
+
     def refresh_table(self) -> None:
         table = self.table
         selected = self.selected_id()
         labels = read_labels(self._labels_path)
         ages = self.window_ages()
-        table.clear()
         rows = self.visible_terminals()
-        for term in rows:
-            table.add_row(*self.row_cells(term, labels, ages), key=term.id)
+        values = [
+            row_values(term, labels, ages, with_new_columns=self.show_new_columns) for term in rows
+        ]
+        self._install_columns(self.frame_widths(values))
+        self.refresh_table_head()
+        for term, row in zip(rows, values):
+            table.add_row(*self.row_cells(term, labels, ages, row), key=term.id)
         if not rows:
             return
         ids = [t.id for t in rows]
@@ -755,9 +927,26 @@ class FleetApp(App[None]):
         else:
             badge = "live"
         return (
-            f"CAO fleet · {self.session} · {self.stamp()} · {workers} workers"
+            f"{SECTION_MARK} CAO fleet · {self.session}  {self.stamp()} · {workers} workers"
             f" · fetch {latency} · {badge}"
         )
+
+    def badge_renderable(self) -> Text:
+        """:meth:`badge_text` split the way the script paints it (``:337-339``).
+
+        ``▌ CAO fleet · <session>`` in the title accent, then a dim tail — the
+        clock, the worker count and the fetch latency. The live/stale badge is
+        the Textual app's own addition (AC1) and rides in that same dim tail,
+        turning yellow only once the snapshot has actually gone stale.
+        """
+        text = self.badge_text()
+        head = f"{SECTION_MARK} CAO fleet · {self.session}"
+        line = Text(no_wrap=True)
+        line.append(head, style=STYLE_SECTION)
+        tail = text[len(head) :]
+        stale = self.state.fetched_at is not None and self.state.stale_for > self._poll_interval
+        line.append(tail, style=STYLE_STALE if stale else STYLE_SECTION_TAIL)
+        return line
 
     def alert_text(self) -> str:
         """The loud server-down line, or ``""`` when the endpoint is answering.
@@ -776,22 +965,30 @@ class FleetApp(App[None]):
         return f"fleet endpoint unreachable: {error} · last good {last_good}"
 
     def refresh_badge(self) -> None:
-        self.query_one("#badge", Static).update(self.badge_text())
+        self.query_one("#badge", Static).update(self.badge_renderable())
         alert = self.query_one("#alert", Static)
         text = self.alert_text()
         alert.display = bool(text)
         alert.update(Text(text, style=STYLE_ALERT))
 
     def refresh_events(self) -> None:
+        """The ``▌ recent`` section: dim lines, indented two spaces (``:419-420``).
+
+        The whole section — title included — disappears when the feed is empty,
+        as the script's ``if ev:`` guard does, so an absent events file leaves
+        no empty box behind.
+        """
         self.maybe_sync_events()
-        log = self.query_one("#events", RichLog)
+        title = self.query_one("#events-title", Static)
+        body = self.query_one("#events", Static)
         lines = read_events(self._events_path)
+        title.display = bool(lines)
+        body.display = bool(lines)
         if lines == self._events_shown:
             return
-        log.clear()
-        for line in lines:
-            log.write(line)
         self._events_shown = lines
+        title.update(Text(f"{SECTION_MARK} recent", style=STYLE_SECTION))
+        body.update(Text("\n".join(f"{EVENT_INDENT}{line}" for line in lines), style=STYLE_EVENT))
 
     def selected_id(self) -> str | None:
         """The terminal id under the row cursor, or ``None`` on an empty table."""
@@ -851,22 +1048,34 @@ class FleetApp(App[None]):
         (``fleet-tui.py:448-449``); ``+``/``-`` then sets a floor on top of that
         rather than being the only thing that decides the height.
         """
-        available = peek.size.height - 1  # the banner line
+        available = peek.size.height - PEEK_CHROME_LINES  # banner + double rule
         return max(self.peek_lines, available)
+
+    def peek_banner(self, term: TerminalState | None) -> Text:
+        """The two chrome lines of the peek section (``fleet-tui.py:441-445``).
+
+        Title in the section accent, then a full-width double rule in the same
+        accent — the heavier rule is what marks the peek as the last section
+        rather than another row of the table above it.
+        """
+        title = self.peek_title(term) if term is not None else f"{SECTION_MARK} peek"
+        banner = Text(title, style=STYLE_SECTION, no_wrap=True)
+        banner.append("\n")
+        banner.append(PEEK_RULE_GLYPH * self.frame_width(), style=STYLE_SECTION)
+        return banner
 
     def refresh_peek(self) -> None:
         peek = self.query_one("#peek", Static)
         peek.display = self.peek_visible
-        peek.styles.min_height = self.peek_lines + 1
+        peek.styles.min_height = self.peek_lines + PEEK_CHROME_LINES
         if not self.peek_visible:
             return
         term = self.selected_terminal()
         if term is None or term.window_index is None:
-            peek.update("(nothing selected)")
+            peek.update(Text("\n").join([self.peek_banner(term), Text("(nothing selected)")]))
             return
         body = Text.from_ansi("\n".join(self.capture_window(term.window_index, peek)))
-        title = Text(self.peek_title(term), style="bold")
-        peek.update(Text("\n").join([title, body]))
+        peek.update(Text("\n").join([self.peek_banner(term), body]))
 
     def error_ring_lines(self, limit: int = ERROR_RING_SHOWN) -> List[str]:
         """The tail of the error ring, or a single "(empty)" line."""
@@ -1018,22 +1227,22 @@ def format_frame(
     out: List[str] = []
     if state.last_error:
         out.append(f"fleet endpoint unreachable: {state.last_error}")
-    out.append(f"▌ CAO fleet · {session} · {clock} · {workers} workers · fetch {latency}")
+    out.append(
+        f"{SECTION_MARK} CAO fleet · {session}  {clock} · {workers} workers · fetch {latency}"
+    )
     out.append("")
     values = [row_values(term, labels, ages) for term in rows]
-    gutter = 2
-    widths = [
-        max([len(header)] + [len(row[index]) for row in values]) + gutter
-        for index, header in enumerate(PARITY_COLUMNS)
-    ]
-    out.append("  " + "".join(h.ljust(w) for h, w in zip(PARITY_COLUMNS, widths)))
+    widths = column_widths(PARITY_COLUMNS, values)
+    header = header_line(PARITY_COLUMNS, widths)
+    out.append(header)
+    out.append(RULE_GLYPH * len(header.rstrip()))
     for term, row in zip(rows, values):
         marker = f"{MARKER_SELECTED} " if term.id == selected else "  "
-        out.append(marker + "".join(cell.ljust(w) for cell, w in zip(row, widths)))
+        out.append((marker + "".join(cell.ljust(w) for cell, w in zip(row, widths))).rstrip())
     if not rows:
         out.append("  (no workers)")
     if events:
-        out += ["", "▌ recent"] + [f"  {line}" for line in events]
+        out += ["", f"{SECTION_MARK} recent"] + [f"{EVENT_INDENT}{line}" for line in events]
     out += ["", hint_text()]
     return "\n".join(out) + "\n"
 

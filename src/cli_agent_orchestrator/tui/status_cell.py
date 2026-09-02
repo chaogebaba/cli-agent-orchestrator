@@ -90,6 +90,15 @@ _CONDITION_STYLES: Final[Dict[str, str]] = {
 #: Rendered when ``status`` is missing or empty — the script's ``or "?"`` branch.
 _MISSING_STATUS: Final[Tuple[str, str]] = ("· ?", STYLE_QUIET)
 
+#: Conditions whose ``[TAG]`` recedes instead of shouting. ``BUSY`` is the
+#: high-frequency one — nearly every working seat carries it — so it rides as a
+#: dim span over the cell's own colour rather than competing with the status
+#: word for attention. The cell's ``style`` is untouched: the condition still
+#: owns it (D4/B12), only the tag's own glyphs are dimmed.
+_QUIET_CONDITION_TAGS: Final[frozenset[str]] = frozenset({"BUSY"})
+#: The overlay applied to those tags.
+STYLE_QUIET_TAG: Final[str] = "dim"
+
 
 def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
     """The status half of the cell: (text, style), before any condition suffix.
@@ -131,15 +140,23 @@ def status_cell(row: Mapping[str, Any]) -> Text:
     """
     text, style = _base_cell(row)
     raw_condition = row.get("condition")
+    quiet_tag = False
     if raw_condition:
         condition = str(raw_condition)
         condition_style = _CONDITION_STYLES.get(condition)
         if condition_style is None:
-            text = f"{text} [? {condition}]"
+            suffix = f" [? {condition}]"
             condition_style = STYLE_UNKNOWN_VALUE
         else:
-            text = f"{text} [{condition}]"
+            suffix = f" [{condition}]"
+            quiet_tag = condition in _QUIET_CONDITION_TAGS
+        base_length = len(text)
+        text = f"{text}{suffix}"
         # A wedge is the loudest thing on the row; nothing overrides its style.
         if style != STYLE_WEDGE:
             style = condition_style
+        cell = Text(text, style=style)
+        if quiet_tag:
+            cell.stylize(STYLE_QUIET_TAG, base_length, len(text))
+        return cell
     return Text(text, style=style)

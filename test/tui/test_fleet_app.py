@@ -15,8 +15,9 @@ from typing import Any, Dict, List, Sequence
 
 import pytest
 from rich.text import Text
+from textual.containers import Vertical
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable, RichLog, Static
+from textual.widgets import DataTable, Static
 
 from cli_agent_orchestrator.tui.columns import (
     ALL_COLUMNS,
@@ -29,12 +30,21 @@ from cli_agent_orchestrator.tui.columns import (
     PARITY_VIEW,
 )
 from cli_agent_orchestrator.tui.fleet_app import (
+    ACCENT_SELECTION,
+    GUTTER_WIDTH,
     KEY_HINTS,
+    PEEK_RULE_GLYPH,
+    RULE_GLYPH,
+    SECTION_MARK,
+    STYLE_HINT_KEY,
+    STYLE_HINT_LABEL,
     FleetApp,
+    column_widths,
     detect_tmux_session,
     find_events_sync_script,
     fmt_age,
     format_frame,
+    hint_renderable,
     hint_text,
     idle_style,
     parse_args,
@@ -45,6 +55,7 @@ from cli_agent_orchestrator.tui.fleet_app import (
     sort_terminals,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState
+from cli_agent_orchestrator.tui.status_cell import STYLE_QUIET_TAG, status_cell
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -407,7 +418,7 @@ async def test_fetch_timeout_marker_keeps_rows_and_grows_the_stale_badge(tmp_pat
         await advance(pilot, feed, 2)
         assert app.table.row_count == 3  # rows kept, not cleared
         badge = app.badge_text()
-        assert badge.startswith("CAO fleet · f702-test · ")
+        assert badge.startswith("▌ CAO fleet · f702-test  ")
         assert " · 2 workers · fetch " in badge
         assert " · stale " in badge
         assert marker["error"] in str(app.state.last_error)
@@ -602,12 +613,26 @@ async def test_s_writes_a_snapshot_under_the_snapshot_dir(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_events_log_tail_lands_in_the_rich_log(tmp_path: Path) -> None:
+async def test_events_log_tail_lands_in_the_recent_section(tmp_path: Path) -> None:
     app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\nbravo\ncharlie\n")
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        assert app.query_one("#events", RichLog).lines
+        body = str(app.query_one("#events", Static).render())
+        for line in ("alpha", "bravo", "charlie"):
+            # each line is indented two spaces, as the script writes them
+            assert f"  {line}" in body
+        assert app.query_one("#events-title", Static).display is True
         assert read_events(app._events_path) == ["alpha", "bravo", "charlie"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_events_feed_hides_the_whole_recent_section(tmp_path: Path) -> None:
+    """The script's ``if ev:`` guard: no feed, no title and no empty box."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.query_one("#events-title", Static).display is False
+        assert app.query_one("#events", Static).display is False
 
 
 @pytest.mark.asyncio
@@ -950,7 +975,9 @@ async def test_the_header_carries_session_clock_worker_count_latency_and_livenes
         await settle(pilot, feed)
         badge = app.badge_text()
         clock = time.strftime("%H:%M:%S", time.localtime(feed.clock))
-        assert badge == f"CAO fleet · f702-test · {clock} · 2 workers · fetch 0ms · live"
+        # The script's header line, verbatim: the ▌ section mark, the accented
+        # title, two spaces, then the dim tail (fleet-tui.py:337-339).
+        assert badge == f"▌ CAO fleet · f702-test  {clock} · 2 workers · fetch 0ms · live"
 
 
 @pytest.mark.asyncio
@@ -1120,3 +1147,137 @@ def test_row_values_is_the_single_source_of_the_row_text() -> None:
         "◌ idle",
         "-",
     ]
+
+
+# ── the section layout contract (F702 #557 "look" round) ─────────────────────
+#
+# The retiring script's section order, top to bottom (fleet-tui.py:336-450):
+# header, blank, table, blank, recent, blank, status+hints, blank, peek. The
+# peek is LAST. These tests are the layout's only guard — a widget reordered in
+# `compose` (the peek back into the middle, most of all) fails here and only
+# here.
+
+#: Widget ids in the order `compose` yields them.
+LAYOUT_ORDER = [
+    "badge",
+    "alert",
+    "table-head",
+    "table-rule",
+    "fleet",
+    "events-title",
+    "events",
+    "debug",
+    "flash",
+    "hints",
+    "peek",
+]
+
+
+@pytest.mark.asyncio
+async def test_the_sections_are_in_the_scripts_order_with_the_peek_last(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\n")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        ids = [child.id for child in app.query_one(Vertical).children]
+        assert ids == LAYOUT_ORDER
+        assert ids[-1] == "peek", "the peek is the last section, never the middle"
+        # and it is below the table and the recent feed on screen, not just in
+        # the widget list
+        peek = app.query_one("#peek", Static)
+        for above in ("#fleet", "#events", "#hints"):
+            assert peek.region.y > app.query_one(above).region.y
+
+
+@pytest.mark.asyncio
+async def test_every_section_title_carries_the_section_mark(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, events="alpha\n")
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.badge_text().startswith(f"{SECTION_MARK} CAO fleet")
+        assert str(app.query_one("#events-title", Static).render()).startswith(
+            f"{SECTION_MARK} recent"
+        )
+        term = app.selected_terminal()
+        assert term is not None
+        assert app.peek_title(term).startswith(f"{SECTION_MARK} peek")
+
+
+@pytest.mark.asyncio
+async def test_the_table_header_row_and_its_rule_sit_above_the_rows(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        head = str(app.query_one("#table-head", Static).render())
+        rule = str(app.query_one("#table-rule", Static).render())
+        assert head.startswith("  WIN")
+        for name in PARITY_COLUMNS:
+            assert name in head
+        assert set(rule) == {RULE_GLYPH}
+        assert len(rule) == app.frame_width()
+        # header cells line up with the table's own columns
+        widths = [int(column.width) for column in app.table.columns.values()]
+        assert head.index("ID") == widths[0] + widths[1]
+
+
+@pytest.mark.asyncio
+async def test_the_peek_banner_is_a_title_over_a_full_width_double_rule(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        banner = app.peek_banner(app.selected_terminal()).plain.splitlines()
+        assert banner[0].startswith(f"{SECTION_MARK} peek · ")
+        assert set(banner[1]) == {PEEK_RULE_GLYPH}
+        assert len(banner[1]) == app.frame_width()
+        # the banner is the head of what the peek widget actually shows
+        assert str(app.query_one("#peek", Static).render()).startswith(banner[0])
+
+
+@pytest.mark.asyncio
+async def test_the_table_columns_carry_the_scripts_two_space_gutter(tmp_path: Path) -> None:
+    """No DataTable cell padding: the widths themselves hold the gutter."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.table.cell_padding == 0
+        assert app.table.show_header is False
+        assert app.table.zebra_stripes is False
+        values = [row_values(t, {}, {}) for t in app.visible_terminals()]
+        widths = app.frame_widths(values)
+        assert widths[0] == GUTTER_WIDTH
+        # every named column is its widest cell plus the two-space gutter,
+        # except the last, which is stretched to the edge of the screen
+        expected = column_widths(PARITY_COLUMNS, values)
+        assert widths[1:-1] == expected[:-1]
+        assert sum(widths) == app.frame_width()
+
+
+def test_the_selection_bar_uses_the_scripts_accent_not_the_textual_theme() -> None:
+    """DataTable's own DEFAULT_CSS would repaint the bar in the theme accent."""
+    assert "#fleet > .datatable--cursor" in FleetApp.CSS
+    assert ACCENT_SELECTION in FleetApp.CSS
+
+
+def test_the_hint_line_is_bold_key_dim_label() -> None:
+    line = hint_renderable()
+    assert line.plain == hint_text()
+    styles = {str(span.style) for span in line.spans}
+    assert STYLE_HINT_KEY in styles and STYLE_HINT_LABEL in styles
+
+
+def test_a_busy_tag_is_dimmed_but_the_condition_still_owns_the_cell_style() -> None:
+    cell = status_cell({"status": "processing", "condition": "BUSY"})
+    assert cell.plain == "● working [BUSY]"
+    assert cell.style == "green"  # the D4/B12 contract is untouched
+    dimmed = [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG]
+    assert len(dimmed) == 1
+    assert cell.plain[dimmed[0].start : dimmed[0].end] == " [BUSY]"
+
+
+def test_a_loud_condition_tag_is_not_dimmed() -> None:
+    cell = status_cell({"status": "idle", "condition": "CAPPED"})
+    assert cell.style == "bold red"
+    assert [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG] == []
