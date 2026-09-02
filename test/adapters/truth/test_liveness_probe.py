@@ -17,12 +17,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from cli_agent_orchestrator.adapters.truth import wiring
-from cli_agent_orchestrator.adapters.truth.liveness_probe import (
-    FLEET_TERMINAL_ID,
-    LivenessProbe,
-    PaneRecord,
-)
+from cli_agent_orchestrator.adapters.truth.liveness_probe import LivenessProbe, PaneRecord
 from cli_agent_orchestrator.core.events import (
+    FLEET_TERMINAL_ID,
     Confidence,
     DecisionKind,
     EventDraft,

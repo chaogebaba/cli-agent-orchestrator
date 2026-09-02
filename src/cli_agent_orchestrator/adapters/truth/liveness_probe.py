@@ -13,8 +13,10 @@ nothing at all, that says something about the PROBE, not about any worker.
 Treating it as absence would tear down a healthy fleet the first time tmux
 hiccups.  So:
 
-* a failed (or empty) probe appends ONE ``probe.failed`` row against the fleet
-  sentinel and touches no terminal;
+* a failed (or empty) probe appends ONE ``probe.failed`` row against
+  ``core.events.FLEET_TERMINAL_ID`` and touches no terminal — a statement about
+  the probe, attributed to no worker, because attributing it to a real terminal
+  would be a lie ``cao diag <terminal_id>`` would then repeat;
 * ``PROBE_FAIL_TICKS`` consecutive failures open a fleet-wide
   ``degraded(producer_error)`` episode — one ``pane.missing`` per terminal
   carrying that reason, once per episode, never once per tick;
@@ -52,6 +54,7 @@ from typing import Callable, Iterable, Protocol
 
 from cli_agent_orchestrator.adapters.truth.wiring import ProducerRuntime, emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
+    FLEET_TERMINAL_ID,
     Confidence,
     DecisionKind,
     EventDraft,
@@ -62,19 +65,12 @@ from cli_agent_orchestrator.core.states import DegradedReason
 from cli_agent_orchestrator.core.timing import PANE_HEARTBEAT_S, PANE_MISS_TICKS, PROBE_FAIL_TICKS
 
 __all__ = [
-    "FLEET_TERMINAL_ID",
     "LivenessProbe",
     "PaneRecord",
     "TerminalRef",
 ]
 
 logger = logging.getLogger(__name__)
-
-#: ``EventDraft.terminal_id`` is ``min_length=1``, so a fleet-wide row needs a
-#: sentinel rather than an empty string.  ``probe.failed`` is the only phase-1
-#: row that uses it: it is a statement about the probe, and attributing it to any
-#: real terminal would be a lie that ``cao diag <terminal_id>`` would then repeat.
-FLEET_TERMINAL_ID = "__fleet__"
 
 
 @dataclass(frozen=True)
