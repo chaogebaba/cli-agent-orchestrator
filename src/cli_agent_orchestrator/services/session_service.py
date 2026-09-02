@@ -47,6 +47,7 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.services.teardown_intent_service import teardown_bracket
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.sandbox_guard import require_provider_admitted
@@ -113,22 +114,29 @@ def finalize_session(
             )
             return bool(backend.session_exists(session_name))
 
-    if _still_alive():
-        backend.kill_session(session_name)
-    for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
-        if not _still_alive():
-            break
-        backend.kill_session(session_name)
-        if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
-            time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
-    if _still_alive():
-        raise RuntimeError(f"Session '{session_name}' still exists after teardown")
-    clear_session_env(session_name)
-    dispatch_plugin_event(
-        registry,
-        "post_kill_session",
-        PostKillSessionEvent(session_id=session_name, session_name=session_name),
-    )
+    # F720 (#576): this kills the WHOLE session, so every row still pointing at
+    # it loses its window here. Session-scope mark (the producer the dead
+    # ``session_name in teardown_scope_keys`` branch of fleet_service never
+    # had), taken BEFORE the first kill and released after the verify loop, so
+    # a fleet sampled mid-teardown reads "reaping", not ERROR. Scoped to THIS
+    # session name only: rows of any other session keep their ERROR.
+    with teardown_bracket(session_name, scope_kind="session", requested_by="finalize_session"):
+        if _still_alive():
+            backend.kill_session(session_name)
+        for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
+            if not _still_alive():
+                break
+            backend.kill_session(session_name)
+            if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
+                time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
+        if _still_alive():
+            raise RuntimeError(f"Session '{session_name}' still exists after teardown")
+        clear_session_env(session_name)
+        dispatch_plugin_event(
+            registry,
+            "post_kill_session",
+            PostKillSessionEvent(session_id=session_name, session_name=session_name),
+        )
 
 
 async def _reconcile_inbox_path_on_publish(
@@ -676,9 +684,15 @@ def delete_session(
             else:
                 # Kill the tmux session even if cleanup is deferred — this stops
                 # the processes so a subsequent retry can complete the cleanup.
+                # F720 (#576): the retained rows are exactly the ones that would
+                # project ERROR the moment their windows go, so the kill runs
+                # under a session-scope teardown mark like finalize_session's.
                 backend = get_backend()
-                if backend.session_exists(session_name):
-                    backend.kill_session(session_name)
+                with teardown_bracket(
+                    session_name, scope_kind="session", requested_by="delete_session"
+                ):
+                    if backend.session_exists(session_name):
+                        backend.kill_session(session_name)
 
             for token in reversed(leases):
                 release_rebind_lease(token)

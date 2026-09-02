@@ -26,6 +26,7 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -150,6 +151,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
+from cli_agent_orchestrator.services.teardown_intent_service import teardown_bracket
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
@@ -1161,12 +1163,22 @@ def _rollback_terminal_creation(
             fifo_manager.stop_reader(terminal_id)
     except Exception:
         pass
+    # F720 (#576): mark before the kill. The row is normally dropped just above
+    # (``db_created``), but that delete can fail — it is caught and logged — and
+    # then a row survives its window, which is the ERROR flash this bracket
+    # removes. Scope follows what is killed: the SESSION only when this create
+    # made it (so no live peer's ERROR is suppressed), otherwise the single
+    # terminal whose window goes.
     try:
         if session_created and session_name:
-            get_backend().kill_session(session_name)
+            with teardown_bracket(
+                session_name, scope_kind="session", requested_by="create_rollback"
+            ):
+                get_backend().kill_session(session_name)
             clear_session_env(session_name)
         elif window_created and session_name and window_name:
-            get_backend().kill_window(session_name, window_name)
+            with teardown_bracket(terminal_id, requested_by="create_rollback"):
+                get_backend().kill_window(session_name, window_name)
     except Exception:
         pass
 
@@ -1369,6 +1381,7 @@ def _roll_back_backend_create_locked(
     window_name: str,
     *,
     created_session: bool,
+    terminal_id: str | None = None,
 ) -> None:
     """Undo the backend resource a create just made. CALLER MUST HOLD the
     lifecycle lock for ``session_name``.
@@ -1398,6 +1411,13 @@ def _roll_back_backend_create_locked(
     Best-effort and never raises: it runs while an exception is already in
     flight, and that original failure is the one the caller must see.
     """
+    # F720 (#576): every kill below runs under a teardown mark so a fleet
+    # sampled mid-rollback does not stamp ERROR on a row whose window this
+    # rollback is removing. ``terminal_id`` is passed only by callers whose row
+    # is already committed (``_roll_back_cancelled_create``); the db-publish
+    # failure callers have no row yet, so the window branch has nothing to mark
+    # and takes the plain path — a session-scope mark there would suppress the
+    # ERROR of live peers on a session this call did not create (AC-F716-2).
     if created_session:
         # `finally`, not a following statement: the env mapping must be dropped
         # however the kill turns out -- including when it raises a BaseException
@@ -1408,14 +1428,17 @@ def _roll_back_backend_create_locked(
         # `finally` still lets a BaseException propagate, which is what we want:
         # a Ctrl-C must not be swallowed here.
         try:
-            if not get_backend().kill_session(session_name):
-                # Falsy means the backend could not confirm the kill (or found
-                # nothing to kill). Either way the name may still be live, so say
-                # so -- a silent branch here is how an orphan goes unnoticed.
-                logger.warning(
-                    f"Rollback: kill_session({session_name}) did not confirm the kill; "
-                    "the session may still be live"
-                )
+            with teardown_bracket(
+                session_name, scope_kind="session", requested_by="create_rollback"
+            ):
+                if not get_backend().kill_session(session_name):
+                    # Falsy means the backend could not confirm the kill (or found
+                    # nothing to kill). Either way the name may still be live, so say
+                    # so -- a silent branch here is how an orphan goes unnoticed.
+                    logger.warning(
+                        f"Rollback: kill_session({session_name}) did not confirm the kill; "
+                        "the session may still be live"
+                    )
         except Exception:
             logger.exception(f"Rollback: failed to kill session {session_name}")
         finally:
@@ -1425,11 +1448,16 @@ def _roll_back_backend_create_locked(
                 logger.exception(f"Rollback: failed to clear session env for {session_name}")
     else:
         try:
-            if not get_backend().kill_window(session_name, window_name):
-                logger.warning(
-                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
-                    "the kill; the window may still be live"
-                )
+            with ExitStack() as _teardown:
+                if terminal_id is not None:
+                    _teardown.enter_context(
+                        teardown_bracket(terminal_id, requested_by="create_rollback")
+                    )
+                if not get_backend().kill_window(session_name, window_name):
+                    logger.warning(
+                        f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                        "the kill; the window may still be live"
+                    )
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
 
@@ -1456,7 +1484,12 @@ def _roll_back_cancelled_create(
     is what the caller must see.
     """
     with session_lifecycle_lock(session_name):
-        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        _roll_back_backend_create_locked(
+            session_name,
+            window_name,
+            created_session=created_session,
+            terminal_id=terminal_id,
+        )
         try:
             db_delete_terminal(terminal_id)
         except Exception:
