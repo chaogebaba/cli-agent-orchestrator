@@ -31,7 +31,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
-from cli_agent_orchestrator.core.events import DecisionKind, EventKind, Producer, WorkerEvent
+from cli_agent_orchestrator.core.events import (
+    FLEET_TERMINAL_ID,
+    DecisionKind,
+    EventKind,
+    Producer,
+    WorkerEvent,
+)
 from cli_agent_orchestrator.core.states import WorkerState
 
 __all__ = [
@@ -175,10 +181,26 @@ def build_agreement_report(
     the scope does not describe yields an empty, INVALID report rather than a
     silent fleet-wide comparison: a report that quietly widened its own scope
     would be worse than no report.
+
+    Rows carrying :data:`~core.events.FLEET_TERMINAL_ID` are dropped before
+    grouping — they describe the fleet, not a worker, and counting the sentinel
+    as a terminal would inflate the content floor.
     """
     facts = dict(scope or {})
     by_terminal: dict[str, list[WorkerEvent]] = {}
     for event in events:
+        if event.terminal_id == FLEET_TERMINAL_ID:
+            # Fleet rows are about the FLEET, not about a worker, so they are not
+            # a terminal and must never be counted as one.  ``probe.failed`` is
+            # the phase-1 case: a failed probe names no pane, but the column is
+            # NOT NULL, so those rows carry the sentinel.
+            #
+            # This is a content-floor bug, not a cosmetic one.  The floor demands
+            # at least three terminals precisely so a thin session cannot claim
+            # agreement it has not measured.  Counting the sentinel would let a
+            # session with two real workers pass it while contributing zero
+            # comparisons — the exact shape the floor exists to reject.
+            continue
         if session is not None and facts.get(event.terminal_id, TerminalFacts()).session != session:
             continue
         by_terminal.setdefault(event.terminal_id, []).append(event)

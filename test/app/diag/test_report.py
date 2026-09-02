@@ -321,3 +321,82 @@ def test_genuine_disagreements_are_listed_individually(rig: Rig) -> None:
 
     assert "genuine disagreements" in text
     assert "unresolved" in text
+
+
+# ------------------------------------------------------------------ fleet rows
+
+
+def _fleet_row(rig: Rig):
+    """One ``probe.failed``, which names no pane and so carries the sentinel."""
+    from cli_agent_orchestrator.core.events import (
+        FLEET_TERMINAL_ID,
+        Confidence,
+        DecisionKind,
+        EventDraft,
+        Producer,
+    )
+
+    return rig.events.append(
+        EventDraft(
+            terminal_id=FLEET_TERMINAL_ID,
+            kind=DecisionKind.PROBE_FAILED,
+            producer=Producer.SERVER,
+            confidence=Confidence.AUTHORITATIVE,
+            observed_at=rig.clock.now(),
+            payload={"exit_code": 1, "stderr_digest": "no server running"},
+            decision=DecisionKind.PROBE_FAILED,
+        )
+    )
+
+
+def test_a_fleet_row_never_appears_on_a_worker_timeline(rig: Rig) -> None:
+    """A row about the fleet is not evidence about this worker.
+
+    Asserted rather than left to the store's WHERE clause, because "correct by
+    construction" is the state a refactor silently breaks.
+    """
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID
+
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    fleet = _fleet_row(rig)
+
+    data = timeline_payload(_sources(rig), TERMINAL, now=rig.clock.now())
+    text = render_timeline(_sources(rig), TERMINAL, now=rig.clock.now())
+
+    assert fleet.event_id not in {row["event_id"] for row in data["events"]}
+    assert FLEET_TERMINAL_ID not in text
+
+
+def test_the_fleet_timeline_is_reachable_by_asking_for_it(rig: Rig) -> None:
+    """Surfaced deliberately, not swallowed.
+
+    ``cao diag __fleet__`` is how an operator sees why the probe gave up, which
+    is the one question fleet rows answer.
+    """
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID, DecisionKind
+
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    fleet = _fleet_row(rig)
+
+    data = timeline_payload(_sources(rig), FLEET_TERMINAL_ID, now=rig.clock.now())
+    text = render_timeline(_sources(rig), FLEET_TERMINAL_ID, now=rig.clock.now())
+
+    assert [row["event_id"] for row in data["events"]] == [fleet.event_id]
+    assert DecisionKind.PROBE_FAILED.value in text
+
+
+def test_a_fleet_row_creates_no_projection(rig: Rig) -> None:
+    """The sweep must never find a ``__fleet__`` row to degrade.
+
+    The projector returns early on decision rows, so this holds today; the test
+    pins it because the sweep would otherwise write a ``degraded(no_signal)``
+    transition for a terminal that does not exist.
+    """
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID
+
+    fleet = _fleet_row(rig)
+    rig.projector.project(fleet)
+
+    assert rig.states.get(FLEET_TERMINAL_ID) is None
+    rig.clock.advance(NO_SIGNAL_S * 3)
+    assert rig.projector.sweep() == []

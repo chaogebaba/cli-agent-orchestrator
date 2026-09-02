@@ -21,7 +21,13 @@ from cli_agent_orchestrator.app.worker_truth.agreement import (
     TerminalFacts,
     build_agreement_report,
 )
-from cli_agent_orchestrator.core.events import EventKind, Producer
+from cli_agent_orchestrator.core.events import (
+    Confidence,
+    DecisionKind,
+    EventDraft,
+    EventKind,
+    Producer,
+)
 from cli_agent_orchestrator.core.states import WorkerState
 
 TERMINAL = "term-g1"
@@ -262,3 +268,92 @@ def test_the_declared_provider_beats_the_jsonl_heuristic(rig: Rig) -> None:
     report = _report(rig, scope={TERMINAL: TerminalFacts(provider="codex")})
 
     assert report.terminals[0].is_codex is True
+
+
+# ------------------------------------------------------------------ fleet rows
+
+
+def test_a_fleet_row_does_not_inflate_the_terminal_count(rig: Rig) -> None:
+    """``__fleet__`` is a sentinel, not a worker, and the floor must not count it.
+
+    This is a content-floor bug rather than a cosmetic one. AC10 demands at least
+    three terminals precisely so a thin session cannot claim agreement it never
+    measured. Counting the sentinel would let a two-worker session pass that
+    floor while contributing zero comparisons — the exact shape the floor exists
+    to reject. Removing the filter makes this test fail on the terminal count.
+    """
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID
+
+    for index in range(2):
+        terminal = f"real-{index}"
+        rig.emit(terminal, EventKind.TURN_STARTED)
+        rig.legacy(terminal, "processing")
+
+    # The liveness probe reports a fleet-wide failure. It names no pane, so the
+    # row carries the sentinel (AC4b: one `server` row, no terminal touched).
+    rig.events.append(
+        EventDraft(
+            terminal_id=FLEET_TERMINAL_ID,
+            kind=DecisionKind.PROBE_FAILED,
+            producer=Producer.SERVER,
+            confidence=Confidence.AUTHORITATIVE,
+            observed_at=rig.clock.now(),
+            payload={"exit_code": 1, "stderr_digest": "no server running"},
+            decision=DecisionKind.PROBE_FAILED,
+        )
+    )
+
+    report = _report(rig)
+
+    assert [t.terminal_id for t in report.terminals] == ["real-0", "real-1"]
+    assert FLEET_TERMINAL_ID not in {t.terminal_id for t in report.terminals}
+    assert any(f"2 terminals, need {MIN_TERMINALS}" in reason for reason in report.invalid_reasons)
+
+
+def test_fleet_rows_are_dropped_before_the_session_filter(rig: Rig) -> None:
+    """The sentinel has no session, so a scoped report must not resurrect it."""
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID
+
+    rig.emit("real-0", EventKind.TURN_STARTED)
+    rig.legacy("real-0", "processing")
+    rig.events.append(
+        EventDraft(
+            terminal_id=FLEET_TERMINAL_ID,
+            kind=DecisionKind.PROBE_FAILED,
+            producer=Producer.SERVER,
+            confidence=Confidence.AUTHORITATIVE,
+            observed_at=rig.clock.now(),
+            payload={"exit_code": 1},
+            decision=DecisionKind.PROBE_FAILED,
+        )
+    )
+
+    scoped = _report(rig, scope={"real-0": TerminalFacts(session="alpha")}, session="alpha")
+    fleetwide = _report(rig)
+
+    assert [t.terminal_id for t in scoped.terminals] == ["real-0"]
+    assert [t.terminal_id for t in fleetwide.terminals] == ["real-0"]
+
+
+def test_fleet_rows_do_not_count_toward_the_event_total(rig: Rig) -> None:
+    """``total_events`` sums the per-terminal counts, so a dropped row is gone
+    from the arithmetic too rather than only from the terminal list."""
+    from cli_agent_orchestrator.core.events import FLEET_TERMINAL_ID
+
+    rig.emit("real-0", EventKind.TURN_STARTED)
+    before = _report(rig).total_events
+
+    for _ in range(5):
+        rig.events.append(
+            EventDraft(
+                terminal_id=FLEET_TERMINAL_ID,
+                kind=DecisionKind.PROBE_FAILED,
+                producer=Producer.SERVER,
+                confidence=Confidence.AUTHORITATIVE,
+                observed_at=rig.clock.now(),
+                payload={"exit_code": 1},
+                decision=DecisionKind.PROBE_FAILED,
+            )
+        )
+
+    assert _report(rig).total_events == before
