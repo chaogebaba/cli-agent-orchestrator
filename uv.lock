@@ -267,6 +267,7 @@ dev = [
     { name = "pytest-repeat" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "textual" },
     { name = "types-psutil" },
 ]
 
@@ -321,6 +322,7 @@ dev = [
     { name = "pytest-repeat", specifier = ">=0.9.3" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "textual", specifier = ">=8,<9" },
     { name = "types-psutil", specifier = ">=5.9.0" },
 ]
 
