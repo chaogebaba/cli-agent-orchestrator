@@ -15,6 +15,7 @@ from libtmux.pane import Pane
 from libtmux.session import Session
 from libtmux.window import Window
 
+from cli_agent_orchestrator.clients.tmux_fast import pane_locator
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     TMUX_HISTORY_LINES,
@@ -1304,6 +1305,28 @@ class TmuxClient:
                 stopped producing output (and a supervisor must not conclude
                 the worker finished) because a listing failed to parse.
         """
+        if visible_only:
+            # "-S 0" starts at the first line of the visible pane (default -E
+            # already ends at its last line): the rendered viewport, no scrollback.
+            flags = ["-p", "-S", "0"]
+        elif full_history:
+            # "-S -" captures from the start of the scrollback buffer
+            flags = ["-p", "-S", "-"]
+        else:
+            lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
+            flags = ["-p", "-S", f"-{lines}"]
+        if not strip_escapes:
+            flags = ["-e"] + flags
+
+        # Perf: one identity-checked exec instead of libtmux's four (see
+        # clients/tmux_fast.py). None means "could not answer" -> legacy path
+        # below keeps every not-found / parse-race semantic.
+        fast = pane_locator.run_pane_command(
+            session_name, window_name, "capture-pane", *flags, pane="first"
+        )
+        if fast is not None:
+            return "\n".join(fast) if fast else ""
+
         try:
             session = self._find_session(session_name)
             if not session:
@@ -1315,18 +1338,6 @@ class TmuxClient:
 
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
             pane = self._find_first_pane(window, session_name, window_name)
-            if visible_only:
-                # "-S 0" starts at the first line of the visible pane (default -E
-                # already ends at its last line): the rendered viewport, no scrollback.
-                flags = ["-p", "-S", "0"]
-            elif full_history:
-                # "-S -" captures from the start of the scrollback buffer
-                flags = ["-p", "-S", "-"]
-            else:
-                lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
-                flags = ["-p", "-S", f"-{lines}"]
-            if not strip_escapes:
-                flags = ["-e"] + flags
             result = pane.cmd("capture-pane", *flags)
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
@@ -1353,6 +1364,11 @@ class TmuxClient:
 
     def capture_viewport(self, session_name: str, window_name: str) -> str:
         """Capture only the current pane viewport as escape-normalized text."""
+        fast = pane_locator.run_pane_command(
+            session_name, window_name, "capture-pane", "-p", pane="first"
+        )
+        if fast is not None:
+            return "\n".join(fast) if fast else ""
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -1411,6 +1427,9 @@ class TmuxClient:
             TmuxLookupError: The listing could not be parsed — not the same
                 thing as a session with no windows.
         """
+        fast = pane_locator.session_windows(session_name)
+        if fast is not None:
+            return fast
         try:
             session = self._find_session(session_name)
             if not session:
@@ -1455,6 +1474,7 @@ class TmuxClient:
             if session is None:
                 return False
             self._read_listing(f"kill-session '{session_name}'", session.kill)
+            pane_locator.forget(session_name)
         except TmuxLookupError as e:
             logger.warning(
                 f"tmux listing failed while killing session {session_name}: {e} — "
@@ -1519,6 +1539,7 @@ class TmuxClient:
             if window is None:
                 return False
             self._read_listing(f"kill-window '{session_name}:{window_name}'", window.kill)
+            pane_locator.forget(session_name, window_name)
             logger.info(f"Killed tmux window: {session_name}:{window_name}")
             return True
         except TmuxLookupError as e:
@@ -1714,6 +1735,16 @@ class TmuxClient:
            cwd is still the freed inode → ``None`` (never misstate the live dir);
         4. otherwise → genuinely deleted → ``None``.
         """
+        fast = pane_locator.run_pane_command(
+            session_name,
+            window_name,
+            "display-message",
+            "-p",
+            "#{pane_current_path}",
+            pane="active",
+        )
+        if fast is not None:
+            return self._normalize_pane_cwd(fast[0].strip()) if fast else None
         try:
             session = self._find_session(session_name)
             if not session:
@@ -1728,22 +1759,26 @@ class TmuxClient:
                 # Get pane_current_path from tmux
                 result = pane.cmd("display-message", "-p", "#{pane_current_path}")
                 if result.stdout:
-                    raw = result.stdout[0].strip()
-                    if not raw.endswith(_DELETED_CWD_SUFFIX):
-                        return raw
-                    full = raw
-                    stripped = full[: -len(_DELETED_CWD_SUFFIX)]
-                    if os.path.exists(full):
-                        return full
-                    if os.path.exists(stripped):
-                        logger.warning("cwd_deleted_recreated cwd=%s", stripped)
-                        return None
-                    logger.warning("cwd_deleted cwd=%s", stripped)
-                    return None
+                    return self._normalize_pane_cwd(result.stdout[0].strip())
             return None
         except Exception as e:
             logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")
             return None
+
+    @staticmethod
+    def _normalize_pane_cwd(raw: str) -> Optional[str]:
+        """Resolve tmux's literal ``" (deleted)"`` cwd suffix (F26) — see get_pane_working_directory."""
+        if not raw.endswith(_DELETED_CWD_SUFFIX):
+            return raw
+        full = raw
+        stripped = full[: -len(_DELETED_CWD_SUFFIX)]
+        if os.path.exists(full):
+            return full
+        if os.path.exists(stripped):
+            logger.warning("cwd_deleted_recreated cwd=%s", stripped)
+            return None
+        logger.warning("cwd_deleted cwd=%s", stripped)
+        return None
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current foreground command running in a pane.
@@ -1754,6 +1789,16 @@ class TmuxClient:
         "assume a real TUI", the pre-existing safe default — so there is no
         "gone" claim to get wrong here either.
         """
+        fast = pane_locator.run_pane_command(
+            session_name,
+            window_name,
+            "display-message",
+            "-p",
+            "#{pane_current_command}",
+            pane="active",
+        )
+        if fast is not None:
+            return fast[0].strip() if fast else None
         try:
             session = self._find_session(session_name)
             if not session:
@@ -1773,6 +1818,20 @@ class TmuxClient:
 
     def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
         """Get the (columns, rows) of a pane's real viewport."""
+        fast = pane_locator.run_pane_command(
+            session_name,
+            window_name,
+            "display-message",
+            "-p",
+            "#{pane_width} #{pane_height}",
+            pane="first",
+        )
+        if fast is not None:
+            try:
+                cols, rows = fast[0].strip().split()
+                return (int(cols), int(rows))
+            except (IndexError, ValueError):
+                return None
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:

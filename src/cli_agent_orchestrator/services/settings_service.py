@@ -1,12 +1,14 @@
 """Settings service for persisting user configuration."""
 
+import copy
 import json
 import logging
 import math
 import os
+import threading
 import tomllib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.utils.paths import normalized_path
@@ -53,16 +55,44 @@ def get_provider_defaults(provider: str) -> Dict[str, Any]:
     all resolve to ``{}``. This file is intentionally separate from
     ``settings.json`` and has no env-var overlay.
     """
-    if not PROVIDER_DEFAULTS_FILE.exists():
-        return {}
-    try:
-        data = tomllib.loads(PROVIDER_DEFAULTS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    data = _load_provider_defaults()
     section = data.get(provider)
     if not isinstance(section, dict):
         return {}
-    return dict(section)
+    # Deep copy: the parsed document is shared by every caller through the
+    # cache, and callers historically received fresh objects they could mutate.
+    return copy.deepcopy(section)
+
+
+# Perf (2026-09-02): providers.toml was re-read and re-parsed on EVERY call —
+# the log writer calls get_logs_settings() per flush batch and provider code
+# calls get_provider_defaults() on hot paths — so parse once per file version.
+# Keyed on (path, mtime_ns, size, inode) like _server_settings_cache below; a
+# rewrite always changes at least mtime_ns, and tests that monkeypatch
+# PROVIDER_DEFAULTS_FILE to a different path miss on the path component.
+_provider_defaults_cache: Optional[Tuple[Tuple[str, int, int, int], Dict[str, Any]]] = None
+_provider_defaults_lock = threading.Lock()
+
+
+def _load_provider_defaults() -> Dict[str, Any]:
+    """Return the parsed ``providers.toml`` document (``{}`` when missing/invalid), cached by file version."""
+    global _provider_defaults_cache
+    path = PROVIDER_DEFAULTS_FILE
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+    cached = _provider_defaults_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        data: Dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    with _provider_defaults_lock:
+        _provider_defaults_cache = (key, data)
+    return data
 
 
 def get_provider_profile_defaults(
