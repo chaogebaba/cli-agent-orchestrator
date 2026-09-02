@@ -46,15 +46,22 @@ async def run_fetch_loop(
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     fetch: Callable[..., Any] = fetch_json,
     now: Callable[[], float] = time.time,
+    poll_interval: float = FETCH_INTERVAL,
 ) -> None:
     """Poll ``url`` forever, posting a `FleetState` after every iteration.
 
     ``state`` and ``interval`` are bound before the loop (BLK-B) so the
     exception branch is total on iteration 1. ``post`` is called outside the
     ``try``/``else`` split, so a failed fetch still yields a snapshot.
+
+    ``poll_interval`` is the healthy cadence and the first rung of the backoff
+    ladder — F702 parity restores the script's ``--interval`` flag
+    (``fleet-tui.py:563``). The cap is never below the requested cadence, so a
+    ``--interval 30`` run backs off to 30 s rather than tightening to 10 s.
     """
     state = FleetState.empty()
-    interval = FETCH_INTERVAL
+    interval = poll_interval
+    ceiling = max(MAX_BACKOFF, poll_interval)
     consecutive_failures = 0
     while True:
         try:
@@ -63,11 +70,11 @@ async def run_fetch_loop(
             state = state.with_failure(str(exc), now=now())
             # Ladder 2 -> 4 -> 8 -> 10 (AC1): the first failure waits the
             # normal interval, each further one doubles up to the cap.
-            interval = min(interval * 2, MAX_BACKOFF) if consecutive_failures else FETCH_INTERVAL
+            interval = min(interval * 2, ceiling) if consecutive_failures else poll_interval
             consecutive_failures += 1
         else:
             state = FleetState.from_dict(raw, fetched_at=now())
-            interval = FETCH_INTERVAL
+            interval = poll_interval
             consecutive_failures = 0
         post(state)
         await sleep(interval)

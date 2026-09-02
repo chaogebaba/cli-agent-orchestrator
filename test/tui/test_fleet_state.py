@@ -130,3 +130,20 @@ def test_with_failure_on_never_fetched_state_has_no_reference_point() -> None:
     assert state.last_error == "connection refused"
     assert state.stale_for == 0.0
     assert state.fetched_at is None
+
+
+def test_window_index_accepts_the_stringified_shape_the_server_sends() -> None:
+    """`clients/tmux.py:1423` emits `{"index": str(window.index)}`.
+
+    A live fleet payload therefore carries `"window_index": "2"`. Dropping that
+    to None is what made the TUI's WIN column render `?` for every row.
+    """
+    from cli_agent_orchestrator.tui.fleet_state import TerminalState
+
+    assert TerminalState.from_dict({"id": "a", "window_index": "2"}).window_index == 2
+    assert TerminalState.from_dict({"id": "a", "window_index": " 7 "}).window_index == 7
+    assert TerminalState.from_dict({"id": "a", "window_index": 0}).window_index == 0
+    assert TerminalState.from_dict({"id": "a", "window_index": None}).window_index is None
+    assert TerminalState.from_dict({"id": "a", "window_index": "x"}).window_index is None
+    assert TerminalState.from_dict({"id": "a", "window_index": True}).window_index is None
+    assert TerminalState.from_dict({"id": "a"}).window_index is None

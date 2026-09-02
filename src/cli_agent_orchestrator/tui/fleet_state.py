@@ -74,6 +74,34 @@ def _as_opt_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _as_window_index(value: Any) -> int | None:
+    """``window_index`` accepting the two shapes the server actually emits.
+
+    F702 parity: the tmux client stringifies the index
+    (``clients/tmux.py:1423`` — ``{"index": str(window.index)}``) and
+    ``build_fleet`` passes that value through untouched, so a live payload
+    carries ``"window_index": "2"`` while the test fixtures carry ``2``. The
+    stricter :func:`_as_opt_int` mapped every live value to ``None``, which is
+    why the WIN column rendered ``?`` for every row against a real server. The
+    retiring stdlib script never saw this because it only ever called ``str()``
+    on the raw value (``fleet-tui.py:353``).
+
+    Accepted: an ``int`` (never a ``bool``), or a string of an integer with
+    surrounding whitespace tolerated. Anything else is ``None`` — the honest
+    "no window" answer that renders as ``?``.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _as_opt_float(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -121,7 +149,7 @@ class TerminalState:
             id=_as_str(raw.get("id")),
             profile=_as_opt_str(raw.get("profile")),
             provider=_as_opt_str(raw.get("provider")),
-            window_index=_as_opt_int(raw.get("window_index")),
+            window_index=_as_window_index(raw.get("window_index")),
             window_name=_as_opt_str(raw.get("window_name")),
             parent_id=_as_opt_str(raw.get("parent_id")),
             depth=_as_int(raw.get("depth")),

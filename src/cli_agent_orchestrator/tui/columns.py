@@ -39,6 +39,23 @@ NEW_COLUMNS: Final[Tuple[str, ...]] = (
 #: Parity first, then the new columns — the order used when ``c`` reveals them.
 ALL_COLUMNS: Final[Tuple[str, ...]] = PARITY_COLUMNS + NEW_COLUMNS
 
+#: The header-less selection gutter, drawn left of ``WIN``.
+#:
+#: The retiring script reserves exactly two leading columns for this and writes
+#: ``"▶ "`` there on the selected row (``fleet-tui.py:374,399``). A ``DataTable``
+#: cannot prefix a row, so the gutter is a real column with an empty header —
+#: the same two visible cells, and the six parity headers stay verbatim (AC5).
+SELECTION_COLUMN: Final[str] = ""
+#: What the gutter holds on the selected row / on every other row.
+MARKER_SELECTED: Final[str] = "▶"
+MARKER_BLANK: Final[str] = " "
+
+#: The column order the table actually installs, gutter included.
+PARITY_VIEW: Final[Tuple[str, ...]] = (SELECTION_COLUMN,) + PARITY_COLUMNS
+ALL_VIEW: Final[Tuple[str, ...]] = (SELECTION_COLUMN,) + ALL_COLUMNS
+#: Index of the gutter in either view.
+MARKER_INDEX: Final[int] = 0
+
 #: The parity column that carries :func:`~cli_agent_orchestrator.tui.status_cell.status_cell`.
 STATUS_COLUMN: Final[str] = "STATUS"
 

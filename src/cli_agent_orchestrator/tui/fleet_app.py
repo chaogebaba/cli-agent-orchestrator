@@ -16,13 +16,26 @@ the script does (``fleet-tui.py:115-118``).
 
 **Side effects (AC4).** Every subprocess goes through one injectable runner.
 Exactly one of them mutates anything: ``tmux select-window`` on jump
-(``fleet-tui.py:484``). ``list-windows``, ``list-panes`` and ``capture-pane``
-are reads.
+(``fleet-tui.py:484``). ``list-windows``, ``list-panes``, ``capture-pane`` and
+``display-message`` are reads. The one other child process this app starts is
+the events-feed sync script (``fleet-tui.py:203-226``), which writes only under
+``/data/cao-scratch``.
 
 **Failure posture (AC1).** A fetch failure is *staleness*, never an error row
 (#441): the last good rows stay on screen and the header badge grows a
 ``stale Ns`` suffix. Before the first successful fetch the badge reads
-``not yet fetched`` (``FleetState.fetched_at is None``).
+``not yet fetched`` (``FleetState.fetched_at is None``). A failure is also
+*loud*: a red ``fleet endpoint unreachable`` line appears above the table with
+the time of the last good fetch (``fleet-tui.py:334-335``).
+
+**Parity restorations (F702 #557 parity round).** Against the retiring script
+this module now also carries: the selection gutter ``▶`` (``:399``), the row
+colour language — supervisor magenta, worker id cyan, IDLE age colouring,
+unlabeled task dim (``:245-250,410-415``) — the on-screen key hints
+(``:430-433``), the clock and fetch latency in the header (``:338-339``), the
+throttled ``fleet-events-sync.sh`` trigger (``:203-226``), the 20-entry error
+ring (``:82-84``) with its debug and snapshot surfaces, and the ``--interval`` /
+``--once`` / tmux-session-auto-detect launch contract (``:548-565``).
 """
 
 from __future__ import annotations
@@ -31,11 +44,13 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Dict, Final, List, Mapping, Sequence, Tuple
 
 # The Textual dependency is the optional `fleet` extra (D1/B10): a server-only
 # install carries no TUI library. Importing this module without it is a clean
@@ -46,6 +61,7 @@ try:  # pragma: no cover - exercised by the install path, not the suite
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Vertical
+    from textual.coordinate import Coordinate
     from textual.message import Message
     from textual.widgets import DataTable, RichLog, Static
 except ModuleNotFoundError as exc:  # pragma: no cover - same
@@ -57,12 +73,20 @@ except ModuleNotFoundError as exc:  # pragma: no cover - same
 
 from rich.text import Text
 
-from cli_agent_orchestrator.tui.columns import ALL_COLUMNS, PARITY_COLUMNS
+from cli_agent_orchestrator.tui.columns import (
+    ALL_COLUMNS,
+    ALL_VIEW,
+    MARKER_BLANK,
+    MARKER_INDEX,
+    MARKER_SELECTED,
+    PARITY_COLUMNS,
+    PARITY_VIEW,
+)
 from cli_agent_orchestrator.tui.fetcher import FETCH_INTERVAL, fetch_json, run_fetch_loop
 from cli_agent_orchestrator.tui.fleet_state import FleetState, TerminalState
 from cli_agent_orchestrator.tui.status_cell import status_cell
 
-__all__ = ["FleetApp", "FleetUpdated", "main"]
+__all__ = ["FleetApp", "FleetUpdated", "hint_text", "main", "render_once"]
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9889"
 SCRATCH = Path("/data/cao-scratch")
@@ -76,13 +100,61 @@ PEEK_LINES_MIN = 6
 PEEK_LINES_MAX = 40
 PEEK_STEP = 4
 
+#: Rolling TUI-error ring, as the script keeps it (``fleet-tui.py:82-84``).
+ERROR_RING_SIZE = 20
+#: How many of them the debug overlay shows (``fleet-tui.py:423``).
+ERROR_RING_SHOWN = 8
+
+# ─── Row colour language, ported from scripts/fleet-tui.py:245-250,410-415 ────
+#: Supervisor rows: WIN/PROFILE magenta, ID magenta+bold (``:411-412``).
+STYLE_SUPERVISOR: Final[str] = "magenta"
+STYLE_SUPERVISOR_ID: Final[str] = "bold magenta"
+#: Worker rows: WIN dim, ID cyan (``:414-415``).
+STYLE_WORKER_ID: Final[str] = "cyan"
+STYLE_DIM: Final[str] = "dim"
+#: IDLE column, ``idle_color`` (``:245-250``): dim under 5 s, yellow at 5 min.
+STYLE_IDLE_STALE: Final[str] = "yellow"
+IDLE_FRESH_SECONDS: Final[float] = 5.0
+IDLE_STALE_SECONDS: Final[float] = 300.0
+#: The selection gutter glyph.
+STYLE_MARKER: Final[str] = "bold"
+#: The loud server-down line (``:335``).
+STYLE_ALERT: Final[str] = "bold red"
+
 #: The tmux verbs this app is allowed to run. Only ``select-window`` mutates
 #: anything; the rest are reads (AC4).
-TMUX_READS = frozenset({"list-windows", "list-panes", "capture-pane"})
+TMUX_READS = frozenset({"list-windows", "list-panes", "capture-pane", "display-message"})
 TMUX_WRITES = frozenset({"select-window"})
 
 #: ``(session, args) -> stdout``; ``None`` means the call failed.
 Runner = Callable[[Sequence[str]], "str | None"]
+
+# ─── Events-feed sync (F481, ported from fleet-tui.py:193-226) ────────────────
+#: Minimum gap between two ``fleet-events-sync.sh`` firings.
+EVENTS_SYNC_INTERVAL = 30.0
+EVENTS_SYNC_SCRIPT_NAME = "fleet-events-sync.sh"
+#: Explicit path override, for a deployment that keeps the script elsewhere.
+EVENTS_SYNC_ENV = "CAO_FLEET_EVENTS_SYNC"
+
+#: On-screen key hints (``fleet-tui.py:430-433``), plus `c` for the new columns.
+#: ``test_fleet_app`` asserts every binding key is covered by one of these, so
+#: a new binding cannot land without a hint.
+KEY_HINTS: Final[Tuple[Tuple[str, str], ...]] = (
+    ("↑↓/jk", "select"),
+    ("⏎/o", "jump"),
+    ("p", "peek"),
+    ("+/-", "size"),
+    ("g/G", "ends"),
+    ("c", "columns"),
+    ("d", "debug"),
+    ("s", "snapshot"),
+    ("q", "quit"),
+)
+
+
+def hint_text() -> str:
+    """The one-line key hint, as the script draws it (``fleet-tui.py:432``)."""
+    return " · ".join(f"{key} {label}" for key, label in KEY_HINTS)
 
 
 def run_tmux(args: Sequence[str]) -> str | None:
@@ -100,6 +172,61 @@ def run_tmux(args: Sequence[str]) -> str | None:
     return done.stdout
 
 
+def spawn_detached(script: Path) -> "subprocess.Popen[bytes]":
+    """Start ``script`` in its own session, discarding its streams.
+
+    The default spawner for the events sync (``fleet-tui.py:217-224``): never
+    waited on, never inherits the TUI's terminal.
+    """
+    return subprocess.Popen(
+        [str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def find_events_sync_script(events_path: Path = EVENTS_PATH) -> Path | None:
+    """Locate ``fleet-events-sync.sh``, or ``None`` when it is not deployed.
+
+    The script lives in the supervising repo, not in this package, so the path
+    cannot be derived from ``__file__`` the way it is in the stdlib script
+    (``fleet-tui.py:198-200``). Three candidates, in order:
+
+    1. ``$CAO_FLEET_EVENTS_SYNC`` — an explicit path, honoured even if broken
+       (a set-but-wrong override is a misconfiguration worth surfacing as "no
+       sync", not something to paper over with a fallback);
+    2. a sibling of the events log itself (``/data/cao-scratch``), which is the
+       directory both halves of the contract already share;
+    3. anything of that name on ``PATH``.
+    """
+    override = os.environ.get(EVENTS_SYNC_ENV)
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.is_file() else None
+    sibling = events_path.parent / EVENTS_SYNC_SCRIPT_NAME
+    if sibling.is_file():
+        return sibling
+    found = shutil.which(EVENTS_SYNC_SCRIPT_NAME)
+    return Path(found) if found else None
+
+
+def detect_tmux_session(runner: Runner = run_tmux) -> str | None:
+    """The tmux session this process runs inside (``fleet-tui.py:548-557``).
+
+    ``None`` outside tmux, or when tmux cannot answer — the caller turns that
+    into the "pass --session" exit.
+    """
+    if not os.environ.get("TMUX"):
+        return None
+    out = runner(["display-message", "-p", "#S"])
+    if not out:
+        return None
+    return out.strip() or None
+
+
 def fmt_age(seconds: float | None) -> str:
     """Seconds since last pane output, as the script formats it (``:253-261``)."""
     if seconds is None:
@@ -110,6 +237,19 @@ def fmt_age(seconds: float | None) -> str:
     if whole < 7200:
         return f"{whole // 60}m"
     return f"{whole // 3600}h"
+
+
+def idle_style(seconds: float | None) -> str:
+    """IDLE-cell style, verbatim from ``idle_color`` (``fleet-tui.py:245-250``).
+
+    Dim below five seconds (including "no window activity at all"), yellow from
+    five minutes, unstyled in between.
+    """
+    if seconds is None or seconds < IDLE_FRESH_SECONDS:
+        return STYLE_DIM
+    if seconds >= IDLE_STALE_SECONDS:
+        return STYLE_IDLE_STALE
+    return ""
 
 
 def read_labels(path: Path) -> Dict[str, str]:
@@ -137,6 +277,22 @@ def read_events(path: Path, n: int = EVENTS_TAIL) -> List[str]:
     except OSError:
         return []
     return lines[-n:]
+
+
+def read_window_ages(
+    tmux: Runner, session: str, *, now: Callable[[], float] = time.time
+) -> Dict[str, float]:
+    """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``)."""
+    out = tmux(["list-windows", "-t", session, "-F", "#{window_index} #{window_activity}"])
+    ages: Dict[str, float] = {}
+    if not out:
+        return ages
+    wall = now()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            ages[parts[0]] = max(0.0, wall - int(parts[1]))
+    return ages
 
 
 def sort_terminals(terminals: Sequence[TerminalState]) -> List[TerminalState]:
@@ -170,6 +326,70 @@ def status_row(term: TerminalState) -> Mapping[str, Any]:
     }
 
 
+def window_key(term: TerminalState) -> str:
+    """The WIN cell's text: the tmux window index, or ``?`` when there is none.
+
+    ``window_index`` arrives from the server as a *string*
+    (``clients/tmux.py:1423``); :func:`~cli_agent_orchestrator.tui.fleet_state`
+    normalises it to ``int | None``, and ``None`` is the only case that renders
+    ``?``. Window ``0`` is a real window and must never render as ``?`` — the
+    stdlib script's ``or "?"`` (``fleet-tui.py:351``) got that wrong.
+    """
+    return str(term.window_index) if term.window_index is not None else "?"
+
+
+def row_values(
+    term: TerminalState,
+    labels: Mapping[str, str],
+    ages: Mapping[str, float],
+    *,
+    with_new_columns: bool = False,
+) -> List[str]:
+    """Every cell of one row as plain text, gutter excluded.
+
+    Shared by the Textual table (which wraps each value in a styled
+    :class:`~rich.text.Text`) and by ``--once``, so the two renderings cannot
+    disagree about what a row says.
+    """
+    default_label = "(supervisor seat)" if not term.parent_id else "(unlabeled)"
+    values = [
+        window_key(term),
+        term.id,
+        term.profile or "?",
+        labels.get(term.id, default_label)[:40],
+        status_cell(status_row(term)).plain,
+        fmt_age(ages.get(window_key(term))),
+    ]
+    if with_new_columns:
+        values += [
+            term.condition or "-",
+            f"delegating ({term.children_count})" if term.delegating else "-",
+            "*" if term.fusion_changed else "",
+            term.lifecycle,
+            term.resolved_model or "-",
+        ]
+    return values
+
+
+def row_styles(term: TerminalState, ages: Mapping[str, float], labelled: bool) -> List[str]:
+    """The per-cell styles of one row, in the order of :func:`row_values`.
+
+    The colour language of ``fleet-tui.py:410-415``: a supervisor row is
+    magenta with a bold id, a worker row has a dim window index and a cyan id,
+    an unlabeled TASK is dim, and IDLE is coloured by age. STATUS carries its
+    own style from :func:`status_cell`, so its slot here is empty.
+    """
+    is_supervisor = not term.parent_id
+    return [
+        STYLE_SUPERVISOR if is_supervisor else STYLE_DIM,  # WIN
+        STYLE_SUPERVISOR_ID if is_supervisor else STYLE_WORKER_ID,  # ID
+        STYLE_SUPERVISOR if is_supervisor else "",  # PROFILE
+        "" if labelled else STYLE_DIM,  # TASK
+        "",  # STATUS — status_cell owns it
+        idle_style(ages.get(window_key(term))),  # IDLE
+    ]
+
+
 class FleetUpdated(Message):
     """One snapshot from the fetcher worker."""
 
@@ -182,19 +402,23 @@ class FleetApp(App[None]):
     """The fleet table.
 
     Every collaborator that touches the outside world — the HTTP fetch, the
-    sleep, the clock, tmux, and the three scratch paths — is a constructor
-    argument, so the pilot tests in ``test/tui/test_fleet_app.py`` drive the
-    real widget code with nothing live behind it.
+    sleep, the clock, tmux, the events-sync child process and the three scratch
+    paths — is a constructor argument, so the pilot tests in
+    ``test/tui/test_fleet_app.py`` drive the real widget code with nothing live
+    behind it.
     """
 
     CSS = """
     Screen { layout: vertical; }
     #badge { height: 1; }
+    #alert { height: 1; color: red; text-style: bold; }
     #flash { height: 1; color: $text-muted; }
-    #fleet { height: 1fr; }
-    #peek { height: 14; border-top: solid $panel; }
+    #hints { height: 1; color: $text-muted; }
+    #fleet { height: auto; max-height: 1fr; }
+    #peek { height: 1fr; border-top: solid $panel; }
     #events { height: 6; border-top: solid $panel; }
     #debug { height: 10; border-top: solid $panel; }
+    DataTable > .datatable--cursor { text-style: bold reverse; }
     """
 
     # Verbatim from scripts/fleet-tui.py:598-619, plus `c` for the new columns.
@@ -232,6 +456,9 @@ class FleetApp(App[None]):
         labels_path: Path = LABELS_PATH,
         events_path: Path = EVENTS_PATH,
         snapshot_dir: Path = SNAPSHOT_DIR,
+        poll_interval: float = FETCH_INTERVAL,
+        sync_script: Path | None = None,
+        spawn: Callable[[Path], Any] = spawn_detached,
     ) -> None:
         super().__init__()
         self.session = session
@@ -243,6 +470,9 @@ class FleetApp(App[None]):
         self._labels_path = labels_path
         self._events_path = events_path
         self._snapshot_dir = snapshot_dir
+        self._poll_interval = poll_interval
+        self._sync_script = sync_script
+        self._spawn = spawn
 
         self.state: FleetState = FleetState.empty()
         self.show_new_columns = False
@@ -252,15 +482,31 @@ class FleetApp(App[None]):
         self.flash = ""
         #: Every tmux argv this app has run, in order — the AC4 audit trail.
         self.tmux_calls: List[List[str]] = []
+        #: ``(HH:MM:SS, message)`` ring (``fleet-tui.py:82-84``).
+        self.errors: List[Tuple[str, str]] = []
         self._last_raw: Any = None
         self._last_fetch_ms: int | None = None
         self._events_shown: List[str] = []
+        #: Last ``window_activity`` read of the frame, reused by the peek banner
+        #: so one refresh never issues two ``list-windows`` calls.
+        self._ages: Dict[str, float] = {}
+        self._events_sync_last = 0.0
+        self._events_sync_proc: Any = None
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
     @property
     def url(self) -> str:
         return f"{self.endpoint}/sessions/{self.session}/fleet"
+
+    def stamp(self) -> str:
+        """``HH:MM:SS`` off the injected clock — never ``time.time`` directly."""
+        return time.strftime("%H:%M:%S", time.localtime(self._now()))
+
+    def record_error(self, message: str) -> None:
+        """Append to the 20-entry ring (``fleet-tui.py:82-84``)."""
+        self.errors.append((self.stamp(), str(message)[:300]))
+        del self.errors[:-ERROR_RING_SIZE]
 
     def tmux(self, args: Sequence[str]) -> str | None:
         """Run one tmux command through the injected runner, recording the argv."""
@@ -269,7 +515,10 @@ class FleetApp(App[None]):
         if verb not in TMUX_READS and verb not in TMUX_WRITES:
             raise AssertionError(f"tmux verb not permitted by this app: {verb!r}")
         self.tmux_calls.append(argv)
-        return self._runner(argv)
+        out = self._runner(argv)
+        if out is None:
+            self.record_error(f"tmux {verb}: failed")
+        return out
 
     def _timed_fetch(self, url: str, timeout: float = 5.0) -> Any:
         """Wrap the injected fetch so the debug pane has latency and raw JSON.
@@ -286,7 +535,11 @@ class FleetApp(App[None]):
     @work(exit_on_error=False)
     async def fetch_worker(self) -> None:
         """The one long-lived worker (D2): fetch, post, sleep, forever."""
-        kwargs: Dict[str, Any] = {"fetch": self._timed_fetch, "now": self._now}
+        kwargs: Dict[str, Any] = {
+            "fetch": self._timed_fetch,
+            "now": self._now,
+            "poll_interval": self._poll_interval,
+        }
         if self._sleep is not None:
             kwargs["sleep"] = self._sleep
         await run_fetch_loop(
@@ -295,16 +548,55 @@ class FleetApp(App[None]):
             **kwargs,
         )
 
+    # ── events-feed sync (F481) ──────────────────────────────────────────────
+
+    def events_sync_script(self) -> Path | None:
+        """The configured script path, or the resolved one (D6 gap 5)."""
+        if self._sync_script is not None:
+            return self._sync_script if self._sync_script.is_file() else None
+        return find_events_sync_script(self._events_path)
+
+    def maybe_sync_events(self) -> bool:
+        """Fire ``fleet-events-sync.sh`` non-blocking, throttled to ≥30 s.
+
+        Verbatim posture from ``fleet-tui.py:203-226``: never wait on the child,
+        never let one failure stop the frame, and skip entirely while a previous
+        run is still going. Returns True only when this call started a run.
+        """
+        proc = self._events_sync_proc
+        if proc is not None:
+            if proc.poll() is None:
+                return False
+            self._events_sync_proc = None
+        wall = self._now()
+        if (wall - self._events_sync_last) < EVENTS_SYNC_INTERVAL:
+            return False
+        script = self.events_sync_script()
+        if script is None:
+            # Deliberately does *not* stamp the throttle: a script that appears
+            # later must be picked up on the next frame, as the script does.
+            return False
+        self._events_sync_last = wall
+        try:
+            self._events_sync_proc = self._spawn(script)
+        except Exception as exc:
+            self._events_sync_proc = None
+            self.record_error(f"events-sync: {exc}")
+            return False
+        return True
+
     # ── composition ──────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(id="badge")
+            yield Static(id="alert")
             yield DataTable(id="fleet")
             yield Static(id="peek")
             yield RichLog(id="events", markup=False)
             yield Static(id="debug")
             yield Static(id="flash")
+            yield Static(id="hints")
 
     def on_mount(self) -> None:
         table = self.table
@@ -314,6 +606,8 @@ class FleetApp(App[None]):
         self._install_columns()
         self.query_one("#peek", Static).display = self.peek_visible
         self.query_one("#debug", Static).display = self.debug_visible
+        self.query_one("#hints", Static).update(hint_text())
+        self.query_one("#events", RichLog).border_title = "recent"  # ``:420``
         self.refresh_view()
         self.fetch_worker()
 
@@ -323,22 +617,59 @@ class FleetApp(App[None]):
 
     @property
     def columns(self) -> Sequence[str]:
-        """The visible column names, in order (AC5)."""
+        """The named (non-gutter) column names, in order (AC5)."""
         return ALL_COLUMNS if self.show_new_columns else PARITY_COLUMNS
+
+    @property
+    def view_columns(self) -> Sequence[str]:
+        """What the table installs: the selection gutter, then :attr:`columns`."""
+        return ALL_VIEW if self.show_new_columns else PARITY_VIEW
+
+    def column_index(self, name: str) -> int:
+        """Table index of a named column, gutter accounted for."""
+        return list(self.view_columns).index(name)
 
     def _install_columns(self) -> None:
         table = self.table
         table.clear(columns=True)
-        table.add_columns(*self.columns)
+        for name in self.view_columns:
+            # The gutter is exactly one glyph wide; DataTable's own cell padding
+            # supplies the space the script wrote by hand (``fleet-tui.py:399``).
+            table.add_column(name, width=1 if name == "" else None)
 
     # ── rendering ────────────────────────────────────────────────────────────
 
     def on_fleet_updated(self, message: FleetUpdated) -> None:
+        if message.state.last_error is not None:
+            self.record_error(f"fetch: {message.state.last_error}")
         self.state = message.state
         self.refresh_view()
 
     def refresh_view(self) -> None:
-        """Redraw every widget from the current snapshot. Never raises."""
+        """Redraw every widget from the current snapshot. Never raises.
+
+        The script auto-snapshots and *exits* on a render crash
+        (``fleet-tui.py:586-591``). Here the snapshot is still written and the
+        traceback still lands in the error ring, but the app stays up: a bad
+        frame is not a reason to lose the fleet view.
+        """
+        try:
+            self._render_all()
+        except Exception:
+            self.record_error(traceback.format_exc(limit=3))
+            try:
+                path: Path | None = self.write_snapshot(reason="render-crash")
+            except Exception:
+                path = None
+            self.flash = (
+                f"render error; snapshot: {path}" if path else "render error (snapshot failed)"
+            )
+            try:
+                self.query_one("#flash", Static).update(self.flash)
+            except Exception:
+                pass
+
+    def _render_all(self) -> None:
         self.refresh_table()
         self.refresh_badge()
         self.refresh_events()
@@ -348,18 +679,8 @@ class FleetApp(App[None]):
 
     def window_ages(self) -> Dict[str, float]:
         """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``)."""
-        out = self.tmux(
-            ["list-windows", "-t", self.session, "-F", "#{window_index} #{window_activity}"]
-        )
-        ages: Dict[str, float] = {}
-        if not out:
-            return ages
-        wall = self._now()
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].isdigit():
-                ages[parts[0]] = max(0.0, wall - int(parts[1]))
-        return ages
+        self._ages = read_window_ages(self.tmux, self.session, now=self._now)
+        return self._ages
 
     def visible_terminals(self) -> List[TerminalState]:
         return sort_terminals(self.state.terminals)
@@ -367,30 +688,20 @@ class FleetApp(App[None]):
     def row_cells(
         self, term: TerminalState, labels: Mapping[str, str], ages: Mapping[str, float]
     ) -> List[Any]:
-        """One row, in the order of :attr:`columns`.
+        """One row, in the order of :attr:`view_columns`.
 
-        STATUS is a :class:`rich.text.Text` (D4/B12) so ``get_cell_at`` hands a
-        test back the glyph and the style; every other cell is a plain string.
+        Every cell is a :class:`rich.text.Text` (D4/B12) so ``get_cell_at``
+        hands a test back both the plain value and the style — which is how the
+        restored colour language is asserted.
         """
-        widx = str(term.window_index) if term.window_index is not None else "?"
-        default_label = "(supervisor seat)" if not term.parent_id else "(unlabeled)"
-        task = labels.get(term.id, default_label)[:40]
-        cells: List[Any] = [
-            widx,
-            term.id,
-            term.profile or "?",
-            task,
-            status_cell(status_row(term)),
-            fmt_age(ages.get(widx)),
-        ]
-        if self.show_new_columns:
-            cells += [
-                term.condition or "-",
-                f"delegating ({term.children_count})" if term.delegating else "-",
-                "*" if term.fusion_changed else "",
-                term.lifecycle,
-                term.resolved_model or "-",
-            ]
+        values = row_values(term, labels, ages, with_new_columns=self.show_new_columns)
+        styles = row_styles(term, ages, term.id in labels)
+        cells: List[Any] = [Text(MARKER_BLANK, style=STYLE_MARKER)]
+        for index, value in enumerate(values):
+            if index == PARITY_COLUMNS.index("STATUS"):
+                cells.append(status_cell(status_row(term)))
+            else:
+                cells.append(Text(value, style=styles[index] if index < len(styles) else ""))
         return cells
 
     def refresh_table(self) -> None:
@@ -407,22 +718,72 @@ class FleetApp(App[None]):
         ids = [t.id for t in rows]
         index = ids.index(selected) if selected in ids else 0
         table.move_cursor(row=index)
+        self.refresh_marker()
+
+    def refresh_marker(self) -> None:
+        """Put ``▶`` on the cursor row and nothing on the others (``:399``)."""
+        table = self.table
+        if not table.row_count:
+            return
+        cursor = table.cursor_row
+        for index in range(table.row_count):
+            wanted = MARKER_SELECTED if index == cursor else MARKER_BLANK
+            coordinate = Coordinate(index, MARKER_INDEX)
+            current = table.get_cell_at(coordinate)
+            plain = current.plain if isinstance(current, Text) else str(current)
+            if plain != wanted:
+                table.update_cell_at(
+                    coordinate, Text(wanted, style=STYLE_MARKER), update_width=False
+                )
+
+    def on_data_table_row_highlighted(self, message: Any) -> None:
+        """Keep the gutter in step with every way the cursor can move."""
+        self.refresh_marker()
 
     def badge_text(self) -> str:
-        """Header line: session, worker count, and the staleness badge (AC1)."""
+        """Header: session, clock, worker count, fetch latency, live/stale.
+
+        Parity with ``fleet-tui.py:338-339`` plus the Textual app's own
+        live/stale badge (AC1), which the script had no concept of.
+        """
         workers = sum(1 for t in self.state.terminals if t.parent_id)
+        latency = "-" if self._last_fetch_ms is None else f"{self._last_fetch_ms}ms"
         if self.state.fetched_at is None:
             badge = "not yet fetched"
-        elif self.state.stale_for > FETCH_INTERVAL:
+        elif self.state.stale_for > self._poll_interval:
             badge = f"stale {int(self.state.stale_for)}s"
         else:
             badge = "live"
-        return f"CAO fleet · {self.session} · {workers} workers · {badge}"
+        return (
+            f"CAO fleet · {self.session} · {self.stamp()} · {workers} workers"
+            f" · fetch {latency} · {badge}"
+        )
+
+    def alert_text(self) -> str:
+        """The loud server-down line, or ``""`` when the endpoint is answering.
+
+        ``fleet-tui.py:334-335`` draws a red ``fleet endpoint unreachable``
+        header whenever the fetch failed; the last-good timestamp is added here
+        so a stale screen says how stale it is without opening the debug pane.
+        """
+        error = self.state.last_error
+        if not error:
+            return ""
+        if self.state.fetched_at is None:
+            last_good = "never"
+        else:
+            last_good = time.strftime("%H:%M:%S", time.localtime(self.state.fetched_at))
+        return f"fleet endpoint unreachable: {error} · last good {last_good}"
 
     def refresh_badge(self) -> None:
         self.query_one("#badge", Static).update(self.badge_text())
+        alert = self.query_one("#alert", Static)
+        text = self.alert_text()
+        alert.display = bool(text)
+        alert.update(Text(text, style=STYLE_ALERT))
 
     def refresh_events(self) -> None:
+        self.maybe_sync_events()
         log = self.query_one("#events", RichLog)
         lines = read_events(self._events_path)
         if lines == self._events_shown:
@@ -449,16 +810,14 @@ class FleetApp(App[None]):
             return None
         return next((t for t in self.state.terminals if t.id == selected), None)
 
-    def capture_window(self, window_index: int) -> List[str]:
+    def capture_window(self, window_index: int, peek: Static | None = None) -> List[str]:
         """Tail of the selected window's CAO pane (``fleet-tui.py:128-148``).
 
         F544: a window target resolves to the *active* pane, so the first pane
         id is resolved first and captured by id.
         """
-        panes = self.tmux(
-            ["list-panes", "-t", f"{self.session}:{window_index}", "-F", "#{pane_id}"]
-        )
         target = f"{self.session}:{window_index}"
+        panes = self.tmux(["list-panes", "-t", target, "-F", "#{pane_id}"])
         if panes:
             first = panes.splitlines()[0].strip()
             if first:
@@ -469,26 +828,60 @@ class FleetApp(App[None]):
         lines = [line.rstrip() for line in out.splitlines()]
         while lines and not lines[-1].strip():
             lines.pop()
-        return lines[-self.peek_lines :] if lines else ["(blank)"]
+        wanted = self.peek_lines if peek is None else self.peek_capacity(peek)
+        return lines[-wanted:] if lines else ["(blank)"]
+
+    def peek_title(self, term: TerminalState) -> str:
+        """The peek banner (``fleet-tui.py:441-443``): who, where, how idle.
+
+        Reads the ages cached by the frame's one ``list-windows`` call; moving
+        the cursor redraws the banner without a second tmux round trip.
+        """
+        ages = self._ages
+        status = status_cell(status_row(term)).plain.removeprefix("· ")
+        return (
+            f"▌ peek · {term.profile}-{term.id} · win {window_key(term)}"
+            f" · {status} · idle {fmt_age(ages.get(window_key(term)))}"
+        )
+
+    def peek_capacity(self, peek: Static) -> int:
+        """How many capture lines fit: the leftover space, or ``peek_lines``.
+
+        The script gives the peek every row the rest of the frame did not use
+        (``fleet-tui.py:448-449``); ``+``/``-`` then sets a floor on top of that
+        rather than being the only thing that decides the height.
+        """
+        available = peek.size.height - 1  # the banner line
+        return max(self.peek_lines, available)
 
     def refresh_peek(self) -> None:
         peek = self.query_one("#peek", Static)
         peek.display = self.peek_visible
-        peek.styles.height = self.peek_lines
+        peek.styles.min_height = self.peek_lines + 1
         if not self.peek_visible:
             return
         term = self.selected_terminal()
         if term is None or term.window_index is None:
             peek.update("(nothing selected)")
             return
-        peek.update(Text.from_ansi("\n".join(self.capture_window(term.window_index))))
+        body = Text.from_ansi("\n".join(self.capture_window(term.window_index, peek)))
+        title = Text(self.peek_title(term), style="bold")
+        peek.update(Text("\n").join([title, body]))
+
+    def error_ring_lines(self, limit: int = ERROR_RING_SHOWN) -> List[str]:
+        """The tail of the error ring, or a single "(empty)" line."""
+        if not self.errors:
+            return ["(no tui errors)"]
+        return [f"{stamp} {message}" for stamp, message in self.errors[-limit:]]
 
     def debug_text(self) -> str:
         latency = "-" if self._last_fetch_ms is None else f"{self._last_fetch_ms}ms"
         raw = json.dumps(self._last_raw, indent=2, default=str) if self._last_raw else "(none)"
+        ring = "\n".join(self.error_ring_lines())
         return (
             f"endpoint={self.url} fetch={latency} "
-            f"stale_for={self.state.stale_for:.1f}s last_error={self.state.last_error}\n{raw}"
+            f"stale_for={self.state.stale_for:.1f}s last_error={self.state.last_error}\n"
+            f"{ring}\n{raw}"
         )
 
     def refresh_debug(self) -> None:
@@ -501,19 +894,23 @@ class FleetApp(App[None]):
 
     def action_cursor_up(self) -> None:
         self.table.action_cursor_up()
+        self.refresh_marker()
         self.refresh_peek()
 
     def action_cursor_down(self) -> None:
         self.table.action_cursor_down()
+        self.refresh_marker()
         self.refresh_peek()
 
     def action_cursor_top(self) -> None:
         self.table.move_cursor(row=0)
+        self.refresh_marker()
         self.refresh_peek()
 
     def action_cursor_bottom(self) -> None:
         if self.table.row_count:
             self.table.move_cursor(row=self.table.row_count - 1)
+        self.refresh_marker()
         self.refresh_peek()
 
     def action_jump(self) -> None:
@@ -558,7 +955,13 @@ class FleetApp(App[None]):
         self.query_one("#flash", Static).update(message)
 
     def write_snapshot(self, reason: str = "manual") -> Path:
-        """Write a debugging snapshot (``fleet-tui.py:273-296``). Not a tmux call."""
+        """Write a debugging snapshot (``fleet-tui.py:273-296``). Not a tmux call.
+
+        Carries every section the script's snapshot has, in its order: the
+        header, the error ring, the labels file, the events tail and the raw
+        fleet JSON. A snapshot missing the raw payload is the one that cannot
+        answer "what did the server actually say".
+        """
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = self._snapshot_dir / f"fleet-{stamp}.txt"
@@ -566,19 +969,107 @@ class FleetApp(App[None]):
             labels_blob = self._labels_path.read_text()
         except OSError as exc:
             labels_blob = f"(unreadable: {exc})"
+        raw = json.dumps(self._last_raw, indent=2, default=str) if self._last_raw else "(none)"
         lines = [
             f"cao-fleet snapshot · session={self.session} · reason={reason} · {stamp}",
             self.badge_text(),
-            self.debug_text(),
+            self.alert_text() or "(endpoint reachable)",
+            f"endpoint={self.url} fetch={self._last_fetch_ms} last_error={self.state.last_error}",
             f"sel={self.selected_id()} peek={self.peek_visible}/{self.peek_lines}",
+            "",
+            "== tui error ring ==",
+            *self.error_ring_lines(ERROR_RING_SIZE),
             "",
             "== labels file ==",
             labels_blob,
             "== events tail ==",
             *read_events(self._events_path, 20),
+            "",
+            "== raw fleet json ==",
+            raw,
         ]
         path.write_text("\n".join(lines) + "\n")
         return path
+
+
+# ── one-shot rendering (`--once`) ────────────────────────────────────────────
+
+
+def format_frame(
+    session: str,
+    state: FleetState,
+    labels: Mapping[str, str],
+    ages: Mapping[str, float],
+    events: Sequence[str],
+    *,
+    latency_ms: int | None = None,
+    clock: str = "",
+    selected: str | None = None,
+) -> str:
+    """One plain-text frame — what ``--once`` prints (``fleet-tui.py:571-574``).
+
+    Column widths follow the script's rule: the wider of the header and the
+    widest cell, plus a two-space gutter (``:362-370``). No colour: the output
+    is meant for a pipe, a snapshot or a bug report.
+    """
+    rows = sort_terminals(state.terminals)
+    workers = sum(1 for term in rows if term.parent_id)
+    latency = "-" if latency_ms is None else f"{latency_ms}ms"
+    out: List[str] = []
+    if state.last_error:
+        out.append(f"fleet endpoint unreachable: {state.last_error}")
+    out.append(f"▌ CAO fleet · {session} · {clock} · {workers} workers · fetch {latency}")
+    out.append("")
+    values = [row_values(term, labels, ages) for term in rows]
+    gutter = 2
+    widths = [
+        max([len(header)] + [len(row[index]) for row in values]) + gutter
+        for index, header in enumerate(PARITY_COLUMNS)
+    ]
+    out.append("  " + "".join(h.ljust(w) for h, w in zip(PARITY_COLUMNS, widths)))
+    for term, row in zip(rows, values):
+        marker = f"{MARKER_SELECTED} " if term.id == selected else "  "
+        out.append(marker + "".join(cell.ljust(w) for cell, w in zip(row, widths)))
+    if not rows:
+        out.append("  (no workers)")
+    if events:
+        out += ["", "▌ recent"] + [f"  {line}" for line in events]
+    out += ["", hint_text()]
+    return "\n".join(out) + "\n"
+
+
+def render_once(
+    session: str,
+    endpoint: str,
+    *,
+    fetch: Callable[..., Any] = fetch_json,
+    runner: Runner = run_tmux,
+    labels_path: Path = LABELS_PATH,
+    events_path: Path = EVENTS_PATH,
+    now: Callable[[], float] = time.time,
+) -> str:
+    """Fetch once and return the frame; no Textual app, no terminal needed."""
+    url = f"{endpoint.rstrip('/')}/sessions/{session}/fleet"
+    started = now()
+    latency: int | None = None
+    try:
+        raw = fetch(url, 5.0)
+    except Exception as exc:
+        state = FleetState.empty().with_failure(str(exc), now=now())
+    else:
+        latency = int((now() - started) * 1000)
+        state = FleetState.from_dict(raw, fetched_at=now())
+    rows = sort_terminals(state.terminals)
+    return format_frame(
+        session,
+        state,
+        read_labels(labels_path),
+        read_window_ages(runner, session, now=now),
+        read_events(events_path, 5),
+        latency_ms=latency,
+        clock=time.strftime("%H:%M:%S", time.localtime(now())),
+        selected=rows[0].id if rows else None,
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -588,12 +1079,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--session",
         default=os.environ.get("CAO_SESSION"),
-        help="CAO/tmux session name (default: $CAO_SESSION).",
+        help="CAO/tmux session name (default: $CAO_SESSION, else the enclosing tmux session).",
     )
     parser.add_argument(
         "--endpoint",
         default=os.environ.get("CAO_ENDPOINT") or DEFAULT_ENDPOINT,
         help=f"cao-server base URL (default: $CAO_ENDPOINT or {DEFAULT_ENDPOINT}).",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=FETCH_INTERVAL,
+        help=f"seconds between fleet fetches (default: {FETCH_INTERVAL}).",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one plain-text frame and exit, instead of running the TUI.",
     )
     return parser.parse_args(argv)
 
@@ -601,10 +1103,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """Console entry for ``cao-fleet`` (D1)."""
     args = parse_args(argv)
-    if not args.session:
-        sys.stderr.write("cao-fleet: no session — pass --session or set CAO_SESSION\n")
+    session = args.session or detect_tmux_session()
+    if not session:
+        sys.stderr.write(
+            "cao-fleet: no session — pass --session, set CAO_SESSION, or run inside tmux\n"
+        )
         return 2
-    FleetApp(args.session, args.endpoint).run()
+    if args.interval <= 0:
+        sys.stderr.write("cao-fleet: --interval must be greater than zero\n")
+        return 2
+    if args.once:
+        sys.stdout.write(render_once(session, args.endpoint))
+        return 0
+    FleetApp(session, args.endpoint, poll_interval=args.interval).run()
     return 0
 
 
