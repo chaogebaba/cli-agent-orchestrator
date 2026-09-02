@@ -567,6 +567,30 @@ _SGR_CSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
 # while the stuck chip is still present — never blind-Enter a submitted
 # composer (idempotent, no double-submit).
 CODEX_PASTE_CHIP_PATTERN = re.compile(r"[›»]\s*\[Pasted Content\s+\d+\s+chars\]")
+# The same chip WITHOUT the composer head glyph, anchored at the start of a
+# draft. codex-cli 0.152.0 splits a long paste into consecutive chips
+# ("[Pasted Content 1022 chars][Pasted Content 1012 chars]"), optionally
+# followed by a short literal tail it did not collapse.
+CODEX_PASTE_CHIP_LEAD_PATTERN = re.compile(r"^(?:\[Pasted Content\s+\d+\s+chars\]\s*)+")
+
+
+def _is_codex_paste_chip_chrome(draft: str) -> bool:
+    """Whether a composer draft is CAO's OWN ``[Pasted Content]`` chip chrome.
+
+    True when the draft STARTS with one or more paste chips; a short literal
+    tail after them is allowed, because codex leaves the end of a split paste
+    uncollapsed. Anchoring at the start is what keeps this from firing on human
+    prose that merely mentions a chip further along.
+
+    F733 #590: a paste chip is unambiguous CAO-injected chrome — codex renders
+    it only for a bracketed paste, and only CAO pastes into a worker composer.
+    A human never types one and an assistant never emits one into the composer.
+    That is what lets the ownership-uncertainty rules elsewhere in this module
+    (which exist to protect a HUMAN's unsent draft) safely stand down for it.
+    """
+    if not draft:
+        return False
+    return CODEX_PASTE_CHIP_LEAD_PATTERN.match(draft.strip()) is not None
 # Grace before the first submission check: give the TUI a beat to register the
 # paste and process the submit Enter under load.
 CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
@@ -690,6 +714,14 @@ def _codex_tui_is_ready_for_submit(rendered: str) -> bool:
     Ready ⇔ the footer/status line is present AND no loading/resuming banner is
     still on screen. Operates on the plain (escape-stripped) rendered pane text;
     a pure predicate so it is trivially unit-testable against fixture screens.
+
+    INPUT CONTRACT (F734 #591): ``rendered`` MUST be the LIVE VIEWPORT — the
+    currently visible screen — never a scrollback window. Both terms of the
+    predicate are statements about what is on screen NOW: "the banner is still
+    showing" and "the footer has rendered". Feed it scrollback and the banner
+    term becomes "the banner was EVER shown", which is true forever after a
+    codex resume and pins the gate at not-ready for its whole budget. See
+    ``pre_paste_gate`` for the incident this contract was written from.
     """
     clean = strip_terminal_escapes(rendered)
     if CODEX_TUI_LOADING_BANNER_PATTERN.search(clean):
@@ -1567,17 +1599,32 @@ class CodexProvider(BaseProvider):
 
         B1 INVARIANT: this is a delivery-side readiness check, not a submission
         confirmation. It gates WHEN we paste; it never asserts the paste landed.
+
+        F734 #591 — READ THE VIEWPORT, NOT THE SCROLLBACK. The r1 gate polled
+        ``get_history(tail_lines=PYTE_SCREEN_ROWS)``, i.e. 200 rows of
+        SCROLLBACK. Codex renders on the normal screen, so its startup card
+        scrolls up but stays inside that 200-row window for the whole
+        init-and-deliver phase — and the card permanently contains
+        ``model:       loading`` and ``Resuming session…``. The banner term of
+        ``_codex_tui_is_ready_for_submit`` therefore stayed true forever and the
+        gate ALWAYS burned its full budget. Measured on this box 2026-09-02:
+        41 of 41 codex spawns logged "TUI not ready after 45.0s"; the ready path
+        never logged once. That is a flat 45 s of dead air before every single
+        task paste — the "long idle gap" the operator reported. Live pane
+        5de4ed8a proved the scoping directly: 0 banner rows in its viewport,
+        2 in its 200-row history, while its composer and footer were plainly
+        live. Reading the viewport restores both terms to their intended
+        meaning and costs nothing: a genuinely initializing TUI still shows the
+        card ON SCREEN, so it still reads not-ready and the gate still waits.
         """
         backend = get_backend()
         deadline = time.monotonic() + CODEX_DELIVERY_READINESS_TIMEOUT_SECONDS
         waited = False
         while True:
             try:
-                rendered = backend.get_history(
+                rendered = backend.capture_viewport(
                     self.session_name,
                     self.window_name,
-                    tail_lines=PYTE_SCREEN_ROWS,
-                    strip_escapes=False,
                 )
             except Exception:
                 # Capture failure must not block delivery — proceed, let the
@@ -3350,21 +3397,54 @@ class CodexProvider(BaseProvider):
         # Join using plain line widths (escape-stripped); matches previous
         # behavior for wrap detection on capture-pane plain or pyte screens.
         draft = self._join_composer_segments(plain_lines, prompt_idx, prompt_pos, segments)
-        if draft and any(
-            re.match(
-                ASSISTANT_PREFIX_PATTERN,
-                strip_terminal_escapes(candidate).strip(),
-                re.IGNORECASE,
+        if (
+            draft
+            and not _is_codex_paste_chip_chrome(draft)
+            and any(
+                re.match(
+                    ASSISTANT_PREFIX_PATTERN,
+                    strip_terminal_escapes(candidate).strip(),
+                    re.IGNORECASE,
+                )
+                for candidate in plain_lines[:prompt_idx]
             )
-            for candidate in plain_lines[:prompt_idx]
         ):
             # A non-empty composer-shaped row below assistant output has no
             # snapshot-only ownership proof. Returning None makes draft_guard
             # defer injection instead of clearing/restoring uncertain text.
+            #
+            # F733 #590 EXEMPTION: a draft that leads with ``[Pasted Content N
+            # chars]`` chips is exempt, because it carries its own ownership
+            # proof — the chip is CAO-injected chrome, never human or assistant
+            # text (the same reasoning ``_pane_shows_pasted_chip`` already
+            # documents). Without the exemption every retry of a stuck long
+            # paste read as unreadable: the stuck pane ALWAYS has the SEED_OK
+            # assistant bullet above the composer, so the reader returned None,
+            # ``preserve_draft_before_send`` raised "Composer state is
+            # unreadable", and deferred init tore the worker down after 3
+            # attempts. Journal 2026-09-02 17:43:09 and 17:43:11 for terminal
+            # 7652d61d is exactly this pair of raises.
             return None
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
+
+    def draft_is_own_paste_chrome(self, draft: str) -> bool:
+        """F733 #590: is this composer draft CAO's OWN unsubmitted paste?
+
+        The draft guard preserves a composer draft because it may be a HUMAN's
+        unsent text: it stashes the draft, clears the composer, injects, then
+        restores. A draft made of ``[Pasted Content N chars]`` chips is not
+        human text at all — it is CAO's own previous delivery that failed to
+        submit. It still has to be CLEARED (otherwise the retry paste appends to
+        it), but restoring it afterwards would type a literal
+        ``[Pasted Content 1022 chars]`` string into the worker's composer, where
+        the next dispatch would submit that nonsense as the task.
+
+        Providers that do not collapse pastes into chips never define this hook,
+        and the guard's behavior for them is unchanged.
+        """
+        return _is_codex_paste_chip_chrome(draft)
 
     @staticmethod
     def _pane_shows_pasted_chip(captured: str) -> bool:
@@ -3425,14 +3505,32 @@ class CodexProvider(BaseProvider):
         return CODEX_PASTE_CHIP_PATTERN.search(region) is not None
 
     @staticmethod
-    def _active_composer_chip_count(captured: str) -> int | None:
-        """Return the ``[Pasted Content N chars]`` count on the ACTIVE composer.
+    def _active_composer_paste_state(captured: str) -> "tuple[list[int], int] | None":
+        """Chip char-counts and literal-tail length for the ACTIVE composer.
 
-        ``None`` when no chip is on the active composer (or it cannot be
-        anchored). Used to prove OWNERSHIP before a recovery Enter (BLOCKER 3):
-        we only re-Enter a stuck chip whose char-count matches the current
-        dispatch, so an UNRELATED queued/steering draft that happens to own the
-        composer is never blind-Entered mid-run.
+        Returns ``(chip_counts, tail_chars)`` or ``None`` when no active
+        composer can be anchored:
+
+          * ``chip_counts`` — the char-count of EVERY ``[Pasted Content N
+            chars]`` chip on the active composer, in render order.
+          * ``tail_chars`` — the length of the composer text that is NOT chip
+            chrome, whitespace-normalized. Codex leaves a short tail literal
+            when the paste ends in one (e.g. the ``[Assigned by terminal …]``
+            trailer that CAO appends), so the drafted length is the chip total
+            PLUS this tail.
+
+        F733 #590 MULTI-CHIP FIX. codex-cli 0.152.0 splits a long bracketed
+        paste into SEVERAL chips rather than one — a ~2000-char task renders as
+        ``› [Pasted Content 1022 chars][Pasted Content 1012 chars]``. The
+        superseded ``_active_composer_chip_count`` used a single ``re.search``
+        and returned only the FIRST count, so it under-reported the draft by
+        every chip after the first. That number then failed the ±1 ownership
+        test in ``_pane_shows_stuck_chip``, the recovery Enter never fired, and
+        a perfectly recoverable stuck paste was reported "structurally
+        unconfirmed" — killing the worker. Measured 2026-09-02: 5/5 short
+        dispatches delivered, 2/2 long ones died this way (6aee61fb, 7652d61d).
+        Summing every chip is what makes ownership computable at all for a
+        split paste.
         """
         if not captured:
             return None
@@ -3448,8 +3546,68 @@ class CodexProvider(BaseProvider):
         while search_end > 0 and not plain_lines[search_end - 1].strip():
             search_end -= 1
         region = "\n".join(plain_lines[prompt_idx:search_end])
-        match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", region)
-        return int(match.group(1)) if match is not None else None
+        # Drop the composer head glyph so it is not counted as drafted text.
+        body = re.sub(r"^\s*[›»]\s?", "", region)
+        chip_counts = [int(m) for m in re.findall(r"\[Pasted Content\s+(\d+)\s+chars\]", body)]
+        tail = re.sub(r"\[Pasted Content\s+\d+\s+chars\]", "", body)
+        return chip_counts, len(CodexProvider._normalize_pane_text(tail))
+
+    @staticmethod
+    def _composer_paste_is_owned(captured: str, own_chip_count: int | None) -> bool:
+        """Is the ACTIVE composer's paste attributable to THIS dispatch?
+
+        False when no composer can be anchored, when it holds no chip at all
+        (nothing to recover — treat as vanished/submitted), or when the drafted
+        length cannot be reconciled with the dispatched message. ``None`` for
+        ``own_chip_count`` means the caller has no length to compare, so any
+        chip counts as ours.
+
+        The drafted length is EVERY chip plus the literal tail. Slack is one
+        char per chip: codex may drop or insert a separator at each split
+        boundary, and the tail is re-measured off rendered cells with
+        whitespace collapsed. For a single chip with no tail this is exactly
+        the legacy ±1 rule.
+
+        F733 #590: this is the SINGLE definition of paste ownership. It was
+        previously written out twice — once in ``_pane_shows_stuck_chip`` and
+        again in the B3 pre-Enter TOCTOU re-read — and the copies disagreed the
+        moment a paste carried a literal tail: the re-read compared chips-only
+        against a message that included its ``[Assigned by terminal …]``
+        trailer, decided the chip had "vanished", and skipped the very Enter the
+        first copy had just authorized. Two copies of one rule is what made that
+        possible, so there is now one.
+        """
+        state = CodexProvider._active_composer_paste_state(captured)
+        if state is None:
+            return False
+        chip_counts, tail_chars = state
+        if not chip_counts:
+            return False
+        if own_chip_count is None:
+            return True
+        drafted = sum(chip_counts) + tail_chars
+        return abs(drafted - own_chip_count) <= max(1, len(chip_counts))
+
+    @staticmethod
+    def _active_composer_chip_count(captured: str) -> int | None:
+        """Return the TOTAL ``[Pasted Content N chars]`` chars on the composer.
+
+        ``None`` when no chip is on the active composer (or it cannot be
+        anchored). Used to prove OWNERSHIP before a recovery Enter (BLOCKER 3):
+        we only re-Enter a stuck chip whose char-count matches the current
+        dispatch, so an UNRELATED queued/steering draft that happens to own the
+        composer is never blind-Entered mid-run.
+
+        F733 #590: this is now the SUM across every chip, so a paste codex
+        split into several chips reports its true drafted length instead of
+        just its first fragment. A single-chip composer is unaffected — the sum
+        of one chip is that chip.
+        """
+        state = CodexProvider._active_composer_paste_state(captured)
+        if state is None:
+            return None
+        chip_counts, _tail = state
+        return sum(chip_counts) if chip_counts else None
 
     @staticmethod
     def _pane_shows_working(captured: str) -> bool:
@@ -3915,14 +4073,25 @@ class CodexProvider(BaseProvider):
                 return False
             if not self._pane_shows_pasted_chip(captured):
                 return False
-            # Verify ownership
-            active_n = self._active_composer_chip_count(captured)
-            if active_n is None:
+            # Verify ownership.
+            #
+            # F733 #590: account for EVERY chip plus the literal tail, not
+            # just the first chip. codex-cli 0.152.0 splits a long paste into
+            # several chips, and a first-chip-only reading of a
+            # ``[Pasted Content 1022 chars][Pasted Content 1012 chars]``
+            # composer reports 1022 against a ~2034-char dispatch — a 1012-char
+            # miss that failed ownership and suppressed the recovery Enter on
+            # every long task. Slack is one char per chip because codex may drop
+            # or insert a separator at each split boundary, and the literal tail
+            # is re-measured off rendered cells with whitespace collapsed. For a
+            # single chip with no tail this is exactly the legacy ±1 rule.
+            if not self._composer_paste_is_owned(captured, own_chip_count):
                 return False
             if own_chip_count is None:
+                # No dispatch length to compare against, so B2's length-ambiguity
+                # test below is not computable. Returning here preserves the
+                # pre-fix early return that used to sit inline above.
                 return True
-            if abs(active_n - own_chip_count) > 1:
-                return False
             # B2 r7: check pre-paste ambiguity. If the baseline captured a
             # draft chip whose length is within ±1 of our dispatch, the chip
             # we see NOW might be that pre-existing draft, not ours → ambiguous.
@@ -4211,10 +4380,12 @@ class CodexProvider(BaseProvider):
                     strip_escapes=False,
                 )
                 if isinstance(pre_enter_pane, str):
-                    pre_enter_chip = self._active_composer_chip_count(pre_enter_pane)
-                    if pre_enter_chip is None or (
-                        own_chip_count is not None and abs(pre_enter_chip - own_chip_count) > 1
-                    ):
+                    # F733 #590: ONE ownership rule, shared with
+                    # _pane_shows_stuck_chip. The old inline copy compared
+                    # chips-only against a message that included its trailer and
+                    # so reported a phantom "vanished" for every trailered
+                    # paste, cancelling an Enter it had already authorized.
+                    if not self._composer_paste_is_owned(pre_enter_pane, own_chip_count):
                         # Chip gone between re-check and now — the submit may
                         # have landed (TOCTOU race). Skip this Enter, re-poll.
                         logger.info(

@@ -327,6 +327,23 @@ def preserve_draft_before_send(
     if draft == "":
         return None
 
+    # F733 #590: a composer holding CAO's OWN unsubmitted paste is not a human
+    # draft. Clear it so the retry paste cannot append to it, and never restore
+    # it — restoring would leave a literal "[Pasted Content N chars]" string in
+    # the worker's composer for the next dispatch to submit as its task.
+    own_chrome = getattr(provider, "draft_is_own_paste_chrome", None)
+    if callable(own_chrome) and own_chrome(draft):
+        logger.info(
+            "Composer for terminal %s holds our own unsubmitted paste chrome; "
+            "clearing without preserving",
+            terminal_id,
+        )
+        if not _clear_composer(terminal_id, metadata, provider):
+            raise DeliveryDeferredError(
+                f"Could not confirm composer clear for terminal {terminal_id}"
+            )
+        return None
+
     # Ghost-text discrimination is provider-authorized. Codex has empirically
     # clear-immune suggestions; an unchanged clear on any other provider is an
     # unconfirmed mutation and must defer rather than authorize a paste.
