@@ -46,22 +46,74 @@ def test_state_store_surface() -> None:
     assert expected <= set(dir(ports.StateStore))
 
 
+_AC6_COLUMNS = (
+    "terminal_id",
+    "state",
+    "since",
+    "last_event_seq",
+    "degraded_reason",
+    "prior_state",
+    "last_probe_at",
+    "last_source_probe_at",
+    "pane_pid",
+    "pane_present",
+    "miss_count",
+)
+
+
 def test_state_projection_carries_the_ac6_columns() -> None:
     """Every column AC6 names is on the projection Protocol."""
-    expected = {
-        "terminal_id",
-        "state",
-        "since",
-        "last_event_seq",
-        "degraded_reason",
-        "prior_state",
-        "last_probe_at",
-        "last_source_probe_at",
-        "pane_pid",
-        "pane_present",
-        "miss_count",
-    }
-    assert expected <= set(ports.StateProjection.__annotations__)
+    assert set(_AC6_COLUMNS) <= set(dir(ports.StateProjection))
+
+
+def test_state_projection_members_are_read_only() -> None:
+    """Read-only properties, so an implementation may be a frozen dataclass.
+
+    A plain annotation makes mypy treat the member as settable and locks out
+    frozen implementations; a read-only property is still satisfied by a plain
+    attribute, so this is the more permissive form.
+    """
+    for name in _AC6_COLUMNS:
+        member = getattr(ports.StateProjection, name)
+        assert isinstance(member, property), name
+        assert member.fset is None, name
+
+
+def test_a_frozen_dataclass_satisfies_the_projection_protocol() -> None:
+    """The point of the change, asserted rather than argued."""
+    from dataclasses import dataclass
+    from datetime import UTC, datetime
+
+    from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
+
+    @dataclass(frozen=True)
+    class FrozenRow:
+        terminal_id: str
+        state: WorkerState
+        since: datetime
+        last_event_seq: int
+        degraded_reason: DegradedReason | None
+        prior_state: WorkerState | None
+        last_probe_at: datetime | None
+        last_source_probe_at: datetime | None
+        pane_pid: int | None
+        pane_present: bool
+        miss_count: int
+
+    row: ports.StateProjection = FrozenRow(
+        terminal_id="t-1",
+        state=WorkerState.IDLE,
+        since=datetime(2026, 9, 2, tzinfo=UTC),
+        last_event_seq=3,
+        degraded_reason=None,
+        prior_state=None,
+        last_probe_at=None,
+        last_source_probe_at=None,
+        pane_pid=None,
+        pane_present=True,
+        miss_count=0,
+    )
+    assert row.terminal_id == "t-1"
 
 
 def test_event_source_declares_authority() -> None:
