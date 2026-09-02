@@ -700,6 +700,13 @@ fn route(id: CommandId) -> Option<Route> {
         // path to a human authorisation act that nothing in the interface has reviewed.
         // (#583 Bolt 2, approval-operation)
         CommandId::WorkflowApprove => None,
+        // HIDE: `cao diag *` reads the server database directly (read-only, `mode=ro`), so there
+        // is no HTTP route to bind — and there should not be one. The whole point of AC7 is that
+        // a diagnostic works when the server is the thing being diagnosed. (WP-ARCH F725 #581)
+        CommandId::DiagAgreement => None,
+        CommandId::DiagFindings => None,
+        CommandId::DiagTerminal => None,
+        CommandId::DiagWhy => None,
     }
 }
 
