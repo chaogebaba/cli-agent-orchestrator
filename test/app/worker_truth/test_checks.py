@@ -11,7 +11,6 @@ from test.app.conftest import Rig
 
 from cli_agent_orchestrator.app.worker_truth.checks import (
     EVIDENCE_REQUIRING_DECISIONS,
-    ghost_transition_check,
     record_migration_failure,
 )
 from cli_agent_orchestrator.core.events import (
@@ -273,3 +272,82 @@ def test_migration_failure_dedupes_on_the_step(rig: Rig) -> None:
     assert findings[0].count == 10
     assert findings[0].terminal_id == ""
     assert findings[0].state is FindingState.OPEN
+
+
+def test_a_muted_legacy_publish_still_gets_measured(rig: Rig) -> None:
+    """The muted path is where disagreements BEGIN, so it runs the check too.
+
+    The pane said one thing while a healthy source said another: that is the
+    definition of a legacy disagreement, and leaving it to the sweep alone would
+    delay the most interesting case by up to a heartbeat.
+    """
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    rig.legacy(TERMINAL, "idle")  # muted: the source is healthy
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+    rig.clock.advance(PANE_HEARTBEAT_S + 1)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.legacy(TERMINAL, "idle")  # muted again; the FIRST one is now stale
+
+    findings = rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)
+    assert len(findings) == 1
+    assert findings[0].dedupe_key == "busy|idle"
+
+
+def test_the_muted_path_cannot_fire_the_check_spuriously(rig: Rig) -> None:
+    """The horizon is measured from the latest publish, which is zero seconds old."""
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    rig.legacy(TERMINAL, "idle")
+
+    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+
+
+def test_a_pane_republishing_the_same_wrong_status_still_fires(rig: Rig) -> None:
+    """The case measuring from the latest publish would miss forever.
+
+    A pane that reasserts the same wrong status every few seconds resets a
+    latest-publish clock on every tick, so the longest-running disagreement in
+    the fleet would be the one that never fired.  The onset is the first publish
+    of the consecutive run instead.
+    """
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    for _ in range(12):
+        rig.clock.advance(5)
+        rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+        rig.legacy(TERMINAL, "idle")
+
+    findings = rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)
+    assert len(findings) == 1
+    assert findings[0].dedupe_key == "busy|idle"
+
+
+def test_the_onset_never_predates_the_current_shadow_state(rig: Rig) -> None:
+    """A publish older than the shadow state was not disagreeing with THIS state.
+
+    Without that bound, a terminal that had been disagreeing, then agreed, then
+    disagreed again would be credited with the whole span and fire immediately.
+    """
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+    for _ in range(6):
+        rig.clock.advance(10)
+        rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+        rig.legacy(TERMINAL, "idle")  # agrees: shadow is idle too
+    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+
+    # The shadow moves to busy.  The disagreement starts NOW, not 60s ago.
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    rig.clock.advance(2)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.legacy(TERMINAL, "idle")
+
+    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []

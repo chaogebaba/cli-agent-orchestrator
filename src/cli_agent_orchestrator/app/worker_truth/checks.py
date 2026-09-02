@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import DecisionKind, EventKind, WorkerEvent
@@ -217,7 +217,14 @@ def bad_transition_check(event: WorkerEvent) -> CheckOutcome | None:
 
 
 class LegacyDisagreementCheck:
-    """``DIAG-LEGACY-DISAGREE``: shadow ≠ legacy for longer than one heartbeat."""
+    """``DIAG-LEGACY-DISAGREE``: shadow ≠ legacy for longer than one heartbeat.
+
+    Durational, so it reads the projection and the legacy publishes together and
+    is driven by the projector after each fold and by the sweep every heartbeat.
+    It is not a registry check: during ``on_append`` the projection is one event
+    stale by construction, and a check that raced the projector would report
+    disagreements that exist only inside that window.
+    """
 
     def __init__(
         self,
@@ -234,12 +241,6 @@ class LegacyDisagreementCheck:
     def __call__(self, terminal_id: str) -> bool:
         """Evaluate one terminal.  Returns whether a finding was recorded.
 
-        The horizon is measured from the legacy publish's ``ingested_at``,
-        because that publish is the moment the two sides last had a chance to
-        agree.  A disagreement younger than ``PANE_HEARTBEAT_S`` is ordinary lag —
-        the two sides are fed by producers on different clocks — and firing on it
-        would bury the real disagreements the agreement report (AC10) counts.
-
         Never raises: the projector calls this on every fold.
         """
         try:
@@ -252,18 +253,27 @@ class LegacyDisagreementCheck:
         projection = self._state_store.get(terminal_id)
         if projection is None:
             return False
-        latest = self._latest_legacy_publish(terminal_id)
-        if latest is None:
+        rows = self._event_store.read(
+            terminal_id, kinds=frozenset({EventKind.STATUS_LEGACY_PUBLISHED})
+        )
+        if not rows:
             return False
-        raw = latest.payload.get("latched_status")
+
+        raw = rows[-1].payload.get("latched_status")
         if not isinstance(raw, str):
             return False
         mapped = legacy_state(raw)
         if mapped is None or mapped is projection.state:
             return False
-        age = self._clock.now() - latest.ingested_at
+
+        onset, sample = self._onset(rows, mapped, projection.since)
+        age = self._clock.now() - onset
+        # Ordinary lag is not a finding.  The two sides are fed by producers on
+        # different clocks and can never move in the same instant; firing on that
+        # would bury the disagreements the agreement report (AC10) counts.
         if age <= timedelta(seconds=PANE_HEARTBEAT_S):
             return False
+
         self._finding_store.record(
             FindingCode.DIAG_LEGACY_DISAGREE,
             terminal_id=terminal_id,
@@ -272,15 +282,35 @@ class LegacyDisagreementCheck:
                 f"shadow {projection.state.value} vs legacy {raw} "
                 f"for {age.total_seconds():.0f}s"
             ),
-            sample_event_id=latest.event_id,
+            sample_event_id=sample.event_id,
         )
         return True
 
-    def _latest_legacy_publish(self, terminal_id: str) -> WorkerEvent | None:
-        rows = self._event_store.read(
-            terminal_id, kinds=frozenset({EventKind.STATUS_LEGACY_PUBLISHED})
-        )
-        return rows[-1] if rows else None
+    @staticmethod
+    def _onset(
+        rows: list[WorkerEvent], mapped: WorkerState, state_since: datetime
+    ) -> tuple[datetime, WorkerEvent]:
+        """When the CURRENT disagreement began, and the row that opened it.
+
+        Measuring from the LATEST publish would be wrong in the case that matters
+        most: a pane republishing the same wrong status every few seconds would
+        reset the clock forever and never fire, which is precisely the
+        long-running disagreement worth a finding.  So walk back through the
+        consecutive publishes that carry the same mapped state and take the
+        earliest.
+
+        The shadow side bounds it too.  A publish that predates the current
+        shadow ``state`` was not disagreeing with THIS state, so the onset is the
+        later of the two: the run's first publish, or the moment the shadow
+        arrived where it now is.
+        """
+        first = rows[-1]
+        for row in reversed(rows[:-1]):
+            raw = row.payload.get("latched_status")
+            if not isinstance(raw, str) or legacy_state(raw) is not mapped:
+                break
+            first = row
+        return max(first.ingested_at, state_since), first
 
 
 def register_phase1_checks(registry: CheckRegistry) -> CheckRegistry:

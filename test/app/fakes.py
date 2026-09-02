@@ -193,18 +193,14 @@ class InMemoryStateStore:
         pane_pid: int | None,
         miss_count: int,
     ) -> None:
-        row = self.rows.setdefault(
-            terminal_id, Shadow(terminal_id=terminal_id, since=probed_at)
-        )
+        row = self.rows.setdefault(terminal_id, Shadow(terminal_id=terminal_id, since=probed_at))
         row.last_probe_at = probed_at
         row.pane_present = pane_present
         row.pane_pid = pane_pid
         row.miss_count = miss_count
 
     def touch_source_probe(self, terminal_id: str, *, probed_at: datetime) -> None:
-        row = self.rows.setdefault(
-            terminal_id, Shadow(terminal_id=terminal_id, since=probed_at)
-        )
+        row = self.rows.setdefault(terminal_id, Shadow(terminal_id=terminal_id, since=probed_at))
         row.last_source_probe_at = probed_at
 
     def all_terminals(self) -> list[StateProjection]:

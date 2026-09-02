@@ -278,18 +278,24 @@ class Projector:
 
         if self._is_muted(row, event):
             self._states.upsert(replace(row, last_event_seq=event.seq))
-            return ProjectionOutcome(
+            outcome = ProjectionOutcome(
                 event.terminal_id,
                 rule="derived_muted_by_healthy_source",
                 applied=False,
                 from_state=row.state,
             )
-
-        if event.kind is EventKind.PANE_RECOVERED:
+        elif event.kind is EventKind.PANE_RECOVERED:
             outcome = self._recover(row, event)
         else:
             outcome = self._transition(row, event)
 
+        # Run for EVERY event, muted ones included.  A muted
+        # ``status.legacy_published`` is exactly where a disagreement begins —
+        # the pane said one thing, the healthy source said another — so skipping
+        # the check on the muted path would leave the most interesting case to
+        # the sweep alone.  It cannot fire spuriously here: the horizon is
+        # measured from the latest legacy publish, which at this moment is zero
+        # seconds old.
         self._legacy_check(event.terminal_id)
         return outcome
 
