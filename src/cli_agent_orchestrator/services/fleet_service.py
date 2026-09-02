@@ -222,14 +222,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         # the observed status instead of stamping ERROR; also expose the
         # teardown state as an additive sibling key (`teardown`, mirroring
         # `delegating`/`fusion_changed`) so the TUI can render `reaping`.
-        in_teardown = row["id"] in teardown_scope_keys or (
-            session_name in teardown_scope_keys
-        )
-        if (
-            has_native_inventory
-            and row["tmux_window"] not in windows
-            and not in_teardown
-        ):
+        in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
+        if has_native_inventory and row["tmux_window"] not in windows and not in_teardown:
             status = TerminalStatus.ERROR
         # F124 S1: compute init_health; failed health overrides status to ERROR.
         init_health = _compute_init_health(row, now)
@@ -247,9 +241,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             TerminalStatus.IDLE,
             TerminalStatus.COMPLETED,
         )
-        last_active = row.get("last_active")
+        last_active = _as_utc(row.get("last_active"))
         if last_active is not None:
-            last_active = _as_utc(last_active)
             since_last_input = max(0.0, (now - last_active).total_seconds())
         else:
             since_last_input = None

@@ -220,7 +220,7 @@ class ClineCliProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
-        allowed_tools: Optional[list] = None,
+        allowed_tools: Optional[list[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
     ):

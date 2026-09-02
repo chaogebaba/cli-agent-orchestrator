@@ -5,6 +5,8 @@ TTL-bounded so a crashed delete stops suppressing after teardown_intent_ttl_s.
 """
 
 import logging
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +14,45 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+# F716 (#571) r2: in-process teardown marks — the fallback that makes "a mark
+# always exists before a tmux kill" unconditional.
+#
+# The durable DB intent is still primary (it survives a process restart and is
+# visible to any reader of the database). But `open_intent` can fail — a locked
+# SQLite file, a migration gap, a disk error — and `delete_terminal` must NOT be
+# blocked by that: a delete is itself a recovery operation, and refusing to reap
+# a terminal because a bookkeeping table is unavailable would turn a cosmetic
+# fleet-projection defect into an availability defect. So the delete path also
+# sets a process-local mark, which `active_teardown_scope_keys` unions into the
+# result. Same TTL discipline as the DB row: a crashed delete stops suppressing.
+_MEMORY_MARKS: dict[str, float] = {}
+_MEMORY_MARKS_LOCK = threading.Lock()
+
+
+def mark_teardown(scope_key: str, ttl_s: float = 300.0) -> None:
+    """Set a process-local teardown mark for ``scope_key`` (terminal id or session).
+
+    Cheap, never raises, and independent of the database. Callers set this
+    BEFORE any tmux kill and clear it in a ``finally``.
+    """
+    with _MEMORY_MARKS_LOCK:
+        _MEMORY_MARKS[scope_key] = time.monotonic() + ttl_s
+
+
+def unmark_teardown(scope_key: str) -> None:
+    """Clear a process-local teardown mark. Idempotent; never raises."""
+    with _MEMORY_MARKS_LOCK:
+        _MEMORY_MARKS.pop(scope_key, None)
+
+
+def _active_memory_marks() -> set[str]:
+    """Unexpired process-local marks, dropping expired entries as it goes."""
+    now = time.monotonic()
+    with _MEMORY_MARKS_LOCK:
+        for key in [k for k, deadline in _MEMORY_MARKS.items() if deadline <= now]:
+            del _MEMORY_MARKS[key]
+        return set(_MEMORY_MARKS)
 
 
 def open_intent(
@@ -100,8 +141,9 @@ def is_teardown_intended(
     OR scope=(terminal, terminal_id). Expired rows match nothing and are
     deleted lazily.
     """
-    from cli_agent_orchestrator.clients.database import F218TeardownIntentModel
     from sqlalchemy import or_
+
+    from cli_agent_orchestrator.clients.database import F218TeardownIntentModel
 
     now = datetime.now(timezone.utc)
 
@@ -124,9 +166,7 @@ def is_teardown_intended(
 
     # Lazy cleanup: delete expired rows we encountered
     try:
-        db.query(F218TeardownIntentModel).filter(
-            F218TeardownIntentModel.expires_at <= now
-        ).delete()
+        db.query(F218TeardownIntentModel).filter(F218TeardownIntentModel.expires_at <= now).delete()
         db.commit()
     except Exception:
         db.rollback()
@@ -142,20 +182,32 @@ def active_teardown_scope_keys() -> set[str]:
     (intent open — delete_terminal opens the intent BEFORE killing the
     window) from "window gone unexpectedly" (no intent). TTL-bounded like
     :func:`is_teardown_intended`, so a crashed delete stops suppressing.
+
+    r2: the durable rows are UNIONED with the in-process marks set by
+    :func:`mark_teardown`. A database read failure degrades to the marks
+    alone rather than to the empty set, because the case that most needs
+    the fallback (the DB is unhealthy, so ``open_intent`` failed) is
+    exactly the case where this query fails too.
     """
     from cli_agent_orchestrator.clients.database import (
         F218TeardownIntentModel,
         SessionLocal,
     )
 
+    keys = _active_memory_marks()
+
     now = datetime.now(timezone.utc)
-    with SessionLocal() as db:
-        rows = (
-            db.query(F218TeardownIntentModel.scope_key)
-            .filter(
-                F218TeardownIntentModel.scope_kind.in_(("terminal", "session")),
-                F218TeardownIntentModel.expires_at > now,
+    try:
+        with SessionLocal() as db:
+            rows = (
+                db.query(F218TeardownIntentModel.scope_key)
+                .filter(
+                    F218TeardownIntentModel.scope_kind.in_(("terminal", "session")),
+                    F218TeardownIntentModel.expires_at > now,
+                )
+                .all()
             )
-            .all()
-        )
-    return {row[0] for row in rows}
+    except Exception as e:
+        logger.warning("f218_teardown_scope_keys_db_read_failed (using in-process marks): %s", e)
+        return keys
+    return keys | {row[0] for row in rows}
