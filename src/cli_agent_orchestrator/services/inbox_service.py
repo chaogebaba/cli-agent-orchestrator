@@ -2196,6 +2196,17 @@ class InboxService:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self._delivery_tasks.clear()
 
+    def _log_delivery_skip(self, terminal_id: str, reason: str) -> None:
+        """F721 #577: name a silent ``deliver_pending`` early return in the journal.
+
+        The 2026-09-02 fleet stall (4 cline terminals, 07:00-07:27Z) left pending
+        rows with no open delivery attempt and nothing above DEBUG to explain why
+        delivery never opened one. These returns are the candidates; one
+        structured INFO line per return makes the next stall diagnosable from
+        ``journalctl`` alone. Observability only — admission is unchanged.
+        """
+        logger.info("deliver_pending_skip terminal=%s reason=%s", terminal_id, reason)
+
     def deliver_pending(
         self,
         terminal_id: str,
@@ -2229,6 +2240,7 @@ class InboxService:
         """
         # F339: skip delivery for terminals already abandoned as ghosts.
         if self._f339_is_abandoned(terminal_id):
+            self._log_delivery_skip(terminal_id, "f339_abandoned")
             return
 
         with _delivery_seq_guard:
@@ -2239,6 +2251,7 @@ class InboxService:
             # advance the wake generation so the next ready event retries.
             with _delivery_seq_guard:
                 _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
+            self._log_delivery_skip(terminal_id, "lock_miss")
             return
         try:
             metadata = get_terminal_metadata(terminal_id) or {}
@@ -2246,9 +2259,14 @@ class InboxService:
                 # F339: terminal row absent — record streak and bail if abandoned.
                 outcome = self._f339_record_not_found(terminal_id, "no_terminal_metadata")
                 if outcome.reason == "abandoned_no_terminal":
+                    self._log_delivery_skip(terminal_id, "abandoned_no_terminal")
                     return
+                self._log_delivery_skip(terminal_id, "no_terminal_metadata")
                 return
             if metadata.get("recovery_state") not in (None, "rebound"):
+                self._log_delivery_skip(
+                    terminal_id, f"recovery_state={metadata.get('recovery_state')}"
+                )
                 return
             # F339: terminal found — reset ghost-terminal streak.
             self._f339_reset_not_found(terminal_id)
@@ -2271,6 +2289,7 @@ class InboxService:
                     # Digesting is the generation fence.  If its transaction
                     # cannot open, leave every row pending for the next wake;
                     # proceeding could expose a stale row to normal delivery.
+                    self._log_delivery_skip(terminal_id, "db_locked")
                     return
                 legacy_parked = get_owned_legacy_parked_messages(terminal_id)
                 if legacy_parked:
@@ -2288,6 +2307,7 @@ class InboxService:
                     ):
                         native_result = native_probe(terminal_id, status_monitor)
                         if native_result is None:
+                            self._log_delivery_skip(terminal_id, "native_probe_none_preadmission")
                             return
                         probe_meta = native_result.meta
                     else:
@@ -2311,6 +2331,7 @@ class InboxService:
                             token=getattr(probe_result, "fresh_token", None),
                         )
                         if view is None or view.probe_evidence is None:
+                            self._log_delivery_skip(terminal_id, "probe_evidence_none_preadmission")
                             return
                         probe_meta = view.probe_evidence.to_legacy_dict()
                     if isinstance(probe_meta, dict):
@@ -2332,6 +2353,7 @@ class InboxService:
                             )
             with _delivery_seq_guard:
                 if _delivery_wake_seq.get(terminal_id, 0) > captured_wake:
+                    self._log_delivery_skip(terminal_id, "wake_superseded")
                     return
             limit = num_messages if num_messages > 0 else 100
             excluded: set[int] = set()
@@ -2489,6 +2511,7 @@ class InboxService:
                         observe_binding_staleness=False,
                     )
                     if gate_state == "stop":
+                        self._log_delivery_skip(terminal_id, "gate_stop")
                         return
                     if gate_state == "skip_d2_only":
                         continue
@@ -2509,6 +2532,7 @@ class InboxService:
                                 monitor=status_monitor,
                             )
                         ) in (None, TerminalStatus.WAITING_USER_ANSWER):
+                            self._log_delivery_skip(terminal_id, "admission_status_unready")
                             return
                         if not legacy_test_seam:
                             try:
@@ -2516,6 +2540,7 @@ class InboxService:
                                     terminal_id
                                 )
                             except Exception:
+                                self._log_delivery_skip(terminal_id, "boundary_observation_error")
                                 return
                         if isinstance(getattr(admission_snapshot, "status", None), TerminalStatus):
                             status = receiver_state_view.view_from_legacy(
@@ -2527,6 +2552,7 @@ class InboxService:
                                 monitor=status_monitor,
                             )
                             if status is None:
+                                self._log_delivery_skip(terminal_id, "snapshot_none")
                                 return
                         else:
                             admission_snapshot = None
@@ -2538,6 +2564,7 @@ class InboxService:
                                 monitor=status_monitor,
                             )
                             if status is None:
+                                self._log_delivery_skip(terminal_id, "snapshot_none")
                                 return
                             if metadata.get("provider") == "claude_code" and status not in {
                                 TerminalStatus.IDLE,
@@ -2874,6 +2901,7 @@ class InboxService:
                     provider_name = metadata.get("provider", "unknown")
                     proof = make_admission_proof(admission_kind, message_ids, successor_source)
                     if not legacy_test_seam and list_delivering_attempts_for_terminal(terminal_id):
+                        self._log_delivery_skip(terminal_id, "attempt_already_delivering")
                         return
                     if not legacy_test_seam:
                         if provider is None:
@@ -2890,6 +2918,7 @@ class InboxService:
                         ):
                             native_result = native_probe(terminal_id, status_monitor)
                             if native_result is None:
+                                self._log_delivery_skip(terminal_id, "native_probe_none_preopen")
                                 return
                             probe_status, probe_meta = native_result.status, native_result.meta
                         else:
@@ -2914,6 +2943,7 @@ class InboxService:
                                 token=getattr(probe_result, "fresh_token", None),
                             )
                             if view is None or view.probe_evidence is None:
+                                self._log_delivery_skip(terminal_id, "probe_evidence_none_preopen")
                                 return
                             probe_status = view.latched_status
                             probe_meta = view.probe_evidence.to_legacy_dict()
@@ -2949,6 +2979,10 @@ class InboxService:
                             TerminalStatus.IDLE,
                             TerminalStatus.COMPLETED,
                         } and not (eager_eligible and probe_status == TerminalStatus.PROCESSING):
+                            self._log_delivery_skip(
+                                terminal_id,
+                                f"probe_status={getattr(probe_status, 'value', probe_status)}",
+                            )
                             return
                         if not isinstance(probe_meta, dict):
                             return
@@ -3594,7 +3628,21 @@ class InboxService:
             try:
                 self.deliver_pending(terminal_id, registry=registry)
             except Exception as e:
-                logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
+                # F721 #577: reconciliation is the declared retry owner, so a
+                # fault here is exactly the 2026-09-02 fleet stall shape —
+                # pending rows, no attempt, nothing above DEBUG in the journal.
+                # Name the receiver and the rows it was owed, at WARNING.
+                try:
+                    owed_ids = [str(m.id) for m in get_pending_messages(terminal_id)]
+                except Exception:
+                    owed_ids = []
+                logger.warning(
+                    "inbox_reconcile_failed receiver=%s message_ids=%s error=%s",
+                    terminal_id,
+                    ",".join(owed_ids) if owed_ids else "unknown",
+                    e,
+                    exc_info=True,
+                )
         # F524 (#379): surface supervisor->worker messages that have aged past the
         # escalation window undelivered. Direct-terminal rows never get an FX191
         # obligation, so this sweep is their only sender-side liveness.
