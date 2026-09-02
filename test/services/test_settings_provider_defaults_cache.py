@@ -66,9 +66,19 @@ def test_same_stat_key_rewrite_is_picked_up(toml_file: Path) -> None:
     cache key catches it."""
     toml_file.write_text("[codex]\nmodel = 'a'\n")
     assert ss.get_provider_defaults("codex") == {"model": "a"}
-    toml_file.write_text("[codex]\nmodel = 'b'\n")
-    st = toml_file.stat()
-    os.utime(toml_file, ns=(st.st_atime_ns, st.st_mtime_ns))
+    # Stat BEFORE the rewrite (gate r2 blocker 2: stat-after made os.utime a
+    # no-op and let a stat-only cache pass), rewrite in place so the inode is
+    # unchanged, then restore the pre-rewrite mtime so the stat key is identical.
+    before = toml_file.stat()
+    with open(toml_file, "r+", encoding="utf-8") as fh:
+        fh.write("[codex]\nmodel = 'b'\n")
+    os.utime(toml_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = toml_file.stat()
+    assert (after.st_mtime_ns, after.st_size, after.st_ino) == (
+        before.st_mtime_ns,
+        before.st_size,
+        before.st_ino,
+    )
     assert ss.get_provider_defaults("codex") == {"model": "b"}
 
 

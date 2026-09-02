@@ -56,7 +56,9 @@ _LIST_FMT = _SEP.join(
         "#{pane_active}",
     )
 )
-_IDENT_FMT = _SEP.join(("#{session_name}", "#{window_name}", "#{pane_id}", "#{pane_active}"))
+_IDENT_FMT = _SEP.join(
+    ("#{session_name}", "#{window_name}", "#{pane_id}", "#{pane_active}", "#{pane_index}")
+)
 
 # tmux client round-trips are milliseconds; anything longer means a wedged
 # server, and the caller's legacy path (with its own logging) should decide.
@@ -81,6 +83,11 @@ class WindowPanes:
     window_index: int
     first_pane: str
     active_pane: Optional[str]
+    # pane_index of ``first_pane`` at resolution time. ``swap-pane`` /
+    # ``rotate-window`` reorder indexes while keeping pane ids, which would
+    # otherwise let a cached id pass the identity check while no longer being
+    # libtmux's ``window.panes[0]`` (gate r2 blocker 3).
+    first_pane_index: int = 0
 
 
 class PaneLocator:
@@ -166,6 +173,7 @@ class PaneLocator:
                     window_index=w_idx,
                     first_pane=panes[0][1],
                     active_pane=active_pane,
+                    first_pane_index=panes[0][0],
                 )
             )
         mapping = {key: entries[0] for key, entries in by_name.items() if len(entries) == 1}
@@ -204,8 +212,10 @@ class PaneLocator:
     ) -> Optional[List[str]]:
         """Run ``command -t <pane> *args`` in ONE exec, identity-checked.
 
-        ``pane`` is ``"first"`` (lowest pane index — libtmux ``window.panes[0]``)
-        or ``"active"`` (libtmux ``window.active_pane``). Returns the command's
+        ``pane`` is ``"first"`` (lowest pane index — libtmux ``window.panes[0]``;
+        the identity line must still report that index, so a reordered window
+        re-resolves) or ``"active"`` (libtmux ``window.active_pane``; the
+        identity line must still report the pane as active). Returns the command's
         stdout lines (libtmux ``tmux_cmd.stdout`` semantics) or ``None`` when
         the caller must fall back.
         """
@@ -242,11 +252,12 @@ class PaneLocator:
             lines = self._split_stdout(completed.stdout)
             ident = lines[0].split(_SEP) if lines else []
             identity_ok = (
-                len(ident) == 4
+                len(ident) == 5
                 and ident[0] == session_name
                 and ident[1] == window_name
                 and ident[2] == pane_id
                 and (pane != "active" or ident[3] == "1")
+                and (pane != "first" or ident[4] == str(entry.first_pane_index))
             )
             if identity_ok and completed.returncode == 0:
                 return lines[1:]

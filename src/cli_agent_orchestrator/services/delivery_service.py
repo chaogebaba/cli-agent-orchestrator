@@ -401,7 +401,11 @@ def _create_self_notify_obligation(terminal_id: str) -> None:
     """
     try:
         with SessionLocal() as db:
-            mailbox = db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).first()
+            mailbox = (
+                db.query(MailboxModel)
+                .filter_by(current_terminal_id=terminal_id)
+                .first()
+            )
             if mailbox is None:
                 return
 
@@ -525,8 +529,8 @@ def attempt_rung1(
     # F457-r2 B2: unified gate — wake.native=false suppresses rung1 native ring
     # (mirrors ring_supervisor_doorbell's config check; inline because the doorbell's
     # cursor-dedup logic structurally conflicts with convergence_tick retry semantics).
-    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
     from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
     if not _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT):
         return LadderResult(
@@ -551,7 +555,9 @@ def attempt_rung1(
     try:
         from cli_agent_orchestrator.services.doorbell_service import _attempt_native_ring
 
-        result = _attempt_native_ring(target.terminal_id, inbox_row_id, message_body=message_body)
+        result = _attempt_native_ring(
+            target.terminal_id, inbox_row_id, message_body=message_body
+        )
         if result == "rang":
             # F547 #403 point 4: record socket_delivered on rung1 success so the
             # delivered-count / backoff machinery sees this ring and _is_row_still
@@ -1011,10 +1017,7 @@ def _fire_due_nudges() -> None:
         logger.warning(
             "f203 delivery.interrupt_after_s clamped: configured=%.1f effective=%.1f "
             "(escalate_after_s=%.1f tick_s=%.1f)",
-            raw_interrupt,
-            effective_interrupt,
-            escalate_after_s,
-            tick_s,
+            raw_interrupt, effective_interrupt, escalate_after_s, tick_s,
         )
 
     intents = nudge_discipline.collect_due(
@@ -1118,7 +1121,6 @@ def _drive_one_obligation(
     inbox_row = db.query(InboxModel.status).filter_by(id=obl.inbox_row_id).one_or_none()
     if inbox_row is not None and inbox_row.status == "delivered":
         from datetime import timedelta
-
         # Back off: delivered messages just need the ack cursor to advance.
         # Check every 30s instead of every 5s — the ack_messages call will
         # settle it much sooner via the normal path.
@@ -1180,7 +1182,9 @@ def _drive_one_obligation(
         repush_body = _rung1_repush_body(delivered_count, msg_age_s, pending_ids)
 
     # Attempt rung 1 (optimization — only in primary or shadow modes)
-    r1 = attempt_rung1(target, obl.inbox_row_id, oldest_age_s=msg_age_s, message_body=repush_body)
+    r1 = attempt_rung1(
+        target, obl.inbox_row_id, oldest_age_s=msg_age_s, message_body=repush_body
+    )
     emit_trace_or_collapse(obl.inbox_row_id, r1.phase, r1.decision, r1.reason, db)
 
     if r1.delivered:
@@ -1269,9 +1273,8 @@ def _escalate(
             obl.attempts,
         )
         # F206a/H3: Arm re-resolve cadence
-        from datetime import timedelta
-
         from cli_agent_orchestrator.services.config_service import ConfigService
+        from datetime import timedelta
 
         eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
         obl.next_attempt_at = now + timedelta(seconds=eas)
@@ -1294,9 +1297,8 @@ def _escalate(
         # F206b: fire display-message floor for supervisor targets
         _fire_escalation_display_message(target, obl.inbox_row_id)
         # F206a/H3: Arm re-resolve cadence
-        from datetime import timedelta
-
         from cli_agent_orchestrator.services.config_service import ConfigService
+        from datetime import timedelta
 
         eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
         obl.next_attempt_at = now + timedelta(seconds=eas)
@@ -1333,9 +1335,8 @@ def _escalate(
         _fire_escalation_display_message(target, obl.inbox_row_id)
 
     # F206a/H3: Arm next_attempt_at for bounded re-resolve cadence
-    from datetime import timedelta
-
     from cli_agent_orchestrator.services.config_service import ConfigService
+    from datetime import timedelta
 
     eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
     obl.next_attempt_at = now + timedelta(seconds=eas)
@@ -1429,14 +1430,20 @@ def _settle_dead_target_obligations(db: Session) -> None:
 
     # N1: SQL join/subquery replaces O(N) Python scan — only fetch obligations
     # whose mailbox current_terminal_id has a tombstone (confirmed dead).
-    dead_subq = db.query(PaneExitTombstoneModel.terminal_id).distinct().subquery()
+    dead_subq = (
+        db.query(PaneExitTombstoneModel.terminal_id)
+        .distinct()
+        .subquery()
+    )
     dead_obls = (
         db.query(DeliveryObligationModel)
         .join(MailboxModel, MailboxModel.id == DeliveryObligationModel.mailbox_id)
         .filter(
             DeliveryObligationModel.state.in_(("OPEN", "ESCALATED")),
             MailboxModel.current_terminal_id.isnot(None),
-            MailboxModel.current_terminal_id.in_(db.query(dead_subq.c.terminal_id)),
+            MailboxModel.current_terminal_id.in_(
+                db.query(dead_subq.c.terminal_id)
+            ),
         )
         .all()
     )
@@ -1470,7 +1477,9 @@ def _settle_dead_target_obligations(db: Session) -> None:
 
             if has_mailbox_authority:
                 # Look for a live successor incarnation in this mailbox
-                successor_terminal_id = _find_live_successor(db, obl.mailbox_id, terminal_id)
+                successor_terminal_id = _find_live_successor(
+                    db, obl.mailbox_id, terminal_id
+                )
 
                 if successor_terminal_id is not None:
                     # ═══ Case (i): Reroute to successor ═══
@@ -1481,11 +1490,8 @@ def _settle_dead_target_obligations(db: Session) -> None:
                     # Keep obligation OPEN — delivery ladder picks it up
                     obl.next_attempt_at = now
                     emit_trace_or_collapse(
-                        obl.inbox_row_id,
-                        "settle",
-                        "reroute",
-                        "successor_incarnation",
-                        db,
+                        obl.inbox_row_id, "settle", "reroute",
+                        "successor_incarnation", db,
                     )
                     rerouted_count += 1
                     continue
@@ -1500,11 +1506,8 @@ def _settle_dead_target_obligations(db: Session) -> None:
                 obl.terminal_at = now
                 obl.terminal_reason = "parked_no_successor"
                 emit_trace_or_collapse(
-                    obl.inbox_row_id,
-                    "settle",
-                    "park",
-                    "no_live_successor",
-                    db,
+                    obl.inbox_row_id, "settle", "park",
+                    "no_live_successor", db,
                 )
                 parked_count += 1
 
@@ -1514,18 +1517,17 @@ def _settle_dead_target_obligations(db: Session) -> None:
                 obl.terminal_at = now
                 obl.terminal_reason = "receiver_gone"
                 emit_trace_or_collapse(
-                    obl.inbox_row_id,
-                    "settle",
-                    "settle",
-                    "receiver_gone",
-                    db,
+                    obl.inbox_row_id, "settle", "settle",
+                    "receiver_gone", db,
                 )
                 settled_count += 1
                 # Track for aggregate session notice
                 noticed_sessions.add(mailbox.session_name)
 
         except Exception:
-            logger.debug("f219_settle_exception inbox=%s", obl.inbox_row_id, exc_info=True)
+            logger.debug(
+                "f219_settle_exception inbox=%s", obl.inbox_row_id, exc_info=True
+            )
             continue
 
     dirty = settled_count + parked_count + rerouted_count
@@ -1556,7 +1558,9 @@ def _settle_dead_target_obligations(db: Session) -> None:
         )
 
 
-def _find_live_successor(db: Session, mailbox_id: str, dead_terminal_id: str) -> str | None:
+def _find_live_successor(
+    db: Session, mailbox_id: str, dead_terminal_id: str
+) -> str | None:
     """Return the terminal_id of the newest live incarnation for mailbox_id.
 
     Iterates incarnations from highest generation downward.  Returns the first
@@ -1723,18 +1727,11 @@ def _reresolve_escalated(escalate_after_s: float) -> None:
                 r2 = attempt_rung2(
                     target,
                     obl.inbox_row_id,
-                    oldest_age_s=(
-                        (
-                            now
-                            - (
-                                obl.accepted_at.replace(tzinfo=timezone.utc)
-                                if obl.accepted_at and obl.accepted_at.tzinfo is None
-                                else obl.accepted_at
-                            )
-                        ).total_seconds()
-                        if obl.accepted_at
-                        else 0.0
-                    ),
+                    oldest_age_s=(now - (obl.accepted_at.replace(tzinfo=timezone.utc)
+                                         if obl.accepted_at and obl.accepted_at.tzinfo is None
+                                         else obl.accepted_at)).total_seconds()
+                    if obl.accepted_at
+                    else 0.0,
                     is_escalation=True,
                 )
 
@@ -1746,7 +1743,9 @@ def _reresolve_escalated(escalate_after_s: float) -> None:
                     emit_trace_or_collapse(
                         obl.inbox_row_id, "f206_reresolve", "settle", "delivered", db
                     )
-                    logger.info("f206a reresolve_delivered inbox=%d", obl.inbox_row_id)
+                    logger.info(
+                        "f206a reresolve_delivered inbox=%d", obl.inbox_row_id
+                    )
                 else:
                     # Still vetoed — fire H2 floor (display-message) at cadence
                     # Count escalated obligations for this mailbox for the message
@@ -1786,7 +1785,9 @@ def _reresolve_escalated(escalate_after_s: float) -> None:
                 try:
                     db.query(DeliveryObligationModel).filter_by(
                         inbox_row_id=obl.inbox_row_id
-                    ).update({"next_attempt_at": now + timedelta(seconds=escalate_after_s)})
+                    ).update(
+                        {"next_attempt_at": now + timedelta(seconds=escalate_after_s)}
+                    )
                     db.commit()
                 except Exception:
                     db.rollback()
@@ -1856,7 +1857,9 @@ def _update_pending_indicators() -> None:
 
             # Clear indicators for mailboxes with no undelivered obligations
             # (get all mailboxes that HAD state but now have count=0)
-            all_supervisor_mailboxes = db.query(MailboxModel).filter_by(role="supervisor").all()
+            all_supervisor_mailboxes = (
+                db.query(MailboxModel).filter_by(role="supervisor").all()
+            )
             for mailbox in all_supervisor_mailboxes:
                 if mailbox.id not in active_mailboxes:
                     target = resolve_supervisor_target(mailbox.id, db)

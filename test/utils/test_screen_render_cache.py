@@ -18,7 +18,29 @@ import pytest
 
 from cli_agent_orchestrator.utils.terminal_render import ScreenRenderCache
 
-_WORDS = ["ok", "─", "│", "▌", "✻", "…", "esc to interrupt", "中文", "日本語テキスト", "> ", "  "]
+_WORDS = [
+    "ok",
+    "─",
+    "│",
+    "▌",
+    "✻",
+    "…",
+    "esc to interrupt",
+    "中文",
+    "日本語テキスト",
+    "> ",
+    "  ",
+    # Combining marks (zero-width): pyte attaches them to the PREVIOUS cell, and
+    # at column 0 to the last cell of the PREVIOUS ROW without a dirty mark —
+    # gate r2 blocker 1. Keep them in the corpus so the fuzz can reach that path.
+    "\u0301",
+    "e\u0301",
+    "\u0308\u0301",
+    "a\u0300",
+    "\u20de",
+    "😀",
+    "👍🏽",
+]
 _SEQS = [
     "\x1b[H",
     "\x1b[2J",
@@ -80,7 +102,7 @@ def _render(fn: "Callable[[], list[str]]") -> object:
         return type(exc)
 
 
-@pytest.mark.parametrize("seed", list(range(12)))
+@pytest.mark.parametrize("seed", list(range(40)))
 def test_incremental_matches_full_display(seed: int) -> None:
     rng = random.Random(seed)
     cols, rows = rng.choice([(40, 8), (80, 24), (120, 30)])
@@ -96,6 +118,52 @@ def test_incremental_matches_full_display(seed: int) -> None:
         assert got == want, f"seed={seed} step={step}"
         # A second call with nothing fed must be stable and cheap.
         assert _render(lambda: cache.rows(screen)) == want
+
+
+def test_combining_char_at_column_zero_updates_previous_row() -> None:
+    """Gate r2 blocker 1, deterministic: a combining mark drawn at column 0 lands on the
+    last cell of the row above; pyte marks only the cursor row dirty."""
+    screen = pyte.Screen(5, 3)
+    stream = pyte.Stream(screen)
+    cache = ScreenRenderCache()
+    stream.feed("abc\r\n")
+    assert cache.rows(screen) == list(screen.display)
+    stream.feed("\u0301")
+    assert sorted(screen.dirty) == [1]  # pyte's dirty set does not include row 0
+    got = cache.rows(screen)
+    assert got == list(screen.display)
+    assert got[0].endswith("\u0301")
+    # and it stays correct on the next (no-op) read and after more drawing
+    assert cache.rows(screen) == list(screen.display)
+    stream.feed("\u0301zz")
+    assert cache.rows(screen) == list(screen.display)
+
+
+def test_combining_char_at_column_zero_of_row_zero_is_harmless() -> None:
+    screen = pyte.Screen(4, 2)
+    stream = pyte.Stream(screen)
+    cache = ScreenRenderCache()
+    cache.rows(screen)
+    stream.feed("\u0301")
+    assert cache.rows(screen) == list(screen.display)
+
+
+def test_incremental_branch_returns_a_copy() -> None:
+    """G2 from the gate: the copy semantics of the INCREMENTAL branch, not just the full render."""
+    screen = pyte.Screen(10, 3)
+    stream = pyte.Stream(screen)
+    cache = ScreenRenderCache()
+    stream.feed("a\r\nb\r\nc")
+    cache.rows(screen)  # full-render branch
+    stream.feed("\x1b[2;1HB")  # one dirty row -> incremental branch
+    got = cache.rows(screen)
+    assert got[1].startswith("B")
+    got[1] = "tampered"  # same length: a size change would mask the bug via the full-render path
+    again = cache.rows(screen)
+    assert again[1].startswith("B")
+    assert again == list(screen.display)
+    # and the copy handed out is not the copy handed out next time either
+    assert again is not cache.rows(screen)
 
 
 def test_only_dirty_rows_are_rerendered(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,7 +187,8 @@ def test_only_dirty_rows_are_rerendered(monkeypatch: pytest.MonkeyPatch) -> None
     got = cache.rows(screen)
     assert got[2].startswith("CHANGED")
     assert got[0].startswith("row0") and got[4].startswith("row4")
-    assert rendered_rows == [id(screen.buffer[2])]
+    # the dirty row and its neighbour above (the only cell pyte can touch unmarked)
+    assert sorted(rendered_rows) == sorted([id(screen.buffer[1]), id(screen.buffer[2])])
     assert got == list(screen.display)
 
 

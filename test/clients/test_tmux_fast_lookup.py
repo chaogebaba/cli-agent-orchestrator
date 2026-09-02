@@ -32,6 +32,8 @@ class FakeTmux:
         self.inventory: List[str] = []
         # pane_id -> (session, window, active)
         self.panes: Dict[str, Tuple[str, str, bool]] = {}
+        # pane_id -> pane_index (reported in the identity line)
+        self.pane_index: Dict[str, int] = {}
         # pane_id -> stdout for the real command
         self.output: Dict[str, str] = {}
         self.calls: List[List[str]] = []
@@ -53,7 +55,21 @@ class FakeTmux:
     ) -> None:
         self.inventory.append(_pane_row(session, wid, widx, wname, pidx, pid, active))
         self.panes[pid] = (session, wname, active)
+        self.pane_index[pid] = pidx
         self.output[pid] = output
+
+    def swap_panes(self, a: str, b: str) -> None:
+        """Emulate ``swap-pane``: indexes trade places, ids and content stay."""
+        ia, ib = self.pane_index[a], self.pane_index[b]
+        self.pane_index[a], self.pane_index[b] = ib, ia
+        rebuilt = []
+        for row in self.inventory:
+            parts = row.split(SEP)
+            pid = parts[5]
+            if pid in (a, b):
+                parts[4] = str(self.pane_index[pid])
+            rebuilt.append(SEP.join(parts))
+        self.inventory = rebuilt
 
     def __call__(self, argv: List[str], **_kw: object) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
@@ -72,10 +88,12 @@ class FakeTmux:
             # tmux falls back to "some" pane for display-message and the real
             # command fails: emulate both.
             other = next(iter(self.panes.values()), ("?", "?", False))
-            head = SEP.join([other[0], other[1], "%999", "1" if other[2] else "0"])
+            head = SEP.join([other[0], other[1], "%999", "1" if other[2] else "0", "0"])
             return subprocess.CompletedProcess(argv, 1, head + "\n", f"can't find pane: {pid}")
         reported = self.ident_pane_override.get(pid, pid)
-        head = SEP.join([ident[0], ident[1], reported, "1" if ident[2] else "0"])
+        head = SEP.join(
+            [ident[0], ident[1], reported, "1" if ident[2] else "0", str(self.pane_index[pid])]
+        )
         rc = self.command_rc.get(pid, 0)
         body = self.output.get(pid, "")
         return subprocess.CompletedProcess(argv, rc, head + "\n" + body, "" if rc == 0 else "boom")
@@ -169,6 +187,33 @@ def test_identity_pane_id_mismatch_is_stale_even_when_names_match(
     assert locator.run_pane_command("s1", "w2", "capture-pane", "-p") == ["first"]
     fake.ident_pane_override["%20"] = "%21"
     assert locator.run_pane_command("s1", "w2", "capture-pane", "-p") is None
+
+
+def test_swap_pane_reresolves_first_pane(locator: PaneLocator, fake: FakeTmux) -> None:
+    """Gate r2 blocker 3: after swap-pane the ids survive but pane 0 is another pane.
+    libtmux's window.panes[0] follows the index; the fast path must too."""
+    assert locator.run_pane_command("s1", "w2", "capture-pane", "-p", pane="first") == ["first"]
+    fake.swap_panes("%20", "%21")  # %21 now has index 0
+    fake.calls.clear()
+    assert locator.run_pane_command("s1", "w2", "capture-pane", "-p", pane="first") == ["active"]
+    # stale identity -> one refresh -> retry, all in the same call
+    assert [c[1] for c in fake.calls] == ["display-message", "list-panes", "display-message"]
+    assert locator.resolve("s1", "w2").first_pane == "%21"
+    assert locator.resolve("s1", "w2").first_pane_index == 0
+    # the active pane read is index-agnostic and unaffected by the swap
+    assert locator.run_pane_command("s1", "w2", "display-message", "-p", "x", pane="active") == [
+        "active"
+    ]
+
+
+def test_first_pane_index_need_not_be_zero(fake: FakeTmux, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A window whose lowest pane index is 3 (pane 0..2 killed) still resolves and passes identity."""
+    monkeypatch.delenv("CAO_TMUX_FAST_LOOKUP", raising=False)
+    fake.add_pane("s3", "@30", 0, "w", 3, "%300", active=True, output="three\n")
+    fake.add_pane("s3", "@30", 0, "w", 7, "%307", active=False, output="seven\n")
+    locator = PaneLocator(runner=fake)
+    assert locator.run_pane_command("s3", "w", "capture-pane", "-p", pane="first") == ["three"]
+    assert locator.resolve("s3", "w").first_pane_index == 3
 
 
 def test_active_pane_focus_change_refreshes(locator: PaneLocator, fake: FakeTmux) -> None:

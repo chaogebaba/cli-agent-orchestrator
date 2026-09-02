@@ -85,13 +85,19 @@ class ScreenRenderCache:
             return list(rows)
 
         if dirty:
-            if len(dirty) >= lines:
+            # pyte marks only ``cursor.y`` dirty in ``draw``, but its zero-width
+            # combining-character branch at column 0 mutates the LAST cell of the
+            # PRECEDING row (``buffer[cursor.y - 1][columns - 1]``) without marking
+            # it (gate r2 blocker 1). That is the only cross-row write pyte makes
+            # without a dirty mark, so re-render the row above every dirty row too.
+            stale = dirty | {y - 1 for y in dirty if y > 0}
+            if len(stale) >= lines:
                 self._rows = list(screen.display)  # type: ignore[attr-defined]
             else:
                 import pyte.screens
 
                 wcwidth = pyte.screens.wcwidth
-                for y in dirty:
+                for y in stale:
                     if 0 <= y < lines:
                         self._rows[y] = self._render_row(buffer[y], columns, wcwidth)
             dirty.clear()
