@@ -84,6 +84,11 @@ F = TypeVar("F", bound=Callable[..., Any])
 #: :func:`latest_submission_source_ref`) has a bounded cost.
 MAX_POLL_BYTES = 4 * 1024 * 1024
 
+#: How many per-path cursors are retained.  A COUNT, not a duration, so §4c's
+#: "durations live only in core/timing.py" does not apply.  See
+#: :func:`_evict_stale_cursors_locked` for why the table needs a bound at all.
+MAX_TRACKED_CURSORS = 512
+
 
 @dataclass
 class _FileCursor:
@@ -122,9 +127,35 @@ def _cursor_for(path: str) -> _FileCursor:
     with _lock:
         cursor = _cursors.get(path)
         if cursor is None:
+            _evict_stale_cursors_locked()
             cursor = _FileCursor()
             _cursors[path] = cursor
         return cursor
+
+
+def _evict_stale_cursors_locked() -> None:
+    """Keep the cursor table bounded.  Caller holds ``_lock``.
+
+    Cursors deliberately OUTLIVE their sources — that is B5, and it is what makes
+    a detach followed by a re-attach to the same rollout re-read nothing.  The
+    price is that a long-lived server accumulates one entry per rollout path it
+    has ever seen, and the server is meant to run for weeks.  Each entry is tiny,
+    so this is a slow leak rather than a fast one, which is exactly the kind that
+    is never noticed and never fixed.
+
+    Eviction is oldest-first by insertion order and never touches a cursor a LIVE
+    source is using, so the B5 guarantee holds for every terminal that could still
+    care about it.  A cursor evicted after its source is gone costs at most one
+    EOF re-seed if that same path is ever attached again.
+    """
+    if len(_cursors) < MAX_TRACKED_CURSORS:
+        return
+    live = {source._path_key for source in _sources.values()}
+    for path in list(_cursors):
+        if len(_cursors) < MAX_TRACKED_CURSORS:
+            return
+        if path not in live:
+            del _cursors[path]
 
 
 class CodexRolloutSource:

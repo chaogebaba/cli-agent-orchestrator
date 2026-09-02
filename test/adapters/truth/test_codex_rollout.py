@@ -328,3 +328,27 @@ def test_an_oversized_record_does_not_stall_the_tail(
     for _ in range(20):
         source.poll_once()
     assert ingest_on.kinds("t1") == ["turn.started"]
+
+
+def test_the_cursor_table_is_bounded_but_spares_live_sources(
+    ingest_on: FakeEventStore, rollout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cursors outlive their sources by design (B5), so the table needs a bound.
+
+    The bound must never evict a cursor a live source is still reading, or B5's
+    "re-attach re-reads nothing" guarantee would break for a running terminal.
+    """
+    monkeypatch.setattr(codex_rollout, "MAX_TRACKED_CURSORS", 8)
+    _write(rollout, TASK_STARTED)
+    codex_rollout.attach("live", rollout)
+    live_key = str(rollout)
+
+    for index in range(40):
+        codex_rollout._cursor_for(f"/tmp/rollout-{index}.jsonl")
+
+    assert len(codex_rollout._cursors) <= codex_rollout.MAX_TRACKED_CURSORS
+    assert live_key in codex_rollout._cursors
+
+    _write(rollout, TASK_COMPLETE, append=True)
+    codex_rollout.source_for("live").poll_once()
+    assert ingest_on.kinds("live") == ["turn.ended"]
