@@ -132,3 +132,30 @@ def is_teardown_intended(
         db.rollback()
 
     return False
+
+
+def active_teardown_scope_keys() -> set[str]:
+    """F716 (#571): scope_keys of ALL unexpired teardown intents.
+
+    Terminal-scope and session-scope keys in one set, so a fleet projection
+    can distinguish "window gone because we are deleting it on purpose"
+    (intent open — delete_terminal opens the intent BEFORE killing the
+    window) from "window gone unexpectedly" (no intent). TTL-bounded like
+    :func:`is_teardown_intended`, so a crashed delete stops suppressing.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        F218TeardownIntentModel,
+        SessionLocal,
+    )
+
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        rows = (
+            db.query(F218TeardownIntentModel.scope_key)
+            .filter(
+                F218TeardownIntentModel.scope_kind.in_(("terminal", "session")),
+                F218TeardownIntentModel.expires_at > now,
+            )
+            .all()
+        )
+    return {row[0] for row in rows}
