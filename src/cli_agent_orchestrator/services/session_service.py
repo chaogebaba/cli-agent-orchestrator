@@ -346,6 +346,16 @@ async def create_session(
     except Exception:
         await _unwind_registered_terminal(terminal.id, registry)
         raise
+    # F702 J4 (#473): the fleet TUI window is created here, after the session is
+    # committed, so a supervisor gets one whatever repo its cwd is in — the two
+    # old triggers resolved through the seat's project directory and only fired
+    # inside cli-subagents. Deliberately outside the unwind block: it runs only
+    # once the session has actually succeeded, and ensure_fleet_window never
+    # raises, so it cannot turn a good session start into a failed one.
+    if profile is not None and profile.role == "supervisor":
+        from cli_agent_orchestrator.services.fleet_window_service import ensure_fleet_window
+
+        await asyncio.to_thread(ensure_fleet_window, terminal.session_name, session_env)
     return terminal
 
 
