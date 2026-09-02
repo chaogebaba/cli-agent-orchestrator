@@ -42,9 +42,13 @@ from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
 
-# ASCII unit separator: never appears in tmux names/ids in practice, and a
-# name that did contain it simply fails the identity check -> fallback.
-_SEP = "\x1f"
+# Field separator for ``-F`` formats. Must be PRINTABLE: tmux < 3.7 vis-escapes
+# control characters in format output (``\x1f`` came back as the four bytes
+# ``\037`` on tmux 3.5a, so every parse failed and the fast path silently fell
+# back on every call — found by the round-3 box A/B). U+241E is what libtmux
+# itself uses as its format separator, so it is proven across tmux versions.
+# A name that did contain it simply fails the identity check -> fallback.
+_SEP = "\u241e"
 _LIST_FMT = _SEP.join(
     (
         "#{session_name}",
@@ -99,6 +103,7 @@ class PaneLocator:
         # session_name -> [(window_index, window_id, window_name)], duplicates kept.
         self._windows: Dict[str, List[Tuple[int, str, str]]] = {}
         self._run: Runner = runner or subprocess.run
+        self._warned_unparseable = False
 
     # ── exec plumbing ────────────────────────────────────────────────────
 
@@ -149,6 +154,18 @@ class PaneLocator:
         for line in self._split_stdout(completed.stdout):
             parts = line.split(_SEP)
             if len(parts) != 7:
+                # Every line unparseable means the separator did not survive
+                # (e.g. tmux client under LC_ALL=C prints U+241E as "_"): the
+                # fast path is then permanently off for this process. Say so
+                # once — the legacy path keeps working, only the perf win is lost.
+                if not self._warned_unparseable:
+                    self._warned_unparseable = True
+                    logger.warning(
+                        "tmux fast lookup disabled: list-panes output unparseable "
+                        "(%d fields, expected 7; check the tmux client locale is UTF-8): %r",
+                        len(parts),
+                        line[:120],
+                    )
                 return None
             session, window_id, window_index, window_name, pane_index, pane_id, active = parts
             try:

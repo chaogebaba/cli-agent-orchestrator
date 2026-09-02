@@ -16,7 +16,7 @@ import pytest
 from cli_agent_orchestrator.clients import tmux_fast
 from cli_agent_orchestrator.clients.tmux_fast import PaneLocator
 
-SEP = "\x1f"
+SEP = "\u241e"  # must match tmux_fast._SEP (printable: tmux < 3.7 vis-escapes control chars)
 
 
 def _pane_row(
@@ -315,6 +315,29 @@ def test_malformed_inventory_line_returns_none(
     monkeypatch.delenv("CAO_TMUX_FAST_LOOKUP", raising=False)
     fake.inventory.append("garbage")
     assert PaneLocator(runner=fake).refresh() is None
+
+
+def test_separator_lost_to_c_locale_falls_back_and_warns_once(
+    fake: FakeTmux, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tmux client under LC_ALL=C prints U+241E as '_' (seen on tmux 3.5a): the fast
+    path must decline (never mis-split on '_') and log the loss once, not per call."""
+    monkeypatch.delenv("CAO_TMUX_FAST_LOOKUP", raising=False)
+    fake.inventory = [row.replace(SEP, "_") for row in fake.inventory]
+    locator = PaneLocator(runner=fake)
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.clients.tmux_fast"):
+        assert locator.run_pane_command("s1", "w1", "capture-pane", "-p") is None
+        assert locator.run_pane_command("s1", "w1", "capture-pane", "-p") is None
+        assert locator.session_windows("s1") is None
+    warnings = [r for r in caplog.records if "fast lookup disabled" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_separator_is_printable() -> None:
+    """tmux < 3.7 escapes control characters in -F output (\\037 for \\x1f); a control
+    separator would make every parse fail and the fast path fall back forever."""
+    assert tmux_fast._SEP.isprintable()
+    assert tmux_fast._SEP == SEP
 
 
 def test_module_singleton_is_a_locator() -> None:
