@@ -294,3 +294,80 @@ def test_since_narrows_the_timeline(db: Path) -> None:
 
     assert everything["shown"] == everything["total"]
     assert narrow["shown"] <= everything["shown"]
+
+
+def test_a_valid_agreement_report_exits_zero_and_names_its_scope(tmp_path: Path) -> None:
+    """The happy path end to end, including the legacy scope lookup.
+
+    The invalid path is covered above; this asserts that a run meeting the AC10
+    content floor actually reports VALID, and that ``--session`` reaches the
+    legacy ``terminals`` table through the composition root rather than silently
+    comparing the whole fleet.
+    """
+    import sqlite3
+
+    path = tmp_path / "cao.db"
+    result, pool = migrate(path, busy_timeout_ms=5000)
+    assert result.ok and pool is not None
+
+    clock = FakeClock()
+    findings = SqliteFindingStore(pool, clock=clock)
+    registry = register_phase1_checks(CheckRegistry(findings))
+    events = SqliteEventStore(pool, clock=clock, check_runner=registry)
+    states = SqliteStateStore(pool)
+    projector = Projector(events, states, clock, StaticSourceRegistry())
+
+    for index in range(3):
+        terminal = f"t{index}"
+        producer = Producer.JSONL if index == 0 else Producer.PANE
+        for _ in range(30):
+            for kind, status in (
+                (EventKind.TURN_STARTED, "processing"),
+                (EventKind.TURN_ENDED, "idle"),
+            ):
+                projector.project(
+                    events.append(
+                        EventDraft(
+                            terminal_id=terminal,
+                            kind=kind,
+                            producer=producer,
+                            confidence=Confidence.AUTHORITATIVE,
+                            observed_at=clock.now(),
+                        )
+                    )
+                )
+                projector.project(
+                    events.append(
+                        EventDraft(
+                            terminal_id=terminal,
+                            kind=EventKind.STATUS_LEGACY_PUBLISHED,
+                            producer=Producer.PANE,
+                            confidence=Confidence.DERIVED,
+                            observed_at=clock.now(),
+                            payload={"latched_status": status, "origin": "incremental"},
+                        )
+                    )
+                )
+                clock.advance(1)
+    pool.close_all()
+
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT, provider TEXT)")
+    conn.executemany(
+        "INSERT INTO terminals VALUES (?, ?, ?)",
+        [("t0", "cao-alpha", "codex"), ("t1", "cao-alpha", "kiro"), ("t2", "cao-alpha", "cline")],
+    )
+    conn.commit()
+    conn.close()
+
+    result_all = _run(path, "agreement")
+    assert result_all.exit_code == 0
+    assert "VALID" in result_all.output
+
+    scoped = _run(path, "agreement", "--session", "cao-alpha")
+    assert scoped.exit_code == 0
+    assert "codex" in scoped.output
+
+    absent = _run(path, "agreement", "--session", "cao-nothing-here")
+    assert absent.exit_code == 2
+    assert "no evidence" in absent.output
