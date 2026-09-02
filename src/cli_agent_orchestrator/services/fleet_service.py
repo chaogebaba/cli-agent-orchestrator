@@ -172,6 +172,21 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         for item in inventory
     }
     has_native_inventory = callable(inventory_reader)
+    # F716 (#571): delete_terminal opens its F218 teardown intent (DB,
+    # committed) BEFORE killing the tmux window and purging the row, so a
+    # live row whose window is already gone may be a HEALTHY teardown in
+    # flight — not a loss. Load unexpired intent scope keys once per build;
+    # the window-absence ERROR override below is suppressed only for those
+    # rows (a vanished window with NO teardown intent is still ERROR).
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        active_teardown_scope_keys,
+    )
+
+    try:
+        teardown_scope_keys = active_teardown_scope_keys()
+    except Exception:
+        logger.exception("f716_teardown_scope_keys_load_failed — fail-closed to ERROR")
+        teardown_scope_keys = set()
     by_id = {row["id"]: row for row in rows}
     depths = _depths(rows)
     now = datetime.now(timezone.utc)
@@ -202,7 +217,13 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         fusion_reason = getattr(observation, "fusion_reason", None)
         if row.get("recovery_state") not in (None, "rebound"):
             status = TerminalStatus.ERROR
-        if has_native_inventory and row["tmux_window"] not in windows:
+        # F716 (#571): window absence under an ACTIVE teardown intent is the
+        # healthy delete ordering (intent → window kill → row purge), so keep
+        # the observed status instead of stamping ERROR; also expose the
+        # teardown state as an additive sibling key (`teardown`, mirroring
+        # `delegating`/`fusion_changed`) so the TUI can render `reaping`.
+        in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
+        if has_native_inventory and row["tmux_window"] not in windows and not in_teardown:
             status = TerminalStatus.ERROR
         # F124 S1: compute init_health; failed health overrides status to ERROR.
         init_health = _compute_init_health(row, now)
@@ -220,9 +241,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             TerminalStatus.IDLE,
             TerminalStatus.COMPLETED,
         )
-        last_active = row.get("last_active")
+        last_active = _as_utc(row.get("last_active"))
         if last_active is not None:
-            last_active = _as_utc(last_active)
             since_last_input = max(0.0, (now - last_active).total_seconds())
         else:
             since_last_input = None
@@ -247,6 +267,9 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "depth": depths[row["id"]],
                 "orphan": orphan,
                 "status": status.value,
+                # F716 (#571): additive sibling key — True while the row is
+                # under an unexpired teardown intent (delete in flight).
+                "teardown": in_teardown,
                 # F611 (#467): typed provider condition label (CAPPED/BLOCKED/
                 # AUTH/…) or None. Rendered by the `cao-fleet` TUI's new columns
                 # (F702) in `COND`, and appended to the status cell; distinct

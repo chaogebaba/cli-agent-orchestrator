@@ -220,7 +220,7 @@ class ClineCliProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
-        allowed_tools: Optional[list] = None,
+        allowed_tools: Optional[list[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
     ):
@@ -333,9 +333,12 @@ class ClineCliProvider(BaseProvider):
             # tool call.  Skip rather than damage a live run.
             pane_cmd = self._pane_cmd()
             if pane_cmd != DISPATCHER_IDLE_CMD:
-                logger.warning(
-                    "cline worker %s: suppressing EOF, pane is running %r "
-                    "(message likely not delivered)",
+                # F716 (#571): this guard fires whenever cline (node) is still
+                # foreground at EOF time — including AFTER the message was
+                # already delivered and pasted. Delivery state is unknown
+                # here, so state the fact only; never claim non-delivery.
+                logger.debug(
+                    "cline worker %s: deferred EOF skipped: pane running %r",
                     self.terminal_id,
                     pane_cmd,
                 )

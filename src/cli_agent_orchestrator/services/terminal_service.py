@@ -52,8 +52,8 @@ from cli_agent_orchestrator.clients.database import (
     get_ready_provider_session,
     get_terminal_metadata,
 )
-from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import list_all_terminals
+from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import (
     list_deferred_init_overdue_pending_rows,
     list_deferred_init_recovery_rows,
@@ -7147,10 +7147,22 @@ def delete_terminal(
         close_intent as _f218_close_intent,
     )
     from cli_agent_orchestrator.services.teardown_intent_service import (
+        mark_teardown as _f218_mark_teardown,
+    )
+    from cli_agent_orchestrator.services.teardown_intent_service import (
         open_intent as _f218_open_intent,
+    )
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        unmark_teardown as _f218_unmark_teardown,
     )
 
     ttl_s = float(ConfigService.get("teardown.intent_ttl_s", 300.0))
+    # F716 (#571) r2: the in-process mark goes first and cannot fail, so no tmux
+    # kill below can ever run without SOME teardown mark for this terminal. The
+    # durable DB intent is still opened right after and is still authoritative
+    # across processes/restarts; when it fails we log and continue on the mark
+    # rather than aborting the delete (see teardown_intent_service for why).
+    _f218_mark_teardown(terminal_id, ttl_s=ttl_s)
     _f218_intent_id: str | None = None
     try:
         with SessionLocal() as _intent_db:
@@ -7162,7 +7174,11 @@ def delete_terminal(
                 db=_intent_db,
             )
     except Exception as e:
-        logger.warning("f218_teardown_intent_open_failed terminal=%s: %s", terminal_id, e)
+        logger.warning(
+            "f218_teardown_intent_open_failed terminal=%s (in-process mark still set): %s",
+            terminal_id,
+            e,
+        )
 
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     try:
@@ -7183,6 +7199,80 @@ def delete_terminal(
                     _f218_close_intent(_f218_intent_id, _intent_db)
             except Exception as e:
                 logger.warning("f218_teardown_intent_close_failed: %s", e)
+        _f218_unmark_teardown(terminal_id)
+
+
+def _open_cascade_teardown_intents(
+    node_ids: list[str],
+    *,
+    caller_id: str | None,
+) -> tuple[list[str], list[str]]:
+    """F716 (#571) r2: mark + open a teardown intent for each cascaded child.
+
+    ``delete_terminal`` brackets only the ROOT terminal in an intent, but the
+    cascade kills every node in the reap plan. Without a mark of its own, a
+    child whose window is already gone projects ERROR in the fleet for the
+    whole of the cascade — the exact symptom F716 exists to remove.
+
+    A session-scope intent would cover the subtree in one row, but it would
+    also suppress the ERROR for siblings on the same session that are NOT
+    being deleted, which is the safety property AC-F716-2 protects. So the
+    intents are per-terminal, exactly over the reap plan.
+
+    Returns ``(intent_ids, marked_keys)`` for :func:`_close_cascade_teardown_intents`.
+    Never raises: an intent that cannot be committed leaves the in-process
+    mark in place, matching the wrapper's behaviour.
+    """
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.config_service import ConfigService
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        mark_teardown,
+        open_intent,
+    )
+
+    ttl_s = float(ConfigService.get("teardown.intent_ttl_s", 300.0))
+    intent_ids: list[str] = []
+    marked: list[str] = []
+    for node_id in node_ids:
+        mark_teardown(node_id, ttl_s=ttl_s)
+        marked.append(node_id)
+        try:
+            with SessionLocal() as db:
+                intent_ids.append(
+                    open_intent(
+                        scope_kind="terminal",
+                        scope_key=node_id,
+                        requested_by=caller_id,
+                        ttl_s=ttl_s,
+                        db=db,
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "f218_teardown_intent_open_failed cascade_child=%s "
+                "(in-process mark still set): %s",
+                node_id,
+                e,
+            )
+    return intent_ids, marked
+
+
+def _close_cascade_teardown_intents(intent_ids: list[str], marked: list[str]) -> None:
+    """Release what :func:`_open_cascade_teardown_intents` took. Never raises."""
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        close_intent,
+        unmark_teardown,
+    )
+
+    for intent_id in intent_ids:
+        try:
+            with SessionLocal() as db:
+                close_intent(intent_id, db)
+        except Exception as e:
+            logger.warning("f218_teardown_intent_close_failed cascade id=%s: %s", intent_id, e)
+    for node_id in marked:
+        unmark_teardown(node_id)
 
 
 def _delete_terminal_inner(
@@ -7228,6 +7318,10 @@ def _delete_terminal_inner(
     )
     if lifecycle_lease is None:
         raise RuntimeError("resume_in_progress")
+    # F716 (#571) r2: declared out here so the lease's own `finally` also
+    # releases the cascade's child intents, whatever exits the block.
+    _cascade_intent_ids: list[str] = []
+    _cascade_marked: list[str] = []
     try:
         terminals = list_terminals_by_session(session_name)
         if caller_id is not None and not _caller_owns_target(terminals, caller_id, terminal_id):
@@ -7264,6 +7358,14 @@ def _delete_terminal_inner(
                 raise RuntimeError("cascade_quiesce_unstable")
         by_id = {row["id"]: row for row in terminals}
         reap_set = set(order)
+        # F716 (#571) r2: the reap plan is final here (the re-plan loop above has
+        # converged) and NOTHING has been killed yet, so this is the last point
+        # before the first tmux kill at which every cascaded node can be covered.
+        # The root is already bracketed by delete_terminal; cover the rest.
+        _cascade_intent_ids, _cascade_marked = _open_cascade_teardown_intents(
+            [node_id for node_id in order if node_id != terminal_id],
+            caller_id=caller_id,
+        )
         reaped: list[dict[str, str]] = []
         for index, node_id in enumerate(order):
             token = acquire_rebind_lease(node_id)
@@ -7317,7 +7419,10 @@ def _delete_terminal_inner(
             "unattempted": [],
         }
     finally:
-        release_session_lifecycle_lease(lifecycle_lease)
+        try:
+            _close_cascade_teardown_intents(_cascade_intent_ids, _cascade_marked)
+        finally:
+            release_session_lifecycle_lease(lifecycle_lease)
 
 
 def _quiesce_cascade_subtree_pre_plan(
