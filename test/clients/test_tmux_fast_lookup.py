@@ -37,6 +37,8 @@ class FakeTmux:
         self.calls: List[List[str]] = []
         self.fail_inventory = False
         self.command_rc: Dict[str, int] = {}
+        # pane_id -> pane_id reported in the identity line (defense-in-depth probe)
+        self.ident_pane_override: Dict[str, str] = {}
 
     def add_pane(
         self,
@@ -72,7 +74,8 @@ class FakeTmux:
             other = next(iter(self.panes.values()), ("?", "?", False))
             head = SEP.join([other[0], other[1], "%999", "1" if other[2] else "0"])
             return subprocess.CompletedProcess(argv, 1, head + "\n", f"can't find pane: {pid}")
-        head = SEP.join([ident[0], ident[1], pid, "1" if ident[2] else "0"])
+        reported = self.ident_pane_override.get(pid, pid)
+        head = SEP.join([ident[0], ident[1], reported, "1" if ident[2] else "0"])
         rc = self.command_rc.get(pid, 0)
         body = self.output.get(pid, "")
         return subprocess.CompletedProcess(argv, rc, head + "\n" + body, "" if rc == 0 else "boom")
@@ -157,6 +160,15 @@ def test_server_restart_id_reuse_detected_by_identity(locator: PaneLocator, fake
     fake.panes["%10"] = ("s1", "somethingelse", True)
     fake.inventory = [_pane_row("s1", "@1", 0, "somethingelse", 0, "%10", True)]
     assert locator.run_pane_command("s1", "w1", "capture-pane", "-p") is None
+
+
+def test_identity_pane_id_mismatch_is_stale_even_when_names_match(
+    locator: PaneLocator, fake: FakeTmux
+) -> None:
+    """Same session+window but a different pane id in the identity line -> not our pane."""
+    assert locator.run_pane_command("s1", "w2", "capture-pane", "-p") == ["first"]
+    fake.ident_pane_override["%20"] = "%21"
+    assert locator.run_pane_command("s1", "w2", "capture-pane", "-p") is None
 
 
 def test_active_pane_focus_change_refreshes(locator: PaneLocator, fake: FakeTmux) -> None:

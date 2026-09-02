@@ -50,6 +50,16 @@ def test_rewrite_is_picked_up(toml_file: Path, monkeypatch: pytest.MonkeyPatch) 
     assert ss.get_provider_defaults("codex") == {"model": "bb"}
 
 
+def test_same_size_rewrite_with_new_mtime_is_picked_up(toml_file: Path) -> None:
+    """Size alone must not be the key: a one-byte-for-one-byte edit is common."""
+    toml_file.write_text("[codex]\nmodel = 'a'\n")
+    assert ss.get_provider_defaults("codex") == {"model": "a"}
+    toml_file.write_text("[codex]\nmodel = 'b'\n")
+    st = toml_file.stat()
+    os.utime(toml_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    assert ss.get_provider_defaults("codex") == {"model": "b"}
+
+
 def test_missing_and_invalid_file(toml_file: Path) -> None:
     assert ss.get_provider_defaults("codex") == {}
     toml_file.write_text("this is = not [valid toml")
