@@ -141,11 +141,20 @@ async def test_check_registry_runs_checks_and_records_findings(
     assert runtime.event_store is not None
     assert runtime.finding_store is not None
 
+    # The composition root now registers the two structural phase-1 checks
+    # (lane C, AC8), so the registry is no longer empty at boot.  Asserting the
+    # exact tuple would only assert that nobody has added a check yet, which is
+    # the opposite of what this test wants to know; assert instead that
+    # registration APPENDS to what bootstrap wired.
+    assert FindingCode.DIAG_GHOST_TRANSITION in runtime.checks.registered_codes
+    assert FindingCode.DIAG_BAD_TRANSITION in runtime.checks.registered_codes
+    before = len(runtime.checks.registered_codes)
+
     runtime.checks.register(
         FindingCode.DIAG_GHOST_TRANSITION,
         lambda event: CheckOutcome(dedupe_key="no-evidence", detail=event.kind.value),
     )
-    assert runtime.checks.registered_codes == (FindingCode.DIAG_GHOST_TRANSITION,)
+    assert len(runtime.checks.registered_codes) == before + 1
 
     from .conftest import draft
 

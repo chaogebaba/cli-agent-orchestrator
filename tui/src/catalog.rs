@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 103;
+const COMMAND_COUNT: usize = 107;
 
 /// What the TUI does with a command.
 ///
@@ -264,6 +264,10 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
+    CommandId::DiagAgreement,
+    CommandId::DiagFindings,
+    CommandId::DiagTerminal,
+    CommandId::DiagWhy,
     CommandId::DoctorCheck,
     CommandId::DoctorReadopt,
     CommandId::Fold,
@@ -500,6 +504,16 @@ pub enum CommandId {
     // `cao config reconcile`
     /// `cao config reconcile`
     ConfigReconcile,
+
+    // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics.
+    /// `cao diag agreement`
+    DiagAgreement,
+    /// `cao diag findings`
+    DiagFindings,
+    /// `cao diag terminal`
+    DiagTerminal,
+    /// `cao diag why`
+    DiagWhy,
 
     // `cao ledger *`
     /// `cao ledger check`
@@ -1428,6 +1442,46 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::DiagAgreement => Command {
+            id: CommandId::DiagAgreement,
+            parent: Some("diag"),
+            leaf_name: "agreement",
+            summary: "Compare the shadow projection against the legacy published status.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::DiagFindings => Command {
+            id: CommandId::DiagFindings,
+            parent: Some("diag"),
+            leaf_name: "findings",
+            summary: "List typed invariant findings, loudest first.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::DiagTerminal => Command {
+            id: CommandId::DiagTerminal,
+            parent: Some("diag"),
+            leaf_name: "terminal",
+            summary: "Print one worker's timeline, newest last.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::DiagWhy => Command {
+            id: CommandId::DiagWhy,
+            parent: Some("diag"),
+            leaf_name: "why",
+            summary: "Print the evidence chain behind one event.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
         CommandId::LedgerCheck => Command {
             id: CommandId::LedgerCheck,
             parent: Some("ledger"),
@@ -1745,7 +1799,7 @@ mod tests {
     /// would look like if it had it.
     ///
     /// **Four assertions rather than one summed check**, also deliberately: a single
-    /// `in_app + handoff + hidden == 61` stays green when a command moves from IN-APP to HIDE,
+    /// `in_app + handoff + hidden == 107` stays green when a command moves from IN-APP to HIDE,
     /// because the total is conserved. Reclassification is exactly the change most likely to
     /// happen by accident, so each policy is pinned separately and the failure names *which* one
     /// moved.
@@ -1772,17 +1826,22 @@ mod tests {
     /// (HANDOFF). That gave **24/18/27 = 69**. A further merge brought 26 fork-only ops (barrier/base/sandbox/seam/messages/mailbox/verify/session lifecycle/etc.); all HIDE by default → **24/18/53 = 95**. Note what the shape of this failure was: every count here was internally
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
+    ///
+    /// WP-ARCH phase 1 (F725 #581) then added `cao diag` {`terminal`, `why`, `findings`,
+    /// `agreement`} — all HIDE, per the mandated default for a command nobody has reviewed for
+    /// in-pane use, and a diagnostic that prints a wide table is a poor fit for the pane anyway →
+    /// **24/18/65 = 107**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_sixtyone() {
+    fn the_policy_distribution_is_twentyfour_eighteen_sixtyfive() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 61, "expected 61 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 65, "expected 65 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            103,
-            "the three policy counts must account for all 103 leaf commands of the Click tree"
+            107,
+            "the three policy counts must account for all 107 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1792,8 +1851,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            103,
-            "DISPLAY_ORDER must list 103 DISTINCT commands; a duplicate would let one command go \
+            107,
+            "DISPLAY_ORDER must list 107 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1939,6 +1998,10 @@ mod tests {
                     CommandId::BarrierStatus => CommandId::BarrierStatus,
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
+                    CommandId::DiagAgreement => CommandId::DiagAgreement,
+                    CommandId::DiagFindings => CommandId::DiagFindings,
+                    CommandId::DiagTerminal => CommandId::DiagTerminal,
+                    CommandId::DiagWhy => CommandId::DiagWhy,
                     CommandId::Fold => CommandId::Fold,
                     CommandId::LedgerCheck => CommandId::LedgerCheck,
                     CommandId::MailboxDelete => CommandId::MailboxDelete,
@@ -2047,6 +2110,10 @@ mod tests {
                 CommandId::BarrierStatus,
                 CommandId::BaseRegister,
                 CommandId::ConfigReconcile,
+                CommandId::DiagAgreement,
+                CommandId::DiagFindings,
+                CommandId::DiagTerminal,
+                CommandId::DiagWhy,
                 CommandId::Fold,
                 CommandId::LedgerCheck,
                 CommandId::MailboxDelete,
