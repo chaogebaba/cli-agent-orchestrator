@@ -289,6 +289,26 @@ class CodexRolloutSource:
             return 0
 
         newline = chunk.rfind(b"\n")
+        if newline < 0 and len(chunk) >= MAX_POLL_BYTES:
+            # A single record longer than the whole poll window.  Waiting for a
+            # newline that will never arrive inside the window would stall this
+            # terminal's tail FOREVER: no further event, and — worse —
+            # ``last_source_probe_at`` would keep being bumped, so the projector
+            # would go on believing the source is healthy while it has in fact
+            # stopped reporting.  A silent permanent stall is the worst outcome
+            # available here, so the window is skipped, the oversized record is
+            # lost (its remainder fails to parse on the next poll and is
+            # discarded), and the loss is logged.
+            logger.warning(
+                "codex rollout record exceeds %d bytes at %s#%d; skipping it to "
+                "keep the tail moving",
+                MAX_POLL_BYTES,
+                self._path_key,
+                start_offset,
+            )
+            with _lock:
+                cursor.offset = start_offset + len(chunk)
+            return 0
         if newline < 0:
             # A single incomplete line so far.  Consume nothing; the next poll
             # reads it whole.

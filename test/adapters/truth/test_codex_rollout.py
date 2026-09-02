@@ -304,3 +304,27 @@ async def test_the_tail_runs_as_an_asyncio_task(ingest_on: FakeEventStore, rollo
     finally:
         await source.stop()
     assert source._task is None
+
+
+def test_an_oversized_record_does_not_stall_the_tail(
+    ingest_on: FakeEventStore, rollout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record larger than one poll window is skipped, not waited on forever.
+
+    Stalling would be silent and permanent: no further event for the terminal,
+    while ``last_source_probe_at`` kept being bumped, so the projector would go
+    on treating a dead tail as a healthy source.
+    """
+    monkeypatch.setattr(codex_rollout, "MAX_POLL_BYTES", 64)
+    codex_rollout.attach("t1", rollout)
+    source = codex_rollout.source_for("t1")
+
+    giant = json.dumps({"type": "response_item", "payload": {"type": "reasoning", "t": "x" * 500}})
+    rollout.write_text(giant + "\n", encoding="utf-8")
+    for _ in range(20):
+        source.poll_once()
+
+    _write(rollout, TASK_STARTED, append=True)
+    for _ in range(20):
+        source.poll_once()
+    assert ingest_on.kinds("t1") == ["turn.started"]
