@@ -1601,6 +1601,27 @@ class StalledCallbackWatchdog:
                     continue
                 episode.fired = True
 
+            # F721 #577: kick delivery before alerting. This watchdog already
+            # holds the exact preconditions reconciliation sweeps for (aged
+            # pending row, ready status, no open delivery attempt), so it can
+            # be a real retry owner instead of pointing at a silent one — the
+            # 2026-09-02 fleet stall (4 cline terminals, 07:00-07:27Z) needed a
+            # server restart precisely because nothing re-attempted. Guarded and
+            # idempotent: deliver_pending is a no-op once the row is delivered
+            # or the terminal stops admitting, and a fault here never starves
+            # the notification below.
+            try:
+                inbox_service.deliver_pending(terminal_id, registry=registry)
+                kick_outcome = "watchdog re-attempted delivery"
+            except Exception as exc:
+                logger.warning(
+                    "ready-backlog watchdog: delivery kick failed for %s: %s",
+                    terminal_id,
+                    exc,
+                    exc_info=True,
+                )
+                kick_outcome = f"watchdog delivery re-attempt failed ({type(exc).__name__})"
+
             age = int(observation.oldest_pending_age_seconds)
             message_id = observation.oldest_message_id
             profile = metadata.get("agent_profile") or ""
@@ -1609,7 +1630,8 @@ class StalledCallbackWatchdog:
                 f"[ready-backlog watchdog] {dn} has pending message "
                 f"{message_id} aged {age}s while status={status.value} with no open "
                 "delivery attempt or attempt progress; inspect "
-                f"`cao messages trace {message_id}`. Reconciliation remains the retry owner."
+                f"`cao messages trace {message_id}`. {kick_outcome}; "
+                "reconciliation remains the retry owner."
             )
             try:
                 from cli_agent_orchestrator.services.mailbox_service import (
