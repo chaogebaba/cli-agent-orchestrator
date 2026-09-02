@@ -135,7 +135,7 @@ def _metadata(session_uuid: str = SESSION_UUID) -> dict[str, Any]:
 def _backend_returning(*panes: str) -> MagicMock:
     """Mock backend serving panes in sequence (last repeats).
 
-    Both capture seams draw from the same queue. #555 moved the
+    Both capture seams draw from the same queue. F734 #591 moved the
     readiness gate off ``get_history`` — 200 rows of scrollback, where the codex
     startup card's ``model: loading`` / ``Resuming session…`` banner survives
     forever — and onto ``capture_viewport``, the live screen the readiness

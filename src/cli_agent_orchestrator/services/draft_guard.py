@@ -327,7 +327,7 @@ def preserve_draft_before_send(
     if draft == "":
         return None
 
-    # #555: a composer holding CAO's OWN unsubmitted paste is not a human
+    # F733 #590: a composer holding CAO's OWN unsubmitted paste is not a human
     # draft. Clear it so the retry paste cannot append to it, and never restore
     # it — restoring would leave a literal "[Pasted Content N chars]" string in
     # the worker's composer for the next dispatch to submit as its task.

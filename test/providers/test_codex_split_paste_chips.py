@@ -1,9 +1,9 @@
-"""#555: split paste chips are a submittable composer state, and the
-delivery readiness gate reads the VIEWPORT, not the scrollback.
+"""F733 (#590) and F734 (#591): split paste chips are a submittable composer
+state, and the delivery readiness gate reads the VIEWPORT, not the scrollback.
 
 Two defects, both observed live on codex-cli 0.152.0 on 2026-09-02.
 
-DEFECT 1 — a long task killed the worker. codex splits a long bracketed paste
+DEFECT 1 (F733 #590) — a long task killed the worker. codex splits a long bracketed paste
 into SEVERAL chips: a ~2000-char task rendered as
 ``› [Pasted Content 1022 chars][Pasted Content 1012 chars]``. Two independent
 readers mis-classified that composer:
@@ -24,7 +24,7 @@ readers mis-classified that composer:
   Scoreboard that day: 5/5 short dispatches delivered, 2/2 long ones died
   (6aee61fb, 7652d61d).
 
-DEFECT 2 — a flat 45 s of dead air before every task paste. ``pre_paste_gate``
+DEFECT 2 (F734 #591) — a flat 45 s of dead air before every task paste. ``pre_paste_gate``
 polled ``get_history(tail_lines=PYTE_SCREEN_ROWS)``, i.e. 200 rows of
 SCROLLBACK. codex renders on the normal screen, so its startup card scrolls up
 but stays inside that window — and the card permanently contains
