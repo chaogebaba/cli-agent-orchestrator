@@ -213,12 +213,32 @@ class TestAssignRemote:
         assert "use_worktree" in result["message"]
         mock_requests.post.assert_not_called()
 
+    # Fork: the LOCAL assign path resolves the supervisor's cwd from the terminal
+    # DB before it creates anything. A remote assign skips that (the path is
+    # interpreted on the target node), which is why only this arm needs the stub.
+    @patch(f"{_SRV}.strict_supervisor_cwd", return_value="/tmp")
     @patch(f"{_SRV}._get_cleanup_nudge", return_value="")
     @patch(f"{_SRV}._create_terminal", return_value=("cafe0001", "mock_cli"))
-    def test_omitted_target_host_keeps_local_path(self, mock_create, _nudge):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}, clear=False):
+    def test_omitted_target_host_keeps_local_path(self, mock_create, _nudge, _cwd):
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}, clear=False),
+            patch(f"{_SRV}.generate_window_name", return_value="dev:cafe0001"),
+            patch(f"{_SRV}.display_name", return_value="dev:cafe0001"),
+            # Fork-only step: the local arm consults a configured default fork base,
+            # and a 404 on the caller's own terminal drops into the identity
+            # diagnosis, which reads the terminal DB. Stub it out — the contract
+            # under test is that the LOCAL creation path ran, not fork resolution.
+            patch(f"{_SRV}._configured_default_fork_base", return_value=None),
+            # Fork-only spawn precondition (F619): free disk on the resolved
+            # directory. Stubbed so this test asserts routing, not the host's
+            # free space.
+            patch(
+                "cli_agent_orchestrator.utils.disk_guard.check_spawn_disk",
+                return_value=None,
+            ),
+        ):
             result = _assign_impl("developer", "Task")
-        assert result["success"] is True
+        assert result["success"] is True, result.get("message")
         mock_create.assert_called_once()
 
 
