@@ -59,7 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from cli_agent_orchestrator.adapters.truth.wiring import current_runtime, emit
+from cli_agent_orchestrator.adapters.truth.wiring import emit, producer_runtime
 from cli_agent_orchestrator.core.events import Confidence, EventDraft, EventKind, Producer
 from cli_agent_orchestrator.core.timing import ROLLOUT_POLL_MS
 
@@ -280,7 +280,7 @@ class CodexRolloutSource:
         nothing new.  A quiet rollout is a healthy rollout, and a tailer that only
         reported liveness when the file grew would degrade an idle terminal.
         """
-        runtime = current_runtime()
+        runtime = producer_runtime()
         if runtime is None:
             return 0
 
@@ -471,7 +471,7 @@ def attach(terminal_id: str, path: Path | str | None, *, resumed: bool = False) 
     """
     if path is None or not terminal_id:
         return
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:
@@ -569,7 +569,7 @@ def rollout_resolution_hook(func: F) -> F:
     @functools.wraps(func)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         resolved = func(self, *args, **kwargs)
-        if current_runtime() is None:
+        if producer_runtime() is None:
             return resolved
         try:
             resume_getter = getattr(self, "resume_session_uuid", None)

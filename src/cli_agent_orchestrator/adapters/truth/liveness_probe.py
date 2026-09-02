@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable, Protocol
 
-from cli_agent_orchestrator.adapters.truth.wiring import TruthRuntime, current_runtime, emit
+from cli_agent_orchestrator.adapters.truth.wiring import ProducerRuntime, emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
     Confidence,
     DecisionKind,
@@ -192,7 +192,7 @@ class LivenessProbe:
 
     def probe_once(self) -> None:
         """Run one probe: update columns, append edges.  Never raises."""
-        runtime = current_runtime()
+        runtime = producer_runtime()
         if runtime is None:
             return
         try:
@@ -213,7 +213,7 @@ class LivenessProbe:
 
     # -- failure path --------------------------------------------------------
 
-    def _on_failed_probe(self, runtime: TruthRuntime) -> None:
+    def _on_failed_probe(self, runtime: ProducerRuntime) -> None:
         state = self._state
         state.consecutive_failures += 1
         now = runtime.clock.now()
@@ -241,7 +241,7 @@ class LivenessProbe:
 
     # -- success path --------------------------------------------------------
 
-    def _on_successful_probe(self, runtime: TruthRuntime, panes: list[PaneRecord]) -> None:
+    def _on_successful_probe(self, runtime: ProducerRuntime, panes: list[PaneRecord]) -> None:
         state = self._state
         now = runtime.clock.now()
         state.consecutive_failures = 0
@@ -270,7 +270,7 @@ class LivenessProbe:
 
     def _on_pane_present(
         self,
-        runtime: TruthRuntime,
+        runtime: ProducerRuntime,
         ref: TerminalRef,
         track: _Track,
         pane: PaneRecord,
@@ -301,7 +301,7 @@ class LivenessProbe:
             )
 
     def _on_pane_unreadable(
-        self, runtime: TruthRuntime, ref: TerminalRef, track: _Track, now: datetime
+        self, runtime: ProducerRuntime, ref: TerminalRef, track: _Track, now: datetime
     ) -> None:
         self._touch(
             runtime,
@@ -318,7 +318,7 @@ class LivenessProbe:
         self._emit_missing(ref.terminal_id, DegradedReason.PANE_UNREADABLE, now)
 
     def _on_pane_absent(
-        self, runtime: TruthRuntime, ref: TerminalRef, track: _Track, now: datetime
+        self, runtime: ProducerRuntime, ref: TerminalRef, track: _Track, now: datetime
     ) -> None:
         first_miss = track.confirmed_present is not False
         track.miss_count += 1
@@ -365,7 +365,7 @@ class LivenessProbe:
 
     def _touch(
         self,
-        runtime: TruthRuntime,
+        runtime: ProducerRuntime,
         terminal_id: str,
         now: datetime,
         *,
@@ -410,7 +410,7 @@ class LivenessProbe:
                 return bool(self._teardown_lookup(terminal_id))
             except Exception:
                 return False
-        runtime = current_runtime()
+        runtime = producer_runtime()
         if runtime is None:
             return False
         try:

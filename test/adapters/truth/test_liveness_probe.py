@@ -278,7 +278,7 @@ def test_the_probe_is_not_authoritative() -> None:
 
 def test_it_works_without_a_state_store(store: FakeEventStore, clock: FakeClock) -> None:
     """Degrades to edges only — less information, never wrong information."""
-    wiring.install(wiring.TruthRuntime(store=store, clock=clock, state_store=None))
+    wiring.install_producers(wiring.ProducerRuntime(store=store, clock=clock, state_store=None))
     ticks = [PRESENT] + [ONLY_TWO] * PANE_MISS_TICKS
     probe = _probe(ticks, [ONE, TWO])
     for _ in range(len(ticks)):

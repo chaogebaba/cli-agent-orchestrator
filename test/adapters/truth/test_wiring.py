@@ -28,30 +28,27 @@ def _draft(terminal_id: str = "t1") -> EventDraft:
     )
 
 
-def test_env_var_name_is_the_blueprint_key() -> None:
-    """AC5 names the key; bootstrap and the producers must not spell it twice."""
-    assert wiring.INGEST_ENV_VAR == "CAO_WORKER_TRUTH_INGEST"
+def test_the_adapter_layer_does_not_spell_the_switch_itself() -> None:
+    """One switch, one spelling, in the module that reads it.
 
-
-def test_ingest_enabled_only_for_exactly_one(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(wiring.INGEST_ENV_VAR, raising=False)
-    assert wiring.ingest_enabled() is False
-    monkeypatch.setenv(wiring.INGEST_ENV_VAR, "0")
-    assert wiring.ingest_enabled() is False
-    monkeypatch.setenv(wiring.INGEST_ENV_VAR, "true")
-    assert wiring.ingest_enabled() is False
-    monkeypatch.setenv(wiring.INGEST_ENV_VAR, "1")
-    assert wiring.ingest_enabled() is True
+    ``bootstrap.py`` owns ``CAO_WORKER_TRUTH_INGEST`` and its test
+    (``test/adapters/test_bootstrap_switch.py``) owns the parsing rules.  A second
+    definition down here is how a switch quietly starts meaning two things — the
+    producers would read one name and the composition root another, and the ON/OFF
+    guarantee would hold for neither.
+    """
+    assert not hasattr(wiring, "INGEST_ENV_VAR")
+    assert not hasattr(wiring, "ingest_enabled")
 
 
 def test_emit_is_a_noop_with_nothing_installed() -> None:
     """The OFF half of every ON/OFF pair in this suite bottoms out here."""
-    assert wiring.is_installed() is False
+    assert wiring.producers_installed() is False
     assert wiring.emit(_draft()) is None
 
 
 def test_emit_stores_and_returns_the_minted_row(store: FakeEventStore, clock: FakeClock) -> None:
-    wiring.install(wiring.TruthRuntime(store=store, clock=clock))
+    wiring.install_producers(wiring.ProducerRuntime(store=store, clock=clock))
     stored = wiring.emit(_draft())
     assert stored is not None
     assert stored.seq == 1
@@ -63,7 +60,7 @@ def test_emit_swallows_a_broken_store_and_logs_once(
     store: FakeEventStore, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A diagnostic that can raise into the status monitor is an outage, not a diagnostic."""
-    wiring.install(wiring.TruthRuntime(store=store, clock=clock))
+    wiring.install_producers(wiring.ProducerRuntime(store=store, clock=clock))
     store.fail_next = True
     with caplog.at_level(logging.WARNING):
         assert wiring.emit(_draft()) is None
@@ -74,7 +71,7 @@ def test_emit_swallows_a_broken_store_and_logs_once(
 
 def test_reset_disarms(store: FakeEventStore, clock: FakeClock) -> None:
     """``bootstrap`` calls this on the AC5 N6 migration-failure path."""
-    wiring.install(wiring.TruthRuntime(store=store, clock=clock))
-    wiring.reset()
+    wiring.install_producers(wiring.ProducerRuntime(store=store, clock=clock))
+    wiring.reset_producers()
     assert wiring.emit(_draft()) is None
     assert store.rows == []

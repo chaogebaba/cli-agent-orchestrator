@@ -204,11 +204,11 @@ def _clean_producer_state() -> Iterator[None]:
     so a leak between tests would make an ON/OFF assertion pass for the previous
     test's reason.
     """
-    wiring.reset()
+    wiring.reset_producers()
     legacy_egress.reset_edges()
     codex_rollout.reset_sources()
     yield
-    wiring.reset()
+    wiring.reset_producers()
     legacy_egress.reset_edges()
     codex_rollout.reset_sources()
 
@@ -233,5 +233,7 @@ def ingest_on(
     store: FakeEventStore, clock: FakeClock, state_store: FakeStateStore
 ) -> FakeEventStore:
     """Arm ingestion the way ``bootstrap.py`` does when the switch is set."""
-    wiring.install(wiring.TruthRuntime(store=store, clock=clock, state_store=state_store))
+    wiring.install_producers(
+        wiring.ProducerRuntime(store=store, clock=clock, state_store=state_store)
+    )
     return store

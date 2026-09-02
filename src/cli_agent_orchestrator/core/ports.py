@@ -155,19 +155,49 @@ class StateProjection(Protocol):
     Structural, not a model, so the adapter that owns the table decides its own
     representation.  ``last_probe_at`` and ``last_source_probe_at`` are the two
     liveness COLUMNS — heartbeats update them, and neither is ever an event row.
+
+    Members are READ-ONLY properties rather than plain annotations, and that is
+    deliberate.  A plain annotation makes mypy treat the member as settable, so
+    a frozen dataclass cannot satisfy the Protocol — which forced both the
+    projector's row type and the store's to be mutable even though nothing ever
+    assigns to them.  Nothing assigns THROUGH the port either: ``get`` produces
+    a row and ``upsert`` consumes one.  A read-only property is still satisfied
+    by a plain instance attribute, so this is strictly more permissive than the
+    annotation form, not less.
     """
 
-    terminal_id: str
-    state: WorkerState
-    since: datetime
-    last_event_seq: int
-    degraded_reason: DegradedReason | None
-    prior_state: WorkerState | None
-    last_probe_at: datetime | None
-    last_source_probe_at: datetime | None
-    pane_pid: int | None
-    pane_present: bool
-    miss_count: int
+    @property
+    def terminal_id(self) -> str: ...
+
+    @property
+    def state(self) -> WorkerState: ...
+
+    @property
+    def since(self) -> datetime: ...
+
+    @property
+    def last_event_seq(self) -> int: ...
+
+    @property
+    def degraded_reason(self) -> DegradedReason | None: ...
+
+    @property
+    def prior_state(self) -> WorkerState | None: ...
+
+    @property
+    def last_probe_at(self) -> datetime | None: ...
+
+    @property
+    def last_source_probe_at(self) -> datetime | None: ...
+
+    @property
+    def pane_pid(self) -> int | None: ...
+
+    @property
+    def pane_present(self) -> bool: ...
+
+    @property
+    def miss_count(self) -> int: ...
 
 
 @runtime_checkable

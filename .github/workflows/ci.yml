@@ -240,6 +240,14 @@ jobs:
         # stays green rather than silently making mypy a hard gate here.
         continue-on-error: true
 
+      # WP-ARCH (F725 #581) AC9: the five package-boundary contracts of the audit
+      # §2.3. BLOCKING, unlike mypy above — the whole point of the strangler is
+      # that the new tree cannot acquire the old tree's dependencies, and a
+      # non-blocking boundary check is a convention, which is what already failed.
+      # Contract definitions live in pyproject.toml under [tool.importlinter].
+      - name: Check package boundaries with import-linter
+        run: uv run lint-imports
+
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest

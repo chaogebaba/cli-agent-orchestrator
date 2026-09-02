@@ -37,7 +37,7 @@ import logging
 from typing import Any, Callable, TypeVar
 
 from cli_agent_orchestrator.adapters.truth import codex_rollout, legacy_egress
-from cli_agent_orchestrator.adapters.truth.wiring import current_runtime, emit
+from cli_agent_orchestrator.adapters.truth.wiring import emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
     Confidence,
     DecisionKind,
@@ -163,7 +163,7 @@ def record_delivery_attempt(
 
     Never raises.
     """
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:
@@ -213,7 +213,7 @@ def dispatch_attempt(carrier: str) -> Callable[[F], F]:
     def decorate(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if current_runtime() is None:
+            if producer_runtime() is None:
                 return func(*args, **kwargs)
             terminal_id = args[0] if args else kwargs.get("terminal_id", "")
             try:
@@ -232,7 +232,7 @@ def dispatch_attempt(carrier: str) -> Callable[[F], F]:
 
 def record_teardown_decided(terminal_id: str, code: str, detail: str = "") -> None:
     """Hook point 6 — ``_claim_and_settle_deferred_failure`` settled a failure."""
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:
@@ -268,7 +268,7 @@ def record_teardown_intended(
     on the in-process mark when the DB write fails, and the truth log has to
     describe what the server INTENDED, which is what the probe needs to know.
     """
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:

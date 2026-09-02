@@ -37,7 +37,7 @@ import logging
 import threading
 from typing import Any
 
-from cli_agent_orchestrator.adapters.truth.wiring import current_runtime, emit
+from cli_agent_orchestrator.adapters.truth.wiring import emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
     Confidence,
     DecisionKind,
@@ -152,7 +152,7 @@ def record_legacy_publish(
     ``get_condition`` read below is reentrant and safe).  Returns without doing
     anything when ingestion is off.  Never raises.
     """
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:
@@ -241,7 +241,7 @@ def record_fleet_override(terminal_id: str, reason: str, detail: str = "") -> No
     ``evidence`` is the ``event_id`` of this terminal's most recent
     ``status.legacy_published`` row — the observation the override replaced.
     """
-    runtime = current_runtime()
+    runtime = producer_runtime()
     if runtime is None:
         return
     try:
