@@ -13,35 +13,56 @@ CODEX_HOME suppresses the interactive trust dialog outright.
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from cli_agent_orchestrator.providers.codex import _pretrust_cwd_in_codex_home
 
-# A worktree-style path whose dots (.cao) are exactly what codex's -c quoted-key
-# parser mishandles — the reason this is a config-file write, not a -c override.
-WORKTREE_CWD = "/data/cao-scratch/e58bc008/.cao/worktrees/abcd1234"
+
+@pytest.fixture
+def worktree_cwd(tmp_path: Path) -> str:
+    """A REAL worktree-style directory whose dots (.cao) are exactly what codex's
+    -c quoted-key parser mishandles — the reason this is a config-file write, not
+    a -c override.
+
+    It must exist on disk: F703 (#558) narrowed the writer to admit only an
+    existing absolute directory, after a MagicMock cwd from a mocked backend
+    reached it and wrote junk trust tables into the operator's live ~/.codex.
+    """
+    path = tmp_path / "seat" / ".cao" / "worktrees" / "abcd1234"
+    path.mkdir(parents=True)
+    return str(path)
 
 
-def test_writes_trusted_table_for_cwd(tmp_path: Path) -> None:
-    assert _pretrust_cwd_in_codex_home(WORKTREE_CWD, tmp_path) is True
-    parsed = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
-    assert parsed["projects"][WORKTREE_CWD]["trust_level"] == "trusted"
+@pytest.fixture
+def codex_home(tmp_path: Path) -> Path:
+    """A codex home separate from the trusted cwd, as in production."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    return home
 
 
-def test_idempotent_no_duplicate(tmp_path: Path) -> None:
-    assert _pretrust_cwd_in_codex_home(WORKTREE_CWD, tmp_path) is True
-    assert _pretrust_cwd_in_codex_home(WORKTREE_CWD, tmp_path) is True
-    text = (tmp_path / "config.toml").read_text(encoding="utf-8")
+def test_writes_trusted_table_for_cwd(worktree_cwd: str, codex_home: Path) -> None:
+    assert _pretrust_cwd_in_codex_home(worktree_cwd, codex_home) is True
+    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert parsed["projects"][worktree_cwd]["trust_level"] == "trusted"
+
+
+def test_idempotent_no_duplicate(worktree_cwd: str, codex_home: Path) -> None:
+    assert _pretrust_cwd_in_codex_home(worktree_cwd, codex_home) is True
+    assert _pretrust_cwd_in_codex_home(worktree_cwd, codex_home) is True
+    text = (codex_home / "config.toml").read_text(encoding="utf-8")
     # Exactly one entry — the second call is a no-op.
-    assert text.count(f'[projects."{WORKTREE_CWD}"]') == 1
+    assert text.count(f'[projects."{worktree_cwd}"]') == 1
     assert text.count("trust_level") == 1
 
 
-def test_preserves_existing_content(tmp_path: Path) -> None:
-    config = tmp_path / "config.toml"
+def test_preserves_existing_content(worktree_cwd: str, codex_home: Path) -> None:
+    config = codex_home / "config.toml"
     config.write_text(
         'model = "gpt-5.6-sol"\n' '[projects."/home/chao"]\n' 'trust_level = "trusted"\n',
         encoding="utf-8",
     )
-    assert _pretrust_cwd_in_codex_home(WORKTREE_CWD, tmp_path) is True
+    assert _pretrust_cwd_in_codex_home(worktree_cwd, codex_home) is True
     text = config.read_text(encoding="utf-8")
     # Nothing clobbered.
     assert 'model = "gpt-5.6-sol"' in text
@@ -49,22 +70,21 @@ def test_preserves_existing_content(tmp_path: Path) -> None:
     # New entry appended.
     parsed = tomllib.loads(text)
     assert parsed["projects"]["/home/chao"]["trust_level"] == "trusted"
-    assert parsed["projects"][WORKTREE_CWD]["trust_level"] == "trusted"
+    assert parsed["projects"][worktree_cwd]["trust_level"] == "trusted"
 
 
-def test_relative_cwd_is_absolutized(tmp_path: Path) -> None:
-    # A relative cwd is stored as its absolute form (codex keys trust on the
-    # canonical absolute project path).
-    assert _pretrust_cwd_in_codex_home(".", tmp_path) is True
-    import os
+def test_relative_cwd_is_refused(codex_home: Path) -> None:
+    # Narrowed by F703 (#558): a relative cwd used to be absolutized against the
+    # process cwd. That is exactly how a mocked backend's "MagicMock/<name>/<id>"
+    # became a trust table, and the pane cwd is always absolute in production, so
+    # a relative value is now refused instead.
+    assert _pretrust_cwd_in_codex_home(".", codex_home) is False
+    assert not (codex_home / "config.toml").exists()
 
-    parsed = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
-    assert os.path.abspath(".") in parsed["projects"]
 
-
-def test_invalid_toml_is_not_modified(tmp_path: Path) -> None:
-    config = tmp_path / "config.toml"
+def test_invalid_toml_is_not_modified(worktree_cwd: str, codex_home: Path) -> None:
+    config = codex_home / "config.toml"
     config.write_text("this is [not valid toml", encoding="utf-8")
     # Refuses to touch a file it cannot parse; returns False, content unchanged.
-    assert _pretrust_cwd_in_codex_home(WORKTREE_CWD, tmp_path) is False
+    assert _pretrust_cwd_in_codex_home(worktree_cwd, codex_home) is False
     assert config.read_text(encoding="utf-8") == "this is [not valid toml"

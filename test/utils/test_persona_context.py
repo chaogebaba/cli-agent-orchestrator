@@ -380,6 +380,10 @@ def test_unknown_codex_resolution_without_runtime_dir_uses_production(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    # F703 (#558): the suite pins CODEX_HOME so no test resolves the operator's
+    # real ~/.codex. This test is specifically about the leg BELOW that override,
+    # so it drops the pin to reach the production fallback.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     production = tmp_path / "production-codex"
     production.mkdir()
     monkeypatch.setattr(
@@ -389,6 +393,39 @@ def test_unknown_codex_resolution_without_runtime_dir_uses_production(
     )
 
     assert resolve_codex_home("unknown-terminal") == production
+
+
+def test_explicit_codex_home_env_wins_over_the_production_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F703 (#558): CODEX_HOME redirects the production fallback, both arities.
+
+    codex's own home variable, so honouring it is right in production too — a
+    process launched against a redirected codex home must read and write THAT
+    home — and it is the single knob the suite uses to keep every unpersona'd
+    resolution off the operator's real ~/.codex.
+    """
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    production = tmp_path / "production-codex"
+    production.mkdir()
+    explicit = tmp_path / "explicit-codex-home"
+    monkeypatch.setattr(
+        persona_context,
+        "provider_home",
+        lambda provider: ProviderHome(provider, "production", production),
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(explicit))
+    assert resolve_codex_home(None) == explicit
+    assert resolve_codex_home("unknown-terminal") == explicit
+
+    # A relative value is not a home; fall through rather than resolve it
+    # against whatever the process cwd happens to be.
+    monkeypatch.setenv("CODEX_HOME", "relative/codex")
+    assert resolve_codex_home(None) == production
+
+    monkeypatch.setenv("CODEX_HOME", "   ")
+    assert resolve_codex_home(None) == production
 
 
 def test_context_policy_schema_accepts_contract_and_rejects_unknown_key() -> None:

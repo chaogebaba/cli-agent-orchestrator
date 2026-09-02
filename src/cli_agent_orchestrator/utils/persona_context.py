@@ -906,10 +906,32 @@ def has_persona_plan(terminal_id: str) -> bool:
     return load_persona_plan(terminal_id) is not None
 
 
+def _env_codex_home() -> Path | None:
+    """An explicit, absolute ``CODEX_HOME`` exported into this process, if any.
+
+    F703 (#558): the production fallback below resolves to the REAL ``~/.codex``,
+    which is how the F597 pre-trust writer came to append trust tables to the
+    operator's live config from inside the test suite. ``CODEX_HOME`` is codex's
+    own home variable — honouring it here is the correct production behaviour
+    too (a process launched against a redirected codex home should read and
+    write THAT home), and it gives the suite a single, ordinary knob to point
+    every unpersona'd resolution at a temp dir.
+
+    Deliberately consulted only for the fallback: a live or retained persona
+    home is more specific than the ambient environment, because that is the home
+    the worker's own codex will actually be launched with.
+    """
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else None
+
+
 def resolve_codex_home(terminal_id: str | None) -> Path:
-    """Resolve live, retained, or production Codex home in that order."""
+    """Resolve live, retained, explicit-env, or production Codex home in that order."""
     if terminal_id is None:
-        return provider_home("codex").home
+        return _env_codex_home() or provider_home("codex").home
     plan = load_persona_plan(terminal_id)
     if plan is not None and plan.provider == "codex" and plan.codex_home is not None:
         if plan.codex_home.is_dir():
@@ -931,7 +953,7 @@ def resolve_codex_home(terminal_id: str | None) -> Path:
                 return resolved
         except PersonaContextError:
             pass
-    return provider_home("codex").home
+    return _env_codex_home() or provider_home("codex").home
 
 
 def retained_persona_destination(session_uuid: str) -> Path:
