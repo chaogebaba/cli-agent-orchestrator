@@ -53,9 +53,13 @@ _COLUMNS = (
 )
 
 
-@dataclass
+@dataclass(frozen=True)
 class StoredProjection:
-    """One row, satisfying the :class:`~core.ports.StateProjection` Protocol."""
+    """One row, satisfying the :class:`~core.ports.StateProjection` Protocol.
+
+    Frozen: a row read out of the table is a snapshot of what was stored, and
+    nothing should be able to edit it into something the database never held.
+    """
 
     terminal_id: str
     state: WorkerState

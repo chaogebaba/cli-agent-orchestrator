@@ -166,22 +166,20 @@ class StaticSourceRegistry:
         return terminal_id in self._terminal_ids
 
 
-@dataclass
+@dataclass(frozen=True)
 class ShadowState:
     """One ``worker_state_shadow`` row, satisfying :class:`~core.ports.StateProjection`.
 
-    Every rule below produces a NEW instance with :func:`dataclasses.replace` and
-    none of them mutates a field.  A projector that edited a row in place would
+    Frozen, and every rule below produces a NEW instance with
+    :func:`dataclasses.replace`.  A projector that edited a row in place would
     make "what changed in this step" unanswerable, and the whole package exists
-    to make that question answerable.
+    to make that question answerable — so the compiler enforces it rather than
+    the convention asking nicely.
 
-    The class is not ``frozen`` only because ``core.ports.StateProjection``
-    declares its members as plain annotations, which mypy reads as settable
-    variables that a read-only attribute cannot satisfy.  The port would be
-    better as read-only properties — nothing ever assigns through it, since
-    ``get`` produces a row and ``upsert`` consumes one — and that change has been
-    proposed to the port's owner.  Until it lands, the immutability here is a
-    convention the code keeps rather than one the compiler enforces.
+    Freezing became possible at lane A's ``805e0cd7``, which made
+    ``StateProjection``'s members read-only properties.  Under the previous plain
+    annotations mypy read every member as settable, and a frozen dataclass could
+    not satisfy the Protocol.
 
     Column order matches AC6's list exactly.
     """

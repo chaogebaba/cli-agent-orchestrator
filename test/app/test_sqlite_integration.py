@@ -306,3 +306,19 @@ def test_the_epoch_sentinel_is_never_reached_in_practice(rig: _Rig) -> None:
     rig.projector.sweep()
 
     assert rig.states.get(TERMINAL).since > datetime(2000, 1, 1, tzinfo=UTC)
+
+
+def test_a_row_read_from_the_table_is_frozen(rig: _Rig) -> None:
+    """A row read out of the table is a snapshot of what was stored.
+
+    Nothing should be able to edit it into something the database never held —
+    least of all the read-only ``cao diag`` path, where a mutated row would
+    render as fact.
+    """
+    import dataclasses
+
+    rig.emit(EventKind.TURN_STARTED)
+    row = rig.states.get(TERMINAL)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        row.state = WorkerState.EXITED  # type: ignore[misc]

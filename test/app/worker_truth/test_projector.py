@@ -513,3 +513,28 @@ def test_confidence_not_producer_decides_muting(rig: Rig) -> None:
     )
 
     assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_the_projection_row_cannot_be_edited_in_place(rig: Rig) -> None:
+    """Immutability is now the compiler's job, not a convention.
+
+    Every rule produces a new row with ``dataclasses.replace``. A projector that
+    edited one in place would make "what changed in this step" unanswerable,
+    which is the question this whole package exists to answer. Lane A's
+    ``805e0cd7`` made ``StateProjection``'s members read-only properties, which
+    is what allows the row type to be frozen at all.
+    """
+    import dataclasses
+
+    from cli_agent_orchestrator.app.worker_truth.projector import ShadowState
+
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    row = ShadowState.from_projection(rig.states.get(TERMINAL))
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        row.state = WorkerState.IDLE  # type: ignore[misc]
+
+    # ``replace`` is the supported path, and it leaves the original alone.
+    moved = dataclasses.replace(row, state=WorkerState.IDLE)
+    assert moved.state is WorkerState.IDLE
+    assert row.state is WorkerState.BUSY
