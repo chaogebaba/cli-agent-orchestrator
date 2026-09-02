@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
+# WP-ARCH phase 1 (F725 #581) hook point 2 — legacy status egress producer.
+from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
 from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -790,6 +792,18 @@ class StatusMonitor:
         slot: Literal["incremental", "fresh"] | None = None,
     ) -> None:
         """Build and publish one receiver observation. Caller holds ``_lock``."""
+
+        # WP-ARCH phase 1 (F725 #581) hook point 2 — the SINGLE status egress every
+        # origin passes through.  Edge-triggered, inert unless ingest is on.
+        _wt_legacy_egress.record_legacy_publish(
+            self,
+            terminal_id,
+            latched_status,
+            origin,
+            frame_source,
+            pass_outcome,
+            raw_classification,
+        )
 
         if metadata is None:
             raise LookupError(f"terminal metadata unavailable for {terminal_id}")
