@@ -1869,6 +1869,16 @@ async def lifespan(app: FastAPI):
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
 
+    # F747 (#604): periodic idle-seat wake reconcile. The client-side rewake
+    # watcher is re-armed only by Stop/PostToolUse, which an idle seat cannot
+    # produce, so when it dies mid-idle nothing surfaces later callbacks. This
+    # sweep is the server-side net that does not depend on the seat being awake.
+    from cli_agent_orchestrator.services.seat_wake_reconcile import (
+        seat_wake_reconcile_daemon,
+    )
+
+    seat_wake_reconcile_task = asyncio.create_task(seat_wake_reconcile_daemon())
+
     # F295 AC4: Start grok canonical config watcher
     from cli_agent_orchestrator.services.grok_config_watcher import grok_config_watcher
 
@@ -1982,6 +1992,13 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task
+    except asyncio.CancelledError:
+        pass
+
+    # F747 (#604): stop the idle-seat wake reconcile
+    seat_wake_reconcile_task.cancel()
+    try:
+        await seat_wake_reconcile_task
     except asyncio.CancelledError:
         pass
 

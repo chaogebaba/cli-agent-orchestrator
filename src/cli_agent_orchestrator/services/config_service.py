@@ -244,6 +244,20 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
     # F210 D10: kill-switch for the whole rung2 send-keys nudge (hot-reloadable)
     "CAO_DELIVERY_NUDGE_SENDKEYS_ENABLED": ("delivery.nudge_sendkeys_enabled", "bool", True),
+    # F747 (#604): periodic idle-seat wake reconcile. Default ON -- it is the
+    # only wake path for an idle pull-mode seat once the client-side rewake
+    # watcher dies, and a safety net that ships off is not a net.
+    "CAO_DELIVERY_SEAT_WAKE_RECONCILE": ("delivery.seat_wake_reconcile", "bool", True),
+    "CAO_DELIVERY_SEAT_WAKE_RECONCILE_INTERVAL_S": (
+        "delivery.seat_wake_reconcile_interval_s",
+        "float",
+        60.0,
+    ),
+    "CAO_DELIVERY_SEAT_WAKE_RECONCILE_GRACE_S": (
+        "delivery.seat_wake_reconcile_grace_s",
+        "float",
+        90.0,
+    ),
     # F547 (#403): per-sender content-hash dedupe window for the native wake
     # write (drops a byte-identical bridge push within the last-N per sender).
     "CAO_SUPERVISOR_WAKE_DEDUPE_WINDOW": ("supervisor.wake.dedupe_window", "int", 20),
@@ -540,6 +554,10 @@ _ALL_PATHS = sorted(
         "delivery.base_ejection_s",
         "delivery.trace_retention_h",
         "delivery.jitter",
+        # F747 (#604): idle-seat wake reconcile
+        "delivery.seat_wake_reconcile",
+        "delivery.seat_wake_reconcile_interval_s",
+        "delivery.seat_wake_reconcile_grace_s",
         # F547 (#403): rung1 re-ring discipline + wake dedupe window
         "delivery.rung1_backoff_s",
         "delivery.hold_pane_markers",
