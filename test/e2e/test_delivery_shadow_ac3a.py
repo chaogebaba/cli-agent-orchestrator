@@ -30,6 +30,7 @@ does.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -62,10 +63,23 @@ MESSAGE_COUNT = 24
 #: first provider that boots, open both terminals with it, and only mix if a
 #: second terminal of that provider will not come up.
 LANE_PROVIDERS = (
-    ("kiro_cli", "developer", "kiro-cli"),
     ("claude_code", "developer", "claude"),
+    ("kiro_cli", "developer", "kiro-cli"),
     ("codex", "developer", "codex"),
 )
+
+#: Provider credentials the shared e2e fixture does not link into the redirected
+#: HOME.
+#:
+#: ``_seed_provider_home_prerequisites`` links the dot-directories providers need
+#: to BOOT — ``.bun`` for the binaries, ``.local`` for the kiro runtime — but not
+#: the ones they need to AUTHENTICATE.  With HOME redirected and these absent,
+#: every provider starts its own login: codex answers 401 and kiro cannot find
+#: its agent, so a run that is really about delivery fails at bring-up and says
+#: nothing about the code.  Seeded here rather than added to the shared list,
+#: because widening that list changes every e2e module's environment and this
+#: phase has no business doing that.
+AUTH_SEEDS = (".claude", ".claude.json", ".codex", ".config")
 
 #: Terminal creation launches a real CLI, which on a cold box can include a
 #: first-run cache warm.  The old 180 s was tuned for a warm laptop and turned an
@@ -129,11 +143,36 @@ class Arm:
             conn.close()
 
 
+def _seed_auth(home: Path) -> None:
+    """Link the auth files into an arm's HOME before its server starts.
+
+    Idempotent and best-effort: ``_seed_provider_home_prerequisites`` skips any
+    target that already exists, so seeding first and letting it fill the rest is
+    the composition that works.  A missing source is silently skipped — the run
+    then fails at bring-up and SKIPS, which is the honest outcome for a host with
+    no authenticated provider.
+
+    Symlinks rather than copies, matching the shared fixture's choice: a provider
+    that refreshes a token writes through to the real file, which on the
+    disposable boxes these runs use is what you want.
+    """
+    real_home = Path(os.environ.get("_CAO_REAL_HOME", "").strip() or Path.home())
+    for name in AUTH_SEEDS:
+        source = real_home / name
+        target = home / name
+        if source.exists() and not target.exists():
+            try:
+                target.symlink_to(source)
+            except OSError as exc:
+                print(f"[p3a] could not seed {name}: {exc!r}")
+
+
 def _arm(tmp_path_factory: pytest.TempPathFactory, name: str, switch: str | None) -> Arm:
     home = tmp_path_factory.mktemp(f"p3a_{name}")
+    _seed_auth(home)
     port = _pick_free_port()
     extra = {} if switch is None else {"CAO_DELIVERY_QUEUE": switch}
-    server = _start_cao_server(home, port, extra_env=extra, deadline=30.0)
+    server = _start_cao_server(home, port, extra_env=extra, deadline=60.0)
     return Arm(home, server)
 
 
@@ -321,9 +360,10 @@ def test_ac3a_the_bounce_resolves_back_to_shadow(
     to prevent loss, in the first sub-phase to ship.
     """
     home = tmp_path_factory.mktemp("p3a_bounce")
+    _seed_auth(home)
     port = _pick_free_port()
     server = _start_cao_server(
-        home, port, extra_env={"CAO_DELIVERY_QUEUE": "shadow"}, deadline=30.0
+        home, port, extra_env={"CAO_DELIVERY_QUEUE": "shadow"}, deadline=60.0
     )
     arm = Arm(home, server)
     try:
@@ -345,7 +385,7 @@ def test_ac3a_the_bounce_resolves_back_to_shadow(
         server.stop()
 
     rebooted = _start_cao_server(
-        home, _pick_free_port(), extra_env={"CAO_DELIVERY_QUEUE": "shadow"}, deadline=30.0
+        home, _pick_free_port(), extra_env={"CAO_DELIVERY_QUEUE": "shadow"}, deadline=60.0
     )
     arm = Arm(home, rebooted)
     try:
