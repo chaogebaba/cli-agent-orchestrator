@@ -53,7 +53,24 @@ MESSAGE_COUNT = 24
 #: decoration: D9's occupancy predicate, the mailbox addressing rule and the
 #: report's own floor all read across receivers, and a single-lane run would
 #: exercise none of them.
-LANE_PROVIDERS = (("claude_code", "developer"), ("kiro_cli", "developer"))
+#:
+#: "Lane" here means RECEIVER, not provider.  Two terminals of one provider give
+#: the two receivers the criterion needs, and they are markedly cheaper and more
+#: reliable to bring up than one of each — a second provider doubles the chance
+#: that a slow first-run authentication turns an acceptance run into a timeout
+#: that says nothing about the code under test.  So the strategy is: find the
+#: first provider that boots, open both terminals with it, and only mix if a
+#: second terminal of that provider will not come up.
+LANE_PROVIDERS = (
+    ("kiro_cli", "developer", "kiro-cli"),
+    ("claude_code", "developer", "claude"),
+    ("codex", "developer", "codex"),
+)
+
+#: Terminal creation launches a real CLI, which on a cold box can include a
+#: first-run cache warm.  The old 180 s was tuned for a warm laptop and turned an
+#: acceptance run into a ReadTimeout that said nothing about the code.
+TERMINAL_CREATE_TIMEOUT_S = 600
 
 
 class Arm:
@@ -120,36 +137,64 @@ def _arm(tmp_path_factory: pytest.TempPathFactory, name: str, switch: str | None
     return Arm(home, server)
 
 
-def _open_lanes(arm: Arm, count: int = 2) -> list[str]:
-    """Open ``count`` lanes, skipping providers whose CLI is not usable here.
+def _create(arm: Arm, session: str, provider: str, profile: str, first: bool) -> str | None:
+    """One terminal, or ``None`` with the reason printed.
 
-    Skips rather than fails when fewer than two lanes come up: a box without a
-    second authenticated provider cannot produce the evidence AC-3a asks for, and
-    reporting that as a FAILURE would put a red run against a build whose
-    behaviour was never exercised.
+    Failures are printed rather than raised because bring-up is a precondition,
+    not the thing under test: a run that cannot open two lanes must say why and
+    skip, so nobody reads a provider timeout as a delivery defect.
+    """
+    endpoint = f"{arm.url}/sessions" if first else f"{arm.url}/sessions/{session}/terminals"
+    params: dict[str, str] = {"provider": provider, "agent_profile": profile}
+    if first:
+        params["session_name"] = session
+    try:
+        response = requests.post(endpoint, params=params, timeout=TERMINAL_CREATE_TIMEOUT_S)
+    except requests.RequestException as exc:
+        print(f"[p3a] {provider} terminal did not come up: {exc!r}")
+        return None
+    if response.status_code not in (200, 201):
+        print(f"[p3a] {provider} terminal refused: {response.status_code} {response.text[:200]}")
+        return None
+    return str(response.json()["id"])
+
+
+def _open_lanes(arm: Arm, count: int = 2) -> list[str]:
+    """Open ``count`` receivers, preferring two terminals of ONE provider.
+
+    Skips rather than fails when fewer than two come up: a box without a usable
+    provider cannot produce the evidence AC-3a asks for, and reporting that as a
+    FAILURE would put a red run against a build whose behaviour was never
+    exercised.  The server log tail is printed on the way out so the reason is in
+    the run's own output rather than in a file nobody fetches.
     """
     import shutil
 
     session = f"p3a-{uuid.uuid4().hex[:8]}"
+    available = [
+        (provider, profile)
+        for provider, profile, binary in LANE_PROVIDERS
+        if shutil.which(binary) is not None
+    ]
     terminals: list[str] = []
-    for provider, profile in LANE_PROVIDERS:
-        binary = {"claude_code": "claude", "kiro_cli": "kiro-cli", "codex": "codex"}.get(
-            provider, provider
-        )
-        if shutil.which(binary) is None:
+    for provider, profile in available:
+        first = _create(arm, session, provider, profile, first=not terminals)
+        if first is None:
             continue
-        endpoint = (
-            f"{arm.url}/sessions" if not terminals else f"{arm.url}/sessions/{session}/terminals"
-        )
-        params = {"provider": provider, "agent_profile": profile}
-        if not terminals:
-            params["session_name"] = session
-        response = requests.post(endpoint, params=params, timeout=180)
-        if response.status_code not in (200, 201):
-            continue
-        terminals.append(response.json()["id"])
+        terminals.append(first)
+        while len(terminals) < count:
+            more = _create(arm, session, provider, profile, first=False)
+            if more is None:
+                break
+            terminals.append(more)
         if len(terminals) >= count:
             break
+
+    if len(terminals) < count:
+        log = arm.home / "server.log"
+        if log.exists():
+            print("[p3a] server log tail:")
+            print("\n".join(log.read_text(errors="replace").splitlines()[-40:]))
     return terminals
 
 
