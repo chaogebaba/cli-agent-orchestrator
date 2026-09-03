@@ -241,7 +241,6 @@ def lint_positions(
     return results
 
 
-
 # --------------------------------------------------------------------------
 # F497 AC17 (D13) — persona byte-budget lint
 # --------------------------------------------------------------------------
@@ -348,9 +347,7 @@ def lint_budgets(
                 f"id-shaped position name (fail-closed: unknown budget key)"
             )
         if key not in table.required:
-            logger.warning(
-                "forward-declared budget key %s (no position file)", key
-            )
+            logger.warning("forward-declared budget key %s (no position file)", key)
 
     overlay_budget = budget.get("overlay")
     composed_slack = budget.get("composed_slack")
@@ -368,8 +365,7 @@ def lint_budgets(
         n = _body_bytes(body)
         if n > pos_budget:
             raise ClauseLintError(
-                f"position '{pos}' body is {n} B, over its budget of {pos_budget} B "
-                f"({path})"
+                f"position '{pos}' body is {n} B, over its budget of {pos_budget} B " f"({path})"
             )
         results[pos] = n
 

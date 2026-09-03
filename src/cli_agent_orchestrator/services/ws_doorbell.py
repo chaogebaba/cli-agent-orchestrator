@@ -260,11 +260,13 @@ def push_doorbell_frame_sync(
         # Timeout or other exception — the coroutine hasn't returned yet.
         # Step 1: Clear permit (prevent send from starting if not yet reached)
         permit.clear()
+
         # Step 2: Cancel the asyncio Task via the event loop (not the concurrent Future).
         # This injects CancelledError into the running coroutine.
         def _cancel_task():
             if _task_holder:
                 _task_holder[0].cancel()
+
         loop.call_soon_threadsafe(_cancel_task)
         # Step 3: WAIT for the future to settle after cancellation.
         _DRAIN_TIMEOUT = 0.2
@@ -379,7 +381,8 @@ def consume_ws_delivered(terminal_id: str, row_id: int) -> bool:
                 found = True
         # Batch cleanup: remove expired or earlier marks for this terminal
         stale = [
-            k for k in _ws_delivered
+            k
+            for k in _ws_delivered
             if k[0] == terminal_id and (k[1] <= row_id or _is_expired(_ws_delivered[k]))
         ]
         for k in stale:

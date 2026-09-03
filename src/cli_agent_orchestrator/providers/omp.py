@@ -198,6 +198,7 @@ class OmpProvider(BaseProvider):
                     config["env"] = env
                 if "CAO_TERMINAL_TOKEN" not in env:
                     import os as _os
+
                     _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
                     if _token:
                         env["CAO_TERMINAL_TOKEN"] = _token

@@ -121,9 +121,7 @@ def _read_lines(tsv: Path) -> list[str]:
 
 def _write_atomic(tsv: Path, lines: list[str]) -> None:
     """Write lines to a temp file then rename into place."""
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(tsv.parent), prefix=".fleet-labels-", suffix=".tmp"
-    )
+    fd, tmp_path = tempfile.mkstemp(dir=str(tsv.parent), prefix=".fleet-labels-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.writelines(lines)

@@ -130,7 +130,9 @@ class TransportEjectionService:
         if state.ejected:
             logger.info(
                 "f203_transport_readmitted terminal=%s rung=%s reason=%s",
-                terminal_id, rung, reason,
+                terminal_id,
+                rung,
+                reason,
             )
         state.ejected = False
         state.consecutive_refusals = 0

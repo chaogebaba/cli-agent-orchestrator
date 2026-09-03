@@ -523,6 +523,7 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name]["env"] = env
             if "CAO_TERMINAL_TOKEN" not in env:
                 import os as _os
+
                 _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
                 if _token:
                     env["CAO_TERMINAL_TOKEN"] = _token
@@ -815,6 +816,7 @@ class CursorCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return Cursor CLI IDLE prompt pattern for log files."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002c")
         return IDLE_PROMPT_PATTERN_LOG
 

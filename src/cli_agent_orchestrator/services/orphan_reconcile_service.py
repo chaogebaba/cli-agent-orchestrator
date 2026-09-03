@@ -43,10 +43,12 @@ MAX_NOTIFICATIONS_PER_JOB: int = 3
 # F166-F1: failure codes known to be permanent (condition cannot resolve without
 # external intervention). Fast-track to attention_required on first observation
 # instead of burning through all retry delays.
-_PERMANENT_FAILURE_PREFIXES: frozenset[str] = frozenset({
-    "permission_denied_server_ancestor",
-    "permission_denied_uid_unknown",
-})
+_PERMANENT_FAILURE_PREFIXES: frozenset[str] = frozenset(
+    {
+        "permission_denied_server_ancestor",
+        "permission_denied_uid_unknown",
+    }
+)
 
 # Safety: never signal these
 _PROTECTED_PIDS: frozenset[int] = frozenset({0, 1})
@@ -66,8 +68,7 @@ def _is_permanent_failure(detail: str | None) -> bool:
     if not errors:
         return False
     return all(
-        any(err.startswith(prefix) for prefix in _PERMANENT_FAILURE_PREFIXES)
-        for err in errors
+        any(err.startswith(prefix) for prefix in _PERMANENT_FAILURE_PREFIXES) for err in errors
     )
 
 
@@ -163,7 +164,7 @@ def _read_proc_start_ticks(pid: int) -> int | None:
         comm_end = stat_data.rfind(")")
         if comm_end < 0:
             return None
-        fields = stat_data[comm_end + 2:].split()
+        fields = stat_data[comm_end + 2 :].split()
         # Fields after comm: state(0), ppid(1), pgrp(2), session(3), ...
         # starttime is field index 19 (0-based after state)
         if len(fields) > 19:
@@ -325,7 +326,7 @@ def _is_server_or_ancestor(pid: int) -> bool:
             comm_end = stat_data.rfind(")")
             if comm_end < 0:
                 break
-            fields = stat_data[comm_end + 2:].split()
+            fields = stat_data[comm_end + 2 :].split()
             ppid = int(fields[1])  # ppid is field index 1 after state
             if ppid == pid:
                 return True
@@ -361,7 +362,7 @@ def _is_descendant_of_server(pid: int) -> bool:
             comm_end = stat_data.rfind(")")
             if comm_end < 0:
                 return True  # unparseable → fail closed
-            fields = stat_data[comm_end + 2:].split()
+            fields = stat_data[comm_end + 2 :].split()
             ppid = int(fields[1])  # ppid is field index 1 after state
         except (OSError, ValueError, IndexError):
             return True  # unreadable → fail closed
@@ -509,9 +510,7 @@ def run_reconciliation_attempt_sync(
 
                 # N2: Resolve actual terminal_id from token_hash DB lookup
                 inc_row = (
-                    db.query(ProcessIncarnationModel)
-                    .filter_by(token_hash=token_hash)
-                    .one_or_none()
+                    db.query(ProcessIncarnationModel).filter_by(token_hash=token_hash).one_or_none()
                 )
                 if inc_row is not None:
                     resolved_terminal_id = inc_row.terminal_id
@@ -656,9 +655,7 @@ def run_reconciliation_attempt_sync(
         if not post_scan.complete:
             continue
         if post_scan.matches:
-            extra_kill = signal_exact_matches(
-                post_scan.matches, signal.SIGKILL, token, owner_uid
-            )
+            extra_kill = signal_exact_matches(post_scan.matches, signal.SIGKILL, token, owner_uid)
             kill_signaled += extra_kill.signaled
         else:
             # Check for second consecutive empty
@@ -769,9 +766,7 @@ def request_orphan_reconciliation(incarnation_id: str, source: str) -> JobReques
     return f138_request_reconciliation(incarnation_id=incarnation_id, source=source)
 
 
-def record_confirmed_gone_observation(
-    incarnation_id: str, source: str
-) -> "JobRequestResult":
+def record_confirmed_gone_observation(incarnation_id: str, source: str) -> "JobRequestResult":
     """D20/D24: Record a confirmed-gone observation — bypasses 2-submission threshold.
 
     Uses f138_force_reconcile_incarnation to handle ALL incarnation states
@@ -826,7 +821,10 @@ def _f166_notify_once(
     if current_count >= MAX_NOTIFICATIONS_PER_JOB:
         logger.warning(
             "f166_notify_cap_exceeded: job=%s count=%d cap=%d failure=%s",
-            job_id, current_count, MAX_NOTIFICATIONS_PER_JOB, failure_code,
+            job_id,
+            current_count,
+            MAX_NOTIFICATIONS_PER_JOB,
+            failure_code,
         )
         return False
 
@@ -1045,7 +1043,10 @@ class OrphanReconcileService:
                 if is_permanent:
                     logger.info(
                         "f166_permanent_fast_track job=%s code=%s detail=%s attempt=%d",
-                        job_id, result.code, result.detail, attempt,
+                        job_id,
+                        result.code,
+                        result.detail,
+                        attempt,
                     )
             else:
                 f138_retry_job(job_id, delay)
@@ -1062,6 +1063,7 @@ class OrphanReconcileService:
 
         Routes through _f166_notify_once for (job_id, failure_code) dedup + cap.
         """
+
         def build_message(supervisor_id: str) -> str:
             return (
                 f"[F138] Orphan reconciliation attention required for terminal {terminal_id}. "

@@ -71,9 +71,7 @@ class FaultSet:
     def inject(self, fault: Fault, now: float) -> None:
         """Inject a fault (only allowed during CHAOS phase)."""
         if self._phase != "CHAOS":
-            raise RuntimeError(
-                f"Cannot inject fault during {self._phase} phase (Do-NOT #6)"
-            )
+            raise RuntimeError(f"Cannot inject fault during {self._phase} phase (Do-NOT #6)")
         fault.inject(now)
         self._faults.append(fault)
 

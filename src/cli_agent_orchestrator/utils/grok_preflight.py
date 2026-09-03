@@ -214,7 +214,11 @@ def run_preflight(
     except requests.ConnectionError as exc:
         # DNS failures also arrive as ConnectionError in requests
         exc_str = str(exc).lower()
-        kind = "dns" if "name or service not known" in exc_str or "nodename" in exc_str else "connect_refused"
+        kind = (
+            "dns"
+            if "name or service not known" in exc_str or "nodename" in exc_str
+            else "connect_refused"
+        )
         raise RelayPreflightFailed(
             _failure_detail(base_url, resolved_model, kind, str(exc)[:_BODY_TAIL_LIMIT], api_key)
         ) from exc
@@ -224,5 +228,7 @@ def run_preflight(
         ) from exc
     except requests.RequestException as exc:
         raise RelayPreflightFailed(
-            _failure_detail(base_url, resolved_model, "connect_refused", str(exc)[:_BODY_TAIL_LIMIT], api_key)
+            _failure_detail(
+                base_url, resolved_model, "connect_refused", str(exc)[:_BODY_TAIL_LIMIT], api_key
+            )
         ) from exc

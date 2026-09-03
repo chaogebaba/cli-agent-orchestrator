@@ -32,7 +32,7 @@ SKILL_CATALOG_INSTRUCTIONS: Dict[str, str] = {
         "The following skills are available exclusively in this CAO orchestration context. "
         "To load a skill's full content, first discover it with `search_tool` "
         "(keywords: `cao-mcp-server load skill`), then call `use_tool` with the qualified "
-        "tool name `cao-mcp-server__load_skill` and `tool_input` `{\"name\": \"<skill-name>\"}`. "
+        'tool name `cao-mcp-server__load_skill` and `tool_input` `{"name": "<skill-name>"}`. '
         "Do NOT prefix the tool name with `mcp__`, and do NOT use a provider-native skill "
         "command or read the skill file directly from disk. "
         "These skills are not accessible through provider-native skill commands or directories."

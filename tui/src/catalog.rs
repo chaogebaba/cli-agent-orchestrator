@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 107;
+const COMMAND_COUNT: usize = 109;
 
 /// What the TUI does with a command.
 ///
@@ -265,7 +265,9 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
     CommandId::DiagAgreement,
+    CommandId::DiagDelivery,
     CommandId::DiagFindings,
+    CommandId::DiagMsg,
     CommandId::DiagTerminal,
     CommandId::DiagWhy,
     CommandId::DoctorCheck,
@@ -505,11 +507,16 @@ pub enum CommandId {
     /// `cao config reconcile`
     ConfigReconcile,
 
-    // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics.
+    // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics, plus
+    // phase 3a (F728 #584) delivery-queue diagnostics.
     /// `cao diag agreement`
     DiagAgreement,
+    /// `cao diag delivery`
+    DiagDelivery,
     /// `cao diag findings`
     DiagFindings,
+    /// `cao diag msg`
+    DiagMsg,
     /// `cao diag terminal`
     DiagTerminal,
     /// `cao diag why`
@@ -1452,11 +1459,31 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::DiagDelivery => Command {
+            id: CommandId::DiagDelivery,
+            parent: Some("diag"),
+            leaf_name: "delivery",
+            summary: "Compare the shadow delivery queue against the legacy inbox (AC-3a).",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
         CommandId::DiagFindings => Command {
             id: CommandId::DiagFindings,
             parent: Some("diag"),
             leaf_name: "findings",
             summary: "List typed invariant findings, loudest first.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::DiagMsg => Command {
+            id: CommandId::DiagMsg,
+            parent: Some("diag"),
+            leaf_name: "msg",
+            summary: "Print one message's delivery history: the queue row, its attempts, its events.",
             policy: Policy::Hidden,
             params: &[],
             handoff_reason: None,
@@ -1999,7 +2026,9 @@ mod tests {
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
                     CommandId::DiagAgreement => CommandId::DiagAgreement,
+                    CommandId::DiagDelivery => CommandId::DiagDelivery,
                     CommandId::DiagFindings => CommandId::DiagFindings,
+                    CommandId::DiagMsg => CommandId::DiagMsg,
                     CommandId::DiagTerminal => CommandId::DiagTerminal,
                     CommandId::DiagWhy => CommandId::DiagWhy,
                     CommandId::Fold => CommandId::Fold,
@@ -2111,7 +2140,9 @@ mod tests {
                 CommandId::BaseRegister,
                 CommandId::ConfigReconcile,
                 CommandId::DiagAgreement,
+                CommandId::DiagDelivery,
                 CommandId::DiagFindings,
+                CommandId::DiagMsg,
                 CommandId::DiagTerminal,
                 CommandId::DiagWhy,
                 CommandId::Fold,

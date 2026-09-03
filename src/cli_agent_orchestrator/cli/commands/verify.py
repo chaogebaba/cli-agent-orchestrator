@@ -148,6 +148,7 @@ def identity(json_output: bool, endpoint: str | None, db_path: Path | None) -> N
     if result["summary"]["fail"]:
         raise click.exceptions.Exit(1)
 
+
 @verify.command("manifest")
 @click.option("--regen", is_flag=True, help="Regenerate the receiver-state trace manifest.")
 def manifest(regen: bool) -> None:

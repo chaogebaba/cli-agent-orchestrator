@@ -114,6 +114,7 @@ class SimWorld:
         # D13: uninstall attached backend
         if self._attached_backend is not None:
             from cli_agent_orchestrator.backends import registry
+
             registry._backend = None
             self._attached_backend = None
         self._installed = False
@@ -129,6 +130,7 @@ class SimWorld:
         uninstalled in uninstall().
         """
         from cli_agent_orchestrator.backends import registry
+
         registry.set_backend(backend)
         self._attached_backend = backend
 
@@ -217,12 +219,14 @@ class SimWorld:
         mailbox_id: str = "mbox-1",
     ) -> None:
         """Track an obligation for liveness checking."""
-        self._obligations.append({
-            "inbox_row_id": inbox_row_id,
-            "terminal_id": terminal_id,
-            "mailbox_id": mailbox_id,
-            "state": "OPEN",
-        })
+        self._obligations.append(
+            {
+                "inbox_row_id": inbox_row_id,
+                "terminal_id": terminal_id,
+                "mailbox_id": mailbox_id,
+                "state": "OPEN",
+            }
+        )
 
     def mark_delivered(self, inbox_row_id: int) -> None:
         """Mark an obligation as delivered."""
@@ -234,7 +238,8 @@ class SimWorld:
     def undelivered(self) -> list[dict[str, object]]:
         """Return obligations not yet DELIVERED/ACKED."""
         return [
-            obl for obl in self._obligations
+            obl
+            for obl in self._obligations
             if obl["inbox_row_id"] not in self._delivered
             and obl.get("state") not in ("DELIVERED", "ACKED")
         ]

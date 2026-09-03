@@ -262,9 +262,7 @@ def rewrite_jsonl(content: bytes, spans: Iterable[Span]) -> ScrubResult:
         for interval in sorted(intervals, key=lambda item: item.start, reverse=True):
             filler = _NEUTRAL_CODEPOINT * (interval.end - interval.start)
             replacement_value = (
-                replacement_value[: interval.start]
-                + filler
-                + replacement_value[interval.end :]
+                replacement_value[: interval.start] + filler + replacement_value[interval.end :]
             )
         encoded_token = json.dumps(replacement_value, ensure_ascii=False, separators=(",", ":"))
         new_line = line[: token.start] + encoded_token + line[token.end :]

@@ -110,7 +110,8 @@ class DaemonDispatcher:
                     self._waiters.remove(waiter)
                 except ValueError:
                     if (
-                        waiter.ticket.done() and not waiter.ticket.cancelled()
+                        waiter.ticket.done()
+                        and not waiter.ticket.cancelled()
                         and waiter.ticket.exception() is None
                     ):
                         self._active -= 1
@@ -123,7 +124,8 @@ class DaemonDispatcher:
                     self._waiters.remove(waiter)
                 except ValueError:
                     if (
-                        waiter.ticket.done() and not waiter.ticket.cancelled()
+                        waiter.ticket.done()
+                        and not waiter.ticket.cancelled()
                         and waiter.ticket.exception() is None
                     ):
                         self._active -= 1
@@ -134,9 +136,7 @@ class DaemonDispatcher:
     def _release_from_thread(self, call: DeferredCall) -> None:
         loop = self._loop
         if loop is not None and not loop.is_closed():
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self._release_and_signal(call))
-            )
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self._release_and_signal(call)))
 
     async def _release_and_signal(self, call: DeferredCall) -> None:
         try:
@@ -179,8 +179,11 @@ class DaemonDispatcher:
     ) -> tuple[Any, float]:
         underlying: concurrent.futures.Future = concurrent.futures.Future()
         call = DeferredCall(
-            terminal_id=terminal_id, generation=generation,
-            call_type=call_type, operation=operation, future=underlying,
+            terminal_id=terminal_id,
+            generation=generation,
+            call_type=call_type,
+            operation=operation,
+            future=underlying,
         )
         call.abandon_event = threading.Event()
         call.released = asyncio.Event()
@@ -215,9 +218,7 @@ class DaemonDispatcher:
             # The retained concurrent Future is reconciled by terminal_service,
             # but wrap_future also needs its late exception retrieved.
             wrapped.add_done_callback(
-                lambda completed: (
-                    None if completed.cancelled() else completed.exception()
-                )
+                lambda completed: (None if completed.cancelled() else completed.exception())
             )
             if underlying.done() and call.released is not None:
                 await call.released.wait()

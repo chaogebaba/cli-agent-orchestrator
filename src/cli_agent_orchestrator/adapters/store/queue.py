@@ -371,6 +371,23 @@ class SqliteQueueStore:
             died_at=parse_timestamp(row["died_at"]),
         )
 
+    def all_rows(self, *, mode: QueueMode | None = None) -> list[QueueMessage]:
+        """Every row, for the AC-3a report.
+
+        A full read is the right shape here and only here: the report compares
+        the whole population against the whole legacy inbox, and paging it would
+        let a row enqueued mid-report appear on one side and not the other.  No
+        server path calls this — ``claim`` is how the tick reads rows.
+        """
+        where = "" if mode is None else " WHERE mode = ?"
+        params = () if mode is None else (mode.value,)
+        rows = (
+            self._pool.connection()
+            .execute(f"SELECT {_MSG_COLUMNS} FROM delivery_msg{where} ORDER BY msg_id", params)
+            .fetchall()
+        )
+        return [_row_to_message(row) for row in rows]
+
     def occupancy(self) -> QueueOccupancy:
         """D9's two predicates, read in one place.
 

@@ -76,6 +76,7 @@ __all__ = [
     "DELIVERY_ENV_VAR",
     "INGEST_ENV_VAR",
     "WorkerTruthRuntime",
+    "build_legacy_inbox_status",
     "build_readonly_diag_stores",
     "build_terminal_scope",
     "current_runtime",
@@ -477,6 +478,36 @@ def build_terminal_scope(db_path: str | Path | None = None) -> dict[str, Termina
         }
     except Exception:  # noqa: BLE001 — a missing scope degrades the report, never fails it
         logger.warning("could not read the legacy terminals table for diag scope", exc_info=True)
+        return {}
+    finally:
+        pool.close_all()
+
+
+def build_legacy_inbox_status(db_path: str | Path | None = None) -> dict[int, str]:
+    """Every legacy inbox row's id and current status, for AC-3a's report.
+
+    Read here rather than in ``app`` for the reason that shapes the whole
+    phase-3a package: ``app`` may not import legacy, so it cannot look at the
+    inbox table.  Handing the statuses in is also what makes the comparison
+    honest — the report has no way to make its own side agree.
+
+    Raw SQL rather than the SQLAlchemy model, for the same two reasons the
+    terminal scope uses it: the model would pull the fork's whole
+    ``clients.database`` import graph into a read-only CLI path, and this
+    connection is deliberately read-only while that module's engine is not.
+
+    Returns an empty mapping when the table cannot be read.  Every comparison
+    then classifies as ``queue_early`` and the content floor fails the report,
+    which is the honest outcome — an unreadable legacy side is "no evidence",
+    not "perfect agreement".
+    """
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    try:
+        rows = pool.connection().execute("SELECT id, status FROM inbox")
+        return {int(row["id"]): str(row["status"] or "") for row in rows}
+    except Exception:  # noqa: BLE001 — an unreadable legacy side is no evidence
+        logger.warning("could not read the legacy inbox for the delivery report", exc_info=True)
         return {}
     finally:
         pool.close_all()

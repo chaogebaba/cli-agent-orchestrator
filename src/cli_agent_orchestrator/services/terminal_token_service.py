@@ -31,9 +31,7 @@ def issue_token(db: Session, terminal_id: str) -> str:
     return token
 
 
-def verify_sender_token(
-    db: Session, sender_id: str, presented: Optional[str]
-) -> tuple[bool, str]:
+def verify_sender_token(db: Session, sender_id: str, presented: Optional[str]) -> tuple[bool, str]:
     """Verify that the presented token matches the sender's issued token.
 
     Returns:

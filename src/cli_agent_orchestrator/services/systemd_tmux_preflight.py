@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Sequence
 
-
 # ---------------------------------------------------------------------------
 # Data contracts
 # ---------------------------------------------------------------------------
@@ -87,9 +86,7 @@ class CommandRunner(Protocol):
 class DefaultCommandRunner:
     """Production runner — subprocess with timeout, never shell=True."""
 
-    def run(
-        self, args: Sequence[str], *, timeout: float = 5.0
-    ) -> subprocess.CompletedProcess[str]:
+    def run(self, args: Sequence[str], *, timeout: float = 5.0) -> subprocess.CompletedProcess[str]:
         _enforce_allowlist(args)
         return subprocess.run(
             list(args),

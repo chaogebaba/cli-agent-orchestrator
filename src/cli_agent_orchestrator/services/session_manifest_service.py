@@ -45,7 +45,9 @@ def _charter_projection(name: str) -> dict[str, Any]:
     }
 
 
-def build_session_manifest(session_name: str, terminal_id: str | None = None, _now: datetime | None = None) -> dict[str, Any]:
+def build_session_manifest(
+    session_name: str, terminal_id: str | None = None, _now: datetime | None = None
+) -> dict[str, Any]:
     _manifest_now = _now or datetime.now(timezone.utc)
     sections = {
         name: "ok"

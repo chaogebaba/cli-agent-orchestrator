@@ -459,6 +459,7 @@ class OpenCodeCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return pattern matching the idle footer in log file output."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002f")
         return IDLE_FOOTER_PATTERN
 

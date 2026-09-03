@@ -91,9 +91,7 @@ def run_post_auth_engine(
         return decision
     open_kind = cast(OpenReplayKind, decision.kind)
     rule = CAP_TABLE[open_kind]
-    counter = (
-        ambiguous_count if rule.counter == "ambiguous" else exhausted_boundary_count
-    )
+    counter = ambiguous_count if rule.counter == "ambiguous" else exhausted_boundary_count
     if counter >= rule.limit:
         return ReplayDecision(
             "stop",

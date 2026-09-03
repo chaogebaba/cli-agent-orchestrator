@@ -253,7 +253,7 @@ class KimiCliProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     @property
     def paste_enter_count(self) -> int:
@@ -407,6 +407,7 @@ class KimiCliProvider(BaseProvider):
                             mcp_config[server_name]["env"] = env
                         if "CAO_TERMINAL_TOKEN" not in env:
                             import os as _os
+
                             _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
                             if _token:
                                 env["CAO_TERMINAL_TOKEN"] = _token
@@ -1121,6 +1122,7 @@ class KimiCliProvider(BaseProvider):
         propagate.
         """
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0001")
         from cli_agent_orchestrator.services.wiki_compiler import _sanitize_for_log
 

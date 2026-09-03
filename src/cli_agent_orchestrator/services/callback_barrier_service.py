@@ -69,6 +69,7 @@ def dispatch(
     try:
         # F136-D7: signal delivery after commit, never inline deliver_pending
         from cli_agent_orchestrator.services.inbox_service import request_delivery
+
         request_delivery(inbox_msg.receiver_id)
     except Exception as exc:
         logger.warning("Immediate delivery attempt failed for %s: %s", receiver_id, exc)
@@ -108,5 +109,6 @@ def cancel(
     for receiver_id in result.get("receiver_ids", []):
         # F136-D7: signal delivery after barrier cancellation commit
         from cli_agent_orchestrator.services.inbox_service import request_delivery
+
         request_delivery(receiver_id)
     return result

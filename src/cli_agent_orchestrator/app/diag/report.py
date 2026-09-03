@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from cli_agent_orchestrator.app.delivery.agreement import AgreementReport as AgreementReportT
 from cli_agent_orchestrator.app.worker_truth.agreement import AgreementReport
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import AnyKind, EventKind, WorkerEvent
@@ -42,8 +43,10 @@ __all__ = [
     "DiagSources",
     "INGEST_OFF_NOTE",
     "findings_payload",
+    "delivery_agreement_payload",
     "message_payload",
     "render_agreement",
+    "render_delivery_agreement",
     "render_message",
     "render_findings",
     "render_timeline",
@@ -742,3 +745,102 @@ def render_message(
 
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
+
+
+# ------------------------------------------------- AC-3a's delivery agreement
+
+
+def delivery_agreement_payload(report: "AgreementReportT", *, now: datetime) -> dict[str, Any]:
+    """AC-3a's report as data, in the shape phase 1's AC10 report uses."""
+    return {
+        "valid": report.valid,
+        "invalid_reasons": report.invalid_reasons,
+        "generated_at": now.isoformat(),
+        "totals": {
+            "receivers": len(report.receivers),
+            "shadow_rows": report.total_messages,
+            "queue_terminal": report.queue_terminal,
+            "legacy_terminal": report.legacy_terminal,
+            "comparable": report.total_comparable,
+            "agreements": report.total_agreements,
+            "agreement_rate": report.agreement_rate,
+        },
+        "classifications": report.classification_counts(),
+        "receivers": [
+            {
+                "receiver_id": receiver.receiver_id,
+                "messages": receiver.messages,
+                "comparable": receiver.comparable,
+                "agreements": receiver.agreements,
+                "agreement_rate": receiver.agreement_rate,
+                "disagreements": [
+                    {
+                        "msg_id": row.msg_id,
+                        "legacy_message_id": row.legacy_message_id,
+                        "queue_state": row.queue_state.value,
+                        "legacy_status": row.legacy_status,
+                        "classification": row.classification,
+                    }
+                    for row in receiver.comparisons
+                    if row.classification is not None
+                ],
+            }
+            for receiver in report.receivers
+        ],
+    }
+
+
+def render_delivery_agreement(report: "AgreementReportT", *, now: datetime) -> str:
+    """The human view of AC-3a.
+
+    The INVALID banner is first and unmissable.  An empty comparison is "no
+    evidence", never "perfect agreement", and a report attached to a gate must
+    not be readable as a pass by someone who skimmed the rate.
+    """
+    data = delivery_agreement_payload(report, now=now)
+    totals = data["totals"]
+    lines: list[str] = []
+    if not report.valid:
+        lines.append("INVALID — this run is not evidence:")
+        lines.extend(f"  - {reason}" for reason in report.invalid_reasons)
+        lines.append("")
+
+    rate = totals["agreement_rate"]
+    lines.append(
+        f"shadow rows {totals['shadow_rows']}  receivers {totals['receivers']}  "
+        f"terminal: queue {totals['queue_terminal']} / legacy {totals['legacy_terminal']}"
+    )
+    lines.append(
+        f"comparable {totals['comparable']}  agreements {totals['agreements']}  "
+        f"rate {'n/a' if rate is None else f'{rate:.3f}'}"
+    )
+    counts = data["classifications"]
+    lines.append(
+        f"disagreements: queue-early {counts['queue_early']}  "
+        f"legacy-early {counts['legacy_early']}  genuine {counts['genuine']}"
+    )
+    lines.append(_SEPARATOR)
+    lines.append(f"{'receiver':<28}  {'msgs':>5}  {'comp':>5}  {'agree':>5}  rate")
+    for receiver in data["receivers"]:
+        receiver_rate = receiver["agreement_rate"]
+        lines.append(
+            f"{receiver['receiver_id'][:28]:<28}  {receiver['messages']:>5}  "
+            f"{receiver['comparable']:>5}  {receiver['agreements']:>5}  "
+            f"{'n/a' if receiver_rate is None else f'{receiver_rate:.3f}'}"
+        )
+
+    rows = [
+        (receiver["receiver_id"], row)
+        for receiver in data["receivers"]
+        for row in receiver["disagreements"]
+    ]
+    if rows:
+        lines.append(_SEPARATOR)
+        lines.append(f"{'msg_id':<28}  {'legacy':>7}  {'queue':<11}  {'legacy status':<14}  class")
+        for receiver_id, row in rows:
+            lines.append(
+                f"{row['msg_id'][:28]:<28}  {str(row['legacy_message_id']):>7}  "
+                f"{row['queue_state']:<11}  {row['legacy_status'] or '-':<14}  "
+                f"{row['classification']}"
+            )
+    return "\n".join(lines)

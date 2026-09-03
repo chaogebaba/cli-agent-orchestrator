@@ -60,6 +60,7 @@ def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
 
     def _convergence(now: float) -> None:
         from cli_agent_orchestrator.services.delivery_service import convergence_tick
+
         convergence_tick()
 
     def _poll_unarmed(now: float) -> None:

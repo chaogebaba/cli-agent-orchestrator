@@ -810,6 +810,7 @@ class AntigravityCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return the agy IDLE footer pattern for log-file pre-checks."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
+
         tombstone("TS-0002d")
         return IDLE_FOOTER_PATTERN_LOG
 

@@ -182,15 +182,23 @@ def raise_alarm(degradation_id: str, db: Session) -> AlarmResult:
     if row.suppressed_by_teardown:
         rungs = [
             AlarmRungResult(rung="sse", attempted=True, ok=False, reason="suppressed_by_teardown"),
-            AlarmRungResult(rung="display", attempted=True, ok=False, reason="suppressed_by_teardown"),
-            AlarmRungResult(rung="other_session", attempted=True, ok=False, reason="suppressed_by_teardown"),
-            AlarmRungResult(rung="mailbox", attempted=True, ok=False, reason="suppressed_by_teardown"),
+            AlarmRungResult(
+                rung="display", attempted=True, ok=False, reason="suppressed_by_teardown"
+            ),
+            AlarmRungResult(
+                rung="other_session", attempted=True, ok=False, reason="suppressed_by_teardown"
+            ),
+            AlarmRungResult(
+                rung="mailbox", attempted=True, ok=False, reason="suppressed_by_teardown"
+            ),
             AlarmRungResult(rung="file", attempted=True, ok=False, reason="suppressed_by_teardown"),
         ]
-        row.alarm_rungs_json = json.dumps([
-            {"rung": r.rung, "attempted": r.attempted, "ok": r.ok, "reason": r.reason}
-            for r in rungs
-        ])
+        row.alarm_rungs_json = json.dumps(
+            [
+                {"rung": r.rung, "attempted": r.attempted, "ok": r.ok, "reason": r.reason}
+                for r in rungs
+            ]
+        )
         row.alarm_delivered = False
         db.flush()
         logger.info(
@@ -226,10 +234,9 @@ def raise_alarm(degradation_id: str, db: Session) -> AlarmResult:
     if r4.ok:
         any_ok = True
 
-    row.alarm_rungs_json = json.dumps([
-        {"rung": r.rung, "attempted": r.attempted, "ok": r.ok, "reason": r.reason}
-        for r in rungs
-    ])
+    row.alarm_rungs_json = json.dumps(
+        [{"rung": r.rung, "attempted": r.attempted, "ok": r.ok, "reason": r.reason} for r in rungs]
+    )
     row.alarm_delivered = any_ok
     db.flush()
 
@@ -332,8 +339,11 @@ def _alarm_rung_display(row: object) -> AlarmRungResult:
             # Also set persistent @cao_degraded option
             subprocess.run(
                 tmux_argv(
-                    "set-option", "-t", session_name,
-                    "@cao_degraded", row.cause,
+                    "set-option",
+                    "-t",
+                    session_name,
+                    "@cao_degraded",
+                    row.cause,
                 ),
                 capture_output=True,
                 text=True,

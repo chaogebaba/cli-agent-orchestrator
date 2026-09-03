@@ -133,9 +133,7 @@ def _existing_terminal_ids(db) -> set[str]:
     return {r[0] for r in rows}
 
 
-def scan_for_orphans(
-    *, tmux_windows: list[tuple[str, str]] | None = None
-) -> ReadoptResult:
+def scan_for_orphans(*, tmux_windows: list[tuple[str, str]] | None = None) -> ReadoptResult:
     """Scan tmux for cao-* session windows missing from the terminals table.
 
     Args:
@@ -229,11 +227,7 @@ def apply_readopt(result: ReadoptResult) -> ReadoptResult:
         try:
             with SessionLocal.begin() as db:
                 # Double-check: skip if row appeared between scan and apply
-                exists = (
-                    db.query(TerminalModel.id)
-                    .filter_by(id=plan.terminal_id)
-                    .first()
-                )
+                exists = db.query(TerminalModel.id).filter_by(id=plan.terminal_id).first()
                 if exists:
                     result.skipped_existing.append(plan.terminal_id)
                     continue
