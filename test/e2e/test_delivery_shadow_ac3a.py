@@ -282,6 +282,37 @@ def _drive_traffic(arm: Arm, terminals: list[str]) -> int:
     return sent
 
 
+def _plant_unresolved_shadow_row(arm: Arm) -> None:
+    """Write one ``ready`` shadow row straight into the arm's queue.
+
+    Through the real store rather than raw SQL, so the row is shaped exactly like
+    one the mirror would have written — the same ``dead_by`` stamp, the same
+    ``mode``, the same defaults. A hand-rolled INSERT could get a column wrong in
+    a way that made the guard's answer right for the wrong reason.
+
+    Opened while the server is running, which WAL permits; the write is a single
+    short transaction against a database the server is not contending for at this
+    moment.
+    """
+    from cli_agent_orchestrator.adapters.store.connection import ConnectionPool
+    from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
+    from cli_agent_orchestrator.core.delivery import EnqueueDraft, QueueMode
+
+    pool = ConnectionPool(arm.db, busy_timeout_ms=10_000)
+    try:
+        SqliteQueueStore(pool).enqueue(
+            EnqueueDraft(
+                idempotency_key=f"legacy-inbox:unresolved-{uuid.uuid4().hex[:8]}",
+                receiver_id="mb_bounce_probe",
+                sender_id="p3a-bounce",
+                payload="an outcome the mirror never observed",
+                mode=QueueMode.SHADOW,
+            )
+        )
+    finally:
+        pool.close_all()
+
+
 @pytest.fixture(scope="module")
 def shadow_arm(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Arm]:
     arm = _arm(tmp_path_factory, "shadow", "shadow")
@@ -391,6 +422,18 @@ def test_ac3a_the_bounce_resolves_back_to_shadow(
             )
         time.sleep(3)
         in_flight = [row for row in arm.queue_rows() if row["state"] == "ready"]
+        if not in_flight:
+            # The mirror settled every row before the restart, which is the
+            # HEALTHY outcome and leaves nothing to bounce over. Rather than
+            # racing the mirror with a shorter sleep — which would make the case
+            # pass or fail on delivery latency — the unresolved row is created
+            # directly. §7a describes exactly this row: "when the mirror writer
+            # misses an outcome, because the server restarted mid-flight or the
+            # legacy edge was lost, the shadow row stays ``ready``". That is the
+            # row the guard must not count, and writing one is a faithful stand-in
+            # for the condition, not a weakening of it.
+            _plant_unresolved_shadow_row(arm)
+            in_flight = [row for row in arm.queue_rows() if row["state"] == "ready"]
         assert in_flight, "the bounce case needs in-flight rows to be a case at all"
         attempts_before = arm.attempt_count()
     finally:
