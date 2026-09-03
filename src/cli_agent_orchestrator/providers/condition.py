@@ -87,6 +87,19 @@ PRECEDENCE: Dict[ConditionKind, float] = {
 }
 
 
+#: F752 (#609): the fleet labels that assert the terminal is WORKING RIGHT NOW.
+#: A condition in this class is only meaningful while the fused status is a
+#: working one; on a seat whose status is idle/completed it is stale by
+#: construction and must be neither written nor rendered. Kept here (beside the
+#: taxonomy) so the server guard and the TUI guard share one definition.
+BUSY_CLASS_LABELS: "frozenset[str]" = frozenset({ConditionKind.BUSY.value})
+
+
+def is_busy_class_label(label: Optional[str]) -> bool:
+    """True when ``label`` is a fleet condition label that asserts live work."""
+    return label is not None and label in BUSY_CLASS_LABELS
+
+
 @dataclass(frozen=True)
 class Condition:
     """A typed, provider-attributable operating state (D1).
@@ -410,6 +423,18 @@ def _classify_transient(provider: str, brows: List[str]) -> Optional[Condition]:
     return None
 
 
+#: F752 (#609): BUSY is a statement about the PRESENT, so its anchor is only
+#: believable in the live tail of the pane. Every other kind matches a banner
+#: that stays true while it is on screen; a busy marker does not. cline is the
+#: proof: ``[thinking]``/``[run_commands]`` are printed LOG lines, not a spinner
+#: that erases itself, so a whole-buffer scan keeps matching a run that ended
+#: hours ago (sample: terminal 1243fb68 re-emitted ``tool_churn`` at 10:05:48Z on
+#: a pane parked since 08:21Z). Scanning only the tail matches the rest of the
+#: tree's liveness convention (``pane_liveness.PANE_LIVENESS_TAIL_LINES`` = 45,
+#: not imported here — a provider module must not pull in a service).
+BUSY_TAIL_ROWS: int = 45
+
+
 def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     pat, subtype = {
         "codex": (_CODEX_BUSY, "working_marker"),
@@ -420,7 +445,7 @@ def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     }.get(provider, (None, ""))
     if pat is None:
         return None
-    ev = _first_evidence(brows, pat)
+    ev = _first_evidence(brows[-BUSY_TAIL_ROWS:], pat)
     if ev:
         return Condition(ConditionKind.BUSY, provider, subtype, ev, Confidence.HIGH)
     return None

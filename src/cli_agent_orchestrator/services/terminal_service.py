@@ -5954,12 +5954,15 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        status = status_monitor.get_status(terminal_id).value
+        fused_status = status_monitor.get_status(terminal_id)
+        status = fused_status.value
         input_gen = status_monitor.get_input_gen(terminal_id)
         status_gen = status_monitor.get_status_gen(terminal_id)
         # F611 (#467): live condition fleet field — a SEPARATE projection from
         # status fusion (D1). None when no condition is detected.
-        condition = status_monitor.get_condition(terminal_id)
+        # F752 (#609): the already-fused status rides along so a stale BUSY-class
+        # label is dropped for an idle/completed seat instead of being served.
+        condition = status_monitor.get_condition(terminal_id, fused_status)
 
         result = {
             "id": metadata["id"],

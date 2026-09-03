@@ -94,15 +94,80 @@ def test_status_without_condition(status: str, plain: str, style: str) -> None:
     assert cell.style == style
 
 
-@pytest.mark.parametrize("status,plain,_style", STATUS_CASES)
+# F752 (#609): the (status, condition) pairs the cell refuses to render — a
+# BUSY tag claims live work, which `idle` and `completed` both deny.
+SUPPRESSED_PAIRS: List[Tuple[str, str]] = [
+    ("idle", "BUSY"),
+    ("completed", "BUSY"),
+]
+
+
+@pytest.mark.parametrize("status,plain,style", STATUS_CASES)
 @pytest.mark.parametrize("condition,cond_style", CONDITION_CASES)
 def test_status_with_condition(
-    status: str, plain: str, _style: str, condition: str, cond_style: str
+    status: str, plain: str, style: str, condition: str, cond_style: str
 ) -> None:
-    """The condition is appended and owns the cell style."""
+    """The condition is appended and owns the cell style.
+
+    The exception is a contradiction: on a quiescent status a BUSY tag is
+    dropped entirely and the row renders as the bare status.
+    """
     cell = status_cell(row(status=status, condition=condition))
+    if (status, condition) in SUPPRESSED_PAIRS:
+        assert cell.plain == plain
+        assert cell.style == style
+        return
     assert cell.plain == f"{plain} [{condition}]"
     assert cell.style == cond_style
+
+
+# ─── F752 (#609): a stale BUSY never rides a resting row ──────────────────────
+
+
+@pytest.mark.parametrize("status", ["idle", "completed"])
+def test_busy_tag_is_dropped_on_a_quiescent_status(status: str) -> None:
+    """The reported row: `◌ idle [BUSY]` renders as `◌ idle`.
+
+    Terminal 1243fb68 was parked for two hours with status=idle while the F611
+    condition field still read BUSY. The server no longer writes that; the cell
+    refuses to render it either way.
+    """
+    plain, style = dict((s, (p, st)) for s, p, st in STATUS_CASES)[status]
+    cell = status_cell(row(status=status, condition="BUSY"))
+    assert cell.plain == plain
+    assert "BUSY" not in cell.plain
+    assert cell.style == style
+
+
+@pytest.mark.parametrize("status", ["processing", "waiting_user_answer", "unknown", "error"])
+def test_busy_tag_survives_every_non_quiescent_status(status: str) -> None:
+    """Only `idle` and `completed` contradict BUSY — nothing else is touched."""
+    cell = status_cell(row(status=status, condition="BUSY"))
+    assert cell.plain.endswith(" [BUSY]")
+
+
+@pytest.mark.parametrize("condition,_cond_style", CONDITION_CASES)
+def test_only_busy_is_suppressed_on_an_idle_row(condition: str, _cond_style: str) -> None:
+    """A cap, an auth expiry or a blocked dialog are all TRUE of a resting seat."""
+    cell = status_cell(row(status="idle", condition=condition))
+    if condition == "BUSY":
+        assert cell.plain == "◌ idle"
+    else:
+        assert cell.plain == f"◌ idle [{condition}]"
+
+
+def test_busy_is_dropped_on_a_delegating_row() -> None:
+    """`delegating` is IDLE/COMPLETED underneath, so the same contradiction holds."""
+    cell = status_cell(row(status="idle", delegating=True, children_count=2, condition="BUSY"))
+    assert cell.plain == "◇ delegating (2)"
+    assert cell.style == "cyan"
+
+
+def test_busy_still_shows_on_a_wedge_row_whose_status_is_not_quiescent() -> None:
+    """A wedge suspect at `unknown` keeps its tag — the fixture row (term-0032)."""
+    cell = status_cell(row(status="unknown", wedge_suspect=True, condition="BUSY"))
+    assert cell.plain == "x WEDGE? [BUSY]"
+    assert cell.style == "bold red"
 
 
 # ─── overrides ────────────────────────────────────────────────────────────────

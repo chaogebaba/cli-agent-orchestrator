@@ -24,6 +24,8 @@ Vocabulary covered, enumerated from the server:
   verbatim — ``NET_INTERRUPTED``, ``CONTEXT_EXHAUSTED``, ``PROC_EXITED``,
   ``TRANSIENT_OVERLOAD``, ``BUSY``. ``None`` means no condition. The two raw
   kinds that the label mapping rewrites are accepted defensively as well.
+  F752 (#609): a ``BUSY`` label is DROPPED on an ``idle``/``completed`` row —
+  the two halves contradict, and the cell never renders a contradiction.
 * ``delegating`` / ``children_count`` — F568 D12c: an IDLE/COMPLETED seat with
   children in flight renders ``delegating (N)``.
 * ``wedge_suspect`` — F295 Half 2 AC10.
@@ -99,6 +101,15 @@ _QUIET_CONDITION_TAGS: Final[frozenset[str]] = frozenset({"BUSY"})
 #: The overlay applied to those tags.
 STYLE_QUIET_TAG: Final[str] = "dim"
 
+#: F752 (#609): condition labels that CONTRADICT a quiescent status. ``BUSY``
+#: says the seat is working right now, so ``◌ idle [BUSY]`` is not a row an
+#: operator can act on — it is two halves of the projection disagreeing. The
+#: server no longer writes it, and this is the defence in depth: whatever the
+#: wire carries, the cell never renders the contradiction.
+_LIVE_WORK_CONDITIONS: Final[frozenset[str]] = frozenset({"BUSY"})
+#: The statuses that make those labels a contradiction.
+_QUIESCENT_STATUSES: Final[frozenset[str]] = frozenset({"idle", "completed"})
+
 
 def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
     """The status half of the cell: (text, style), before any condition suffix.
@@ -124,6 +135,19 @@ def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
     return f"? {status}", STYLE_UNKNOWN_VALUE
 
 
+def _contradicts_status(raw_status: Any, raw_condition: Any) -> bool:
+    """True when the condition claims live work but the status says otherwise.
+
+    Read off the row's raw ``status``, not the rendered cell: ``wedge_suspect``
+    and ``delegating`` rewrite the text but not the underlying status, and a
+    delegating seat is IDLE/COMPLETED by construction — its stale ``BUSY`` is
+    exactly as wrong there as on a plain idle row.
+    """
+    if not raw_status:
+        return False
+    return str(raw_status) in _QUIESCENT_STATUSES and str(raw_condition) in _LIVE_WORK_CONDITIONS
+
+
 def status_cell(row: Mapping[str, Any]) -> Text:
     """Render one fleet row's STATUS cell.
 
@@ -140,6 +164,8 @@ def status_cell(row: Mapping[str, Any]) -> Text:
     """
     text, style = _base_cell(row)
     raw_condition = row.get("condition")
+    if raw_condition and _contradicts_status(row.get("status"), raw_condition):
+        raw_condition = None
     quiet_tag = False
     if raw_condition:
         condition = str(raw_condition)
