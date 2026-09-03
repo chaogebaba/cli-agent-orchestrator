@@ -155,3 +155,35 @@ def test_only_the_bridge_module_names_the_new_tree() -> None:
             assert marker not in text, f"{path} now names the new tree directly"
     bridge = (SRC / "services" / "delivery_mirror.py").read_text()
     assert "cli_agent_orchestrator.app.delivery" in bridge
+
+
+def test_the_barrier_cancel_reads_its_ids_before_the_bulk_update() -> None:
+    """Placement again, and this one has no behavioural defence at all.
+
+    ``_close_barrier_owner_gone_in_db`` ends its rows with a bulk
+    ``UPDATE ... synchronize_session=False``, which returns a COUNT and not the
+    rows it touched — and once it has run, the predicate that selected them
+    (``status == HELD``) no longer matches any of them.  So the ids must be read
+    BEFORE it.  A stash moved after the update would record nothing, silently,
+    for every barrier-owner-gone cancel, and the only symptom would be a slow
+    drift in the agreement report's legacy-early count.
+    """
+    node = _function("clients/database.py", "_close_barrier_owner_gone_in_db")
+    stash = [
+        child.lineno
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == "_stash_shadow_observation"
+    ]
+    updates = [
+        child.lineno
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr == "update"
+    ]
+    assert stash and updates
+    assert min(stash) < min(
+        updates
+    ), "the shadow stash runs after the bulk update, so it records nothing"
