@@ -28,7 +28,16 @@ AC11_LEGACY_IMPORTERS = {
     "services/status_monitor.py",
     "services/fleet_service.py",
     "services/terminal_service.py",
-    "cli/main.py",
+    # AC11 names ``cli/main.py`` for hook point 4, the diag CLI registration.
+    # Lane C put the new-tree imports in a dedicated command module instead and
+    # left ``cli/main.py`` importing only that module — a legacy-to-legacy
+    # import, which is why ``main.py`` no longer appears here at all.  The
+    # deviation is an improvement on the blueprint and is recorded rather than
+    # smoothed over: the contact surface is one command file instead of the CLI
+    # entry point, and ``cli/commands/diag.py`` imports ``app`` and ``core`` but
+    # NOT ``adapters``, so the fifth contract (only the composition root names an
+    # adapter) still holds.
+    "cli/commands/diag.py",
 }
 
 #: The subset lane B is responsible for.
@@ -116,14 +125,24 @@ def _calls(node: ast.AST) -> list[str]:
 
 
 def test_only_the_ac11_files_import_the_new_tree() -> None:
-    """The decisive contract: legacy reaches the new tree ONLY at the hook points."""
+    """The decisive contract: legacy reaches the new tree ONLY at the hook points.
+
+    EQUALITY, not containment.  While the lanes were landing separately this was
+    written as a subset so it would not fail before lane C existed, and a subset
+    is the weaker half of the claim: it catches a legacy file that starts
+    importing the new tree, and says nothing about one that quietly stops.  Both
+    directions matter now.  A file dropping out of this set means a hook point
+    was deleted, which is exactly how phase 1 would decay into a diagnostic
+    surface that compiles, passes, and observes nothing.
+    """
     importers = {
         str(path.relative_to(SRC))
         for path in _legacy_files()
         if _imported_roots(_tree(path)) & NEW_PACKAGES
     }
-    assert importers <= AC11_LEGACY_IMPORTERS, sorted(importers - AC11_LEGACY_IMPORTERS)
-    assert LANE_B_IMPORTERS <= importers, sorted(LANE_B_IMPORTERS - importers)
+    unexpected = sorted(importers - AC11_LEGACY_IMPORTERS)
+    missing = sorted(AC11_LEGACY_IMPORTERS - importers)
+    assert importers == AC11_LEGACY_IMPORTERS, f"unexpected={unexpected} missing={missing}"
 
 
 def test_the_new_tree_never_imports_legacy() -> None:

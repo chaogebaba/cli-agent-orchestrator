@@ -157,3 +157,370 @@ owner     = "F487-r2"
 filed     = "2026-08-26"
 expires   = "2026-09-25"
 review_by = "2026-09-25"
+
+
+# --- WP-ARCH phase 1 (F725 #581): test_f72_fleet_lifecycle.py, whole file ---
+#
+# Root cause (lane A's investigation, confirmed independently by lanes B and C):
+# the module carries its own latent race and it flakes on BASE trees that contain
+# none of the three lanes' code. At :273 it creates a CallbackBarrierModel with
+# `timeout_at=datetime.now(timezone.utc)` — a barrier already expired at the
+# moment of creation — and then asserts at :321 that the barrier reached
+# CANCELLED; whether the cancelling path beats the timeout path is a scheduling
+# question. Its final assertions then read rows[0] and rows[1] off an id-ordered
+# query, which is order-sensitive by construction.
+#
+# Evidence that it is not any lane's diff: the `f72_env` fixture (:86) builds an
+# in-memory SQLite engine and monkeypatches SessionLocal onto it, and never starts
+# the FastAPI app — so bootstrap.start_worker_truth never runs, the phase-1 tables
+# are never created in its database, and no new-tree code executes inside it at
+# all. Four distinct tests in the file failed sporadically across two lanes, two
+# of them on base arms, and two base arms disagreed with each other about which
+# failed. All passed 5/5 when re-run in isolation.
+#
+# WHOLE FILE, and enumerated from `pytest --collect-only`, not from the source.
+# test/plugins/quarantine.py matches `item.nodeid` by exact dict lookup, so a
+# single file-level entry would be silently inert — the #559 failure mode, a rule
+# that looks configured and never applies. Three of these tests are PARAMETRIZED
+# and collect as 10 distinct nodeids with `[...]` suffixes; entries written from
+# the function names alone would have left those 10 unquarantined while looking
+# complete. 37 collected nodeids, 37 entries. Regenerate the same way.
+#
+# Class is `xdist_flaky`, which SERIALIZES rather than deselects, so every test
+# still runs and coverage is unchanged.
+#
+# Burn-down: fix the already-expired barrier and the positional row assertions,
+# then delete this block. Filed against the fix issue, not against WP-ARCH.
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_cascade_reaps_four_children_depth_first_and_releases_success_lease"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_cascade_is_children_before_parent_at_every_depth"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_orphan_reparents_both_edges_records_origin_and_rewrites_tmux_cache"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_sticky_cut_is_named_and_force_overrides"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_skipped_child_is_reparented_to_nearest_surviving_mailbox_ancestor"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_ready_base_reason_is_structured_for_descendant_and_root"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_held_rows_readdress_and_terminal_owned_barrier_releases_members"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_uncertain_kill_stops_keeps_row_and_releases_quarantine_exit_lease"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_uncertain_walk_is_idempotent_both_before_and_after_confirmed_death"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_busy_descendant_is_named_and_all_held_rows_leave_held_state"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_mailbox_owned_barrier_survives_bound_terminal_reap"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_authority_abort_releases_lease_and_self_delete_is_refused"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fallback_settlement_repoints_children_in_same_transaction"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_legacy_fallback_husk_edges_are_migrated"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fleet_is_one_bulk_inventory_with_dangling_parent_and_no_body_fields"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fleet_reports_exact_multilevel_depths"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fleet_since_last_input_treats_naive_db_clock_as_utc"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_f467_since_last_input_correct_regardless_of_host_tz[America/New_York--4]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_f467_since_last_input_correct_regardless_of_host_tz[Asia/Kolkata-5.5]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_f467_since_last_input_correct_regardless_of_host_tz[Europe/Berlin-2]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_f467_since_last_input_correct_regardless_of_host_tz[Pacific/Auckland-12]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fleet_drill_projection_is_under_8192_bytes_with_profile_count_recorded"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_depth_cap_cuts_and_names_the_remaining_subtree"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_restore_is_named_unmanaged_exception_under_exclusive_lease"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_mode_matrix_before_and_after_publication[cold]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_mode_matrix_before_and_after_publication[fork]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_mode_matrix_before_and_after_publication[resume]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_prepublication_failure_releases_local_authority[cold]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_prepublication_failure_releases_local_authority[fork]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_managed_create_prepublication_failure_releases_local_authority[resume]"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_fork_create_started_after_quiesce_snapshot_is_blocked"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_collision_quiesces_first_refuses_once_and_deletes_nothing"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_ac13_held_row_target_exists_after_delete"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_ac13_no_surviving_ancestor_cancels_with_reason"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_ac15_barrier_cancelled_before_terminal_row_removed"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_ac14_cascade_parent_with_n_children_leaves_zero_held_rows"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
+
+[[entry]]
+nodeid    = "test/services/test_f72_fleet_lifecycle.py::test_delete_terminal_forgets_pane_liveness_and_question_state"
+class     = "xdist_flaky"
+reason    = "F725 #581: file-wide race — barrier created already-expired at :273 then asserted CANCELLED at :321; final assertions index rows[0]/rows[1] of an id-ordered query. Flakes on base trees containing no WP-ARCH code."
+owner     = "WP-ARCH-p1-train"
+filed     = "2026-09-03"
+expires   = "2026-10-03"
+review_by = "2026-10-03"
