@@ -62,6 +62,14 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
     # stronger than the old aggregate bound.
     branches = ["joined_ready", "mutation_in_flight"] * 30
 
+    # Every bound below that is NOT the thing under test is generous, so a
+    # loaded box can never be the reason the probe fails. The one deliberately
+    # tiny budget is the 10 ms quiesce timeout on the mutation_in_flight branch,
+    # and CPU contention only makes that timeout more certain, never less.
+    # Ample = "no scheduler this side of a hang reaches it"; these are ceilings
+    # on failure paths, so they cost nothing on a green run.
+    AMPLE_S = 30.0
+
     for iteration, branch in enumerate(branches):
         terminal_id = f"ready-edge-{iteration}"
         db.create_terminal(
@@ -81,7 +89,7 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
 
         def blocked_commit(connection):
             entered.set()
-            release.wait(1)
+            release.wait(AMPLE_S)
             original_do_commit(connection)
 
         monkeypatch.setattr(isolated_db.dialect, "do_commit", blocked_commit)
@@ -103,14 +111,14 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
                 "init_deadline_s": 3.0,
             },
         )
-        assert await asyncio.to_thread(entered.wait, 1)
+        assert await asyncio.to_thread(entered.wait, AMPLE_S)
         record = terminals._deferred_tasks_by_terminal[terminal_id]
         registered_call = record.current_call
         assert registered_call is not None
 
         if branch == "joined_ready":
             release.set()
-            timeout_s = 5.0
+            timeout_s = AMPLE_S
         else:
             timeout_s = 0.010
         try:
@@ -132,7 +140,7 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
         # iteration 25 of 60 on an unloaded laptop). Wait for the settled state
         # itself, bounded generously: the probe's claim is that exactly one
         # lawful owner settles the row, not that it settles within 200 ms.
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + AMPLE_S
         while time.monotonic() < deadline:
             if registered_call.future.done():
                 db.invalidate_terminal_metadata_cache(terminal_id)
