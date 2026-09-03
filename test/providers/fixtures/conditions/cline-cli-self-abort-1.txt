@@ -1,0 +1,16 @@
+I'll run the `sleep 1` command six times, one at a time as requested.
+[run_commands] sleep 1
+   ⎿ ok
+Run 1 of 6 complete.
+[run_commands] sleep 1
+   ⎿ ok
+Run 2 of 6 complete.
+[run_commands] sleep 1
+   ⎿ ok
+Run 3 of 6 complete.
+[run_commands] sleep 1
+   ⎿ ok
+Run 4 of 6 complete.
+[run_commands] sleep 1
+   ⎿ ok
+[abort] aborted by another client

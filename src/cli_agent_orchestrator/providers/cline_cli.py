@@ -101,15 +101,47 @@ ERROR_PATTERN = (
     r")$"
 )
 
-# Cline prints this when a run ends with finishReason "aborted" and the CLI
-# process itself did not request the abort.  In the shipped bundle the text is
-# the *fallback* branch of:
+# F738 (#595): loop guard, injected into EVERY CAO cline worker's system prompt
+# by ``_build_base_args`` (never carried by an individual profile, where it could
+# be forgotten).  Two sentences; see the ABORT_LINE block below for why.
+LOOP_GUARD_CLAUSE = (
+    "LOOP GUARD: never issue the same shell command twice in a row with "
+    "byte-identical text — when polling or waiting, vary every call, for "
+    "example by appending `; echo poll-<n>` with an incrementing n. "
+    "Cline's loop detector aborts the whole session after five consecutive "
+    "byte-identical tool calls, and that abort loses the run."
+)
+
+# F738 (#595) — root-caused 2026-09-02 against cline core 0.0.82.
+#
+# "aborted by another client" is a MISNOMER: there is no other client, and no
+# hub is involved (a CAO worker always passes --data-dir, which sets the CLI's
+# `sandbox` flag, which forces the in-process backend — it never connects to the
+# hub daemon).  The line is the unconditional fallback arm of the CLI's
 #     if (timedOut)       -> "aborted after timeout"
 #     else if (aborted)   -> "aborted"
 #     else                -> "aborted by another client"
-# so the wording is a guess, not a detection — there is no other client.  What
-# it does reliably mean is that the run produced no answer, so the terminal must
-# not be reported COMPLETED.
+# so it is printed whenever the runtime returns finishReason "aborted" for any
+# reason the CLI process did not itself initiate (SIGINT/SIGTERM/--timeout).
+#
+# What actually fires it: cline's own LOOP DETECTOR.  Five consecutive
+# byte-identical tool calls (a poll loop such as `sleep 28; <same check>`) trip a
+# hard escalation, which FORCES the consecutive-mistake counter straight to its
+# limit (3 — `maxConsecutiveMistakes: n.retries ?? 3`) rather than incrementing
+# it, so --retries buys no headroom.  Under `--auto-approve true` the limit
+# handler can only return "stop", so the runtime aborts itself.
+#
+# There is no CLI flag that disables this: `loopDetection: false` exists in the
+# runtime config schema but is not plumbed to any flag, and `--retries 0` is
+# rejected (the parser requires >= 1).  The only lever CAO holds is the loop
+# SIGNATURE — hence LOOP_GUARD_CLAUSE above, which tells the agent to vary
+# consecutive commands.
+#
+# The run produced no answer, so the terminal must not be reported COMPLETED;
+# cline preserves session state across this abort ("Session state was preserved.
+# Send a new prompt to resume from the latest state."), so the correct handling
+# is a typed, re-dispatchable condition (F611 TRANSIENT_OVERLOAD /
+# `self_abort_loop_limit`) rather than a silent IDLE.
 ABORT_LINE = "[abort] aborted by another client"
 
 # Keep an abort visible for two full agent-step polling periods before closing
@@ -561,8 +593,13 @@ class ClineCliProvider(BaseProvider):
 
         system_prompt = profile.system_prompt if profile and profile.system_prompt else ""
         system_prompt = self._apply_skill_prompt(system_prompt)
-        if system_prompt:
-            command_parts.extend(["-s", system_prompt])
+        # F738 (#595): the loop guard is injected HERE, by the provider, so that
+        # every CAO cline worker carries it regardless of profile — a profile
+        # can be added or edited without it, the provider cannot be forgotten.
+        # Appended last so it is the final word in the system prompt, and
+        # unconditionally (a worker with no profile prompt still needs it).
+        system_prompt = (system_prompt + "\n\n" + LOOP_GUARD_CLAUSE).strip()
+        command_parts.extend(["-s", system_prompt])
 
         # D1/D3: sandbox mode via --data-dir
         command_parts.extend(["--data-dir", str(self._data_dir())])
@@ -717,9 +754,15 @@ class ClineCliProvider(BaseProvider):
                 if not non_authoritative and occurrences > self._abort_reported_occ:
                     self._abort_reported_occ = occurrences
                     self._abort_reported_at = now
+                    # F738 (#595): name the REAL cause. The pane text blames
+                    # "another client"; there is none (see ABORT_LINE above).
                     logger.warning(
-                        "cline worker %s: run aborted (cline reported %r); "
-                        "no answer was produced",
+                        "cline worker %s: cline self-aborted its run — loop "
+                        "detector hard threshold (5 consecutive byte-identical "
+                        "tool calls) or the consecutive-mistake limit; no other "
+                        "client is involved. No answer was produced; cline "
+                        "preserved session state, so re-dispatching the same "
+                        "message resumes it. Pane line: %r",
                         self.terminal_id,
                         ABORT_LINE,
                     )
