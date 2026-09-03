@@ -28,7 +28,6 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class EnrollmentAuthority:
     """Immutable authority tuple pinned at FIFO enrollment time (D19)."""
-
     terminal_id: str
     terminal_generation: int | None
     incarnation_id: str | None  # None = explicit process-less marker
@@ -109,7 +108,7 @@ def _f138_is_durable_detail(detail: str) -> bool:
         return True
     # Parse "incarnation_state=<value>" exactly (no substring match).
     if detail.startswith("incarnation_state="):
-        state_value = detail[len("incarnation_state=") :]
+        state_value = detail[len("incarnation_state="):]
         return state_value in _F138_DURABLE_STATES
     return False
 
@@ -542,7 +541,9 @@ class FifoManager:
         if thread is not None:
             thread.join(timeout=2.0)
 
-    def _bound_probe_failure(self, terminal_id: str, dispatch_epoch: int | None = None) -> None:
+    def _bound_probe_failure(
+        self, terminal_id: str, dispatch_epoch: int | None = None
+    ) -> None:
         """#598: Bound the probe-throws-because-gone liveness storm.
 
         The session/window/whole tmux server is gone, so probe() raises
@@ -604,8 +605,7 @@ class FifoManager:
             except Exception:
                 logger.warning(
                     "f218_confirmed_gone_pipeline_outer_failed: terminal=%s",
-                    terminal_id,
-                    exc_info=True,
+                    terminal_id, exc_info=True,
                 )
 
             # D20: Report BEFORE unenroll — uses pinned authority.
@@ -654,19 +654,14 @@ class FifoManager:
 
                 backend = TmuxBackend()
                 scope_probe = backend.session_scope_probe(
-                    session_name,
-                    window_name=window_name,
-                    samples=samples,
-                    timeout_s=timeout_s,
+                    session_name, window_name=window_name,
+                    samples=samples, timeout_s=timeout_s,
                 )
 
                 logger.info(
                     "f218_scope_probe terminal=%s session=%s hint=%s scope=%s samples=%d "
                     "session_present=%s siblings=%s elapsed=n/a",
-                    terminal_id,
-                    session_name,
-                    scope_hint,
-                    scope_probe.scope,
+                    terminal_id, session_name, scope_hint, scope_probe.scope,
                     scope_probe.samples,
                     scope_probe.session_present,
                     len(scope_probe.sibling_windows) if scope_probe.sibling_windows else 0,
@@ -681,15 +676,8 @@ class FifoManager:
                 )
 
                 forensics_enabled = bool(ConfigService.get("forensics.tombstone_enabled", True))
-                incarnation_id = (
-                    authority.incarnation_id
-                    or f"processless:{terminal_id}:{authority.terminal_generation}"
-                )
-                token_hash = (
-                    self._f138_get_token_hash(authority.incarnation_id)
-                    if authority.incarnation_id
-                    else None
-                )
+                incarnation_id = authority.incarnation_id or f"processless:{terminal_id}:{authority.terminal_generation}"
+                token_hash = self._f138_get_token_hash(authority.incarnation_id) if authority.incarnation_id else None
 
                 # Resolve session incarnation (D15: total, never None)
                 try:
@@ -746,8 +734,7 @@ class FifoManager:
             # D11: pipeline failures never block reconciliation
             logger.warning(
                 "f218_confirmed_gone_pipeline_failed: terminal=%s",
-                terminal_id,
-                exc_info=True,
+                terminal_id, exc_info=True,
             )
 
     def _f138_report_confirmed_gone(self, terminal_id: str, source: str) -> bool:
@@ -855,7 +842,11 @@ class FifoManager:
             )
 
             with SessionLocal() as db:
-                inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
+                inc = (
+                    db.query(ProcessIncarnationModel)
+                    .filter_by(id=incarnation_id)
+                    .one_or_none()
+                )
                 if inc and hasattr(inc, "token_hash"):
                     return inc.token_hash or "unknown"
         except Exception:
@@ -991,8 +982,9 @@ class FifoManager:
                         return  # Stale — discard
             # D15: Classify ValueError shapes from get_history().
             msg = str(ve)
-            if (msg.startswith("Session '") and msg.endswith("' not found")) or (
-                "not found in session '" in msg and msg.startswith("Window '")
+            if (
+                (msg.startswith("Session '") and msg.endswith("' not found"))
+                or ("not found in session '" in msg and msg.startswith("Window '"))
             ):
                 # Definitive absence — session/window genuinely gone.
                 # D1: Derive hint from the string shape (stored, never acted on).

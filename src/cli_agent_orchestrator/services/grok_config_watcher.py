@@ -60,6 +60,7 @@ def _routing_fingerprint(text: str) -> dict | None:
     return fp
 
 
+
 def _canonical_config_path() -> Path:
     """Return the canonical grok config path."""
     return provider_home("grok_cli").home / "config.toml"

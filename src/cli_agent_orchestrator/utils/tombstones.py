@@ -20,16 +20,13 @@ from pathlib import Path
 
 _ARMED: bool = os.environ.get("CAO_TOMBSTONES", "1") != "0"
 
-_LEDGER: Path = (
-    Path(
-        os.environ.get("CAO_TOMBSTONE_DIR")
-        or os.path.join(
-            os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-            "cao-tombstones",
-        )
+_LEDGER: Path = Path(
+    os.environ.get("CAO_TOMBSTONE_DIR")
+    or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "cao-tombstones",
     )
-    / "fired.jsonl"
-)
+) / "fired.jsonl"
 
 # ── Build identity (observed from the running module) ──────────────────
 

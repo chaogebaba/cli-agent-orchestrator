@@ -313,7 +313,7 @@ class NudgeDiscipline:
 
         # A1-D1: Floor-clamped Full Jitter
         # ceiling = min(cap, base * 2^step)
-        ceiling = min(BACKOFF_CAP, BACKOFF_BASE * (2**step))
+        ceiling = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** step))
         # floor = base (always 30s minimum spacing)
         floor = BACKOFF_BASE
         # n=0: ceiling = min(120, 30*1) = 30, floor = 30 → exactly 30s

@@ -373,12 +373,7 @@ _CLI_BACKENDS: "dict[str, _CliBackend]" = {
         # --tools "" disables every built-in tool for the run.
         # --model pins to the cheap tier (F277).
         build_argv=lambda prompt, outfile: [
-            "claude",
-            "-p",
-            "--tools",
-            "",
-            "--model",
-            _F277_BACKGROUND_MODEL,
+            "claude", "-p", "--tools", "", "--model", _F277_BACKGROUND_MODEL,
         ],
         stdin_for=lambda prompt: prompt,
         uses_outfile=False,

@@ -133,7 +133,9 @@ class DoorbellCoalesceService:
         def _schedule() -> None:
             buf = self._buffers.get(terminal_id)
             if buf is not None:
-                buf.timer_handle = loop.call_later(delay, self._on_timer_fire, terminal_id)
+                buf.timer_handle = loop.call_later(
+                    delay, self._on_timer_fire, terminal_id
+                )
 
         try:
             loop.call_soon_threadsafe(_schedule)
@@ -211,8 +213,9 @@ class DoorbellCoalesceService:
                 preview = f"(row {intent.max_written_row_id})"
             summary_lines.append(f"- [{sender}] {preview}")
 
-        combined_body = f"[cao-fleet] {len(intents)} callbacks coalesced:\n" + "\n".join(
-            summary_lines
+        combined_body = (
+            f"[cao-fleet] {len(intents)} callbacks coalesced:\n"
+            + "\n".join(summary_lines)
         )
 
         # Append full bodies (truncated) for each

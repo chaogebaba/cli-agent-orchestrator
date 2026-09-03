@@ -226,7 +226,8 @@ def collect_memory_evidence(cgroup_path: str | None) -> MemoryEvidence:
             pass
 
         has_any = any(
-            v is not None for v in (memory_events_json, memory_current, memory_peak, memory_max)
+            v is not None
+            for v in (memory_events_json, memory_current, memory_peak, memory_max)
         )
         return MemoryEvidence(
             memory_events_json=memory_events_json,
@@ -286,7 +287,9 @@ def record(
             reason="forensics_disabled" if not forensics_enabled else "no_evidence_path",
         )
 
-    complete = (proc_ev.status == "ok" or proc_ev.status == "not_applicable") and (
+    complete = (
+        proc_ev.status == "ok" or proc_ev.status == "not_applicable"
+    ) and (
         mem_ev.status == "ok" or mem_ev.status == "not_applicable"
     )
 

@@ -110,14 +110,15 @@ def advertise_capability(mcp: Any) -> None:
 
         class McpAppsExtension(ServerExtension):
             """SEP-2133 extension for MCP Apps (io.modelcontextprotocol/ui)."""
-
             identifier = EXTENSION_ID
 
             def settings(self) -> Dict[str, Any]:
                 return {"mimeTypes": ["text/html;profile=mcp-app"]}
 
         mcp.add_extension(McpAppsExtension())
-        logger.info("SEP-2133: registered %s extension (capabilities.extensions)", EXTENSION_ID)
+        logger.info(
+            "SEP-2133: registered %s extension (capabilities.extensions)", EXTENSION_ID
+        )
     except Exception:
         logger.warning(
             "SEP-2133: failed to register ServerExtension for %s; "
@@ -131,14 +132,15 @@ def advertise_capability(mcp: Any) -> None:
         experimental = getattr(mcp, "experimental_capabilities", None)
         if experimental is not None:
             experimental.update(SERVER_EXTENSION_CAPABILITY)
-            logger.info("SEP-2133: mirrored %s into experimental_capabilities", EXTENSION_ID)
+            logger.info(
+                "SEP-2133: mirrored %s into experimental_capabilities", EXTENSION_ID
+            )
         else:
             # FastMCP instance has no experimental_capabilities attribute;
             # fall back to the legacy monkey-patch if _mcp_server is available
             logger.debug(
                 "SEP-2133: no experimental_capabilities attr on %r; "
-                "legacy clients may not see the advertisement",
-                mcp,
+                "legacy clients may not see the advertisement", mcp
             )
     except Exception:
         logger.warning(

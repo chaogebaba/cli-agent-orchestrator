@@ -596,8 +596,6 @@ def _is_codex_paste_chip_chrome(draft: str) -> bool:
     if not draft:
         return False
     return CODEX_PASTE_CHIP_LEAD_PATTERN.match(draft.strip()) is not None
-
-
 # Grace before the first submission check: give the TUI a beat to register the
 # paste and process the submit Enter under load.
 CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
@@ -1645,7 +1643,8 @@ class CodexProvider(BaseProvider):
             if isinstance(rendered, str) and _codex_tui_is_ready_for_submit(rendered):
                 if waited:
                     logger.info(
-                        "F643c readiness gate: terminal %s TUI ready; proceeding " "with paste",
+                        "F643c readiness gate: terminal %s TUI ready; proceeding "
+                        "with paste",
                         self.terminal_id,
                     )
                 return

@@ -133,7 +133,7 @@ class HermesProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, "_resolved_model", None)
+        return getattr(self, '_resolved_model', None)
 
     @property
     def paste_enter_count(self) -> int:
@@ -270,7 +270,6 @@ class HermesProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return Hermes idle prompt pattern for log file monitoring."""
         from cli_agent_orchestrator.utils.tombstones import tombstone
-
         tombstone("TS-0002e")
         return IDLE_PROMPT_PATTERN_LOG
 

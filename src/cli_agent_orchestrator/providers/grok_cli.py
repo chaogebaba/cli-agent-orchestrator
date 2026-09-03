@@ -357,7 +357,13 @@ class GrokCliProvider(BaseProvider):
         the session, so validate on the session directory plus ANY non-empty seed
         artifact grok writes at startup.
         """
-        session_dir = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid
+        session_dir = (
+            Path.home()
+            / ".grok"
+            / "sessions"
+            / quote(cwd, safe="")
+            / session_uuid
+        )
         # The directory itself is the earliest liveness signal grok emits; before
         # it exists the session has not started, so keep retrying until the deadline.
         if not session_dir.is_dir():

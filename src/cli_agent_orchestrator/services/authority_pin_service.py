@@ -283,6 +283,7 @@ def verify_pin(file_path: str) -> dict[str, Any]:
     }
 
 
+
 # ─── F129: Frozen-pin registration and validation ───────────────────────────
 
 
@@ -387,9 +388,9 @@ def rotate_frozen_pins(
     validated = _validate_pins(authority_files)
 
     # Step 1: Remove all prior frozen pins for this terminal
-    db.query(dbmod.AuthorityPinModel).filter_by(task_key=task_key, frozen=True).delete(
-        synchronize_session=False
-    )
+    db.query(dbmod.AuthorityPinModel).filter_by(
+        task_key=task_key, frozen=True
+    ).delete(synchronize_session=False)
 
     # Step 2: Register new frozen pins
     results: list[dict[str, Any]] = []
@@ -444,35 +445,20 @@ def validate_frozen_pins(db: Any, sender_id: str) -> FrozenPinValidation:
     for file_path, pin in current_pins.items():
         observed_sha, reason = _hash_file(file_path)
         if reason is not None:
-            results.append(
-                PinCheckResult(
-                    file_path=file_path,
-                    verdict="DRIFT",
-                    expected=pin.sha256,
-                    observed=None,
-                    reason=reason,
-                )
-            )
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="DRIFT",
+                expected=pin.sha256, observed=None, reason=reason,
+            ))
         elif observed_sha != pin.sha256:
-            results.append(
-                PinCheckResult(
-                    file_path=file_path,
-                    verdict="DRIFT",
-                    expected=pin.sha256,
-                    observed=observed_sha,
-                    reason="content",
-                )
-            )
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="DRIFT",
+                expected=pin.sha256, observed=observed_sha, reason="content",
+            ))
         else:
-            results.append(
-                PinCheckResult(
-                    file_path=file_path,
-                    verdict="VALID",
-                    expected=pin.sha256,
-                    observed=observed_sha,
-                    reason=None,
-                )
-            )
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="VALID",
+                expected=pin.sha256, observed=observed_sha, reason=None,
+            ))
 
     drifted = [r for r in results if r.verdict == "DRIFT"]
     if drifted:
@@ -511,7 +497,7 @@ def format_drift_notice(sender_id: str, validation: FrozenPinValidation) -> str:
     for r in validation.drifted:
         reason_str = r.reason or "content"
         expected_short = r.expected[:8] if r.expected else "?"
-        observed_short = r.observed[:8] if r.observed else "none"
+        observed_short = (r.observed[:8] if r.observed else "none")
         lines.append(
             f"DRIFT {r.file_path} expected={expected_short} "
             f"observed={observed_short} reason={reason_str}"

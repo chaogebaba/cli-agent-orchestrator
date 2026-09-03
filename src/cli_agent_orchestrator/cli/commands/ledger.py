@@ -28,7 +28,7 @@ def _extract_ledger_section(text: str) -> str | None:
     if not matches:
         return None
     last = matches[-1]
-    after = text[last.end() :]
+    after = text[last.end():]
     # Find next H2 boundary.
     next_h2 = re.search(r"^## ", after, re.M)
     if next_h2:
@@ -62,9 +62,7 @@ def _parse_bullet_rows(section: str) -> list[tuple[str, str]]:
         if status_match:
             # Feature name is the first meaningful token(s) after the bullet.
             # Typically: "- F213 ... status: PENDING"
-            feature_match = re.match(
-                r"[-*]\s+(.+?)(?:\s+\.{2,}|\s+status:)", stripped, re.IGNORECASE
-            )
+            feature_match = re.match(r"[-*]\s+(.+?)(?:\s+\.{2,}|\s+status:)", stripped, re.IGNORECASE)
             feature = feature_match.group(1).strip() if feature_match else ""
             rows.append((feature, status_match.group(1)))
     return rows
@@ -120,9 +118,7 @@ def check() -> None:
         elif status in _PENDING_STATUSES:
             pending += 1
         else:
-            click.echo(
-                f"warning: unrecognized ledger status '{raw_status.strip()}' for '{feature}'"
-            )
+            click.echo(f"warning: unrecognized ledger status '{raw_status.strip()}' for '{feature}'")
 
     for feature in stale:
         click.echo(f"warning: POST-RESTART RE-ENTRY names drained feature: {feature}")

@@ -17,12 +17,15 @@ from urllib.request import url2pathname
 
 from cli_agent_orchestrator.constants import SERVER_PORT
 
+
 STAMP_MAGIC = "# CAO_SUITE_LOG_V1"
 STAMP_FIELDS = ("commit", "dirty", "timestamp", "cwd")
 _PYTEST_OUTCOME = re.compile(
     r"(?P<count>\d+)\s+(?P<kind>passed|failed|error|errors|skipped|deselected|xfailed|xpassed)\b"
 )
-_PYTEST_COMPLETION = re.compile(r"\bin\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d{2}:\d{2}\))?\s*$")
+_PYTEST_COMPLETION = re.compile(
+    r"\bin\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d{2}:\d{2}\))?\s*$"
+)
 
 
 class DeploymentStatus(TypedDict):
@@ -34,11 +37,8 @@ class DeploymentStatus(TypedDict):
 
 def git_root(cwd: Path | None = None) -> Path:
     result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-        check=True,
+        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, text=True,
+        capture_output=True, check=True,
     )
     return Path(result.stdout.strip()).resolve()
 
@@ -52,9 +52,7 @@ def _git(root: Path, *args: str) -> str:
 def changed_files(root: Path) -> list[str]:
     output = subprocess.run(
         ["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"],
-        cwd=root,
-        capture_output=True,
-        check=True,
+        cwd=root, capture_output=True, check=True,
     ).stdout
     return sorted({item.decode("utf-8", "surrogateescape") for item in output.split(b"\0") if item})
 
@@ -94,7 +92,7 @@ def parse_stamp(path: Path) -> tuple[dict[str, object], str]:
             if not line.startswith(prefix):
                 raise ValueError(f"missing stamp field: {field}")
             try:
-                stamp[field] = json.loads(line[len(prefix) :])
+                stamp[field] = json.loads(line[len(prefix):])
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid stamp field: {field}") from exc
         if stream.readline() != "\n":
@@ -159,11 +157,8 @@ def run_suite(feature: str, stdout: IO[str]) -> tuple[int, Path, str]:
     try:
         with raw_path.open("w", encoding="utf-8") as raw:
             process = subprocess.Popen(
-                ["uv", "run", "pytest"],
-                cwd=root,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                ["uv", "run", "pytest"], cwd=root, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
             assert process.stdout is not None
             for line in process.stdout:
@@ -221,13 +216,8 @@ def installed_package_root() -> Path | None:
         return None
     python = first[0][2:].strip()
     result = subprocess.run(
-        [
-            python,
-            "-c",
-            "import pathlib,cli_agent_orchestrator as p; print(pathlib.Path(p.__file__).parent)",
-        ],
-        text=True,
-        capture_output=True,
+        [python, "-c", "import pathlib,cli_agent_orchestrator as p; print(pathlib.Path(p.__file__).parent)"],
+        text=True, capture_output=True,
     )
     return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
 
@@ -262,7 +252,9 @@ def cli_deploy_root(repo_root: Path) -> Path:
     return root
 
 
-def compare_installed(root: Path, installed: Path) -> tuple[str, int | None, float | None]:
+def compare_installed(
+    root: Path, installed: Path
+) -> tuple[str, int | None, float | None]:
     source = root / "src" / "cli_agent_orchestrator"
     newest = max((p.stat().st_mtime for p in installed.rglob("*.py")), default=None)
     if not source.is_dir():
@@ -278,18 +270,19 @@ def compare_installed(root: Path, installed: Path) -> tuple[str, int | None, flo
 
 
 def listening_pid(port: int) -> int | None:
-    result = subprocess.run(["ss", "-ltnp", f"sport = :{port}"], text=True, capture_output=True)
-    match = re.search(r"pid=(\d+)", result.stdout)
+    result = subprocess.run(
+        ["ss", "-ltnp", f"sport = :{port}"], text=True, capture_output=True
+    )
+    match = re.search(r'pid=(\d+)', result.stdout)
     return int(match.group(1)) if match else None
 
 
 def process_start_time(pid: int) -> float | None:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-        ticks = int(stat[stat.rfind(")") + 2 :].split()[19])
+        ticks = int(stat[stat.rfind(")") + 2:].split()[19])
         boot = next(
-            int(line.split()[1])
-            for line in Path("/proc/stat").read_text().splitlines()
+            int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
             if line.startswith("btime ")
         )
         return boot + ticks / os.sysconf("SC_CLK_TCK")
@@ -310,11 +303,7 @@ def deployment_status(repo_root: Path) -> DeploymentStatus:
         server = "not-running"
     else:
         started = process_start_time(pid)
-        server = (
-            "unknown"
-            if started is None or newest is None
-            else ("restart-needed" if newest > started else "current")
-        )
+        server = "unknown" if started is None or newest is None else ("restart-needed" if newest > started else "current")
     return {
         "cli_path": state,
         "differing_files": count,
@@ -333,7 +322,9 @@ def format_server_status(
     if server == "current" and restarted:
         return f"server: current (restarted and listening on :{SERVER_PORT})"
     if server == "not-running":
-        elapsed = f" after {timeout_seconds}s" if timeout_seconds is not None else ""
+        elapsed = (
+            f" after {timeout_seconds}s" if timeout_seconds is not None else ""
+        )
         return (
             f"server: not-running (no listener on :{SERVER_PORT}{elapsed} - check: "
             "systemctl --user status cao-server; "

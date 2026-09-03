@@ -127,7 +127,9 @@ class MockCliProvider(BaseProvider):
         # - process-less: needs baseline (no child starts, pane stays at shell)
         # - spawn-then-fault: faults before identity persist; capture is harmless
         try:
-            baseline = get_backend().get_pane_current_command(self.session_name, self.window_name)
+            baseline = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
         except Exception:
             baseline = None
         if baseline:
@@ -200,6 +202,7 @@ class MockCliProvider(BaseProvider):
             self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=15.0
         ):
             raise TimeoutError("mock_cli initialization timed out after 15 seconds")
+
 
         # ARM7: configurable startup delay — creates timing window for
         # crash-restart-with-pending-job tests
@@ -396,7 +399,6 @@ class MockCliProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         from cli_agent_orchestrator.utils.tombstones import tombstone
-
         tombstone("TS-0002a")
         return IDLE_PROMPT_PATTERN_LOG
 

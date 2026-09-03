@@ -627,7 +627,9 @@ class ConditionDelivery:
             # F642 AC24: the gate still writes a `gated` decision row — the one
             # routing outcome that would otherwise be invisible everywhere. It is
             # SKIPPED by the de-dup comparison (it moves no memory).
-            self._record(terminal_id, "gated", cond.kind.value, cond.subtype, epoch)
+            self._record(
+                terminal_id, "gated", cond.kind.value, cond.subtype, epoch
+            )
             return DeliveryResult(False, None, 0, "confidence_below_gate")
         label = self._fleet_label(cond)
         key = (cond.kind.value, cond.subtype, epoch)

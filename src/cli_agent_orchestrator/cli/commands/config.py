@@ -126,9 +126,7 @@ def preflight_cmd(activation: bool, use_json: bool):
         click.echo(json.dumps(output, indent=2))
     else:
         status = "PASS" if result.ok else "FAIL"
-        click.echo(
-            f"{status} — mode={result.mode} version={result.version} policy={result.version_policy}"
-        )
+        click.echo(f"{status} — mode={result.mode} version={result.version} policy={result.version_policy}")
         for check in result.checks:
             marker = "✓" if check.ok else "✗"
             line = f"  {marker} {check.code}"
