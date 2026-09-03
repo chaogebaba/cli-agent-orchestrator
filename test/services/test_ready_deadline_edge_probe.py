@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -38,13 +39,30 @@ def isolated_db(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_ready_completion_at_deadline_has_one_lawful_owner(
-    isolated_db, monkeypatch,
+    isolated_db,
+    monkeypatch,
 ):
     original_do_commit = isolated_db.dialect.do_commit
     outcomes: list[str] = []
     monkeypatch.setattr(terminals, "_confirm_launch_health", AsyncMock())
 
-    for iteration in range(60):
+    # F153 (#17): the branch taken on each iteration is CHOSEN, not raced.
+    # The probe previously started a threading.Timer with a 5/10/15 ms delay
+    # against a 10 ms quiesce budget and asserted only that both branches
+    # appeared at least 15 times in 60 runs — a distribution that depends on
+    # scheduler jitter and flaked under load. Release sequencing now decides the
+    # branch up front:
+    #   joined_ready       — the blocked commit is released BEFORE quiesce runs
+    #                        and quiesce is given a budget it cannot miss, so it
+    #                        must join the decided commit.
+    #   mutation_in_flight — the commit stays blocked across a 10 ms budget, so
+    #                        quiesce must time out with the mutation in flight.
+    # Every post-condition the probe cared about is unchanged and now asserted
+    # per iteration against the branch that was chosen, which is strictly
+    # stronger than the old aggregate bound.
+    branches = ["joined_ready", "mutation_in_flight"] * 30
+
+    for iteration, branch in enumerate(branches):
         terminal_id = f"ready-edge-{iteration}"
         db.create_terminal(
             terminal_id,
@@ -68,7 +86,9 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
 
         monkeypatch.setattr(isolated_db.dialect, "do_commit", blocked_commit)
         provider = SimpleNamespace(
-            initialize=AsyncMock(), supports_reauth_rebind=False, shell_baseline=None,
+            initialize=AsyncMock(),
+            supports_reauth_rebind=False,
+            shell_baseline=None,
         )
         terminals._schedule_deferred_init(
             provider,
@@ -88,30 +108,41 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
         registered_call = record.current_call
         assert registered_call is not None
 
-        delay = (0.005, 0.010, 0.015)[iteration % 3]
-        timer = threading.Timer(delay, release.set)
-        timer.start()
+        if branch == "joined_ready":
+            release.set()
+            timeout_s = 5.0
+        else:
+            timeout_s = 0.010
         try:
-            await terminals.quiesce_deferred_terminal(terminal_id, timeout_s=0.010)
+            await terminals.quiesce_deferred_terminal(terminal_id, timeout_s=timeout_s)
         except RuntimeError as exc:
             assert str(exc) == "quiesce_timeout_mutation_in_flight"
             outcomes.append("mutation_in_flight")
         else:
             outcomes.append("joined_ready")
         finally:
-            timer.join(1)
             release.set()
+        assert outcomes[-1] == branch, f"iteration {iteration} took the unchosen branch"
 
-        for _ in range(200):
+        # F153 (#17): settling is asynchronous on BOTH branches — on the
+        # mutation_in_flight branch the row is written by the late reconciler,
+        # which runs after the call future resolves. The old probe waited a
+        # fixed 200 x 1 ms only for the future and then read the row, so a
+        # reconciler that had not yet committed failed the run (observed at
+        # iteration 25 of 60 on an unloaded laptop). Wait for the settled state
+        # itself, bounded generously: the probe's claim is that exactly one
+        # lawful owner settles the row, not that it settles within 200 ms.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
             if registered_call.future.done():
-                break
+                db.invalidate_terminal_metadata_cache(terminal_id)
+                if db.get_terminal_metadata(terminal_id)["init_state"] == "ready":
+                    break
             await asyncio.sleep(0.001)
         assert registered_call.future.done()
         assert registered_call.future.exception() is None
         assert registered_call.future.result() is True
+        db.invalidate_terminal_metadata_cache(terminal_id)
         assert db.get_terminal_metadata(terminal_id)["init_state"] == "ready"
 
-    assert outcomes.count("joined_ready") >= 15
-    assert outcomes.count("mutation_in_flight") >= 15
-    assert len(outcomes) == 60
-
+    assert outcomes == branches
