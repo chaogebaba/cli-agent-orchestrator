@@ -279,7 +279,11 @@ class MirrorWriter:
         getter = getattr(self._store, "get_by_legacy_id", None)
         if getter is None:  # pragma: no cover — every real store has it
             return None
-        result = getter(legacy_message_id)
+        try:
+            result = getter(legacy_message_id)
+        except Exception:  # noqa: BLE001 — a READ may not break delivery either
+            logger.debug("delivery mirror lookup failed", exc_info=True)
+            return None
         return result if isinstance(result, QueueMessage) else None
 
     def _record(self, message: QueueMessage, attempt: LegacyAttempt) -> None:
