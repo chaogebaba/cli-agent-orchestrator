@@ -16,9 +16,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-__all__ = ["FleetState", "TerminalState"]
+__all__ = ["FleetState", "StatusClock", "StatusSpell", "TerminalState"]
 
 _EMPTY_MAP: Mapping[str, Any] = MappingProxyType({})
 
@@ -235,3 +235,98 @@ class FleetState:
         wall = time.time() if now is None else now
         stale_for = self.stale_for if self.fetched_at is None else max(0.0, wall - self.fetched_at)
         return replace(self, last_error=msg, stale_for=stale_for)
+
+
+# ─── Time in the current status (F702 #557 "elapsed" round) ───────────────────
+#
+# "How long has this worker been working?" needs the moment a terminal entered
+# the status it is in now. **The server does not publish it.** ``build_fleet()``
+# (``services/fleet_service.py:250-300``) emits no transition timestamp, and the
+# nearest key, ``since_last_input``, comes from the row's ``last_active``, which
+# ``clients/database.py:4842`` writes *only on input delivery* — so it misses a
+# seat a human drove by typing into the pane, which is why F467 marks it
+# unreliable and the retiring script refuses it outright
+# (``scripts/fleet-tui.py:21-22``).
+#
+# The field the server should grow is ``status_since``: the UTC stamp at which
+# ``StatusMonitor`` last changed a terminal's fused status, published next to
+# ``status``. :class:`StatusClock` reads it the moment it appears — until then it
+# watches the fetches go by and times the transitions itself.
+
+
+@dataclass(frozen=True, slots=True)
+class StatusSpell:
+    """One unbroken run of one terminal in one status.
+
+    Attributes:
+        status: the status the terminal has been in since :attr:`since`.
+        since: clock reading of the first fetch that observed this spell.
+        exact: ``True`` when the *transition into* this status was witnessed —
+            the clock had already seen the same terminal in a different status,
+            so ``since`` is right to within one poll interval. ``False`` when the
+            terminal was already in this status the first time it was ever seen,
+            which makes any elapsed time computed from it a lower bound.
+    """
+
+    status: str
+    since: float
+    exact: bool
+
+
+class StatusClock:
+    """Time-in-current-status for every terminal, tracked across fetches.
+
+    Deliberately the only thing in this module that remembers anything between
+    snapshots. It is safe to do so here, and it is not a route back to #439's
+    sticky latch, because of three properties the tests pin:
+
+    * it never reports or influences a *status* — only how long one has lasted,
+      and the status it answers about is always the one in the current snapshot;
+    * a status change replaces the spell outright, so a stale reading cannot
+      survive a transition;
+    * a terminal that leaves the fleet is forgotten entirely.
+
+    The clock keys on ``status`` alone, as the fused status is what the STATUS
+    column shows. A ``condition`` (F611 #467) coming or going is not a
+    transition: a seat that has been ``completed`` for an hour has been
+    completed for an hour whether or not its provider also flagged ``BUSY``
+    somewhere in the middle.
+    """
+
+    __slots__ = ("_spells",)
+
+    def __init__(self) -> None:
+        self._spells: dict[str, StatusSpell] = {}
+
+    def observe(self, terminals: "Sequence[TerminalState]", now: float) -> None:
+        """Fold one snapshot in: open, keep or drop each terminal's spell."""
+        present = set()
+        for term in terminals:
+            present.add(term.id)
+            current = self._spells.get(term.id)
+            if current is not None and current.status == term.status:
+                continue
+            # A terminal already known in another status means the transition
+            # itself was seen, which is what makes the new spell exact.
+            self._spells[term.id] = StatusSpell(term.status, now, current is not None)
+        for gone in set(self._spells) - present:
+            del self._spells[gone]
+
+    def spell(self, terminal_id: str) -> StatusSpell | None:
+        """The open spell of one terminal, or ``None`` if it has none yet."""
+        return self._spells.get(terminal_id)
+
+    def elapsed(self, terminal_id: str, now: float) -> float | None:
+        """Seconds the terminal has been in its current status, or ``None``.
+
+        Never negative: a clock that jumps backwards reads as zero rather than
+        rendering a negative age.
+        """
+        current = self._spells.get(terminal_id)
+        if current is None:
+            return None
+        return max(0.0, now - current.since)
+
+    def tracked(self) -> "frozenset[str]":
+        """The terminal ids with an open spell — the whole of this clock's memory."""
+        return frozenset(self._spells)

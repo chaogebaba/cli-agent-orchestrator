@@ -2,9 +2,10 @@
 
 Two disjoint groups:
 
-* :data:`PARITY_COLUMNS` — the six headers the retiring stdlib script draws,
-  verbatim and in order (root repo ``scripts/fleet-tui.py:344``). They are the
-  default view (AC5).
+* :data:`PARITY_COLUMNS` — the six headers of the retiring stdlib script
+  (root repo ``scripts/fleet-tui.py:344``), in its order. They are the default
+  view (AC5). Five are verbatim; the sixth is ``ELAPSED``, renamed from the
+  script's ``IDLE`` — see :data:`ELAPSED_COLUMN`.
 * :data:`NEW_COLUMNS` — the five keys ``build_fleet()`` publishes that no code
   renders today (blueprint B7). Hidden by default, toggled with ``c``.
 
@@ -16,6 +17,21 @@ from __future__ import annotations
 
 from typing import Final, Tuple
 
+#: The last parity column, renamed from the script's ``IDLE`` (F702 #557
+#: "elapsed" round, user request 2026-09-03).
+#:
+#: The script's column was seconds since the pane last produced output, under a
+#: header that asserted the seat was idle. Both halves misread a busy worker: it
+#: was headed ``IDLE`` whatever the row's status, so a worker six hours into a
+#: task read as "idle 6h". The column now carries time in the CURRENT status —
+#: working, idle, errored or completed alike — so the header has to be
+#: status-neutral. ``ELAPSED`` says what the number is without claiming what the
+#: seat is doing; the STATUS column one place left already says that.
+#:
+#: Position is unchanged: still the sixth and last parity column, still the one
+#: stretched to the screen edge, so no other column moves.
+ELAPSED_COLUMN: Final[str] = "ELAPSED"
+
 #: The six parity headers, in the order of ``scripts/fleet-tui.py:344``.
 PARITY_COLUMNS: Final[Tuple[str, ...]] = (
     "WIN",
@@ -23,7 +39,7 @@ PARITY_COLUMNS: Final[Tuple[str, ...]] = (
     "PROFILE",
     "TASK",
     "STATUS",
-    "IDLE",
+    ELAPSED_COLUMN,
 )
 
 #: The five new columns (blueprint D3): ``condition``, ``delegating``/
