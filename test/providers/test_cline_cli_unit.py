@@ -24,6 +24,7 @@ from cli_agent_orchestrator.providers.cline_cli import (
     CLINE_BINARY,
     DISPATCHER_IDLE_CMD,
     ERROR_PATTERN,
+    LOOP_GUARD_CLAUSE,
     SCRATCH_DIR,
     ClineCliProvider,
     _build_dispatcher_script,
@@ -170,7 +171,10 @@ class TestClineCliBaseArgs:
         assert "-i" not in parts
         # No -m without model override
         assert "-m" not in parts
-        assert "-s" not in parts
+        # F738 (#595): -s is now ALWAYS passed — with no profile prompt it
+        # carries the provider-injected loop guard on its own.
+        assert "-s" in parts
+        assert parts[parts.index("-s") + 1] == LOOP_GUARD_CLAUSE
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
@@ -202,7 +206,9 @@ class TestClineCliBaseArgs:
         parts = shlex.split(args)
 
         assert "-s" in parts
-        assert parts[parts.index("-s") + 1] == "You are a test agent."
+        # F738 (#595): the profile prompt is preserved verbatim and the
+        # provider-injected loop guard is appended after it.
+        assert parts[parts.index("-s") + 1] == "You are a test agent.\n\n" + LOOP_GUARD_CLAUSE
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")

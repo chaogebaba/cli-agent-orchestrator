@@ -226,6 +226,15 @@ _KIRO_TRAFFIC = re.compile(
     r"experiencing a high volume of traffic\. Try changing the model", re.IGNORECASE
 )
 _CODEX_CAPACITY = re.compile(r"^⚠ Selected model is at capacity", re.IGNORECASE)
+# F738 (#595): cline self-abort. The pane blames "another client", but there is
+# none — it is the fallback arm of cline's abort-reason string, printed when its
+# own loop detector (5 consecutive byte-identical tool calls) or the
+# consecutive-mistake limit aborts the run from inside the same process. It is
+# TRANSIENT_OVERLOAD, not CAPPED/PROC_EXITED: cline preserves session state, so
+# the run is recovered by re-dispatching the same message (policy NONE — this
+# must never rebind a lane or stop-and-ask). Precedence 6 beats BUSY (7), so the
+# abort wins over the `[run_commands]` churn still on the pane above it.
+_CLINE_SELF_ABORT = re.compile(r"\[abort\] aborted by another client")
 
 # BUSY anchors (precedence 7 — last).
 _CODEX_BUSY = re.compile(r"Working \(.*esc to interrupt\)", re.IGNORECASE)
@@ -372,6 +381,17 @@ def _classify_transient(provider: str, brows: List[str]) -> Optional[Condition]:
                 ev,
                 Confidence.HIGH,
                 reset_hint="Try changing the model and re-running your prompt",
+            )
+    if provider == "cline_cli":
+        ev = _first_evidence(brows, _CLINE_SELF_ABORT)
+        if ev:
+            return Condition(
+                ConditionKind.TRANSIENT_OVERLOAD,
+                provider,
+                "self_abort_loop_limit",
+                ev,
+                Confidence.HIGH,
+                reset_hint="re-dispatch the same message; cline preserved session state",
             )
     if provider == "codex":
         for row in brows:
