@@ -176,14 +176,18 @@ def test_the_barrier_cancel_reads_its_ids_before_the_bulk_update() -> None:
         and isinstance(child.func, ast.Name)
         and child.func.id == "_stash_shadow_observation"
     ]
-    updates = [
+    # Anchored on the CANCELLED write, not on ".update() call number one": the
+    # function OPENS with an unrelated bulk update against ``CallbackBarrierModel``
+    # that legitimately precedes the stash, so comparing against the first update
+    # of any kind failed for a reason with nothing to do with the property. The
+    # statement that matters is the one setting the inbox rows CANCELLED, because
+    # that is what makes the selecting predicate stop matching.
+    cancels = [
         child.lineno
         for child in ast.walk(node)
-        if isinstance(child, ast.Call)
-        and isinstance(child.func, ast.Attribute)
-        and child.func.attr == "update"
+        if isinstance(child, ast.Attribute) and child.attr == "CANCELLED"
     ]
-    assert stash and updates
+    assert stash and cancels
     assert min(stash) < min(
-        updates
-    ), "the shadow stash runs after the bulk update, so it records nothing"
+        cancels
+    ), "the shadow stash runs after the rows are cancelled, so it records nothing"
