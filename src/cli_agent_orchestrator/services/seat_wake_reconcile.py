@@ -64,17 +64,6 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _as_utc(value: Any) -> Optional[datetime]:
-    """Normalise a stored datetime to aware-UTC; ``None`` stays ``None``."""
-    if value is None:
-        return None
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
 @dataclass(frozen=True)
 class SeatWakeDecision:
     """One mailbox's outcome for one reconcile tick.
@@ -129,6 +118,16 @@ def _advance_wake_cursor(mailbox_id: str, previous_id: int, new_id: int) -> bool
 
     The compare-and-set on ``previous_id`` means a concurrent claim that
     already advanced the cursor wins and this reconcile does not rewind it.
+
+    ``wake_notified_at`` is deliberately NOT stamped. That column is F476's
+    300 s claim lease, and ``claim_unnotified_wake`` refuses a claim when the
+    lease is fresh AND ``claimed_high_water <= wake_notified_id``
+    (``clients/database.py:11616``). Stamping it here would satisfy both halves
+    at once, so the seat we just woke would call in and be handed
+    ``kind="lease_held"`` with zero rows for the next five minutes -- woken with
+    nothing to drain, which is the failure this reconcile exists to prevent.
+    Advancing the id alone leaves the lease stale, so the seat's own claim
+    proceeds and stamps the lease properly.
     """
     from cli_agent_orchestrator.clients.database import MailboxModel, SessionLocal
 
@@ -140,10 +139,7 @@ def _advance_wake_cursor(mailbox_id: str, previous_id: int, new_id: int) -> bool
                 MailboxModel.wake_notified_id == previous_id,
             )
             .update(
-                {
-                    MailboxModel.wake_notified_id: new_id,
-                    MailboxModel.wake_notified_at: _utcnow(),
-                },
+                {MailboxModel.wake_notified_id: new_id},
                 synchronize_session=False,
             )
         )

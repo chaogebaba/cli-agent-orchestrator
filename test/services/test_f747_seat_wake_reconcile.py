@@ -152,6 +152,24 @@ class TestBatchToOneWake:
 
         assert _wake_cursor(real_sqlite_env) == 4162
 
+    def test_wake_does_not_stamp_the_claim_lease(self, real_sqlite_env, push):
+        """``wake_notified_at`` is F476's 300 s lease, not ours to take.
+
+        Stamping it would make ``claim_unnotified_wake`` answer the seat we
+        just woke with ``lease_held`` and no rows -- woken with nothing to
+        drain, the failure this reconcile exists to prevent.
+        """
+        from cli_agent_orchestrator.clients.database import MailboxModel
+
+        _seed(real_sqlite_env, pending_ids=[4154, 4162])
+
+        reconcile_seat_wakes(now=_NOW)
+
+        with real_sqlite_env["TestSession"]() as db:
+            mailbox = db.query(MailboxModel).filter_by(id=MAILBOX).one()
+            assert mailbox.wake_notified_at is None
+            assert int(mailbox.wake_notified_id) == 4162
+
 
 class TestDedup:
     def test_already_notified_ids_never_wake_again(self, real_sqlite_env, push):
