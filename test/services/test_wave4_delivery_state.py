@@ -984,11 +984,14 @@ def test_probe_16_frozen_drain_sql_fixture_ratios():
     if not shutil.which("sqlite3"):
         pytest.skip("sqlite3 CLI binary not installed (apt install sqlite3)")
     from test.conftest import ROOT_REPO
+
     if ROOT_REPO is None:
         pytest.skip("root repo not found (worktree without .git context)")
     root = ROOT_REPO
     if not (root / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
-        pytest.skip("wave4-drain-metric-fixture.sql not found in root repo orchestrator/blueprints/")
+        pytest.skip(
+            "wave4-drain-metric-fixture.sql not found in root repo orchestrator/blueprints/"
+        )
     command = [
         "sqlite3",
         "-cmd",
@@ -1166,14 +1169,50 @@ def test_livefix_p2_fresh_capture_failure_fails_closed(wave4_db, capture_result)
     assert screen.display == incremental_rows
 
 
-@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/p17-pane-final.txt"))
+def _p17_grok_completed_screen() -> list[str]:
+    """Synthesize the P17 drain shape: a finished grok turn above idle chrome.
+
+    F149 (#16): the original capture (``fixtures/drain-wave4/p17-pane-final.txt``)
+    was a machine-local artifact of the 2026-07-16 drain and is gone from every
+    machine (fx147 empirical gate probe 4). The probe's discriminating content is
+    the SHAPE, not the byte-for-byte pane: a stale spinner high in the scrollback,
+    tool flow rows, then the newest ``Worked for <n>s.`` completion line followed
+    by grok's idle prompt and footer. Synthesizing it here keeps the probe
+    deterministic and machine-independent.
+    """
+    return [
+        "❯ run the queued drain step",
+        "⠋ Thinking",
+        "● read_file(orchestrator/HANDOFF.md)",
+        *[f"flow row {index}" for index in range(24)],
+        "Worked for 1.6s.",
+        "❯",
+        "Grok 4.5 · always-approve · ctrl+o transcript",
+    ]
+
+
+def _f16_grok_processing_tail() -> list[str]:
+    """Synthesize the F16 drain tail: commands still running under a live spinner.
+
+    F149 (#16): same provenance as :func:`_p17_grok_completed_screen` — the
+    original ``fixtures/drain-wave4/f16-tmux-tail.txt`` is gone. The shape under
+    test is a pane whose newest completion-looking row is grok's RUNNING line
+    (``Worked for <n>s. <k> commands still running.``), which must NOT match
+    ``COMPLETION_PATTERN``, plus a live braille spinner that keeps the pane
+    PROCESSING across an animated re-probe.
+    """
+    return [
+        "❯ drain the wave4 backlog",
+        "● bash(scripts/drain.sh)",
+        *[f"flow row {index}" for index in range(22)],
+        "Worked for 2.4s. 2 commands still running.",
+        "⠹ Responding",
+        "Grok 4.5 · always-approve · ctrl+o transcript",
+    ]
+
+
 def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
-    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
-    screen = (
-        (fixture_dir / "p17-pane-final.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
+    screen = _p17_grok_completed_screen()
     provider = _grok()
     classification = provider.classify_screen(screen)
     assert classification.status == TerminalStatus.COMPLETED
@@ -1230,14 +1269,8 @@ def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
     assert incremental_screen.display == screen
 
 
-@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/f16-tmux-tail.txt"))
 def test_livefix_p4_f16_live_pane_remains_processing():
-    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
-    screen = (
-        (fixture_dir / "f16-tmux-tail.txt")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    )
+    screen = _f16_grok_processing_tail()
     classification = _grok().classify_screen(screen)
     assert classification.status == TerminalStatus.PROCESSING
     assert classification.provider_signal == "PROCESSING_PATTERN"

@@ -115,16 +115,16 @@ filed     = "2026-08-18"
 expires   = "2026-09-17"
 review_by = "2026-09-17"
 
-# --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---
-
-[[entry]]
-nodeid    = "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner"
-class     = "serial_only"
-reason    = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
-owner     = "WP-suite-D2"
-filed     = "2026-08-18"
-review_by = "2026-09-17"
-verdict   = "test_ready_completion_at_deadline_has_one_lawful_owner"
+# --- F153 (#17) 2026-09-03: the deadline-edge probe left quarantine ---
+# test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_
+# deadline_has_one_lawful_owner was "serial_only, F262 verdict (d) —
+# irreproducible timing flake". The flake was not irreproducible: the probe
+# raced a threading.Timer against the quiesce budget to pick its branch, and
+# then read the settled row after a fixed 200 ms wait on the call future while
+# the mutation_in_flight branch settles later, via the late reconciler
+# (test_ready_deadline_edge_probe.py:124-143). Both are now deterministic —
+# the branch is chosen, and the probe waits for the settled state itself — so
+# the entry is removed rather than re-dated.
 
 
 # --- F487-r2 S3: xdist-order-sensitive timing/environment tests ---

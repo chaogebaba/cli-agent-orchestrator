@@ -433,6 +433,19 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
 
     # server.py defaults sender_id to "supervisor" when unset
     monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # F550 (#406): the rest of the worker-terminal identity block that CAO
+    # injects alongside CAO_TERMINAL_ID (clients/tmux.py:889-891,
+    # backends/herdr_backend.py:1131-1134). Stripping the id but leaving its
+    # siblings made the isolation half-done: several providers merge
+    # CAO_TERMINAL_TOKEN out of os.environ into the MCP server env they write
+    # (omp.py:199-203, claude_code.py:958, kimi_cli.py:412, cursor_cli.py:528),
+    # so test_omp_unit's expected-env assertion picked up the token of whatever
+    # worker terminal the suite happened to run inside and failed there while
+    # passing in a clean shell (observed 2026-08-28, kiro_dev-e08be272).
+    # Tests that want these set them explicitly after fixture setup.
+    monkeypatch.delenv("CAO_TERMINAL_TOKEN", raising=False)
+    monkeypatch.delenv("CAO_PROCESS_INCARNATION", raising=False)
+    monkeypatch.delenv("CAO_ARTIFACTS_DIR", raising=False)
     # server.py reads these for workflow_return context detection
     monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
     monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
