@@ -389,6 +389,7 @@ dev = [
     # two above -- test/tui/test_fleet_app.py drives the app with Textual's
     # own pilot and must not be a permanently-skipped hole in the baseline.
     "textual>=8,<9",
+    "import-linter>=2.3",
 ]
 
 [tool.black]
@@ -467,3 +468,122 @@ filterwarnings = [
     "ignore::pytest_mock.plugin.PytestMockWarning",
     "ignore:\\[tier-budget WARN\\]:UserWarning",
 ]
+
+# ---------------------------------------------------------------------------------------
+# import-linter — the WP-ARCH package boundaries (F725 #581, blueprint AC9 / audit §2.3).
+#
+# The audit's diagnosis starts here: the fork has no enforceable package boundaries, so all
+# 16 packages form ONE strongly connected component, and every quirk downstream of that
+# (status written from anywhere, a god database, truth growing outside the server) is a
+# symptom. A convention cannot fix that — the convention already existed. These five
+# contracts are the mechanism.
+#
+# import-linter counts a FUNCTION-BODY import exactly as a module-level one, which is what
+# closes the escape hatch the fork currently uses to break its own cycles.
+#
+# The two decisive contracts are `new-code-never-imports-legacy` and `core-is-pure`. The
+# rest keep the composition root honest.
+# ---------------------------------------------------------------------------------------
+[tool.importlinter]
+# `services` and `clients` are listed EXPLICITLY. Both are implicit namespace packages
+# (neither has an __init__.py), and grimp's file walk skips a directory without one — so
+# with the bare root package it analysed 216 modules and saw ZERO of the 132 under
+# `services`, silently making the legacy contracts vacuous for the two largest legacy
+# packages. Measured 2026-09-02: 216 modules before, 348 after. Naming a namespace portion
+# as an extra root package is grimp's supported way to pull it in. If a future package is
+# added without an __init__.py, it must be added here too.
+root_packages = [
+    "cli_agent_orchestrator",
+    "cli_agent_orchestrator.services",
+    "cli_agent_orchestrator.clients",
+]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "layers: edge > app > core"
+type = "layers"
+# The three edge packages are NON-independent siblings (":" not "|"): they already import
+# each other today (api/main.py imports cli.commands.init; cli/commands/mcp_server.py imports
+# mcp_server.server) and that is not what this contract is about. What it forbids is `app`
+# or `core` reaching UP into an edge.
+containers = ["cli_agent_orchestrator"]
+layers = [
+    "api : mcp_server : cli",
+    "app",
+    "core",
+]
+
+[[tool.importlinter.contracts]]
+name = "adapters-are-leaves"
+type = "forbidden"
+source_modules = ["cli_agent_orchestrator.adapters"]
+forbidden_modules = [
+    "cli_agent_orchestrator.app",
+    "cli_agent_orchestrator.api",
+    "cli_agent_orchestrator.services",
+]
+
+# "Legacy" is defined ONCE, here: every pre-existing package except api, mcp_server and cli
+# (blueprint N2). New code may never import it — the strangler only works if the new tree
+# cannot quietly acquire the old tree's dependencies. Legacy importing NEW code is allowed,
+# and is exactly what the seven AC11 hook points do.
+[[tool.importlinter.contracts]]
+name = "new-code-never-imports-legacy"
+type = "forbidden"
+source_modules = [
+    "cli_agent_orchestrator.core",
+    "cli_agent_orchestrator.app",
+    "cli_agent_orchestrator.adapters",
+]
+forbidden_modules = [
+    "cli_agent_orchestrator.agent_store",
+    "cli_agent_orchestrator.backends",
+    "cli_agent_orchestrator.clients",
+    "cli_agent_orchestrator.constants",
+    "cli_agent_orchestrator.ext_apps",
+    "cli_agent_orchestrator.graph",
+    "cli_agent_orchestrator.hooks",
+    "cli_agent_orchestrator.kernel",
+    "cli_agent_orchestrator.models",
+    "cli_agent_orchestrator.ops_mcp_server",
+    "cli_agent_orchestrator.plugins",
+    "cli_agent_orchestrator.providers",
+    "cli_agent_orchestrator.sandbox_bootstrap",
+    "cli_agent_orchestrator.schemas",
+    "cli_agent_orchestrator.security",
+    "cli_agent_orchestrator.services",
+    "cli_agent_orchestrator.sim",
+    "cli_agent_orchestrator.skills",
+    "cli_agent_orchestrator.telemetry",
+    "cli_agent_orchestrator.transcript_scrub",
+    "cli_agent_orchestrator.tui",
+    "cli_agent_orchestrator.utils",
+]
+
+# core/ is the domain: stdlib and pydantic, no I/O of any kind. This is what makes the
+# transition table and the event vocabulary testable with no database, no tmux and no
+# event loop anywhere in the test.
+[[tool.importlinter.contracts]]
+name = "core-is-pure"
+type = "forbidden"
+source_modules = ["cli_agent_orchestrator.core"]
+forbidden_modules = ["sqlite3", "sqlalchemy", "libtmux", "fastapi", "httpx"]
+
+# Adapters are named in exactly one place: cli_agent_orchestrator/bootstrap.py, which builds
+# them and hands them to app as core.ports Protocols. bootstrap.py is deliberately absent
+# from the source list — that absence IS the exception.
+[[tool.importlinter.contracts]]
+name = "adapters-only-via-composition-root"
+type = "forbidden"
+source_modules = [
+    "cli_agent_orchestrator.app",
+    "cli_agent_orchestrator.api",
+    "cli_agent_orchestrator.mcp_server",
+    "cli_agent_orchestrator.cli",
+]
+forbidden_modules = ["cli_agent_orchestrator.adapters"]
+# DIRECT imports only. The rule is "no edge module may NAME an adapter"; reaching one
+# through the composition root is the sanctioned path, and every edge module reaches
+# bootstrap.py transitively the moment api/main.py wires it (api -> bootstrap -> adapters).
+# Without this, the contract would forbid the very indirection it exists to mandate.
+allow_indirect_imports = "true"

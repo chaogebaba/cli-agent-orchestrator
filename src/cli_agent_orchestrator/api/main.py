@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field, StrictInt, field_validator, model_validat
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
+from cli_agent_orchestrator import bootstrap
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -1663,6 +1664,10 @@ async def lifespan(app: FastAPI):
 
         configure_sandbox_fixture_runtime(active_manifest)
     init_db()
+    # WP-ARCH (F725 #581) hook point 5 — the composition root. Migrates the
+    # phase-1 tables at every boot (additive, inert) and starts the worker-truth
+    # adapters ONLY when CAO_WORKER_TRUTH_INGEST=1; default off. Never raises.
+    await bootstrap.start_worker_truth()
     from cli_agent_orchestrator.utils.persona_context import reconcile_retained_persona_homes
 
     reconcile_retained_persona_homes()
@@ -1917,6 +1922,10 @@ async def lifespan(app: FastAPI):
         logger.info("Herdr inbox service started")
 
     yield
+
+    # WP-ARCH (F725 #581) hook point 5, teardown half: stop the retention task
+    # and close the store's connections. Never raises.
+    await bootstrap.shutdown_worker_truth()
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
