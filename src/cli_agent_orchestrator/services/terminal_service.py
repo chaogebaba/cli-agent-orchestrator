@@ -81,6 +81,9 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
+
+# WP-ARCH phase 1 (F725 #581) hook points 3, 6, 7 — server decision rows.
+from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
@@ -3728,6 +3731,7 @@ async def _claim_and_settle_deferred_failure(
     fatal_claim_failure: bool = False,
     reason: str = "",
 ) -> None:
+    _wt_server.record_teardown_decided(terminal_id, code, reason)  # WP-ARCH F725 #581 hook 6
     token = str(uuid.uuid4())
     owner_epoch = snapshot.get("init_owner_epoch")
     try:
@@ -6182,6 +6186,7 @@ def _fixture_send_input_override(provider, message: str) -> bool:
     return True
 
 
+@_wt_server.dispatch_attempt("send_input")  # WP-ARCH F725 #581 hook 3
 def send_input(
     terminal_id: str,
     message: str,
@@ -6437,6 +6442,7 @@ def prepare_input(
     )
 
 
+@_wt_server.dispatch_attempt("send_prepared_input")  # WP-ARCH F725 #581 hook 3
 def send_prepared_input(
     terminal_id: str,
     message: str,
@@ -7212,6 +7218,13 @@ def delete_terminal(
             terminal_id,
             e,
         )
+    _wt_server.record_teardown_intended(  # WP-ARCH F725 #581 hook 7
+        terminal_id,
+        scope_kind="terminal",
+        scope_key=terminal_id,
+        ttl_s=ttl_s,
+        requested_by=caller_id,
+    )
 
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     try:

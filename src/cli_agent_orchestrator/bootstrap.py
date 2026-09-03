@@ -41,6 +41,7 @@ from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.findings import SqliteFindingStore
 from cli_agent_orchestrator.adapters.store.migrator import MigrationResult, migrate
 from cli_agent_orchestrator.adapters.store.retention import RetentionTask
+from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
 from cli_agent_orchestrator.app.worker_truth.checks import CheckRegistry
 from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore
 
@@ -168,8 +169,21 @@ async def start_worker_truth(
         event_store = SqliteEventStore(pool, clock=resolved_clock, check_runner=checks)
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
+        # Arm the phase-1 PRODUCERS.  Until this line runs, the seven legacy hook
+        # points are no-ops that cost one module-global lookup; after it, they
+        # append.  That is the whole of AC5's enforcement, and it is why the
+        # switch cannot be half-on: there is no other way for a hook to reach the
+        # store.
+        truth_wiring.install_producers(
+            truth_wiring.ProducerRuntime(
+                store=event_store,
+                clock=resolved_clock,
+                findings=finding_store,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either
         logger.error("worker-truth bootstrap failed to wire adapters: %r", exc)
+        truth_wiring.reset_producers()
         _runtime = WorkerTruthRuntime(
             ingest_enabled=False, migration=result, clock=resolved_clock, pool=pool
         )
@@ -195,6 +209,9 @@ async def shutdown_worker_truth() -> None:
 
     runtime = _runtime
     _runtime = None
+    # Disarm the producers FIRST: a hook that fires while the pool is closing
+    # would log a failure for a shutdown that is going perfectly well.
+    truth_wiring.reset_producers()
     if runtime is None:
         return
     if runtime.retention is not None:

@@ -11,4 +11,15 @@ sides.
 That last rule is what keeps a test able to point the store at a scratch file
 without a monkeypatch, and what keeps the legacy configuration sprawl from
 growing a new consumer while phase 6 is still ahead of us.
+
+Traffic runs one way through here.  ``adapters/store/`` implements the event log,
+the finding table and retention; ``adapters/truth/`` holds the four phase-1
+PRODUCERS, which append to the store and never call the projector — that is what
+``adapters-are-leaves`` buys.
+
+The one place the arrow points inward from outside is the legacy tree.  The seven
+AC11 hook points live in ``services/`` and ``providers/`` and call into
+``adapters.truth`` directly, because a legacy module has no composition root to be
+injected from.  Every one of those calls is a no-op until ``bootstrap.py`` has
+armed ingestion — see ``adapters/truth/wiring.py``.
 """
