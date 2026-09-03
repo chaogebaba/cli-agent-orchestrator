@@ -9,6 +9,7 @@ from cli_agent_orchestrator.cli.commands.auto_answers import auto_answers
 from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
+from cli_agent_orchestrator.cli.commands.diag import diag
 from cli_agent_orchestrator.cli.commands.doctor import doctor
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fold import fold
@@ -78,6 +79,8 @@ cli.add_command(fold)
 cli.add_command(suite)
 cli.add_command(verify)
 cli.add_command(ledger)
+# WP-ARCH phase 1 (F725 #581), AC11 hook point 4 — the only line this file gains.
+cli.add_command(diag)
 cli.add_command(update)
 cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 cli.add_command(auto_answers)  # F530: whitelist auto-responder diagnostics

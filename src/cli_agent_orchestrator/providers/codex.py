@@ -18,6 +18,11 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
+# WP-ARCH phase 1 (F725 #581) hook point 1 — hands the resolved rollout path to
+# the JSONL tailer.  Inert unless bootstrap installed a truth runtime.
+from cli_agent_orchestrator.adapters.truth.codex_rollout import (
+    rollout_resolution_hook as _wt_rollout_resolution_hook,
+)
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR, PYTE_SCREEN_ROWS
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
@@ -2113,6 +2118,7 @@ class CodexProvider(BaseProvider):
     # F435 r6 — STRUCTURAL rollout confirmation helpers
     # ------------------------------------------------------------------
 
+    @_wt_rollout_resolution_hook  # WP-ARCH F725 #581 hook 1 (no-op unless ingest on)
     def _resolve_rollout_file(self, session_uuid: str | None) -> Path | None:
         """Locate the rollout JSONL for the given session UUID.
 

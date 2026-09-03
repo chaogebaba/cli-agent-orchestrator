@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# WP-ARCH phase 1 (F725 #581) hook point 2b — the three fleet ERROR overrides.
+from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -217,6 +219,9 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         fusion_reason = getattr(observation, "fusion_reason", None)
         if row.get("recovery_state") not in (None, "rebound"):
             status = TerminalStatus.ERROR
+            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+                row["id"], "recovery_state", str(row.get("recovery_state"))
+            )
         # F716 (#571): window absence under an ACTIVE teardown intent is the
         # healthy delete ordering (intent → window kill → row purge), so keep
         # the observed status instead of stamping ERROR; also expose the
@@ -225,10 +230,16 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
         if has_native_inventory and row["tmux_window"] not in windows and not in_teardown:
             status = TerminalStatus.ERROR
+            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+                row["id"], "window_absent", str(row["tmux_window"])
+            )
         # F124 S1: compute init_health; failed health overrides status to ERROR.
         init_health = _compute_init_health(row, now)
         if init_health == "failed":
             status = TerminalStatus.ERROR
+            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+                row["id"], "init_health_failed", ""
+            )
         # F568 D12c: `delegating` is a projection over the FINAL status (computed
         # here, AFTER all three ERROR overrides above) and the children ledger.
         # An ERROR/quarantined seat never renders `delegating` (r11 S2); a
