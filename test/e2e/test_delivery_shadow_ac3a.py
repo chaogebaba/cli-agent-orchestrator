@@ -176,17 +176,27 @@ def _arm(tmp_path_factory: pytest.TempPathFactory, name: str, switch: str | None
     return Arm(home, server)
 
 
-def _create(arm: Arm, session: str, provider: str, profile: str, first: bool) -> str | None:
-    """One terminal, or ``None`` with the reason printed.
+def _create(arm: Arm, session: str | None, provider: str, profile: str) -> tuple[str, str] | None:
+    """One terminal as ``(terminal_id, actual_session_name)``, or ``None``.
+
+    **The returned session name is the one to use for every later terminal**, and
+    it is not the one that was asked for: the e2e fixture exports
+    ``CAO_SESSION_PREFIX=cao-test-`` so test sessions are distinguishable from
+    production ones during incident triage, and the server applies it. Posting
+    later terminals to the REQUESTED name 404s, which is what made the first
+    live run open one lane and skip — an hour of box time spent proving that a
+    name was wrong.
 
     Failures are printed rather than raised because bring-up is a precondition,
     not the thing under test: a run that cannot open two lanes must say why and
     skip, so nobody reads a provider timeout as a delivery defect.
     """
-    endpoint = f"{arm.url}/sessions" if first else f"{arm.url}/sessions/{session}/terminals"
+    endpoint = (
+        f"{arm.url}/sessions" if session is None else f"{arm.url}/sessions/{session}/terminals"
+    )
     params: dict[str, str] = {"provider": provider, "agent_profile": profile}
-    if first:
-        params["session_name"] = session
+    if session is None:
+        params["session_name"] = f"p3a-{uuid.uuid4().hex[:8]}"
     try:
         response = requests.post(endpoint, params=params, timeout=TERMINAL_CREATE_TIMEOUT_S)
     except requests.RequestException as exc:
@@ -195,7 +205,8 @@ def _create(arm: Arm, session: str, provider: str, profile: str, first: bool) ->
     if response.status_code not in (200, 201):
         print(f"[p3a] {provider} terminal refused: {response.status_code} {response.text[:200]}")
         return None
-    return str(response.json()["id"])
+    payload = response.json()
+    return str(payload["id"]), str(payload.get("session_name") or session or "")
 
 
 def _open_lanes(arm: Arm, count: int = 2) -> list[str]:
@@ -209,23 +220,24 @@ def _open_lanes(arm: Arm, count: int = 2) -> list[str]:
     """
     import shutil
 
-    session = f"p3a-{uuid.uuid4().hex[:8]}"
     available = [
         (provider, profile)
         for provider, profile, binary in LANE_PROVIDERS
         if shutil.which(binary) is not None
     ]
     terminals: list[str] = []
+    session: str | None = None
     for provider, profile in available:
-        first = _create(arm, session, provider, profile, first=not terminals)
-        if first is None:
+        opened = _create(arm, session, provider, profile)
+        if opened is None:
             continue
-        terminals.append(first)
+        terminal_id, session = opened
+        terminals.append(terminal_id)
         while len(terminals) < count:
-            more = _create(arm, session, provider, profile, first=False)
+            more = _create(arm, session, provider, profile)
             if more is None:
                 break
-            terminals.append(more)
+            terminals.append(more[0])
         if len(terminals) >= count:
             break
 
