@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from cli_agent_orchestrator.adapters.store.connection import (
-    ConnectionPool,
+    SqliteConnectionSource,
     immediate_transaction,
     parse_timestamp,
     render_timestamp,
@@ -41,7 +41,7 @@ class _SystemClock:
 class SqliteFindingStore:
     """``core.ports.FindingStore`` over SQLite."""
 
-    def __init__(self, pool: ConnectionPool, *, clock: Clock | None = None) -> None:
+    def __init__(self, pool: SqliteConnectionSource, *, clock: Clock | None = None) -> None:
         self._pool = pool
         self._clock = clock if clock is not None else _SystemClock()
 

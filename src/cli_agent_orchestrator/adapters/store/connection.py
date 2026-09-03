@@ -33,9 +33,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 __all__ = [
     "ConnectionPool",
+    "SqliteConnectionSource",
     "immediate_transaction",
     "parse_timestamp",
     "read_only_connect",
@@ -66,6 +68,31 @@ def render_timestamp(value: datetime) -> str:
 def parse_timestamp(value: str) -> datetime:
     """Parse a stored timestamp back to an aware UTC datetime."""
     return datetime.strptime(value, _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+
+
+@runtime_checkable
+class SqliteConnectionSource(Protocol):
+    """What the three store adapters actually need from a pool.
+
+    Exactly two methods, which is the point.  :class:`ConnectionPool` and
+    :class:`~adapters.store.readonly.ReadOnlyPool` are unrelated classes — one
+    hands out thread-local read/write connections, the other a single ``mode=ro``
+    connection for ``cao diag`` — and structural typing is what lets the same
+    ``SqliteEventStore`` serve both without either inheriting from the other or
+    the stores growing a second read-only implementation of the same SELECTs.
+
+    Deliberately NOT ``db_path`` or ``close_all``: a Protocol should name what
+    callers use, not everything the concrete classes happen to expose.  Widening
+    it later is additive; narrowing it is not.
+
+    The migrator keeps its concrete :class:`ConnectionPool` annotation and is not
+    moved to this Protocol.  That is not an oversight — it writes DDL, so a
+    read-only pool must remain a type error there.
+    """
+
+    def connection(self) -> sqlite3.Connection: ...
+
+    def checkpoint(self) -> None: ...
 
 
 class ConnectionPool:

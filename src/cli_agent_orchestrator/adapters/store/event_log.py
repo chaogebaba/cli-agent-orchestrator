@@ -31,7 +31,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from cli_agent_orchestrator.adapters.store.connection import (
-    ConnectionPool,
+    SqliteConnectionSource,
     immediate_transaction,
     parse_timestamp,
     render_timestamp,
@@ -67,7 +67,7 @@ class SqliteEventStore:
 
     def __init__(
         self,
-        pool: ConnectionPool,
+        pool: SqliteConnectionSource,
         *,
         clock: Clock | None = None,
         check_runner: CheckRunner | None = None,

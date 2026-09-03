@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from cli_agent_orchestrator.adapters.store.connection import (
-    ConnectionPool,
+    SqliteConnectionSource,
     parse_timestamp,
     render_timestamp,
 )
@@ -105,7 +105,7 @@ def _row_to_projection(row: sqlite3.Row) -> StoredProjection:
 class SqliteStateStore:
     """``core.ports.StateStore`` over ``worker_state_shadow``."""
 
-    def __init__(self, pool: ConnectionPool) -> None:
+    def __init__(self, pool: SqliteConnectionSource) -> None:
         self._pool = pool
 
     def get(self, terminal_id: str) -> StateProjection | None:
