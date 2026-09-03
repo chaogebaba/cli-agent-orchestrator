@@ -38,6 +38,7 @@ import pytest
 
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.services import wiki_compiler as wc
+from cli_agent_orchestrator.utils import tombstones
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -118,6 +119,27 @@ class TestT1NoFilesystem:
         the call count from inside ``extract_session_context`` must be 0.
         """
         mock_tmux.return_value.get_history.return_value = KIMI_FIXTURE
+
+        # F563 (#419): disarm the F261 dead-code tombstone ledger for this test.
+        # extract_session_context's FIRST statement is tombstone("TS-0001")
+        # (kimi_cli.py:1123-1124), and utils.tombstones._write appends to
+        # ~/.local/state/cao-tombstones/fired.jsonl with
+        # os.open(..., O_WRONLY|O_CREAT|O_APPEND) — flags 1089, exactly the call
+        # the gate saw. The spies below are process-global, so they record it.
+        #
+        # Why the probe passed most of the time: _write is deduped per site per
+        # PROCESS via tombstones._seen, so the ledger is only opened by whichever
+        # test calls extract FIRST in that xdist worker. Test distribution
+        # therefore decides pass or fail, which is why the failure reproduced
+        # identically on main and on the lane under review and looked like a
+        # fleet-ambient effect (F548 r3/r3b gates, 2026-08-28).
+        #
+        # Disarming is deliberate and test-only: the tombstone is dead-code
+        # instrumentation, not part of the extract contract, and _ARMED is its
+        # documented kill switch (CAO_TOMBSTONES=0 at import). Every filesystem
+        # access that IS part of the contract still trips the assertions below,
+        # and the probe now gives the same verdict whatever ran before it.
+        monkeypatch.setattr(tombstones, "_ARMED", False)
 
         os_open_calls: List[Any] = []
         builtins_open_calls: List[Any] = []
