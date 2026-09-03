@@ -5681,7 +5681,9 @@ def delete_terminal_and_warm_intent(
         prefix = f"[released from {terminal_id} ({profile or 'unknown'}) — terminal reaped]\n"
         _reap_flipped_rows: list[tuple[str, int, str | None]] = []
         _f642_reparented_ids: list[int] = []  # moved to target receiver
+        _p3a_reaped_ids: list[int] = []
         for row in held.all():
+            _p3a_reaped_ids.append(int(row.id))
             row.message = prefix + row.message
             if target_id is None:
                 row.status = MessageStatus.CANCELLED.value
@@ -5696,6 +5698,12 @@ def delete_terminal_and_warm_intent(
                     (MessageStatus.PENDING.value, int(row.id), target_mailbox_id)
                 )
                 _f642_reparented_ids.append(int(row.id))
+        # WP-ARCH phase 3a, hook point 4b — reaping ends or moves these rows and
+        # does NOT pass through write_through_terminal_state, so without this the
+        # shadow copies would sit ready and read as legacy-early disagreements
+        # for the life of the queue. Sub-phase 3b carries the re-parent itself
+        # (§13c); here the ids are only re-read after commit.
+        _stash_shadow_observation(db, _p3a_reaped_ids)
         # F413 D7b: create obligations for flipped rows
         if _reap_flipped_rows:
             db.flush()
@@ -7452,6 +7460,19 @@ def _close_barrier_owner_gone_in_db(db: Any, barrier: Any, now: datetime) -> Non
     )
     if changed != 1:
         return
+    # WP-ARCH phase 3a, hook point 4c — the ids are read BEFORE the bulk update,
+    # because a bulk UPDATE with synchronize_session=False returns a count and
+    # not the rows it touched, and after it runs the predicate no longer matches.
+    _stash_shadow_observation(
+        db,
+        [
+            int(row_id)
+            for (row_id,) in db.query(InboxModel.id).filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.HELD.value,
+            )
+        ],
+    )
     db.query(InboxModel).filter(
         InboxModel.barrier_id == barrier.id,
         InboxModel.status == MessageStatus.HELD.value,
@@ -8526,6 +8547,10 @@ def cancel_pending_watchdog_message(message_id: int, terminal_id: str) -> bool:
                 synchronize_session=False,
             )
         )
+        # WP-ARCH phase 3a, hook point 4d — the third cancel writer. The id is
+        # known here, so no pre-read is needed.
+        if changed == 1:
+            _stash_shadow_observation(db, [message_id])
         return changed == 1
 
 

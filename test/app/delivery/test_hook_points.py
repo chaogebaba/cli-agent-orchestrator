@@ -25,6 +25,14 @@ HOOK_POINTS = {
     ("clients/database.py", "settle_delivery_attempt"): "observe_messages",
     ("clients/database.py", "write_through_terminal_state"): "_stash_shadow_observation",
     ("services/inbox_service.py", "deliver_pending"): "observe_veto",
+    # 4b, 4c and 4d: the three CANCEL writers. None of them passes through
+    # write_through_terminal_state, so without these three a cancelled row's
+    # shadow copy would sit ready and read as a legacy-early disagreement for the
+    # life of the queue. They stash rather than call, like hook point 4, because
+    # each runs inside its caller's transaction.
+    ("clients/database.py", "delete_terminal_and_warm_intent"): "_stash_shadow_observation",
+    ("clients/database.py", "_close_barrier_owner_gone_in_db"): "_stash_shadow_observation",
+    ("clients/database.py", "cancel_pending_watchdog_message"): "_stash_shadow_observation",
 }
 
 
