@@ -931,7 +931,14 @@ class FleetApp(App[None]):
         self.query_one("#flash", Static).update(self.flash)
 
     def window_ages(self) -> Dict[str, float]:
-        """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``)."""
+        """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``).
+
+        Read once per frame and cached in :attr:`_ages` for the peek banner's
+        ``quiet`` reading. This is the script's old IDLE number; it no longer
+        heads a column, because "the pane has printed nothing for N" and "the
+        seat is idle" are different claims and only the second belongs under a
+        status-shaped header.
+        """
         self._ages = read_window_ages(self.tmux, self.session, now=self._now)
         return self._ages
 
@@ -1042,6 +1049,9 @@ class FleetApp(App[None]):
         table = self.table
         selected = self.selected_id()
         labels = read_labels(self._labels_path)
+        # One `list-windows` per frame, cached in `_ages`. The table no longer
+        # reads it — ELAPSED times the status, not the pane — but the peek
+        # banner still reports it as `quiet Ns`.
         self.window_ages()
         rows = self.visible_terminals()
         # Fold this snapshot into the clock before anything reads it, so a
