@@ -33,8 +33,10 @@ import click
 from cli_agent_orchestrator.app.diag.report import (
     DiagSources,
     findings_payload,
+    message_payload,
     render_agreement,
     render_findings,
+    render_message,
     render_timeline,
     render_why,
     timeline_payload,
@@ -43,6 +45,7 @@ from cli_agent_orchestrator.app.diag.report import (
 from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.core.events import AnyKind, parse_kind
 from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.ids import is_ulid
 
 INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
 
@@ -110,12 +113,19 @@ def _emit(payload: Any, text: str, as_json: bool) -> None:
 
 
 class _DiagGroup(click.Group):
-    """Lets ``cao diag <terminal_id>`` work without naming a subcommand.
+    """Lets ``cao diag <id>`` work without naming a subcommand.
 
-    The blueprint spells the command that way and it is the right shape: the
-    terminal timeline is what the command is FOR, and the other views are
-    variations on it.  An unrecognised first argument is therefore routed to
-    ``terminal`` rather than rejected.
+    Both blueprints spell the command that way and it is the right shape: a
+    timeline for an id is what the command is FOR, and the other views are
+    variations on it.  An unrecognised first argument is therefore routed to a
+    view rather than rejected.
+
+    **Which view is decided by the id's own shape.**  ``msg_id`` is a ULID —
+    26 Crockford base32 characters, minted by ``core/ids.py`` — and a
+    ``terminal_id`` is not, so the discriminator is a property of the value
+    rather than a prefix convention someone has to remember or a flag they have
+    to pass.  ``cao diag msg <id>`` and ``cao diag terminal <id>`` remain
+    available for the case where an operator has an id whose shape lies.
 
     A leading dash is left alone so ``cao diag --help`` and ``cao diag --why``
     still resolve normally, and so does anything that really is a subcommand.
@@ -125,7 +135,8 @@ class _DiagGroup(click.Group):
         self, ctx: click.Context, args: list[str]
     ) -> tuple[str | None, click.Command | None, list[str]]:
         if args and not args[0].startswith("-") and args[0] not in self.commands:
-            return super().resolve_command(ctx, ["terminal", *args])
+            view = "msg" if is_ulid(args[0]) else "terminal"
+            return super().resolve_command(ctx, [view, *args])
         return super().resolve_command(ctx, args)
 
 
@@ -139,6 +150,7 @@ def diag(ctx: click.Context, why_event_id: str | None, db_path: str | None, as_j
 
     \b
     cao diag <terminal-id>          the timeline and the projection header
+    cao diag <msg-id>               one message's queue row, attempts and events
     cao diag --why <event-id>       the evidence chain behind one decision
     cao diag findings               open invariant findings
     cao diag agreement              the shadow projection vs the legacy status
@@ -182,6 +194,22 @@ def diag_terminal(
         render_timeline(
             sources, terminal_id, now=now, since=since_at, kinds=kind_filter, ingest_on=ingest_on
         ),
+        as_json,
+    )
+
+
+@diag.command("msg")
+@click.argument("msg_id")
+@click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def diag_msg(msg_id: str, db_path: str | None, as_json: bool) -> None:
+    """Print one message's delivery history: the queue row, its attempts, its events."""
+    now = datetime.now(UTC)
+    sources = _sources(db_path)
+    ingest_on = _ingest_on()
+    _emit(
+        message_payload(sources, msg_id, now=now, ingest_on=ingest_on),
+        render_message(sources, msg_id, now=now, ingest_on=ingest_on),
         as_json,
     )
 

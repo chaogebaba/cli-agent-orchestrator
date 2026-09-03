@@ -40,6 +40,14 @@ AC11_LEGACY_IMPORTERS = {
     "services/fleet_service.py",
     "services/terminal_service.py",
     "cli/main.py",
+    # WP-ARCH phase 3a (#584) adds ONE entry. The five delivery hook points sit in
+    # ``clients/database.py``, ``services/mailbox_service.py`` and
+    # ``services/inbox_service.py``, but each is a legacy-to-legacy call into
+    # ``services/delivery_mirror.py``, which is the only phase-3a file that names
+    # the new tree. That is lane C's phase-1 pattern applied again, and for the
+    # same reason: the contact surface a reviewer has to read stays at one file
+    # instead of spreading across the two largest legacy packages.
+    "services/delivery_mirror.py",
 }
 
 _LEGACY_DIRS = (

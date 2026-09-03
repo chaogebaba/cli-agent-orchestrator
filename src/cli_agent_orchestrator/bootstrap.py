@@ -40,10 +40,13 @@ from cli_agent_orchestrator.adapters.store.connection import ConnectionPool
 from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.findings import SqliteFindingStore
 from cli_agent_orchestrator.adapters.store.migrator import MigrationResult, migrate
+from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
 from cli_agent_orchestrator.adapters.store.readonly import ReadOnlyPool
 from cli_agent_orchestrator.adapters.store.retention import RetentionTask
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
+from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
+from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 from cli_agent_orchestrator.app.diag.report import DiagSources
 from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
 from cli_agent_orchestrator.app.worker_truth.checks import (
@@ -52,22 +55,44 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
-from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore, StateStore
+from cli_agent_orchestrator.core.delivery import (
+    GuardOutcome,
+    QueueOccupancy,
+    SwitchPosition,
+    parse_switch,
+    resolve_switch,
+)
+from cli_agent_orchestrator.core.ports import (
+    Clock,
+    EventStore,
+    FindingStore,
+    QueueStore,
+    StateStore,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DELIVERY_ENV_VAR",
     "INGEST_ENV_VAR",
     "WorkerTruthRuntime",
     "build_readonly_diag_stores",
     "build_terminal_scope",
     "current_runtime",
+    "delivery_position",
     "ingest_enabled",
     "shutdown_worker_truth",
     "start_worker_truth",
 ]
 
 INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
+
+#: The delivery queue's own switch (D9).  A SEPARATE variable from the ingestion
+#: one, sitting beside it here and read once at boot in the same structural way.
+#: One master strangler flag was rejected because it would couple a phase-1
+#: rollback to a phase-3 rollback; this is a different switch, not the second
+#: spelling this module's own docstring warns against.
+DELIVERY_ENV_VAR = "CAO_DELIVERY_QUEUE"
 
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
@@ -79,6 +104,18 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """
     source = os.environ if env is None else env
     return source.get(INGEST_ENV_VAR) == "1"
+
+
+def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition:
+    """The REQUESTED position, before D9's guard resolves it.
+
+    Requested, not effective: the guard can demote ``off`` or ``shadow`` to
+    ``drain`` over a non-empty queue, and promote ``drain`` to ``shadow`` over an
+    empty one.  The effective position is on the runtime, and a caller that wants
+    to know what the server is actually doing must read it there.
+    """
+    source = os.environ if env is None else env
+    return parse_switch(source.get(DELIVERY_ENV_VAR))
 
 
 @dataclass
@@ -102,6 +139,12 @@ class WorkerTruthRuntime:
     projector: Projector | None = None
     sources: StaticSourceRegistry | None = None
     retention: RetentionTask | None = None
+    #: The delivery queue's RESOLVED position (D9), and the guard's reasoning.
+    #: Present whatever the ingestion switch says: the two are independent, and
+    #: a queue that only ran when worker-truth ingestion happened to be on would
+    #: be a coupling neither blueprint asks for.
+    delivery: GuardOutcome | None = None
+    queue_store: QueueStore | None = None
 
 
 _runtime: WorkerTruthRuntime | None = None
@@ -129,6 +172,93 @@ def _default_busy_timeout_ms() -> int:
     from cli_agent_orchestrator.constants import CAO_DB_BUSY_TIMEOUT_MS
 
     return int(CAO_DB_BUSY_TIMEOUT_MS)
+
+
+def _start_delivery(
+    pool: ConnectionPool,
+    clock: Clock,
+    *,
+    env: dict[str, str] | None = None,
+) -> tuple[GuardOutcome, QueueStore | None]:
+    """Resolve ``CAO_DELIVERY_QUEUE`` through D9's guard and arm the hooks.
+
+    Never raises.  Three things happen, in this order and for this reason:
+
+    1. **The requested position is read once**, from the process environment,
+       which makes it a deployment decision rather than something that can flip
+       mid-session.
+    2. **The guard resolves it against the queue.**  Boot-time only — no runtime
+       transition exists, so a position changes when the server restarts and at
+       no other moment.  The guard never refuses the boot: this ships into the
+       server running the strangler work, so a self-inflicted boot failure would
+       be worse than the condition it reports, and an operator whose only mistake
+       was leaving a variable unset must not lose the server.
+    3. **A demotion writes its finding**, which is how an operator learns.  The
+       finding store is built here regardless of the INGESTION switch, because
+       the ``finding`` table is created by step 0 of every migration and the
+       guard's notice belongs to phase 3, not to phase 1.
+
+    Only ``shadow`` arms the hooks.  Sub-phase 3a builds the shadow queue and the
+    boot guard and nothing else: ``drain`` and ``on`` are positions whose
+    behaviour — the tick, the write-through, the digest — lands in 3b.  A boot
+    requesting one of them here gets a loud warning and NO hooks, rather than
+    being quietly reinterpreted as ``shadow``.  Reinterpreting would be worse
+    than refusing: an operator who asked for write-through and got a shadow queue
+    would believe the seat was being served from the queue when it was not.
+    """
+    requested = delivery_position(env)
+    try:
+        store: QueueStore = SqliteQueueStore(pool, clock=clock)
+        occupancy = store.occupancy()
+    except Exception as exc:  # noqa: BLE001 — a queue we cannot read must not block boot
+        logger.error("delivery queue could not be opened: %r", exc)
+        return GuardOutcome(requested=requested, position=SwitchPosition.OFF), None
+
+    outcome = resolve_switch(requested, occupancy)
+
+    if outcome.finding is not None:
+        try:
+            SqliteFindingStore(pool, clock=clock).record(
+                outcome.finding,
+                dedupe_key=f"{outcome.requested.value}->{outcome.position.value}",
+                detail=outcome.detail,
+            )
+        except Exception:  # noqa: BLE001 — a notice that cannot be written is logged
+            logger.warning(
+                "delivery boot guard: %s (finding could not be recorded)",
+                outcome.detail,
+                exc_info=True,
+            )
+
+    if outcome.demoted:
+        logger.warning(
+            "delivery boot guard resolved %s=%s to %s: %s",
+            DELIVERY_ENV_VAR,
+            outcome.requested.value,
+            outcome.position.value,
+            outcome.detail,
+        )
+
+    if outcome.position is SwitchPosition.SHADOW:
+        delivery_wiring.install_delivery(
+            delivery_wiring.DeliveryRuntime(
+                store=store,
+                clock=clock,
+                position=outcome.position,
+                mirror=MirrorWriter(store, clock),
+            )
+        )
+        logger.info("delivery queue armed in SHADOW mode (%s)", DELIVERY_ENV_VAR)
+    elif outcome.position in (SwitchPosition.DRAIN, SwitchPosition.ON):
+        logger.warning(
+            "%s resolved to %s, which sub-phase 3a does not implement: the queue "
+            "is NOT being served and no rows are being written. Set %s=shadow, or "
+            "unset it, until sub-phase 3b ships.",
+            DELIVERY_ENV_VAR,
+            outcome.position.value,
+            DELIVERY_ENV_VAR,
+        )
+    return outcome, store
 
 
 async def start_worker_truth(
@@ -163,17 +293,32 @@ async def start_worker_truth(
     result, pool = migrate(path, busy_timeout_ms=timeout)
 
     if not result.ok or pool is None:
-        # Booted, failure recorded, ingestion off for the life of the process.
+        # Booted, failure recorded, ingestion off for the life of the process —
+        # and the delivery queue off with it. Its tables are migration steps, so
+        # a failed migration may well be the step that would have created them;
+        # arming hooks against a schema that may not exist would turn a recorded
+        # failure into a stream of caught exceptions on every message.
+        delivery_wiring.reset_delivery()
         _runtime = WorkerTruthRuntime(
             ingest_enabled=False, migration=result, clock=resolved_clock, pool=pool
         )
         return _runtime
 
+    # The delivery switch is resolved whatever the INGESTION switch says: they
+    # are two independent strangler phases and coupling them would mean a
+    # phase-3 rollback needed a phase-1 decision.
+    delivery, queue_store = _start_delivery(pool, resolved_clock, env=env)
+
     if not enabled:
-        # Tables exist and are inert.  No store, no tasks, nothing to contend
-        # for the single writer.
+        # Tables exist and phase 1 is inert.  No event store, no tasks, nothing
+        # of phase 1's contending for the single writer.
         _runtime = WorkerTruthRuntime(
-            ingest_enabled=False, migration=result, clock=resolved_clock, pool=pool
+            ingest_enabled=False,
+            migration=result,
+            clock=resolved_clock,
+            pool=pool,
+            delivery=delivery,
+            queue_store=queue_store,
         )
         return _runtime
 
@@ -225,7 +370,12 @@ async def start_worker_truth(
         logger.error("worker-truth bootstrap failed to wire adapters: %r", exc)
         truth_wiring.reset_producers()
         _runtime = WorkerTruthRuntime(
-            ingest_enabled=False, migration=result, clock=resolved_clock, pool=pool
+            ingest_enabled=False,
+            migration=result,
+            clock=resolved_clock,
+            pool=pool,
+            delivery=delivery,
+            queue_store=queue_store,
         )
         return _runtime
 
@@ -241,6 +391,8 @@ async def start_worker_truth(
         projector=projector,
         sources=sources,
         retention=retention,
+        delivery=delivery,
+        queue_store=queue_store,
     )
     logger.info("worker-truth ingestion ENABLED (%s=1)", INGEST_ENV_VAR)
     return _runtime
@@ -255,6 +407,7 @@ async def shutdown_worker_truth() -> None:
     # Disarm the producers FIRST: a hook that fires while the pool is closing
     # would log a failure for a shutdown that is going perfectly well.
     truth_wiring.reset_producers()
+    delivery_wiring.reset_delivery()
     if runtime is None:
         return
     if runtime.retention is not None:
@@ -290,6 +443,7 @@ def build_readonly_diag_stores(db_path: str | Path | None = None) -> DiagSources
         events=SqliteEventStore(pool, clock=SystemClock()),
         states=SqliteStateStore(pool),
         findings=SqliteFindingStore(pool, clock=SystemClock()),
+        queue=SqliteQueueStore(pool, clock=SystemClock()),
     )
 
 

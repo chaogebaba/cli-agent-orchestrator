@@ -2974,6 +2974,22 @@ class InboxService:
                                 safety.reason,
                                 safety.gate_episode,
                             )
+                            # WP-ARCH phase 3a, hook point 5. §7a requires a veto
+                            # be RECORDED rather than dropped: a dropped veto is
+                            # the difference between "we tried and were refused"
+                            # and "nothing happened", and the second is what made
+                            # #604 unreadable from the stored rows. This is the
+                            # veto site where the message batch is in scope; the
+                            # pre-admission check at the top of deliver_pending
+                            # runs before any batch is selected, so there is
+                            # nothing there to attribute a veto to.
+                            from cli_agent_orchestrator.services import delivery_mirror
+
+                            delivery_mirror.observe_veto(
+                                [int(m.id) for m in batch],
+                                reason=safety.reason,
+                                gate_episode=safety.gate_episode,
+                            )
                             return
                         if probe_status not in {
                             TerminalStatus.IDLE,
