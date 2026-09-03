@@ -22,6 +22,7 @@ from textual.widgets import DataTable, Static
 from cli_agent_orchestrator.tui.columns import (
     ALL_COLUMNS,
     ALL_VIEW,
+    ELAPSED_COLUMN,
     MARKER_BLANK,
     MARKER_INDEX,
     MARKER_SELECTED,
@@ -31,6 +32,8 @@ from cli_agent_orchestrator.tui.columns import (
 )
 from cli_agent_orchestrator.tui.fleet_app import (
     ACCENT_SELECTION,
+    ELAPSED_TICK_SECONDS,
+    ELAPSED_UNKNOWN,
     GUTTER_WIDTH,
     KEY_HINTS,
     PEEK_RULE_GLYPH,
@@ -41,12 +44,12 @@ from cli_agent_orchestrator.tui.fleet_app import (
     FleetApp,
     column_widths,
     detect_tmux_session,
+    elapsed_cell,
     find_events_sync_script,
     fmt_age,
     format_frame,
     hint_renderable,
     hint_text,
-    idle_style,
     is_working,
     parse_args,
     read_events,
@@ -54,9 +57,8 @@ from cli_agent_orchestrator.tui.fleet_app import (
     render_once,
     row_values,
     sort_terminals,
-    work_age_cell,
 )
-from cli_agent_orchestrator.tui.fleet_state import FleetState
+from cli_agent_orchestrator.tui.fleet_state import FleetState, StatusClock, StatusSpell
 from cli_agent_orchestrator.tui.status_cell import STYLE_QUIET_TAG, status_cell
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -288,7 +290,7 @@ async def test_default_view_is_exactly_the_six_parity_columns(tmp_path: Path) ->
         labels = [str(col.label) for col in table.columns.values()]
         assert labels == list(PARITY_VIEW)
         # AC5: the six parity headers, verbatim, after the header-less gutter.
-        assert labels[1:] == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "IDLE"]
+        assert labels[1:] == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED"]
         assert labels[MARKER_INDEX] == ""
 
 
@@ -359,8 +361,9 @@ async def test_healthy_fixture_status_cells_carry_glyph_and_style(tmp_path: Path
         assert plain(table, 0, PARITY_VIEW.index("TASK")) == "(supervisor seat)"
         assert plain(table, 1, PARITY_VIEW.index("TASK")) == "build the fetcher"
         assert plain(table, 2, PARITY_VIEW.index("TASK")) == "(unlabeled)"
-        # IDLE from tmux window_activity: window 3 was stamped at 999.
-        assert plain(table, 2, PARITY_VIEW.index("IDLE")) == fmt_age(feed.clock - 999)
+        # ELAPSED: term-0003 has been `completed` since the clock first saw it,
+        # so it reads zero with the lower-bound marker.
+        assert plain(table, 2, PARITY_VIEW.index(ELAPSED_COLUMN)) == "0s+"
 
 
 @pytest.mark.asyncio
@@ -760,16 +763,6 @@ async def test_the_unreachable_line_says_never_when_no_fetch_ever_succeeded(
 # ── parity: the row colour language (ranked gap 3) ──────────────────────────
 
 
-def test_idle_style_matches_the_scripts_thresholds() -> None:
-    assert idle_style(None) == "dim"
-    assert idle_style(0.0) == "dim"
-    assert idle_style(4.9) == "dim"
-    assert idle_style(5.0) == ""
-    assert idle_style(299.0) == ""
-    assert idle_style(300.0) == "yellow"
-    assert idle_style(10_000.0) == "yellow"
-
-
 @pytest.mark.asyncio
 async def test_supervisor_and_worker_rows_carry_the_scripts_colours(tmp_path: Path) -> None:
     """Gap 3: supervisor magenta, worker id cyan, worker WIN dim."""
@@ -801,23 +794,20 @@ async def test_unlabeled_tasks_are_dim_and_labeled_ones_are_not(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_idle_cells_are_coloured_by_age(tmp_path: Path) -> None:
-    """A window last active 10 min ago is yellow; a fresh one is dim."""
-    tmux = FakeTmux(activity={"0": 400, "2": 999, "3": 999})  # clock is 1000.0
-    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=tmux)
+async def test_working_rows_are_distinguishable_from_resting_ones_at_a_glance(
+    tmp_path: Path,
+) -> None:
+    """Requirement 3: one column, two readings, told apart by glyph and colour."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        idle = PARITY_VIEW.index("IDLE")
-        assert plain(app.table, 0, idle) == "10m"
-        assert cell(app.table, 0, idle).style == "yellow"
-        # row 2 is term-0003 (completed). Row 1 is term-0002, which is working,
-        # and a working row's IDLE cell carries the elapsed-work readout in the
-        # status colour instead of a window-activity age.
-        fresh = plain(app.table, 2, idle)
-        assert fresh.endswith("s") and int(fresh[:-1]) < 5
-        assert cell(app.table, 2, idle).style == "dim"
-        assert plain(app.table, 1, idle).startswith("●")
-        assert cell(app.table, 1, idle).style == "green"
+        elapsed = PARITY_VIEW.index(ELAPSED_COLUMN)
+        # row 1 is term-0002 (processing); rows 0 and 2 are idle and completed
+        assert plain(app.table, 1, elapsed).startswith("● ")
+        assert cell(app.table, 1, elapsed).style == "green"
+        for resting_row in (0, 2):
+            assert not plain(app.table, resting_row, elapsed).startswith("●")
+            assert cell(app.table, resting_row, elapsed).style == "dim"
 
 
 # ── parity: the ▶ selection marker (ranked gap 4) ───────────────────────────
@@ -1134,7 +1124,7 @@ def test_render_once_reports_an_unreachable_endpoint(tmp_path: Path) -> None:
 
 def test_format_frame_widths_follow_the_scripts_rule(tmp_path: Path) -> None:
     state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
-    frame = format_frame("s", state, {}, {}, [], latency_ms=12, clock="00:00:00")
+    frame = format_frame("s", state, {}, [], latency_ms=12, clock="00:00:00")
     header = next(line for line in frame.splitlines() if line.strip().startswith("WIN"))
     rows = [line for line in frame.splitlines() if line.startswith(("▶ ", "  term"))]
     assert header.startswith("  WIN")
@@ -1146,13 +1136,13 @@ def test_format_frame_widths_follow_the_scripts_rule(tmp_path: Path) -> None:
 def test_row_values_is_the_single_source_of_the_row_text() -> None:
     state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
     supervisor = next(t for t in state.terminals if not t.parent_id)
-    assert row_values(supervisor, {}, {}) == [
+    assert row_values(supervisor, {}) == [
         "0",
         "term-0001",
         "chao_supervisor",
         "(supervisor seat)",
         "◌ idle",
-        "-",
+        ELAPSED_UNKNOWN,  # no clock passed: one frame cannot time a transition
     ]
 
 
@@ -1252,7 +1242,7 @@ async def test_the_table_columns_carry_the_scripts_two_space_gutter(tmp_path: Pa
         assert app.table.cell_padding == 0
         assert app.table.show_header is False
         assert app.table.zebra_stripes is False
-        values = [row_values(t, {}, {}) for t in app.visible_terminals()]
+        values = [row_values(t, {}) for t in app.visible_terminals()]
         widths = app.frame_widths(values)
         assert widths[0] == GUTTER_WIDTH
         # every named column is its widest cell plus the two-space gutter,
@@ -1298,12 +1288,12 @@ def test_a_loud_condition_tag_is_not_dimmed() -> None:
 # and marked `+` while that start is only a lower bound.
 
 
-def resting(payload: Dict[str, Any], terminal_id: str) -> Dict[str, Any]:
-    """The same payload with one terminal no longer working."""
+def restatus(payload: Dict[str, Any], terminal_id: str, status: str) -> Dict[str, Any]:
+    """The same payload with one terminal moved to another status."""
     copy = json.loads(json.dumps(payload))
     for term in copy["terminals"]:
         if term["id"] == terminal_id:
-            term["status"] = "idle"
+            term["status"] = status
             term["condition"] = None
     return copy
 
@@ -1344,66 +1334,181 @@ def test_a_busy_flag_never_outranks_a_status_that_says_the_seat_is_resting() -> 
         assert is_working(term) is expected, status
 
 
-def test_work_age_cell_marks_an_unbounded_spell() -> None:
-    assert work_age_cell(0.0, True) == "● 0s"
-    assert work_age_cell(720.0, True) == "● 12m"
-    # `+` means "at least": the spell was already running when the app started
-    assert work_age_cell(720.0, False) == "● 12m+"
+def test_elapsed_cell_marks_working_rows_and_unbounded_spells() -> None:
+    assert elapsed_cell(0.0, True, False) == "0s"
+    assert elapsed_cell(720.0, True, False) == "12m"
+    # working rows carry the STATUS cell's glyph
+    assert elapsed_cell(720.0, True, True) == "● 12m"
+    # `+` means "at least": the transition into this status was never seen
+    assert elapsed_cell(720.0, False, False) == "12m+"
+    assert elapsed_cell(720.0, False, True) == "● 12m+"
 
 
 @pytest.mark.asyncio
-async def test_a_working_row_shows_how_long_it_has_been_working(tmp_path: Path) -> None:
+async def test_the_elapsed_column_times_the_current_status_of_every_row(
+    tmp_path: Path,
+) -> None:
+    """Requirement 2: the value is time in the CURRENT status, for any status."""
     payload = load_payload("healthy")
     app, feed, _ = make_app([payload, payload, payload], tmp_path, tick=60.0)
-    idle = PARITY_VIEW.index("IDLE")
+    elapsed = PARITY_VIEW.index(ELAPSED_COLUMN)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        rows = [t.id for t in app.visible_terminals()]
-        working = rows.index("term-0002")
-        # already working when first seen, so the elapsed time is a lower bound
-        assert plain(app.table, working, idle) == "● 0s+"
-        assert cell(app.table, working, idle).style == "green"
+        # every row, not just the working one, and every one a lower bound
+        assert [plain(app.table, r, elapsed) for r in range(3)] == ["0s+", "● 0s+", "0s+"]
 
         await advance(pilot, feed, 2)
-        assert plain(app.table, working, idle) == "● 2m+"
-
-        # the rows that are not working keep their window-activity age
-        resting_row = rows.index("term-0003")
-        assert plain(app.table, resting_row, idle) == fmt_age(app._ages.get("3"))
-        assert not plain(app.table, resting_row, idle).startswith("●")
+        assert [plain(app.table, r, elapsed) for r in range(3)] == ["2m+", "● 2m+", "2m+"]
 
 
 @pytest.mark.asyncio
-async def test_a_finished_spell_is_dropped_and_restarts_from_zero(tmp_path: Path) -> None:
-    """The anti-latch invariant: a spell never outlives the work that opened it."""
+async def test_a_status_change_resets_the_elapsed_clock(tmp_path: Path) -> None:
+    """Requirement 2: the clock restarts on every transition, and then is exact."""
     payload = load_payload("healthy")
-    app, feed, _ = make_app([payload, resting(payload, "term-0002"), payload], tmp_path, tick=60.0)
-    idle = PARITY_VIEW.index("IDLE")
+    app, feed, _ = make_app(
+        [payload, payload, restatus(payload, "term-0002", "completed")],
+        tmp_path,
+        tick=60.0,
+    )
+    elapsed = PARITY_VIEW.index(ELAPSED_COLUMN)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        working = [t.id for t in app.visible_terminals()].index("term-0002")
-        assert plain(app.table, working, idle) == "● 0s+"
-
-        # it stops working: the spell is dropped, not paused
         await advance(pilot, feed)
-        assert "term-0002" not in app._work_spells
-        assert not plain(app.table, working, idle).startswith("●")
+        assert plain(app.table, 1, elapsed) == "● 60s+"  # fmt_age: seconds below 120
 
-        # it starts again: a new spell from zero, and now an exact one, because
-        # this app has seen the row resting
+        # term-0002 stops working: a new spell from zero, and an exact one,
+        # because this clock watched the transition happen
         await advance(pilot, feed)
-        assert plain(app.table, working, idle) == "● 0s"
-        assert app._work_spells["term-0002"].exact is True
+        assert plain(app.table, 1, elapsed) == "0s"
+        assert cell(app.table, 1, elapsed).style == "dim"
+        # the rows that did not transition keep counting
+        assert plain(app.table, 0, elapsed) == "2m+"
 
 
 @pytest.mark.asyncio
-async def test_a_row_that_leaves_the_fleet_drops_its_spell(tmp_path: Path) -> None:
-    app, feed, _ = make_app(
-        [load_payload("healthy"), load_payload("wake_alarm")], tmp_path, tick=60.0
-    )
+async def test_the_elapsed_column_ticks_between_fetches(tmp_path: Path) -> None:
+    """Requirement 2: once a second, without waiting for the next fetch."""
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    elapsed = PARITY_VIEW.index(ELAPSED_COLUMN)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        assert set(app._work_spells) == {"term-0002"}
-        await advance(pilot, feed)
-        # a different session's rows entirely; nothing from the old one survives
-        assert set(app._work_spells) == {"term-0032"}  # unknown + BUSY
+        assert plain(app.table, 1, elapsed) == "● 0s+"
+        fetches = feed.fetches
+
+        # what the 1 Hz timer calls, with no fetch in between
+        feed.clock += 5.0
+        app.refresh_elapsed()
+        await pilot.pause()
+        assert plain(app.table, 1, elapsed) == "● 5s+"
+        assert feed.fetches == fetches, "ticking must not drive the fetch loop"
+
+
+@pytest.mark.asyncio
+async def test_the_elapsed_tick_is_armed_once_a_second(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        intervals = [
+            timer._interval
+            for timer in app._timers
+            if getattr(timer, "_callback", None) is not None
+            and getattr(timer._callback, "__name__", "") == "refresh_elapsed"
+        ]
+        assert intervals == [ELAPSED_TICK_SECONDS]
+
+
+# ── the transition clock (fleet_state.StatusClock) ───────────────────────────
+
+
+def clock_terms(*pairs: Tuple[str, str]) -> List[Any]:
+    """Terminals with just the two fields the clock reads."""
+    raw = {"terminals": [{"id": i, "status": st} for i, st in pairs]}
+    return list(FleetState.from_dict(raw, fetched_at=0.0).terminals)
+
+
+def test_the_clock_opens_a_spell_the_first_time_it_sees_a_terminal() -> None:
+    clock = StatusClock()
+    clock.observe(clock_terms(("a", "processing")), now=100.0)
+    spell = clock.spell("a")
+    assert spell == StatusSpell("processing", 100.0, False)
+    # never witnessed the transition in, so the elapsed time is a lower bound
+    assert spell.exact is False
+    assert clock.elapsed("a", now=160.0) == 60.0
+
+
+def test_the_clock_keeps_a_spell_while_the_status_holds() -> None:
+    clock = StatusClock()
+    clock.observe(clock_terms(("a", "processing")), now=100.0)
+    clock.observe(clock_terms(("a", "processing")), now=160.0)
+    clock.observe(clock_terms(("a", "processing")), now=220.0)
+    assert clock.spell("a").since == 100.0
+    assert clock.elapsed("a", now=220.0) == 120.0
+
+
+def test_a_status_change_replaces_the_spell_and_makes_it_exact() -> None:
+    clock = StatusClock()
+    clock.observe(clock_terms(("a", "processing")), now=100.0)
+    clock.observe(clock_terms(("a", "completed")), now=160.0)
+    assert clock.spell("a") == StatusSpell("completed", 160.0, True)
+    assert clock.elapsed("a", now=170.0) == 10.0
+    # and back again: still exact, still from zero
+    clock.observe(clock_terms(("a", "processing")), now=200.0)
+    assert clock.spell("a") == StatusSpell("processing", 200.0, True)
+
+
+def test_a_condition_change_is_not_a_transition() -> None:
+    """A seat completed an hour ago has been completed an hour, BUSY or not."""
+    clock = StatusClock()
+    raw = {"terminals": [{"id": "a", "status": "completed", "condition": "BUSY"}]}
+    with_busy = list(FleetState.from_dict(raw, fetched_at=0.0).terminals)
+    clock.observe(with_busy, now=100.0)
+    clock.observe(clock_terms(("a", "completed")), now=160.0)
+    assert clock.spell("a").since == 100.0
+
+
+def test_the_clock_forgets_a_terminal_that_leaves_the_fleet() -> None:
+    clock = StatusClock()
+    clock.observe(clock_terms(("a", "processing"), ("b", "idle")), now=100.0)
+    assert clock.tracked() == {"a", "b"}
+    clock.observe(clock_terms(("b", "idle")), now=160.0)
+    assert clock.tracked() == {"b"}
+    assert clock.elapsed("a", now=160.0) is None
+    assert clock.spell("a") is None
+    # a terminal that comes back is new again, not resumed
+    clock.observe(clock_terms(("a", "processing"), ("b", "idle")), now=200.0)
+    assert clock.spell("a") == StatusSpell("processing", 200.0, False)
+
+
+def test_the_clock_never_reports_a_negative_elapsed() -> None:
+    clock = StatusClock()
+    clock.observe(clock_terms(("a", "idle")), now=100.0)
+    assert clock.elapsed("a", now=40.0) == 0.0
+
+
+def test_the_clock_knows_nothing_before_its_first_fold() -> None:
+    clock = StatusClock()
+    assert clock.spell("a") is None
+    assert clock.elapsed("a", now=1.0) is None
+    assert clock.tracked() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_the_peek_banner_names_both_clocks(tmp_path: Path) -> None:
+    """`for` is time in status; `quiet` is time since the pane last printed.
+
+    The window-activity age keeps a home in the detail view, where a working
+    seat that has gone quiet for minutes is worth noticing. What it lost is the
+    right to head a column of every row under the word "idle".
+    """
+    tmux = FakeTmux(activity={"0": 940, "2": 999, "3": 999})  # clock is 1000.0
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=tmux)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        term = app.selected_terminal()
+        assert term is not None and term.id == "term-0001"
+        banner = app.peek_title(term)
+        assert banner.startswith(f"{SECTION_MARK} peek · chao_supervisor-term-0001 · win 0 · ")
+        # the frozen clock reads 1001.0 by the first render, so window 0's
+        # last output at 940 is 61 s ago
+        assert banner.endswith("· ◌ idle · for 0s+ · quiet 61s")
+        assert "idle 61s" not in banner  # the misleading old wording is gone

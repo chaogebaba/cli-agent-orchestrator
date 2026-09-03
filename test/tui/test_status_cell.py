@@ -17,7 +17,12 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.condition import ConditionKind
-from cli_agent_orchestrator.tui.columns import ALL_COLUMNS, NEW_COLUMNS, PARITY_COLUMNS
+from cli_agent_orchestrator.tui.columns import (
+    ALL_COLUMNS,
+    ELAPSED_COLUMN,
+    NEW_COLUMNS,
+    PARITY_COLUMNS,
+)
 from cli_agent_orchestrator.tui.status_cell import status_cell
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -177,7 +182,15 @@ def test_non_string_status_never_raises() -> None:
 
 
 def test_parity_columns_are_the_six_script_headers_in_order() -> None:
-    assert PARITY_COLUMNS == ("WIN", "ID", "PROFILE", "TASK", "STATUS", "IDLE")
+    """Five verbatim from the script; the sixth renamed IDLE -> ELAPSED.
+
+    The column no longer shows how long a pane has been quiet under a header
+    that asserts the seat is idle — it shows time in the current status, for
+    every status — so the header had to stop naming one of them.
+    """
+    assert PARITY_COLUMNS == ("WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED")
+    assert PARITY_COLUMNS[-1] == ELAPSED_COLUMN
+    assert PARITY_COLUMNS[:5] == ("WIN", "ID", "PROFILE", "TASK", "STATUS")
 
 
 def test_new_columns_are_the_five_unrendered_keys() -> None:

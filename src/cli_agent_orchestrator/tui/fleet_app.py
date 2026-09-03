@@ -80,9 +80,7 @@ from typing import (
     Final,
     List,
     Mapping,
-    NamedTuple,
     Sequence,
-    Set,
     Tuple,
 )
 
@@ -110,6 +108,7 @@ from rich.text import Text
 from cli_agent_orchestrator.tui.columns import (
     ALL_COLUMNS,
     ALL_VIEW,
+    ELAPSED_COLUMN,
     MARKER_BLANK,
     MARKER_INDEX,
     MARKER_SELECTED,
@@ -117,18 +116,17 @@ from cli_agent_orchestrator.tui.columns import (
     PARITY_VIEW,
 )
 from cli_agent_orchestrator.tui.fetcher import FETCH_INTERVAL, fetch_json, run_fetch_loop
-from cli_agent_orchestrator.tui.fleet_state import FleetState, TerminalState
+from cli_agent_orchestrator.tui.fleet_state import FleetState, StatusClock, TerminalState
 from cli_agent_orchestrator.tui.status_cell import status_cell
 
 __all__ = [
     "FleetApp",
     "FleetUpdated",
-    "WorkSpell",
     "hint_text",
     "is_working",
     "main",
     "render_once",
-    "work_age_cell",
+    "elapsed_cell",
 ]
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9889"
@@ -204,48 +202,38 @@ FALLBACK_WIDTH: Final[int] = 80
 #: the banner and the double rule.
 PEEK_CHROME_LINES: Final[int] = 2
 
-# ─── Working-elapsed readout (F702 #557 "look" round) ─────────────────────────
-# "I want to see how long a subagent has been working, if it is working." The
-# IDLE column answers that for a working seat: `● 12m` instead of a window-
-# activity age that is always near zero while output is flowing.
+# ─── The ELAPSED column (F702 #557, "look" then "elapsed" rounds) ────────────
+# The column shows how long each seat has been in the status it is in now:
+# working, idle, errored or completed alike. It replaces the script's
+# window-activity age, which was seconds since the pane last printed something
+# and so read near zero for exactly the seats that were busiest.
 #
-# **No server field carries this today.** ``build_fleet()``
-# (``services/fleet_service.py:250-300``) publishes no status-transition
-# timestamp: the closest key, ``since_last_input``, is derived from the row's
-# ``last_active``, which ``clients/database.py:4842`` writes *only on input
-# delivery* (``send_input``/``send_message``/``send_special_key``). It therefore
-# misses a seat a human drove by typing into the pane, which is exactly why
-# F467 marks it unreliable and why the retiring script refuses it outright
-# (``fleet-tui.py:21-22``). The field the server should grow is
-# ``status_since``: the UTC stamp at which ``StatusMonitor`` last changed a
-# terminal's fused status, published next to ``status`` in the projection. With
-# it this readout becomes exact and this whole cross-fetch derivation deletes.
+# Where the number comes from — and the field the server should grow — is
+# documented on :class:`~cli_agent_orchestrator.tui.fleet_state.StatusClock`,
+# which owns the tracking. This module only decides how the number looks.
 #
-# Until then the spell is measured from the first poll that saw the row
-# working, so it is approximate in one direction only — never longer than the
-# truth — and a spell already running when the app started renders with a
-# trailing ``+`` to say so.
-#
-# **On D2.** This is the module's one piece of per-terminal cross-fetch state.
-# It cannot recreate #439's sticky latch: it never feeds ``status``, a row that
-# stops working drops its spell on the very next frame, and a row that leaves
-# the fleet drops it too. The invariant it must keep is "no spell outlives the
-# working state that created it", which
-# ``test_a_finished_spell_is_dropped_and_restarts_from_zero`` pins.
+# Working rows are marked so the column is readable at a glance without a
+# second column: the STATUS cell's own ``●`` and its green, against dim for
+# every other state. That is the whole visual difference, and it is the same
+# two-signal language the script used for status (``fleet-tui.py:229-242``).
 #: The status that means a turn is open.
 WORKING_STATUS: Final[str] = "processing"
 #: The provider condition that can mean the same, where the status is silent.
 WORKING_CONDITION: Final[str] = "BUSY"
 #: Statuses that positively assert the seat is at rest. A ``BUSY`` condition on
 #: one of these is a stale provider flag the fusion has overtaken, never a
-#: reason to start a clock — see :func:`is_working`.
+#: reason to call the seat working — see :func:`is_working`.
 RESTING_STATUSES: Final[frozenset[str]] = frozenset({"idle", "waiting_user_answer", "error"})
 #: The glyph the STATUS cell already uses for a working seat (``:236``).
 WORKING_GLYPH: Final[str] = "●"
-#: Appended when the spell started before this app was watching.
+#: Appended when the status began before this app was watching — a lower bound.
 WORK_APPROX_SUFFIX: Final[str] = "+"
-#: The IDLE cell's style while a seat is working — the status colour.
+#: The ELAPSED cell's style while a seat is working — the status colour.
 STYLE_WORKING: Final[str] = "green"
+#: Rendered when the clock has no spell for a row (only before its first fold).
+ELAPSED_UNKNOWN: Final[str] = "-"
+#: How often the ELAPSED column re-renders, independently of the fetch loop.
+ELAPSED_TICK_SECONDS: Final[float] = 1.0
 
 #: The tmux verbs this app is allowed to run. Only ``select-window`` mutates
 #: anything; the rest are reads (AC4).
@@ -398,19 +386,6 @@ def fmt_age(seconds: float | None) -> str:
     return f"{whole // 3600}h"
 
 
-def idle_style(seconds: float | None) -> str:
-    """IDLE-cell style, verbatim from ``idle_color`` (``fleet-tui.py:245-250``).
-
-    Dim below five seconds (including "no window activity at all"), yellow from
-    five minutes, unstyled in between.
-    """
-    if seconds is None or seconds < IDLE_FRESH_SECONDS:
-        return STYLE_DIM
-    if seconds >= IDLE_STALE_SECONDS:
-        return STYLE_IDLE_STALE
-    return ""
-
-
 def is_working(term: TerminalState) -> bool:
     """Whether this seat is *currently working*, for the IDLE cell's purposes.
 
@@ -440,30 +415,14 @@ def is_working(term: TerminalState) -> bool:
     return term.condition == WORKING_CONDITION
 
 
-def work_age_cell(seconds: float, exact: bool) -> str:
-    """The IDLE cell of a working row: ``● 12m``, or ``● 12m+`` when approximate.
+def elapsed_cell(seconds: float, exact: bool, working: bool) -> str:
+    """One ELAPSED cell: ``● 12m`` for a working seat, ``12m`` for any other.
 
-    The glyph is the STATUS cell's own ``●`` (``fleet-tui.py:236``), so the cell
-    says what it is measuring without the column having to be renamed. ``+``
-    marks a lower bound: the row was already working the first time this app
-    saw it, so the spell started before the readout did.
+    ``+`` marks a lower bound — the seat was already in this status the first
+    time the clock saw it, so the transition into it was never witnessed.
     """
-    return f"{WORKING_GLYPH} {fmt_age(seconds)}" + ("" if exact else WORK_APPROX_SUFFIX)
-
-
-class WorkSpell(NamedTuple):
-    """One unbroken working spell of one terminal, as this app observed it.
-
-    Attributes:
-        started_at: the clock reading of the first poll that saw the spell.
-        exact: ``True`` when the app had already seen this row *not* working, so
-            the start is real to within one poll interval. ``False`` when the
-            row was working the first time it was ever seen, which makes the
-            elapsed time a lower bound.
-    """
-
-    started_at: float
-    exact: bool
+    glyph = f"{WORKING_GLYPH} " if working else ""
+    return f"{glyph}{fmt_age(seconds)}" + ("" if exact else WORK_APPROX_SUFFIX)
 
 
 def read_labels(path: Path) -> Dict[str, str]:
@@ -555,10 +514,9 @@ def window_key(term: TerminalState) -> str:
 def row_values(
     term: TerminalState,
     labels: Mapping[str, str],
-    ages: Mapping[str, float],
     *,
     with_new_columns: bool = False,
-    work_cells: Mapping[str, str] | None = None,
+    elapsed_cells: Mapping[str, str] | None = None,
 ) -> List[str]:
     """Every cell of one row as plain text, gutter excluded.
 
@@ -566,23 +524,24 @@ def row_values(
     :class:`~rich.text.Text`) and by ``--once``, so the two renderings cannot
     disagree about what a row says.
 
-    ``work_cells`` maps a terminal id to its working-elapsed readout (from
-    :func:`work_age_cell`). An id present there takes over the IDLE cell: the
-    window-activity age of a working seat is always near zero, because the seat
-    is producing the output that resets it, so it answers the wrong question.
-    ``--once`` has no fetch history and passes nothing, leaving idle ages.
+    ``elapsed_cells`` maps a terminal id to its ELAPSED readout (from
+    :func:`elapsed_cell`), which is the app's :class:`StatusClock` rendered.
+    ``--once`` is a single fetch with no history to time a transition against,
+    so it passes nothing and every ELAPSED cell reads ``-``: an honest "not
+    known from one frame" rather than a window-activity age wearing the new
+    column's name.
     """
     default_label = "(supervisor seat)" if not term.parent_id else "(unlabeled)"
-    idle = fmt_age(ages.get(window_key(term)))
-    if work_cells is not None and term.id in work_cells:
-        idle = work_cells[term.id]
+    elapsed = ELAPSED_UNKNOWN
+    if elapsed_cells is not None:
+        elapsed = elapsed_cells.get(term.id, ELAPSED_UNKNOWN)
     values = [
         window_key(term),
         term.id,
         term.profile or "?",
         labels.get(term.id, default_label)[:40],
         status_cell(status_row(term)).plain,
-        idle,
+        elapsed,
     ]
     if with_new_columns:
         values += [
@@ -595,23 +554,18 @@ def row_values(
     return values
 
 
-def row_styles(
-    term: TerminalState,
-    ages: Mapping[str, float],
-    labelled: bool,
-    *,
-    working: bool = False,
-) -> List[str]:
+def row_styles(term: TerminalState, labelled: bool, *, working: bool = False) -> List[str]:
     """The per-cell styles of one row, in the order of :func:`row_values`.
 
     The colour language of ``fleet-tui.py:410-415``: a supervisor row is
     magenta with a bold id, a worker row has a dim window index and a cyan id,
-    an unlabeled TASK is dim, and IDLE is coloured by age. STATUS carries its
-    own style from :func:`status_cell`, so its slot here is empty.
+    and an unlabeled TASK is dim. STATUS carries its own style from
+    :func:`status_cell`, so its slot here is empty.
 
-    ``working`` swaps the IDLE cell's age colouring for the status colour, so a
-    working-elapsed readout is green next to its green ``● working`` — the age
-    thresholds mean nothing for a number that counts up rather than down.
+    ``working`` gives the ELAPSED cell the status colour, so a working seat's
+    elapsed time is green beside its green ``● working``; every other state is
+    dim. That one difference is what makes the column readable at a glance,
+    and it is why no second column was needed to carry it.
     """
     is_supervisor = not term.parent_id
     return [
@@ -620,7 +574,7 @@ def row_styles(
         STYLE_SUPERVISOR if is_supervisor else "",  # PROFILE
         "" if labelled else STYLE_DIM,  # TASK
         "",  # STATUS — status_cell owns it
-        STYLE_WORKING if working else idle_style(ages.get(window_key(term))),  # IDLE
+        STYLE_WORKING if working else STYLE_DIM,  # ELAPSED
     ]
 
 
@@ -751,12 +705,10 @@ class FleetApp(App[None]):
         #: Rendered column widths of the current frame, gutter first — the
         #: single source the table and its ``#table-head`` line both size from.
         self._widths: List[int] = []
-        #: Open working spells, ``{terminal_id: WorkSpell}``. The module's only
-        #: per-terminal cross-fetch state; see the readout's note above.
-        self._work_spells: Dict[str, WorkSpell] = {}
-        #: Ids this app has seen *not* working at least once, which is what
-        #: makes a later spell's start exact rather than a lower bound.
-        self._seen_resting: Set[str] = set()
+        #: Time-in-current-status per terminal. The only thing this app
+        #: remembers between fetches; see :class:`StatusClock` for why that is
+        #: safe and for the server field that would retire it.
+        self._clock = StatusClock()
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -885,6 +837,9 @@ class FleetApp(App[None]):
         self.query_one("#hints", Static).update(hint_renderable())
         self.refresh_view()
         self.fetch_worker()
+        # The clock ticks on its own: the fetch loop is too slow to watch a
+        # number count up, and too expensive to run at this rate.
+        self.set_interval(ELAPSED_TICK_SECONDS, self.refresh_elapsed)
 
     def frame_width(self) -> int:
         """Full-width for the two rules and the selection bar.
@@ -976,55 +931,74 @@ class FleetApp(App[None]):
         self.query_one("#flash", Static).update(self.flash)
 
     def window_ages(self) -> Dict[str, float]:
-        """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``)."""
+        """``{window_index: seconds since last output}`` (``fleet-tui.py:115-118``).
+
+        Read once per frame and cached in :attr:`_ages` for the peek banner's
+        ``quiet`` reading. This is the script's old IDLE number; it no longer
+        heads a column, because "the pane has printed nothing for N" and "the
+        seat is idle" are different claims and only the second belongs under a
+        status-shaped header.
+        """
         self._ages = read_window_ages(self.tmux, self.session, now=self._now)
         return self._ages
 
     def visible_terminals(self) -> List[TerminalState]:
         return sort_terminals(self.state.terminals)
 
-    # ── working-elapsed readout ──────────────────────────────────────────────
+    # ── the ELAPSED column ───────────────────────────────────────────────────
 
-    def track_work_spells(self, terminals: Sequence[TerminalState]) -> Dict[str, WorkSpell]:
-        """Open, keep or close each row's working spell against this snapshot.
-
-        Called once per frame, before the rows are built. Three rules, and the
-        second and third are what keep this from ever latching (D2):
-
-        * a row that is working and has no open spell opens one at the current
-          clock, marked *exact* only if this app has already seen the same row
-          not working;
-        * a row that is **not** working drops its spell immediately, so the next
-          spell restarts from zero rather than resuming the last one;
-        * a row that has left the fleet drops its spell and its history.
-        """
+    def elapsed_cells(self) -> Dict[str, str]:
+        """``{terminal_id: "● 12m"}`` for every row the clock is timing."""
         now = self._now()
-        present = {term.id for term in terminals}
-        for term in terminals:
-            if not is_working(term):
-                self._work_spells.pop(term.id, None)
-                self._seen_resting.add(term.id)
+        cells: Dict[str, str] = {}
+        for term in self.state.terminals:
+            spell = self._clock.spell(term.id)
+            if spell is None:
                 continue
-            if term.id not in self._work_spells:
-                self._work_spells[term.id] = WorkSpell(now, term.id in self._seen_resting)
-        for gone in set(self._work_spells) - present:
-            del self._work_spells[gone]
-        self._seen_resting &= present
-        return self._work_spells
+            cells[term.id] = elapsed_cell(
+                max(0.0, now - spell.since), spell.exact, is_working(term)
+            )
+        return cells
 
-    def work_cells(self) -> Dict[str, str]:
-        """``{terminal_id: "● 12m"}`` for every row with an open spell."""
+    def elapsed_text(self, term: TerminalState, now: float) -> Text:
+        """One ELAPSED cell, styled: green while working, dim otherwise."""
+        spell = self._clock.spell(term.id)
+        working = is_working(term)
+        if spell is None:
+            return Text(ELAPSED_UNKNOWN, style=STYLE_DIM)
+        plain = elapsed_cell(max(0.0, now - spell.since), spell.exact, working)
+        return Text(plain, style=STYLE_WORKING if working else STYLE_DIM)
+
+    def refresh_elapsed(self) -> None:
+        """Re-render just the ELAPSED cells. Driven by a 1 Hz timer.
+
+        The fetch loop runs every couple of seconds and does real work on each
+        pass — reading the labels file and shelling out to tmux — so it is the
+        wrong thing to run once a second just to advance a clock. This touches
+        the one column that changes on its own, writes a cell only when its text
+        actually differs, and never resizes a column: the ELAPSED column is the
+        one stretched to the screen edge, so a value growing from ``59s`` to
+        ``1m`` always has room.
+        """
+        table = self.table
+        if not table.row_count:
+            return
+        column = self.column_index(ELAPSED_COLUMN)
         now = self._now()
-        return {
-            terminal_id: work_age_cell(max(0.0, now - spell.started_at), spell.exact)
-            for terminal_id, spell in self._work_spells.items()
-        }
+        for index, term in enumerate(self.visible_terminals()):
+            if index >= table.row_count:
+                break
+            wanted = self.elapsed_text(term, now)
+            coordinate = Coordinate(index, column)
+            current = table.get_cell_at(coordinate)
+            if isinstance(current, Text) and current.plain == wanted.plain:
+                continue
+            table.update_cell_at(coordinate, wanted, update_width=False)
 
     def row_cells(
         self,
         term: TerminalState,
         labels: Mapping[str, str],
-        ages: Mapping[str, float],
         values: Sequence[str] | None = None,
     ) -> List[Any]:
         """One row, in the order of :attr:`view_columns`.
@@ -1037,11 +1011,10 @@ class FleetApp(App[None]):
             values = row_values(
                 term,
                 labels,
-                ages,
                 with_new_columns=self.show_new_columns,
-                work_cells=self.work_cells(),
+                elapsed_cells=self.elapsed_cells(),
             )
-        styles = row_styles(term, ages, term.id in labels, working=is_working(term))
+        styles = row_styles(term, term.id in labels, working=is_working(term))
         cells: List[Any] = [Text(MARKER_BLANK, style=STYLE_MARKER)]
         for index, value in enumerate(values):
             if index == PARITY_COLUMNS.index("STATUS"):
@@ -1076,24 +1049,28 @@ class FleetApp(App[None]):
         table = self.table
         selected = self.selected_id()
         labels = read_labels(self._labels_path)
-        ages = self.window_ages()
+        # One `list-windows` per frame, cached in `_ages`. The table no longer
+        # reads it — ELAPSED times the status, not the pane — but the peek
+        # banner still reports it as `quiet Ns`.
+        self.window_ages()
         rows = self.visible_terminals()
-        self.track_work_spells(rows)
-        work_cells = self.work_cells()
+        # Fold this snapshot into the clock before anything reads it, so a
+        # status that changed on this fetch is already timed from now.
+        self._clock.observe(rows, self._now())
+        elapsed = self.elapsed_cells()
         values = [
             row_values(
                 term,
                 labels,
-                ages,
                 with_new_columns=self.show_new_columns,
-                work_cells=work_cells,
+                elapsed_cells=elapsed,
             )
             for term in rows
         ]
         self._install_columns(self.frame_widths(values))
         self.refresh_table_head()
         for term, row in zip(rows, values):
-            table.add_row(*self.row_cells(term, labels, ages, row), key=term.id)
+            table.add_row(*self.row_cells(term, labels, row), key=term.id)
         if not rows:
             return
         ids = [t.id for t in rows]
@@ -1240,14 +1217,23 @@ class FleetApp(App[None]):
     def peek_title(self, term: TerminalState) -> str:
         """The peek banner (``fleet-tui.py:441-443``): who, where, how idle.
 
-        Reads the ages cached by the frame's one ``list-windows`` call; moving
-        the cursor redraws the banner without a second tmux round trip.
+        Two different clocks, both named for what they measure. ``for`` is time
+        in the current status, the same number the row's ELAPSED cell shows.
+        ``quiet`` is time since the pane last printed anything, from the frame's
+        one cached ``list-windows`` call — the old IDLE number, which is a real
+        signal in a detail view (a working seat that has gone quiet for minutes
+        is worth a look) and only misleading when it wears the word "idle" in a
+        column of every seat.
         """
-        ages = self._ages
         status = status_cell(status_row(term)).plain.removeprefix("· ")
+        spell = self._clock.spell(term.id)
+        if spell is None:
+            held = ELAPSED_UNKNOWN
+        else:
+            held = elapsed_cell(max(0.0, self._now() - spell.since), spell.exact, False)
         return (
             f"▌ peek · {term.profile}-{term.id} · win {window_key(term)}"
-            f" · {status} · idle {fmt_age(ages.get(window_key(term)))}"
+            f" · {status} · for {held} · quiet {fmt_age(self._ages.get(window_key(term)))}"
         )
 
     def peek_capacity(self, peek: Static) -> int:
@@ -1417,7 +1403,6 @@ def format_frame(
     session: str,
     state: FleetState,
     labels: Mapping[str, str],
-    ages: Mapping[str, float],
     events: Sequence[str],
     *,
     latency_ms: int | None = None,
@@ -1429,6 +1414,12 @@ def format_frame(
     Column widths follow the script's rule: the wider of the header and the
     widest cell, plus a two-space gutter (``:362-370``). No colour: the output
     is meant for a pipe, a snapshot or a bug report.
+
+    ELAPSED reads ``-`` throughout: one fetch has no earlier fetch to time a
+    transition against, and no server field carries the transition stamp (see
+    :class:`StatusClock`). Printing a window-activity age there instead would
+    put a number under the new column's name that does not mean what the column
+    says.
     """
     rows = sort_terminals(state.terminals)
     workers = sum(1 for term in rows if term.parent_id)
@@ -1440,7 +1431,7 @@ def format_frame(
         f"{SECTION_MARK} CAO fleet · {session}  {clock} · {workers} workers · fetch {latency}"
     )
     out.append("")
-    values = [row_values(term, labels, ages) for term in rows]
+    values = [row_values(term, labels) for term in rows]
     widths = column_widths(PARITY_COLUMNS, values)
     header = header_line(PARITY_COLUMNS, widths)
     out.append(header)
@@ -1482,7 +1473,6 @@ def render_once(
         session,
         state,
         read_labels(labels_path),
-        read_window_ages(runner, session, now=now),
         read_events(events_path, 5),
         latency_ms=latency,
         clock=time.strftime("%H:%M:%S", time.localtime(now())),
