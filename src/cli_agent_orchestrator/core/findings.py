@@ -36,12 +36,33 @@ class FindingCode(StrEnum):
                                 the ``finding`` table, which is why that table is
                                 created FIRST and in its own transaction: it has
                                 to survive its own migration failing.
+
+    Phase 3 adds the two codes D9's boot guard raises.  The phase names five in
+    all; the other three (``DIAG-DUP-DELIVERY``, ``DIAG-DOUBLE-WAKE`` and
+    ``DIAG-DELIVERY-TIME-BOUND``) belong to sub-phases 3b and 3c and land with
+    the code that can raise them.  A finding code no code path reaches is a
+    promise the enum cannot keep, and ``cao diag findings`` would offer an
+    operator a filter that never matches.
+
+    ``DIAG_QUEUE_ORPHAN_GUARD``   — the boot guard demoted the requested switch
+                                    position to ``drain`` because live
+                                    non-terminal rows were outstanding (D9).
+                                    This is also how an operator learns that an
+                                    UNSET variable started the delivery
+                                    machinery: the guard overrides the default,
+                                    and the finding is the notice.
+    ``DIAG_BARRIER_OPEN_AT_FLIP`` — a boot requested ``on`` while a callback
+                                    barrier was still OPEN, so the flip was held
+                                    at ``shadow`` rather than splitting that
+                                    barrier's members across two tables (D9).
     """
 
     DIAG_BAD_TRANSITION = "DIAG-BAD-TRANSITION"
     DIAG_GHOST_TRANSITION = "DIAG-GHOST-TRANSITION"
     DIAG_LEGACY_DISAGREE = "DIAG-LEGACY-DISAGREE"
     DIAG_MIGRATION_FAILED = "DIAG-MIGRATION-FAILED"
+    DIAG_QUEUE_ORPHAN_GUARD = "DIAG-QUEUE-ORPHAN-GUARD"
+    DIAG_BARRIER_OPEN_AT_FLIP = "DIAG-BARRIER-OPEN-AT-FLIP"
 
 
 class FindingState(StrEnum):

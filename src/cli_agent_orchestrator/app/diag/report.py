@@ -31,18 +31,23 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from cli_agent_orchestrator.app.delivery.agreement import AgreementReport as AgreementReportT
 from cli_agent_orchestrator.app.worker_truth.agreement import AgreementReport
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import AnyKind, EventKind, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
-from cli_agent_orchestrator.core.ports import EventStore, FindingStore, StateStore
+from cli_agent_orchestrator.core.ports import EventStore, FindingStore, QueueStore, StateStore
 from cli_agent_orchestrator.core.states import WorkerState
 
 __all__ = [
     "DiagSources",
     "INGEST_OFF_NOTE",
     "findings_payload",
+    "delivery_agreement_payload",
+    "message_payload",
     "render_agreement",
+    "render_delivery_agreement",
+    "render_message",
     "render_findings",
     "render_timeline",
     "render_why",
@@ -77,6 +82,12 @@ class DiagSources:
     events: EventStore
     states: StateStore
     findings: FindingStore
+    #: The delivery queue, for ``cao diag <msg_id>`` (I5).  Optional because the
+    #: message view is the only reader and a caller that does not need it should
+    #: not have to open the queue's tables; a ``None`` here renders the worker
+    #: events for the id and says plainly that the queue was not consulted,
+    #: rather than reporting an empty queue as a fact.
+    queue: QueueStore | None = None
 
 
 # ---------------------------------------------------------------------- helpers
@@ -559,5 +570,277 @@ def render_agreement(report: AgreementReport) -> str:
                 f"  {disagreement.terminal_id:<16} shadow {disagreement.projected.value} vs "
                 f"legacy {disagreement.legacy.value}  {span}  "
                 f"opened_by={disagreement.opened_by}  {disagreement.sample_event_id}"
+            )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------- the message view
+
+
+def message_payload(
+    sources: DiagSources, msg_id: str, *, now: datetime, ingest_on: bool = True
+) -> dict[str, Any]:
+    """Everything stored about one ``msg_id``, as data (WP-ARCH phase 3a, I5).
+
+    I5 is "one query returns a msg_id's full history", and the history has two
+    halves that a reader needs together.  The queue row and its
+    ``delivery_attempt`` rows say what the delivery machinery did.  The
+    ``worker_event`` rows carrying the same ``msg_id`` say what the SERVER
+    decided around it — phase 1 put the column on the log and the timeline
+    renderer already shows it, so this view is the filter §7a asks for rather
+    than a second store.
+
+    Both halves, because either alone is the pane archaeology this replaces: the
+    attempts without the decisions do not say why an injection was tried, and the
+    decisions without the attempts do not say whether it landed.
+    """
+    message = None if sources.queue is None else sources.queue.get(msg_id)
+    attempts = [] if sources.queue is None else sources.queue.attempts_for(msg_id)
+    dead = None
+    if sources.queue is not None:
+        reader = getattr(sources.queue, "dead_letter", None)
+        if reader is not None:
+            dead = reader(msg_id)
+
+    header: dict[str, Any] = {
+        "found": message is not None,
+        "queue_consulted": sources.queue is not None,
+    }
+    if message is not None:
+        header.update(
+            {
+                "msg_id": message.msg_id,
+                "state": message.state.value,
+                "mode": message.mode.value,
+                "receiver_id": message.receiver_id,
+                "sender_id": message.sender_id,
+                "kind": message.kind.value,
+                "attempts": message.attempts,
+                "max_attempts": message.max_attempts,
+                "claim_id": message.claim_id,
+                "lease_owner": message.lease_owner,
+                "lease_expires_at": _iso(message.lease_expires_at),
+                "available_at": _iso(message.available_at),
+                # The deadline is stamped once at enqueue and never recomputed,
+                # so printing it beside created_at is also the cheapest possible
+                # audit of that rule: the gap is DELIVERY_MAX_LIFETIME_S, or the
+                # caller's shorter expiry, and nothing else.
+                "dead_by": _iso(message.dead_by),
+                "held_since": _iso(message.held_since),
+                "created_at": _iso(message.created_at),
+                "terminated_at": _iso(message.terminated_at),
+                "expire_after_s": message.expire_after_s,
+                "supersede_key": message.supersede_key,
+                "legacy_message_id": message.legacy_message_id,
+                "is_notice": message.is_notice,
+                "cancel_on_complete": message.cancel_on_complete,
+            }
+        )
+    if dead is not None:
+        header["dead_reason"] = dead.reason.value
+        header["died_at"] = _iso(dead.died_at)
+
+    events = sources.events.read()
+    related = [row for row in events if row.msg_id == msg_id]
+
+    return {
+        "ingest_on": ingest_on,
+        "generated_at": now.isoformat(),
+        "header": header,
+        "attempts": [
+            {
+                "claim_id": attempt.claim_id,
+                "carrier": attempt.carrier,
+                "started_at": attempt.started_at.isoformat(),
+                "outcome": attempt.outcome.value,
+                "detail": attempt.detail,
+            }
+            for attempt in attempts
+        ],
+        "events": [
+            {
+                "seq": row.seq,
+                "event_id": row.event_id,
+                "terminal_id": row.terminal_id,
+                "kind": row.kind.value,
+                "producer": row.producer.value,
+                "confidence": row.confidence.value,
+                "ingested_at": row.ingested_at.isoformat(),
+                "decision": row.decision.value if row.decision is not None else None,
+                "evidence": row.evidence,
+                "payload": row.payload,
+            }
+            for row in related
+        ],
+    }
+
+
+def render_message(
+    sources: DiagSources, msg_id: str, *, now: datetime, ingest_on: bool = True
+) -> str:
+    """The human view of one message.  Rendered entirely from the payload.
+
+    Two reads of the stores could return different rows — the CLI opens the live
+    database while the server is writing to it — and a text view that disagreed
+    with its own ``--json`` would be worse than either alone.
+    """
+    data = message_payload(sources, msg_id, now=now, ingest_on=ingest_on)
+    header = data["header"]
+    lines: list[str] = []
+    if not ingest_on:
+        lines.append(INGEST_OFF_NOTE)
+    lines.append(f"message {msg_id}")
+
+    if not header["queue_consulted"]:
+        lines.append("  delivery queue: not consulted (no queue store was opened)")
+    elif not header["found"]:
+        lines.append("  delivery queue: no row with this id")
+    else:
+        state = header["state"]
+        if header.get("dead_reason"):
+            state = f"{state}({header['dead_reason']})"
+        lines.append(
+            f"  state        {state}  mode={header['mode']}  kind={header['kind']}"
+            f"  attempts={header['attempts']}/{header['max_attempts']}"
+            f"  claim_id={header['claim_id']}"
+        )
+        lines.append(f"  receiver     {header['receiver_id']}  from {header['sender_id'] or '-'}")
+        lines.append(
+            f"  created      {_age(now, _parse(header['created_at']))}"
+            f"   deadline {_age(now, _parse(header['dead_by']))}"
+            f"   available {_age(now, _parse(header['available_at']))}"
+        )
+        if header.get("held_since"):
+            lines.append(f"  dialog hold  since {_age(now, _parse(header['held_since']))}")
+        if header.get("terminated_at"):
+            lines.append(f"  ended        {_age(now, _parse(header['terminated_at']))}")
+        if header.get("legacy_message_id") is not None:
+            lines.append(f"  mirrors      legacy inbox row {header['legacy_message_id']}")
+
+    lines.append(_SEPARATOR)
+    if not data["attempts"]:
+        lines.append("no delivery attempts recorded")
+    else:
+        lines.append(f"{'claim':>6}  {'carrier':<16}  {'started':<14}  {'outcome':<16}  detail")
+        for attempt in data["attempts"]:
+            started = _parse(attempt["started_at"])
+            lines.append(
+                f"{attempt['claim_id']:>6}  {attempt['carrier'][:16]:<16}  "
+                f"{(_clock(started) if started else '-'):<14}  "
+                f"{attempt['outcome']:<16}  {attempt['detail']}"
+            )
+
+    lines.append(_SEPARATOR)
+    if not data["events"]:
+        lines.append("no worker events carry this msg_id")
+    else:
+        lines.append(f"{'seq':>6}  {'terminal':<20}  {'kind':<22}  {'producer':<10}  decision")
+        for row in data["events"]:
+            lines.append(
+                f"{row['seq']:>6}  {row['terminal_id'][:20]:<20}  {row['kind'][:22]:<22}  "
+                f"{row['producer']:<10}  {row['decision'] or '-'}"
+            )
+    return "\n".join(lines)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+# ------------------------------------------------- AC-3a's delivery agreement
+
+
+def delivery_agreement_payload(report: "AgreementReportT", *, now: datetime) -> dict[str, Any]:
+    """AC-3a's report as data, in the shape phase 1's AC10 report uses."""
+    return {
+        "valid": report.valid,
+        "invalid_reasons": report.invalid_reasons,
+        "generated_at": now.isoformat(),
+        "totals": {
+            "receivers": len(report.receivers),
+            "shadow_rows": report.total_messages,
+            "queue_terminal": report.queue_terminal,
+            "legacy_terminal": report.legacy_terminal,
+            "comparable": report.total_comparable,
+            "agreements": report.total_agreements,
+            "agreement_rate": report.agreement_rate,
+        },
+        "classifications": report.classification_counts(),
+        "receivers": [
+            {
+                "receiver_id": receiver.receiver_id,
+                "messages": receiver.messages,
+                "comparable": receiver.comparable,
+                "agreements": receiver.agreements,
+                "agreement_rate": receiver.agreement_rate,
+                "disagreements": [
+                    {
+                        "msg_id": row.msg_id,
+                        "legacy_message_id": row.legacy_message_id,
+                        "queue_state": row.queue_state.value,
+                        "legacy_status": row.legacy_status,
+                        "classification": row.classification,
+                    }
+                    for row in receiver.comparisons
+                    if row.classification is not None
+                ],
+            }
+            for receiver in report.receivers
+        ],
+    }
+
+
+def render_delivery_agreement(report: "AgreementReportT", *, now: datetime) -> str:
+    """The human view of AC-3a.
+
+    The INVALID banner is first and unmissable.  An empty comparison is "no
+    evidence", never "perfect agreement", and a report attached to a gate must
+    not be readable as a pass by someone who skimmed the rate.
+    """
+    data = delivery_agreement_payload(report, now=now)
+    totals = data["totals"]
+    lines: list[str] = []
+    if not report.valid:
+        lines.append("INVALID — this run is not evidence:")
+        lines.extend(f"  - {reason}" for reason in report.invalid_reasons)
+        lines.append("")
+
+    rate = totals["agreement_rate"]
+    lines.append(
+        f"shadow rows {totals['shadow_rows']}  receivers {totals['receivers']}  "
+        f"terminal: queue {totals['queue_terminal']} / legacy {totals['legacy_terminal']}"
+    )
+    lines.append(
+        f"comparable {totals['comparable']}  agreements {totals['agreements']}  "
+        f"rate {'n/a' if rate is None else f'{rate:.3f}'}"
+    )
+    counts = data["classifications"]
+    lines.append(
+        f"disagreements: queue-early {counts['queue_early']}  "
+        f"legacy-early {counts['legacy_early']}  genuine {counts['genuine']}"
+    )
+    lines.append(_SEPARATOR)
+    lines.append(f"{'receiver':<28}  {'msgs':>5}  {'comp':>5}  {'agree':>5}  rate")
+    for receiver in data["receivers"]:
+        receiver_rate = receiver["agreement_rate"]
+        lines.append(
+            f"{receiver['receiver_id'][:28]:<28}  {receiver['messages']:>5}  "
+            f"{receiver['comparable']:>5}  {receiver['agreements']:>5}  "
+            f"{'n/a' if receiver_rate is None else f'{receiver_rate:.3f}'}"
+        )
+
+    rows = [
+        (receiver["receiver_id"], row)
+        for receiver in data["receivers"]
+        for row in receiver["disagreements"]
+    ]
+    if rows:
+        lines.append(_SEPARATOR)
+        lines.append(f"{'msg_id':<28}  {'legacy':>7}  {'queue':<11}  {'legacy status':<14}  class")
+        for receiver_id, row in rows:
+            lines.append(
+                f"{row['msg_id'][:28]:<28}  {str(row['legacy_message_id']):>7}  "
+                f"{row['queue_state']:<11}  {row['legacy_status'] or '-':<14}  "
+                f"{row['classification']}"
             )
     return "\n".join(lines)
