@@ -1775,6 +1775,19 @@ class StatusMonitor:
                 exc_info=True,
             )
 
+    def reset_detection_retry_budget(self, terminal_id: str) -> None:
+        """F530 #386: refund the per-silence-episode detection-retry budget.
+
+        ``schedule_detection_retry`` allows six requests per silence episode and
+        the only other reset edge is real pane output (:1565). A pane stalled on
+        a dialog produces none, so ~31 s after it goes quiet the budget is spent
+        and nothing looks at that terminal again — an auto-answer rule added
+        after that point can never be consulted. A change to the rule file is a
+        new reason to look, so it buys a fresh budget.
+        """
+        with self._lock:
+            self._retry_backoff_step.pop(terminal_id, None)
+
     def _on_raw_quiescent(self, terminal_id: str, expected_seq: Optional[int] = None) -> None:
         """Quiescence timer fired for raw path: re-detect from current buffer.
 

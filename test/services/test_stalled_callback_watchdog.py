@@ -935,6 +935,41 @@ class TestWaitingInboxAlert:
         assert "for 10s" in message
         # Delivery is implicit via inbox insertion (F136-D17)
 
+    def test_b2_the_sweep_offers_the_responder_a_rules_reload(self):
+        """F530 #386: a pane stalled on a dialog emits nothing, so the
+        responder's own detection-retry budget is spent long before this alert
+        fires and no tick will ever consult a rule added in the meantime. This
+        sweep is the only thing still visiting the terminal, so it is where the
+        rule file gets re-read — on every tick, from the first, not only when
+        the alert crosses its grace period.
+        """
+        svc = StalledCallbackWatchdog()
+        metadata = {
+            "id": "worker1",
+            "caller_id": "caller1",
+            "agent_profile": "developer",
+            "provider": "codex",
+        }
+        with _waiting_inbox_fakes(metadata=metadata):
+            with patch(
+                "cli_agent_orchestrator.services.auto_responder."
+                "auto_responder.rearm_if_rules_changed"
+            ) as mock_rearm:
+                svc.tick_waiting_inbox(now=100.0)
+
+        mock_rearm.assert_called_once_with("worker1", "codex")
+
+    def test_b3_a_terminal_with_no_provider_is_skipped(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes():  # default metadata carries no provider
+            with patch(
+                "cli_agent_orchestrator.services.auto_responder."
+                "auto_responder.rearm_if_rules_changed"
+            ) as mock_rearm:
+                svc.tick_waiting_inbox(now=100.0)
+
+        mock_rearm.assert_not_called()
+
     def test_c_fired_episode_does_not_push_twice(self):
         svc = StalledCallbackWatchdog()
         with _waiting_inbox_fakes() as fakes:
