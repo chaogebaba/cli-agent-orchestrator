@@ -35,6 +35,8 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, assert_
 
 import requests
 
+# WP-ARCH phase 1 (F725 #581) hook points 3, 6, 7 — server decision rows.
+from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     _utcnow,
@@ -81,9 +83,6 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
-
-# WP-ARCH phase 1 (F725 #581) hook points 3, 6, 7 — server decision rows.
-from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
