@@ -7,7 +7,8 @@ reset_hint_raw, source_path, source_line_range, captured_at, sha256) per fixture
 `captured_at` = scrollback file mtime (UTC) — the capture date of the terminal session.
 
 Condition taxonomy: CAPPED (usage/rate limit, with reset hint when present),
-AUTH_EXPIRED, NET_INTERRUPTED, CONTEXT_EXHAUSTED, DIALOG_BLOCKED, PROC_EXITED, BUSY.
+AUTH_EXPIRED, NET_INTERRUPTED, CONTEXT_EXHAUSTED, DIALOG_BLOCKED, PROC_EXITED, BUSY,
+TRANSIENT_OVERLOAD.
 
 ## Index
 
@@ -41,6 +42,7 @@ AUTH_EXPIRED, NET_INTERRUPTED, CONTEXT_EXHAUSTED, DIALOG_BLOCKED, PROC_EXITED, B
 | kiro-cli-busy-1 | kiro_cli | BUSY | thinking_spinner | — | 28b50b67.scrollback:531-539 | d33d0b9d0467 |
 | claude-code-busy-1 | claude_code | BUSY | asterisk_spinner | — | 82b743ab.scrollback:19-27 | 6b29b25c3549 |
 | cline-cli-proc-exited-1 | cline_cli | PROC_EXITED | command_exit_code | — | 0b970e6c.scrollback:72-75 | baedd3768dbc |
+| cline-cli-self-abort-1 | cline_cli | TRANSIENT_OVERLOAD | self_abort_loop_limit | — (none on screen) | f738-build-report.md §4 Arm A | d5aecdaf9ba7 |
 
 Notes:
 - codex-context-exhausted-1 and codex-busy-1 are the same source excerpt (footer with
