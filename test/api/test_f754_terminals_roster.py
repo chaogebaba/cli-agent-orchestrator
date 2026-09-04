@@ -31,9 +31,7 @@ class TestTerminalsRoster:
                 "caller_id": "34a7b2c1",
             },
         ]
-        with patch(
-            "cli_agent_orchestrator.clients.database.list_all_terminals", return_value=rows
-        ):
+        with patch("cli_agent_orchestrator.clients.database.list_all_terminals", return_value=rows):
             response = client.get("/terminals")
 
         assert response.status_code == 200
