@@ -16,10 +16,11 @@ that need to exercise the Auth0 paths.
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 from unittest.mock import patch
 
 import pytest
@@ -252,6 +253,92 @@ def _reset_backend_registry():
 
 
 # ---------------------------------------------------------------------------
+# terminal_service process-global registries
+# ---------------------------------------------------------------------------
+# ``terminal_service`` keeps eleven module-level registries that are correct for
+# a long-lived server process and wrong for a test worker, because the worker
+# runs thousands of "processes" back to back in one interpreter. The names they
+# key on are not unique across tests -- a full-suite instrumented run on
+# grok-box-005 (2026-09-04, main 9b93dd24) caught 45 tests ending with state they
+# did not create, keyed on ids as generic as ``worker1``, ``test1234``,
+# ``queued``, ``receiver`` and sessions ``cao-test``, ``cao-race``. Two of those
+# registries are gates: ``_memory_injected_terminals`` makes the first-message
+# memory injection a no-op for an id it already holds, and
+# ``_f160_retried_terminals`` spends a terminal's one watchdog re-arm, which is
+# in-memory by design. A test that picks a used id therefore
+# exercises a different branch than it does in isolation.
+#
+# Save/restore rather than clear: whatever a class- or module-scoped fixture put
+# there during setup is still there for the rest of that fixture's tests, while
+# anything a test itself adds is gone before the next one starts. Restoring in
+# place (not rebinding) keeps the aliases in ``from ... import`` test modules --
+# several import these registries by name -- pointing at the live objects.
+_TERMINAL_SERVICE_REGISTRIES = (
+    "_memory_injected_terminals",
+    "_deferred_init_tasks",
+    "_deferred_reconciler_tasks",
+    "_f160_retried_terminals",
+    "_deferred_tasks_by_terminal",
+    "_fork_refresh_locks",
+    "_cap_admission_locks",
+    "_cap_reservations",
+    "_cap_publishing_ids",
+    "_cap_token_seq",
+    "_cap_gen",
+)
+# Same treatment, but these are plain ints rather than containers.
+_TERMINAL_SERVICE_COUNTERS = ("_cap_registry_cardinality", "_cap_registry_warned_at")
+
+
+_TERMINAL_SERVICE_MODULE = "cli_agent_orchestrator.services.terminal_service"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_terminal_service_registries() -> Iterator[None]:
+    """Confine terminal_service's module-global registries to one test.
+
+    Reads ``sys.modules`` rather than importing: this fixture is autouse over the
+    whole suite, and importing terminal_service here would drag it (and its
+    dependency graph) into thousands of tests that never touch it. That is not
+    hypothetical — at base, a trivial test runs with the module absent from
+    ``sys.modules``, so an unconditional import here changes the process state
+    every test observes. There is nothing to isolate while the module is unloaded
+    anyway: its registries cannot hold another test's state until something
+    imports it.
+    """
+    module = sys.modules.get(_TERMINAL_SERVICE_MODULE)
+    # Values are (live container, copy taken at setup). The containers are a mix
+    # of dict and set, so this is deliberately not narrowed past Any: every use
+    # below is clear()/update(), which both support identically.
+    saved: Dict[str, tuple[Any, Any]] = {}
+    counters: "Dict[str, Any] | None" = None
+    if module is not None:
+        for name in _TERMINAL_SERVICE_REGISTRIES:
+            live = getattr(module, name)
+            saved[name] = (live, live.copy())
+        counters = {name: getattr(module, name) for name in _TERMINAL_SERVICE_COUNTERS}
+
+    yield
+
+    module = sys.modules.get(_TERMINAL_SERVICE_MODULE)
+    if module is None:
+        return
+    if counters is not None:
+        for name, (live, snapshot) in saved.items():
+            live.clear()
+            live.update(snapshot)
+        for name, value in counters.items():
+            setattr(module, name, value)
+    else:
+        # The test imported it. A fresh import starts every registry empty and
+        # both counters at zero, so whatever is in them now, this test put there.
+        for name in _TERMINAL_SERVICE_REGISTRIES:
+            getattr(module, name).clear()
+        for name in _TERMINAL_SERVICE_COUNTERS:
+            setattr(module, name, 0)
+
+
+# ---------------------------------------------------------------------------
 # F352: Global sender-token bypass for tests not exercising enforcement
 # ---------------------------------------------------------------------------
 _F352_ENFORCEMENT_MODULES = frozenset(
@@ -290,9 +377,9 @@ def _sim_leak_guard():
     Promoted from test/simulation/conftest.py to suite-wide scope. Extended
     to also assert backends.registry._backend is None on entry (D14 amendment).
     """
+    from cli_agent_orchestrator.backends import registry
     from cli_agent_orchestrator.sim.clock import active as clock_active
     from cli_agent_orchestrator.sim.rng import active as rng_active
-    from cli_agent_orchestrator.backends import registry
 
     # Pre-check: should not be installed
     leaked_clock_pre = clock_active()
@@ -340,12 +427,13 @@ def _isolate_seam_parity_and_incarnations():
     from sqlalchemy.exc import SQLAlchemyError
 
     try:
+        from sqlalchemy import inspect, text
+
         from cli_agent_orchestrator.clients.database import (
             SeamParityMismatchModel,
             SeamParityModel,
             SessionLocal,
         )
-        from sqlalchemy import inspect, text
 
         with SessionLocal() as db:
             # Seam-parity cleanup (was _isolate_seam_parity_state)
