@@ -32,19 +32,28 @@ from cli_agent_orchestrator.tui.columns import (
 )
 from cli_agent_orchestrator.tui.fleet_app import (
     ACCENT_SELECTION,
+    ELAPSED_FRESH_SECONDS,
+    ELAPSED_STALE_SECONDS,
     ELAPSED_TICK_SECONDS,
     ELAPSED_UNKNOWN,
+    EMPTY_ROWS_TEXT,
+    FLASH_SECONDS,
+    FLASH_TICK_SECONDS,
     GUTTER_WIDTH,
     KEY_HINTS,
     PEEK_RULE_GLYPH,
     RULE_GLYPH,
     SECTION_MARK,
+    STYLE_DIM,
+    STYLE_ELAPSED_STALE,
     STYLE_HINT_KEY,
     STYLE_HINT_LABEL,
+    STYLE_WORKING,
     FleetApp,
     column_widths,
     detect_tmux_session,
     elapsed_cell,
+    elapsed_style,
     find_events_sync_script,
     fmt_age,
     format_frame,
@@ -55,11 +64,14 @@ from cli_agent_orchestrator.tui.fleet_app import (
     read_events,
     read_labels,
     render_once,
+    row_styles,
     row_values,
     sort_terminals,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState, StatusClock, StatusSpell
 from cli_agent_orchestrator.tui.status_cell import STYLE_QUIET_TAG, status_cell
+
+from .screen import screen_lines
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -1161,6 +1173,7 @@ LAYOUT_ORDER = [
     "table-head",
     "table-rule",
     "fleet",
+    "empty",
     "events-title",
     "events",
     "debug",
@@ -1225,7 +1238,9 @@ async def test_the_peek_banner_is_a_title_over_a_full_width_double_rule(
     app, feed, _ = make_app([load_payload("healthy")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
-        banner = app.peek_banner(app.selected_terminal()).plain.splitlines()
+        # FakeTmux answers `list-panes` with %7, which is what the app resolved
+        # for this frame and wrote into the banner.
+        banner = app.peek_banner(app.selected_terminal(), "%7").plain.splitlines()
         assert banner[0].startswith(f"{SECTION_MARK} peek · ")
         assert set(banner[1]) == {PEEK_RULE_GLYPH}
         assert len(banner[1]) == app.frame_width()
@@ -1506,9 +1521,233 @@ async def test_the_peek_banner_names_both_clocks(tmp_path: Path) -> None:
         await settle(pilot, feed)
         term = app.selected_terminal()
         assert term is not None and term.id == "term-0001"
-        banner = app.peek_title(term)
-        assert banner.startswith(f"{SECTION_MARK} peek · chao_supervisor-term-0001 · win 0 · ")
+        banner = app.peek_title(term, "%7")
+        assert banner.startswith(f"{SECTION_MARK} peek · chao_supervisor-term-0001 · win 0 · %7 · ")
         # the frozen clock reads 1001.0 by the first render, so window 0's
         # last output at 940 is 61 s ago
         assert banner.endswith("· ◌ idle · for 0s+ · quiet 61s")
         assert "idle 61s" not in banner  # the misleading old wording is gone
+
+
+# ── second parity round (F702 #557, 2026-09-04) ──────────────────────────────
+#
+# The five items the first parity round left behind, one section each. Every
+# one is a behaviour scripts/fleet-tui.py has and the Textual app did not.
+
+
+# ── age colouring of the last column (script `idle_color`, :245-250) ─────────
+
+
+def test_elapsed_style_restores_the_scripts_three_age_bands() -> None:
+    """`idle_color` verbatim (`fleet-tui.py:245-250`), plus the working green."""
+    assert elapsed_style(None, False) == STYLE_DIM
+    assert elapsed_style(0.0, False) == STYLE_DIM
+    assert elapsed_style(ELAPSED_FRESH_SECONDS - 0.1, False) == STYLE_DIM
+    # the middle band carries no style at all — the script's ""
+    assert elapsed_style(ELAPSED_FRESH_SECONDS, False) == ""
+    assert elapsed_style(120.0, False) == ""
+    assert elapsed_style(ELAPSED_STALE_SECONDS, False) == STYLE_ELAPSED_STALE
+    assert elapsed_style(3600.0, False) == STYLE_ELAPSED_STALE
+    # a working seat is green whatever its age: the STATUS colour, so the two
+    # cells never disagree about what the row is doing
+    for seconds in (None, 0.0, 120.0, 3600.0):
+        assert elapsed_style(seconds, True) == STYLE_WORKING
+
+
+@pytest.mark.asyncio
+async def test_the_elapsed_cell_changes_colour_as_a_resting_status_ages(
+    tmp_path: Path,
+) -> None:
+    """A seat stuck in one status for five minutes is findable by colour again.
+
+    Flattening every non-working row to dim (the state this round found) is
+    what made a stalled seat indistinguishable from one that just transitioned.
+    """
+    payload = load_payload("healthy")
+    app, feed, _ = make_app([payload], tmp_path)
+    elapsed = PARITY_VIEW.index(ELAPSED_COLUMN)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        # row 0 is the idle supervisor; row 1 is the working codex_dev
+        assert cell(app.table, 0, elapsed).style == STYLE_DIM
+        assert cell(app.table, 1, elapsed).style == STYLE_WORKING
+
+        feed.clock += ELAPSED_FRESH_SECONDS
+        app.refresh_elapsed()
+        await pilot.pause()
+        assert cell(app.table, 0, elapsed).style == ""
+        assert cell(app.table, 1, elapsed).style == STYLE_WORKING
+
+        feed.clock += ELAPSED_STALE_SECONDS
+        app.refresh_elapsed()
+        await pilot.pause()
+        assert cell(app.table, 0, elapsed).style == STYLE_ELAPSED_STALE
+        # the working row never yellows — its clock climbing is the normal case
+        assert cell(app.table, 1, elapsed).style == STYLE_WORKING
+
+
+def test_row_styles_reads_the_age_for_the_elapsed_slot() -> None:
+    """The colour comes from the same seconds the cell text is formatted from."""
+    state = FleetState.from_dict(load_payload("healthy"), fetched_at=1.0)
+    supervisor = next(t for t in state.terminals if t.id == "term-0001")
+    fresh = row_styles(supervisor, True, working=False, elapsed_seconds=1.0)
+    stale = row_styles(supervisor, True, working=False, elapsed_seconds=1800.0)
+    assert fresh[-1] == STYLE_DIM
+    assert stale[-1] == STYLE_ELAPSED_STALE
+    # nothing else about the row moved
+    assert fresh[:-1] == stale[:-1]
+
+
+# ── the `(no workers)` line (script :416-417) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_empty_fleet_says_no_workers_under_the_table_header(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("empty_session")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.table.row_count == 0
+        empty = app.query_one("#empty", Static)
+        assert empty.display is True
+        assert str(empty.render()).strip() == EMPTY_ROWS_TEXT
+        # the header and its rule stay: an empty table under a header reads as
+        # an empty fleet, a blank screen reads as a broken TUI
+        assert "WIN" in str(app.query_one("#table-head", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_the_no_workers_line_disappears_once_a_row_arrives(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("empty_session"), load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert app.query_one("#empty", Static).display is True
+        await advance(pilot, feed)
+        assert app.table.row_count == 3
+        assert app.query_one("#empty", Static).display is False
+
+
+def test_the_once_frame_and_the_app_use_the_same_empty_line() -> None:
+    frame = format_frame("s", FleetState.empty(), {}, [])
+    assert f"  {EMPTY_ROWS_TEXT}" in frame
+
+
+# ── the peek's line clipping (script `ansi_clip`, :151-169,451) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_a_long_capture_line_is_cropped_not_wrapped(tmp_path: Path) -> None:
+    """One captured line stays one line on screen, as `ansi_clip` guarantees.
+
+    A wrapping Static turns a 400-column log line into four rows and silently
+    drops three of the peek's last-N lines off the bottom.
+    """
+    width = 100
+    wide = "x" * (width * 4)
+    tmux = FakeTmux(activity={"0": 990}, capture=f"{wide}\nsecond\nthird\n")
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=tmux)
+    async with app.run_test(size=(width, 40)) as pilot:
+        await settle(pilot, feed)
+        peek = app.query_one("#peek", Static)
+        rows = screen_lines(app)[peek.region.y : peek.region.y + peek.region.height]
+        # banner, double rule, then ONE row per captured line — a wrapping
+        # Static would spend four rows on the first one and lose the last two
+        assert rows[2] == "x" * width
+        assert rows[3:5] == ["second", "third"]
+
+
+# ── the captured pane's id in the peek banner (script :442) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_peek_banner_names_the_pane_it_captured(tmp_path: Path) -> None:
+    """F544's resolution is only visible here: a peek showing the wrong pane's
+    output is diagnosable from the banner alone."""
+    app, feed, tmux = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        assert "· %7 ·" in str(app.query_one("#peek", Static).render())
+
+
+@pytest.mark.asyncio
+async def test_the_banner_says_question_mark_when_tmux_cannot_name_the_pane(
+    tmp_path: Path,
+) -> None:
+    class NoPanes(FakeTmux):
+        def __call__(self, args: Sequence[str]) -> str | None:
+            if args[0] == "list-panes":
+                self.calls.append(list(args))
+                return None
+            return super().__call__(args)
+
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path, tmux=NoPanes(activity={"0": 990}))
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        term = app.selected_terminal()
+        assert term is not None
+        assert "· ? ·" in app.peek_title(term, app.resolve_pane(0))
+
+
+@pytest.mark.asyncio
+async def test_one_frame_resolves_the_pane_once(tmp_path: Path) -> None:
+    """The banner and the capture share one `list-panes`, not one each."""
+    app, feed, tmux = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        before = tmux.verbs.count("list-panes")
+        app.refresh_peek()
+        await pilot.pause()
+        assert tmux.verbs.count("list-panes") == before + 1
+
+
+# ── the notice line expires (script :427-429) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_flash_notice_expires_instead_of_sitting_there_forever(
+    tmp_path: Path,
+) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        await pilot.press("o")
+        assert app.flash.startswith("jumped to ")
+
+        app.expire_flash()
+        assert app.flash.startswith("jumped to "), "not yet — the notice is fresh"
+
+        feed.clock += FLASH_SECONDS
+        app.expire_flash()
+        await pilot.pause()
+        assert app.flash == ""
+        assert str(app.query_one("#flash", Static).render()).strip() == ""
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_does_not_resurrect_an_expired_notice(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy"), load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        await pilot.press("o")
+        feed.clock += FLASH_SECONDS
+        app.expire_flash()
+        await advance(pilot, feed)
+        assert app.flash == ""
+        assert str(app.query_one("#flash", Static).render()).strip() == ""
+
+
+@pytest.mark.asyncio
+async def test_the_flash_expiry_is_armed_on_its_own_timer(tmp_path: Path) -> None:
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        intervals = [
+            timer._interval
+            for timer in app._timers
+            if getattr(timer, "_callback", None) is not None
+            and getattr(timer._callback, "__name__", "") == "expire_flash"
+        ]
+        assert intervals == [FLASH_TICK_SECONDS]
