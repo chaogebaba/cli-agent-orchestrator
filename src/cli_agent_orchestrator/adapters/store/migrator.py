@@ -110,6 +110,122 @@ CREATE TABLE IF NOT EXISTS worker_state_shadow (
   miss_count           INTEGER NOT NULL DEFAULT 0)
 """
 
+# ---------------------------------------------------------------------------
+# Phase 3 — the delivery queue (audit §3.2, blueprint §5).
+#
+# Added to THIS migrator rather than a second one.  D5 is explicit that phase 3
+# reuses phase 1 rather than forking it: decision rows into ``worker_event``, DDL
+# here, ids from ``core/ids.py``, findings into ``core/findings.py``.  A second
+# migrator or a second ULID factory is a review-stopping defect, because it is
+# how one schema comes to have two authorities.
+#
+# The column set is the audit's statement plus what the blueprint's decisions
+# require, each named where it is decided:
+#
+#   mode                D9/B16 — the shadow/live discriminator the occupancy
+#                       predicate and ``claim``'s filter both read.
+#   dead_by             D12    — stamped ONCE at enqueue.  No UPDATE statement in
+#                       the adapter names this column; that is the enforcement.
+#   held_since          D12    — the dialog-hold clock.
+#   expire_after_s      D8     — the caller's own expiry, folded into dead_by.
+#   supersede_key       F578, carried from ``inbox:514``.
+#   content_hash        D13    — the F475 window check's key, deliberately NOT
+#                       ``idempotency_key``: an earlier draft conflated them and
+#                       would have dropped legitimate repeats a minute apart.
+#   park_warm           D13    — an F475 conjunct, so the check needs the column.
+#   barrier_id,
+#   barrier_member_key  D13    — carried association, so ``CallbackBarrierModel``
+#                       sees its members whichever table carries them.
+#   enqueue_generation  D13    — recorded for diagnosis.  Queue rows are
+#                       addressed to the durable mailbox id and are NOT
+#                       generation-gated (§13c), which is what lets a fresh
+#                       incarnation inherit pending rows with no rewrite (#33).
+#   cancel_on_complete  D8     — the completion-cancel flag that actually reaches
+#                       #435, where supersede_key alone does not.
+#   is_notice           D14    — a dead-letter notice is never itself
+#                       dead-lettered into another notice.
+#   legacy_message_id   3a     — the mirror writer's join back to the inbox row.
+#   terminated_at       §13d   — retention needs to know when a row ended.
+#
+# ``superseded`` joins the audit's four states, since F578 supersession and the
+# flip's sweep both need an ending that is neither a delivery nor a death.
+# ---------------------------------------------------------------------------
+
+_DELIVERY_MSG_DDL = """
+CREATE TABLE IF NOT EXISTS delivery_msg (
+  msg_id             TEXT PRIMARY KEY,
+  idempotency_key    TEXT NOT NULL UNIQUE,
+  payload_digest     TEXT NOT NULL DEFAULT '',
+  receiver_id        TEXT NOT NULL,
+  sender_id          TEXT NOT NULL DEFAULT '',
+  kind               TEXT NOT NULL,
+  payload            TEXT NOT NULL DEFAULT '',
+  state              TEXT NOT NULL,
+  mode               TEXT NOT NULL,
+  claim_id           INTEGER NOT NULL DEFAULT 0,
+  lease_owner        TEXT,
+  lease_expires_at   TEXT,
+  attempts           INTEGER NOT NULL DEFAULT 0,
+  max_attempts       INTEGER NOT NULL DEFAULT 5,
+  available_at       TEXT NOT NULL,
+  dead_by            TEXT NOT NULL,
+  held_since         TEXT,
+  expire_after_s     INTEGER,
+  supersede_key      TEXT,
+  content_hash       TEXT,
+  park_warm          INTEGER NOT NULL DEFAULT 0,
+  barrier_id         INTEGER,
+  barrier_member_key TEXT,
+  enqueue_generation INTEGER,
+  cancel_on_complete INTEGER NOT NULL DEFAULT 0,
+  is_notice          INTEGER NOT NULL DEFAULT 0,
+  legacy_message_id  INTEGER,
+  created_at         TEXT NOT NULL,
+  terminated_at      TEXT)
+"""
+
+_DELIVERY_ATTEMPT_DDL = """
+CREATE TABLE IF NOT EXISTS delivery_attempt (
+  msg_id     TEXT NOT NULL,
+  claim_id   INTEGER NOT NULL,
+  carrier    TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  outcome    TEXT NOT NULL,
+  detail     TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (msg_id, claim_id, carrier))
+"""
+
+# A separate table, not a status flag — the audit adopted honker's decision, so
+# a poisoned message stops occupying the reclaim loop and hiding live rows.
+# ``mode`` is carried beyond the audit's columns: without it a shadow row that
+# mirrored a legacy expiry is indistinguishable from a live dead-letter, and
+# AC-3a's counting turns on exactly that distinction.
+_DELIVERY_DEAD_DDL = """
+CREATE TABLE IF NOT EXISTS delivery_dead (
+  msg_id          TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  receiver_id     TEXT NOT NULL DEFAULT '',
+  payload         TEXT NOT NULL DEFAULT '',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  reason          TEXT NOT NULL,
+  mode            TEXT NOT NULL,
+  died_at         TEXT NOT NULL)
+"""
+
+# ``msg_ids`` is a JSON array of IDS, never bodies: a wake costs one line of seat
+# context rather than N message bodies.  ``consumed_via`` is a column so which
+# surface landed a digest stops being a hypothesis (#499).
+_SEAT_DIGEST_DDL = """
+CREATE TABLE IF NOT EXISTS seat_digest (
+  receiver_id  TEXT NOT NULL,
+  epoch        INTEGER NOT NULL,
+  msg_ids      TEXT NOT NULL,
+  built_at     TEXT NOT NULL,
+  consumed_at  TEXT,
+  consumed_via TEXT,
+  PRIMARY KEY (receiver_id, epoch))
+"""
+
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)
 # so a test can substitute a failing step and watch boot survive it.
 MIGRATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -134,6 +250,36 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("worker_state_shadow", (_WORKER_STATE_SHADOW_DDL,)),
+    ("delivery_msg", (_DELIVERY_MSG_DDL,)),
+    (
+        "delivery_msg_indexes",
+        (
+            # The audit's index, and the one ``claim`` runs on.
+            "CREATE INDEX IF NOT EXISTS ix_delivery_ready "
+            "ON delivery_msg(receiver_id, state, available_at)",
+            # The mirror writer's join key.  Sub-phase 3a looks a row up by the
+            # legacy inbox id on every observed edge, so without this every
+            # settle is a full scan of the queue.  Partial, because only shadow
+            # rows carry one.
+            "CREATE INDEX IF NOT EXISTS ix_delivery_legacy "
+            "ON delivery_msg(legacy_message_id) WHERE legacy_message_id IS NOT NULL",
+            # Retention scans terminal rows by when they ended.
+            "CREATE INDEX IF NOT EXISTS ix_delivery_terminated "
+            "ON delivery_msg(terminated_at) WHERE terminated_at IS NOT NULL",
+        ),
+    ),
+    ("delivery_attempt", (_DELIVERY_ATTEMPT_DDL,)),
+    ("delivery_dead", (_DELIVERY_DEAD_DDL,)),
+    ("seat_digest", (_SEAT_DIGEST_DDL,)),
+    (
+        "seat_digest_indexes",
+        (
+            # "the receiver's OPEN epoch" is the only lookup the digest has, and
+            # it is on the hot path of both the tick and the re-parent.
+            "CREATE INDEX IF NOT EXISTS ix_seat_digest_open "
+            "ON seat_digest(receiver_id, epoch) WHERE consumed_at IS NULL",
+        ),
+    ),
 )
 
 

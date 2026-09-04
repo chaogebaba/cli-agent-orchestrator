@@ -186,6 +186,11 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# F752 (#609): the statuses that mean "this seat is NOT working right now". A
+# BUSY-class condition is a claim about the present, so on a seat in one of
+# these it is stale by construction and is neither written nor served.
+_QUIESCENT_STATUSES = frozenset({TerminalStatus.IDLE, TerminalStatus.COMPLETED})
+
 # F579 D17: consecutive non-PROCESSING status publishes after which the
 # children-ledger publish-time reconcile drops all entries (D3's K). A lost
 # SubagentStop cannot pin a seat at delegating beyond this many ticks.
@@ -1364,7 +1369,9 @@ class StatusMonitor:
                     cond_provider = provider_manager.get_provider(terminal_id)
                 except Exception:
                     cond_provider = None
-                self._classify_and_deliver_condition(terminal_id, cond_provider, cond_buffer)
+                self._classify_and_deliver_condition(
+                    terminal_id, cond_provider, cond_buffer, status=detected
+                )
             except Exception:
                 logger.debug("condition detection at transition failed", exc_info=True)
 
@@ -1895,15 +1902,32 @@ class StatusMonitor:
         with self._lock:
             return self._status_gen.get(terminal_id, 0)
 
-    def get_condition(self, terminal_id: str) -> Optional[str]:
+    def get_condition(
+        self, terminal_id: str, status: Optional[TerminalStatus] = None
+    ) -> Optional[str]:
         """F611 (#467): return the live condition fleet label, or None.
 
         Read at egress by ``terminal_service.get_terminal`` to populate
         ``Terminal.condition`` — a SEPARATE projection from status fusion. Pure
         read; never invokes detection or captures. ``None`` = no condition.
+
+        F752 (#609): callers that already hold the terminal's FUSED status pass
+        it as ``status``; a BUSY-class label is then dropped for a seat whose
+        status is idle/completed. The status is a parameter and never fused
+        here — this read is taken under the monitor's own lock (and re-entrantly
+        from the locked publish path), where a fuse would be a hazard. Omitting
+        ``status`` keeps the F611 behaviour unchanged.
         """
         with self._lock:
-            return self._last_condition.get(terminal_id)
+            label = self._last_condition.get(terminal_id)
+        if label is not None and status in _QUIESCENT_STATUSES:
+            # Imported inside the call, like the delivery seam above: the
+            # providers package imports back into services at module scope.
+            from cli_agent_orchestrator.providers.condition import is_busy_class_label
+
+            if is_busy_class_label(label):
+                return None
+        return label
 
     def _get_condition_delivery(self) -> Any:
         """Lazily build the ONE condition-delivery seam with production sinks.
@@ -1981,7 +2005,13 @@ class StatusMonitor:
         except Exception:
             pass
 
-    def _classify_and_deliver_condition(self, terminal_id: str, provider: Any, buffer: str) -> None:
+    def _classify_and_deliver_condition(
+        self,
+        terminal_id: str,
+        provider: Any,
+        buffer: str,
+        status: Optional[TerminalStatus] = None,
+    ) -> None:
         """F611 (#467): detection + ONE-event delivery at a status transition.
 
         Called from the published-transition seam in ``_apply_detection``. Runs
@@ -1989,6 +2019,16 @@ class StatusMonitor:
         hands the result to the ONE delivery seam, de-duped per dispatch epoch
         (D4). SEPARATE from status/fusion (D1); a failure here never disturbs the
         status publish that triggered it.
+
+        F752 (#609): ``status`` is the status this transition just published. A
+        BUSY-class condition asserts the seat is working RIGHT NOW, so on a
+        transition to idle/completed it is false by construction — it is
+        downgraded to "no condition", which makes the delivery seam CLEAR the
+        latched fleet label instead of re-affirming it. This is what stops the
+        ``idle [BUSY]`` row: the F611 fan-out wrote ``condition`` and only ever
+        cleared it when the classifier came back empty, which a pane full of
+        cline's ``[run_commands]`` log lines never did. Reading the status the
+        caller already holds keeps this seam free of a re-entrant fuse.
         """
         if provider is None:
             return
@@ -2000,6 +2040,16 @@ class StatusMonitor:
         except Exception:
             logger.debug("condition classify failed for %s", terminal_id, exc_info=True)
             return
+        if cond is not None and status in _QUIESCENT_STATUSES:
+            from cli_agent_orchestrator.providers.condition import ConditionKind
+
+            if getattr(cond, "kind", None) is ConditionKind.BUSY:
+                logger.debug(
+                    "suppressing BUSY condition for %s: status is %s",
+                    terminal_id,
+                    status.value if status is not None else None,
+                )
+                cond = None
         with self._lock:
             epoch = self._buffer_epochs.get(terminal_id, 0)
         try:
