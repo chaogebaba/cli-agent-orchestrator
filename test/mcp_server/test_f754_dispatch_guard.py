@@ -45,6 +45,17 @@ class TestRuleSet:
         msg = f"When you finish, report to terminal {OWN}."
         assert tis.guard(msg, OWN, LIVE, reader=lambda p: None) is None
 
+    def test_own_id_passes_even_when_the_roster_omits_it(self):
+        """MUTANT GUARD: this is what the own-id branch is FOR.
+
+        With the seat's own row in the roster, dropping the own-id check
+        changes nothing. It matters exactly when the roster does not list the
+        caller — a partial read, or the seat's row briefly missing — and the
+        supervisor must still be able to dispatch a brief naming itself.
+        """
+        msg = f"When you finish, report to terminal {OWN}."
+        assert tis.guard(msg, OWN, {LIVE_FOREIGN}, reader=lambda p: None) is None
+
     def test_live_foreign_id_passes(self):
         msg = f"Coordinate with terminal {LIVE_FOREIGN} before you commit."
         assert tis.guard(msg, OWN, LIVE, reader=lambda p: None) is None
