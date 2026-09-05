@@ -12,10 +12,10 @@ double is a plain class and no adapter needs to inherit from core.  They are
 that ``isinstance`` against a runtime-checkable Protocol checks method PRESENCE
 only, never signatures; mypy checks the signatures, and it runs strict here.
 
-Phase boundaries are marked on each Protocol.  ``QueueStore``, ``GateStore`` and
-``ProviderAdapter`` are deliberately thin stubs: they exist so the composition
-root and the contracts have the right shape from the start, and they grow in
-phases 3, 4 and 5 respectively.  The blueprint r9 is explicit that the 12-method
+Phase boundaries are marked on each Protocol.  ``QueueStore`` was the phase-3
+stub and is now filled in.  ``GateStore`` and ``ProviderAdapter`` remain
+deliberately thin: they exist so the composition root and the contracts have the
+right shape from the start, and they grow in phases 4 and 5 respectively.  The blueprint r9 is explicit that the 12-method
 provider protocol is a long-run sketch and NOT a phase, so ``ProviderAdapter``
 here stays at the capability-flag surface phase 5 actually needs.
 """
@@ -25,6 +25,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
+from cli_agent_orchestrator.core.delivery import (
+    DeadReason,
+    DeliveryAttempt,
+    EnqueueDraft,
+    MsgState,
+    QueueMessage,
+    QueueMode,
+    QueueOccupancy,
+    SeatDigest,
+)
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
@@ -260,16 +270,156 @@ class EventSource(Protocol):
 
 @runtime_checkable
 class QueueStore(Protocol):
-    """Delivery queue — PHASE 3 stub (audit §3.2).
+    """Delivery queue (audit §3.2, WP-ARCH phase 3).
 
-    Present now so the composition root and the layering contracts have their
-    final shape.  Phase 3 adds the idempotency key, ``claim_id`` fencing, lease
-    expiry reclaim, the separate dead-letter table and the single ``seat_digest``
-    row per epoch.  Implementing it before then would be building against a
-    design that has not been gated.
+    The four protocol operations are single SQL statements in the adapter, which
+    is where the guarantees live: ``enqueue`` is replay-safe on the idempotency
+    key, ``claim`` issues one owner and a fencing token, ``ack`` rejects a stale
+    worker whose lease was stolen, and ``reclaim`` is the visibility-timeout
+    redelivery that replaces a 2,311-line watchdog service.
+
+    Sub-phase 3a calls only ``enqueue`` and the mirror-writer methods; ``claim``,
+    ``ack`` and ``reclaim`` land here with their statements written and tested
+    because two of the phase's three easiest-to-lose properties live inside them
+    — the ``mode='live'`` filter that must sit in ``claim``'s own SQL rather than
+    in its callers, and the ``dead_by`` column that no ``UPDATE`` may recompute.
+    Both are cheaper to get right before there is a caller than after.
     """
 
-    def enqueue(self, *args: object, **kwargs: object) -> object: ...
+    # -- the four statements ----------------------------------------------
+
+    def enqueue(self, draft: EnqueueDraft) -> QueueMessage:
+        """Insert a row, or return the existing one for a repeated key.
+
+        Replay-safe: a second enqueue under the same ``idempotency_key`` returns
+        the row already stored rather than a second row or an error, so a
+        retried caller sees the same outcome it saw the first time.  A repeat
+        carrying a DIFFERENT payload digest is a genuine conflict and raises,
+        because that is a caller reusing one key for two messages.
+        """
+        ...
+
+    def claim(
+        self, *, lease_owner: str, now: datetime, limit: int = 1, receiver_id: str | None = None
+    ) -> list[QueueMessage]:
+        """Lease up to ``limit`` deliverable rows, incrementing the fencing token.
+
+        The statement selects ``state='ready' AND available_at<=now AND
+        mode='live'``.  **The mode filter lives inside this statement**, not in
+        any caller: all three consumers of the queue inherit it that way — the
+        boot occupancy test, the drain tick and the ordinary tick — and no future
+        caller can forget it.  The occupancy predicate and the drain rule keep
+        their own ``mode`` conditions as redundant defence rather than as the
+        enforcement.
+        """
+        ...
+
+    def ack(self, msg_id: str, claim_id: int, *, now: datetime) -> bool:
+        """Settle one delivered row.  False when ``claim_id`` is stale.
+
+        A slow worker whose lease was stolen and re-issued cannot ack a newer
+        delivery: the statement matches on the fencing token, so zero rows
+        changed means "rejected", not "not found".
+        """
+        ...
+
+    def reclaim(self, *, now: datetime) -> tuple[int, int]:
+        """Return expired leases to ``ready`` and dead-letter the exhausted.
+
+        Returns ``(reclaimed, dead_lettered)``.  Increments ``attempts`` and adds
+        ``DELIVERY_BACKOFF_S`` to ``available_at`` on each re-offer, and is the
+        SOLE writer of that column.  It does NOT touch ``dead_by``: recomputing
+        the deadline from the current ``available_at`` here would extend it on
+        every re-offer and the row would never die (D12).
+        """
+        ...
+
+    # -- reads --------------------------------------------------------------
+
+    def get(self, msg_id: str) -> QueueMessage | None: ...
+
+    def get_by_idempotency_key(self, key: str) -> QueueMessage | None: ...
+
+    def attempts_for(self, msg_id: str) -> list[DeliveryAttempt]:
+        """Every attempt for one id, oldest first — the ``cao diag`` body (I5)."""
+        ...
+
+    def occupancy(self) -> QueueOccupancy:
+        """What D9's boot guard resolves the requested position against.
+
+        Counts rows that are BOTH ``mode='live'`` and non-terminal.  Callers do
+        not compose this from ``claim``; a guard that ran the claim statement
+        would issue leases as a side effect of asking a question.
+        """
+        ...
+
+    def count(self, *, mode: QueueMode | None = None) -> int:
+        """Rows in ``delivery_msg``, optionally by mode.
+
+        AC-3a's off-arm criterion is a count from here: with the switch off the
+        count is nil, and rows in that arm are a failure rather than a curiosity.
+        """
+        ...
+
+    # -- writes the mirror writer and the tick share -------------------------
+
+    def record_attempt(self, attempt: DeliveryAttempt) -> None:
+        """Write one attempt row, idempotently on its primary key."""
+        ...
+
+    def settle(
+        self,
+        msg_id: str,
+        *,
+        state: MsgState,
+        now: datetime,
+        reason: DeadReason | None = None,
+        attempts: int | None = None,
+    ) -> bool:
+        """Move one row to a terminal state.  False when it was already terminal.
+
+        ``reason`` is required for :attr:`MsgState.DEAD` and writes the
+        ``delivery_dead`` row in the same transaction.  Terminal states are
+        final: settling an already-terminal row is refused rather than
+        overwritten, so a late edge cannot rewrite a recorded outcome.
+        """
+        ...
+
+    def mark_dialog_hold(self, msg_id: str, *, held_since: datetime | None) -> None:
+        """Set or clear the ``held_since`` clock (D12)."""
+        ...
+
+    # -- the digest ----------------------------------------------------------
+
+    def open_digest(self, receiver_id: str) -> SeatDigest | None:
+        """The receiver's open epoch, if one is open."""
+        ...
+
+    def reparent(
+        self,
+        msg_id: str,
+        *,
+        new_receiver_id: str,
+        now: datetime,
+        message_prefix: str = "",
+    ) -> bool:
+        """Move one undelivered row to another mailbox, digests and all.
+
+        **One transaction, or none of it.**  The same transaction that rewrites
+        ``receiver_id`` removes the id from the old receiver's open epoch and
+        adds it to the new receiver's, opening one if none is open — so an id is
+        listed in exactly one epoch and no fewer.  Splitting the two writes is
+        one of the phase's three easiest-to-lose properties and it has no second
+        line of defence: the moved id would stay listed in an epoch it no longer
+        belongs to, never reach a terminal state there, and hold that epoch open
+        forever while the tick re-woke it once per lease.
+
+        An epoch left EMPTY by the move closes immediately as ``abandoned``,
+        without waiting for a tick: the trigger is a reap, so the old receiver
+        has no live incarnation, and an empty set satisfies the
+        every-message-terminal test vacuously.
+        """
+        ...
 
 
 @runtime_checkable

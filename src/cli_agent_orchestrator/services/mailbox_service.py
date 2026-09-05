@@ -623,6 +623,14 @@ def _create_logical_inbox_message_inner(
 
                 db.commit()
                 db.refresh(row)
+                # WP-ARCH phase 3a, hook point 2 — the logical (mailbox) twin of
+                # hook point 1. Both enqueue paths converge on
+                # ``_insert_routed_inbox_row`` but commit in different modules, so
+                # each needs its own post-commit call. Behind the switch and
+                # non-raising; see services/delivery_mirror.py.
+                from cli_agent_orchestrator.services import delivery_mirror
+
+                delivery_mirror.record_inbox_row(row, logical_receiver_id=logical_receiver_id)
                 result = _inbox_message_from_row(row)
 
                 if result.barrier_id is not None and result.barrier_member_key is not None:

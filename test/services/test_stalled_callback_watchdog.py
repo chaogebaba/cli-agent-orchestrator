@@ -935,7 +935,7 @@ class TestWaitingInboxAlert:
         assert "for 10s" in message
         # Delivery is implicit via inbox insertion (F136-D17)
 
-    def test_b2_the_sweep_offers_the_responder_a_rules_reload(self):
+    def test_b2_the_sweep_offers_the_responder_a_rules_reload(self) -> None:
         """F530 #386: a pane stalled on a dialog emits nothing, so the
         responder's own detection-retry budget is spent long before this alert
         fires and no tick will ever consult a rule added in the meantime. This
@@ -959,7 +959,7 @@ class TestWaitingInboxAlert:
 
         mock_rearm.assert_called_once_with("worker1", "codex")
 
-    def test_b3_a_terminal_with_no_provider_is_skipped(self):
+    def test_b3_a_terminal_with_no_provider_is_skipped(self) -> None:
         svc = StalledCallbackWatchdog()
         with _waiting_inbox_fakes():  # default metadata carries no provider
             with patch(

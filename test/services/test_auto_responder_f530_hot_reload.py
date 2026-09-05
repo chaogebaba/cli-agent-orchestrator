@@ -161,7 +161,9 @@ class TestRulesChangedRearm:
     """The missing edge: a rule-file change makes something look again."""
 
     @staticmethod
-    def _responder(monkeypatch: pytest.MonkeyPatch) -> tuple[ar.AutoResponder, list, list]:
+    def _responder(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[ar.AutoResponder, list[str], list[str]]:
         responder = ar.AutoResponder()
         refunded: list[str] = []
         ticked: list[str] = []

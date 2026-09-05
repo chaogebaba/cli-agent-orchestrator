@@ -262,7 +262,9 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         # /sessions/{name}/fleet carries it (blueprint §3 surface 1). Additive
         # sibling key like fusion_reason/delegating — SEPARATE from `status`
         # (D1), never derived from or feeding fusion. None when no condition.
-        condition = status_monitor.get_condition(row["id"])
+        # F752 (#609): the fused status goes with the read so a BUSY-class label
+        # left over from the last working turn never rides an idle row.
+        condition = status_monitor.get_condition(row["id"], status)
         projected.append(
             {
                 "id": row["id"],

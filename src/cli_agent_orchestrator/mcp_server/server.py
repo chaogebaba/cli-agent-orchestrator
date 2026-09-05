@@ -17,6 +17,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -65,6 +66,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_server_settings,
     is_learning_enabled,
 )
+from cli_agent_orchestrator.utils import routing_guard, terminal_id_scan
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.http import _PRODUCTION_PORT, CAOHttpClient
 from cli_agent_orchestrator.utils.session_lookup import (
@@ -489,6 +491,195 @@ Args:
 Returns:
     The skill content on success, or a dict with success=False and an error message on failure
 """
+
+
+# ---------------------------------------------------------------------------
+# F754 (#611): stale-terminal-id dispatch guard
+# ---------------------------------------------------------------------------
+# A supervisor that dispatches right after a compaction can carry a
+# PRE-RELAUNCH seat id in its summary and hand every worker an unroutable
+# callback address (incident 2026-09-04: seven lanes told to report to
+# `terminal 5561a7d1` while the live seat was `34a7b2c1`; the codex lanes would
+# have failed their callback silently). assign/handoff/send_message run the
+# shared scanner over the outgoing message — and over every brief it points at
+# — and refuse BEFORE any terminal is created or any inbox row is written.
+
+_LIVE_TERMINALS_TTL_S = 5.0
+# (fetched_at, ids) — ids is None when the roster could not be read.
+_live_terminals_cache: Tuple[float, Optional[Set[str]]] = (0.0, None)
+
+
+def _live_terminal_ids(force_refresh: bool = False) -> Optional[Set[str]]:
+    """The live terminal id set: ONE ``GET /terminals`` per call, cached 5 s.
+
+    Returns ``None`` when the roster cannot be read — either the route does not
+    exist (a cao-server predating this fix) or the server is unreachable. The
+    caller decides what to do with that; the guard itself never refuses on it.
+    """
+    global _live_terminals_cache
+    now = time.monotonic()
+    fetched_at, cached = _live_terminals_cache
+    if not force_refresh and cached is not None and (now - fetched_at) < _LIVE_TERMINALS_TTL_S:
+        return cached
+
+    ids: Optional[Set[str]] = None
+    try:
+        response = cao_http.get("/terminals", timeout=_mcp_timeout(), headers=_api_headers())
+        if response.status_code != 404:
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                ids = terminal_id_scan.live_ids_from_rows(payload)
+    except Exception:
+        ids = None
+
+    _live_terminals_cache = (now, ids)
+    return ids
+
+
+def _probe_live_ids(candidates: Set[str]) -> Optional[Set[str]]:
+    """Which of ``candidates`` still have a terminal row, one GET each.
+
+    The fallback for a cao-server that predates ``GET /terminals``.
+    ``GET /terminals/{id}`` has existed for the whole life of the API, so this
+    keeps the client-side guard honest against an old server (issue #611
+    part 3, "belt and braces"). It is also strictly more accurate than a
+    session-scoped listing would be: a live id in ANOTHER session answers 200
+    here, so no legitimate cross-session reference is ever seen as stale.
+
+    Returns ``None`` when even the per-id probe cannot be completed, which the
+    guard reads as "unknown" and allows.
+    """
+    live: Set[str] = set()
+    for candidate in sorted(candidates):
+        try:
+            response = cao_http.get(
+                f"/terminals/{candidate}", timeout=_mcp_timeout(), headers=_api_headers()
+            )
+        except Exception:
+            return None
+        if response.status_code == 404:
+            continue
+        if response.status_code >= 400:
+            return None
+        live.add(candidate)
+    return live
+
+
+def _dispatch_guard(message: Optional[str], action: str) -> Optional[str]:
+    """Refusal text for a message citing a stale terminal id, else ``None``.
+
+    ``action`` names the verb in the refusal ("assign"/"handoff"/
+    "send_message") so the caller is told what did NOT happen.
+    """
+    if not message:
+        return None
+    try:
+        own_id = os.environ.get("CAO_TERMINAL_ID") or None
+        # Cheap pre-check: no citation at all means no roster fetch. Most
+        # dispatches take this path, so the guard costs one regex sweep.
+        citations = terminal_id_scan.collect_citations(message)
+        if not citations:
+            return None
+        candidates = terminal_id_scan.candidate_ids(citations)
+        live_ids = _live_terminal_ids()
+        if live_ids is None:
+            live_ids = _probe_live_ids(candidates)
+        if live_ids is None:
+            return None
+        stale = terminal_id_scan.stale_findings(
+            terminal_id_scan.verdicts(citations, own_id, live_ids)
+        )
+        if not stale:
+            return None
+        return terminal_id_scan.format_refusal(stale, own_id, live_ids, action=action)
+    except Exception as exc:  # never let the guard itself break a dispatch
+        logger.debug("F754 dispatch guard skipped: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# F754 (#611 scope add): routing-violation guard
+# ---------------------------------------------------------------------------
+# routing.toml is the SOLE authority on which lane fills which position, and it
+# carries the user's word. Dispatching a legacy provider-named profile
+# (codex_dev, kiro_dev, kiro_oracle, grok_dev, ...) implies that profile's
+# provider, so it can silently contradict the store — the M34-class mistake in
+# routing.toml's own status log (2026-09-04: three kiro_dev lanes plus
+# kiro_oracle dispatched against `dev = in_harness`; all four reaped).
+
+_routing_bindings_cache: Tuple[float, Optional[List[Dict[str, Any]]]] = (0.0, None)
+
+
+def _routing_bindings(force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+    """routing.toml's binding rows as plain dicts, cached 5 s.
+
+    Read through the fork's own validated loader (``load_routing_table``) so the
+    guard sees exactly the table the rest of D9 sees, then flattened to dicts —
+    the shared rule module is stdlib-only and cannot depend on the fork's
+    dataclasses. ``None`` on any failure: an unreadable store refuses nothing.
+    """
+    global _routing_bindings_cache
+    now = time.monotonic()
+    fetched_at, cached = _routing_bindings_cache
+    if not force_refresh and cached is not None and (now - fetched_at) < _LIVE_TERMINALS_TTL_S:
+        return cached
+
+    rows: Optional[List[Dict[str, Any]]] = None
+    try:
+        from cli_agent_orchestrator.constants import routing_toml_path
+        from cli_agent_orchestrator.utils.routing import load_routing_table
+
+        table = load_routing_table(routing_toml_path())
+        rows = [
+            {
+                "position": binding.position,
+                "provider": binding.provider,
+                "kind": binding.kind,
+                "model": binding.model,
+            }
+            for binding in table.bindings
+        ]
+    except Exception:
+        rows = None
+
+    _routing_bindings_cache = (now, rows)
+    return rows
+
+
+def _routing_guard(agent_profile: Optional[str], action: str) -> Optional[str]:
+    """Refusal text when a legacy profile contradicts routing.toml, else ``None``.
+
+    A bare POSITION name is never checked: that is the routed path, where the
+    provider comes FROM routing.toml and cannot contradict it.
+    """
+    if not agent_profile:
+        return None
+    try:
+        from cli_agent_orchestrator.constants import local_agent_store_dir, positions_store_dir
+        from cli_agent_orchestrator.utils.agent_profiles import _position_exists
+
+        if _position_exists(agent_profile):
+            return None
+        profile_path = local_agent_store_dir() / f"{agent_profile}.md"
+        if not profile_path.is_file():
+            return None
+        meta = routing_guard.parse_profile_frontmatter(
+            profile_path.read_text(encoding="utf-8", errors="replace"), agent_profile
+        )
+        if not meta.provider:
+            return None
+        known_positions = sorted(p.stem for p in positions_store_dir().glob("*.md")) or None
+        position = routing_guard.position_for_profile(meta, known_positions)
+        bindings = _routing_bindings()
+        if bindings is None:
+            return None
+        return routing_guard.routing_violation(
+            agent_profile, meta.provider, position, bindings, action=action
+        )
+    except Exception as exc:  # never let the guard itself break a dispatch
+        logger.debug("F754 routing guard skipped: %s", exc)
+        return None
 
 
 def _resolve_child_allowed_tools(
@@ -1506,6 +1697,15 @@ async def _handoff_impl(
     the one behavior-equivalence risk flagged in the plan; keeping the shaping
     caller-side is the choice that preserves the exact existing codex banner.
     """
+    # F754 (#611): refuse before anything is created when the task message
+    # tells the worker to call back an id that is neither ours nor live.
+    _stale = _dispatch_guard(message, "handoff")
+    if _stale:
+        return HandoffResult(success=False, message=_stale, output=None, terminal_id=None)
+    _misrouted = _routing_guard(agent_profile, "handoff")
+    if _misrouted:
+        return HandoffResult(success=False, message=_misrouted, output=None, terminal_id=None)
+
     start_time = time.time()
     terminal_id: Optional[str] = None
     # Upstream #693: a target_host handoff addresses THAT node's cao-server.
@@ -2252,6 +2452,18 @@ def _assign_impl(
     # path on its own filesystem, where the resolved one does not exist.
     _requested_working_directory = working_directory
     terminal_id: Optional[str] = None
+    # F754 (#611): a brief citing a dead seat id must not spawn a worker that
+    # then has nowhere to report. Checked before the profile/provider
+    # resolution below, so nothing is created and nothing is charged.
+    _stale = _dispatch_guard(message, "assign")
+    if _stale:
+        return {"success": False, "terminal_id": None, "message": _stale}
+    # F754 scope add: a legacy provider-named profile must not contradict the
+    # routing store. Checked on the ORIGINAL argument, before resolution
+    # rewrites a position name into a profile.
+    _misrouted = _routing_guard(agent_profile, "assign")
+    if _misrouted:
+        return {"success": False, "terminal_id": None, "message": _misrouted}
     try:
         # F497 D7 — resolve the assign target: legacy name (unchanged) or a
         # position name (provider from provider= arg, allowlist-checked). Reject
@@ -3105,6 +3317,14 @@ def _send_message_impl(
     supersede_key: str | None = None,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
+    # F754 (#611): same scan as assign/handoff. Only the message BODY is
+    # scanned — a stale ``receiver_id`` argument already fails loudly at the
+    # inbox POST, whereas a stale id quoted in the body is exactly the silent
+    # failure this guard exists for.
+    _stale = _dispatch_guard(message, "send_message")
+    if _stale:
+        return {"success": False, "error": _stale}
+
     try:
         own_terminal_id = _current_terminal_id()
 
