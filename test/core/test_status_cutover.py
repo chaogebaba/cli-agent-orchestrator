@@ -57,7 +57,7 @@ def test_parse_is_permissive_about_case_and_nothing_else(
         ("CODEX", frozenset({"codex"})),
     ],
 )
-def test_the_allowlist_is_a_list_not_a_boolean(raw: str | None, expected: frozenset) -> None:
+def test_the_allowlist_is_a_list_not_a_boolean(raw: str | None, expected: frozenset[str]) -> None:
     """MetaMask's correction: a single-provider flag cannot be rolled out per key.
 
     This phase ships two sources, so the switch has to advance one provider at a
@@ -71,7 +71,7 @@ def test_the_allowlist_is_a_list_not_a_boolean(raw: str | None, expected: frozen
 
 @pytest.mark.parametrize("ingest", [True, False])
 @pytest.mark.parametrize("providers", [frozenset(), frozenset({"codex"})])
-def test_off_stays_off_under_every_condition(ingest: bool, providers: frozenset) -> None:
+def test_off_stays_off_under_every_condition(ingest: bool, providers: frozenset[str]) -> None:
     """Row 1: ``off`` is exactly phase-1 behaviour and nothing can promote it."""
     outcome = resolve_status_switch(StatusPosition.OFF, ingest_enabled=ingest, providers=providers)
     assert outcome.position is StatusPosition.OFF
@@ -82,7 +82,7 @@ def test_off_stays_off_under_every_condition(ingest: bool, providers: frozenset)
 @pytest.mark.parametrize("requested", [StatusPosition.SHADOW, StatusPosition.ON])
 @pytest.mark.parametrize("providers", [frozenset(), frozenset({"codex"})])
 def test_ingestion_off_demotes_to_off_and_says_so(
-    requested: StatusPosition, providers: frozenset
+    requested: StatusPosition, providers: frozenset[str]
 ) -> None:
     """Rows 2 and 4.  A fold whose events reach no consumer is a silent status
     outage: the producers would run, the projection would move, and nothing would
@@ -96,7 +96,7 @@ def test_ingestion_off_demotes_to_off_and_says_so(
 
 @pytest.mark.parametrize("providers", [frozenset(), frozenset({"codex"})])
 def test_shadow_with_ingestion_on_resolves_to_shadow_whatever_the_allowlist_says(
-    providers: frozenset,
+    providers: frozenset[str],
 ) -> None:
     """Row 3.  The allowlist gates the FEED, and shadow has no feed, so it is not
     a condition on this cell — writing it as one would make an operator set a

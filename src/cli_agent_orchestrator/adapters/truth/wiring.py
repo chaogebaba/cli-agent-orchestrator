@@ -38,7 +38,13 @@ import threading
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.core.events import EventDraft, WorkerEvent
-from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore, StateStore
+from cli_agent_orchestrator.core.ports import (
+    Clock,
+    EventStore,
+    FindingStore,
+    StateFolder,
+    StateStore,
+)
 
 __all__ = [
     "ProducerRuntime",
@@ -71,6 +77,20 @@ class ProducerRuntime:
     clock: Clock
     state_store: StateStore | None = None
     findings: FindingStore | None = None
+    #: WP-ARCH phase 2, A1 — the fold's driver.
+    #:
+    #: Typed as the ``StateFolder`` PROTOCOL and never as ``Projector``. That is
+    #: the whole of the fix rather than a style note: this module is an adapter
+    #: and the projector lives in ``app``, so a field annotated on the concrete
+    #: class would put the forbidden import back while looking like a port, and
+    #: ``test_adapters_never_import_app`` fails on it either way. The composition
+    #: root fills it with the projector, which satisfies the Protocol
+    #: structurally.
+    #:
+    #: Optional, the shape the store's own ``CheckRunner`` already has: a lane
+    #: bringing producers up without a projector still appends, which is strictly
+    #: less information and never wrong information.
+    folder: StateFolder | None = None
 
 
 _lock = threading.Lock()
@@ -111,18 +131,47 @@ def producers_installed() -> bool:
 
 
 def emit(draft: EventDraft) -> WorkerEvent | None:
-    """Append one draft through the installed store.
+    """Append one draft through the installed store, then FOLD it.
 
     Returns the stored :class:`WorkerEvent` (callers that need the minted
     ``event_id`` as evidence for a later decision row use it), ``None`` when
     ingestion is off OR when the append failed.  Never raises ``Exception``.
+
+    **The fold rides here because this is the one path from a hook to the store**
+    (WP-ARCH phase 2, A1).  At phase 1's anchor ``Projector.project`` had no call
+    site at all: the composition root built the projector and then handed the
+    producer runtime everything except it, so the local was dropped and nothing
+    ever folded an appended event.  AC-2a's agreement report compares
+    ``status.transition`` rows against ``status.legacy_published``, and the fold
+    is what writes the former — without a driver that criterion has one side.
+
+    Three properties, each of which is a way this seam fails quietly:
+
+    * **It runs after the append transaction commits**, which at this seam is
+      automatic rather than a discipline: the fold sees what ``append`` has
+      already returned, and ``append`` closes its ``immediate_transaction``
+      before returning.  This matters because the projector's own
+      ``_append_decision`` calls the store, so a fold placed inside an open
+      transaction would nest one and fail every transition.
+    * **Re-entry is bounded structurally.**  The fold is on EMITTED events, and
+      the projector's own rows do not travel this way — ``_append_decision``
+      writes through the event-store port directly, never through ``emit``.  A
+      ``status.transition`` the fold produces therefore cannot re-enter it.  What
+      the projector's ``decision_row`` branch guards is different and real: a
+      decision row arriving from a PRODUCER, which ``server_decisions`` and
+      ``legacy_egress`` both do.
+    * **A fold failure never changes what this function returns.**  The append
+      already succeeded and its ``event_id`` is a caller's evidence for a later
+      decision row; swallowing the row because a diagnostic raised would turn a
+      projector bug into a missing evidence chain.  So the fold has its own
+      guard, outside the append's.
     """
     global _failure_count
     runtime = _runtime
     if runtime is None:
         return None
     try:
-        return runtime.store.append(draft)
+        stored = runtime.store.append(draft)
     except Exception:
         with _lock:
             _failure_count += 1
@@ -136,3 +185,31 @@ def emit(draft: EventDraft) -> WorkerEvent | None:
                 exc_info=True,
             )
         return None
+
+    _fold(runtime, stored)
+    return stored
+
+
+def _fold(runtime: ProducerRuntime, event: WorkerEvent) -> None:
+    """Drive the projection for one appended event.  Never raises ``Exception``.
+
+    Swallowing is the same promise :func:`emit` makes and the same one the
+    store's ``CheckRunner`` is held to: this runs on the single path every
+    producer takes, so a projector bug that escaped here would reach the status
+    publish path and break AC11's no-behaviour-change claim.  The port's own
+    contract says implementations must not raise; this is the belt to that
+    suspenders.
+    """
+    folder = runtime.folder
+    if folder is None:
+        return
+    try:
+        folder.project(event)
+    except Exception:  # noqa: BLE001 — a projection may never break an append
+        logger.warning(
+            "worker-truth fold failed for terminal=%s kind=%s (the row is stored; "
+            "the projection is one event stale)",
+            event.terminal_id,
+            event.kind.value,
+            exc_info=True,
+        )

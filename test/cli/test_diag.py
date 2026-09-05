@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from test.app.fakes import FakeClock
+from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.findings import SqliteFindingStore
@@ -26,11 +27,13 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.cli.commands.diag import INGEST_ENV_VAR, _parse_since, diag
 from cli_agent_orchestrator.core.events import (
+    AnyKind,
     Confidence,
     DecisionKind,
     EventDraft,
     EventKind,
     Producer,
+    WorkerEvent,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
@@ -58,7 +61,7 @@ def db(tmp_path: Path) -> Path:
         legacy_check=PaneDisagreementCheck(findings, events, states, clock),
     )
 
-    def emit(kind, **kw):
+    def emit(kind: AnyKind, **kw: Any) -> WorkerEvent:
         stored = events.append(
             EventDraft(
                 terminal_id=TERMINAL,
@@ -87,7 +90,7 @@ def db(tmp_path: Path) -> Path:
     return path
 
 
-def _run(db: Path, *args: str):
+def _run(db: Path, *args: str) -> Result:
     return CliRunner().invoke(diag, [*args, "--db", str(db)])
 
 
@@ -177,7 +180,7 @@ def test_an_unknown_terminal_reports_rather_than_failing(db: Path) -> None:
     assert "never been projected" in result.output
 
 
-def test_the_ingest_note_follows_the_environment(db: Path, monkeypatch) -> None:
+def test_the_ingest_note_follows_the_environment(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(INGEST_ENV_VAR, raising=False)
     off = _run(db, TERMINAL)
 

@@ -71,6 +71,20 @@ def _turn_duration(uuid: str) -> dict[str, Any]:
     }
 
 
+def _source() -> claude_transcript.ClaudeTranscriptSource:
+    """The live tailer for :data:`TERMINAL`, asserted present.
+
+    ``source_for`` returns ``None`` for a terminal with no tailer, and every use
+    below has just attached one. Narrowing here rather than at each call site
+    turns "attach silently did nothing" into a named failure instead of an
+    ``AttributeError`` twenty lines later, and satisfies strict typing as a
+    by-product rather than by an ignore comment.
+    """
+    source = claude_transcript.source_for(TERMINAL)
+    assert source is not None, "no tailer is attached for the terminal"
+    return source
+
+
 @pytest.fixture
 def transcript(tmp_path: Path) -> Path:
     return tmp_path / f"{SESSION}.jsonl"
@@ -100,7 +114,7 @@ def test_unlisted_sidecar_types_are_ignored_and_cannot_break_the_tail(
         {"type": "a-type-invented-after-this-test-was-written"},
         _user_text("u1"),
     )
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == [
         "session.started",
@@ -139,7 +153,7 @@ def test_the_allow_set_filter_runs_before_the_uuid_chain(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, {"type": "permission-mode"}, {"type": "mode"}, {"type": "last-prompt"})
-    assert claude_transcript.source_for(TERMINAL).poll_once() == 0
+    assert _source().poll_once() == 0
     assert ingest_on.rows == []
 
 
@@ -158,7 +172,7 @@ def test_a_tool_result_is_a_user_record_and_is_not_a_turn_start(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _tool_result("r1"), _tool_result("r2"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == ["session.started", "tool.result", "tool.result"]
 
@@ -167,7 +181,7 @@ def test_an_assistant_tool_use_is_a_tool_call(ingest_on: FakeEventStore, transcr
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _tool_use("a1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == ["session.started", "tool.called"]
 
@@ -184,7 +198,7 @@ def test_a_start_of_turn_record_is_both_a_turn_and_a_submission(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == [
         "session.started",
@@ -207,7 +221,7 @@ def test_a_queued_prompt_appearing_twice_under_one_prompt_id_is_one_turn(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1", prompt_id="p-1"), _user_text("u2", prompt_id="p-1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == [
         "session.started",
@@ -221,7 +235,7 @@ def test_two_distinct_prompt_ids_are_two_turns(ingest_on: FakeEventStore, transc
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1", prompt_id="p-1"), _user_text("u2", prompt_id="p-2"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.of_kind(EventKind.TURN_STARTED, TERMINAL).__len__() == 2
 
@@ -242,7 +256,7 @@ def test_turn_ended_comes_from_the_explicit_marker_not_from_a_hook(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _turn_duration("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.kinds(TERMINAL) == ["session.started", "turn.ended"]
 
@@ -260,7 +274,7 @@ def test_the_other_system_subtypes_assert_no_turn(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, {"type": "system", "subtype": subtype, "uuid": "s1"})
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert ingest_on.rows == []
 
@@ -293,7 +307,7 @@ def test_a_file_that_does_not_exist_yet_starts_at_its_head(
     """
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert "turn.started" in ingest_on.kinds(TERMINAL)
 
@@ -310,7 +324,7 @@ def test_a_poll_that_finds_nothing_still_bumps_the_source_probe(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     before = len(state_store.source_touches)
-    assert claude_transcript.source_for(TERMINAL).poll_once() == 0
+    assert _source().poll_once() == 0
     assert len(state_store.source_touches) == before + 1
 
 
@@ -326,7 +340,7 @@ def test_a_missing_file_is_not_a_source_health_signal(
     """
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     state_store.source_touches.clear()
-    assert claude_transcript.source_for(TERMINAL).poll_once() == 0
+    assert _source().poll_once() == 0
     assert state_store.source_touches == []
 
 
@@ -341,7 +355,7 @@ def test_rotation_is_detected_by_inode_and_size_not_by_name(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
     assert len(ingest_on.of_kind(EventKind.TURN_STARTED, TERMINAL)) == 1
 
     # The poll that OBSERVES the truncation is what detects it. Writing a
@@ -349,9 +363,9 @@ def test_rotation_is_detected_by_inode_and_size_not_by_name(
     # inode-and-size detector, so a test that skipped this poll would be asserting
     # something no tailer of this shape can do.
     transcript.write_text("")  # truncate: size below the consumed offset
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
     _write(transcript, _user_text("u2"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert len(ingest_on.of_kind(EventKind.TURN_STARTED, TERMINAL)) == 2
 
@@ -367,12 +381,12 @@ def test_a_partial_line_is_never_parsed(ingest_on: FakeEventStore, transcript: P
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_user_text("u1"))[:-8])  # no newline, truncated json
-    assert claude_transcript.source_for(TERMINAL).poll_once() == 0
+    assert _source().poll_once() == 0
     assert ingest_on.rows == []
 
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_user_text("u1"))[-8:] + "\n")
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert "turn.started" in ingest_on.kinds(TERMINAL)
 
@@ -384,7 +398,7 @@ def test_the_source_ref_carries_the_transcript_scheme(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     for row in ingest_on.read(TERMINAL):
         assert row.source_ref is not None
@@ -399,7 +413,7 @@ def test_a_record_without_a_uuid_falls_back_rather_than_losing_its_provenance(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _turn_duration("parent-1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     ref = ingest_on.of_kind(EventKind.TURN_ENDED, TERMINAL)[0].source_ref
     assert ref is not None and ref.endswith("#parent-1")
@@ -422,13 +436,13 @@ def test_a_resume_epoch_replays_nothing_and_skips_nothing(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
     before = [row.source_ref for row in ingest_on.read(TERMINAL)]
 
     # The worker is killed and resumed: a new binding epoch, same file.
     claude_transcript.attach(TERMINAL, transcript, "sess-2")
     _write(transcript, _user_text("u2", session="sess-2"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     refs = [row.source_ref for row in ingest_on.read(TERMINAL)]
     assert refs[: len(before)] == before, "a replayed record"
@@ -467,12 +481,12 @@ def test_detach_keeps_the_cursor_so_a_re_attach_re_reads_nothing(
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
     _write(transcript, _user_text("u1"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
     count = len(ingest_on.rows)
 
     claude_transcript.detach(TERMINAL)
     claude_transcript.attach(TERMINAL, transcript, SESSION)
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     assert len(ingest_on.rows) == count
 
@@ -498,18 +512,18 @@ def test_a_terminal_that_moves_to_a_different_transcript_follows_it(
     first.touch()
     claude_transcript.attach(TERMINAL, first, "sess-1")
     _write(first, _user_text("old"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     second.touch()
     claude_transcript.attach(TERMINAL, second, "sess-2")
     _write(second, _user_text("new", session="sess-2"))
-    claude_transcript.source_for(TERMINAL).poll_once()
+    _source().poll_once()
 
     refs = [row.source_ref for row in ingest_on.read(TERMINAL)]
     assert any(
         ref is not None and ref.endswith("#new") for ref in refs
     ), "the tailer did not follow the terminal to its new transcript"
-    assert claude_transcript.source_for(TERMINAL).path_key == str(second)
+    assert _source().path_key == str(second)
 
 
 # -- the switch --------------------------------------------------------------
@@ -544,7 +558,7 @@ def test_a_poll_after_the_switch_goes_off_writes_nothing(
     """
     transcript.touch()
     claude_transcript.attach(TERMINAL, transcript, SESSION)
-    source = claude_transcript.source_for(TERMINAL)
+    source = _source()
     wiring.reset_producers()
     _write(transcript, _user_text("u1"))
 

@@ -460,12 +460,21 @@ async def start_worker_truth(
         # events apply in full, and r9's source precedence silently never
         # engages — with both lanes' own tests still green, because each injects
         # its own double here.
+        # WP-ARCH phase 2, A1: the projector built above is also HANDED IN, as
+        # the ``StateFolder`` port, so ``emit`` folds every appended event. At
+        # phase 1's anchor this line passed everything but the projector, so the
+        # local was dropped and ``Projector.project`` had no call site anywhere —
+        # the fold that writes ``status.transition`` never ran, and AC-2a's
+        # agreement report compares exactly those rows. The field is typed on the
+        # Protocol, so nothing under ``adapters/`` names ``Projector``; this is
+        # the one module allowed to know both halves.
         truth_wiring.install_producers(
             truth_wiring.ProducerRuntime(
                 store=event_store,
                 clock=resolved_clock,
                 state_store=state_store,
                 findings=finding_store,
+                folder=projector,
             )
         )
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either

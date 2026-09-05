@@ -120,7 +120,9 @@ def test_rows_without_a_key_are_never_deduplicated(store: SqliteEventStore) -> N
 
 def test_the_key_survives_the_round_trip(store: SqliteEventStore) -> None:
     stored = store.append(_marker("k-1"))
-    assert store.get(stored.event_id).idempotency_key == "k-1"
+    read_back = store.get(stored.event_id)
+    assert read_back is not None
+    assert read_back.idempotency_key == "k-1"
 
 
 def test_the_partial_unique_index_exists_and_is_partial(tmp_path: Path) -> None:

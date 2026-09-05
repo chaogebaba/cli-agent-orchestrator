@@ -27,6 +27,7 @@ from cli_agent_orchestrator.core.events import (
     Producer,
     WorkerEvent,
 )
+from cli_agent_orchestrator.core.states import WorkerState
 
 
 @dataclass
@@ -97,7 +98,9 @@ class Rig:
             payload=payload,
         )
 
-    def legacy(self, terminal_id: str, latched_status: str, origin: str = "incremental"):
+    def legacy(
+        self, terminal_id: str, latched_status: str, origin: str = "incremental"
+    ) -> WorkerEvent:
         """Shorthand for one ``status.legacy_published`` row."""
         from cli_agent_orchestrator.core.events import EventKind
 
@@ -125,7 +128,7 @@ class Rig:
             payload={"latched_status": latched_status, "origin": origin},
         )
 
-    def state_of(self, terminal_id: str):
+    def state_of(self, terminal_id: str) -> WorkerState | None:
         row = self.states.get(terminal_id)
         return None if row is None else row.state
 

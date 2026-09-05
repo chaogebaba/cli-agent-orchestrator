@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from test.app.fakes import FakeClock
+from typing import Any
 
 import pytest
 
@@ -35,13 +36,16 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.core.events import (
+    AnyKind,
     Confidence,
     DecisionKind,
     EventDraft,
     EventKind,
     Producer,
+    WorkerEvent,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.ports import StateProjection
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
@@ -68,7 +72,14 @@ class _Rig:
             self.events, self.states, self.clock, self.sources, legacy_check=self.legacy_check
         )
 
-    def emit(self, kind, *, producer=Producer.JSONL, confidence=Confidence.AUTHORITATIVE, **kw):
+    def emit(
+        self,
+        kind: AnyKind,
+        *,
+        producer: Producer = Producer.JSONL,
+        confidence: Confidence = Confidence.AUTHORITATIVE,
+        **kw: Any,
+    ) -> WorkerEvent:
         stored = self.events.append(
             EventDraft(
                 terminal_id=kw.pop("terminal_id", TERMINAL),
@@ -82,7 +93,7 @@ class _Rig:
         self.projector.project(stored)
         return stored
 
-    def legacy(self, status: str, terminal_id: str = TERMINAL):
+    def legacy(self, status: str, terminal_id: str = TERMINAL) -> WorkerEvent:
         return self.emit(
             EventKind.STATUS_LEGACY_PUBLISHED,
             producer=Producer.PANE,
@@ -90,6 +101,17 @@ class _Rig:
             payload={"latched_status": status, "origin": "incremental"},
             terminal_id=terminal_id,
         )
+
+    def row(self, terminal_id: str = TERMINAL) -> StateProjection:
+        """The projection row, asserted present.
+
+        Every caller below has just folded an event for this terminal, so a
+        missing row means the fold did nothing — which is worth failing by name
+        rather than as an ``AttributeError`` on ``None``.
+        """
+        projection = self.states.get(terminal_id)
+        assert projection is not None, f"no projection row for {terminal_id}"
+        return projection
 
 
 @pytest.fixture
@@ -111,7 +133,7 @@ def test_the_projection_survives_the_round_trip(rig: _Rig) -> None:
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(EventKind.PANE_MISSING, producer=Producer.PANE, confidence=Confidence.DERIVED)
 
-    row = rig.states.get(TERMINAL)
+    row = rig.row()
 
     assert row is not None
     assert row.state is WorkerState.DEGRADED
@@ -144,7 +166,7 @@ def test_a_probe_never_moves_the_state(rig: _Rig) -> None:
     """Heartbeats are columns.  A probe that could change ``state`` would make
     the projector's rules unfalsifiable."""
     rig.emit(EventKind.TURN_STARTED)
-    since_before = rig.states.get(TERMINAL).since
+    since_before = rig.row().since
     rig.clock.advance(5)
 
     rig.states.touch_probe(
@@ -152,7 +174,7 @@ def test_a_probe_never_moves_the_state(rig: _Rig) -> None:
     )
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
 
-    row = rig.states.get(TERMINAL)
+    row = rig.row()
     assert row.state is WorkerState.BUSY
     assert row.since == since_before
 
@@ -275,7 +297,7 @@ def test_timestamps_come_back_as_aware_utc(rig: _Rig) -> None:
     against everything else — the class of bug AC10 must not have to explain."""
     rig.emit(EventKind.TURN_STARTED)
 
-    row = rig.states.get(TERMINAL)
+    row = rig.row()
     event = rig.events.read(TERMINAL)[0]
 
     assert row.since.tzinfo is not None
@@ -305,7 +327,7 @@ def test_the_epoch_sentinel_is_never_reached_in_practice(rig: _Rig) -> None:
     rig.clock.advance(NO_SIGNAL_S + 1)
     rig.projector.sweep()
 
-    assert rig.states.get(TERMINAL).since > datetime(2000, 1, 1, tzinfo=UTC)
+    assert rig.row().since > datetime(2000, 1, 1, tzinfo=UTC)
 
 
 def test_a_row_read_from_the_table_is_frozen(rig: _Rig) -> None:
@@ -318,7 +340,7 @@ def test_a_row_read_from_the_table_is_frozen(rig: _Rig) -> None:
     import dataclasses
 
     rig.emit(EventKind.TURN_STARTED)
-    row = rig.states.get(TERMINAL)
+    row = rig.row()
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.state = WorkerState.EXITED  # type: ignore[misc]

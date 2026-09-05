@@ -130,7 +130,9 @@ def test_a_recovery_into_an_anomalous_cell_is_also_flagged(rig: Rig) -> None:
     mis-attributed launch.  Checking only ``status.transition`` would lose it.
     """
     rig.pane(TERMINAL, EventKind.PANE_MISSING)
-    assert rig.states.get(TERMINAL).prior_state is WorkerState.STARTING
+    degraded = rig.states.get(TERMINAL)
+    assert degraded is not None
+    assert degraded.prior_state is WorkerState.STARTING
 
     rig.pane(TERMINAL, EventKind.PANE_RECOVERED)
 
@@ -241,6 +243,7 @@ def test_repeats_increment_and_keep_the_first_sample(rig: Rig) -> None:
 
     findings = rig.findings.list_findings(code=FindingCode.DIAG_BAD_TRANSITION)
     assert len(findings) == 1
+    assert first is not None
     assert findings[0].count == 4
     assert findings[0].sample_event_id == first.sample_event_id
     assert findings[0].first_seen_at == first.first_seen_at

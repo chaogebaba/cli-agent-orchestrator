@@ -37,9 +37,7 @@ async def _clean_runtime() -> AsyncIterator[None]:
     await bootstrap.shutdown_worker_truth()
 
 
-def _guard_findings(
-    runtime: bootstrap.WorkerTruthRuntime, clock: FakeClock
-) -> list[Finding]:
+def _guard_findings(runtime: bootstrap.WorkerTruthRuntime, clock: FakeClock) -> list[Finding]:
     assert runtime.pool is not None
     findings: list[Finding] = SqliteFindingStore(runtime.pool, clock=clock).list_findings(
         code=FindingCode.DIAG_STATUS_GUARD
