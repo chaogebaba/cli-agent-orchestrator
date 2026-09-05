@@ -30,8 +30,15 @@ word separators `\\W+` — a NON-word character — and met a letter.
 
 The fix is `bleed_tolerant_pattern`: word interiors are never corrupted (the
 dialog does write every glyph of its own words), so pin the words and let each
-gap absorb a short run of anything. `contains` rules get it as a fallback after
-the plain substring test, which makes it a widening and never a narrowing.
+gap absorb exactly one cell — one space, or one stale alphanumeric, never a
+longer run, because a single blank cell cannot hold two characters. `contains`
+rules get it as a fallback after the plain substring test, on anchors of three
+words or more, which makes it a widening and never a narrowing.
+
+An anchor match is not a keystroke. `TestTheFalsePositiveBound` states the
+property that actually matters at the rule: question, every option, and a
+two-capture settle gate, checked against the three adversarial screens the
+EMPIRICAL gate built for r1 and three more taken from real pane scrollback.
 """
 
 from __future__ import annotations
@@ -238,12 +245,35 @@ class TestItWidensAndDoesNotLeak:
         assert fork.matches(region_of(STALL_REGION_CANONICAL)) is False
         assert fork.matches(ar.dialog_region(CLEAN_CARD)) is False
 
-    def test_a_gap_wider_than_the_cap_is_not_a_match(self) -> None:
+    def test_a_gap_is_exactly_one_cell_wide(self) -> None:
+        """The allowance is the physics: one blank cell, one stale character.
+
+        Two characters between two anchor words is not a bleed. A single blank
+        cell cannot hold two characters, so a two-character run is different
+        text and must not match.
+
+        The strings here are lowercase because the canonical domain is: the fold
+        lowercases before matching, so a stale glyph reaches the pattern as
+        ``[a-z0-9]`` and nothing else.
+        """
         pattern = ar.bleed_tolerant_pattern("press enter to continue")
         assert pattern is not None
-        assert pattern.search("press enter to continue") is not None
-        assert pattern.search("press enter toXXXcontinue") is not None  # 3, at the cap
-        assert pattern.search("press enter toXXXXcontinue") is None  # 4, over it
+        assert pattern.search("press enter to continue") is not None  # uncorrupted
+        assert pattern.search("press enter todcontinue") is not None  # one stale glyph
+        assert pattern.search("press enter to7continue") is not None  # a stale digit
+        assert pattern.search("press enter todxcontinue") is None  # two: not a bleed
+        assert pattern.search("press enter todxycontinue") is None
+
+    def test_a_two_word_anchor_gets_no_tolerance_at_all(self) -> None:
+        """A widening is paid for by the specificity around it.
+
+        Two words with one wildcard between them is not a phrase. The short
+        anchors in the shipped rules — "Yes, continue", "No, quit" — keep the
+        exact substring test and nothing else.
+        """
+        assert ar.bleed_tolerant_pattern("yes continue") is None
+        assert ar.bleed_tolerant_pattern("no quit") is None
+        assert ar.bleed_tolerant_pattern("use current directory") is not None
 
     def test_absent_words_are_still_absent(self) -> None:
         rule = fixed()
@@ -253,6 +283,7 @@ class TestItWidensAndDoesNotLeak:
         """No gaps to tolerate, and a word interior is never corrupted."""
         assert ar.bleed_tolerant_pattern("continue") is None
         assert ar.bleed_tolerant_pattern("") is None
+        assert ar.BLEED_MIN_ANCHOR_WORDS == 3
 
     def test_an_empty_anchor_stays_trivially_present(self) -> None:
         """Behaviour preservation: `"" in haystack` was always True."""
@@ -346,29 +377,54 @@ class TestTheGrokTrustCard:
         assert "yes proceed" in canonical  # the option rows the rule anchors on
         assert "enter or y to trust" in canonical  # the footer hint
 
-    def test_it_still_matches_when_the_previous_frame_bleeds_through(self) -> None:
-        """Provider-independence, at the level where it is decided.
+    BACKGROUND: List[str] = [
+        "change approach scope or semantics is not yours to decide available",
+        "skills the following skills are available exclusively in this cao",
+        "orchestration context to load a skill first discover it, then read it",
+        "from disk because these are not reachable through provider-native",
+        "skill commands or directories at all in this configuration here",
+        "- box-ops: offload-box operations for CAO workers, slot-locked runs",
+        "- cao-worker-protocols: worker-side callback and completion rules",
+        "- doc-keeper: descriptive-doc maintenance and staleness sweeps",
+        "--session-id c35e3120-8014-4f9c-9c5e-3f96e8651f8f --print-mode never",
+        "--allowed-tools bash,read,write,edit --max-turns 400 --verbose",
+    ]
 
-        The matcher is shared, so the bleed fallback covers grok the moment it
-        covers codex. Superposed here on the tail of the launch command's system
-        prompt, which is what sits above this card on a real grok pane.
+    def test_the_question_survives_a_bleed_but_the_short_options_do_not(self) -> None:
+        """Provider-independence, and the exact edge of what it buys.
+
+        The matcher is shared, so grok gets the tolerance the moment codex
+        does — the seven-word question still matches this card superposed on the
+        launch command's echoed system prompt, which is what sits above it on a
+        real grok pane.
+
+        Its OPTIONS do not, and that is the word floor working as designed:
+        "Yes, proceed" and "No, quit" are two words each, so they keep the exact
+        substring test, and a stale glyph in either gap defeats them. Recorded
+        rather than fixed by loosening the floor — a two-word anchor with a
+        wildcard in it is not specific enough to auto-answer on. The rule would
+        become bleed-proof by anchoring on a three-word option instead, which is
+        a config change for the supervisor and is written up in the follow-ups.
+
+        This is synthetic. Neither live grok capture was bled: both matched
+        cleanly and fired.
         """
-        background = [
-            "change approach scope or semantics is not yours to decide available",
-            "skills the following skills are available exclusively in this cao",
-            "orchestration context to load a skill first discover it, then read it",
-            "from disk because these are not reachable through provider-native",
-            "skill commands or directories at all in this configuration here",
-            "- box-ops: offload-box operations for CAO workers, slot-locked runs",
-            "- cao-worker-protocols: worker-side callback and completion rules",
-            "- doc-keeper: descriptive-doc maintenance and staleness sweeps",
-            "--session-id c35e3120-8014-4f9c-9c5e-3f96e8651f8f --print-mode never",
-            "--allowed-tools bash,read,write,edit --max-turns 400 --verbose",
-        ]
-        bled = superpose(self.CARD, background)
+        bled = superpose(self.CARD, self.BACKGROUND)
         canonical = ar.normalize_screen(bled)
         assert "do you trust the contents of this directory" not in canonical
-        assert self._rule().reject_reason(ar.dialog_region(bled)) is None
+        region = ar.dialog_region(bled)
+
+        question_only = ar.Rule(
+            name="probe",
+            enabled=True,
+            match_mode="contains",
+            question="Do you trust the contents of this directory?",
+            options=[],
+            answer=["y"],
+        )
+        assert question_only.reject_reason(region) is None
+
+        assert self._rule().reject_reason(region) == "option[Yes, proceed]"
 
     def test_the_revival_rule_is_a_duplicate_of_the_one_that_fires(self) -> None:
         """Both grok trust rules are byte-identical in body.
@@ -387,6 +443,132 @@ class TestTheGrokTrustCard:
             modality="hard",
         )
         assert revival.body_hash == self._rule().body_hash
+
+
+class TestTheFalsePositiveBound:
+    """The property that matters, stated where it is decided: at the RULE.
+
+    EMPIRICAL gate r1 rejected the first cut for letting a ≤3-character letter
+    run stand in for a word gap, and it was right — that is not what the physics
+    produces. The gap is one cell wide now, which removes the gate's
+    `sessionXYZ use` and `currentABCdirectory` cases outright.
+
+    `workingXdirectory` is a single cell and still satisfies that FRAGMENT, and
+    it should: at the matcher there is no way to tell a stale glyph from a
+    letter someone typed. The bound is therefore not "the anchor never matches
+    prose" — it is that a RULE never fires on prose. Three gates stand between a
+    fragment and a keystroke: every word of the question, every word of every
+    option, and a two-capture settle proving the frame is byte-stable.
+    """
+
+    # The three screens the gate built, verbatim in shape.
+    GATE_SCREENS: Dict[str, str] = {
+        "workingXdirectory": (
+            "choose workingXdirectory to resume this session before the next step"
+        ),
+        "sessionXYZ use": "restore the sessionXYZ use of the previous working directory",
+        "currentABCdirectory": "listing the currentABCdirectory for the resumed session",
+    }
+
+    # Real lines lifted from panes under
+    # ~/.aws/cli-agent-orchestrator/logs/terminal/*.scrollback: doctrine prose,
+    # a launch command, and a CLI help table. All three carry anchor words.
+    REAL_PROSE: Dict[str, List[str]] = {
+        "worktree-containment doctrine": [
+            "11. WORKTREE CONTAINMENT (F452): when your task was provisioned with",
+            "an isolated worktree, your working directory AT SPAWN is that worktree",
+            "— it is the ONLY place you may build, commit, or resume a session.",
+        ],
+        "launch command echo": [
+            "cao launch --agents chao_supervisor --provider claude_code \\",
+            '  --session-name "$SESSION_CLI_NAME" --working-directory .',
+            "  --headless --yolo   # resume the session directory afterwards",
+        ],
+        "cli help table": [
+            "  -l/--list-sessions   list saved sessions for the current directory",
+            "  --session-source <v1|v2>   narrow --delete-session target store",
+            "  Use current directory as the root when no session is chosen.",
+        ],
+    }
+
+    def _shipped_codex_rules(self) -> List[ar.Rule]:
+        path = Path(str(ar.AUTO_ANSWER_DIR / "codex.yaml"))
+        if path.exists():
+            return [r for r in ar._RuleStore._load(path) if r.enabled]
+        return [fixed()]
+
+    @pytest.mark.parametrize("label", sorted(GATE_SCREENS))
+    def test_no_shipped_rule_fires_on_the_gates_screens(self, label: str) -> None:
+        region = region_of(ar.canonicalize(self.GATE_SCREENS[label]))
+        fired = [r.name for r in self._shipped_codex_rules() if r.matches(region)]
+        assert fired == [], f"{label} fired {fired}"
+
+    @pytest.mark.parametrize("label", sorted(REAL_PROSE))
+    def test_no_shipped_rule_fires_on_real_pane_prose(self, label: str) -> None:
+        region = ar.dialog_region(self.REAL_PROSE[label])
+        fired = [r.name for r in self._shipped_codex_rules() if r.matches(region)]
+        assert fired == [], f"{label} fired {fired}"
+
+    def test_the_multi_character_gaps_die_at_the_anchor(self) -> None:
+        """Two of the gate's three never reach the option check at all."""
+        pattern = ar.bleed_tolerant_pattern("use session directory")
+        assert pattern is not None
+        assert pattern.search("use sessionXYZ directory") is None
+        pattern = ar.bleed_tolerant_pattern("use current directory")
+        assert pattern is not None
+        assert pattern.search("use currentABCdirectory") is None
+
+    def test_a_single_cell_fragment_needs_the_whole_rule_to_be_harmless(self) -> None:
+        """`workingXdirectory` DOES satisfy its fragment. It still cannot fire.
+
+        This is the bound in one test: the fragment matches, the full question
+        matches, and the rule is still refused because the option is not there.
+        """
+        prose = ar.canonicalize(self.GATE_SCREENS["workingXdirectory"])
+        fragment = ar.bleed_tolerant_pattern("choose working directory")
+        assert fragment is not None
+        assert fragment.search(prose) is not None
+        rule = fixed()
+        assert rule._bleed_question is not None
+        assert rule._bleed_question.search(prose) is not None
+        assert rule.reject_reason(region_of(prose)) == "option[Use current directory]"
+        assert rule.matches(region_of(prose)) is False
+
+    def test_a_matched_frame_that_keeps_changing_sends_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The settle gate is the third guard, and it is load-bearing.
+
+        Even a frame that matches every part of a rule sends no key until two
+        captures a beat apart are byte-identical. A moving frame withholds.
+        """
+        responder = ar.AutoResponder()
+        rule = fixed()
+        frames = [ar.dialog_region(CLEAN_CARD), ar.dialog_region(CLEAN_CARD + ["working"])]
+        seen = 0
+
+        def moving(
+            terminal_id: str, chrome_patterns: "List[re.Pattern[str]] | None"
+        ) -> "ar.DialogRegion | None":
+            nonlocal seen
+            seen += 1
+            return frames[min(seen - 1, 1)]
+
+        monkeypatch.setattr(responder, "_settle_capture", moving)
+        monkeypatch.setattr(ar, "_clock_sleep", lambda _seconds: None)
+        region = ar.dialog_region(CLEAN_CARD)
+        settled = responder._settle_before_first_send(
+            "t1", _StubProvider(), region.with_digests(settle="d", consume="d"), rule
+        )
+        assert settled is False, "a moving frame must not be settled"
+        assert seen == 2, "the gate must sample twice before deciding"
+
+
+class _StubProvider:
+    """Just enough provider for the settle gate's chrome-pattern lookup."""
+
+    def chrome_row_patterns(self) -> List["re.Pattern[str]"]:
+        return []
 
 
 class TestTheShippedSeed:

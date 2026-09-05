@@ -99,13 +99,13 @@ DIALOG_PROXIMITY_CHARS = 200
 # pane bottom (above ASCII banner); must reach it (≥17) while staying below the
 # M2/F55 quoted-prose suppression boundary (≤23).
 DIALOG_REGION_LINES = 20
-# F530 #386: how many characters of foreign text a single word gap in an anchor
-# may absorb before the anchor is considered absent. See
-# ``bleed_tolerant_pattern`` for the mechanism. Three covers every corruption
-# observed in the 162c159f stall frame: the widest gap there was two characters
-# (``ec3 ralways``, where the card's ". " became "3" plus a bled "r"), and a
-# dialog that indents an option by three blanks is the next case up.
-BLEED_GAP_MAX_CHARS = 3
+# F530 #386: the smallest anchor a bleed-tolerant match is allowed to run on.
+# A gap allowance is a widening, so it has to be paid for by the specificity of
+# what surrounds it. Two words with one wildcard between them is not a phrase,
+# it is a coincidence waiting to happen ("Yes, continue", "No, quit"); three
+# words carry two fixed spans and two anchored boundaries. Short anchors keep
+# the exact substring test and nothing else.
+BLEED_MIN_ANCHOR_WORDS = 3
 
 # F86: Known permission/AskUserQuestion patterns — these are interactive prompts
 # from the host CLI (claude_code, kiro) that should NOT trigger unknown-dialog
@@ -245,7 +245,7 @@ def bleed_tolerant_pattern(canonical_anchor: str) -> "re.Pattern[str] | None":
 
         choose working directory todresumeothisnsessiont by running omz update
 
-    where ``d``, ``o`` and ``n`` are characters of the shell's leftover
+    where ``d``, ``o`` and ``n`` are single characters of the shell's leftover
     ``[oh-my-zsh] It's time to update! ...`` line showing through the card's
     word gaps, and the trailing ``t by running omz update`` is the tail of that
     same line past the end of the card's text. Three of the card's other lines
@@ -254,20 +254,39 @@ def bleed_tolerant_pattern(canonical_anchor: str) -> "re.Pattern[str] | None":
 
     The saving property is that a dialog DOES write every glyph of its own
     words: only the gaps BETWEEN words are unreliable, never a word's interior.
-    So the anchor's words are pinned verbatim and each gap is allowed to be any
-    run of up to ``BLEED_GAP_MAX_CHARS`` characters. On an uncorrupted screen a
-    gap is exactly one space, so the returned pattern matches everything the
-    plain substring test matched and strictly more — it is a widening, never a
-    replacement, and callers try the substring first.
 
-    Returns ``None`` for a single-token (or empty) anchor: there are no gaps to
-    tolerate, and a word interior is never corrupted, so the plain substring
-    test is already complete for those.
+    THE ALLOWANCE IS EXACTLY ONE CELL, because that is exactly what the physics
+    produces. A word gap the dialog renders as a single blank is a single cell,
+    and a single cell holds a single stale character. So each space in the
+    anchor may be replaced by ONE character and no more: in the canonical domain
+    that is either a space (the gap was not corrupted, or the stale glyph was
+    punctuation and folded back to a space) or one alphanumeric (a stale letter
+    or digit, the ``d`` in ``todresume``). A multi-character run between two
+    anchor words is NOT a bleed — it is different text — and must not match.
+    Wider blank runs and the stale tail past the end of a dialog's line lie
+    outside the anchor's span and need no allowance at all.
+
+    The tolerant path is also confined to anchors of at least
+    ``BLEED_MIN_ANCHOR_WORDS`` words. A widening has to be paid for by the
+    specificity of what surrounds it, and a two-word anchor with one wildcard
+    between them is not specific enough to spend it on.
+
+    On an uncorrupted screen every gap is exactly one space, which this pattern
+    matches, so it accepts everything the plain substring test accepted and a
+    strictly bounded amount more. It is a widening, never a replacement, and
+    callers try the substring first. It is also not the whole guard: an anchor
+    match alone never sends a key — the rule's options must match the same
+    screen, and the two-capture settle gate must find that screen byte-stable,
+    before any key is sent.
+
+    Returns ``None`` for an anchor below the word floor: there is nothing to
+    tolerate that the plain substring test does not already decide.
     """
     tokens = canonical_anchor.split()
-    if len(tokens) < 2:
+    if len(tokens) < BLEED_MIN_ANCHOR_WORDS:
         return None
-    gap = ".{1,%d}" % BLEED_GAP_MAX_CHARS
+    # Exactly one canonical character: a space, or one stale alphanumeric.
+    gap = "[a-z0-9 ]"
     return re.compile(gap.join(re.escape(token) for token in tokens))
 
 
