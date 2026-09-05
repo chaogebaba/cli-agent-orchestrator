@@ -240,6 +240,83 @@ def test_trust_roots_never_reach_home_or_above(seat: Path, tmp_path: Path) -> No
 
 
 # --------------------------------------------------------------------------
+# The same boundary, applied to cwd itself (gate blocker, 2026-09-05).
+#
+# The first cut seeded ``roots = [cwd]`` and only then applied the boundary to
+# the ancestors, so a direct spawn with cwd == $HOME or cwd == / returned that
+# forbidden directory as a trusted root and the writer emitted a
+# ``[projects."$HOME"]`` / ``[projects."/"]`` table — global trust for every
+# future directory on the machine.  $HOME here is always the scratch home the
+# autouse fixture installs; these tests never look at the operator's real one.
+# --------------------------------------------------------------------------
+
+
+def _forbidden_cwds(tmp_path: Path) -> dict[str, Path]:
+    """cwd values that must never yield a trust root, with a scratch $HOME."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    return {
+        "home": home,
+        "above-home": tmp_path,
+        "filesystem-root": Path("/"),
+    }
+
+
+@pytest.mark.parametrize("which", ["home", "above-home", "filesystem-root"])
+def test_trust_roots_refuse_a_forbidden_cwd(which: str, tmp_path: Path) -> None:
+    assert _codex_trust_roots(_forbidden_cwds(tmp_path)[which]) == []
+
+
+def test_trust_roots_refuse_home_even_when_home_is_a_repository(tmp_path: Path) -> None:
+    """A dotfiles checkout at $HOME must not make $HOME trustable as a cwd."""
+    home = tmp_path / "home"
+    (home / ".git").mkdir(parents=True, exist_ok=True)
+    assert _codex_trust_roots(home) == []
+
+
+@pytest.mark.parametrize("which", ["home", "above-home", "filesystem-root"])
+def test_writer_emits_no_projects_table_for_a_forbidden_cwd(
+    which: str, tmp_path: Path, codex_home: Path
+) -> None:
+    cwd = _forbidden_cwds(tmp_path)[which]
+    _reassert_codex_startup_keys(str(cwd), codex_home)
+    config = codex_home / "config.toml"
+    text = config.read_text(encoding="utf-8") if config.exists() else ""
+    assert "[projects." not in text
+    assert tomllib.loads(text).get("projects") in (None, {})
+
+
+def test_writer_emits_no_projects_table_when_home_is_a_repository(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    home = tmp_path / "home"
+    (home / ".git").mkdir(parents=True, exist_ok=True)
+    _reassert_codex_startup_keys(str(home), codex_home)
+    config = codex_home / "config.toml"
+    text = config.read_text(encoding="utf-8") if config.exists() else ""
+    assert "[projects." not in text
+
+
+def test_a_scratch_cwd_outside_home_still_gets_cwd_and_repo_roots(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """The production shape: seats live on a /data-style mount outside $HOME.
+
+    The cwd boundary must not cost those seats their roots — that is the whole
+    reason the walk is allowed to start outside the home tree.
+    """
+    (tmp_path / "home").mkdir(parents=True, exist_ok=True)
+    repo = tmp_path / "data" / "cao-scratch" / "side" / "repo"
+    (repo / ".git").mkdir(parents=True)
+    seat = repo / ".cao" / "worktrees" / "abcd1234"
+    seat.mkdir(parents=True)
+    assert _codex_trust_roots(seat) == [seat, repo]
+    assert _reassert_codex_startup_keys(str(seat), codex_home) is True
+    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert set(parsed["projects"]) == {str(seat), str(repo)}
+
+
+# --------------------------------------------------------------------------
 # The writer.
 # --------------------------------------------------------------------------
 

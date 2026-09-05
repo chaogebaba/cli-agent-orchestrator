@@ -323,6 +323,21 @@ def _codex_hook_trust_entries(hooks_file: Path) -> list[tuple[str, str]]:
     return entries
 
 
+def _codex_trust_root_is_forbidden(candidate: Path, home: Path | None) -> bool:
+    """True when ``candidate`` is too broad a directory for CAO to trust.
+
+    ``candidate`` must already be resolved.  The filesystem root, the user's
+    home directory and every ancestor of it are refused: a ``projects`` entry
+    for any of them trusts every directory below it, now and forever, which is
+    a decision only the operator gets to make at codex's own card.
+    """
+    if candidate == candidate.parent:  # filesystem root
+        return True
+    if home is not None and (candidate == home or candidate in home.parents):
+        return True
+    return False
+
+
 def _codex_trust_roots(cwd: Path) -> list[Path]:
     """Return ``cwd`` plus each enclosing repository root, nearest first.
 
@@ -334,29 +349,41 @@ def _codex_trust_roots(cwd: Path) -> list[Path]:
     trust-this-directory answer uses, so trusting it is not a widening of what
     the operator already approves at the card.
 
-    Bounded deliberately: the walk never yields the user's home directory, any
-    ancestor of it, or the filesystem root, and it never climbs more than
-    ``_CODEX_TRUST_ROOT_SCAN_LIMIT`` levels.  Trusting $HOME or / would trust
-    every future directory on the machine, which is not CAO's call to make.
-    The boundary is on what may be TRUSTED, not on where the walk may start:
-    CAO provisions seats under a scratch mount outside $HOME, and stopping the
-    walk at the home boundary would have left those seats with no repo root at
-    all.
+    Bounded deliberately: no returned root is ever the user's home directory,
+    an ancestor of it, or the filesystem root, and the walk never climbs more
+    than ``_CODEX_TRUST_ROOT_SCAN_LIMIT`` levels.  Trusting $HOME or / would
+    trust every future directory on the machine, which is not CAO's call to
+    make.  The boundary is on what may be TRUSTED, not on where the walk may
+    start: CAO provisions seats under a scratch mount outside $HOME, and
+    stopping the walk at the home boundary would have left those seats with no
+    repo root at all.
+
+    The boundary applies to ``cwd`` itself, not only to its ancestors.  A
+    caller that hands us ``$HOME`` or ``/`` directly gets an empty list — the
+    ancestors of such a cwd are forbidden by construction too, so there is
+    nothing left to walk for.
     """
-    roots = [cwd]
     try:
         home: Path | None = Path.home().resolve()
     except (OSError, RuntimeError):
         home = None
+    try:
+        resolved_cwd = cwd.resolve()
+    except OSError:
+        return []
+    if _codex_trust_root_is_forbidden(resolved_cwd, home):
+        logger.warning(
+            "codex hook-trust: refusing to trust %s (home, an ancestor of it, or /)", cwd
+        )
+        return []
+    roots = [cwd]
     current = cwd.parent
     for _ in range(_CODEX_TRUST_ROOT_SCAN_LIMIT):
-        if current == current.parent:  # filesystem root
-            break
         try:
             resolved = current.resolve()
         except OSError:
             break
-        if home is not None and (resolved == home or resolved in home.parents):
+        if _codex_trust_root_is_forbidden(resolved, home):
             break
         if (current / ".git").exists() and current not in roots:
             roots.append(current)
