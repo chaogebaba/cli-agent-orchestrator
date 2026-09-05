@@ -33,6 +33,7 @@ from datetime import datetime
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import (
     FLEET_TERMINAL_ID,
+    PROJECTION_ORIGIN,
     DecisionKind,
     EventKind,
     Producer,
@@ -311,6 +312,16 @@ def _compare_terminal(
                     value = None
             side = "projection"
         elif event.kind is EventKind.STATUS_LEGACY_PUBLISHED and event.decision is None:
+            # D5's exclusion.  From phase 2's D1 the projection publishes through
+            # this same egress, so a publish it fed is not an independent
+            # observation of anything — comparing it against the projection would
+            # be the projection agreeing with itself, and the report would show a
+            # rising agreement rate as the cutover advanced, for that reason
+            # alone.  ``fed_by`` names the producer of record and this drops the
+            # echoes.  Rows written before phase 2 carry no ``fed_by`` at all;
+            # absent means the pane fed it, which is what was true then.
+            if event.payload.get("fed_by") == PROJECTION_ORIGIN:
+                continue
             legacy_publishes += 1
             raw_status = event.payload.get("latched_status")
             value = legacy_state(raw_status) if isinstance(raw_status, str) else None

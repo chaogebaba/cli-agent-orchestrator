@@ -30,7 +30,7 @@ from cli_agent_orchestrator.app.diag.report import DiagSources, render_findings,
 from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
-    LegacyDisagreementCheck,
+    PaneDisagreementCheck,
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
@@ -61,7 +61,7 @@ class _Rig:
         self.events = SqliteEventStore(pool, clock=self.clock, check_runner=self.registry)
         self.states = SqliteStateStore(pool)
         self.sources = StaticSourceRegistry()
-        self.legacy_check = LegacyDisagreementCheck(
+        self.legacy_check = PaneDisagreementCheck(
             self.findings, self.events, self.states, self.clock
         )
         self.projector = Projector(

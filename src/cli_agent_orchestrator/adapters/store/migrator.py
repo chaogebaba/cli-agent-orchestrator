@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,8 +38,18 @@ __all__ = [
     "FINDING_DDL",
     "MIGRATION_STEPS",
     "MigrationResult",
+    "MigrationStatement",
     "migrate",
 ]
+
+#: A migration statement is SQL, or a callable that applies one.  The callable
+#: form exists for exactly one thing: ``ALTER TABLE ... ADD COLUMN`` has no
+#: ``IF NOT EXISTS`` in SQLite, and this migrator runs at EVERY boot.  A bare
+#: ALTER would succeed once and fail forever after — and a failed step aborts the
+#: whole migration and disables ingestion for the process, so the second boot
+#: would silently turn phase 1 off.  The callable checks ``PRAGMA table_info``
+#: first, which is what keeps an additive column additive.
+MigrationStatement = str | Callable[[sqlite3.Connection], None]
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -80,8 +91,32 @@ CREATE TABLE IF NOT EXISTS worker_event (
   msg_id       TEXT,
   decision     TEXT,
   evidence     TEXT,
+  idempotency_key TEXT,
   UNIQUE(terminal_id, seq))
 """
+
+
+def _add_worker_event_idempotency_key(conn: sqlite3.Connection) -> None:
+    """WP-ARCH phase 2, D4 — the caller-supplied idempotency key column.
+
+    Additive and idempotent.  A database created before phase 2 has the
+    fourteen-column ``worker_event``; one created after has the column already,
+    because it is in the DDL above.  Both reach this function, and it must be a
+    no-op for the second.
+
+    The key is NULLABLE and the index below is PARTIAL for the same reason:
+    almost no row carries one.  Only the claude_code hook route supplies a key,
+    because only a hook POST can be retried by a transport this server does not
+    control.  A ``NOT NULL`` column would have forced every other producer to
+    invent one, and a full unique index would have paid for a column of NULLs on
+    every insert — and SQLite treats NULLs as distinct in a UNIQUE index anyway,
+    so the constraint would have been vacuous where it was not expensive.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(worker_event)")}
+    if "idempotency_key" in columns:
+        return
+    conn.execute("ALTER TABLE worker_event ADD COLUMN idempotency_key TEXT")
+
 
 _WORKER_EVENT_SEQ_DDL = """
 CREATE TABLE IF NOT EXISTS worker_event_seq (
@@ -228,9 +263,28 @@ CREATE TABLE IF NOT EXISTS seat_digest (
 
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)
 # so a test can substitute a failing step and watch boot survive it.
-MIGRATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
     ("worker_event", (_WORKER_EVENT_DDL,)),
     ("worker_event_seq", (_WORKER_EVENT_SEQ_DDL,)),
+    # WP-ARCH phase 2, D4 / R1: the idempotency key goes into THIS migrator.  A
+    # second migrator is how one schema comes to have two authorities, and both
+    # phase 2 and phase 3 commit to not adding one.
+    (
+        "worker_event_idempotency_key",
+        (
+            _add_worker_event_idempotency_key,
+            # The partial unique index is what makes the retried hook POST append
+            # once.  Stripe's shape: "a client generates an idempotency key,
+            # which is a unique key that the server uses to recognize subsequent
+            # retries of the same request".  One divergence is deliberate — Stripe
+            # replays a cached response and the duplicate leaves no row, whereas
+            # here a duplicate OBSERVATION is data, and the ``producer`` column
+            # exists to record that two sources saw one turn.  What must not
+            # double is one producer's own retry, which is what this indexes.
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_event_idempotency "
+            "ON worker_event(idempotency_key) WHERE idempotency_key IS NOT NULL",
+        ),
+    ),
     (
         "worker_event_indexes",
         (
@@ -374,7 +428,10 @@ def migrate(
         try:
             conn.execute("BEGIN IMMEDIATE")
             for statement in statements:
-                conn.execute(statement)
+                if callable(statement):
+                    statement(conn)
+                else:
+                    conn.execute(statement)
             conn.execute("COMMIT")
         except Exception as exc:  # noqa: BLE001
             try:

@@ -16,8 +16,10 @@ from typing import Any, Iterator
 import pytest
 
 from cli_agent_orchestrator.adapters.truth import (
+    claude_transcript,
     codex_rollout,
     legacy_egress,
+    pane_classification,
     wiring,
 )
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
@@ -206,11 +208,15 @@ def _clean_producer_state() -> Iterator[None]:
     """
     wiring.reset_producers()
     legacy_egress.reset_edges()
+    pane_classification.reset_edges()
     codex_rollout.reset_sources()
+    claude_transcript.reset_sources()
     yield
     wiring.reset_producers()
     legacy_egress.reset_edges()
+    pane_classification.reset_edges()
     codex_rollout.reset_sources()
+    claude_transcript.reset_sources()
 
 
 @pytest.fixture

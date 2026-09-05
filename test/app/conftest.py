@@ -15,7 +15,7 @@ import pytest
 
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
-    LegacyDisagreementCheck,
+    PaneDisagreementCheck,
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
@@ -38,7 +38,7 @@ class Rig:
     states: InMemoryStateStore
     findings: InMemoryFindingStore
     registry: CheckRegistry
-    checks: LegacyDisagreementCheck
+    checks: PaneDisagreementCheck
     sources: StaticSourceRegistry
     projector: Projector
 
@@ -107,6 +107,24 @@ class Rig:
             payload={"latched_status": latched_status, "origin": origin},
         )
 
+    def classified(
+        self, terminal_id: str, latched_status: str, origin: str = "incremental"
+    ) -> WorkerEvent:
+        """Shorthand for one ``status.pane_classified`` row (phase 2, D1c).
+
+        The side ``DIAG-PANE-DISAGREE`` reads after D5 repointed it.  Separate
+        from :meth:`legacy` rather than replacing it, because the two rows are
+        genuinely different things and a test that could not have both would not
+        be able to show that the check ignores the publish.
+        """
+        from cli_agent_orchestrator.core.events import EventKind
+
+        return self.pane(
+            terminal_id,
+            EventKind.STATUS_PANE_CLASSIFIED,
+            payload={"latched_status": latched_status, "origin": origin},
+        )
+
     def state_of(self, terminal_id: str):
         row = self.states.get(terminal_id)
         return None if row is None else row.state
@@ -119,7 +137,7 @@ def rig() -> Rig:
     states = InMemoryStateStore()
     findings = InMemoryFindingStore(clock)
     registry = register_phase1_checks(CheckRegistry(findings))
-    checks = LegacyDisagreementCheck(findings, events, states, clock)
+    checks = PaneDisagreementCheck(findings, events, states, clock)
     events.set_checks(registry)
     events.bind_findings(findings)
     sources = StaticSourceRegistry()

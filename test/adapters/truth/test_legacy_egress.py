@@ -124,6 +124,10 @@ def test_payload_carries_every_blueprint_field(ingest_on: FakeEventStore) -> Non
         "raw_classification": "classified",
         "fusion_reason": "resync_after_drop",
         "condition": "BUSY",
+        # WP-ARCH phase 2, D5.  Present from 2a even though nothing can yet set
+        # it to the projection: written BEFORE D1's publisher, deliberately, or
+        # the agreement report the 2b gate rests on would be self-confirming.
+        "fed_by": "pane",
     }
 
 

@@ -236,6 +236,14 @@ def main() -> int:
             "event": event_source,
             "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "nonce": uuid.uuid4().hex,
+            # WP-ARCH phase 2, D4 — the ONLY worker-side change the whole
+            # sub-phase makes. Minted once per hook invocation and reused by every
+            # retry of THIS POST, which is what makes it an idempotency key rather
+            # than a second nonce: the server's partial unique index turns a
+            # retried request into one row. A fresh CC firing of the same hook
+            # mints a fresh key and appends a second row, which is correct — that
+            # is a second observation, not a retry of the first.
+            "idempotency_key": uuid.uuid4().hex,
         }
         if tool_name is not None:
             payload["tool_name"] = tool_name

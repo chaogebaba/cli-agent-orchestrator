@@ -21,7 +21,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-__all__ = ["Finding", "FindingCode", "FindingState"]
+__all__ = ["RETIRED_FINDING_CODES", "Finding", "FindingCode", "FindingState"]
 
 
 class FindingCode(StrEnum):
@@ -32,6 +32,26 @@ class FindingCode(StrEnum):
                                 explains why the server acted.
     ``DIAG_LEGACY_DISAGREE``  — the shadow projection and the legacy published
                                 status disagreed for longer than one heartbeat.
+                                **Accepted but no longer raised**, from WP-ARCH
+                                phase 2 (D9b): see ``DIAG_PANE_DISAGREE`` below.
+    ``DIAG_PANE_DISAGREE``    — the same disagreement, read from the pane's own
+                                ``status.pane_classified`` record rather than
+                                from the publish (D5).
+
+    Phase 2's D9b makes that a RENAME WITH HISTORY rather than a rename.  Rows
+    already carry the old code and ``cao diag findings`` reads them, so the new
+    code is ADDED, the old one is RETAINED in the enum as accepted-but-never-
+    raised, and both print.  Deleting the old member would orphan its rows in the
+    very table phase 1 built to be the evidence base; renaming the string in place
+    would make ``count`` on a repeat ambiguous across the cutover boundary — the
+    same reading would be two findings before and after, or one finding whose
+    count spans two different checks.
+
+    The repointing itself is D5's, and it is not cosmetic.  The old check compares
+    the projection against ``status.legacy_published``; the moment phase 2's D1
+    publishes the projection through that same egress, the check compares the
+    projection with itself and reports agreement forever.  The new one reads the
+    pane's own reading, which stays independent.
     ``DIAG_MIGRATION_FAILED`` — the phase-1 migrator raised (AC5).  Written into
                                 the ``finding`` table, which is why that table is
                                 created FIRST and in its own transaction: it has
@@ -63,6 +83,16 @@ class FindingCode(StrEnum):
     DIAG_MIGRATION_FAILED = "DIAG-MIGRATION-FAILED"
     DIAG_QUEUE_ORPHAN_GUARD = "DIAG-QUEUE-ORPHAN-GUARD"
     DIAG_BARRIER_OPEN_AT_FLIP = "DIAG-BARRIER-OPEN-AT-FLIP"
+    DIAG_PANE_DISAGREE = "DIAG-PANE-DISAGREE"
+    DIAG_STATUS_GUARD = "DIAG-STATUS-GUARD"
+
+
+#: Codes that remain readable but which no code path raises any more (D9b).
+#: ``cao diag findings`` prints them, retention keeps their samples, and a check
+#: that starts raising one again is a defect a test can name.  Retiring a code
+#: this way rather than by deletion is what keeps a finding written before a
+#: cutover readable after it.
+RETIRED_FINDING_CODES: frozenset[FindingCode] = frozenset({FindingCode.DIAG_LEGACY_DISAGREE})
 
 
 class FindingState(StrEnum):

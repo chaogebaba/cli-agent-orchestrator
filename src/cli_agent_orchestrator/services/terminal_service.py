@@ -7302,6 +7302,26 @@ def _open_cascade_teardown_intents(
                 node_id,
                 e,
             )
+        # WP-ARCH phase 2, D10 (#601). ``delete_terminal`` brackets only the ROOT
+        # terminal in an event-log intent (hook 7), while this cascade kills every
+        # node in the reap plan. Without a row of its own, the liveness probe's
+        # ``_teardown_is_live`` finds no live intent for a child and classifies its
+        # exit ``crash`` — so an orderly reap writes a false crash into the log
+        # this phase is about to make authoritative. A wrong row in the evidence
+        # base costs more than the one-line fix, which is why this belongs here
+        # and not in phase 7's fleet read-model.
+        #
+        # INSIDE the loop and OUTSIDE the try: every child needs one (appending
+        # for the first child only leaves #601 alive for the rest, and that is a
+        # named mutant), and the row records what the server INTENDED, which is
+        # true whether or not the durable DB intent above committed.
+        _wt_server.record_teardown_intended(
+            node_id,
+            scope_kind="terminal",
+            scope_key=node_id,
+            ttl_s=ttl_s,
+            requested_by=caller_id,
+        )
     return intent_ids, marked
 
 
