@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -92,23 +92,29 @@ LEFTOVER_SCREEN: List[str] = [
     "  --search",
 ]
 
-# The rule as it shipped when the stall happened, and as it reads now.
-SHIPPED_AT_STALL = dict(
-    name="codex-resume-workdir-card",
-    enabled=True,
-    match_mode="regex",
-    question=r"Choose\W+working\W+directory\W+to\W+resume\W+this\W+session",
-    options=["continue"],
-    answer=["Down", "Enter"],
-)
-FIXED = dict(
-    name="codex-resume-workdir-card",
-    enabled=True,
-    match_mode="contains",
-    question="Choose working directory to resume this session",
-    options=["Use current directory"],
-    answer=["Down", "Enter"],
-)
+
+def shipped_at_stall() -> ar.Rule:
+    """`codex-resume-workdir-card` exactly as it read when the seat stalled."""
+    return ar.Rule(
+        name="codex-resume-workdir-card",
+        enabled=True,
+        match_mode="regex",
+        question=r"Choose\W+working\W+directory\W+to\W+resume\W+this\W+session",
+        options=["continue"],
+        answer=["Down", "Enter"],
+    )
+
+
+def fixed() -> ar.Rule:
+    """The same rule as it reads now: plain prose, option-text anchor."""
+    return ar.Rule(
+        name="codex-resume-workdir-card",
+        enabled=True,
+        match_mode="contains",
+        question="Choose working directory to resume this session",
+        options=["Use current directory"],
+        answer=["Down", "Enter"],
+    )
 
 
 def superpose(card: List[str], background: List[str]) -> List[str]:
@@ -129,6 +135,10 @@ def superpose(card: List[str], background: List[str]) -> List[str]:
     return rows
 
 
+# One recorded `_log_decision` call: its positional args and its keyword args.
+DecisionCall = Tuple[Tuple[Any, ...], Dict[str, Any]]
+
+
 def region_of(canonical: str) -> ar.DialogRegion:
     """A region carrying ``canonical`` in both match domains."""
     return ar.DialogRegion(rows=(canonical,), normalized=canonical, normalized_light=canonical)
@@ -139,12 +149,12 @@ class TestTheStall:
 
     def test_the_shipped_regex_rule_misses_the_frame_it_was_written_for(self) -> None:
         """The reject the decisions log recorded four times, reproduced."""
-        rule = ar.Rule(**SHIPPED_AT_STALL)  # type: ignore[arg-type]
+        rule = shipped_at_stall()
         assert rule.matches(region_of(STALL_REGION_CANONICAL)) is False
         assert rule.reject_reason(region_of(STALL_REGION_CANONICAL)) == "question(regex)"
 
     def test_the_fixed_rule_fires_on_that_same_frame(self) -> None:
-        rule = ar.Rule(**FIXED)  # type: ignore[arg-type]
+        rule = fixed()
         assert rule.reject_reason(region_of(STALL_REGION_CANONICAL)) is None
         assert rule.matches(region_of(STALL_REGION_CANONICAL)) is True
         assert rule.answer == ["Down", "Enter"]
@@ -174,18 +184,18 @@ class TestTheMechanism:
 
     def test_the_fixed_rule_fires_on_the_superposed_screen(self) -> None:
         region = ar.dialog_region(superpose(CLEAN_CARD, LEFTOVER_SCREEN))
-        rule = ar.Rule(**FIXED)  # type: ignore[arg-type]
+        rule = fixed()
         assert rule.reject_reason(region) is None
 
     def test_the_shipped_regex_rule_does_not(self) -> None:
         region = ar.dialog_region(superpose(CLEAN_CARD, LEFTOVER_SCREEN))
-        rule = ar.Rule(**SHIPPED_AT_STALL)  # type: ignore[arg-type]
+        rule = shipped_at_stall()
         assert rule.reject_reason(region) == "question(regex)"
 
     def test_an_uncorrupted_card_still_matches_the_ordinary_way(self) -> None:
         """The fallback must not be the only thing holding the rule up."""
         region = ar.dialog_region(CLEAN_CARD)
-        rule = ar.Rule(**FIXED)  # type: ignore[arg-type]
+        rule = fixed()
         assert rule._canon_question in region.normalized  # exact path, no fallback
         assert rule.matches(region) is True
 
@@ -196,7 +206,7 @@ class TestOptionsGetTheSameTreatment:
     def test_a_bled_option_still_matches(self) -> None:
         # "2. Use current directory" composited as "2 huseecurrent directory".
         assert "2 huseecurrent directory" in STALL_REGION_CANONICAL
-        rule = ar.Rule(**FIXED)  # type: ignore[arg-type]
+        rule = fixed()
         assert rule.matches(region_of(STALL_REGION_CANONICAL)) is True
 
     def test_a_regex_rules_options_are_tolerant_even_though_its_question_is_not(self) -> None:
@@ -236,7 +246,7 @@ class TestItWidensAndDoesNotLeak:
         assert pattern.search("press enter toXXXXcontinue") is None  # 4, over it
 
     def test_absent_words_are_still_absent(self) -> None:
-        rule = ar.Rule(**FIXED)  # type: ignore[arg-type]
+        rule = fixed()
         assert rule.matches(region_of("resuming session working on the directory")) is False
 
     def test_a_single_word_anchor_gets_no_pattern(self) -> None:
@@ -453,8 +463,10 @@ class TestTheUnknownMenuDetector:
 class TestTheUnknownPathIsNoLongerSilent:
     """A held seat that nobody was told about left no trace in the log."""
 
-    def _responder(self, monkeypatch: pytest.MonkeyPatch) -> tuple[ar.AutoResponder, List[tuple]]:
-        recorded: List[tuple] = []
+    def _responder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> "tuple[ar.AutoResponder, List[DecisionCall]]":
+        recorded: List[DecisionCall] = []
         monkeypatch.setattr(
             ar.AutoResponder,
             "_log_decision",
