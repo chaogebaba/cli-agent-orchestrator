@@ -570,6 +570,7 @@ async def test_quiesce_wins_after_ready_sync_call_starts(
     entered = threading.Event()
     release = threading.Event()
     ticks = 0
+    last_tick = 0.0
     provider = SimpleNamespace(
         initialize=AsyncMock(),
         supports_reauth_rebind=False,
@@ -585,9 +586,13 @@ async def test_quiesce_wins_after_ready_sync_call_starts(
         release.wait()
 
     async def ticker():
-        nonlocal ticks
+        # ``last_tick`` is what makes this a liveness probe rather than a
+        # stopwatch: a count alone cannot tell "the loop ran throughout the wait"
+        # from "the loop ran at the start of the wait and then stopped".
+        nonlocal ticks, last_tick
         while not release.is_set():
             ticks += 1
+            last_tick = time.monotonic()
             await asyncio.sleep(0.001)
 
     event.listen(sessions.class_, "before_commit", before_commit)
@@ -607,9 +612,22 @@ async def test_quiesce_wins_after_ready_sync_call_starts(
     assert await asyncio.to_thread(entered.wait, 1)
     ticking = asyncio.create_task(ticker())
     started = time.monotonic()
+    # 0.2 s, not 0.02 s: the tick assertions below count 1 ms ticker wakeups, so
+    # the budget has to be long enough that a starved process still gets several.
+    # At 20 ms it was not — the window held exactly one tick under ``-n 2`` on a
+    # loaded box and the test failed with ``assert 1 >= 3`` at 0.14 s wall, i.e.
+    # no hang, one scheduling slice (grok-box-004, full-suite run 2 of 5 at main
+    # 9b93dd24; the other four runs passed, and it was the only test that moved
+    # across those five runs). The branch under test does not depend on the
+    # budget: the commit is held by ``before_commit`` until ``release``, so
+    # quiesce times out however long it waits.
     with pytest.raises(RuntimeError, match="deferred_task_quiesce_timeout"):
-        await terminals.quiesce_deferred_terminal("inverse-ready", timeout_s=0.02)
+        await terminals.quiesce_deferred_terminal("inverse-ready", timeout_s=0.2)
     elapsed = time.monotonic() - started
+    # Snapshot before ``release`` is set, so the ticker's post-quiesce wakeups
+    # cannot be mistaken for liveness during the wait.
+    ticks_in_wait = ticks
+    last_tick_in_wait = last_tick
     assert (
         terminals._deferred_tasks_by_terminal["inverse-ready"].current_call.ready_winner
         == "timeout"
@@ -618,8 +636,29 @@ async def test_quiesce_wins_after_ready_sync_call_starts(
     await ticking
     await asyncio.sleep(0.03)
 
-    assert elapsed < 0.1
-    assert ticks >= 3
+    assert elapsed < 0.5
+    assert ticks_in_wait >= 3
+    # The count alone is not the claim, and on its own it is not even load-bearing:
+    # quiesce awaits ``wait_for(shield(record.task), remaining)`` BEFORE it reaches
+    # its polling loop, so a quiesce that yields there and then blocks the loop
+    # outright for the rest of the budget banks its three wakeups and passes.
+    # Reproduced deliberately (mutant M1b: ``await asyncio.sleep(0.05)`` in front of
+    # a blocking polling loop) — 5/5 pass against the count alone, 5/5 fail against
+    # the assertion below. The EMPIRICAL gate hit the same hole from the other
+    # side, reporting the plain blocking-``time.sleep`` mutant as a survivor under
+    # its pinned load (r1 B3, 2026-09-05); that plain form dies here at every load
+    # tried, which is precisely why the count is not something to rely on.
+    #
+    # So assert WHEN the last wakeup landed, not just how many there were: the
+    # loop has to still be live near the end of the wait. This is a ratio of the
+    # measured elapsed time, not an absolute bound, so a host that stretches the
+    # whole window stretches the threshold with it — while a loop that goes dead
+    # partway through fails no matter how slow the host is. Under the mutant the
+    # final wakeup lands during that opening await and nothing ticks afterwards.
+    assert last_tick_in_wait >= started + 0.5 * elapsed, (
+        f"event loop went dead mid-quiesce: last tick at "
+        f"{last_tick_in_wait - started:.4f}s of a {elapsed:.4f}s wait"
+    )
     assert db.get_terminal_metadata("inverse-ready")["init_state"] == "init_pending"
     event.remove(sessions.class_, "before_commit", before_commit)
 
