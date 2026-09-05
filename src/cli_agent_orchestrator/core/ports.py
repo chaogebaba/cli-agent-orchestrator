@@ -511,6 +511,49 @@ class QueueStore(Protocol):
         """Retention over the queue's tables, keeping open digests and evidence."""
         ...
 
+    # -- the write-through (§6) ---------------------------------------------
+
+    def next_surrogate_id(self) -> int:
+        """The integer handle a write-through row carries instead of an inbox id.
+
+        §6 makes the legacy inbox read-only at ``on``, so no ``inbox`` row is
+        written and its autoincrement never advances — while the public surface
+        stays integer-keyed. The floor is the high-water of BOTH tables, so a
+        surrogate can never collide with a historical inbox id and an
+        ``ack_messages`` cursor cannot settle across the boundary between the two
+        eras.
+        """
+        ...
+
+    def find_recent_duplicate(
+        self,
+        *,
+        sender_id: str,
+        receiver_id: str,
+        content_hash: str,
+        window_s: int,
+        now: datetime,
+        park_warm: bool = False,
+        barrier_id: int | None = None,
+    ) -> QueueMessage | None:
+        """D13's F475 window check, with all five conjuncts.
+
+        Carried rather than approximated: at ``on`` the legacy predicate scans an
+        inbox nothing writes any more, and the queue's ``idempotency_key``
+        constraint has neither the window nor any conjunct.
+        """
+        ...
+
+    def pending_for_receiver(
+        self, receiver_id: str, *, after_id: int = 0, limit: int = 25
+    ) -> list[QueueMessage]:
+        """The receiver's undelivered live rows, in surrogate-id order (§5b)."""
+        ...
+
+    def settle_through(self, receiver_id: str, *, up_to_id: int, now: datetime) -> tuple[str, ...]:
+        """Settle rows at or below the seat's ack cursor; returns the ids (§5b)."""
+        ...
+
 
 @runtime_checkable
 class ReceiverDirectory(Protocol):

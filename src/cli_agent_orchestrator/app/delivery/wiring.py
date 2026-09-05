@@ -39,8 +39,14 @@ from dataclasses import dataclass
 
 from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue, LegacyOutcome, LegacyVeto
 from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
-from cli_agent_orchestrator.core.delivery import QueueMode, SwitchPosition
+from cli_agent_orchestrator.core.delivery import (
+    EnqueueDraft,
+    MsgKind,
+    QueueMode,
+    SwitchPosition,
+)
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
+from cli_agent_orchestrator.core.timing import DELIVERY_DEDUP_WINDOW_S
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,7 @@ __all__ = [
     "record_outcome",
     "record_veto",
     "reset_delivery",
+    "write_through",
 ]
 
 #: How many hook failures are logged with a traceback before the logger falls
@@ -156,26 +163,31 @@ def queue_owns_new_traffic() -> bool:
 
 
 def record_enqueue(fact: LegacyEnqueue) -> None:
-    """Write the queue row for one committed legacy insert.
+    """Mirror one committed legacy insert as a SHADOW row (3a's hook).
 
-    ``mode`` follows the position: ``shadow`` observes, ``live`` is served by the
-    tick.  At ``drain`` nothing is written at all, because ``drain`` accepts no
-    new queue rows.
+    Sub-phase 3a's observational copy, and it stays exactly that. Two positions
+    write nothing at all:
+
+    * ``drain`` accepts no new queue rows — that is the position's whole point,
+      since it empties on its own budget while new traffic goes back to the
+      legacy inbox (§6);
+    * ``on`` has no legacy insert to mirror. There the queue is the AUTHORITY and
+      :func:`write_through` is what wrote the row, before the caller reached its
+      own insert. Mirroring here as well would produce the second row for one
+      message that §6 excludes as a fifth carrier — the exact defect the flip is
+      supposed to remove.
 
     Returns ``None`` always, and callers in legacy code are written to ignore it.
-    Handing back the minted ``msg_id`` was considered and rejected: a legacy
-    caller with a queue id in its hand is a caller that can come to depend on
-    one.
     """
     runtime = _runtime
     if runtime is None:
         return
-    position = runtime.position
-    if position is SwitchPosition.DRAIN:
+    if runtime.position in (SwitchPosition.DRAIN, SwitchPosition.ON):
         return
-    mode = QueueMode.LIVE if position is SwitchPosition.ON else QueueMode.SHADOW
     _guarded(
-        lambda: runtime.mirror.enqueue(fact, mode=mode), "enqueue", str(fact.legacy_message_id)
+        lambda: runtime.mirror.enqueue(fact, mode=QueueMode.SHADOW),
+        "enqueue",
+        str(fact.legacy_message_id),
     )
 
 
@@ -203,6 +215,80 @@ def record_veto(fact: LegacyVeto) -> None:
         "veto",
         ",".join(str(mid) for mid in fact.legacy_message_ids),
     )
+
+
+def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
+    """Enqueue new traffic into the QUEUE instead of the legacy inbox (§6).
+
+    Returns ``(surrogate_id, msg_id)``, or ``None`` when the queue does not own
+    new traffic — in which case the caller writes its legacy row exactly as it
+    does today.
+
+    This is the flip §6 describes: "the legacy inbox goes read-only: it stops
+    accepting inserts, existing rows drain through the old path, and new rows go
+    to ``delivery_msg``". Sub-phase 3a's ``record_enqueue`` mirror still exists
+    and still runs at ``shadow``; the difference here is authority, so the two
+    are deliberately separate functions rather than one with a mode flag.
+
+    Dual-write is excluded, and the reason is in the same paragraph: a
+    dual-written row is a fifth carrier and would reproduce #506 inside the fix.
+
+    **D13's carried effects that are NOT here happen in the caller**, because
+    they operate on the barrier tables and the legacy predicate has to see them
+    in its own transaction: the dispatch-barrier attach, the open-barrier
+    association, the late-callback rewrite and the F578 supersession. What IS
+    here is the F475 window check, because at ``on`` there is no legacy row for
+    the legacy predicate to find.
+
+    Never raises into the caller: a queue that cannot be written returns
+    ``None``, and the caller writes its legacy row. That degrades to the
+    pre-flip behaviour rather than losing the message.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is not SwitchPosition.ON:
+        return None
+    try:
+        now = runtime.clock.now()
+        duplicate = runtime.store.find_recent_duplicate(
+            sender_id=fact.sender_id,
+            receiver_id=fact.receiver_id,
+            content_hash=fact.content_hash or "",
+            window_s=DELIVERY_DEDUP_WINDOW_S,
+            now=now,
+            park_warm=fact.park_warm,
+            barrier_id=fact.barrier_id,
+        )
+        if duplicate is not None and duplicate.legacy_message_id is not None:
+            # A suppressed duplicate returns the EXISTING row, which is what the
+            # legacy path returns today — never a fabricated id.
+            return int(duplicate.legacy_message_id), duplicate.msg_id
+
+        surrogate = runtime.store.next_surrogate_id()
+        message = runtime.store.enqueue(
+            EnqueueDraft(
+                idempotency_key=f"live-inbox:{surrogate}",
+                receiver_id=fact.receiver_id,
+                sender_id=fact.sender_id,
+                kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
+                payload=fact.message,
+                mode=QueueMode.LIVE,
+                expire_after_s=fact.expire_after_s,
+                supersede_key=fact.supersede_key,
+                content_hash=fact.content_hash,
+                park_warm=fact.park_warm,
+                barrier_id=fact.barrier_id,
+                barrier_member_key=fact.barrier_member_key,
+                enqueue_generation=fact.enqueue_generation,
+                legacy_message_id=surrogate,
+            )
+        )
+        return surrogate, message.msg_id
+    except Exception:  # noqa: BLE001 — a queue write may never break a send
+        logger.warning(
+            "delivery write-through failed; the caller falls back to the legacy insert",
+            exc_info=True,
+        )
+        return None
 
 
 def record_completion(receiver_id: str) -> tuple[str, ...]:

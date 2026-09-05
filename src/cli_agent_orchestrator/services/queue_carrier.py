@@ -29,6 +29,7 @@ would be the place an unclassified string acquired a bound by accident.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Optional
 
 from cli_agent_orchestrator.core.delivery import (
@@ -42,10 +43,76 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "LegacyReceiverDirectory",
+    "forget_terminal_status",
+    "note_terminal_status",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
     "queue_owns_delivery",
 ]
+
+
+#: Per-terminal last latched status, for D8's completion EDGE.
+#:
+#: The status egress fires on every publish, and D8 is explicit that the cancel
+#: is "evaluated once per completion EVENT, not as a standing predicate over
+#: ``ready`` rows" — that is what keeps its limit true, since a steer reclaimed
+#: to ``ready`` after the completion must NOT be retroactively cancelled. So the
+#: edge is detected here rather than by re-running the rule on every tick.
+_last_status: dict[str, str] = {}
+_status_lock = threading.Lock()
+
+#: The latched statuses that mean the receiver finished its work.
+_COMPLETION_STATUSES = frozenset({"completed"})
+
+
+def note_terminal_status(terminal_id: str, latched_status: object) -> None:
+    """D8's trigger: a receiver's own completion cancels its flagged steers.
+
+    Called from the single status egress every origin passes through, so there is
+    one trigger rather than one per producer.
+
+    ``supersede_key`` handles the same-mailbox case at enqueue and does NOT reach
+    #435, where the aged steer is addressed to the WORKER and the completion
+    callback to the supervisor — no newer row ever lands in the worker's mailbox,
+    so nothing supersedes the steer. The receiver's own completion is the event
+    that does reach it.
+
+    Edge-triggered and fail-silent: a completion that cannot cancel is logged and
+    the rows die on their own budget, which is a bounded ending rather than a
+    stalled one.
+    """
+    status = str(getattr(latched_status, "value", latched_status) or "").lower()
+    if not terminal_id:
+        return
+    with _status_lock:
+        previous = _last_status.get(terminal_id)
+        _last_status[terminal_id] = status
+    if status not in _COMPLETION_STATUSES or previous == status:
+        return
+
+    try:
+        from cli_agent_orchestrator.app.delivery.wiring import record_completion
+        from cli_agent_orchestrator.clients.database import SessionLocal, resolve_inbox_receiver
+
+        with SessionLocal() as db:
+            _cache, mailbox_id, _generation = resolve_inbox_receiver(db, terminal_id)
+        receiver = mailbox_id or terminal_id
+        cancelled = record_completion(receiver)
+        if cancelled:
+            logger.info(
+                "d8 completion-cancel terminal=%s receiver=%s cancelled=%d",
+                terminal_id,
+                receiver,
+                len(cancelled),
+            )
+    except Exception:  # noqa: BLE001 — a cancel may never break a status publish
+        logger.debug("d8 completion-cancel failed for %s", terminal_id, exc_info=True)
+
+
+def forget_terminal_status(terminal_id: str) -> None:
+    """Drop a reaped terminal's edge memory, so the map cannot grow unbounded."""
+    with _status_lock:
+        _last_status.pop(terminal_id, None)
 
 
 def queue_owns_delivery() -> bool:

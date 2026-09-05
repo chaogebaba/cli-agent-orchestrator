@@ -462,7 +462,19 @@ def test_probe_03_paste_fence_serializes_and_generation_race_requeues_to_success
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
+        "WP-ARCH 3b / A1.5: the PROBED BEHAVIOUR is gone for this receiver, not "
+        "merely its observation point. This probe opens a real delivery ATTEMPT, "
+        "pauses inside attempt-scoped mailbox-authority revalidation "
+        "(get_attempt_mailbox_authority), forces a generation change, and asserts "
+        "the attempt is interrupted and the row parked against the old "
+        "incarnation. A supervisor receiver no longer takes the paste path at "
+        "all, so it opens no inbox_delivery_attempt row and there is no "
+        "attempt-scoped revalidation to interrupt — the seat's surviving delivery "
+        "revalidates authority inside claim_unnotified_wake/commit_wake, which "
+        "probe 12 and the publication probe now cover between them. The two "
+        "sibling probes were REWRITTEN because their subjects survived; this "
+        "one's did not. strict=True so a future edit that restores the seat's "
+        "attempt path turns this red rather than passing quietly."
     ),
 )
 def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_successor(
@@ -505,89 +517,77 @@ def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_succe
         assert (delivered.status, delivered.receiver_id) == ("parked", "11111111")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
-    ),
-)
-def test_probe_03_publication_waits_until_actual_paste_releases_authority(
+def test_probe_03_publication_cannot_steal_the_mailbox_from_an_inflight_wake(
     scratch_db,
+    monkeypatch,
 ):
+    """A publication racing an in-flight delivery cannot make it deliver stale.
+
+    WP-ARCH 3b / A1.5 changes how this safety is EXPRESSED, not whether it holds.
+
+    The original probe blocked inside a paste and asserted that publication
+    WAITED for it: the paste was a long critical section held under the mailbox
+    authority lock, so a racing publication simply queued behind it. A supervisor
+    receiver no longer takes the paste path, and the seat's surviving delivery
+    holds authority only for the short claim/commit window — so publication is no
+    longer made to wait.
+
+    What must still be true is the property the waiting existed to guarantee: a
+    delivery that claimed against generation N does not go on to emit after
+    generation N+1 has been published. In the surviving path the commit is what
+    catches it, and the delivery LOSES rather than waits.
+
+    So the race is driven at the same point and the assertion follows the
+    mechanism: publish between the claim and the commit, then require that the
+    delivery emitted nothing and the row is still pending for the successor.
+    """
     with scratch_db.begin() as db:
         mailbox(db)
         terminal(db, "11111111")
         terminal(db, "22222222")
         row = inbox(db, "11111111", logical="mb_aaaaaaaa")
     claim = claim_mailbox("cao-wave3b")
-    paste_entered = threading.Event()
-    allow_paste_return = threading.Event()
-    publication_done = threading.Event()
-    pasted: list[str] = []
-    observation = BoundaryObservation("wave3b-epoch", TerminalStatus.IDLE, 3, 1, 4, 2, 4)
-    provider = MagicMock()
-    provider.read_composer_draft_state.return_value = "empty"
-    resolution = TranscriptResolution(
-        Path("/trace"), "binding", TranscriptLiveReference(Path("/trace"), 1, 0)
-    )
+    claimed = threading.Event()
+    allow_commit = threading.Event()
+    outcomes: list[object] = []
 
-    def paste(target, _wire, **kwargs):
-        pasted.append(target)
-        paste_entered.set()
-        assert allow_paste_return.wait(2)
-        kwargs["on_submitted"](observation)
-        return observation
+    import cli_agent_orchestrator.clients.database as _db_mod
 
-    def publish():
-        publish_supervisor_incarnation(claim, "22222222")
-        publication_done.set()
+    original_claim = _db_mod.claim_unnotified_wake
 
-    with (
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
-            return_value=provider,
-        ),
-        patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
-            return_value=resolution,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
-            side_effect=lambda _target, value, _kind: value,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
-            side_effect=paste,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
-            return_value=("unverified", {"kind": "test-confirmation"}),
-        ),
-        patch.object(InboxService, "_commit_watchdog_ops"),
-    ):
-        monitor.get_boundary_observation.return_value = observation
-        monitor.get_status.return_value = TerminalStatus.IDLE
-        monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
-        monitor.probe_screen_status.return_value = (
-            TerminalStatus.IDLE,
-            {"result_status": "idle", "law_signal": {"class": "chrome"}},
-        )
-        delivery_thread = threading.Thread(
-            target=InboxService().deliver_pending, args=("11111111",)
-        )
-        delivery_thread.start()
-        assert paste_entered.wait(2)
-        publication_thread = threading.Thread(target=publish)
-        publication_thread.start()
-        assert not publication_done.wait(0.05)
-        allow_paste_return.set()
-        delivery_thread.join(2)
-        publication_thread.join(2)
-    assert not delivery_thread.is_alive() and not publication_thread.is_alive()
-    assert pasted == ["11111111"]
-    assert get_message_trace(row.id)["message"]["status"] == "delivered"
+    def pause_between_claim_and_commit(*args, **kwargs):
+        result = original_claim(*args, **kwargs)
+        claimed.set()
+        assert allow_commit.wait(2)
+        return result
+
+    monkeypatch.setattr(_db_mod, "claim_unnotified_wake", pause_between_claim_and_commit)
+
+    def deliver():
+        outcomes.append(InboxService()._f136_run_callback_delivery("11111111"))
+
+    delivery_thread = threading.Thread(target=deliver)
+    delivery_thread.start()
+    assert claimed.wait(2), "the delivery never reached its claim"
+
+    # The successor is published while the delivery is mid-flight.
+    publish_supervisor_incarnation(claim, "22222222")
+    allow_commit.set()
+    delivery_thread.join(2)
+
+    assert not delivery_thread.is_alive()
+    assert outcomes, "the delivery thread produced no outcome"
+    outcome = outcomes[0]
+    assert outcome.written == 0, "a delivery that lost its generation must emit nothing"
+    # PARKED, not pending: publishing the successor parks the predecessor's
+    # undelivered rows against the incarnation they were addressed to, which is
+    # the same ending the sibling probe asserts. The point is that the row was
+    # neither delivered to the stale incarnation nor lost.
+    trace = get_message_trace(row.id)
+    assert trace["message"]["status"] == "parked"
     with scratch_db() as db:
+        parked = db.get(InboxModel, row.id)
+        assert parked.receiver_id == "11111111"
         assert db.get(MailboxModel, "mb_aaaaaaaa").current_terminal_id == "22222222"
 
 
@@ -1230,13 +1230,19 @@ def test_probe_12_publication_cleanup_failure_keeps_typed_original_cause(
     assert caught.value.cause_message == "original conflict"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
-    ),
-)
 def test_probe_12_sender_lock_timeout_interrupts_and_requeues(scratch_db, monkeypatch):
+    """Authority contention still interrupts a seat delivery and requeues it.
+
+    WP-ARCH 3b / A1.5 moves the OBSERVABLE, not the behaviour. A supervisor
+    receiver no longer takes the paste path, so it opens no
+    ``inbox_delivery_attempt`` row and there is no attempt outcome to read. What
+    survives — and what this probe is actually about — is that a delivery which
+    cannot take the mailbox authority lock does NOT deliver, does not consume the
+    row, and leaves it pending for the next wake.
+
+    So the assertion moves from the attempt table to the runner's own typed
+    outcome, which is the seat path's equivalent record.
+    """
     with scratch_db.begin() as db:
         mailbox(db)
         terminal(db, "11111111")
@@ -1245,13 +1251,14 @@ def test_probe_12_sender_lock_timeout_interrupts_and_requeues(scratch_db, monkey
     lock.acquire()
     monkeypatch.setattr(mailbox_service, "MAILBOX_AUTHORITY_TIMEOUT_SECONDS", 0.01)
     try:
-        assert deliver_with_real_attempt(monkeypatch, "11111111") == []
+        outcome = InboxService()._f136_run_callback_delivery("11111111")
     finally:
         lock.release()
+
+    assert outcome.reason == "authority_lock_contention"
+    assert outcome.written == 0, "a contended delivery emits nothing"
     trace = get_message_trace(row.id)
-    assert trace["message"]["status"] == "pending"
-    assert trace["attempts"][-1]["outcome"] == "interrupted"
-    assert trace["attempts"][-1]["reason"] == "mailbox_authority_timeout"
+    assert trace["message"]["status"] == "pending", "and the row is requeued, not consumed"
 
 
 def test_probe_12_attempt_open_racing_delete_serializes_behind_begin_immediate(

@@ -925,22 +925,42 @@ class InboxService:
                 terminal_id=terminal_id,
                 generation=generation,
             )
-            if not healed:
-                return CallbackRunOutcome(
-                    reason="no_path",
-                    retry_delay_s=_get_backoff_delay(terminal_id),
-                    retryable_failure_count=1,
-                )
-            # Re-read inbox path after heal
-            with SessionLocal() as db:
-                mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
-                inbox_path_str = mb.cc_inbox_path if mb else None
-            if not inbox_path_str:
-                return CallbackRunOutcome(
-                    reason="no_path",
-                    retry_delay_s=_get_backoff_delay(terminal_id),
-                    retryable_failure_count=1,
-                )
+            if healed:
+                # Re-read inbox path after heal
+                with SessionLocal() as db:
+                    mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+                    inbox_path_str = mb.cc_inbox_path if mb else None
+
+        # WP-ARCH 3b / A1.5: a missing CC inbox path is no longer a REFUSAL.
+        #
+        # ``cc_inbox_path`` is K2's on-disk ``team-lead.json`` — the pull-mode
+        # CONTENT channel — and it is configured only when ``supervisor.mailbox_pull``
+        # is on. A1.5 keeps that flag at its shipped ``False``, because the seat's
+        # paste ban no longer depends on it. So on a default deployment a
+        # supervisor mailbox has no path, and returning ``no_path`` here left
+        # ``written`` at zero, which left ``_f136_post_delivery``'s
+        # ``outcome.written > 0`` gate shut and the doorbell silent.
+        #
+        # That is the whole of the shadow failure: the role gate routes the seat
+        # here, this returned ``no_path``, and the seat was NEITHER pasted NOR
+        # woken — #604 arriving through the amendment written to end it. A1.5
+        # says the carrier in the three non-``on`` positions IS this chain into
+        # ``ring_supervisor_doorbell``, so the chain has to reach it.
+        #
+        # The cursor is what matters and it is kept: ``claim_unnotified_wake``
+        # and ``commit_wake`` still run, so an acked or aged id is still gated
+        # and #388 stays closed. What is dropped when there is no path is only
+        # the FILE — which D6 deletes as K2 anyway, and which A1 replaces with
+        # the seat draining ids by ``list_messages``/``ack_messages``.
+        content_channel = bool(inbox_path_str)
+        if not content_channel:
+            logger.info(
+                "f136 wake without a content channel terminal=%s mailbox=%s: "
+                "no cc_inbox_path (supervisor.mailbox_pull is off), so the wake "
+                "carries ids and the seat drains bodies by ack",
+                terminal_id,
+                mailbox_id,
+            )
 
         # D10: acquire delivery_lock (authority lock is inside claim/commit)
         delivery_lock = get_delivery_lock(terminal_id)
@@ -1045,7 +1065,7 @@ class InboxService:
                 )
 
             # F476 D3: EMIT — write CC inbox entries AFTER commit
-            inbox_path = Path(os.path.expanduser(inbox_path_str))
+            inbox_path = Path(os.path.expanduser(inbox_path_str)) if content_channel else None
             deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
             written = 0
             _max_written_row_id = 0
@@ -1055,6 +1075,19 @@ class InboxService:
             for row in claim.rows:
                 if time.monotonic() >= deadline_mono:
                     break
+
+                if not content_channel:
+                    # WP-ARCH 3b / A1.5: no K2 file, and the row is still
+                    # WAKE-ELIGIBLE. ``written`` is the doorbell's gate, not a
+                    # count of files, and the cursor above has already decided
+                    # this id is unacked and unaged. The body is deliberately
+                    # NOT carried: A1's wake is ids and a count, and #613's
+                    # first observation was a full body riding the native
+                    # message, which the context-hygiene rule files as a defect.
+                    written += 1
+                    if row.inbox_row_id > _max_written_row_id:
+                        _max_written_row_id = row.inbox_row_id
+                    continue
 
                 msg = InboxMessage(
                     id=row.inbox_row_id,

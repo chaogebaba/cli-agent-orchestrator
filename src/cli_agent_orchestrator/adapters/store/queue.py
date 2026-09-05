@@ -996,6 +996,130 @@ class SqliteQueueStore:
                 cancelled.append(msg_id)
         return tuple(cancelled)
 
+    def next_surrogate_id(self) -> int:
+        """The integer handle a write-through row carries in place of an inbox id.
+
+        §6 makes the legacy inbox READ-ONLY from the flip, so at ``on`` no
+        ``inbox_messages`` row is written and its autoincrement never advances.
+        The public surface is still integer-keyed — ``message_id`` in the HTTP
+        response, ``up_to_id`` in ``ack_messages``, ``member.message_id`` on a
+        barrier — so the queue mints the integer instead, and stores it in
+        ``legacy_message_id`` where ``cao diag`` and the mirror already look.
+
+        The floor is ``MAX`` over BOTH tables. Taking only the queue's own column
+        would hand out an id a historical inbox row already used, and an
+        ``ack_messages(up_to_id=N)`` would then settle across the boundary
+        between the two eras. Allocated inside the caller's transaction, which is
+        the single writer.
+        """
+        conn = self._pool.connection()
+        high = 0
+        row = conn.execute("SELECT MAX(legacy_message_id) AS v FROM delivery_msg").fetchone()
+        if row is not None and row["v"] is not None:
+            high = int(row["v"])
+        try:
+            # The legacy table shares this file but belongs to the other tree, so
+            # it is read defensively: a deployment whose inbox has not been
+            # created yet is a valid state, and the queue's own high-water is
+            # then the whole floor.
+            legacy = conn.execute("SELECT MAX(id) AS v FROM inbox").fetchone()
+        except sqlite3.Error:
+            legacy = None
+        if legacy is not None and legacy["v"] is not None:
+            high = max(high, int(legacy["v"]))
+        return high + 1
+
+    def find_recent_duplicate(
+        self,
+        *,
+        sender_id: str,
+        receiver_id: str,
+        content_hash: str,
+        window_s: int,
+        now: datetime,
+        park_warm: bool = False,
+        barrier_id: int | None = None,
+    ) -> QueueMessage | None:
+        """D13's F475 window check, reproduced with all five conjuncts.
+
+        Same sender, same receiver, matching content hash, ``park_warm`` not true
+        and ``barrier_id`` null, inside a rolling window. Reproduced rather than
+        approximated because the legacy predicate is what decides how many
+        messages are delivered, and the queue's ``idempotency_key`` constraint
+        has neither the window nor any conjunct: two identical sends more than a
+        minute apart are ordinary traffic here and must both land.
+
+        Returns the existing row so the caller can hand it back, which is what
+        legacy returns today — never a fabricated success id for a message that
+        was not enqueued.
+        """
+        if park_warm or barrier_id is not None or not content_hash:
+            return None
+        cutoff = render_timestamp(datetime.fromtimestamp(now.timestamp() - window_s, tz=UTC))
+        row = (
+            self._pool.connection()
+            .execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
+                "WHERE sender_id = ? AND receiver_id = ? AND content_hash = ? "
+                "AND created_at >= ? AND park_warm = 0 AND barrier_id IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (sender_id, receiver_id, content_hash, cutoff),
+            )
+            .fetchone()
+        )
+        return None if row is None else _row_to_message(row)
+
+    def pending_for_receiver(
+        self, receiver_id: str, *, after_id: int = 0, limit: int = 25
+    ) -> list[QueueMessage]:
+        """The receiver's undelivered live rows, in surrogate-id order.
+
+        What ``list_messages`` serves from once the queue owns new traffic. The
+        ordering and the ``after_id`` cursor are the legacy call's, so the seat's
+        drain loop is unchanged on the other side of the flip.
+        """
+        rows = (
+            self._pool.connection()
+            .execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE receiver_id = ? "
+                "AND mode = 'live' AND state IN ('ready', 'leased') "
+                "AND legacy_message_id > ? "
+                "ORDER BY legacy_message_id LIMIT ?",
+                (receiver_id, int(after_id), int(limit)),
+            )
+            .fetchall()
+        )
+        return [_row_to_message(row) for row in rows]
+
+    def settle_through(self, receiver_id: str, *, up_to_id: int, now: datetime) -> tuple[str, ...]:
+        """Mark the receiver's rows delivered up to a surrogate id (§5b's ack).
+
+        The cursor semantics are legacy's, unchanged: everything at or below the
+        id the seat names is settled, and the digest stamp is the caller's to
+        write. Returns the ids settled so the caller can close the covering
+        epoch with ``consumed_via='mcp_ack'``.
+        """
+        conn = self._pool.connection()
+        stamp = render_timestamp(now)
+        settled: list[str] = []
+        with immediate_transaction(conn):
+            rows = conn.execute(
+                "SELECT msg_id FROM delivery_msg WHERE receiver_id = ? AND mode = 'live' "
+                "AND legacy_message_id IS NOT NULL AND legacy_message_id <= ? "
+                f"AND state NOT IN ({','.join('?' for _ in _TERMINAL_VALUES)})",
+                (receiver_id, int(up_to_id), *_TERMINAL_VALUES),
+            ).fetchall()
+            for row in rows:
+                msg_id = str(row["msg_id"])
+                conn.execute(
+                    "UPDATE delivery_msg SET state = 'delivered', terminated_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL, held_since = NULL "
+                    "WHERE msg_id = ?",
+                    (stamp, msg_id),
+                )
+                settled.append(msg_id)
+        return tuple(settled)
+
     def prune(self, *, now: datetime, protected: frozenset[str] = frozenset()) -> int:
         """Retention over the new tables (§13d), returning rows removed.
 
