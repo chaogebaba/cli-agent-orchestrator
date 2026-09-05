@@ -37,7 +37,12 @@ import logging
 import threading
 from dataclasses import dataclass
 
-from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue, LegacyOutcome, LegacyVeto
+from cli_agent_orchestrator.app.delivery.facts import (
+    LegacyEnqueue,
+    LegacyOutcome,
+    LegacySeatWake,
+    LegacyVeto,
+)
 from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 from cli_agent_orchestrator.core.delivery import (
     EnqueueDraft,
@@ -61,6 +66,7 @@ __all__ = [
     "record_completion",
     "record_enqueue",
     "record_outcome",
+    "record_seat_wake",
     "record_veto",
     "reset_delivery",
     "write_through",
@@ -203,6 +209,29 @@ def record_outcome(fact: LegacyOutcome) -> None:
     if runtime is None or runtime.position is SwitchPosition.ON:
         return
     _guarded(lambda: runtime.mirror.observe(fact), "outcome", str(fact.legacy_message_id))
+
+
+def record_seat_wake(fact: LegacySeatWake) -> None:
+    """Record the attempt row for one native seat wake legacy emitted (§A1.5).
+
+    ``off``, ``shadow`` and ``drain`` are the positions where the F136 chain IS
+    the seat's carrier, and this is what puts that emission on the record. At
+    ``on`` it is inert twice over: the doorbell is muted there (D6/K3) so nothing
+    calls this, and the tick's own attempt rows are the authority for a live row
+    (I5) — a legacy edge writing one would give a single id two authorities,
+    which is the defect D13 scopes the legacy ledger out for.
+
+    Inert at ``off`` by construction rather than by a position test: nothing is
+    installed there, so there is no shadow row to file an attempt against.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is SwitchPosition.ON:
+        return
+    _guarded(
+        lambda: runtime.mirror.observe_seat_wake(fact),
+        "seat_wake",
+        str(fact.legacy_message_id),
+    )
 
 
 def record_veto(fact: LegacyVeto) -> None:

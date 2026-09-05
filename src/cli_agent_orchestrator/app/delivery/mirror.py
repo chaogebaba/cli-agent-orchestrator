@@ -33,9 +33,11 @@ from cli_agent_orchestrator.app.delivery.facts import (
     LegacyAttempt,
     LegacyEnqueue,
     LegacyOutcome,
+    LegacySeatWake,
     LegacyVeto,
 )
 from cli_agent_orchestrator.core.delivery import (
+    CARRIER_SEAT_WAKE,
     AttemptOutcome,
     DeadReason,
     DeliveryAttempt,
@@ -156,6 +158,17 @@ VETO_OUTCOME_MAP: dict[str, AttemptOutcome] = {
 #: under re-observation, since the value is derived from the veto's own instant
 #: rather than from a sequence.
 _VETO_CLAIM_ID = -1
+
+#: Where a legacy seat wake's attempt row is filed.
+#:
+#: Same shape as the veto's and for the same reason — a doorbell ring carries no
+#: legacy attempt ordinal, since it opens no ``inbox_delivery_attempt`` row at
+#: all — and it may share the veto's arithmetic safely because the attempt key is
+#: ``(msg_id, claim_id, carrier)`` and this row's carrier is ``seat_wake``, which
+#: no other producer here writes. Derived from the emission's own instant, so a
+#: re-observation of one ring converges on one row while a genuinely later ring
+#: is a second attempt, which is what it is.
+_SEAT_WAKE_CLAIM_ID = -1
 
 
 class MirrorWriter:
@@ -284,6 +297,34 @@ class MirrorWriter:
                     detail=detail,
                 ),
             )
+
+    def observe_seat_wake(self, wake: LegacySeatWake) -> None:
+        """Record the ``delivery_attempt`` row for one emitted legacy seat wake.
+
+        The row is NOT advanced. A wake is an emission, not a settlement: the
+        seat consumes its ids through ``list_messages``/``ack_messages`` and the
+        legacy status edge is what ends the message, observed by :meth:`observe`.
+        Settling here would report a delivery the seat has not made yet.
+
+        Unlike :meth:`observe_veto` this records against a terminal row too. The
+        veto skips one because a refusal after the ending is noise; an emission
+        after it is a FACT — the carrier really did write those bytes — and
+        hiding it would leave exactly the gap this method exists to close.
+        """
+        message = self._lookup(wake.legacy_message_id)
+        if message is None:
+            return
+        self._safely(
+            self._store.record_attempt,
+            DeliveryAttempt(
+                msg_id=message.msg_id,
+                claim_id=_SEAT_WAKE_CLAIM_ID - int(wake.at.timestamp()),
+                carrier=CARRIER_SEAT_WAKE,
+                started_at=wake.at,
+                outcome=AttemptOutcome.DELIVERED,
+                detail=wake.detail or "legacy seat wake",
+            ),
+        )
 
     # -- internals ----------------------------------------------------------
 

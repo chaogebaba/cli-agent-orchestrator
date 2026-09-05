@@ -725,3 +725,161 @@ def test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery(flip_env
     # seat, because there it is still part of the legacy chain.
     install(SwitchPosition.SHADOW)
     assert seat_wake_reconcile._queue_owns_delivery() is False
+
+
+# ---------------------------------------------------------------------------
+# I5 — an emission the stored rows cannot see is the failure I5 exists to end.
+#
+# The r2 gate's blocker: at the exact head the shadow live arm wrote 500 bytes
+# to the seat's socket, left the pane byte-identical, and recorded
+# `delivery_attempt=0`. The carrier fired and `cao diag <msg_id>` said nothing
+# was ever attempted, which is the pane archaeology #604 was diagnosed through.
+#
+# This case drives the PRODUCTION chain — the real `_f136_post_delivery`, the
+# real `ring_supervisor_doorbell`, the real `_attempt_native_ring` — and stubs
+# only the socket itself, so it fails if either the attempt insert or the
+# emission is removed.
+# ---------------------------------------------------------------------------
+
+
+class _SocketCapture:
+    """Stands in for the seat's Unix socket, and for nothing else."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+
+    def write(self, socket_path: str, payload: str, auth_token: Any = None) -> None:
+        self.writes.append((socket_path, payload))
+        return None
+
+
+def _registry_record() -> Any:
+    from cli_agent_orchestrator.services.cc_session_registry import RegistryRecord
+
+    return RegistryRecord(
+        pid=4242,
+        session_id="sess-p3b",
+        cwd="/tmp/p3b",
+        tmux=f"cao-p3b:{SEAT_TERMINAL}.%1",
+        version="2.1.5",
+        peer_protocol=1,
+        messaging_socket_path="/run/p3b/seat.sock",
+        proc_start=99,
+        status="idle",
+        status_updated_at="2026-09-05T00:00:00Z",
+        updated_at="2026-09-05T00:00:00Z",
+        raw={},
+    )
+
+
+def _drive_shadow_production(capture: _SocketCapture, pastes: list[str]) -> None:
+    """One real delivery cycle at `shadow`, with only the socket stubbed.
+
+    `ring_supervisor_doorbell` is deliberately NOT patched here, unlike the
+    position arms above: the row this case is about is written inside it, so a
+    recorder standing in for the ring would assert against a double and prove
+    nothing about the production chain.
+    """
+    from cli_agent_orchestrator.services import cc_session_registry
+    from cli_agent_orchestrator.services.cc_session_registry import ResolveResult
+
+    service = InboxService()
+    coalesce = MagicMock()
+
+    def _submit(terminal_id: str, max_row_id: int, **kwargs: Any) -> None:
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
+        ring_supervisor_doorbell(terminal_id, max_row_id, **kwargs)
+
+    coalesce.submit.side_effect = _submit
+    metadata = {
+        "tmux_session": "cao-p3b",
+        "tmux_window": SEAT_TERMINAL,
+        "lifecycle_generation": 1,
+        "recovery_state": None,
+        "metadata": {},
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service",
+            coalesce,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch.object(
+            cc_session_registry, "resolve_target", return_value=ResolveResult(_registry_record())
+        ),
+        patch.object(cc_session_registry, "check_version_guard", return_value=None),
+        patch.object(cc_session_registry, "read_peer_token", return_value="tok"),
+        patch.object(cc_session_registry, "verify_wake", return_value=True),
+        patch.object(cc_session_registry, "write_to_socket", side_effect=capture.write),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
+            side_effect=lambda terminal_id, *a, **k: pastes.append(terminal_id),
+        ),
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
+        patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
+    ):
+        outcome = service._f136_run_callback_delivery(SEAT_TERMINAL)
+        service._f136_post_delivery(SEAT_TERMINAL, outcome)
+
+
+def _seat_wake_attempts(store, msg_id: str) -> list[Any]:
+    from cli_agent_orchestrator.core.delivery import CARRIER_SEAT_WAKE
+
+    return [a for a in store.attempts_for(msg_id) if a.carrier == CARRIER_SEAT_WAKE]
+
+
+def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env) -> None:
+    """One emitted epoch, one socket write, one `delivery_attempt` row, no paste.
+
+    All four are asserted together on purpose. Counting the row alone would pass
+    on a build that recorded an attempt nothing emitted, and counting the bytes
+    alone is the r2 head — which emitted and recorded nothing, so the emission
+    was true and unreadable.
+    """
+    from cli_agent_orchestrator.clients.database import _create_inbox_message_unfenced
+    from cli_agent_orchestrator.core.delivery import AttemptOutcome
+
+    sessions, store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+        db.add(
+            TerminalModel(
+                id=WORKER_TERMINAL,
+                tmux_session="cao-p3b",
+                tmux_window=WORKER_TERMINAL,
+                provider="claude_code",
+                agent_profile="grunt",
+                init_state="ready",
+            )
+        )
+    install(SwitchPosition.SHADOW)
+
+    sent = _create_inbox_message_unfenced(WORKER_TERMINAL, SEAT_TERMINAL, "SHADOW_ATTEMPT_PROBE")
+    assert store.count(mode=QueueMode.SHADOW) == 1, "3a's mirror must have written the shadow row"
+    # Read by the LEGACY id rather than through `pending_for_receiver`, which
+    # serves `mode='live'` rows only — a shadow row is unclaimable by
+    # construction (D9), and that filter is the reason the r2 arm's row was
+    # invisible to every consumer that looked for it the delivery way.
+    shadow = store.get_by_legacy_id(int(sent.id))
+    assert shadow is not None
+
+    capture = _SocketCapture()
+    pastes: list[str] = []
+    _drive_shadow_production(capture, pastes)
+
+    assert len(capture.writes) == 1, "the seat's carrier must emit exactly once per epoch"
+    attempts = _seat_wake_attempts(store, shadow.msg_id)
+    assert len(attempts) == 1, (
+        "one emitted epoch owes exactly one delivery_attempt row (I5); "
+        f"got {len(attempts)} for msg_id={shadow.msg_id}"
+    )
+    assert attempts[0].outcome is AttemptOutcome.DELIVERED
+    assert pastes == [], "a supervisor-role receiver is never pasted (K8)"
