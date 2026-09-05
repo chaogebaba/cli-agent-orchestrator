@@ -830,13 +830,13 @@ def _drive_shadow_production(capture: _SocketCapture, pastes: list[str]) -> None
         service._f136_post_delivery(SEAT_TERMINAL, outcome)
 
 
-def _seat_wake_attempts(store, msg_id: str) -> list[Any]:
+def _seat_wake_attempts(store: Any, msg_id: str) -> list[Any]:
     from cli_agent_orchestrator.core.delivery import CARRIER_SEAT_WAKE
 
     return [a for a in store.attempts_for(msg_id) if a.carrier == CARRIER_SEAT_WAKE]
 
 
-def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env) -> None:
+def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env: Any) -> None:
     """One emitted epoch, one socket write, one `delivery_attempt` row, no paste.
 
     All four are asserted together on purpose. Counting the row alone would pass
