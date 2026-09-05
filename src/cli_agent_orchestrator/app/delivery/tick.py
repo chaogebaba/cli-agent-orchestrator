@@ -215,7 +215,8 @@ class DeliveryTick:
             return
         wake = self._wake.deliver(digest, claimed)
         report.wakes = (*report.wakes, wake)
-        self._record_attempts(wake, claimed, now)
+        if wake.recordable:
+            self._record_attempts(wake, claimed, now)
         self._raise_wake_finding(wake)
 
     def _epoch_for(self, receiver_id: str, now: datetime, report: TickReport) -> SeatDigest | None:

@@ -86,6 +86,12 @@ class WakeOutcomeReport:
     carrier: str
     outcome: AttemptOutcome
     emitted: bool = False
+    #: Whether this report should produce ``delivery_attempt`` rows at all.
+    #: False for the one case where no carrier ran — the epoch closed between
+    #: the tick reading it and the emission — because an attempt row states
+    #: what a carrier DID, and inventing one would put a delivery on the record
+    #: that never happened.
+    recordable: bool = True
     detail: str = ""
     finding_reason: str | None = None
     wake_count: int = 0
@@ -150,12 +156,21 @@ class WakeService:
             # The epoch closed between the tick reading it and this emission.  A
             # wake for a consumed epoch is UNREACHABLE rather than suppressed
             # (I4), and there is nothing to record against the rows.
+            #
+            # ``recordable`` is false here and nowhere else. An attempt row says
+            # what a CARRIER DID, and no carrier ran: writing ``delivered``
+            # would tell ``cao diag <msg_id>`` that a wake landed when none was
+            # composed, which is the pane-archaeology guesswork I5 exists to
+            # end. It would also be an outcome that spends no attempt, so the
+            # rows would re-offer to their deadline with a delivery on the
+            # record and nothing delivered.
             return WakeOutcomeReport(
                 receiver_id=digest.receiver_id,
                 epoch=digest.epoch,
                 carrier=CARRIER_SEAT_WAKE if resolution.is_supervisor else CARRIER_PANE,
                 outcome=AttemptOutcome.DELIVERED,
                 emitted=False,
+                recordable=False,
                 detail="epoch_closed",
             )
 

@@ -934,3 +934,31 @@ def test_the_digest_line_carries_ids_and_never_a_body(harness: Harness) -> None:
     assert body not in line
     assert row.msg_id in line
     assert "list_messages(epoch=1)" in line
+
+
+def test_an_epoch_that_closes_mid_tick_records_no_attempt(harness: Harness) -> None:
+    """The one report that produces no attempt rows, and why that matters.
+
+    A digest can close between the tick reading it and the emission — the seat
+    acked, or a re-parent emptied it — and no carrier then runs. Writing
+    ``delivered`` anyway would tell ``cao diag <msg_id>`` that a wake landed when
+    none was composed, which is the pane archaeology I5 exists to end; and since
+    ``delivered`` spends no attempt, the rows would re-offer to their deadline
+    with a delivery on the record and nothing delivered.
+    """
+    row = harness.enqueue("k1")
+    harness.tick.run_once(now=harness.clock.now())
+    digest = harness.queue.open_digest(SEAT)
+    assert digest is not None
+
+    harness.queue.close_digest(SEAT, digest.epoch, via="mcp_ack", now=harness.clock.now())
+    resolution = harness.directory.resolve(SEAT)
+    before = len(harness.queue.attempts_for(row.msg_id))
+
+    report = harness.tick._wake.deliver(digest, ())  # noqa: SLF001
+
+    assert report.recordable is False
+    assert report.emitted is False
+    assert report.detail == "epoch_closed"
+    assert len(harness.queue.attempts_for(row.msg_id)) == before
+    assert resolution.live
