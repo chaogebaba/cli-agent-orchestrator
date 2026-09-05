@@ -264,6 +264,75 @@ class TestItWidensAndDoesNotLeak:
         assert pattern.search("press enter todxcontinue") is None  # two: not a bleed
         assert pattern.search("press enter todxycontinue") is None
 
+    def test_the_cell_may_hold_any_glyph_not_just_a_letter(self) -> None:
+        """The previous frame is ordinary output, so the stale glyph can be
+        anything: a path separator, a rule, a card wall, a bullet.
+
+        Pinned against the pattern directly, in the light (punctuation-
+        preserving) domain, because the full canonical fold would turn every one
+        of these back into a space and the assertion would prove nothing.
+        """
+        pattern = ar.bleed_tolerant_pattern("use current directory")
+        assert pattern is not None
+        for glyph in "/─│·:%.-":
+            bled = f"use{glyph}current{glyph}directory"
+            assert pattern.search(bled) is not None, f"{glyph!r} should be one cell"
+        assert pattern.search("use//current directory") is None  # two cells
+
+    # Two rows taken from real panes under
+    # ~/.aws/cli-agent-orchestrator/logs/terminal/*.scrollback: a box-drawing
+    # separator, and one of the `-c` config fragments from the codex launch echo
+    # that was sitting under the card in the 162c159f stall itself.
+    PUNCTUATION_BACKGROUNDS: Dict[str, str] = {
+        "box-drawing rule": "─" * 80,
+        "launch -c fragment": (
+            "-c 'mcp_servers.cao-mcp-server.env.CAO_TERMINAL_ID=\"162c159f\"' --search"
+        ),
+    }
+
+    @pytest.mark.parametrize("label", sorted(PUNCTUATION_BACKGROUNDS))
+    def test_a_punctuation_bleed_from_a_real_row_still_matches(self, label: str) -> None:
+        """Replay, not construction: a real pane row under the card's title.
+
+        The title's six word gaps come back holding whatever that row had at
+        those columns — `─` from the separator, and `.`/`T` from the config
+        fragment. Neither is alphanumeric-and-lowercase, which is exactly the
+        assumption an `[a-z0-9 ]` cell class would have made.
+        """
+        title = "Choose working directory to resume this session"
+        raw = superpose([title], [self.PUNCTUATION_BACKGROUNDS[label]])[0]
+        assert title not in raw, "the background must actually have bled in"
+        stale = [raw[i] for i, c in enumerate(title) if c == " "]
+        assert any(not c.isalnum() for c in stale), f"no punctuation bled: {stale}"
+
+        # Light domain: punctuation survives intact, and the one-cell class
+        # spans it. This is the assertion an `[a-z0-9 ]` class fails.
+        pattern = ar.bleed_tolerant_pattern(ar.canonicalize(title))
+        assert pattern is not None
+        assert pattern.search(ar.canonicalize_light(raw)) is not None
+
+        # Full domain: each stale glyph is either folded back to a space or
+        # kept as one lowercase alphanumeric, so it is still one cell and the
+        # same pattern spans it.
+        assert pattern.search(ar.canonicalize(raw)) is not None
+
+    def test_the_fold_lowercases_so_case_is_never_a_reason_to_miss(self) -> None:
+        """The `T` of CAO_TERMINAL_ID lands in one of the title's gaps.
+
+        A case-sensitive cell class would miss on it. The fold lowercases before
+        matching, so it arrives as `t` and the gap is spanned like any other.
+        """
+        title = "Choose working directory to resume this session"
+        raw = superpose([title], [self.PUNCTUATION_BACKGROUNDS["launch -c fragment"]])[0]
+        stale = [raw[i] for i, c in enumerate(title) if c == " "]
+        assert any(c.isupper() for c in stale), f"no uppercase bled: {stale}"
+        folded = ar.canonicalize(raw)
+        assert folded == folded.lower()
+        assert "thistsession" in folded  # the T, lowercased, sitting in the gap
+        pattern = ar.bleed_tolerant_pattern(ar.canonicalize(title))
+        assert pattern is not None
+        assert pattern.search(folded) is not None
+
     def test_a_two_word_anchor_gets_no_tolerance_at_all(self) -> None:
         """A widening is paid for by the specificity around it.
 

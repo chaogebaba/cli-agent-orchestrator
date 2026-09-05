@@ -258,13 +258,23 @@ def bleed_tolerant_pattern(canonical_anchor: str) -> "re.Pattern[str] | None":
     THE ALLOWANCE IS EXACTLY ONE CELL, because that is exactly what the physics
     produces. A word gap the dialog renders as a single blank is a single cell,
     and a single cell holds a single stale character. So each space in the
-    anchor may be replaced by ONE character and no more: in the canonical domain
-    that is either a space (the gap was not corrupted, or the stale glyph was
-    punctuation and folded back to a space) or one alphanumeric (a stale letter
-    or digit, the ``d`` in ``todresume``). A multi-character run between two
-    anchor words is NOT a bleed — it is different text — and must not match.
-    Wider blank runs and the stale tail past the end of a dialog's line lie
-    outside the anchor's span and need no allowance at all.
+    anchor may be replaced by ONE character and no more. A multi-character run
+    between two anchor words is NOT a bleed — it is different text — and must
+    not match. Wider blank runs and the stale tail past the end of a dialog's
+    line lie outside the anchor's span and need no allowance at all.
+
+    The cell may hold ANY glyph, so the class is "one non-whitespace character,
+    or one space" and not an alphanumeric whitelist. The previous frame is
+    ordinary terminal output: a path's ``/``, a rule's ``─``, a card wall's
+    ``│``, ``:``, ``·``, ``%`` are all things it leaves behind. Today the FULL
+    canonical fold (``canonicalize``) has already mapped every non-``[a-z0-9]``
+    character to a space and lowercased the rest, so on that domain the broader
+    class and an alphanumeric one accept the same strings — but the pattern must
+    not silently depend on that. Written this way it stays correct if it is ever
+    matched against the light domain, where punctuation survives intact.
+
+    Because the fold lowercases, an uppercase stale glyph reaches the pattern as
+    lowercase; case is never a reason for a miss.
 
     The tolerant path is also confined to anchors of at least
     ``BLEED_MIN_ANCHOR_WORDS`` words. A widening has to be paid for by the
@@ -285,8 +295,10 @@ def bleed_tolerant_pattern(canonical_anchor: str) -> "re.Pattern[str] | None":
     tokens = canonical_anchor.split()
     if len(tokens) < BLEED_MIN_ANCHOR_WORDS:
         return None
-    # Exactly one canonical character: a space, or one stale alphanumeric.
-    gap = "[a-z0-9 ]"
+    # Exactly one cell: one non-whitespace glyph of any kind, or one space.
+    # Never two, and never a tab or newline (which are not cells a dialog's own
+    # text can leave behind mid-line).
+    gap = r"(?:\S| )"
     return re.compile(gap.join(re.escape(token) for token in tokens))
 
 
