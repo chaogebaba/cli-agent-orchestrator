@@ -66,9 +66,15 @@ PROFILE_POSITION_TABLE: Dict[str, str] = {
 #   claude_blueprint_maker,
 #   claude_blueprint_maker_tester
 #                          - the maker lane fills no routed position.
-#   chao_supervisor,
+#   chao_supervisor        - the seat itself; it is not dispatched into a
+#                            position.
 #   developer-opus,
-#   developer-sonnet       - no `provider:` frontmatter, so nothing is implied.
+#   developer-sonnet       - harness lanes, not CAO cells.
+# (These three are listed explicitly rather than relying on "has no provider":
+#  the repo's profiles/ copies carry no `provider:`, but the INSTALLED
+#  agent-store copies do — verified 2026-09-04, where all three read
+#  `provider: kiro_cli`. The guard reads the installed store, so the exclusion
+#  has to hold on the artifact it actually parses.)
 UNMAPPED_BY_DESIGN = frozenset(
     {
         "grok_reviewer",
