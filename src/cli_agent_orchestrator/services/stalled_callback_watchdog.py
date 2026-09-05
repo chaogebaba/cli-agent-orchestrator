@@ -1410,6 +1410,15 @@ class StalledCallbackWatchdog:
                     self._waiting_inbox_episodes.pop(terminal_id, None)
                 continue
 
+            # F530 #386: this sweep is the only thing that still visits a
+            # terminal stalled on a dialog — its pane emits nothing, so the
+            # responder's own detection-retry budget is long spent. An edit to
+            # the auto-answer rules is a new reason to look at it. Called
+            # outside the watchdog lock (F522 lock-order law).
+            provider_name = metadata.get("provider")
+            if provider_name:
+                auto_responder.rearm_if_rules_changed(terminal_id, str(provider_name))
+
             with self._lock:
                 episode = self._waiting_inbox_episodes.get(terminal_id)
                 if episode is None:

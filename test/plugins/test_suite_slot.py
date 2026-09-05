@@ -37,6 +37,32 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _reap(child: subprocess.Popen[bytes]) -> None:
+    """Get *child* gone, escalating SIGTERM to SIGKILL.
+
+    Every helper process in this module is a ``python -c "time.sleep(60)"``
+    sentinel and no test's claim is about which signal ends it — the claims are
+    about what the ledger recorded. A bare ``terminate(); wait(timeout=5)``
+    makes SIGTERM delivery part of the verdict anyway, and in-suite it is not
+    reliable: on grok-box-005 the two TestLedgerSampling tests alternated
+    in and out of the failure set across three full-suite runs at main
+    9b93dd24, each failure a ``subprocess.TimeoutExpired`` from teardown after
+    the sentinel outlived SIGTERM for the full 5 s (twice, 10.04 s, in
+    test_sample_ledger_monotonic_growth, which sends it once mid-test and again
+    in its finally) while every assertion in the body had passed. SIGKILL
+    cannot be missed, so escalating removes the sentinel's fate from the
+    verdict without touching what is being tested.
+    """
+    if child.poll() is not None:
+        return
+    child.terminate()
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Redirect the lockfile to a temp path so tests don't interfere with real runs."""
@@ -283,7 +309,6 @@ class TestSkipConditions:
         suite_slot.pytest_unconfigure(config)
 
 
-
 # ---------------------------------------------------------------------------
 # F437 (issue #292): self-destruct watchdog
 # ---------------------------------------------------------------------------
@@ -320,9 +345,7 @@ class TestMaxSecondsParsing:
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "-1")
         assert suite_slot._max_seconds() == -1.0
 
-    def test_unparseable_falls_back_to_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unparseable_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A garbage value uses the safe default rather than disabling."""
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "not-a-number")
         assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
@@ -341,15 +364,11 @@ class TestMaxSecondsParsing:
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "inf")
         assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
 
-    def test_negative_inf_falls_back_to_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_negative_inf_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "-inf")
         assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
 
-    def test_overflow_literal_falls_back_to_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_overflow_literal_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """`1e309` overflows to inf in float() — must not survive as a bound."""
         # Guard: confirm the literal really does overflow to inf, so this test
         # exercises the isfinite() gate and not merely ValueError.
@@ -367,9 +386,7 @@ class TestNonFiniteArmingBehavior:
     timer's interval — never sleeping an hour).
     """
 
-    def test_nan_does_not_fire_immediately(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_nan_does_not_fire_immediately(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With the fix, `nan` must arm a real 3600 bound, not fire at once.
 
         A pre-fix `_max_seconds()` returned nan → threading.Timer(nan, ...)
@@ -389,9 +406,7 @@ class TestNonFiniteArmingBehavior:
             suite_slot._cancel_watchdog()
             assert suite_slot._watchdog is None
 
-    def test_inf_arms_real_bound_not_crash(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_inf_arms_real_bound_not_crash(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """`inf` must arm a genuine 3600 bound, not crash the timer thread.
 
         A pre-fix `_max_seconds()` returned inf → threading.Timer(inf, ...)
@@ -411,9 +426,7 @@ class TestNonFiniteArmingBehavior:
             suite_slot._cancel_watchdog()
             assert suite_slot._watchdog is None
 
-    def test_overflow_literal_arms_real_bound(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_overflow_literal_arms_real_bound(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """`1e309` (→inf) arms a finite 3600 bound, same as inf."""
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "1e309")
         suite_slot._arm_watchdog()
@@ -514,9 +527,7 @@ class TestArmingDecisions:
         assert suite_slot._lock_fd is None
         assert suite_slot._watchdog is None
 
-    def test_no_arm_on_xdist_worker(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_arm_on_xdist_worker(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """xdist workers skip acquisition — must never arm the self-destruct."""
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
         config = _make_config(is_worker=True)
@@ -551,9 +562,7 @@ class TestWatchdogIntegration:
         )
         # A test that hangs well past the 2s bound (would run ~120s).
         (run_dir / "test_hang.py").write_text(
-            "import time\n"
-            "def test_sleep_forever():\n"
-            "    time.sleep(120)\n"
+            "import time\n" "def test_sleep_forever():\n" "    time.sleep(120)\n"
         )
 
         env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
@@ -565,8 +574,17 @@ class TestWatchdogIntegration:
         # killpg targets that group.
         start = time.monotonic()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_hang.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_hang.py",
+            ],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -589,9 +607,10 @@ class TestWatchdogIntegration:
         #       process IS in the killpg target group.
         #   137: os._exit(137) runs first (e.g. if the killpg was already
         #       delivered but didn't terminate us before os._exit).
-        assert proc.returncode in (-9, 137), (
-            f"expected -9 or 137 (watchdog kill), got returncode={proc.returncode}\n{out}"
-        )
+        assert proc.returncode in (
+            -9,
+            137,
+        ), f"expected -9 or 137 (watchdog kill), got returncode={proc.returncode}\n{out}"
         # Fired ~on the 2s bound, comfortably under the 30s incident ceiling.
         assert elapsed < 20, f"took too long ({elapsed:.1f}s):\n{out}"
         # Loud diagnostic present.
@@ -605,7 +624,6 @@ class TestWatchdogIntegration:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-
 
 
 # ---------------------------------------------------------------------------
@@ -644,9 +662,7 @@ class TestWatchdogAncestorSafety:
         )
         # test that hangs past the 2s watchdog
         (run_dir / "test_hang.py").write_text(
-            "import time\n"
-            "def test_hang():\n"
-            "    time.sleep(60)\n"
+            "import time\n" "def test_hang():\n" "    time.sleep(60)\n"
         )
 
         # Parent script: spawns pytest as a child (same pgid — no
@@ -687,9 +703,7 @@ class TestWatchdogAncestorSafety:
             f"Parent died (rc={result.returncode}) — watchdog killed ancestor!\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
-        assert marker_file.exists(), (
-            "Ancestor marker not written — ancestor was killed by watchdog"
-        )
+        assert marker_file.exists(), "Ancestor marker not written — ancestor was killed by watchdog"
         content = marker_file.read_text()
         assert content.startswith("alive:"), f"Unexpected marker: {content}"
 
@@ -709,19 +723,25 @@ class TestWatchdogAncestorSafety:
             "pytest_plugins = ('test.plugins.suite_slot',)\n"
         )
         (run_dir / "test_hang.py").write_text(
-            "import time\n"
-            "def test_hang():\n"
-            "    time.sleep(300)\n"
+            "import time\n" "def test_hang():\n" "    time.sleep(300)\n"
         )
 
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
         env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_hang.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_hang.py",
+            ],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -737,9 +757,10 @@ class TestWatchdogAncestorSafety:
 
         # os.killpg(our_pgid, SIGKILL) kills us with -9 before os._exit(137)
         # can run, OR os._exit(137) wins the race. Both are valid.
-        assert proc.returncode in (-9, 137), (
-            f"Expected -9 or 137 from watchdog, got {proc.returncode}"
-        )
+        assert proc.returncode in (
+            -9,
+            137,
+        ), f"Expected -9 or 137 from watchdog, got {proc.returncode}"
 
 
 class TestWatchdogDisarmOnNormalCompletion:
@@ -759,19 +780,24 @@ class TestWatchdogDisarmOnNormalCompletion:
             f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
             "pytest_plugins = ('test.plugins.suite_slot',)\n"
         )
-        (run_dir / "test_fast.py").write_text(
-            "def test_quick():\n"
-            "    assert 1 + 1 == 2\n"
-        )
+        (run_dir / "test_fast.py").write_text("def test_quick():\n" "    assert 1 + 1 == 2\n")
 
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
         env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
 
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_fast.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_fast.py",
+            ],
             cwd=str(run_dir),
             env=env,
             timeout=15,
@@ -799,19 +825,24 @@ class TestWatchdogDisarmOnNormalCompletion:
             f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
             "pytest_plugins = ('test.plugins.suite_slot',)\n"
         )
-        (run_dir / "test_pass.py").write_text(
-            "def test_pass():\n"
-            "    pass\n"
-        )
+        (run_dir / "test_pass.py").write_text("def test_pass():\n" "    pass\n")
 
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
         env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
 
         subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_pass.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_pass.py",
+            ],
             cwd=str(run_dir),
             env=env,
             timeout=15,
@@ -872,13 +903,21 @@ class TestDescendantDeath:
             "    time.sleep(300)  # hang past watchdog\n"
         )
 
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_spawn_child.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_spawn_child.py",
+            ],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -966,16 +1005,24 @@ class TestDaemonSetsidEscape:
             "        time.sleep(300)\n"
         )
 
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         # 6s bound: child sleeps 3s in our pgid (ledger samples at 2s),
         # then setsids. Watchdog fires at 6s — ledger has the entry from
         # when the child was still in our group.
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "6"
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-             "-p", "no:libtmux", "-s", "test_daemon.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:libtmux",
+                "-s",
+                "test_daemon.py",
+            ],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -1000,14 +1047,10 @@ class TestDaemonSetsidEscape:
                     pass
             pytest.fail(f"watchdog did not fire within 20s. Output:\n{out}")
 
-        assert proc.returncode in (-9, 137), (
-            f"Expected -9 or 137, got {proc.returncode}\n{out}"
-        )
+        assert proc.returncode in (-9, 137), f"Expected -9 or 137, got {proc.returncode}\n{out}"
 
         # Read daemon PID and confirm it was killed by the ledger.
-        assert daemon_pid_file.exists(), (
-            "Daemon PID file not written — daemon didn't start"
-        )
+        assert daemon_pid_file.exists(), "Daemon PID file not written — daemon didn't start"
         daemon_pid = int(daemon_pid_file.read_text().strip())
         # Give the kernel a moment
         time.sleep(0.5)
@@ -1052,8 +1095,10 @@ class TestPidReuseGuard:
 
             # Patch os._exit so we don't actually die, and killpg so we don't
             # kill our own group.
-            with unittest.mock.patch("os._exit") as mock_exit, \
-                 unittest.mock.patch("os.killpg") as mock_killpg:
+            with (
+                unittest.mock.patch("os._exit") as mock_exit,
+                unittest.mock.patch("os.killpg") as mock_killpg,
+            ):
                 suite_slot._watchdog_fire(10.0, time.monotonic() - 11.0)
 
             # The sentinel must still be alive — it was NOT killed.
@@ -1062,8 +1107,7 @@ class TestPidReuseGuard:
                 "PID-reuse guard failed — stale entry was signaled."
             )
         finally:
-            sentinel.terminate()
-            sentinel.wait(timeout=5)
+            _reap(sentinel)
 
     def test_matching_entry_is_killed(self, tmp_path: Path) -> None:
         """A ledger entry whose starttime DOES match gets signaled."""
@@ -1087,20 +1131,17 @@ class TestPidReuseGuard:
             suite_slot._armed_pgid = os.getpid()
 
             # Patch os._exit and killpg so we don't die or hit our own group.
-            with unittest.mock.patch("os._exit"), \
-                 unittest.mock.patch("os.killpg"):
+            with unittest.mock.patch("os._exit"), unittest.mock.patch("os.killpg"):
                 suite_slot._watchdog_fire(10.0, time.monotonic() - 11.0)
 
             # The target should have been killed.
             time.sleep(0.3)
-            assert target.poll() is not None, (
-                "Target was NOT killed — ledger kill with matching starttime failed."
-            )
+            assert (
+                target.poll() is not None
+            ), "Target was NOT killed — ledger kill with matching starttime failed."
             assert target.returncode == -signal.SIGKILL
         finally:
-            if target.poll() is None:
-                target.terminate()
-                target.wait(timeout=5)
+            _reap(target)
 
 
 class TestLedgerSampling:
@@ -1124,8 +1165,7 @@ class TestLedgerSampling:
             real_st = suite_slot._get_starttime(child.pid)
             assert recorded_st == real_st
         finally:
-            child.terminate()
-            child.wait(timeout=5)
+            _reap(child)
 
     def test_sample_ledger_monotonic_growth(self, tmp_path: Path) -> None:
         """Ledger entries are never removed — only added."""
@@ -1143,14 +1183,11 @@ class TestLedgerSampling:
                 size_after_first = len(suite_slot._ledger)
 
             # Kill child1 and sample again — entry should persist.
-            child1.terminate()
-            child1.wait(timeout=5)
+            _reap(child1)
 
             suite_slot._sample_ledger(my_pid, my_pgid)
             with suite_slot._ledger_lock:
                 assert child1.pid in suite_slot._ledger
                 assert len(suite_slot._ledger) >= size_after_first
         finally:
-            if child1.poll() is None:
-                child1.terminate()
-                child1.wait(timeout=5)
+            _reap(child1)

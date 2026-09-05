@@ -41,16 +41,14 @@ def _run_pytest(
     census_path = tmp_path / "census.json"
     conftest = tmp_path / "conftest.py"
     # Minimal conftest that registers tier_marks so tier derivation works
-    conftest.write_text(
-        textwrap.dedent(f"""\
+    conftest.write_text(textwrap.dedent(f"""\
         import sys
         sys.path.insert(0, {str(Path(__file__).resolve().parent.parent.parent)!r})
         pytest_plugins = (
             "test.plugins.tier_marks",
             "test.plugins.resource_census",
         )
-        """)
-    )
+        """))
 
     test_path = tmp_path / "test_probe.py"
     test_path.write_text(test_file)
@@ -102,26 +100,51 @@ _PROBE_SUITE = textwrap.dedent("""\
     import sys
     import pytest
 
-    # --- Hog: wall (2s sleep in setup fixture) ---
+    # Every hog below is sized so its #1 finish survives CPU contention on the
+    # host, because test_ac1_hogs_rank_first asserts a RANKING and the suite runs
+    # these probe subprocesses under -n 2 alongside everything else. Sleeping is
+    # the only cost contention cannot inflate, so the wall hog sleeps far longer
+    # than the CPU hog can take even when it gets a third of a core, and the RSS
+    # hog allocates the least memory that still ranks it #1 by rss_delta_kb.
+
+    # --- Hog: wall (2.4s of sleeps across the three phases) ---
+    # 1.5/0.3/0.6, not 0.4/0.1/0.2: the CPU hog is CPU-bound, so ITS wall grows
+    # under contention while these sleeps do not. At 0.7 s total the wall hog led
+    # the CPU hog by less unloaded wall than a contended box can add to it, and
+    # doubling the CPU hog below would have closed the gap outright.
     @pytest.fixture
     def slow_setup_fixture():
-        time.sleep(0.4)  # setup phase
+        time.sleep(1.5)  # setup phase
         yield
-        time.sleep(0.2)  # teardown phase
+        time.sleep(0.6)  # teardown phase
 
     def test_wall_hog(slow_setup_fixture):
-        time.sleep(0.1)  # call phase
+        time.sleep(0.3)  # call phase
 
     # --- Hog: CPU (busy loop) ---
+    # 10M iterations, not 5M: the CPU ranking is a comparison, and at 5M the hog
+    # burned ~0.35 s of user time while test_rss_hog's allocation costs system
+    # time for its page faults — a cost that grows with memory pressure on the
+    # host. Under enough pressure the two cross and the census ranks test_rss_hog
+    # #1 on CPU: "CPU hog not #1: test_probe.py::test_rss_hog", in both the serial
+    # and the parallel arm, on grok-box-005 2026-09-04 in a full-suite run
+    # carrying an extra per-test plugin. Ten plain full-suite runs on 004 and 005
+    # passed it in 1.43-1.95 s, so this widening is prophylaxis against a margin
+    # measured small, not a fix for a failure seen in the default invocation.
     def test_cpu_hog():
         total = 0
-        for i in range(5_000_000):
+        for i in range(10_000_000):
             total += i
 
-    # --- Hog: RSS (allocate 50 MB, held via fixture so it's alive at teardown) ---
+    # --- Hog: RSS (allocate 20 MB, held via fixture so it's alive at teardown) ---
+    # 20 MB, not 50: the RSS ranking needs to beat the other probe tests, whose
+    # rss_delta is a lazy import or two, and 20 MB clears that by more than an
+    # order of magnitude. What 50 MB also bought was 12800 pages of fault cost
+    # charged to this test's system time — the other half of the CPU inversion
+    # above. Faulting 5120 pages cannot reach the CPU hog's user time.
     @pytest.fixture
     def rss_holder():
-        data = bytearray(50 * 1024 * 1024)  # 50 MB
+        data = bytearray(20 * 1024 * 1024)  # 20 MB
         yield data
         del data
 
@@ -170,9 +193,7 @@ _PROBE_SUITE = textwrap.dedent("""\
 @pytest.mark.parametrize("n_workers", [0, 2], ids=["serial", "parallel"])
 def test_ac1_hogs_rank_first(tmp_path: Path, n_workers: int) -> None:
     """AC1: deliberately hungry tests rank #1 on their axis."""
-    exit_code, output, census_path = _run_pytest(
-        tmp_path, _PROBE_SUITE, n_workers=n_workers
-    )
+    exit_code, output, census_path = _run_pytest(tmp_path, _PROBE_SUITE, n_workers=n_workers)
     assert census_path.exists(), f"Census not written. Output:\n{output}"
     data = json.loads(census_path.read_text())
     tests = data["tests"]
@@ -195,9 +216,7 @@ def test_ac1_hogs_rank_first(tmp_path: Path, n_workers: int) -> None:
         key=lambda t: sum(t["wall"].values()),
         reverse=True,
     )
-    assert by_wall[0]["nodeid"] == wall_hog["nodeid"], (
-        f"Wall hog not #1: {by_wall[0]['nodeid']}"
-    )
+    assert by_wall[0]["nodeid"] == wall_hog["nodeid"], f"Wall hog not #1: {by_wall[0]['nodeid']}"
 
     # CPU: test_cpu_hog should be #1 by user+system
     by_cpu = sorted(
@@ -205,9 +224,7 @@ def test_ac1_hogs_rank_first(tmp_path: Path, n_workers: int) -> None:
         key=lambda t: (t["cpu"].get("user") or 0) + (t["cpu"].get("system") or 0),
         reverse=True,
     )
-    assert by_cpu[0]["nodeid"] == cpu_hog["nodeid"], (
-        f"CPU hog not #1: {by_cpu[0]['nodeid']}"
-    )
+    assert by_cpu[0]["nodeid"] == cpu_hog["nodeid"], f"CPU hog not #1: {by_cpu[0]['nodeid']}"
 
     # RSS: test_rss_hog should be #1
     by_rss = sorted(
@@ -215,15 +232,13 @@ def test_ac1_hogs_rank_first(tmp_path: Path, n_workers: int) -> None:
         key=lambda t: t.get("rss_delta_kb") or 0,
         reverse=True,
     )
-    assert by_rss[0]["nodeid"] == rss_hog["nodeid"], (
-        f"RSS hog not #1: {by_rss[0]['nodeid']}"
-    )
+    assert by_rss[0]["nodeid"] == rss_hog["nodeid"], f"RSS hog not #1: {by_rss[0]['nodeid']}"
 
     # Spawns: test_spawn_hog should be #1
     by_spawns = sorted(tests, key=lambda t: t.get("spawns", 0), reverse=True)
-    assert by_spawns[0]["nodeid"] == spawn_hog["nodeid"], (
-        f"Spawn hog not #1: {by_spawns[0]['nodeid']}"
-    )
+    assert (
+        by_spawns[0]["nodeid"] == spawn_hog["nodeid"]
+    ), f"Spawn hog not #1: {by_spawns[0]['nodeid']}"
 
     # Spawn hog should also show children CPU > 0
     assert (spawn_hog["cpu"].get("children") or 0) > 0
@@ -241,16 +256,14 @@ def test_ac3_off_mode(tmp_path: Path) -> None:
 
     # Write conftest without census env
     conftest = tmp_path / "conftest.py"
-    conftest.write_text(
-        textwrap.dedent(f"""\
+    conftest.write_text(textwrap.dedent(f"""\
         import sys
         sys.path.insert(0, {str(Path(__file__).resolve().parent.parent.parent)!r})
         pytest_plugins = (
             "test.plugins.tier_marks",
             "test.plugins.resource_census",
         )
-        """)
-    )
+        """))
     test_path = tmp_path / "test_off.py"
     test_path.write_text(test_file)
 
@@ -259,9 +272,12 @@ def test_ac3_off_mode(tmp_path: Path) -> None:
 
     result = subprocess.run(
         [
-            sys.executable, "-m", "pytest",
+            sys.executable,
+            "-m",
+            "pytest",
             str(test_path),
-            "-p", "no:cacheprovider",
+            "-p",
+            "no:cacheprovider",
             "-q",
         ],
         capture_output=True,
@@ -287,9 +303,7 @@ def test_ac4_determinism(tmp_path: Path) -> None:
         run_dir = tmp_path / f"run{run_idx}"
         run_dir.mkdir()
         n = 2 if run_idx < 2 else 0
-        _, output, census_path = _run_pytest(
-            run_dir, _PROBE_SUITE, n_workers=n
-        )
+        _, output, census_path = _run_pytest(run_dir, _PROBE_SUITE, n_workers=n)
         assert census_path.exists(), f"Run {run_idx} failed:\n{output}"
         data = json.loads(census_path.read_text())
         nodeids.append([t["nodeid"] for t in data["tests"]])
@@ -310,9 +324,7 @@ def test_ac4_determinism(tmp_path: Path) -> None:
 @pytest.mark.parametrize("n_workers", [0, 2], ids=["serial", "parallel"])
 def test_ac5_no_test_lost(tmp_path: Path, n_workers: int) -> None:
     """AC5: census test count == total passed+failed+skipped."""
-    _, output, census_path = _run_pytest(
-        tmp_path, _PROBE_SUITE, n_workers=n_workers
-    )
+    _, output, census_path = _run_pytest(tmp_path, _PROBE_SUITE, n_workers=n_workers)
     assert census_path.exists(), f"Census not written:\n{output}"
     data = json.loads(census_path.read_text())
     census_count = len(data["tests"])
@@ -368,9 +380,7 @@ def test_ac8_candidate_spawns(tmp_path: Path) -> None:
     data = json.loads(census_path.read_text())
 
     candidates = data["slow_tier_candidates"]
-    spawn_candidates = [
-        c for c in candidates if "test_spawn_hog" in c["nodeid"]
-    ]
+    spawn_candidates = [c for c in candidates if "test_spawn_hog" in c["nodeid"]]
     assert spawn_candidates, "test_spawn_hog not in slow_tier_candidates"
     assert "spawns" in spawn_candidates[0]["trips"]
 
@@ -444,9 +454,7 @@ def test_ac7_no_verdict_change(tmp_path: Path) -> None:
     # With census off
     dir_off = tmp_path / "off"
     dir_off.mkdir()
-    rc_off, out_off, _ = _run_pytest(
-        dir_off, test_with_failure, n_workers=0, census_env=False
-    )
+    rc_off, out_off, _ = _run_pytest(dir_off, test_with_failure, n_workers=0, census_env=False)
 
     # Exit codes must match (both should be 1 due to test_fail)
     assert rc_on == rc_off, f"Exit codes differ: on={rc_on} off={rc_off}"
