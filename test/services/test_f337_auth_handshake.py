@@ -481,14 +481,29 @@ class TestAC5WakeNativeGateTerminalService:
 
 
 class TestF337R2DefaultDark:
-    """B1 regression: absent setting → zero native-path calls from all five gate sites."""
+    """B1's shape, re-aimed by WP-ARCH 3b / A1.5: the default is now True.
 
-    def test_absent_setting_doorbell_service_takes_legacy_path(self):
-        """With no setting, doorbell_service.ring_supervisor_doorbell skips the native path."""
+    F337 B1 shipped ``supervisor.wake.native`` DARK, and these tests were the
+    regression that held it there. The amendment flips it, and the reason is
+    that removing the seat's composer paste from every switch position is only
+    half the job: with the paste role-gated away and this default False, the
+    seat would be NEITHER pasted NOR woken under ``off``, ``shadow`` and
+    ``drain`` — which is #604, not a fix. A paste is an ugly carrier; silence is
+    the bug the phase exists to remove.
+
+    What B1's regression was really protecting — that the gate is READ from one
+    canonical constant, and that every call site obeys it rather than deciding
+    for itself — is preserved: the tests below still drive the constant through
+    the gates, and now assert the native path IS taken. A test that pinned the
+    VALUE alone would have been a test of a decision rather than of a mechanism.
+    """
+
+    def test_absent_setting_doorbell_service_takes_the_native_path(self):
+        """With no setting, ring_supervisor_doorbell takes the NATIVE path (A1.5)."""
         from unittest.mock import patch, MagicMock
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-        assert WAKE_NATIVE_DEFAULT is False, "Canonical default must be False"
+        assert WAKE_NATIVE_DEFAULT is True, "A1.5: the canonical default is True from 3b"
 
         # Simulate ConfigService returning the canonical default for wake.native,
         # and True for supervisor.doorbell (so it doesn't bail out early).
@@ -522,11 +537,23 @@ class TestF337R2DefaultDark:
             from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
 
             result = ring_supervisor_doorbell("term-1", 1, written_count=1)
-        # Native ring must NOT be attempted
-        mock_attempt_native_ring.assert_not_called()
+        # The native ring IS the carrier now, and it is the only one: the pane
+        # fallback below it stays unreachable because supervisor.teammate_push
+        # remains False, which is what A1.5 keeps it for.
+        # The CALL is the assertion. What the ring then returns is decided by
+        # the mock, and the fallback below it stays unreachable regardless
+        # because supervisor.teammate_push remains False — which is exactly what
+        # A1.5 keeps that flag for.
+        mock_attempt_native_ring.assert_called_once()
+        assert result != ""
 
-    def test_absent_setting_delivery_service_skips_native(self, tmp_path):
-        """With no setting, delivery rung1 returns skipped_disabled."""
+    def test_absent_setting_delivery_service_attempts_native(self, tmp_path):
+        """With no setting, rung1 no longer declines on the flag (A1.5).
+
+        It may still defer for its own reasons — an unresolvable target, a
+        socket that is not there — and that is the point: the decision moves
+        from a config value to the carrier's own typed answer.
+        """
         from unittest.mock import patch
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
         from cli_agent_orchestrator.services.delivery_service import (
@@ -550,21 +577,28 @@ class TestF337R2DefaultDark:
             return_value=WAKE_NATIVE_DEFAULT,
         ):
             result = attempt_rung1(target, 99)
-        assert result.decision == "skipped_disabled"
+        assert result.decision != "skipped_disabled"
 
-    def test_config_registry_default_is_false(self):
-        """The config registry entry for CAO_SUPERVISOR_WAKE_NATIVE defaults to False."""
+    def test_the_registry_and_the_canonical_constant_agree(self):
+        """The property B1 was really defending: ONE spelling of the default.
+
+        The value is duplicated because the config registry dict is evaluated at
+        import time, before service imports resolve. A duplicated default that
+        can drift is how a flag comes to mean two things, so this asserts the
+        two agree rather than asserting either one's value in isolation.
+        """
+        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
         from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
 
         entry = ENV_REGISTRY["CAO_SUPERVISOR_WAKE_NATIVE"]
         # entry = (key_path, type, default)
-        assert entry[2] is False
+        assert entry[2] is WAKE_NATIVE_DEFAULT
 
-    def test_canonical_constant_is_false(self):
-        """WAKE_NATIVE_DEFAULT in cc_session_registry is False."""
+    def test_the_shipped_default_is_true_from_sub_phase_3b(self):
+        """A1.5, stated once so a reader finds the decision from the test."""
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-        assert WAKE_NATIVE_DEFAULT is False
+        assert WAKE_NATIVE_DEFAULT is True
 
 
 class TestF337R2ProcStartBinding:

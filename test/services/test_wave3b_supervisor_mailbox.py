@@ -459,6 +459,12 @@ def test_probe_03_paste_fence_serializes_and_generation_race_requeues_to_success
     assert get_message_trace(row.id)["message"]["status"] == "parked"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
+    ),
+)
 def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_successor(
     scratch_db,
     monkeypatch,
@@ -499,6 +505,12 @@ def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_succe
         assert (delivered.status, delivered.receiver_id) == ("parked", "11111111")
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
+    ),
+)
 def test_probe_03_publication_waits_until_actual_paste_releases_authority(
     scratch_db,
 ):
@@ -1218,6 +1230,12 @@ def test_probe_12_publication_cleanup_failure_keeps_typed_original_cause(
     assert caught.value.cause_message == "original conflict"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "WP-ARCH 3b / A1.5: this probe synchronises on a PASTE into the supervisor seat's composer, and the amendment removes that paste in every switch position — the ban is a property of the receiver's role, not of a flag. The mailbox-authority mechanism the probe is really about survives, but its observation point does not: there is no longer a paste to enter, block in, or interrupt. Redesigning it against the queue's lease is 3c work and is listed in the 3b build report rather than guessed at here. strict=True so that a future edit which restores the seat paste turns this red instead of quietly passing."
+    ),
+)
 def test_probe_12_sender_lock_timeout_interrupts_and_requeues(scratch_db, monkeypatch):
     with scratch_db.begin() as db:
         mailbox(db)
@@ -1390,7 +1408,7 @@ def test_probe_13_ready_base_guard_raw_and_mailbox_parity_with_refresh_override(
     assert allowed_raw.status_code == allowed_logical.status_code == 200
 
 
-def test_probe_13_logical_insert_immediately_pastes_to_resolved_live_incarnation(
+def test_probe_13_logical_insert_immediately_routes_to_resolved_live_incarnation(
     scratch_db,
     client,
 ):
@@ -1445,11 +1463,24 @@ def test_probe_13_logical_insert_immediately_pastes_to_resolved_live_incarnation
             "/terminals/mb_aaaaaaaa/inbox/messages",
             params={"sender_id": "99999999", "message": "inline"},
         )
+    # WP-ARCH 3b / A1.5 splits this into the half that survives and the half
+    # the amendment ends, and both are asserted.
+    #
+    # SURVIVES: a logical insert addressed to the MAILBOX still resolves to the
+    # current live incarnation, immediately and inside the request. That is what
+    # this probe is named for and it is unchanged.
+    #
+    # ENDS: the resolved receiver is the supervisor seat, and the seat's
+    # composer is never written to — in any switch position, because the ban is
+    # a property of the receiver's role rather than of a flag. The row is
+    # therefore held PENDING for the seat to drain through
+    # list_messages/ack_messages, and the wake reaches it over the native
+    # cross-session channel instead.
     assert response.status_code == 200
     assert response.json()["receiver_id"] == "11111111"
-    assert pasted == ["11111111"]
+    assert pasted == [], "a supervisor-role receiver is never pasted (K8)"
     with scratch_db() as db:
-        assert db.get(InboxModel, response.json()["message_id"]).status == "delivered"
+        assert db.get(InboxModel, response.json()["message_id"]).status == "pending"
 
 
 @pytest.mark.parametrize(

@@ -83,12 +83,13 @@ def _mailbox(
     mailbox_id: str = "mb_wpq10aa",
     session_name: str = "wpq10-session",
     terminal_id: str = "old",
+    role: str = "supervisor",
 ) -> MailboxModel:
     now = datetime.now()
     row = MailboxModel(
         id=mailbox_id,
         session_name=session_name,
-        role="supervisor",
+        role=role,
         current_terminal_id=terminal_id,
         generation=1,
         consumed_through_id=0,
@@ -548,8 +549,17 @@ def test_wpq10_deferred_composer_attempt_stays_pending(wpq10_db, monkeypatch):
 
 
 def test_wpq10_delivery_engine_uses_native_composer_defer_path(wpq10_db, monkeypatch):
+    # WP-ARCH 3b / A1.5: a WORKER receiver, unlike the rest of this file.
+    #
+    # The subject here is the native composer DEFER path — what the draft guard
+    # does when a paste meets a non-empty composer — and that path exists only
+    # for receivers who are still pasted. After the amendment the seat is not
+    # one of them: its composer is never written to in any switch position, so
+    # a supervisor-role receiver is short-circuited before the classify step
+    # this test observes. The digest and publication tests around it keep the
+    # supervisor role, because for them it IS the subject.
     with wpq10_db.begin() as db:
-        _mailbox(db, terminal_id="receiver")
+        _mailbox(db, terminal_id="receiver", role="worker")
         _terminal(db, "receiver")
         row = _message(db, "receiver")
     events: list[str] = []
