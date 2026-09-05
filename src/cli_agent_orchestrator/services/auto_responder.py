@@ -1786,7 +1786,23 @@ class AutoResponder:
             if recheck_incarnation != incarnation:
                 return TerminalStatus.WAITING_USER_ANSWER
 
+            # F530 #386: say WHICH frame this text is. ``normalized`` comes from
+            # a FRESH capture taken for the payload, not from the frame the
+            # rules were judged on — on a pane still repainting they differ, and
+            # on b637333f (2026-09-05 03:00Z) they differed in exactly the way
+            # that matters: the payload was clean while every evaluated frame
+            # was bled. A reader given only the clean text concludes the matcher
+            # is broken. Both frames go in the message now, and the evaluated
+            # one is named as the one the verdict came from.
             dialog_text = self._payload_excerpt(normalized)
+            evaluated_text = self._payload_excerpt(region.normalized)
+            if evaluated_text != dialog_text:
+                dialog_text = (
+                    f"{dialog_text}\n\nThe rules were NOT judged on that text. It is a fresh "
+                    "capture taken for this message, and the pane repainted in between. The "
+                    "frame the verdict came from, and the one to reason about, is:\n\n"
+                    f"{evaluated_text}"
+                )
             self._push(
                 terminal_id,
                 metadata,

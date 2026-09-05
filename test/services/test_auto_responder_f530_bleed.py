@@ -514,6 +514,90 @@ class TestTheGrokTrustCard:
         assert revival.body_hash == self._rule().body_hash
 
 
+class TestTheSecondStall:
+    """b637333f, 2026-09-05 ~03:00Z. Same fault, and a lesson about evidence.
+
+    Reported as a case the bleed model does not explain: the responder pushed
+    "unknown blocking dialog… no rule matched" carrying text that is completely
+    clean, so the anchor should have matched and the matcher must be at fault.
+
+    The clean text is real, but it is not the text that was evaluated. The
+    unknown-dialog push takes a FRESH capture for its payload
+    (`_capture_for_analysis`), and by the time it ran the pane had settled into
+    its final repaint. The frames the rules were actually judged on are in the
+    decisions log, and they are bled exactly like 162c159f's:
+
+        ec2 ruseycurrent directory
+        b64 3always useacurrent3directory
+        comm anpress enter to continueare uv tools
+
+    The live build was `ca94554c`, which has no bleed tolerance, so:
+
+      * 24 evaluations rejected on `question(contains)` — the title itself bled
+      * 7 evaluations rejected on `option[Use current directory]` — the title
+        rendered clean, the option did not
+
+    `useycurrent` is one stale cell between two intact words. It is the whole
+    thesis in one token, and the fix spans it.
+    """
+
+    # VERBATIM from ~/.aws/cli-agent-orchestrator/logs/auto-answers/
+    # b637333f.decisions.log, reason=region_dump, the frame carrying the card.
+    EVALUATED_REGION = (
+        "choose working directory to resume this session b637333f on cao b637333f via v3 14 7 on "
+        "session latest cwd recorded in the resumed session current your current working directory "
+        "b637333f on cao b637333f via v3 14 7 on 1 use session directory home chao vscode projects "
+        "cli subagents ec2 ruseycurrent directory data cao scratch worktrees cli subagents b637333f "
+        "3 always use session directory b64 3always useacurrent3directory v3 14 7 on 5 codex resume "
+        "dangerously bypass approvals and sandbox no alt screen disable shell snapshot dangerously "
+        "bypass hook trust model gpt 5 6 sol c mcp servers cao mcp server comm anpress enter to "
+        "continueare uv tools cli agent orchestrator bin cao"
+    )
+
+    # The push payload, verbatim. A later frame of the same pane.
+    PUSH_PAYLOAD = (
+        "choose working directory to resume this session session latest cwd recorded in the "
+        "resumed session current your current working directory 1 use session directory home chao "
+        "vscode projects cli subagents 2 use current directory data cao scratch worktrees cli "
+        "subagents b637333f 3 always use session directory 4 always use current directory press "
+        "enter to continue"
+    )
+
+    def test_the_evaluated_frame_was_bled_even_though_the_payload_was_clean(self) -> None:
+        """The two are different frames of one pane. That is the whole confusion."""
+        assert "use current directory" in self.PUSH_PAYLOAD
+        assert "use current directory" not in self.EVALUATED_REGION
+        assert "ruseycurrent directory" in self.EVALUATED_REGION
+
+    def test_the_live_build_could_not_have_fired_on_it(self) -> None:
+        """Plain substring, which is all `ca94554c` has. The title is there; the
+        option is not. That is the `option[Use current directory]` in the log."""
+        assert ar.canonicalize("Choose working directory to resume this session") in (
+            self.EVALUATED_REGION
+        )
+        assert ar.canonicalize("Use current directory") not in self.EVALUATED_REGION
+
+    def test_the_fix_fires_on_it(self) -> None:
+        rule = fixed()
+        region = region_of(self.EVALUATED_REGION)
+        assert rule.reject_reason(region) is None
+        assert rule.matches(region) is True
+        assert rule.answer == ["Down", "Enter"]
+
+    def test_each_bled_gap_in_it_is_one_cell(self) -> None:
+        """Not a new mechanism needing a wider allowance — the same one."""
+        pattern = ar.bleed_tolerant_pattern(ar.canonicalize("Use current directory"))
+        assert pattern is not None
+        match = pattern.search(self.EVALUATED_REGION)
+        assert match is not None
+        assert match.group() == "useycurrent directory"
+
+    def test_the_clean_payload_would_have_matched_all_along(self) -> None:
+        """Which is why reading it alone leads straight to the wrong conclusion."""
+        assert fixed().matches(region_of(self.PUSH_PAYLOAD)) is True
+        assert ar.canonicalize("Use current directory") in self.PUSH_PAYLOAD
+
+
 class TestTheFalsePositiveBound:
     """The property that matters, stated where it is decided: at the RULE.
 
