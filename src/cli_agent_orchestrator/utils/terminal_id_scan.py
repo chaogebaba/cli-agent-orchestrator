@@ -24,10 +24,8 @@ can carry a byte-identical twin without importing the fork.
 # The fork copy is canonical. The root copy exists because a Claude Code hook
 # must not import the fork (the hook runs in the supervisor's shell, against a
 # server that may predate this fix). Drift between the two is caught from BOTH
-# sides — test_shared_scanner_block_is_identical_to_the_root_twin (fork) and
-# test_shared_scanner_block_is_identical_to_the_fork_copy (root) — each
-# comparing exactly the text between these two markers. Regenerate both copies
-# rather than hand-editing either.
+# sides by test_shared_blocks_are_identical, comparing exactly the text between
+# these two markers. Regenerate both copies rather than hand-editing either.
 import re
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 

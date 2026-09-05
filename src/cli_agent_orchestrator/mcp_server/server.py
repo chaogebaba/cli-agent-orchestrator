@@ -66,7 +66,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_server_settings,
     is_learning_enabled,
 )
-from cli_agent_orchestrator.utils import terminal_id_scan
+from cli_agent_orchestrator.utils import routing_guard, terminal_id_scan
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.http import _PRODUCTION_PORT, CAOHttpClient
 from cli_agent_orchestrator.utils.session_lookup import (
@@ -595,6 +595,90 @@ def _dispatch_guard(message: Optional[str], action: str) -> Optional[str]:
         return terminal_id_scan.format_refusal(stale, own_id, live_ids, action=action)
     except Exception as exc:  # never let the guard itself break a dispatch
         logger.debug("F754 dispatch guard skipped: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# F754 (#611 scope add): routing-violation guard
+# ---------------------------------------------------------------------------
+# routing.toml is the SOLE authority on which lane fills which position, and it
+# carries the user's word. Dispatching a legacy provider-named profile
+# (codex_dev, kiro_dev, kiro_oracle, grok_dev, ...) implies that profile's
+# provider, so it can silently contradict the store — the M34-class mistake in
+# routing.toml's own status log (2026-09-04: three kiro_dev lanes plus
+# kiro_oracle dispatched against `dev = in_harness`; all four reaped).
+
+_routing_bindings_cache: Tuple[float, Optional[List[Dict[str, Any]]]] = (0.0, None)
+
+
+def _routing_bindings(force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+    """routing.toml's binding rows as plain dicts, cached 5 s.
+
+    Read through the fork's own validated loader (``load_routing_table``) so the
+    guard sees exactly the table the rest of D9 sees, then flattened to dicts —
+    the shared rule module is stdlib-only and cannot depend on the fork's
+    dataclasses. ``None`` on any failure: an unreadable store refuses nothing.
+    """
+    global _routing_bindings_cache
+    now = time.monotonic()
+    fetched_at, cached = _routing_bindings_cache
+    if not force_refresh and cached is not None and (now - fetched_at) < _LIVE_TERMINALS_TTL_S:
+        return cached
+
+    rows: Optional[List[Dict[str, Any]]] = None
+    try:
+        from cli_agent_orchestrator.constants import routing_toml_path
+        from cli_agent_orchestrator.utils.routing import load_routing_table
+
+        table = load_routing_table(routing_toml_path())
+        rows = [
+            {
+                "position": binding.position,
+                "provider": binding.provider,
+                "kind": binding.kind,
+                "model": binding.model,
+            }
+            for binding in table.bindings
+        ]
+    except Exception:
+        rows = None
+
+    _routing_bindings_cache = (now, rows)
+    return rows
+
+
+def _routing_guard(agent_profile: Optional[str], action: str) -> Optional[str]:
+    """Refusal text when a legacy profile contradicts routing.toml, else ``None``.
+
+    A bare POSITION name is never checked: that is the routed path, where the
+    provider comes FROM routing.toml and cannot contradict it.
+    """
+    if not agent_profile:
+        return None
+    try:
+        from cli_agent_orchestrator.constants import local_agent_store_dir, positions_store_dir
+        from cli_agent_orchestrator.utils.agent_profiles import _position_exists
+
+        if _position_exists(agent_profile):
+            return None
+        profile_path = local_agent_store_dir() / f"{agent_profile}.md"
+        if not profile_path.is_file():
+            return None
+        meta = routing_guard.parse_profile_frontmatter(
+            profile_path.read_text(encoding="utf-8", errors="replace"), agent_profile
+        )
+        if not meta.provider:
+            return None
+        known_positions = sorted(p.stem for p in positions_store_dir().glob("*.md")) or None
+        position = routing_guard.position_for_profile(meta, known_positions)
+        bindings = _routing_bindings()
+        if bindings is None:
+            return None
+        return routing_guard.routing_violation(
+            agent_profile, meta.provider, position, bindings, action=action
+        )
+    except Exception as exc:  # never let the guard itself break a dispatch
+        logger.debug("F754 routing guard skipped: %s", exc)
         return None
 
 
@@ -1618,6 +1702,9 @@ async def _handoff_impl(
     _stale = _dispatch_guard(message, "handoff")
     if _stale:
         return HandoffResult(success=False, message=_stale, output=None, terminal_id=None)
+    _misrouted = _routing_guard(agent_profile, "handoff")
+    if _misrouted:
+        return HandoffResult(success=False, message=_misrouted, output=None, terminal_id=None)
 
     start_time = time.time()
     terminal_id: Optional[str] = None
@@ -2371,6 +2458,12 @@ def _assign_impl(
     _stale = _dispatch_guard(message, "assign")
     if _stale:
         return {"success": False, "terminal_id": None, "message": _stale}
+    # F754 scope add: a legacy provider-named profile must not contradict the
+    # routing store. Checked on the ORIGINAL argument, before resolution
+    # rewrites a position name into a profile.
+    _misrouted = _routing_guard(agent_profile, "assign")
+    if _misrouted:
+        return {"success": False, "terminal_id": None, "message": _misrouted}
     try:
         # F497 D7 — resolve the assign target: legacy name (unchanged) or a
         # position name (provider from provider= arg, allowlist-checked). Reject
