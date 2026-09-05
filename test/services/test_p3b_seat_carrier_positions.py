@@ -700,3 +700,28 @@ def test_the_write_through_row_satisfies_the_public_message_shape(flip_env) -> N
     assert message.created_at is not None
     assert message.message == "SHAPE_PROBE"
     assert message.status is MessageStatus.PENDING
+
+
+def test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery(flip_env) -> None:
+    """K6 is a kill-list entry, not a component to integrate (D11).
+
+    It is server-side, so it is a genuine improvement on the dead client-side
+    hook, but it repairs a NOTIFICATION path rather than making the durable row's
+    observation unconditional, and it drives the legacy inbox. Left running at
+    `on` it is a second wake emitter over rows the tick already owns — the
+    emitter count case 17 forbids. Caught from a live sandbox log, where its
+    daemon announced itself while the queue was serving.
+    """
+    from cli_agent_orchestrator.services import seat_wake_reconcile
+
+    sessions, store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+
+    install(SwitchPosition.ON)
+    assert seat_wake_reconcile.reconcile_seat_wakes() == [], "K6 must be silent at `on`"
+
+    # And it is NOT muted in the positions where the queue does not serve the
+    # seat, because there it is still part of the legacy chain.
+    install(SwitchPosition.SHADOW)
+    assert seat_wake_reconcile._queue_owns_delivery() is False

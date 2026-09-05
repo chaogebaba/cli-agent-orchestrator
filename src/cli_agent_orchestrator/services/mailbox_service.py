@@ -979,7 +979,7 @@ def _queue_owns_new_traffic() -> bool:
     inbox, which is the pre-flip behaviour.
     """
     try:
-        from cli_agent_orchestrator.app.delivery.wiring import queue_owns_new_traffic
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_new_traffic
 
         return queue_owns_new_traffic()
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
@@ -1000,9 +1000,9 @@ def _list_from_queue(receiver: str, *, after_id: int | None, limit: int) -> dict
     surrogate the write-through minted, which is what makes ``ack_messages``'s
     integer cursor keep working across the flip.
     """
-    from cli_agent_orchestrator.app.delivery.wiring import delivery_runtime
+    from cli_agent_orchestrator.services.queue_carrier import queue_runtime
 
-    runtime = delivery_runtime()
+    runtime = queue_runtime()
     if runtime is None:
         return None
     try:
@@ -1058,9 +1058,9 @@ def _ack_on_queue(terminal_id: str, up_to_id: int) -> dict[str, Any] | None:
     Returns ``None`` when the queue settled nothing, so the caller falls through
     to the legacy ack for rows the inbox still holds from before the flip.
     """
-    from cli_agent_orchestrator.app.delivery.wiring import delivery_runtime
+    from cli_agent_orchestrator.services.queue_carrier import queue_runtime
 
-    runtime = delivery_runtime()
+    runtime = queue_runtime()
     if runtime is None:
         return None
     with SessionLocal() as db:

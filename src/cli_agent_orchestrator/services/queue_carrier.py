@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LegacyReceiverDirectory",
     "forget_terminal_status",
+    "legacy_enqueue_fact",
     "note_terminal_status",
+    "queue_owns_new_traffic",
+    "queue_runtime",
+    "write_through_enqueue",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
     "queue_owns_delivery",
@@ -113,6 +117,62 @@ def forget_terminal_status(terminal_id: str) -> None:
     """Drop a reaped terminal's edge memory, so the map cannot grow unbounded."""
     with _status_lock:
         _last_status.pop(terminal_id, None)
+
+
+def queue_owns_new_traffic() -> bool:
+    """Does the queue own NEW traffic, so the legacy inbox stops inserting? (§6)
+
+    False everywhere but ``on``. ``drain`` accepts no new queue rows at all —
+    that is the position's whole point, since it empties on its own budget while
+    new enqueues go back to the legacy inbox.
+    """
+    try:
+        from cli_agent_orchestrator.app.delivery.wiring import queue_owns_new_traffic as _owns
+
+        return _owns()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
+def write_through_enqueue(fact: Any) -> tuple[int, str] | None:
+    """Forward one new message to the queue's write-through (§6).
+
+    A pass-through so ``clients/database.py`` reaches the new tree the way every
+    other legacy file does — through THIS module. The AC11 contact surface stays
+    one file, which is the property the import-contract tests defend: a reviewer
+    reads one bridge to see everything legacy now depends on.
+    """
+    try:
+        from cli_agent_orchestrator.app.delivery.wiring import write_through
+
+        return write_through(fact)
+    except Exception:  # noqa: BLE001 — a write-through may never break a send
+        logger.debug("wp_arch write_through unavailable", exc_info=True)
+        return None
+
+
+def legacy_enqueue_fact(**fields: Any) -> Any:
+    """Build the fact the write-through takes, without naming the new tree.
+
+    ``clients/database.py`` has the values; only this module knows the type.
+    """
+    from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
+
+    return LegacyEnqueue(**fields)
+
+
+def queue_runtime() -> Any:
+    """The installed delivery runtime, or ``None``.
+
+    ``mailbox_service`` needs the store to serve §5b's drain from the queue, and
+    reaches it here rather than importing the wiring module directly.
+    """
+    try:
+        from cli_agent_orchestrator.app.delivery.wiring import delivery_runtime
+
+        return delivery_runtime()
+    except Exception:  # pragma: no cover
+        return None
 
 
 def queue_owns_delivery() -> bool:

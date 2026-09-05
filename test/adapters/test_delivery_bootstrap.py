@@ -252,12 +252,23 @@ async def test_a_served_position_arms_the_hooks_and_registers_the_tick(
     wiring.record_enqueue(fact(99))
     assert rebooted.queue_store is not None
     after = rebooted.queue_store.count()
+    # NEITHER position mirrors, and for opposite reasons (§6).
+    #
+    # `drain` accepts no new queue rows at all — that is what lets it empty on
+    # its own budget while new traffic goes back to the legacy inbox.
+    #
+    # `on` has no legacy insert to mirror: the inbox is read-only there, and
+    # `write_through` already wrote the authority row before the caller reached
+    # its own insert. Mirroring on top of it would be the second row for one
+    # message that §6 excludes as a fifth carrier.
+    assert after == before
+    assert rebooted.queue_store.count(mode=QueueMode.SHADOW) == 0
     if position == "on":
-        assert after == before + 1
+        assert wiring.queue_owns_new_traffic() is True
+        assert wiring.write_through(fact(101)) is not None, "the write-through is the path"
         assert rebooted.queue_store.count(mode=QueueMode.LIVE) == 2
     else:
-        assert after == before, "drain accepts no new queue rows"
-    assert rebooted.queue_store.count(mode=QueueMode.SHADOW) == 0
+        assert wiring.queue_owns_new_traffic() is False
 
     await bootstrap.shutdown_worker_truth()
 

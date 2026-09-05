@@ -7772,11 +7772,13 @@ def _queue_write_through(
     no rewrite (#33).
     """
     try:
-        from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
-        from cli_agent_orchestrator.app.delivery.wiring import write_through
+        from cli_agent_orchestrator.services.queue_carrier import (
+            legacy_enqueue_fact,
+            write_through_enqueue,
+        )
 
-        return write_through(
-            LegacyEnqueue(
+        return write_through_enqueue(
+            legacy_enqueue_fact(
                 legacy_message_id=0,
                 sender_id=str(fields.get("sender_id") or ""),
                 receiver_id=logical_receiver_id or receiver_id,
