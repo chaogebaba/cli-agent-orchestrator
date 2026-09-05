@@ -519,25 +519,57 @@ class AutoResponderDecision:
 
 
 class _RuleStore:
-    """Per-provider rule file, hot-reloaded on mtime change."""
+    """Per-provider rule file, hot-reloaded when its stat signature changes."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._cache: Dict[str, tuple] = {}  # provider -> (mtime, rules)
+        self._cache: Dict[str, tuple] = {}  # provider -> (signature, rules)
+        self._generation = 0
+
+    @staticmethod
+    def _signature(path: Path) -> tuple[int, int, int]:
+        """The stat fields that say "this is a different file than last time".
+
+        F530 #386: mtime alone is not one of them. Measured on grok-box-007,
+        where a CAO seat's home is an overlayfs mount: across a write followed
+        by an append, ``st_mtime`` and ``st_mtime_ns`` are IDENTICAL in 495 of
+        500 trials — the filesystem's timestamp is coarser than the interval
+        between two edits — while ``st_size`` differs in 500 of 500. An
+        mtime-keyed cache therefore keeps serving the OLD ruleset after an
+        operator appends a rule, for as long as the file is not touched again:
+        the rule that "textually matches the pane" is genuinely not in the list
+        the matcher walks. Size catches an append or any rewrite of a different
+        length; the inode catches an editor's save-by-rename, which can land a
+        same-size file with a backdated mtime.
+        """
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    @property
+    def generation(self) -> int:
+        """Bumped every time any provider's rule file is re-read (F530 #386).
+
+        The number is meaningless on its own; a CHANGE in it is the signal that
+        the ruleset a terminal was last evaluated against is no longer the one
+        on disk.
+        """
+        with self._lock:
+            return self._generation
 
     def get_rules(self, provider: str) -> List[Rule]:
         path = _rules_path(provider)
         try:
-            mtime = path.stat().st_mtime
+            signature = self._signature(path)
         except OSError:
             return []
         with self._lock:
             cached = self._cache.get(provider)
-            if cached is not None and cached[0] == mtime:
+            if cached is not None and cached[0] == signature:
                 return cached[1]
         rules = self._load(path)
         with self._lock:
-            self._cache[provider] = (mtime, rules)
+            self._cache[provider] = (signature, rules)
+            self._generation += 1
         return rules
 
     @staticmethod
@@ -656,6 +688,60 @@ class AutoResponder:
         self._settled_signatures: Dict[str, set[str]] = {}
         self._rearm_state: Dict[str, _RearmState] = {}
         self._logged_region_hashes: Dict[str, set[str]] = {}
+        # F530 #386: the ruleset generation each terminal was last evaluated
+        # against, so an edit to the rule file can be told apart from a re-read
+        # that changed nothing. Purged in clear_terminal.
+        self._rules_generation_seen: Dict[str, int] = {}
+
+    def rearm_if_rules_changed(self, terminal_id: str, provider_name: str) -> bool:
+        """F530 #386: re-evaluate a held terminal when the rule file has changed.
+
+        The matcher matches; ``_RuleStore._signature`` fixes the store's half.
+        The remaining half is that NOTHING LOOKS AGAIN. Rules are
+        only ever consulted from ``on_screen``, which runs on a detection tick;
+        ``status_monitor.schedule_detection_retry`` allows six requests per
+        silence episode and its only other reset edge is real pane output
+        (``status_monitor.py:1565``). A pane stalled on a dialog emits none, so
+        ~31 s after it goes quiet the responder stops evaluating it for good —
+        which is why an operator appending a matching rule saw no fire, and why
+        every "the matcher is broken" reading of #386 was looking in the wrong
+        place (2026-08-30 04:34Z: 81 decisions in 6 s, then nothing).
+
+        Stats the provider's rule file (reloading it if it changed), and when
+        the ruleset is not the one this terminal was last evaluated against,
+        clears the spent retry budget and asks for a tick. Returns whether a
+        re-arm was requested. Called as a LEAF with no responder lock held
+        (F522 #377); never raises into its caller.
+        """
+        try:
+            _store.get_rules(provider_name)  # stats the file; reloads on change
+            generation = _store.generation
+        except Exception:
+            logger.debug(
+                "auto-responder: rule reload check failed for %s", terminal_id, exc_info=True
+            )
+            return False
+        with self._lock:
+            seen = self._rules_generation_seen.get(terminal_id)
+            self._rules_generation_seen[terminal_id] = generation
+        # First sighting is not a change: the terminal has not been evaluated
+        # against an older ruleset, so there is nothing to redo.
+        if seen is None or seen == generation:
+            return False
+        try:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            status_monitor.reset_detection_retry_budget(terminal_id)
+        except Exception:
+            logger.debug(
+                "auto-responder: retry-budget reset failed for %s", terminal_id, exc_info=True
+            )
+            return False
+        self._log_decision(
+            terminal_id, "not_running", "rules_changed_rearm", extra=f"generation={generation}"
+        )
+        self._request_detection_retry(terminal_id)
+        return True
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -825,6 +911,7 @@ class AutoResponder:
             self._logged_region_hashes.pop(terminal_id, None)
             self._settled_signatures.pop(terminal_id, None)
             self._rearm_state.pop(terminal_id, None)
+            self._rules_generation_seen.pop(terminal_id, None)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
             for key in [key for key in self._consumed_digests if key[0] == terminal_id]:
@@ -939,7 +1026,14 @@ class AutoResponder:
             had_history = bool(self._region_history.get(terminal_id))
         banner_marked = self._push_region_history(terminal_id, region)
 
-        for rule in _store.get_rules(provider_name):
+        # F530 #386: remember WHICH ruleset this eval used, so a later edit to
+        # the rule file is distinguishable from a re-read that changed nothing.
+        rules = _store.get_rules(provider_name)
+        rules_generation = _store.generation
+        with self._lock:
+            self._rules_generation_seen[terminal_id] = rules_generation
+
+        for rule in rules:
             if not rule.matches(match_region):
                 continue
             if rule.is_wait:

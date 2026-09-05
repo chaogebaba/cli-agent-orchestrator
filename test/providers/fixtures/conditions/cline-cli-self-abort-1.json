@@ -1,0 +1,11 @@
+{
+  "provider": "cline_cli",
+  "condition": "TRANSIENT_OVERLOAD",
+  "subtype": "self_abort_loop_limit",
+  "reset_hint_raw": "",
+  "source_path": "/data/cao-scratch/f738-build-report.md (§4 Arm A)",
+  "source_line_range": "219-236",
+  "captured_at": "2026-09-03",
+  "sha256": "d5aecdaf9ba7776f11b84e5c7f0fc7fdd2f298d6994813b70e8ede7709abf91b",
+  "note": "Live F738 #595 repro (cline @cline/cli-linux-x64, core 0.0.82), not a scrollback harvest: six byte-identical `sleep 1` tool calls trip cline's loop detector, which self-aborts the run and blames a client that does not exist. Escapes stripped; no reset hint is printed on screen — the classifier's \"re-dispatch the same message\" hint is authored, not pane text. Fills the INDEX gap cline_cli x TRANSIENT_OVERLOAD."
+}

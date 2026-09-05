@@ -41,6 +41,7 @@ from cli_agent_orchestrator.tui.fleet_app import (
     SECTION_MARK,
     STYLE_HINT_KEY,
     STYLE_HINT_LABEL,
+    WORKING_GLYPH,
     FleetApp,
     column_widths,
     detect_tmux_session,
@@ -1320,8 +1321,8 @@ def test_a_busy_flag_never_outranks_a_status_that_says_the_seat_is_resting() -> 
         ("idle", False),
         ("waiting_user_answer", False),
         ("error", False),
-        # not statements of rest — the turn ended, or could not be read
-        ("completed", True),
+        ("completed", False),
+        # not statements of rest — the status could not be read at all
         ("unknown", True),
         ("render_uncertain", True),
         ("processing", True),
@@ -1332,6 +1333,22 @@ def test_a_busy_flag_never_outranks_a_status_that_says_the_seat_is_resting() -> 
         raw["terminals"][0]["condition"] = "BUSY"
         term = FleetState.from_dict(raw, fetched_at=1.0).terminals[0]
         assert is_working(term) is expected, status
+
+
+def test_a_latched_busy_cannot_keep_a_completed_lane_clocking() -> None:
+    """F752 #609: `condition` is written by the F611 fan-out and is never reset
+    when the fused status returns to rest, so `completed [BUSY]` outlives the
+    turn it described. The ELAPSED cell must not answer "how long has this been
+    going" with a climbing green clock for a lane that has finished.
+    """
+    raw = json.loads(json.dumps(load_payload("healthy")))
+    raw["terminals"] = [raw["terminals"][1]]
+    raw["terminals"][0]["status"] = "completed"
+    raw["terminals"][0]["condition"] = "BUSY"
+    term = FleetState.from_dict(raw, fetched_at=1.0).terminals[0]
+
+    assert is_working(term) is False
+    assert WORKING_GLYPH not in elapsed_cell(720.0, True, is_working(term))
 
 
 def test_elapsed_cell_marks_working_rows_and_unbounded_spells() -> None:

@@ -4556,6 +4556,43 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
         )
 
 
+@app.get("/terminals")
+async def list_all_terminals_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict[str, Any]]:
+    """The live terminal roster across every session — the F754 dispatch guard's
+    one source of truth for "does this id still answer to a terminal?".
+
+    `/sessions/{name}/terminals` is session-scoped, so a guard built on it would
+    refuse legitimate cross-session references. This one is unscoped and returns
+    a LEAN projection (id, session, window, profile, provider) rather than the
+    full row: its callers only need the id set plus enough label to name a
+    terminal in an error, and one of those callers is a PreToolUse hook that
+    fires on every dispatch.
+
+    Registered above `/terminals/{terminal_id}`, matching the `by-window`
+    precedent — a literal path must not be shadowed by the id parameter route.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import list_all_terminals
+
+        return [
+            {
+                "id": row["id"],
+                "tmux_session": row.get("tmux_session"),
+                "tmux_window": row.get("tmux_window"),
+                "agent_profile": row.get("agent_profile"),
+                "provider": row.get("provider"),
+            }
+            for row in await asyncio.to_thread(list_all_terminals)
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list terminals: {str(e)}",
+        )
+
+
 @app.get("/terminals/by-window", response_model=Terminal)
 async def resolve_terminal_by_window(session: str, window: str) -> Terminal:
     """Resolve a terminal by its live tmux window. Registered ABOVE
