@@ -64,9 +64,7 @@ def _deliver_with_patches(
         patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,
         patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata") as mock_meta,
         patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages") as mock_pending,
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role"
-        ) as mock_pull,
+        patch("cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role") as mock_pull,
         patch(
             "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
         ) as mock_push,

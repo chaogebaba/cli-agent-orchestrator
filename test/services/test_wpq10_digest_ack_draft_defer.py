@@ -34,8 +34,8 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.services import mailbox_service, terminal_service
 from cli_agent_orchestrator.services import inbox_service as inbox_service_module
+from cli_agent_orchestrator.services import mailbox_service, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.mailbox_service import (
@@ -43,11 +43,11 @@ from cli_agent_orchestrator.services.mailbox_service import (
     claim_mailbox,
     publish_supervisor_incarnation,
 )
-from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
     TranscriptResolution,
 )
+from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
 @pytest.fixture

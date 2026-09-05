@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -58,6 +58,7 @@ class TestFix1PostArmsF136:
         create_inbox_message and before deliver_pending.
         """
         import inspect
+
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
         source = inspect.getsource(create_inbox_message_endpoint)
@@ -71,6 +72,7 @@ class TestFix1PostArmsF136:
     def test_request_delivery_wrapped_in_try_except(self):
         """request_delivery is wrapped in try/except to not break the endpoint."""
         import inspect
+
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
         source = inspect.getsource(create_inbox_message_endpoint)
@@ -224,8 +226,8 @@ class TestFix2StalePathSelfHeal:
         F476 contract: claim → commit → stale-path check → emit. When the
         mailbox path matches metadata, the runner proceeds to write normally.
         """
-        from cli_agent_orchestrator.services.inbox_service import InboxService
         from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
+        from cli_agent_orchestrator.services.inbox_service import InboxService
 
         service = InboxService.__new__(InboxService)
         service._tnf_lock = threading.Lock()

@@ -496,10 +496,12 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
     via the gate; the join is a secondary filter, not a pull-mode protection.
     """
     monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
-    from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
     from cli_agent_orchestrator.clients.database import list_pending_receiver_ids_older_than
+    from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
 
-    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS + 60)
+    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        seconds=INBOX_RECONCILE_GRACE_SECONDS + 60
+    )
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -509,7 +511,11 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
         )
         # Young row (within grace) — should NOT appear
         young_row = _inbox_row(
-            db, "sup-001", logical="mb_sup", message="young msg", created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            db,
+            "sup-001",
+            logical="mb_sup",
+            message="young msg",
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         old_id, young_id = old_row.id, young_row.id
 
@@ -623,11 +629,7 @@ def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
 
     # Verify the attempt is settled (not dangling)
     with scratch_db() as db:
-        attempt = (
-            db.query(InboxDeliveryAttemptModel)
-            .filter_by(attempt_uuid=attempt_uuid)
-            .one()
-        )
+        attempt = db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt_uuid).one()
         assert attempt.settled_at is not None
         assert attempt.outcome == "confirmed"
         assert attempt.reason == "mailbox_pull_acked"
