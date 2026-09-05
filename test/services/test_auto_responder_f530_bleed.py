@@ -597,6 +597,38 @@ class TestTheSecondStall:
         assert fixed().matches(region_of(self.PUSH_PAYLOAD)) is True
         assert ar.canonicalize("Use current directory") in self.PUSH_PAYLOAD
 
+    # A third seat, 5d2d125c at 05:06Z, reported the same way: clean push text,
+    # no match. Its evaluated frame is in its own decisions log and carries the
+    # identical corruption — `ruseycurrent`, one stale cell, in a worktree whose
+    # path differs entirely. Three independent captures, one mechanism.
+    THIRD_REGION = (
+        "choose working directory to resume this session 5d2d125c on cao 5d2d125c is v2 5 0 via "
+        "v3 14 7 on session latest cwd recorded in the resumed session current your current "
+        "working directory 5d2d125c on cao 5d2d125c is v2 5 0 via v3 14 7 on 1 use session "
+        "directory home chao vscode projects cli subagents cli agent orchestrator ec2 ruseycurrent "
+        "directory data cao scratch worktrees cli agent orchestrator 5d2d125c 3 always use session "
+        "directory 5d4 1always useacurrent2directory v2 5 0 via v3 14 7 on codex resume dangerously "
+        "bypass approvals and sandbox no alt screen disable shell snapshot dangerously bypass hook "
+        "trust model gpt 5 6 sol c mcp servers cao mcp server command hpress enter to continuev"
+    )
+
+    def test_the_third_seat_is_the_same_one_cell_bleed(self) -> None:
+        assert "ruseycurrent directory" in self.THIRD_REGION
+        assert ar.canonicalize("Use current directory") not in self.THIRD_REGION
+        rule = fixed()
+        assert rule.reject_reason(region_of(self.THIRD_REGION)) is None
+        assert rule.matches(region_of(self.THIRD_REGION)) is True
+
+    @pytest.mark.parametrize("label", ["second", "third"])
+    def test_both_later_seats_bleed_the_same_option_the_same_way(self, label: str) -> None:
+        """`useycurrent` in two unrelated worktrees. Not a coincidence of paths."""
+        region = self.EVALUATED_REGION if label == "second" else self.THIRD_REGION
+        pattern = ar.bleed_tolerant_pattern(ar.canonicalize("Use current directory"))
+        assert pattern is not None
+        match = pattern.search(region)
+        assert match is not None
+        assert match.group() == "useycurrent directory"
+
 
 class TestTheFalsePositiveBound:
     """The property that matters, stated where it is decided: at the RULE.
