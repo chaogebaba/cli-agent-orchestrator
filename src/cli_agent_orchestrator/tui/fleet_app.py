@@ -223,7 +223,9 @@ WORKING_CONDITION: Final[str] = "BUSY"
 #: Statuses that positively assert the seat is at rest. A ``BUSY`` condition on
 #: one of these is a stale provider flag the fusion has overtaken, never a
 #: reason to call the seat working — see :func:`is_working`.
-RESTING_STATUSES: Final[frozenset[str]] = frozenset({"idle", "waiting_user_answer", "error"})
+RESTING_STATUSES: Final[frozenset[str]] = frozenset(
+    {"idle", "waiting_user_answer", "error", "completed"}
+)
 #: The glyph the STATUS cell already uses for a working seat (``:236``).
 WORKING_GLYPH: Final[str] = "●"
 #: Appended when the status began before this app was watching — a lower bound.
@@ -393,17 +395,22 @@ def is_working(term: TerminalState) -> bool:
     only the ties it leaves:
 
     * ``processing`` is working, full stop;
-    * ``idle``, ``waiting_user_answer`` and ``error`` are **not**, whatever the
-      condition says. These are positive statements of rest, and a live fleet
-      does show ``◌ idle [BUSY]`` — a provider BUSY flag the fusion has already
-      overtaken. Trusting it there would put a climbing green clock next to the
-      word "idle" one column over;
-    * ``completed``, ``unknown`` and ``render_uncertain`` are not statements of
-      rest — the turn ended, or could not be read — so a ``BUSY`` condition is
-      allowed to mean the turn is in fact still open. This is the case that
-      matters: a working ``claude_code`` seat regularly renders
-      ``· completed [BUSY]`` while the fusion catches up, and an operator asking
-      "how long has this been going" wants the answer then too.
+    * ``idle``, ``waiting_user_answer``, ``error`` and ``completed`` are
+      **not**, whatever the condition says. These are positive statements of
+      rest, and a live fleet does show ``◌ idle [BUSY]`` — a provider BUSY flag
+      the fusion has already overtaken. Trusting it there would put a climbing
+      green clock next to the word "idle" one column over;
+    * ``unknown`` and ``render_uncertain`` are not statements of rest — the
+      status could not be read at all — so a ``BUSY`` condition is allowed to
+      break the tie and mean the turn is still open.
+
+    ``completed`` used to sit in the second group, on the reasoning that a
+    working ``claude_code`` seat renders ``· completed [BUSY]`` while the fusion
+    catches up. That was a bet on the condition being fresher than the status,
+    and F752 #609 showed the opposite: ``condition`` is written by the F611
+    fan-out and latches, so the pair outlives the turn and the ELAPSED cell
+    keeps a green clock climbing beside a finished lane. ``completed`` is the
+    end of a turn, which is a statement of rest.
 
     The rule's whole point is that this readout never contradicts the STATUS
     cell beside it.
