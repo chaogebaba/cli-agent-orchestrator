@@ -10,12 +10,11 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 
 # ===========================================================================
 # Fixtures
@@ -82,6 +81,7 @@ class TestParseRegistryTimestamp:
 
     def test_epoch_ms_int(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         # Known epoch-ms: 2026-08-13T12:00:00Z = 1786622400000
         result = _parse_registry_timestamp(1786622400000)
         dt = datetime.fromisoformat(result)
@@ -91,38 +91,45 @@ class TestParseRegistryTimestamp:
 
     def test_epoch_ms_numeric_string(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp("1786622400000")
         dt = datetime.fromisoformat(result)
         assert dt.year == 2026
 
     def test_iso8601_string_passthrough(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         iso = "2026-08-13T12:00:00+00:00"
         result = _parse_registry_timestamp(iso)
         assert result == iso
 
     def test_iso8601_with_z(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         iso = "2026-08-13T12:00:00Z"
         result = _parse_registry_timestamp(iso)
         assert result == iso  # passthrough, downstream handles Z
 
     def test_empty_string(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         assert _parse_registry_timestamp("") == ""
 
     def test_none(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         assert _parse_registry_timestamp(None) == ""
 
     def test_float_epoch_ms(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp(1786622400000.5)
         dt = datetime.fromisoformat(result)
         assert dt.year == 2026
 
     def test_garbage_string(self):
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         # Non-numeric, non-ISO → passthrough (will fail downstream → stale)
         result = _parse_registry_timestamp("not-a-date")
         assert result == "not-a-date"
@@ -130,6 +137,7 @@ class TestParseRegistryTimestamp:
     def test_short_numeric_string_not_epoch(self):
         """Short numeric strings (< 10 digits) are not treated as epoch-ms."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp("12345")
         # Returned as-is since < 10 digits
         assert result == "12345"
@@ -142,6 +150,7 @@ class TestParseRegistryTimestamp:
         Without the heuristic, dividing by 1000 gives 1970-01-21 → always stale.
         """
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp(1786622400)
         dt = datetime.fromisoformat(result)
         assert dt.year == 2026
@@ -151,6 +160,7 @@ class TestParseRegistryTimestamp:
     def test_epoch_seconds_numeric_string_10_digits(self):
         """10-digit numeric string (epoch-seconds) is correctly interpreted."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp("1786622400")
         dt = datetime.fromisoformat(result)
         assert dt.year == 2026
@@ -159,6 +169,7 @@ class TestParseRegistryTimestamp:
     def test_epoch_ms_13_digits_still_correct(self):
         """13-digit epoch-ms (>= 1e12) still handled as milliseconds."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         # 1786622400000 ms = 2026-08-13T12:00:00Z
         result = _parse_registry_timestamp(1786622400000)
         dt = datetime.fromisoformat(result)
@@ -169,6 +180,7 @@ class TestParseRegistryTimestamp:
     def test_epoch_ms_13_digit_numeric_string_still_correct(self):
         """13-digit numeric string epoch-ms still handled as milliseconds."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         result = _parse_registry_timestamp("1786622400000")
         dt = datetime.fromisoformat(result)
         assert dt.year == 2026
@@ -176,6 +188,7 @@ class TestParseRegistryTimestamp:
     def test_threshold_boundary_below(self):
         """Value just below 1e12 is treated as epoch-seconds."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         # 1_786_622_400 seconds = 2026-08-13T12:00:00Z (10-digit, < 1e12)
         result = _parse_registry_timestamp(1_786_622_400)
         dt = datetime.fromisoformat(result)
@@ -184,6 +197,7 @@ class TestParseRegistryTimestamp:
     def test_threshold_boundary_at(self):
         """Value exactly at 1e12 is treated as epoch-milliseconds."""
         from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+
         # 1_000_000_000_000 ms = 2001-09-09T01:46:40Z
         result = _parse_registry_timestamp(1_000_000_000_000)
         dt = datetime.fromisoformat(result)
@@ -200,6 +214,7 @@ class TestReadRegistryEpochCoercion:
 
     def test_epoch_int_updated_at_coerced(self, sessions_dir):
         from cli_agent_orchestrator.services.cc_session_registry import read_registry
+
         now_ms = _epoch_ms_now()
         _make_epoch_registry_record(sessions_dir, 300, updated_at=now_ms)
 
@@ -212,6 +227,7 @@ class TestReadRegistryEpochCoercion:
 
     def test_epoch_int_status_updated_at_coerced(self, sessions_dir):
         from cli_agent_orchestrator.services.cc_session_registry import read_registry
+
         now_ms = _epoch_ms_now()
         _make_epoch_registry_record(sessions_dir, 300, status_updated_at=now_ms)
 
@@ -223,6 +239,7 @@ class TestReadRegistryEpochCoercion:
 
     def test_iso_string_preserved(self, sessions_dir):
         from cli_agent_orchestrator.services.cc_session_registry import read_registry
+
         iso = "2026-08-13T12:00:00+00:00"
         _make_epoch_registry_record(sessions_dir, 300, updated_at=iso, status_updated_at=iso)
 
@@ -245,7 +262,8 @@ class TestResolveTargetEpochFreshness:
 
         now_ms = _epoch_ms_now()
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at=now_ms,
@@ -256,9 +274,18 @@ class TestResolveTargetEpochFreshness:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -276,7 +303,8 @@ class TestResolveTargetEpochFreshness:
         old_dt = datetime.now(timezone.utc) - timedelta(hours=2)
         old_ms = _epoch_ms_from_dt(old_dt)
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at=old_ms,
@@ -287,9 +315,18 @@ class TestResolveTargetEpochFreshness:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -311,7 +348,8 @@ class TestResolveTargetEpochFreshness:
 
         now_ms = str(_epoch_ms_now())
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at=now_ms,
@@ -322,9 +360,18 @@ class TestResolveTargetEpochFreshness:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -346,25 +393,33 @@ class TestVerifyWakeEpochTimestamps:
         """statusUpdatedAt advances as epoch-ms int → verify returns True."""
         from cli_agent_orchestrator.services.cc_session_registry import (
             RegistryRecord,
-            verify_wake,
             _parse_registry_timestamp,
+            verify_wake,
         )
+
         initial_ms = _epoch_ms_now()
         initial_iso = _parse_registry_timestamp(initial_ms)
 
         record_path = _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             status_updated_at=initial_ms,
             proc_start=3000,
         )
 
         record = RegistryRecord(
-            pid=300, session_id="s", cwd="/tmp", tmux="s:@0.%0",
-            version="2.1.231", peer_protocol=1,
+            pid=300,
+            session_id="s",
+            cwd="/tmp",
+            tmux="s:@0.%0",
+            version="2.1.231",
+            peer_protocol=1,
             messaging_socket_path="/tmp/x.sock",
-            proc_start=3000, status="idle",
+            proc_start=3000,
+            status="idle",
             status_updated_at=initial_iso,
-            updated_at=initial_iso, raw={},
+            updated_at=initial_iso,
+            raw={},
         )
 
         # Simulate wake: update statusUpdatedAt after a delay
@@ -387,25 +442,33 @@ class TestVerifyWakeEpochTimestamps:
         """statusUpdatedAt stays same epoch-ms → verify returns False."""
         from cli_agent_orchestrator.services.cc_session_registry import (
             RegistryRecord,
-            verify_wake,
             _parse_registry_timestamp,
+            verify_wake,
         )
+
         fixed_ms = _epoch_ms_now()
         fixed_iso = _parse_registry_timestamp(fixed_ms)
 
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             status_updated_at=fixed_ms,
             proc_start=3000,
         )
 
         record = RegistryRecord(
-            pid=300, session_id="s", cwd="/tmp", tmux="s:@0.%0",
-            version="2.1.231", peer_protocol=1,
+            pid=300,
+            session_id="s",
+            cwd="/tmp",
+            tmux="s:@0.%0",
+            version="2.1.231",
+            peer_protocol=1,
             messaging_socket_path="/tmp/x.sock",
-            proc_start=3000, status="idle",
+            proc_start=3000,
+            status="idle",
             status_updated_at=fixed_iso,
-            updated_at=fixed_iso, raw={},
+            updated_at=fixed_iso,
+            raw={},
         )
 
         result = verify_wake(record, fixed_iso, sessions_dir=sessions_dir, timeout_s=1.0)
@@ -418,24 +481,32 @@ class TestVerifyWakeEpochTimestamps:
             RegistryRecord,
             verify_wake,
         )
+
         # Pre-sample: ISO string from first read
         pre_iso = "2026-08-13T12:00:00+00:00"
 
         # On disk: epoch-ms int that's different
         new_ms = _epoch_ms_now()
         record_path = _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             status_updated_at=new_ms,  # int on disk
             proc_start=3000,
         )
 
         record = RegistryRecord(
-            pid=300, session_id="s", cwd="/tmp", tmux="s:@0.%0",
-            version="2.1.231", peer_protocol=1,
+            pid=300,
+            session_id="s",
+            cwd="/tmp",
+            tmux="s:@0.%0",
+            version="2.1.231",
+            peer_protocol=1,
             messaging_socket_path="/tmp/x.sock",
-            proc_start=3000, status="idle",
+            proc_start=3000,
+            status="idle",
             status_updated_at=pre_iso,
-            updated_at=pre_iso, raw={},
+            updated_at=pre_iso,
+            raw={},
         )
 
         # Should detect as changed since normalized timestamps differ
@@ -456,7 +527,8 @@ class TestFailClosedPreserved:
         from cli_agent_orchestrator.services.cc_session_registry import resolve_target
 
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at="not-a-valid-timestamp",
@@ -467,9 +539,18 @@ class TestFailClosedPreserved:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -490,7 +571,8 @@ class TestFailClosedPreserved:
         from cli_agent_orchestrator.services.cc_session_registry import resolve_target
 
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at="",
@@ -501,9 +583,18 @@ class TestFailClosedPreserved:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -518,7 +609,6 @@ class TestFailClosedPreserved:
         assert result.refusal_reason is None
         assert result.stale is True
         assert result.record is not None
-
 
 
 # ===========================================================================
@@ -536,7 +626,8 @@ class TestNegativeAgeFarFutureStale:
         # 10_000_000_000 seconds = year 2286 — far future, negative age
         far_future_s = 10_000_000_000
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at=far_future_s,
@@ -547,9 +638,18 @@ class TestNegativeAgeFarFutureStale:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -571,7 +671,8 @@ class TestNegativeAgeFarFutureStale:
 
         # 100_000_000_000 seconds ≈ year 5138
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at="100000000000",
@@ -582,9 +683,18 @@ class TestNegativeAgeFarFutureStale:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0
@@ -607,7 +717,8 @@ class TestNegativeAgeFarFutureStale:
         # 1 second ago in epoch-seconds
         just_now_s = int(time.time()) - 1
         _make_epoch_registry_record(
-            sessions_dir, 300,
+            sessions_dir,
+            300,
             tmux="s:@0.%0",
             proc_start=3000,
             updated_at=just_now_s,
@@ -618,9 +729,18 @@ class TestNegativeAgeFarFutureStale:
                 "cli_agent_orchestrator.services.cc_session_registry.first_pane",
                 return_value=("%0", 100),
             ),
-            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
-            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
-            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._descendants",
+                return_value=[100, 300],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._read_proc_start",
+                return_value=3000,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+                return_value="@0",
+            ),
             patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
         ):
             mock_cfg.get.return_value = 900.0

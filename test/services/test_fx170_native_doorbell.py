@@ -18,10 +18,10 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -208,6 +208,7 @@ class TestAC2WireFormat:
     def test_from_address_matches_pattern(self, socket_stub):
         """from field matches ^bridge:cao-[A-Za-z0-9._-]{1,64}$."""
         import re
+
         from cli_agent_orchestrator.services.cc_session_registry import (
             build_wake_payload,
             write_to_socket,
@@ -299,6 +300,7 @@ class TestAC3NoAuthFrame:
 
         # More direct: verify the module never references .key files
         import inspect
+
         import cli_agent_orchestrator.services.cc_session_registry as mod
 
         source = inspect.getsource(mod)
@@ -1242,6 +1244,7 @@ class TestAC13SocketErrorsFallback:
     def test_timeout_does_not_raise(self):
         """Socket timeout => returns error string."""
         import socket as sock_mod
+
         from cli_agent_orchestrator.services.cc_session_registry import write_to_socket
 
         with patch("socket.socket.connect", side_effect=sock_mod.timeout("timed out")):
@@ -1673,8 +1676,8 @@ class TestFX170S2StringCoercion:
         (sessions_dir / "500.json").write_text(json.dumps(record_data))
 
         from cli_agent_orchestrator.services.cc_session_registry import (
-            read_registry,
             check_version_guard,
+            read_registry,
         )
 
         records = read_registry(sessions_dir)

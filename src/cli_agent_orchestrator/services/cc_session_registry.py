@@ -109,8 +109,10 @@ def _extract_sender_and_content(payload_line: str) -> tuple[Optional[str], Optio
     msg = obj.get("message") if isinstance(obj, dict) else None
     if isinstance(msg, dict):
         content = msg.get("content")
-    return (sender if isinstance(sender, str) else None,
-            content if isinstance(content, str) else None)
+    return (
+        sender if isinstance(sender, str) else None,
+        content if isinstance(content, str) else None,
+    )
 
 
 def _dedupe_window_size() -> int:
@@ -285,7 +287,7 @@ def _read_proc_start(pid: int) -> Optional[int]:
     try:
         stat_text = (proc_root / str(pid) / "stat").read_text()
         # Fields after the comm (enclosed in parens)
-        tail = stat_text[stat_text.rfind(")") + 2:].split()
+        tail = stat_text[stat_text.rfind(")") + 2 :].split()
         # Field indices: 0=state,1=ppid,...,19=starttime (0-indexed from after comm)
         return int(tail[19])
     except (OSError, ValueError, IndexError):
@@ -337,20 +339,22 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
         # F216: coerce explicit JSON null → "" for all string fields.
         # dict.get(key, default) returns None when the key IS present with value
         # null; the `or ""` pattern normalizes that to empty-string at parse time.
-        records.append(RegistryRecord(
-            pid=int(stem),
-            session_id=data.get("sessionId", "") or "",
-            cwd=data.get("cwd", "") or "",
-            tmux=data.get("tmux", "") or "",
-            version=data.get("version", "") or "",
-            peer_protocol=peer_protocol,
-            messaging_socket_path=data.get("messagingSocketPath", "") or "",
-            proc_start=proc_start,
-            status=data.get("status", "") or "",
-            status_updated_at=status_updated_at,
-            updated_at=updated_at,
-            raw=data,
-        ))
+        records.append(
+            RegistryRecord(
+                pid=int(stem),
+                session_id=data.get("sessionId", "") or "",
+                cwd=data.get("cwd", "") or "",
+                tmux=data.get("tmux", "") or "",
+                version=data.get("version", "") or "",
+                peer_protocol=peer_protocol,
+                messaging_socket_path=data.get("messagingSocketPath", "") or "",
+                proc_start=proc_start,
+                status=data.get("status", "") or "",
+                status_updated_at=status_updated_at,
+                updated_at=updated_at,
+                raw=data,
+            )
+        )
     return records
 
 
@@ -697,8 +701,7 @@ def read_peer_token(
                 continue
             if key_proc_start != expected_proc_start:
                 logger.debug(
-                    "f337_peer_token_procstart_mismatch pid=%s "
-                    "key_procstart=%s expected=%s",
+                    "f337_peer_token_procstart_mismatch pid=%s " "key_procstart=%s expected=%s",
                     pid,
                     data.get("procStart"),
                     expected_proc_start,
