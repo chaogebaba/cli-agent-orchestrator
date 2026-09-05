@@ -49,8 +49,8 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import (
     InboxService,
-    _IdentityAuthorityEpisode,
     _fx158_gate5_last_warn,
+    _IdentityAuthorityEpisode,
 )
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
@@ -86,9 +86,7 @@ def f424_db(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", sessions)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.mailbox_service.SessionLocal", sessions
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.mailbox_service.SessionLocal", sessions)
     clear_terminal_metadata_cache()
     from cli_agent_orchestrator.services import inbox_service as inbox_mod
 
@@ -127,14 +125,18 @@ def _ambiguous_on(
         provider,
         "digest",
         4,
-        evidence=json.dumps({"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}),
+        evidence=json.dumps(
+            {"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}
+        ),
     )
     settle_delivery_attempt(
         attempt,
         MessageStatus.PENDING,
         "ambiguous",
         reason="confirmation_timeout",
-        evidence=json.dumps({"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}),
+        evidence=json.dumps(
+            {"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}
+        ),
     )
     return (batch if extra_messages is not None else messages[0]), attempt
 
@@ -232,7 +234,9 @@ def _gate_attempt(*, provider: str = "claude_code") -> dict:
         "started_at": datetime.now(timezone.utc) - timedelta(minutes=2),
         "settled_at": datetime.now(timezone.utc) - timedelta(minutes=1),
         "prior_attempt_uuid": None,
-        "evidence": json.dumps({"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}),
+        "evidence": json.dumps(
+            {"resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10}
+        ),
     }
 
 
@@ -299,9 +303,7 @@ def test_wpm1_non_claude_metadata_is_not_authoritative(f424_db):
         svc.deliver_pending(receiver)
     assert ctx.settle.call_count == 0
     wpm1_delivered = [
-        args
-        for args, kwargs in ctx.settle_calls
-        if args[1] is MessageStatus.DELIVERED
+        args for args, kwargs in ctx.settle_calls if args[1] is MessageStatus.DELIVERED
     ]
     assert wpm1_delivered == []
 
@@ -519,7 +521,10 @@ def _f136_run_with_batch(
             return NativeInboxWriteResult(kind="written")
 
     with (
-        patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock", return_value=mock_lock),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+            return_value=mock_lock,
+        ),
         patch(
             "cli_agent_orchestrator.services.mailbox_service.get_mailbox_authority_lock",
             return_value=mock_lock,
@@ -536,9 +541,7 @@ def _f136_run_with_batch(
         patch(
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
             return_value=(
-                {"metadata": {"cc_team_inbox_path": inbox_meta_path}}
-                if inbox_meta_path
-                else None
+                {"metadata": {"cc_team_inbox_path": inbox_meta_path}} if inbox_meta_path else None
             ),
         ),
         patch(
@@ -607,9 +610,19 @@ def test_f136_no_path_kind_invokes_f150_self_heal():
         reason="no_inbox_path_configured",
     )
     outcome, heal = _f136_run_with_batch(batch, heal=False)
+    # F150's self-heal is still ATTEMPTED, which is what this kill is about and
+    # what the mutant it names would remove.
     heal.assert_called_once()
-    assert outcome.reason == "no_path"
-    assert outcome.retryable_failure_count == 1
+    # WP-ARCH 3b / A1.5: a missing content channel is no longer a REFUSAL.
+    #
+    # `cc_inbox_path` is K2's pull-mode file, written only when
+    # supervisor.mailbox_pull is on — which A1.5 keeps at its shipped False. The
+    # old `no_path` return left `written` at zero, held the doorbell's
+    # `written > 0` gate shut, and left the seat neither pasted nor woken, which
+    # is #604 arriving through the amendment written to end it. The run now
+    # proceeds and the wake carries ids while the seat drains bodies by ack.
+    assert outcome.reason != "no_path"
+    assert outcome.retryable_failure_count == 0
 
 
 def test_f136_written_kind_increments_outcome_written():
@@ -962,8 +975,11 @@ def test_reconcile_pull_mode_push_selects_only_own_mailbox_rows(f424_db, monkeyp
     )
 
     def _cfg(path, default=None, **_kw):
-        if path in {"supervisor.mailbox_pull", "supervisor.teammate_push",
-                    "supervisor.wake.native"}:
+        if path in {
+            "supervisor.mailbox_pull",
+            "supervisor.teammate_push",
+            "supervisor.wake.native",
+        }:
             return True
         return default
 

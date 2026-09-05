@@ -7736,11 +7736,15 @@ def _refresh_if_persistent(db: Any, row: Any) -> None:
     refresh they have always done.
     """
     try:
-        from sqlalchemy import inspect as _sa_inspect
-
-        if _sa_inspect(row).persistent:
-            db.refresh(row)
+        db.refresh(row)
     except Exception:  # noqa: BLE001 — a refresh that cannot run is not a failure
+        # TRIED rather than pre-checked with ``inspect(row).persistent``.
+        # A mocked session holds no identity map, so a row added to one is never
+        # "persistent" and a pre-check would skip the refresh the caller's own
+        # double is standing in for — turning a passing legacy test red for a
+        # path that has not changed. The only row this is expected to raise on
+        # is the write-through's never-added instance, whose fields the choke
+        # point has already filled in.
         logger.debug("wp_arch_refresh_skipped", exc_info=True)
 
 
