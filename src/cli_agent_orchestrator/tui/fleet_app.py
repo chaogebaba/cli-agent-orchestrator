@@ -518,6 +518,52 @@ def read_window_ages(
     return ages
 
 
+def read_pane_id(tmux: Runner, session: str, window_index: int) -> str | None:
+    """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``).
+
+    F544: a window target resolves to the *active* pane, so every reader names
+    the first pane — the one CAO started — by id instead.
+
+    Module-level so the live app and ``--once`` issue the same tmux read; the
+    app passes its own gated runner, which is what keeps the verb allowlist
+    (AC4) over both paths.
+    """
+    panes = tmux(["list-panes", "-t", f"{session}:{window_index}", "-F", "#{pane_id}"])
+    if not panes:
+        return None
+    first = panes.splitlines()[0].strip()
+    return first or None
+
+
+def read_pane_tail(
+    tmux: Runner,
+    session: str,
+    window_index: int,
+    lines_wanted: int,
+    pane: str | None = None,
+) -> List[str]:
+    """Last ``lines_wanted`` non-blank-tail lines of a pane (``:138-148``)."""
+    target = pane or f"{session}:{window_index}"
+    out = tmux(["capture-pane", "-p", "-e", "-S", "-200", "-t", target])
+    if out is None:
+        return ["(capture failed)"]
+    lines = [line.rstrip() for line in out.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-lines_wanted:] if lines else ["(blank)"]
+
+
+def capture_once(
+    tmux: Runner,
+    session: str,
+    window_index: int,
+    lines_wanted: int,
+) -> Tuple[str | None, List[str]]:
+    """``(pane id, tail)`` for the ``--once`` peek — one resolve, one capture."""
+    pane = read_pane_id(tmux, session, window_index)
+    return pane, read_pane_tail(tmux, session, window_index, lines_wanted, pane)
+
+
 def sort_terminals(terminals: Sequence[TerminalState]) -> List[TerminalState]:
     """Supervisors first, then workers, each by window index.
 
@@ -1302,18 +1348,8 @@ class FleetApp(App[None]):
         return next((t for t in self.state.terminals if t.id == selected), None)
 
     def resolve_pane(self, window_index: int) -> str | None:
-        """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``).
-
-        F544: a window target resolves to the *active* pane, so the capture and
-        the banner both name the first pane — the one CAO started — by id.
-        """
-        panes = self.tmux(
-            ["list-panes", "-t", f"{self.session}:{window_index}", "-F", "#{pane_id}"]
-        )
-        if not panes:
-            return None
-        first = panes.splitlines()[0].strip()
-        return first or None
+        """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``)."""
+        return read_pane_id(self.tmux, self.session, window_index)
 
     def capture_window(
         self,
@@ -1328,15 +1364,8 @@ class FleetApp(App[None]):
         """
         if pane is None:
             pane = self.resolve_pane(window_index)
-        target = pane or f"{self.session}:{window_index}"
-        out = self.tmux(["capture-pane", "-p", "-e", "-S", "-200", "-t", target])
-        if out is None:
-            return ["(capture failed)"]
-        lines = [line.rstrip() for line in out.splitlines()]
-        while lines and not lines[-1].strip():
-            lines.pop()
         wanted = self.peek_lines if peek is None else self.peek_capacity(peek)
-        return lines[-wanted:] if lines else ["(blank)"]
+        return read_pane_tail(self.tmux, self.session, window_index, wanted, pane)
 
     def peek_title(self, term: TerminalState, pane: str | None = None) -> str:
         """The peek banner (``fleet-tui.py:441-443``): who, where, how idle.
@@ -1559,6 +1588,56 @@ class FleetApp(App[None]):
 # ── one-shot rendering (`--once`) ────────────────────────────────────────────
 
 
+def snapshot_elapsed(
+    rows: Sequence[TerminalState],
+    ages: Mapping[str, float] | None,
+) -> Dict[str, str]:
+    """ELAPSED cells for a frame with no history behind it (``--once``).
+
+    The live view times the status itself, against the previous fetch. One
+    snapshot has no previous fetch, so the age has to come from the snapshot:
+    tmux ``window_activity``, which is the number the retiring script printed
+    under ``IDLE`` for exactly this reason (``fleet-tui.py:326,352-353``).
+
+    It is a weaker claim than the live column's, and it is marked as one — the
+    ``+`` suffix already means "at least this long, the transition in was never
+    seen", which is precisely what "the pane has been silent this long" licenses
+    for a resting seat. A working row still carries its ``●`` so the two-signal
+    language matches the live table.
+
+    When the server grows the ``status_since`` field
+    (:class:`~cli_agent_orchestrator.tui.fleet_state.StatusClock` names it),
+    this is the function that should read it and drop the ``+``.
+    """
+    if not ages:
+        return {}
+    cells: Dict[str, str] = {}
+    for term in rows:
+        age = ages.get(window_key(term))
+        if age is None:
+            continue
+        cells[term.id] = elapsed_cell(age, False, is_working(term))
+    return cells
+
+
+def snapshot_peek_title(
+    term: TerminalState,
+    pane: str | None,
+    ages: Mapping[str, float] | None,
+) -> str:
+    """The ``--once`` peek banner (``fleet-tui.py:441-443``).
+
+    The live banner names two clocks; this one can only name ``quiet``, for the
+    same reason :func:`snapshot_elapsed` exists.
+    """
+    status = status_cell(status_row(term)).plain.removeprefix("· ")
+    quiet = (ages or {}).get(window_key(term))
+    return (
+        f"{SECTION_MARK} peek · {term.profile}-{term.id} · win {window_key(term)}"
+        f" · {pane or '?'} · {status} · quiet {fmt_age(quiet)}"
+    )
+
+
 def format_frame(
     session: str,
     state: FleetState,
@@ -1568,6 +1647,9 @@ def format_frame(
     latency_ms: int | None = None,
     clock: str = "",
     selected: str | None = None,
+    ages: Mapping[str, float] | None = None,
+    peek: Sequence[str] | None = None,
+    pane: str | None = None,
 ) -> str:
     """One plain-text frame — what ``--once`` prints (``fleet-tui.py:571-574``).
 
@@ -1575,11 +1657,20 @@ def format_frame(
     widest cell, plus a two-space gutter (``:362-370``). No colour: the output
     is meant for a pipe, a snapshot or a bug report.
 
-    ELAPSED reads ``-`` throughout: one fetch has no earlier fetch to time a
-    transition against, and no server field carries the transition stamp (see
-    :class:`StatusClock`). Printing a window-activity age there instead would
-    put a number under the new column's name that does not mean what the column
-    says.
+    ``ages`` is ``{window_index: seconds since that pane last printed}`` — the
+    script's own IDLE source (``fleet-tui.py:115-118``) and the only age a
+    single snapshot can carry, since no server field records when a status
+    began (see :class:`StatusClock`). It is rendered with the ``+`` the live
+    view uses for the same claim: *at least* this long, because the transition
+    into the status was never witnessed. A working row keeps its ``●``. Passing
+    nothing leaves every cell ``-``.
+
+    ``peek`` and ``pane`` are the selected row's captured tail and the pane id
+    it came from; given them, the frame ends with the script's peek section
+    (``:440-451``) instead of stopping after the hints. The capture is **not**
+    clipped to a terminal width the way the script clips it: ``--once`` writes
+    to a pipe, and truncating there would drop the very information a bug
+    report is being taken for.
     """
     rows = sort_terminals(state.terminals)
     workers = sum(1 for term in rows if term.parent_id)
@@ -1591,7 +1682,7 @@ def format_frame(
         f"{SECTION_MARK} CAO fleet · {session}  {clock} · {workers} workers · fetch {latency}"
     )
     out.append("")
-    values = [row_values(term, labels) for term in rows]
+    values = [row_values(term, labels, elapsed_cells=snapshot_elapsed(rows, ages)) for term in rows]
     widths = column_widths(PARITY_COLUMNS, values)
     header = header_line(PARITY_COLUMNS, widths)
     out.append(header)
@@ -1604,6 +1695,11 @@ def format_frame(
     if events:
         out += ["", f"{SECTION_MARK} recent"] + [f"{EVENT_INDENT}{line}" for line in events]
     out += ["", hint_text()]
+    if peek is not None:
+        chosen = next((term for term in rows if term.id == selected), None)
+        if chosen is not None:
+            out += ["", snapshot_peek_title(chosen, pane, ages), PEEK_RULE_GLYPH * len(header)]
+            out += list(peek)
     return "\n".join(out) + "\n"
 
 
@@ -1616,8 +1712,20 @@ def render_once(
     labels_path: Path = LABELS_PATH,
     events_path: Path = EVENTS_PATH,
     now: Callable[[], float] = time.time,
+    peek_lines: int = PEEK_LINES_DEFAULT,
 ) -> str:
-    """Fetch once and return the frame; no Textual app, no terminal needed."""
+    """Fetch once and return the frame; no Textual app, no terminal needed.
+
+    Everything the live view shows is in this frame: the script's ``--once``
+    prints the age column and the peek section too (``fleet-tui.py:571-574``
+    renders the same function the loop does), and a frame that silently drops
+    them is a worse bug report than a wider one.
+
+    The three tmux reads it takes to do that — ``list-windows`` for the ages,
+    ``list-panes`` and ``capture-pane`` for the peek — are all reads (AC4). Each
+    degrades on its own: no tmux means ``ELAPSED -`` and no peek section, never
+    a failure.
+    """
     url = f"{endpoint.rstrip('/')}/sessions/{session}/fleet"
     started = now()
     latency: int | None = None
@@ -1629,6 +1737,11 @@ def render_once(
         latency = int((now() - started) * 1000)
         state = FleetState.from_dict(raw, fetched_at=now())
     rows = sort_terminals(state.terminals)
+    ages = read_window_ages(runner, session, now=now)
+    pane: str | None = None
+    peek: List[str] | None = None
+    if rows and rows[0].window_index is not None:
+        pane, peek = capture_once(runner, session, rows[0].window_index, peek_lines)
     return format_frame(
         session,
         state,
@@ -1637,6 +1750,9 @@ def render_once(
         latency_ms=latency,
         clock=time.strftime("%H:%M:%S", time.localtime(now())),
         selected=rows[0].id if rows else None,
+        ages=ages,
+        peek=peek,
+        pane=pane,
     )
 
 

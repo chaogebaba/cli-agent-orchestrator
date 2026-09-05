@@ -11,10 +11,11 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import pytest
 from rich.text import Text
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, Static
@@ -50,6 +51,8 @@ from cli_agent_orchestrator.tui.fleet_app import (
     STYLE_HINT_LABEL,
     STYLE_WORKING,
     FleetApp,
+    Runner,
+    capture_once,
     column_widths,
     detect_tmux_session,
     elapsed_cell,
@@ -66,6 +69,7 @@ from cli_agent_orchestrator.tui.fleet_app import (
     render_once,
     row_styles,
     row_values,
+    snapshot_elapsed,
     sort_terminals,
 )
 from cli_agent_orchestrator.tui.fleet_state import FleetState, StatusClock, StatusSpell
@@ -233,6 +237,27 @@ def cell(table: DataTable[Any], row: int, column: int) -> Any:
 def plain(table: DataTable[Any], row: int, column: int) -> str:
     value = cell(table, row, column)
     return value.plain if isinstance(value, Text) else str(value)
+
+
+def app_bindings() -> List[Binding]:
+    """`FleetApp.BINDINGS` narrowed to `Binding`.
+
+    Textual types the class attribute as a union that also admits raw key
+    tuples; this app declares only `Binding`s, and asserting that here is what
+    lets the strict type check read `.key`/`.action` off them.
+    """
+    bindings = []
+    for binding in FleetApp.BINDINGS:
+        assert isinstance(binding, Binding), binding
+        bindings.append(binding)
+    return bindings
+
+
+def spell_of(clock: StatusClock, terminal_id: str) -> StatusSpell:
+    """`clock.spell(id)`, asserting the spell the test is about exists."""
+    spell = clock.spell(terminal_id)
+    assert spell is not None, f"no spell for {terminal_id}"
+    return spell
 
 
 async def wait_for_sleeps(pilot: Any, feed: Feed, count: int) -> None:
@@ -666,7 +691,7 @@ async def test_q_quits(tmp_path: Path) -> None:
 async def test_every_binding_names_an_action_the_app_implements(tmp_path: Path) -> None:
     """No binding can point at a missing action (the key set is the contract)."""
     keys = set()
-    for binding in FleetApp.BINDINGS:
+    for binding in app_bindings():
         keys.add(binding.key)
         if binding.action != "quit":
             assert hasattr(FleetApp, f"action_{binding.action}"), binding
@@ -718,7 +743,7 @@ HINT_COVERAGE = {
 def test_every_binding_key_is_covered_by_an_on_screen_hint() -> None:
     """Gap 1: d/s/p/c (and the rest) are discoverable without the source."""
     text = hint_text()
-    for binding in FleetApp.BINDINGS:
+    for binding in app_bindings():
         assert binding.key in HINT_COVERAGE, f"binding {binding.key} has no hint"
         assert HINT_COVERAGE[binding.key] in text, binding.key
     for key, label in KEY_HINTS:
@@ -1305,7 +1330,7 @@ def test_a_loud_condition_tag_is_not_dimmed() -> None:
 
 def restatus(payload: Dict[str, Any], terminal_id: str, status: str) -> Dict[str, Any]:
     """The same payload with one terminal moved to another status."""
-    copy = json.loads(json.dumps(payload))
+    copy: Dict[str, Any] = json.loads(json.dumps(payload))
     for term in copy["terminals"]:
         if term["id"] == terminal_id:
             term["status"] = status
@@ -1456,7 +1481,7 @@ def test_the_clock_keeps_a_spell_while_the_status_holds() -> None:
     clock.observe(clock_terms(("a", "processing")), now=100.0)
     clock.observe(clock_terms(("a", "processing")), now=160.0)
     clock.observe(clock_terms(("a", "processing")), now=220.0)
-    assert clock.spell("a").since == 100.0
+    assert spell_of(clock, "a").since == 100.0
     assert clock.elapsed("a", now=220.0) == 120.0
 
 
@@ -1478,7 +1503,7 @@ def test_a_condition_change_is_not_a_transition() -> None:
     with_busy = list(FleetState.from_dict(raw, fetched_at=0.0).terminals)
     clock.observe(with_busy, now=100.0)
     clock.observe(clock_terms(("a", "completed")), now=160.0)
-    assert clock.spell("a").since == 100.0
+    assert spell_of(clock, "a").since == 100.0
 
 
 def test_the_clock_forgets_a_terminal_that_leaves_the_fleet() -> None:
@@ -1611,7 +1636,11 @@ async def test_an_empty_fleet_says_no_workers_under_the_table_header(
         assert app.table.row_count == 0
         empty = app.query_one("#empty", Static)
         assert empty.display is True
-        assert str(empty.render()).strip() == EMPTY_ROWS_TEXT
+        # The literal, not the constant: comparing the render against
+        # EMPTY_ROWS_TEXT passes just as happily when the constant is emptied,
+        # which is how the gate's M12 mutant survived round 1.
+        assert str(empty.render()).strip() == "(no workers)"
+        assert EMPTY_ROWS_TEXT == "(no workers)"
         # the header and its rule stay: an empty table under a header reads as
         # an empty fleet, a blank screen reads as a broken TUI
         assert "WIN" in str(app.query_one("#table-head", Static).render())
@@ -1632,7 +1661,7 @@ async def test_the_no_workers_line_disappears_once_a_row_arrives(
 
 def test_the_once_frame_and_the_app_use_the_same_empty_line() -> None:
     frame = format_frame("s", FleetState.empty(), {}, [])
-    assert f"  {EMPTY_ROWS_TEXT}" in frame
+    assert "  (no workers)" in frame
 
 
 # ── the peek's line clipping (script `ansi_clip`, :151-169,451) ──────────────
@@ -1751,3 +1780,145 @@ async def test_the_flash_expiry_is_armed_on_its_own_timer(tmp_path: Path) -> Non
             and getattr(timer._callback, "__name__", "") == "expire_flash"
         ]
         assert intervals == [FLASH_TICK_SECONDS]
+
+
+# ── round 2: the `--once` frame carries the age and the peek ─────────────────
+#
+# EMPIRICAL-GATE-NO on ae3c2011, blockers 1 and 2: replaying one immutable
+# snapshot to both implementations, legacy printed IDLE ages 0s/8m/0s and a
+# full peek section (banner, pane id, quiet age, captured lines); Textual
+# printed `ELAPSED -` for every row and stopped after the key hints. That is
+# missing information in the surface a bug report is taken with.
+
+
+def once_tmux(
+    *,
+    activity: str = "0 940\n2 1000\n3 700\n",
+    panes: str | None = "%287\n",
+    capture: str | None = "first line\nlast line\n\n\n",
+) -> Runner:
+    """A canned tmux for `render_once`, answering its three reads."""
+
+    def runner(args: Sequence[str]) -> str | None:
+        return {"list-windows": activity, "list-panes": panes, "capture-pane": capture}.get(
+            args[0], ""
+        )
+
+    return runner
+
+
+def table_rows(frame: str) -> List[str]:
+    """Just the terminal rows of a `--once` frame — never a section title."""
+    return [
+        line
+        for line in frame.splitlines()
+        if "term-000" in line and not line.startswith(SECTION_MARK)
+    ]
+
+
+def once_frame(tmp_path: Path, **kwargs: Any) -> str:
+    return render_once(
+        "f702-test",
+        "http://127.0.0.1:9889",
+        fetch=lambda url, timeout=5.0: load_payload("healthy"),
+        labels_path=tmp_path / "absent-labels.tsv",
+        events_path=tmp_path / "absent-events.log",
+        now=lambda: 1000.0,
+        **kwargs,
+    )
+
+
+def test_the_once_frame_carries_a_real_age_for_every_row(tmp_path: Path) -> None:
+    """Blocker 1: the ELAPSED column is the script's window-activity age.
+
+    The clock reads 1000; window 0 last printed at 940 (60 s), window 2 at
+    1000 (0 s), window 3 at 700 (5 m). Every value is a lower bound (`+`),
+    because one snapshot cannot witness a transition, and the working row keeps
+    its `●` — the same two-signal language the live table uses.
+    """
+    frame = once_frame(tmp_path, runner=once_tmux())
+    rows = table_rows(frame)
+    assert len(rows) == 3
+    assert rows[0].endswith("60s+")  # term-0001, idle, window 0
+    assert rows[1].endswith("● 0s+")  # term-0002, working, window 2
+    assert rows[2].endswith("5m+")  # term-0003, completed, window 3
+    assert " -" not in " ".join(row.split()[-1] for row in rows)
+
+
+def test_the_once_frame_falls_back_to_a_dash_when_tmux_is_silent(
+    tmp_path: Path,
+) -> None:
+    """No tmux is a degraded frame, never a failed one — and never a fake age.
+
+    The peek section still appears, carrying the script's own `(capture
+    failed)` line (`fleet-tui.py:143-144`): a named failure is information, a
+    silently absent section is not.
+    """
+    frame = once_frame(tmp_path, runner=lambda args: None)
+    rows = table_rows(frame)
+    assert len(rows) == 3
+    for row in rows:
+        assert row.split()[-1] == ELAPSED_UNKNOWN
+    banner = next(line for line in frame.splitlines() if line.startswith(f"{SECTION_MARK} peek"))
+    assert banner.endswith("quiet -")
+    assert frame.splitlines()[-1] == "(capture failed)"
+
+
+def test_the_once_frame_ends_with_the_peek_section(tmp_path: Path) -> None:
+    """Blocker 2: banner, pane id, quiet age, double rule, captured lines."""
+    frame = once_frame(tmp_path, runner=once_tmux())
+    lines = frame.splitlines()
+    banner = next(line for line in lines if line.startswith(f"{SECTION_MARK} peek"))
+    # the selected (first) row, its window, the resolved pane, its status
+    assert "chao_supervisor-term-0001" in banner
+    assert "win 0" in banner
+    assert "%287" in banner
+    assert "◌ idle" in banner
+    assert banner.endswith("quiet 60s")
+    rule = lines[lines.index(banner) + 1]
+    assert set(rule) == {PEEK_RULE_GLYPH}
+    # the capture itself, trailing blank lines trimmed as the script trims them
+    assert lines[lines.index(banner) + 2 :] == ["first line", "last line"]
+
+
+def test_the_once_peek_says_question_mark_when_the_pane_cannot_be_named(
+    tmp_path: Path,
+) -> None:
+    frame = once_frame(tmp_path, runner=once_tmux(panes=None))
+    banner = next(line for line in frame.splitlines() if line.startswith(f"{SECTION_MARK} peek"))
+    assert " · ? · " in banner
+
+
+def test_the_once_frame_does_not_clip_a_wide_capture_line(tmp_path: Path) -> None:
+    """A pipe has no width, and truncating there loses the report's payload.
+
+    The live peek crops (the screen has an edge); `--once` must not.
+    """
+    wide = "y" * 500
+    frame = once_frame(tmp_path, runner=once_tmux(capture=f"{wide}\n"))
+    assert wide in frame.splitlines()
+
+
+def test_snapshot_elapsed_marks_every_age_as_a_lower_bound() -> None:
+    """The `+` is the honest part: no snapshot field records a transition."""
+    rows = sort_terminals(FleetState.from_dict(load_payload("healthy"), fetched_at=1.0).terminals)
+    cells = snapshot_elapsed(rows, {"0": 61.0, "2": 0.0})
+    assert cells["term-0001"] == "61s+"
+    assert cells["term-0002"] == "● 0s+"
+    assert "term-0003" not in cells  # no age for its window: the cell stays `-`
+    assert snapshot_elapsed(rows, None) == {}
+
+
+def test_capture_once_resolves_the_pane_then_captures_it() -> None:
+    """One `list-panes` and one `capture-pane`, and the capture is by pane id."""
+    calls: List[List[str]] = []
+
+    def runner(args: Sequence[str]) -> str | None:
+        calls.append(list(args))
+        return "%287\n" if args[0] == "list-panes" else "body\n"
+
+    pane, lines = capture_once(runner, "f702-test", 4, 10)
+    assert pane == "%287"
+    assert lines == ["body"]
+    assert [call[0] for call in calls] == ["list-panes", "capture-pane"]
+    assert calls[1][-1] == "%287"
