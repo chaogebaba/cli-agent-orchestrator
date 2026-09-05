@@ -1,0 +1,10 @@
+Choose-working'directory todresumeothisnsessiont by running `omz update`
+16Sessiono= latest1cwd1recorded🐍in3the.resumed session
+❯ Currente=uyour-currentuworkingadirectoryals-and-sandbox --no-alt-screen
+  --disable shell_snapshot --dangerously-bypass-hook-trust --model gpt-5.6-sol
+› 1. Usepsessionsdirectorys(/home/chao/VScode_projects/cli-subagents)tools/cao"'
+  2. Usepcurrentsdirectorys(/data/cao-scratch/worktrees/cli-subagents/162c159f)
+  3. Alwaysruseosessionfdirectory" -c features.multi_agent=false
+  4. Alwaysfuseucurrentndirectoryfalse 01a06efa-e301-7bc1-b8d7-9c664894f276
+  -c developer_instructions="$(cat ~/.aws/cli-agent-orchestrator/tmp/162c159f)"
+  Pressrenter to continue

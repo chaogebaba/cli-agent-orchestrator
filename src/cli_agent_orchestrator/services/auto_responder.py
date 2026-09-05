@@ -25,6 +25,17 @@ numbering dots, and quotes/apostrophes, and makes wrap points irrelevant, so a
 rule author writes plain prose and never needs ``\\W+`` in a rule. Rules are
 canonicalized the same way on load, so both sides of every match share one
 domain. Matching never runs against raw lines.
+
+THE bleed trap: a TUI that repaints a dialog over a screen it never cleared
+writes only its own non-blank glyphs, so every cell the dialog leaves BLANK
+still shows the previous frame's character and the composite is a superposition
+of the two. Word interiors survive; the gaps between words do not. ``contains``
+anchors are therefore matched through ``bleed_tolerant_pattern`` when the plain
+substring test fails: it pins the anchor's words and lets each gap absorb a
+short run of foreign characters. This is the second reason a rule must never
+spell its word separators as ``\\W+`` — that demands a NON-word character
+exactly where a bled letter now sits, and it is how the codex resume-cwd card
+stalled a seat for 37 seconds (F530 #386).
 """
 
 from __future__ import annotations
@@ -88,6 +99,13 @@ DIALOG_PROXIMITY_CHARS = 200
 # pane bottom (above ASCII banner); must reach it (≥17) while staying below the
 # M2/F55 quoted-prose suppression boundary (≤23).
 DIALOG_REGION_LINES = 20
+# F530 #386: the smallest anchor a bleed-tolerant match is allowed to run on.
+# A gap allowance is a widening, so it has to be paid for by the specificity of
+# what surrounds it. Two words with one wildcard between them is not a phrase,
+# it is a coincidence waiting to happen ("Yes, continue", "No, quit"); three
+# words carry two fixed spans and two anchored boundaries. Short anchors keep
+# the exact substring test and nothing else.
+BLEED_MIN_ANCHOR_WORDS = 3
 
 # F86: Known permission/AskUserQuestion patterns — these are interactive prompts
 # from the host CLI (claude_code, kiro) that should NOT trigger unknown-dialog
@@ -140,8 +158,13 @@ SEED_RULES: Dict[str, str] = {
   enabled: true
   match_mode: contains
   question: "Choose working directory to resume this session"
-  options: ["Press enter"]
-  answer: ["Enter"]
+  # F530 #386: anchor on the OPTION text, not the "Press enter" footer. The
+  # footer is the line most exposed to bleed-through, and a short anchor there
+  # has too few words for the bleed-tolerant matcher to pin.
+  options: ["Use current directory"]
+  # codex-cli 0.153's 4-option card ignores digit keys; Down+Enter picks option
+  # 2, the worker's provisioned working directory.
+  answer: ["Down", "Enter"]
 """,
 }
 
@@ -149,6 +172,17 @@ SEED_RULES: Dict[str, str] = {
 # "1. Yes, continue" plus a "press enter to continue"-style footer. F597 #454:
 # these run against the CANONICAL string, where "1." has been folded to "1 "
 # (the dot became a space), so the numbered-option pattern is "<digit> <word>".
+# F530 #386: the digit class stops at 3 and cannot see a fourth option. On the
+# codex resume-cwd card that stalled 162c159f, options 3 and 4 are the two
+# nearest the "press enter" footer and both are invisible here, leaving the
+# nearest VISIBLE option 177 canonical characters from the footer against a
+# DIALOG_PROXIMITY_CHARS budget of 200. The heuristic still held — the detector
+# did return True on that screen, so this was not part of the stall — but 177
+# of 200 is not much margin, and a longer path in option 2 would spend it.
+# Widening to [1-9] was TRIED and reverted: on that same screen it matches "7 o"
+# inside the prompt's "via v3 14 7 on", i.e. a version number, so it buys the
+# margin by making every digit in ordinary prose a candidate option. The real
+# fix is to require consecutive numbering, which is more than this change is.
 _NUMBERED_OPTION_PATTERN = re.compile(r"\b[1-3]\s+\S")
 _PRESS_ENTER_PATTERN = re.compile(r"press enter", re.IGNORECASE)
 # F597 #454: canonical-domain equivalent of codex's WAITING_PROMPT_PATTERN
@@ -197,6 +231,75 @@ def canonicalize_light(text: str) -> str:
     load, so both sides share this domain.
     """
     return " ".join(unicodedata.normalize("NFKC", text).lower().split())
+
+
+def bleed_tolerant_pattern(canonical_anchor: str) -> "re.Pattern[str] | None":
+    """Compile a canonical anchor so it survives space-cell bleed-through.
+
+    THE BLEED TRAP (F530 #386, terminal 162c159f, 2026-09-05T00:32:35Z). A TUI
+    that repaints a dialog over a screen it never cleared writes only the
+    NON-BLANK glyph runs of its own text and steps the cursor across the blanks.
+    Every cell the dialog leaves blank therefore still holds the PREVIOUS
+    frame's character, and the composited screen is a superposition of the two.
+    The codex resume-cwd card composited as::
+
+        choose working directory todresumeothisnsessiont by running omz update
+
+    where ``d``, ``o`` and ``n`` are single characters of the shell's leftover
+    ``[oh-my-zsh] It's time to update! ...`` line showing through the card's
+    word gaps, and the trailing ``t by running omz update`` is the tail of that
+    same line past the end of the card's text. Three of the card's other lines
+    were corrupted the same way in the same frame (``2 huseecurrent directory``,
+    ``ec3 ralways use session directory``, ``press enter to continuesly``).
+
+    The saving property is that a dialog DOES write every glyph of its own
+    words: only the gaps BETWEEN words are unreliable, never a word's interior.
+
+    THE ALLOWANCE IS EXACTLY ONE CELL, because that is exactly what the physics
+    produces. A word gap the dialog renders as a single blank is a single cell,
+    and a single cell holds a single stale character. So each space in the
+    anchor may be replaced by ONE character and no more. A multi-character run
+    between two anchor words is NOT a bleed — it is different text — and must
+    not match. Wider blank runs and the stale tail past the end of a dialog's
+    line lie outside the anchor's span and need no allowance at all.
+
+    The cell may hold ANY glyph, so the class is "one non-whitespace character,
+    or one space" and not an alphanumeric whitelist. The previous frame is
+    ordinary terminal output: a path's ``/``, a rule's ``─``, a card wall's
+    ``│``, ``:``, ``·``, ``%`` are all things it leaves behind. Today the FULL
+    canonical fold (``canonicalize``) has already mapped every non-``[a-z0-9]``
+    character to a space and lowercased the rest, so on that domain the broader
+    class and an alphanumeric one accept the same strings — but the pattern must
+    not silently depend on that. Written this way it stays correct if it is ever
+    matched against the light domain, where punctuation survives intact.
+
+    Because the fold lowercases, an uppercase stale glyph reaches the pattern as
+    lowercase; case is never a reason for a miss.
+
+    The tolerant path is also confined to anchors of at least
+    ``BLEED_MIN_ANCHOR_WORDS`` words. A widening has to be paid for by the
+    specificity of what surrounds it, and a two-word anchor with one wildcard
+    between them is not specific enough to spend it on.
+
+    On an uncorrupted screen every gap is exactly one space, which this pattern
+    matches, so it accepts everything the plain substring test accepted and a
+    strictly bounded amount more. It is a widening, never a replacement, and
+    callers try the substring first. It is also not the whole guard: an anchor
+    match alone never sends a key — the rule's options must match the same
+    screen, and the two-capture settle gate must find that screen byte-stable,
+    before any key is sent.
+
+    Returns ``None`` for an anchor below the word floor: there is nothing to
+    tolerate that the plain substring test does not already decide.
+    """
+    tokens = canonical_anchor.split()
+    if len(tokens) < BLEED_MIN_ANCHOR_WORDS:
+        return None
+    # Exactly one cell: one non-whitespace glyph of any kind, or one space.
+    # Never two, and never a tab or newline (which are not cells a dialog's own
+    # text can leave behind mid-line).
+    gap = r"(?:\S| )"
+    return re.compile(gap.join(re.escape(token) for token in tokens))
 
 
 def normalize_screen(lines: List[str]) -> str:
@@ -394,6 +497,14 @@ class Rule:
     _canon_question: str = field(init=False, repr=False, compare=False, default="")
     _canon_options: tuple[str, ...] = field(init=False, repr=False, compare=False, default=())
     _regex: "re.Pattern[str] | None" = field(init=False, repr=False, compare=False, default=None)
+    # F530 #386: bleed-tolerant companions to the canonical forms above, tried
+    # only after the plain substring test fails. See ``bleed_tolerant_pattern``.
+    _bleed_question: "re.Pattern[str] | None" = field(
+        init=False, repr=False, compare=False, default=None
+    )
+    _bleed_options: tuple["re.Pattern[str] | None", ...] = field(
+        init=False, repr=False, compare=False, default=()
+    )
 
     def __post_init__(self) -> None:
         # F597 #454 B2: precompute the canonical match forms once on load so both
@@ -424,6 +535,16 @@ class Rule:
             self._canon_question = canonicalize(self.question)
             self._regex = None
         self._canon_options = tuple(canonicalize(opt) for opt in self.options)
+        # F530 #386: precompile the bleed-tolerant companions once on load. Only
+        # ``contains`` questions get one — a ``regex`` question is an author's
+        # opaque pattern and is not ours to widen (the shipped rules that used
+        # ``\W+`` word separators are ``contains`` rules now, which is what the
+        # module docstring has always told rule authors to write). OPTIONS are
+        # plain prose in BOTH modes, so they get one either way.
+        self._bleed_question = (
+            None if self.match_mode == "regex" else bleed_tolerant_pattern(self._canon_question)
+        )
+        self._bleed_options = tuple(bleed_tolerant_pattern(opt) for opt in self._canon_options)
         # F700 #555: validate modality here so BOTH the YAML loader and direct
         # construction land on a known value; an unknown value degrades to the
         # safe default ("soft" = vetoable) rather than silently arming a bypass.
@@ -473,6 +594,19 @@ class Rule:
             return region.normalized, (region.normalized_light or region.normalized)
         return region, region
 
+    @staticmethod
+    def _present(canonical: str, bleed: "re.Pattern[str] | None", haystack: str) -> bool:
+        """Is ``canonical`` on the screen, allowing for space-cell bleed-through?
+
+        F530 #386: the plain substring test runs first and decides the common
+        case (an empty anchor is trivially present, exactly as before). Only when
+        it fails does the bleed-tolerant pattern get a look — so this widens what
+        matches and never narrows it.
+        """
+        if canonical in haystack:
+            return True
+        return bleed is not None and bleed.search(haystack) is not None
+
     def matches(self, region: "DialogRegion | str") -> bool:
         if not self.enabled:
             return False
@@ -481,9 +615,12 @@ class Rule:
             if self._regex is None or not self._regex.search(light):
                 return False
         else:
-            if self._canon_question not in full:
+            if not self._present(self._canon_question, self._bleed_question, full):
                 return False
-        return all(opt in full for opt in self._canon_options)
+        return all(
+            self._present(canon, bleed, full)
+            for canon, bleed in zip(self._canon_options, self._bleed_options)
+        )
 
     def reject_reason(self, region: "DialogRegion | str") -> Optional[str]:
         """F530 diagnosability: return WHY this rule does NOT match, or None when
@@ -501,10 +638,10 @@ class Rule:
         if self.match_mode == "regex":
             if self._regex is None or not self._regex.search(light):
                 return "question(regex)"
-        elif self._canon_question not in full:
+        elif not self._present(self._canon_question, self._bleed_question, full):
             return "question(contains)"
-        for authored, canon in zip(self.options, self._canon_options):
-            if canon not in full:
+        for authored, canon, bleed in zip(self.options, self._canon_options, self._bleed_options):
+            if not self._present(canon, bleed, full):
                 return f"option[{authored}]"
         return None
 
@@ -1555,8 +1692,20 @@ class AutoResponder:
     ) -> Optional[TerminalStatus]:
         # F86: exempt known permission/AskUserQuestion prompts — return
         # WAITING_USER_ANSWER without escalating to the supervisor.
-        if any(pat.search(region.normalized) for pat in _PERMISSION_PROMPT_PATTERNS):
-            return TerminalStatus.WAITING_USER_ANSWER
+        for pattern in _PERMISSION_PROMPT_PATTERNS:
+            if pattern.search(region.normalized):
+                # F530 #386: this branch used to be silent. A seat held here is
+                # a seat nobody is being told about, and the decisions log — the
+                # one artefact a stall investigation has — showed only the
+                # preceding "no_rule_matched", which reads as "nothing was
+                # holding it". Name the pattern that claimed the screen.
+                self._log_decision(
+                    terminal_id,
+                    "no_match",
+                    "permission_prompt_exempt",
+                    extra=f"pattern={pattern.pattern!r}",
+                )
+                return TerminalStatus.WAITING_USER_ANSWER
 
         shape_suspect = self._looks_like_dialog(region.normalized, provider_name)
         is_suspect = supplied_status == TerminalStatus.WAITING_USER_ANSWER or (
@@ -1574,11 +1723,21 @@ class AutoResponder:
 
         if not is_suspect:
             if shape_suspect:
+                # F530 #386: a dialog-SHAPED screen the provider did not call
+                # WAITING is the exact frame a stall investigation needs to see.
+                # It was invisible in the log before.
+                self._log_decision(
+                    terminal_id,
+                    "no_match",
+                    "unknown_shape_not_waiting",
+                    extra=f"status={supplied_status}",
+                )
                 return self._record_unknown_nonclean_tick(terminal_id)
             return self._record_unknown_clean_tick(terminal_id)
 
         fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
         if fresh is None:
+            self._log_decision(terminal_id, "no_match", "unknown_capture_failed")
             return None
         fresh_region = self._region_from_capture(fresh)
         fresh_status = self._classify_region(terminal_id, provider, fresh_region)
@@ -1589,6 +1748,12 @@ class AutoResponder:
         )
         if not is_suspect:
             if fresh_shape_suspect:
+                self._log_decision(
+                    terminal_id,
+                    "no_match",
+                    "unknown_fresh_not_waiting",
+                    extra=f"status={fresh_status}",
+                )
                 return self._record_unknown_nonclean_tick(terminal_id)
             return self._record_unknown_clean_tick(terminal_id)
         normalized = fresh_region.normalized
@@ -1621,7 +1786,23 @@ class AutoResponder:
             if recheck_incarnation != incarnation:
                 return TerminalStatus.WAITING_USER_ANSWER
 
+            # F530 #386: say WHICH frame this text is. ``normalized`` comes from
+            # a FRESH capture taken for the payload, not from the frame the
+            # rules were judged on — on a pane still repainting they differ, and
+            # on b637333f (2026-09-05 03:00Z) they differed in exactly the way
+            # that matters: the payload was clean while every evaluated frame
+            # was bled. A reader given only the clean text concludes the matcher
+            # is broken. Both frames go in the message now, and the evaluated
+            # one is named as the one the verdict came from.
             dialog_text = self._payload_excerpt(normalized)
+            evaluated_text = self._payload_excerpt(region.normalized)
+            if evaluated_text != dialog_text:
+                dialog_text = (
+                    f"{dialog_text}\n\nThe rules were NOT judged on that text. It is a fresh "
+                    "capture taken for this message, and the pane repainted in between. The "
+                    "frame the verdict came from, and the one to reason about, is:\n\n"
+                    f"{evaluated_text}"
+                )
             self._push(
                 terminal_id,
                 metadata,
@@ -1633,6 +1814,13 @@ class AutoResponder:
                 f"Dialog text (normalized): {dialog_text}",
                 incarnation,
             )
+            self._log_decision(terminal_id, "matched", "unknown_dialog_pushed")
+        else:
+            # F530 #386: an episode already open, or the 300s push floor still
+            # standing. Either way the seat is held at WAITING and nobody is
+            # being told again — say so, once per eval, instead of leaving the
+            # log to imply nothing happened.
+            self._log_decision(terminal_id, "no_match", "unknown_dialog_push_suppressed")
         return TerminalStatus.WAITING_USER_ANSWER
 
     def _record_unknown_nonclean_tick(self, terminal_id: str) -> Optional[TerminalStatus]:
