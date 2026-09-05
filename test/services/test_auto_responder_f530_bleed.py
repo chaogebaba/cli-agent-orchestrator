@@ -280,6 +280,105 @@ class TestItWidensAndDoesNotLeak:
         assert rule.matches(region_of(STALL_REGION_CANONICAL)) is False
 
 
+class TestTheGrokTrustCard:
+    """The grok trust-directory card, replayed from two live captures.
+
+    Filed alongside this work as the same fault class. It is not: the decisions
+    logs show `grok-trust-directory` matching, settling and FIRING on both
+    terminals, about one and a half seconds after the card appeared, and both
+    workers went on to finish their assignments.
+
+      cd6f8655   card at 00:21:17.913Z, settled :18.420, fired :18.501, composer up
+                 by :19; the worker then ran for 13m52s and sent its callback.
+      9208a488   card at 00:47:05.891Z, settled :06.396, fired :06.503, composer up
+                 at :07.418; the worker ran 6m14s and committed a67029ce.
+
+    The card's rows below are verbatim from
+    ``~/.aws/cli-agent-orchestrator/logs/terminal/9208a488.scrollback`` lines
+    52-61. It carries BOTH affordances — the "y  Yes, proceed" option rows the
+    rule anchors on, and the "Enter or y to trust" footer. Pinned so the pairing
+    is not lost, and so the card is covered by the bleed matcher too: grok
+    repaints over an uncleared screen exactly as codex does, and the launch
+    command's echoed system prompt is sitting right above this card on the pane.
+    """
+
+    CARD: List[str] = [
+        "Do you trust the contents of this directory?",
+        "/home/chao/VScode_projects/cli-subagents",
+        "",
+        "Grok Build may run or modify contents in this directory,",
+        "posing security risks.",
+        "",
+        "y  Yes, proceed",
+        "n  No, quit",
+        "",
+        "Enter or y to trust · n or Esc to quit",
+    ]
+
+    def _rule(self) -> ar.Rule:
+        return ar.Rule(
+            name="grok-trust-directory",
+            enabled=True,
+            match_mode="contains",
+            question="Do you trust the contents of this directory?",
+            options=["Yes, proceed", "No, quit"],
+            answer=["y"],
+            modality="hard",
+        )
+
+    def test_the_captured_card_matches_the_shipped_rule(self) -> None:
+        """What the live fire log already proves, pinned as a test."""
+        region = ar.dialog_region(self.CARD)
+        assert self._rule().reject_reason(region) is None
+
+    def test_the_card_carries_both_affordances(self) -> None:
+        canonical = ar.normalize_screen(self.CARD)
+        assert "yes proceed" in canonical  # the option rows the rule anchors on
+        assert "enter or y to trust" in canonical  # the footer hint
+
+    def test_it_still_matches_when_the_previous_frame_bleeds_through(self) -> None:
+        """Provider-independence, at the level where it is decided.
+
+        The matcher is shared, so the bleed fallback covers grok the moment it
+        covers codex. Superposed here on the tail of the launch command's system
+        prompt, which is what sits above this card on a real grok pane.
+        """
+        background = [
+            "change approach scope or semantics is not yours to decide available",
+            "skills the following skills are available exclusively in this cao",
+            "orchestration context to load a skill first discover it, then read it",
+            "from disk because these are not reachable through provider-native",
+            "skill commands or directories at all in this configuration here",
+            "- box-ops: offload-box operations for CAO workers, slot-locked runs",
+            "- cao-worker-protocols: worker-side callback and completion rules",
+            "- doc-keeper: descriptive-doc maintenance and staleness sweeps",
+            "--session-id c35e3120-8014-4f9c-9c5e-3f96e8651f8f --print-mode never",
+            "--allowed-tools bash,read,write,edit --max-turns 400 --verbose",
+        ]
+        bled = superpose(self.CARD, background)
+        canonical = ar.normalize_screen(bled)
+        assert "do you trust the contents of this directory" not in canonical
+        assert self._rule().reject_reason(ar.dialog_region(bled)) is None
+
+    def test_the_revival_rule_is_a_duplicate_of_the_one_that_fires(self) -> None:
+        """Both grok trust rules are byte-identical in body.
+
+        First match wins, so `grok-trust-directory-revival` can never fire. It
+        costs an evaluation per rule per tick and nothing else. Recorded rather
+        than deleted: it is the supervisor's config to retire.
+        """
+        revival = ar.Rule(
+            name="grok-trust-directory-revival",
+            enabled=True,
+            match_mode="contains",
+            question="Do you trust the contents of this directory?",
+            options=["Yes, proceed", "No, quit"],
+            answer=["y"],
+            modality="hard",
+        )
+        assert revival.body_hash == self._rule().body_hash
+
+
 class TestTheShippedSeed:
     """A fresh install must not ship the anchor that failed."""
 
