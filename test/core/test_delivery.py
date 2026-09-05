@@ -589,3 +589,43 @@ def test_the_ordinal_is_what_makes_two_wakes_of_one_epoch_differ() -> None:
 def test_the_streak_length_is_three_leases() -> None:
     """180 s or more, comfortably past a compaction (§A1.4)."""
     assert UNVERIFIED_STREAK_LEASES == 3
+
+
+def test_socket_timeout_specifically_is_not_a_failure() -> None:
+    """Named rather than covered by iterating the set it belongs to.
+
+    A test that loops over ``WAKE_EMITTED_UNVERIFIED_REASONS`` is satisfied by an
+    EMPTY set, so removing a member weakens the assertion instead of failing it —
+    which is exactly how the mutation run found this hole.  The reasoning A1.4
+    gives for this member is specific and so is the test: the timeout bounds a
+    connect that MAY have completed, so a ``wake_unreachable`` here would fire
+    ``DIAG-SEAT-WAKE-UNREACHABLE`` at a seat that was merely slow to accept.
+    """
+    classification = classify_wake_reason("socket_timeout")
+    assert classification.outcome is AttemptOutcome.EMITTED_UNVERIFIED
+    assert classification.emitted
+    assert not classification.finding
+    assert not classification.spends_attempt
+
+
+def test_record_stale_specifically_never_becomes_a_refusal() -> None:
+    """The same hole, on the reason #613 sample 5 forced a decision about.
+
+    Under the pre-amendment behaviour every message to a seat idle for fifteen
+    minutes would have taken ``wake_unreachable`` and died at ``dead_by`` — #604
+    reintroduced by the amendment written to close it.  So the classification is
+    asserted by name, not by membership of a set that could be emptied.
+    """
+    classification = classify_wake_reason("record_stale")
+    assert classification.annotation
+    assert classification.emitted
+    assert classification.outcome is AttemptOutcome.DELIVERED
+    assert not classification.finding
+    assert not classification.spends_attempt
+    assert "record_stale" not in WAKE_UNREACHABLE_REASONS
+    assert "record_stale" not in WAKE_UNRESOLVABLE_REASONS
+
+
+def test_the_two_emitted_unverified_reasons_are_both_named() -> None:
+    """Membership asserted in the direction that an empty set cannot satisfy."""
+    assert WAKE_EMITTED_UNVERIFIED_REASONS == {"wake_unverified", "socket_timeout"}
