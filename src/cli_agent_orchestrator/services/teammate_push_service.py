@@ -213,6 +213,19 @@ def write_supervisor_callback_notification(
     deadline, reads/validates JSON, deduplicates by deterministic msg_id, and
     performs atomic durable write.
     """
+    # WP-ARCH 3b: K2 is MUTED while the queue owns delivery (D6, §13b).
+    #
+    # This writer and its replay sibling are a SECOND content channel over the
+    # same rows (#506) — the duplicate family D6 deletes rather than
+    # deduplicates. §A1.4 considered reviving it as a second native leg for a
+    # refused wake and rejected that too: a fallback that resurrects a killed
+    # surface gives one id two carriers again the moment the primary is flaky,
+    # which is the defect family this phase closes.
+    from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+    if queue_owns_delivery():
+        return NativeInboxWriteResult(kind="skipped", reason="queue_owns_delivery")
+
     # F178-S1: resolve symlinks so os.replace targets the real file, not the link.
     inbox_path = inbox_path.resolve()
     msg_id = callback_notification_id(mailbox_id, message.id)

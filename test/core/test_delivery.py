@@ -337,8 +337,255 @@ def test_legacy_other_is_the_only_shadow_only_attempt_outcome() -> None:
     """
     live_vocabulary = set(AttemptOutcome) - {AttemptOutcome.LEGACY_OTHER}
     assert live_vocabulary == {
+        # D12's four, as at r14.
         AttemptOutcome.DELIVERED,
         AttemptOutcome.VETO_DIALOG,
         AttemptOutcome.VETO_UNVERIFIED,
         AttemptOutcome.PANE_ABSENT,
+        # A1's four, added by sub-phase 3b (§A1.4).  Listed here rather than
+        # exempted, because this test's job is that the LIVE vocabulary is
+        # closed and stated: a fifth outcome appearing without a row in A1.4's
+        # table is the defect it catches.
+        AttemptOutcome.EMITTED_UNVERIFIED,
+        AttemptOutcome.WAKE_UNREACHABLE,
+        AttemptOutcome.WAKE_UNRESOLVABLE,
+        AttemptOutcome.PASTE_ATTEMPTED,
     }
+
+
+# ---------------------------------------------------------------------------
+# A1 — the carrier's refusal table, the sender rule, and the wake line.
+#
+# The point of these is TOTALITY.  A1.4 makes classifying every reason a rule
+# rather than a courtesy: an unclassified string would otherwise inherit
+# whichever bound the builder guessed, which is the defect r16 raised and r17
+# closed for only two reasons out of nine.  So the closed set is enumerated from
+# the producers' own returns and asserted against the table, and a producer that
+# grows a string without a row fails here rather than in production.
+# ---------------------------------------------------------------------------
+
+from cli_agent_orchestrator.core.delivery import (  # noqa: E402
+    ATTEMPT_BUDGET_OUTCOMES,
+    UNVERIFIED_STREAK_LEASES,
+    WAKE_ANNOTATION_REASONS,
+    WAKE_EMITTED_UNVERIFIED_REASONS,
+    WAKE_ID_CAP,
+    WAKE_PANE_ABSENT,
+    WAKE_PASTE_ATTEMPTED,
+    WAKE_REASONS,
+    WAKE_UNREACHABLE_REASONS,
+    WAKE_UNRESOLVABLE_REASONS,
+    build_digest_line,
+    classify_wake_reason,
+    resolve_wake_sender,
+    spends_attempt,
+)
+
+#: Every string the three producers can return, read off their own source at the
+#: phase's anchor base: ``resolve_target`` (7), ``write_to_socket`` (7 plus the
+#: ``socket_error:<errno>`` family), ``check_version_guard`` (4), plus the two
+#: the bridge itself returns before any producer runs and the two dispatch
+#: conditions.  Written out rather than derived, because a derivation from the
+#: table under test would assert nothing.
+PRODUCER_REASONS = {
+    # resolve_target
+    "no_registry_records",
+    "pane_pid_failed",
+    "no_descendant_record",
+    "target_ambiguous",
+    "proc_start_unreadable",
+    "proc_start_mismatch",
+    "record_stale",
+    # write_to_socket
+    "socket_path_empty",
+    "socket_enoent",
+    "socket_econnrefused",
+    "socket_eperm",
+    "socket_einval",
+    "socket_timeout",
+    "socket_error:104",
+    # check_version_guard
+    "version_absent",
+    "version_out_of_band",
+    "version_config_invalid",
+    "peer_protocol",
+    # the bridge, before a producer runs
+    "no_terminal_metadata",
+    "no_tmux_coordinates",
+    # the carrier's own unconfirmed write, and the socket it never published
+    "wake_unverified",
+    "socket_unpublished",
+    # dispatch conditions
+    WAKE_PANE_ABSENT,
+    WAKE_PASTE_ATTEMPTED,
+}
+
+
+def test_the_refusal_table_is_total_over_the_producers_closed_set() -> None:
+    """Every reason classifies, and no reason falls through to the default.
+
+    The default exists so the function is total, not so a real reason can use
+    it: an unclassified string means the phase's bound was chosen by accident.
+    """
+    for reason in PRODUCER_REASONS:
+        classification = classify_wake_reason(reason)
+        assert classification.outcome is not None
+        if reason.startswith("socket_error:"):
+            continue
+        assert reason in WAKE_REASONS or reason in {
+            WAKE_PANE_ABSENT,
+            WAKE_PASTE_ATTEMPTED,
+        }, f"{reason} classifies only through the conservative default"
+
+
+def test_the_reason_families_do_not_overlap() -> None:
+    """One reason, one bound.  Overlap would make the outcome order-dependent."""
+    families = [
+        WAKE_UNREACHABLE_REASONS,
+        WAKE_UNRESOLVABLE_REASONS,
+        WAKE_EMITTED_UNVERIFIED_REASONS,
+        WAKE_ANNOTATION_REASONS,
+    ]
+    for i, first in enumerate(families):
+        for second in families[i + 1 :]:
+            assert not (first & second)
+
+
+def test_the_carrier_absent_family_is_bounded_by_the_deadline_alone() -> None:
+    """T1's whole point: a stale record heals at 900 s, the budget spans 325 s.
+
+    Putting these on the attempt budget would dead-letter every message to a
+    HEALTHY seat during an ordinary staleness window — #604's harm reintroduced
+    by the amendment that is supposed to end it.
+    """
+    for reason in WAKE_UNREACHABLE_REASONS:
+        classification = classify_wake_reason(reason)
+        assert classification.outcome is AttemptOutcome.WAKE_UNREACHABLE
+        assert not classification.spends_attempt
+        assert classification.finding
+
+
+def test_the_identity_and_version_refusals_take_the_attempt_budget() -> None:
+    """None of them heals on the republish argument the deadline bound rests on."""
+    for reason in WAKE_UNRESOLVABLE_REASONS:
+        classification = classify_wake_reason(reason)
+        assert classification.outcome is AttemptOutcome.WAKE_UNRESOLVABLE
+        assert classification.spends_attempt
+
+
+def test_an_unconfirmed_write_counts_as_sent_and_raises_nothing() -> None:
+    """``socket_timeout`` is classified with ``wake_unverified``, not with failure.
+
+    The timeout bounds a connect that may or may not have completed, so calling
+    it a failure asserts something unobserved.  Under D2 a duplicate wake costs
+    nothing; a false unreachable costs a finding and a dead message at 325 s.
+    """
+    for reason in WAKE_EMITTED_UNVERIFIED_REASONS:
+        classification = classify_wake_reason(reason)
+        assert classification.emitted
+        assert classification.outcome is AttemptOutcome.EMITTED_UNVERIFIED
+        assert not classification.finding
+        assert not classification.spends_attempt
+
+
+def test_a_stale_record_is_an_annotation_and_the_emission_proceeds() -> None:
+    classification = classify_wake_reason("record_stale")
+    assert classification.annotation
+    assert classification.emitted
+    assert not classification.finding
+
+
+def test_success_classifies_as_delivered() -> None:
+    assert classify_wake_reason(None).outcome is AttemptOutcome.DELIVERED
+    assert classify_wake_reason(None).emitted
+
+
+def test_an_unknown_reason_takes_the_conservative_bound() -> None:
+    """Conservative rather than correct, on purpose.
+
+    A condition nobody has argued heals should die faster (D12), and the
+    totality test above is what stops an unknown string ever reaching here.
+    """
+    classification = classify_wake_reason("something_nobody_classified")
+    assert classification.outcome is AttemptOutcome.WAKE_UNRESOLVABLE
+    assert classification.spends_attempt
+
+
+def test_the_attempt_budget_set_and_spends_attempt_agree() -> None:
+    """One rule, one place: ``reclaim`` asks only this question of an outcome."""
+    for outcome in AttemptOutcome:
+        assert spends_attempt(outcome) is (outcome in ATTEMPT_BUDGET_OUTCOMES)
+    assert spends_attempt(None) is True
+
+
+def test_a_lease_that_recorded_nothing_spends_an_attempt() -> None:
+    """Nothing observed, so the honest accounting is the failing one."""
+    assert spends_attempt(None)
+
+
+def test_emitted_outcomes_never_spend_an_attempt() -> None:
+    """§5b: a seat that reads the line and stops without acking is supported."""
+    assert not spends_attempt(AttemptOutcome.DELIVERED)
+    assert not spends_attempt(AttemptOutcome.EMITTED_UNVERIFIED)
+    assert not spends_attempt(AttemptOutcome.VETO_DIALOG)
+    assert not spends_attempt(AttemptOutcome.WAKE_UNREACHABLE)
+
+
+# ------------------------------------------------------------- the sender rule
+
+
+def test_one_sender_names_the_worker() -> None:
+    sender = resolve_wake_sender(("cline-f5d4",), receiver_key="mb_seat")
+    assert (sender.key, sender.substituted) == ("cline-f5d4", False)
+
+
+def test_several_senders_name_the_carrier_and_the_count() -> None:
+    sender = resolve_wake_sender(("a", "b", "a"), receiver_key="mb_seat")
+    assert sender.key == "cao-delivery"
+    assert sender.name == "2 workers"
+
+
+def test_a_self_addressed_sender_is_substituted_rather_than_refused() -> None:
+    """Refusing would strand a server-generated notice behind a guard (#381)."""
+    sender = resolve_wake_sender(("mb_seat",), receiver_key="mb_seat")
+    assert sender.key == "cao-delivery"
+    assert sender.substituted
+
+
+def test_no_sender_at_all_still_resolves() -> None:
+    """Total: an epoch of server-generated rows carries no worker name."""
+    sender = resolve_wake_sender((), receiver_key="mb_seat")
+    assert sender.key == "cao-delivery"
+    assert not sender.substituted
+
+
+# ---------------------------------------------------------------- the wake line
+
+
+def test_the_line_carries_the_epoch_the_count_the_ordinal_and_the_ids() -> None:
+    line = build_digest_line(epoch=7, msgs=2, wake=3, msg_ids=("a", "b"))
+    assert line == (
+        "[cao] digest epoch=7 msgs=2 wake=3 ids=a,b. "
+        "Drain: list_messages(epoch=7) -> ack_messages"
+    )
+
+
+def test_the_id_list_is_capped_and_summarises_the_rest() -> None:
+    """A FORMATTING bound: ``k`` has no ceiling and a wake must stay one line."""
+    ids = tuple(str(n) for n in range(WAKE_ID_CAP + 4))
+    line = build_digest_line(epoch=1, msgs=len(ids), wake=1, msg_ids=ids)
+    assert f"+{4} more" in line
+    assert "\n" not in line
+    assert line.count(",") == WAKE_ID_CAP
+
+
+def test_the_ordinal_is_what_makes_two_wakes_of_one_epoch_differ() -> None:
+    """Without it the transport's content window swallows every re-wake."""
+    first = build_digest_line(epoch=1, msgs=1, wake=1, msg_ids=("a",))
+    second = build_digest_line(epoch=1, msgs=1, wake=2, msg_ids=("a",))
+    assert first != second
+
+
+def test_the_streak_length_is_three_leases() -> None:
+    """180 s or more, comfortably past a compaction (§A1.4)."""
+    assert UNVERIFIED_STREAK_LEASES == 3

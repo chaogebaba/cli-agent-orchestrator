@@ -219,8 +219,8 @@ def test_reclaim_returns_an_expired_lease_and_counts_the_attempt(
     queue.claim(lease_owner="tick", now=clock.now())
     clock.advance(seconds=DELIVERY_LEASE_S + 1)
 
-    reclaimed, dead = queue.reclaim(now=clock.now())
-    assert (reclaimed, dead) == (1, 0)
+    result = queue.reclaim(now=clock.now())
+    assert (result.reoffered, result.incremented, result.dead_count) == (1, 1, 0)
     after = queue.get(row.msg_id)
     assert after is not None
     assert after.state is MsgState.READY
@@ -287,8 +287,9 @@ def test_a_row_whose_deadline_passes_dies_on_the_time_bound(
     """The outermost term ends the row even with attempts to spare (I1, D12)."""
     row = queue.enqueue(live("k1"))
     clock.advance(seconds=DELIVERY_MAX_LIFETIME_S + 1)
-    _, dead_count = queue.reclaim(now=clock.now())
-    assert dead_count == 1
+    result = queue.reclaim(now=clock.now())
+    assert result.dead_count == 1
+    assert result.dead[0].reason is DeadReason.MAX_LIFETIME
     dead = queue.dead_letter(row.msg_id)
     assert dead is not None and dead.reason is DeadReason.MAX_LIFETIME
 

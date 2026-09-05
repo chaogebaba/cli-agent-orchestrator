@@ -39,7 +39,7 @@ from dataclasses import dataclass
 
 from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue, LegacyOutcome, LegacyVeto
 from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
-from cli_agent_orchestrator.core.delivery import SwitchPosition
+from cli_agent_orchestrator.core.delivery import QueueMode, SwitchPosition
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,10 @@ __all__ = [
     "delivery_runtime",
     "install_delivery",
     "queue_enabled",
+    "queue_owns_delivery",
+    "queue_owns_new_traffic",
+    "queue_position",
+    "record_completion",
     "record_enqueue",
     "record_outcome",
     "record_veto",
@@ -112,38 +116,117 @@ def queue_enabled() -> bool:
     return _runtime is not None
 
 
-def record_enqueue(fact: LegacyEnqueue) -> None:
-    """Write the shadow row for one committed legacy insert.
+def queue_position() -> SwitchPosition:
+    """The RESOLVED position, or ``off`` when nothing is installed.
 
-    Returns ``None`` always, and callers in legacy code are written to ignore
-    it.  Handing back the minted ``msg_id`` was considered and rejected: a legacy
+    One reader for the whole legacy tree, so "is the queue serving this?" has one
+    answer and not one per call site.  Legacy modules ask this rather than the
+    environment: the boot guard can demote a requested position, and a hook that
+    read the variable itself could act on a position the guard already refused.
+    """
+    runtime = _runtime
+    return SwitchPosition.OFF if runtime is None else runtime.position
+
+
+def queue_owns_delivery() -> bool:
+    """True at ``on``: the queue serves the seat and D6's surfaces are MUTED.
+
+    This is the whole of sub-phase 3b's muting, in one predicate.  K1 through K7
+    are still present — they are deleted in 3c — and each asks this before it
+    emits, so the single-emitter property in 3b rests on the SWITCH while in 3c
+    it rests on the deletions.  Case 17 therefore tests the muting, and a second
+    emitter in its ``on`` arm is a leaky mute rather than a missing deletion.
+
+    ``drain`` is deliberately false.  Under ``drain`` the tick finishes
+    delivering rows already enqueued while new traffic goes back to the legacy
+    inbox (§6), so legacy must keep emitting for those rows; muting there would
+    leave the new traffic with no carrier at all.
+    """
+    return queue_position() is SwitchPosition.ON
+
+
+def queue_owns_new_traffic() -> bool:
+    """True at ``on``: a new enqueue becomes a ``mode='live'`` queue row.
+
+    False at ``drain``, which is the position's whole point — it accepts no new
+    queue rows, so it empties on its own budget while new enqueues go to the
+    legacy inbox (§6, D9).
+    """
+    return queue_position() is SwitchPosition.ON
+
+
+def record_enqueue(fact: LegacyEnqueue) -> None:
+    """Write the queue row for one committed legacy insert.
+
+    ``mode`` follows the position: ``shadow`` observes, ``live`` is served by the
+    tick.  At ``drain`` nothing is written at all, because ``drain`` accepts no
+    new queue rows.
+
+    Returns ``None`` always, and callers in legacy code are written to ignore it.
+    Handing back the minted ``msg_id`` was considered and rejected: a legacy
     caller with a queue id in its hand is a caller that can come to depend on
-    one, and sub-phase 3a's whole claim is that removing it changes nothing.
+    one.
     """
     runtime = _runtime
     if runtime is None:
         return
-    _guarded(lambda: runtime.mirror.enqueue(fact), "enqueue", str(fact.legacy_message_id))
+    position = runtime.position
+    if position is SwitchPosition.DRAIN:
+        return
+    mode = QueueMode.LIVE if position is SwitchPosition.ON else QueueMode.SHADOW
+    _guarded(
+        lambda: runtime.mirror.enqueue(fact, mode=mode), "enqueue", str(fact.legacy_message_id)
+    )
 
 
 def record_outcome(fact: LegacyOutcome) -> None:
-    """Advance one shadow row from the legacy row's current status."""
+    """Advance one SHADOW row from the legacy row's current status.
+
+    Inert once the queue owns delivery: at ``on`` the queue's own attempt rows
+    and states are the authority (I5), and letting a legacy edge settle a live
+    row would give one id two authorities — which is the defect D13 scopes the
+    legacy ledger out for.
+    """
     runtime = _runtime
-    if runtime is None:
+    if runtime is None or runtime.position is SwitchPosition.ON:
         return
     _guarded(lambda: runtime.mirror.observe(fact), "outcome", str(fact.legacy_message_id))
 
 
 def record_veto(fact: LegacyVeto) -> None:
-    """Record an injection the legacy path declined."""
+    """Record an injection the legacy path declined.  Inert at ``on``, as above."""
     runtime = _runtime
-    if runtime is None:
+    if runtime is None or runtime.position is SwitchPosition.ON:
         return
     _guarded(
         lambda: runtime.mirror.observe_veto(fact),
         "veto",
         ",".join(str(mid) for mid in fact.legacy_message_ids),
     )
+
+
+def record_completion(receiver_id: str) -> tuple[str, ...]:
+    """D8's completion-cancel, driven by the RECEIVER'S OWN completion.
+
+    ``supersede_key`` handles the same-mailbox case at enqueue and does NOT reach
+    #435, where the aged steer is addressed to the worker and the completion
+    callback to the supervisor, so no newer row ever lands in the worker's
+    mailbox.  This is the mechanism that does reach it.
+
+    Evaluated once per completion EVENT rather than as a standing predicate, and
+    over ``ready`` rows only: a steer already leased at completion still lands,
+    and a steer reclaimed to ``ready`` after the completion is not retroactively
+    cancelled.  Both limits are stated rather than hidden, and both stay
+    diagnosable through ``cao diag <msg_id>``.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is not SwitchPosition.ON:
+        return ()
+    try:
+        return runtime.store.cancel_on_complete(receiver_id, now=runtime.clock.now())
+    except Exception:  # noqa: BLE001 — a cancel that cannot run must not break completion
+        logger.warning("delivery: completion-cancel failed for %s", receiver_id, exc_info=True)
+        return ()
 
 
 def _guarded(call: object, hook: str, subject: str) -> None:

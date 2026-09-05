@@ -539,13 +539,34 @@ def _get_backoff_delay(terminal_id: str) -> float:
     return _BACKOFF_SCHEDULE[idx]
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting.)
+
+    One import, wrapped: an admission signal is unnecessary once the tick polls
+    (§13b), but a mute that could raise into the delivery path would be worse
+    than no mute at all.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 def request_delivery(terminal_id: str) -> None:
     """D7/D15: Signal that deliverable work exists for a terminal.
 
     O(1) admission: increments dirty_epoch, invalidates delayed token,
     and admits at most one immediate callback. Never calls deliver_pending
     inline and never writes the native inbox.
+
+    WP-ARCH 3b: inert while the queue owns delivery. §13b marks it REPLACED —
+    an admission signal is unnecessary once something polls the durable rows on
+    a schedule no wake path can suppress.
     """
+    if _queue_owns_delivery():
+        return
     service = globals().get("inbox_service")
     if not isinstance(service, InboxService):
         return
@@ -2238,6 +2259,22 @@ class InboxService:
         (test_message_trace_inbox_matrix::
         test_waiter_queued_during_ambiguous_settlement_skips_same_wake).
         """
+        # WP-ARCH 3b: MUTED while the queue owns delivery (D6, §13b).
+        #
+        # deliver_pending is REPLACED by §5c's tick — its idle-gate admission is
+        # the status precondition D1 removes, and its fall-through paste is K8's
+        # first anchor. 3b mutes it and 3c deletes it. Muting rather than
+        # deleting is the reason 3b and 3c are separate commits: the `drain`
+        # position needs this path alive for new traffic while the tick finishes
+        # the rows already enqueued (§6).
+        #
+        # Note what this mute does NOT carry: the paste ban. That is role-gated
+        # further down and holds in every switch position, because muting follows
+        # the position and the ban does not (§A1.5).
+        if _queue_owns_delivery():
+            self._log_delivery_skip(terminal_id, "queue_owns_delivery")
+            return
+
         # F339: skip delivery for terminals already abandoned as ghosts.
         if self._f339_is_abandoned(terminal_id):
             self._log_delivery_skip(terminal_id, "f339_abandoned")
@@ -2426,14 +2463,37 @@ class InboxService:
                 return
 
             # --- WP-MAILBOX-CHANNEL: pull-mode gate (D6) ---
-            # If the supervisor.mailbox_pull flag is on AND this terminal is the
-            # current supervisor mailbox incarnation, skip the push entirely.
-            # Rows stay PENDING; the supervisor drains them via list_messages/ack.
+            # WP-ARCH 3b / K8 anchor 1 (§A1.3, §A1.5). This branch used to ask
+            # is_supervisor_mailbox_pull_terminal, which returns False before it
+            # looks at the terminal at all whenever supervisor.mailbox_pull is
+            # unset — so with the shipped defaults the branch was NOT taken and a
+            # supervisor-mailbox row fell straight through to prepare_input and
+            # send_prepared_input. THAT is the path that produced the pasted
+            # "[Message from ...]" blocks in the seat's composer (#613 emitter 3),
+            # and #613 is the evidence: with only wake.native set, the paste
+            # fired anyway.
+            #
+            # It now asks is_supervisor_role_terminal — the same fail-closed
+            # probe D7's dispatch and the rung-2 exemption already use. The ban
+            # is therefore a property of the RECEIVER'S ROLE, not of a switch
+            # position or a config flag:
+            #
+            #   * muting follows the switch position and the ban does not. Under
+            #     `off`, `shadow` and `drain` this path still serves new traffic,
+            #     and `drain` is a position D9's boot guard can impose without an
+            #     operator asking for it. Scoping the ban to CAO_DELIVERY_QUEUE=on
+            #     would leave it false in three of four positions (#488).
+            #   * a config-gated ban is exactly what F210 declined to build when
+            #     it made the rung-2 exemption role-based; an operator could
+            #     unset the flag and the user's decision would evaporate.
+            #
+            # Rows stay PENDING; the seat drains them via list_messages/ack, and
+            # the wake reaches it over the native cross-session channel.
             from cli_agent_orchestrator.services.mailbox_service import (
-                is_supervisor_mailbox_pull_terminal,
+                probe_supervisor_role,
             )
 
-            if is_supervisor_mailbox_pull_terminal(terminal_id):
+            if probe_supervisor_role(terminal_id):
                 # F476 r3 (#388): the supervisor teammate-push wake MUST route
                 # through the single wake cursor, never attempt_teammate_push
                 # directly. Calling attempt_teammate_push here bypassed

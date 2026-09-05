@@ -46,6 +46,15 @@ AC11_LEGACY_IMPORTERS = {
     # same reason: the contact surface a reviewer has to read stays at one file
     # instead of spreading across the two largest legacy packages.
     "services/delivery_mirror.py",
+    # WP-ARCH phase 3b (#584) adds ONE more, and for the third time the same
+    # reason. 3b's legacy contact surface is wide — the seat's role gate in
+    # ``inbox_service``, the mutes on the doorbell, the ladder, the teammate
+    # writer and the stalled watchdog, and the three ``core.ports``
+    # implementations D7's split needs — but every one of those files reaches
+    # the new tree through ``services/queue_carrier.py``, which is a
+    # legacy-to-legacy call. So the file a reviewer must read to see what legacy
+    # now depends on is still exactly one.
+    "services/queue_carrier.py",
 }
 
 #: The subset lane B is responsible for.

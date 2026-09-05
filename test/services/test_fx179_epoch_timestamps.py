@@ -295,7 +295,15 @@ class TestResolveTargetEpochFreshness:
             mock_cfg.get.return_value = 900.0
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_numeric_string_epoch_recent_not_stale(self, sessions_dir):
         """Epoch-ms as numeric string also works."""
@@ -467,7 +475,15 @@ class TestFailClosedPreserved:
             mock_cfg.get.return_value = 900.0
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_empty_updated_at_is_stale(self, sessions_dir):
         """Empty updatedAt → record_stale."""
@@ -493,7 +509,15 @@ class TestFailClosedPreserved:
             mock_cfg.get.return_value = 900.0
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
 
 
@@ -531,7 +555,15 @@ class TestNegativeAgeFarFutureStale:
             mock_cfg.get.return_value = 900.0
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_far_future_numeric_string_is_stale(self, sessions_dir):
         """12-digit epoch-seconds numeric string (far future) → record_stale."""
@@ -558,7 +590,15 @@ class TestNegativeAgeFarFutureStale:
             mock_cfg.get.return_value = 900.0
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_just_under_now_stays_fresh(self, sessions_dir):
         """A timestamp 1 second ago is still fresh (positive age < max)."""

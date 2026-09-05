@@ -48,6 +48,12 @@ AC11_LEGACY_IMPORTERS = {
     # same reason: the contact surface a reviewer has to read stays at one file
     # instead of spreading across the two largest legacy packages.
     "services/delivery_mirror.py",
+    # WP-ARCH phase 3b (#584): one more, same pattern. Every legacy file 3b
+    # touches reaches the new tree through ``services/queue_carrier.py``, which
+    # is also where D7's split gets its three ``core.ports`` implementations —
+    # ``app`` may not import ``services``, so the bridge lives on the legacy
+    # side and the composition root wires it.
+    "services/queue_carrier.py",
 }
 
 _LEGACY_DIRS = (

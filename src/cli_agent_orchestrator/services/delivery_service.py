@@ -827,6 +827,28 @@ def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) 
 # ---------------------------------------------------------------------------
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting of K7.)
+
+    §13d marks this whole module REPLACED and puts it on the kill list as K7:
+    1,983 lines of FX191 convergent delivery whose every part has a carried
+    equivalent — the obligation IS the ``delivery_msg`` row, the ladder is
+    ``reclaim`` plus ``DELIVERY_BACKOFF_S``, the convergence tick is §5c's tick,
+    the stranded detector is ``delivery_dead`` and the trace emitter is
+    ``delivery_attempt``. Two parallel delivery engines over one row set is the
+    two-carrier defect at engine scale, so 3b mutes it and 3c deletes it.
+
+    Never raises: a mute that could break the engine it is muting would be worse
+    than no mute.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 def convergence_tick() -> None:
     """Drive all OPEN obligations one step. Called as first sibling tick (D5/D8).
 
@@ -834,7 +856,11 @@ def convergence_tick() -> None:
     tracks obligation age, fires the masked interrupt (D2) when no boundary
     has occurred for the E-window, updates the @cao_pending indicator (D4),
     and handles escalation (D6).
+
+    WP-ARCH 3b: inert while the queue owns delivery (K7's mute).
     """
+    if _queue_owns_delivery():
+        return
     from cli_agent_orchestrator.services.config_service import ConfigService
 
     phase = ConfigService.get("delivery.phase", "shadow")

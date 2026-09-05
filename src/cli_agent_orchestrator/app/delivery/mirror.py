@@ -172,8 +172,28 @@ class MirrorWriter:
 
     # -- enqueue ------------------------------------------------------------
 
-    def enqueue(self, fact: LegacyEnqueue) -> QueueMessage:
-        """Write the shadow row for one legacy inbox insert.
+    def enqueue(self, fact: LegacyEnqueue, *, mode: QueueMode = QueueMode.SHADOW) -> QueueMessage:
+        """Write the queue row for one legacy inbox insert.
+
+        ``mode`` is the write-through flip (3b): ``shadow`` is an observational
+        copy the tick can never claim, ``live`` is the row the tick serves.  The
+        FIELDS are identical either way, which is the point — the write-through
+        is a change of authority, not a change of shape, so 3a's agreement report
+        is a comparison of the same row against two engines rather than of two
+        different rows.
+
+        **Every one of D13's carried effects is preserved by CONSTRUCTION here**,
+        because the legacy choke point still runs and this hook fires after it
+        commits.  Barrier attach, open-barrier association, the late-callback
+        rewrite, the F475 window check, the enqueue-generation stamp, F578
+        supersession and the barrier ``AWAITING``→``ARRIVED`` transition all
+        happen exactly as they do today, and their results arrive here as fields
+        on the fact.  Reimplementing any of them against the queue's own tables
+        would give one behaviour two implementations, which is the failure D13's
+        rejected alternative names.  What the flip changes is who DELIVERS the
+        row: at ``on`` the legacy surfaces are muted and the tick is the only
+        engine, so the row has one carrier even though two tables hold a record
+        of it.
 
         Runs AFTER the legacy insert has committed, which is not an incidental
         detail.  The queue's store holds its own connection to the same SQLite
@@ -198,7 +218,7 @@ class MirrorWriter:
             sender_id=fact.sender_id,
             kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
             payload=fact.message,
-            mode=QueueMode.SHADOW,
+            mode=mode,
             expire_after_s=fact.expire_after_s,
             supersede_key=fact.supersede_key,
             content_hash=fact.content_hash,

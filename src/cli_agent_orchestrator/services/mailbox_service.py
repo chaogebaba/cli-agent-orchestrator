@@ -150,6 +150,34 @@ def is_supervisor_role_terminal(terminal_id: str, db: Any | None = None) -> bool
         return _check(session)
 
 
+def probe_supervisor_role(terminal_id: str | None) -> bool:
+    """The role probe, FAIL-CLOSED — the one D7's dispatch and K8's ban both use.
+
+    An unanswerable probe reports *supervisor*, because the cost of a wrong
+    ``False`` is typing into the user's own pane. That direction and that reason
+    are F210's, and WP-ARCH 3b keeps both while moving the wrapper here: the
+    wrapper used to live in ``delivery_service`` (the FX191 ladder), which the
+    phase deletes, and A1.1 puts the probe in its own module so it outlives the
+    ladder.
+
+    The misclassification cost is stated rather than hidden. A worker wrongly
+    read as a seat is never pasted, and its rows die at ``dead_by`` with a
+    ``DIAG-SEAT-WAKE-UNREACHABLE`` finding — loud, bounded, and the safe
+    direction. A seat wrongly read as a worker is a paste into a human's
+    composer, which is the thing the user ended.
+
+    A builder who "fixes" this to fail open has reverted the amendment.
+    """
+    if not terminal_id:
+        return True
+    try:
+        with SessionLocal() as db:
+            return is_supervisor_role_terminal(terminal_id, db)
+    except Exception:
+        logger.debug("supervisor-role probe failed for %s", terminal_id, exc_info=True)
+        return True
+
+
 def get_current_supervisor_terminal_id() -> str | None:
     """F138: Return the terminal_id of the current live supervisor mailbox, or None.
 

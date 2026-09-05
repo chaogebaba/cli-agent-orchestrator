@@ -548,7 +548,15 @@ class TestAC6ResolutionRefusals:
 
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_two_descendants_both_match_pane_ambiguous(self, sessions_dir):
         """Two descendant records both matching pane tmux => target_ambiguous."""

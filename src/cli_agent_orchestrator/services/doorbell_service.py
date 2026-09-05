@@ -125,6 +125,23 @@ def is_socket_delivered(row_id: int) -> bool:
         return False
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting.)
+
+    Asked through the delivery wiring rather than the environment: the boot guard
+    can demote a requested position, and a surface that read the variable itself
+    could mute on a position the guard already refused. Never raises — a wiring
+    module that cannot answer leaves legacy behaving exactly as it does today,
+    which is the safe direction for a mute.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 def ring_supervisor_doorbell(
     terminal_id: str,
     max_written_row_id: int,
@@ -144,6 +161,22 @@ def ring_supervisor_doorbell(
     F459: message_body/sender_display_name carry the worker's actual callback
     text and display name through to the native bridge message.
     """
+    # WP-ARCH 3b: K3 is MUTED while the queue owns delivery (D6, §7b).
+    #
+    # The module is still here — 3c deletes it — so the mute is what stops it
+    # emitting, and case 17's emitter count is what tests the mute. A second
+    # emitter in the `on` arm is a LEAKY MUTE rather than a missing deletion.
+    # `drain` deliberately does not mute: there the tick finishes rows already
+    # enqueued while NEW traffic goes back to the legacy inbox, so muting would
+    # leave that traffic with no carrier at all (§6).
+    if _queue_owns_delivery():
+        logger.info(
+            "f170_doorbell terminal=%s decision=skipped_muted reason=queue_owns_delivery row=%s",
+            terminal_id,
+            max_written_row_id,
+        )
+        return "skipped_disabled"
+
     # D10 (fx168): outer switch — off means no bell of any kind.
     if not ConfigService.get("supervisor.doorbell", default=True):
         logger.info(

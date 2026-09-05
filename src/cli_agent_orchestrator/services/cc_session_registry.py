@@ -55,9 +55,24 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 
-# F337 B1: canonical default for supervisor.wake.native — ship DARK (False).
-# All call sites and the config-registry entry MUST reference this constant.
-WAKE_NATIVE_DEFAULT = False
+# Canonical default for supervisor.wake.native. All call sites and the
+# config-registry entry MUST reference this constant.
+#
+# F337 B1 shipped it DARK (False). WP-ARCH 3b / A1.5 flips it to True, and the
+# reason is that removing the paste from every position is only half the job.
+# The seat's composer injection is now role-gated rather than flag-gated, so it
+# is gone under `off`, `shadow`, `drain` and `on` alike. In the three non-`on`
+# positions the queue does not serve the seat, so the only remaining carrier is
+# the F136 chain into ring_supervisor_doorbell — and with this default False
+# that chain emits NOTHING: supervisor.doorbell True passes the outer gate,
+# wake.native False skips the native ring, and teammate_push False declines the
+# fallback. The seat would then be neither pasted nor woken in three positions
+# including the shipped default. A paste is an ugly carrier; silence is the bug
+# the phase exists to remove.
+#
+# The cost is stated rather than buried: a deployment that never opted into the
+# queue gets a native seat ring it did not ask for (blueprint §10).
+WAKE_NATIVE_DEFAULT = True
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +185,37 @@ class RegistryRecord:
 
 @dataclass
 class ResolveResult:
-    """Outcome of target resolution."""
+    """Outcome of target resolution.
+
+    WP-ARCH 3b (A1.4): ``stale`` is an ANNOTATION, not a refusal. The registry
+    record's ``updatedAt`` is written by Claude Code's own process, not by CAO,
+    so its age measures how long the seat has been QUIET — which for an idle
+    seat is unbounded. A gate that refuses to wake an idle seat is a gate that
+    fails in exactly the case #604 is about: under the pre-amendment behaviour
+    every message to a seat idle for fifteen minutes was refused on a timestamp
+    and died at its deadline unreached.
+
+    So resolution now attempts the write and lets the socket answer. The
+    identity guards that protect against writing into the WRONG session stay
+    hard refusals — ``proc_start_mismatch`` (PID reuse), ``no_descendant_record``
+    and ``target_ambiguous`` — because the socket's errno is a definite answer
+    where the timestamp is a guess: a dead session yields ``socket_enoent`` or
+    ``socket_econnrefused`` and is reported unreachable honestly, and a
+    live-but-quiet session is woken.
+
+    The demotion lives HERE rather than in the queue's emitter because both
+    callers reach this function: the queue's ``wake_seat`` when the delivery
+    switch is ``on``, and ``_attempt_native_ring`` in every other position. Put
+    in the emitter, an idle seat under ``off``, ``shadow`` or ``drain`` would
+    still be refused on a timestamp (§A1.5).
+    """
 
     record: Optional[RegistryRecord] = None
     refusal_reason: Optional[str] = None
+    #: The record resolved but its ``updatedAt`` is older than
+    #: ``supervisor.wake.max_record_age_s`` (or unparseable). Recorded on the
+    #: delivery attempt row; it blocks nothing.
+    stale: bool = False
 
 
 def _sanitize_sender_name(name: str) -> str:
@@ -450,18 +492,28 @@ def resolve_target(
     if live_proc_start != record.proc_start:
         return ResolveResult(refusal_reason="proc_start_mismatch")
 
-    # Guard: record freshness
+    # Annotation (not a guard): record freshness.
+    #
+    # WP-ARCH 3b / A1.4, forced by #613 sample 5 — the server-side push deferred
+    # with reason=record_stale for ids 4231 and 4232 while the seat was
+    # demonstrably alive. This age is CC's own quiet time, so refusing on it
+    # refuses exactly the idle seats #604 is about. The identity guards above
+    # stay hard; this one is recorded and the caller writes anyway.
+    stale = False
     try:
         from datetime import datetime, timezone
+
         updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
         age_s = (datetime.now(timezone.utc) - updated).total_seconds()
-        if age_s < 0 or age_s > max_record_age_s:
-            return ResolveResult(refusal_reason="record_stale")
+        stale = age_s < 0 or age_s > max_record_age_s
     except (ValueError, TypeError, AttributeError):
-        # If updatedAt is unparseable, treat as stale
-        return ResolveResult(refusal_reason="record_stale")
+        # An unparseable updatedAt is a formatting fact, not an identity one:
+        # the PID-reuse and descendant guards have already proved WHICH session
+        # this is, so the socket is still the right place to ask whether it is
+        # alive.
+        stale = True
 
-    return ResolveResult(record=record)
+    return ResolveResult(record=record, stale=stale)
 
 
 def check_version_guard(record: RegistryRecord) -> Optional[str]:
