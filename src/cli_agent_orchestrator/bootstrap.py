@@ -47,6 +47,8 @@ from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
 from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
 from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
+from cli_agent_orchestrator.app.delivery.tick import DeliveryTick
+from cli_agent_orchestrator.app.delivery.wake import WakeService
 from cli_agent_orchestrator.app.diag.report import DiagSources
 from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
 from cli_agent_orchestrator.app.worker_truth.checks import (
@@ -146,6 +148,10 @@ class WorkerTruthRuntime:
     #: be a coupling neither blueprint asks for.
     delivery: GuardOutcome | None = None
     queue_store: QueueStore | None = None
+    #: §5c's tick, present only for a position that is SERVED (``on`` or
+    #: ``drain``).  Held here so shutdown can stop it and so a test can drive
+    #: ``run_once`` directly rather than waiting on a cadence.
+    delivery_tick: DeliveryTick | None = None
 
 
 _runtime: WorkerTruthRuntime | None = None
@@ -180,7 +186,7 @@ def _start_delivery(
     clock: Clock,
     *,
     env: dict[str, str] | None = None,
-) -> tuple[GuardOutcome, QueueStore | None]:
+) -> tuple[GuardOutcome, QueueStore | None, DeliveryTick | None]:
     """Resolve ``CAO_DELIVERY_QUEUE`` through D9's guard and arm the hooks.
 
     Never raises.  Three things happen, in this order and for this reason:
@@ -199,13 +205,19 @@ def _start_delivery(
        the ``finding`` table is created by step 0 of every migration and the
        guard's notice belongs to phase 3, not to phase 1.
 
-    Only ``shadow`` arms the hooks.  Sub-phase 3a builds the shadow queue and the
-    boot guard and nothing else: ``drain`` and ``on`` are positions whose
-    behaviour — the tick, the write-through, the digest — lands in 3b.  A boot
-    requesting one of them here gets a loud warning and NO hooks, rather than
-    being quietly reinterpreted as ``shadow``.  Reinterpreting would be worse
-    than refusing: an operator who asked for write-through and got a shadow queue
-    would believe the seat was being served from the queue when it was not.
+    ``shadow``, ``drain`` and ``on`` all arm the hooks, and they arm different
+    things.  ``shadow`` writes observational rows and nothing serves them.
+    ``on`` writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.
+    ``drain`` accepts NO new queue rows while the tick finishes delivering the
+    ones already there, which is the only way back out of ``on`` that does not
+    orphan them (§6).  ``off`` arms nothing, and there is no code path from a
+    hook to the queue that does not pass the install guard in the wiring module.
+
+    The write-through flip's FIRST act is the shadow sweep: a shadow row the
+    mirror writer never resolved is still ``ready`` with no terminal state, and
+    although ``claim``'s ``mode`` filter already makes it unclaimable, a durable
+    row with no ending is the shape this phase exists to remove.  The sweep and
+    the filter are independent — either alone prevents the delivery.
     """
     requested = delivery_position(env)
     try:
@@ -213,7 +225,7 @@ def _start_delivery(
         occupancy = store.occupancy()
     except Exception as exc:  # noqa: BLE001 — a queue we cannot read must not block boot
         logger.error("delivery queue could not be opened: %r", exc)
-        return GuardOutcome(requested=requested, position=SwitchPosition.OFF), None
+        return GuardOutcome(requested=requested, position=SwitchPosition.OFF), None, None
 
     outcome = resolve_switch(requested, occupancy)
 
@@ -240,26 +252,84 @@ def _start_delivery(
             outcome.detail,
         )
 
-    if outcome.position is SwitchPosition.SHADOW:
-        delivery_wiring.install_delivery(
-            delivery_wiring.DeliveryRuntime(
-                store=store,
-                clock=clock,
-                position=outcome.position,
-                mirror=MirrorWriter(store, clock),
-            )
+    if outcome.position is SwitchPosition.OFF:
+        return outcome, store, None
+
+    if outcome.position is SwitchPosition.ON:
+        try:
+            swept = store.sweep_shadow(now=clock.now())
+            if swept:
+                logger.info("delivery flip swept %d unresolved shadow rows to superseded", swept)
+        except Exception:  # noqa: BLE001 — a sweep that fails must not block boot
+            logger.warning("delivery flip: the shadow sweep failed", exc_info=True)
+
+    delivery_wiring.install_delivery(
+        delivery_wiring.DeliveryRuntime(
+            store=store,
+            clock=clock,
+            position=outcome.position,
+            mirror=MirrorWriter(store, clock),
         )
-        logger.info("delivery queue armed in SHADOW mode (%s)", DELIVERY_ENV_VAR)
-    elif outcome.position in (SwitchPosition.DRAIN, SwitchPosition.ON):
-        logger.warning(
-            "%s resolved to %s, which sub-phase 3a does not implement: the queue "
-            "is NOT being served and no rows are being written. Set %s=shadow, or "
-            "unset it, until sub-phase 3b ships.",
-            DELIVERY_ENV_VAR,
-            outcome.position.value,
-            DELIVERY_ENV_VAR,
+    )
+    logger.info("delivery queue armed in %s mode (%s)", outcome.position.value, DELIVERY_ENV_VAR)
+
+    findings: FindingStore | None
+    try:
+        findings = SqliteFindingStore(pool, clock=clock)
+    except Exception:  # noqa: BLE001 — a tick without findings still delivers
+        logger.warning("delivery: the finding store could not be built", exc_info=True)
+        findings = None
+    tick = _build_delivery_tick(store, clock, position=outcome.position, findings=findings)
+    return outcome, store, tick
+
+
+def _build_delivery_tick(
+    store: QueueStore,
+    clock: Clock,
+    *,
+    position: SwitchPosition,
+    findings: FindingStore | None,
+) -> DeliveryTick | None:
+    """Assemble §5c's tick, or ``None`` for a position that is not served.
+
+    The one place the legacy carrier bridge is NAMED, for the same reason this
+    module is the one place an adapter is named: ``app`` may not import
+    ``services``, so the tick depends on three Protocols and the composition root
+    is what satisfies them.  Imported inside the function so a test can build the
+    tick from doubles without pulling the legacy service tree in.
+    """
+    if position not in (SwitchPosition.ON, SwitchPosition.DRAIN):
+        return None
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import (
+            LegacyReceiverDirectory,
+            NativeSeatCarrier,
+            PaneWorkerInjector,
         )
-    return outcome, store
+
+        directory = LegacyReceiverDirectory()
+        wake = WakeService(
+            store=store,
+            directory=directory,
+            carrier=NativeSeatCarrier(),
+            injector=PaneWorkerInjector(),
+            clock=clock,
+        )
+        return DeliveryTick(
+            store=store,
+            wake=wake,
+            directory=directory,
+            findings=findings,
+            clock=clock,
+            position=position,
+        )
+    except Exception:  # noqa: BLE001 — a tick that cannot be built must not block boot
+        logger.error(
+            "delivery tick could not be assembled; the queue holds rows nothing will "
+            "serve until the next restart",
+            exc_info=True,
+        )
+        return None
 
 
 async def start_worker_truth(
@@ -308,7 +378,13 @@ async def start_worker_truth(
     # The delivery switch is resolved whatever the INGESTION switch says: they
     # are two independent strangler phases and coupling them would mean a
     # phase-3 rollback needed a phase-1 decision.
-    delivery, queue_store = _start_delivery(pool, resolved_clock, env=env)
+    delivery, queue_store, delivery_tick = _start_delivery(pool, resolved_clock, env=env)
+    if delivery_tick is not None:
+        # Started HERE rather than behind the ingestion switch: the two are
+        # independent strangler phases, and a queue that only ran when phase 1
+        # happened to be ingesting would be a coupling neither blueprint asks
+        # for — and, worse, a delivery safety net with a second precondition.
+        await delivery_tick.start()
 
     if not enabled:
         # Tables exist and phase 1 is inert.  No event store, no tasks, nothing
@@ -320,6 +396,7 @@ async def start_worker_truth(
             pool=pool,
             delivery=delivery,
             queue_store=queue_store,
+            delivery_tick=delivery_tick,
         )
         return _runtime
 
@@ -377,6 +454,7 @@ async def start_worker_truth(
             pool=pool,
             delivery=delivery,
             queue_store=queue_store,
+            delivery_tick=delivery_tick,
         )
         return _runtime
 
@@ -394,6 +472,7 @@ async def start_worker_truth(
         retention=retention,
         delivery=delivery,
         queue_store=queue_store,
+        delivery_tick=delivery_tick,
     )
     logger.info("worker-truth ingestion ENABLED (%s=1)", INGEST_ENV_VAR)
     return _runtime
@@ -411,6 +490,11 @@ async def shutdown_worker_truth() -> None:
     delivery_wiring.reset_delivery()
     if runtime is None:
         return
+    if runtime.delivery_tick is not None:
+        try:
+            await runtime.delivery_tick.stop()
+        except Exception:  # noqa: BLE001
+            logger.warning("delivery tick did not stop cleanly", exc_info=True)
     if runtime.retention is not None:
         try:
             await runtime.retention.stop()

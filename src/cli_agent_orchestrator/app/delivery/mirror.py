@@ -33,9 +33,11 @@ from cli_agent_orchestrator.app.delivery.facts import (
     LegacyAttempt,
     LegacyEnqueue,
     LegacyOutcome,
+    LegacySeatWake,
     LegacyVeto,
 )
 from cli_agent_orchestrator.core.delivery import (
+    CARRIER_SEAT_WAKE,
     AttemptOutcome,
     DeadReason,
     DeliveryAttempt,
@@ -157,6 +159,17 @@ VETO_OUTCOME_MAP: dict[str, AttemptOutcome] = {
 #: rather than from a sequence.
 _VETO_CLAIM_ID = -1
 
+#: Where a legacy seat wake's attempt row is filed.
+#:
+#: Same shape as the veto's and for the same reason — a doorbell ring carries no
+#: legacy attempt ordinal, since it opens no ``inbox_delivery_attempt`` row at
+#: all — and it may share the veto's arithmetic safely because the attempt key is
+#: ``(msg_id, claim_id, carrier)`` and this row's carrier is ``seat_wake``, which
+#: no other producer here writes. Derived from the emission's own instant, so a
+#: re-observation of one ring converges on one row while a genuinely later ring
+#: is a second attempt, which is what it is.
+_SEAT_WAKE_CLAIM_ID = -1
+
 
 class MirrorWriter:
     """Writes and advances ``mode='shadow'`` rows from observed legacy facts.
@@ -172,8 +185,28 @@ class MirrorWriter:
 
     # -- enqueue ------------------------------------------------------------
 
-    def enqueue(self, fact: LegacyEnqueue) -> QueueMessage:
-        """Write the shadow row for one legacy inbox insert.
+    def enqueue(self, fact: LegacyEnqueue, *, mode: QueueMode = QueueMode.SHADOW) -> QueueMessage:
+        """Write the queue row for one legacy inbox insert.
+
+        ``mode`` is the write-through flip (3b): ``shadow`` is an observational
+        copy the tick can never claim, ``live`` is the row the tick serves.  The
+        FIELDS are identical either way, which is the point — the write-through
+        is a change of authority, not a change of shape, so 3a's agreement report
+        is a comparison of the same row against two engines rather than of two
+        different rows.
+
+        **Every one of D13's carried effects is preserved by CONSTRUCTION here**,
+        because the legacy choke point still runs and this hook fires after it
+        commits.  Barrier attach, open-barrier association, the late-callback
+        rewrite, the F475 window check, the enqueue-generation stamp, F578
+        supersession and the barrier ``AWAITING``→``ARRIVED`` transition all
+        happen exactly as they do today, and their results arrive here as fields
+        on the fact.  Reimplementing any of them against the queue's own tables
+        would give one behaviour two implementations, which is the failure D13's
+        rejected alternative names.  What the flip changes is who DELIVERS the
+        row: at ``on`` the legacy surfaces are muted and the tick is the only
+        engine, so the row has one carrier even though two tables hold a record
+        of it.
 
         Runs AFTER the legacy insert has committed, which is not an incidental
         detail.  The queue's store holds its own connection to the same SQLite
@@ -198,7 +231,7 @@ class MirrorWriter:
             sender_id=fact.sender_id,
             kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
             payload=fact.message,
-            mode=QueueMode.SHADOW,
+            mode=mode,
             expire_after_s=fact.expire_after_s,
             supersede_key=fact.supersede_key,
             content_hash=fact.content_hash,
@@ -264,6 +297,34 @@ class MirrorWriter:
                     detail=detail,
                 ),
             )
+
+    def observe_seat_wake(self, wake: LegacySeatWake) -> None:
+        """Record the ``delivery_attempt`` row for one emitted legacy seat wake.
+
+        The row is NOT advanced. A wake is an emission, not a settlement: the
+        seat consumes its ids through ``list_messages``/``ack_messages`` and the
+        legacy status edge is what ends the message, observed by :meth:`observe`.
+        Settling here would report a delivery the seat has not made yet.
+
+        Unlike :meth:`observe_veto` this records against a terminal row too. The
+        veto skips one because a refusal after the ending is noise; an emission
+        after it is a FACT — the carrier really did write those bytes — and
+        hiding it would leave exactly the gap this method exists to close.
+        """
+        message = self._lookup(wake.legacy_message_id)
+        if message is None:
+            return
+        self._safely(
+            self._store.record_attempt,
+            DeliveryAttempt(
+                msg_id=message.msg_id,
+                claim_id=_SEAT_WAKE_CLAIM_ID - int(wake.at.timestamp()),
+                carrier=CARRIER_SEAT_WAKE,
+                started_at=wake.at,
+                outcome=AttemptOutcome.DELIVERED,
+                detail=wake.detail or "legacy seat wake",
+            ),
+        )
 
     # -- internals ----------------------------------------------------------
 

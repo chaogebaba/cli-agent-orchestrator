@@ -130,16 +130,22 @@ def _inbox_row(
 # ---------------------------------------------------------------------------
 
 
-def test_ac1_flag_off_push_unchanged(scratch_db, monkeypatch):
-    """With supervisor.mailbox_pull absent/false, delivering to a supervisor mailbox
-    terminal does NOT trigger the pull-mode gate — the push path proceeds.
+def test_ac1_flag_off_gate_still_holds_the_row_by_role(scratch_db, monkeypatch):
+    """WP-ARCH 3b / A1.5 INVERTS this case, and the inversion is the decision.
 
-    Verifies:
-    1. is_supervisor_mailbox_pull_terminal returns False when flag is off
-       (the gate condition evaluates to False → no early return)
-    2. Contrast with AC#2 which proves the gate DOES activate when True
-    3. The row remains PENDING because the production delivery path needs
-       many more components, but crucially it was NOT settled by the gate.
+    AC#1 used to prove that with ``supervisor.mailbox_pull`` off, a supervisor
+    mailbox terminal fell through the gate and took the push path. That
+    fall-through is the path that produced the pasted ``[Message from ...]``
+    blocks in the seat's composer (#613, emitter 3), and the user ended it.
+
+    The gate now asks the fail-closed ROLE probe instead of the flag, so the ban
+    holds under ``off``, ``shadow``, ``drain`` and ``on`` alike — muting follows
+    the switch position and the ban does not. A config-gated ban is exactly what
+    F210 declined to build when it made the rung-2 exemption role-based.
+
+    What is still asserted here: the flag helper is unchanged and still reports
+    False (the flag did not silently flip), and the row is held PENDING for the
+    seat to drain rather than settled by the gate.
     """
     monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
     with scratch_db.begin() as db:
@@ -148,15 +154,15 @@ def test_ac1_flag_off_push_unchanged(scratch_db, monkeypatch):
         row = _inbox_row(db, "sup-001", logical="mb_sup")
         row_id = row.id
 
-    # Core assertion: gate helper returns False when flag is off
+    # The flag helper is untouched by the amendment and still reports False.
+    # What changed is which predicate the GATE consults.
     assert is_supervisor_mailbox_pull_terminal("sup-001") is False
 
-    # Deliver with the full InboxService (it will hit other guards and return
-    # without completing delivery, but the key assertion is that it doesn't
-    # return at the pull-mode gate). We trace whether the gate was reached
-    # by patching is_supervisor_mailbox_pull_terminal to record the call.
+    # Trace the predicate the gate actually consults now.
+    from cli_agent_orchestrator.services.mailbox_service import probe_supervisor_role
+
     gate_called = []
-    original_fn = is_supervisor_mailbox_pull_terminal
+    original_fn = probe_supervisor_role
 
     def traced_fn(tid):
         result = original_fn(tid)
@@ -165,7 +171,7 @@ def test_ac1_flag_off_push_unchanged(scratch_db, monkeypatch):
 
     with (
         patch(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
             traced_fn,
         ),
         patch(
@@ -197,10 +203,10 @@ def test_ac1_flag_off_push_unchanged(scratch_db, monkeypatch):
         svc._terminal_not_found_streaks = {}
         svc.deliver_pending("sup-001")
 
-    # Gate was called and returned False — push path was NOT short-circuited.
-    assert any(tid == "sup-001" and result is False for tid, result in gate_called)
-    # Row is still PENDING (push path didn't complete due to missing mocks,
-    # but crucially it was NOT acked/settled by the pull gate either).
+    # The gate was reached and reported SUPERVISOR, so the row was short-circuited
+    # by role rather than falling through to the composer.
+    assert any(tid == "sup-001" and result is True for tid, result in gate_called)
+    # And it is held PENDING for the seat to drain, not settled by the gate.
     with scratch_db() as db:
         msg = db.get(InboxModel, row_id)
         assert msg.status == MessageStatus.PENDING.value
@@ -490,10 +496,12 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
     via the gate; the join is a secondary filter, not a pull-mode protection.
     """
     monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
-    from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
     from cli_agent_orchestrator.clients.database import list_pending_receiver_ids_older_than
+    from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
 
-    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS + 60)
+    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        seconds=INBOX_RECONCILE_GRACE_SECONDS + 60
+    )
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -503,7 +511,11 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
         )
         # Young row (within grace) — should NOT appear
         young_row = _inbox_row(
-            db, "sup-001", logical="mb_sup", message="young msg", created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            db,
+            "sup-001",
+            logical="mb_sup",
+            message="young msg",
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         old_id, young_id = old_row.id, young_row.id
 
@@ -617,11 +629,7 @@ def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
 
     # Verify the attempt is settled (not dangling)
     with scratch_db() as db:
-        attempt = (
-            db.query(InboxDeliveryAttemptModel)
-            .filter_by(attempt_uuid=attempt_uuid)
-            .one()
-        )
+        attempt = db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt_uuid).one()
         assert attempt.settled_at is not None
         assert attempt.outcome == "confirmed"
         assert attempt.reason == "mailbox_pull_acked"
@@ -661,7 +669,7 @@ def test_p0_hotfix_supervisor_row_pushes_when_receiver_idle(scratch_db, monkeypa
 
     with (
         patch(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
             traced_fn,
         ),
         patch(

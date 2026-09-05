@@ -37,10 +37,21 @@ import logging
 import threading
 from dataclasses import dataclass
 
-from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue, LegacyOutcome, LegacyVeto
+from cli_agent_orchestrator.app.delivery.facts import (
+    LegacyEnqueue,
+    LegacyOutcome,
+    LegacySeatWake,
+    LegacyVeto,
+)
 from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
-from cli_agent_orchestrator.core.delivery import SwitchPosition
+from cli_agent_orchestrator.core.delivery import (
+    EnqueueDraft,
+    MsgKind,
+    QueueMode,
+    SwitchPosition,
+)
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
+from cli_agent_orchestrator.core.timing import DELIVERY_DEDUP_WINDOW_S
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +60,16 @@ __all__ = [
     "delivery_runtime",
     "install_delivery",
     "queue_enabled",
+    "queue_owns_delivery",
+    "queue_owns_new_traffic",
+    "queue_position",
+    "record_completion",
     "record_enqueue",
     "record_outcome",
+    "record_seat_wake",
     "record_veto",
     "reset_delivery",
+    "write_through",
 ]
 
 #: How many hook failures are logged with a traceback before the logger falls
@@ -112,38 +129,219 @@ def queue_enabled() -> bool:
     return _runtime is not None
 
 
-def record_enqueue(fact: LegacyEnqueue) -> None:
-    """Write the shadow row for one committed legacy insert.
+def queue_position() -> SwitchPosition:
+    """The RESOLVED position, or ``off`` when nothing is installed.
 
-    Returns ``None`` always, and callers in legacy code are written to ignore
-    it.  Handing back the minted ``msg_id`` was considered and rejected: a legacy
-    caller with a queue id in its hand is a caller that can come to depend on
-    one, and sub-phase 3a's whole claim is that removing it changes nothing.
+    One reader for the whole legacy tree, so "is the queue serving this?" has one
+    answer and not one per call site.  Legacy modules ask this rather than the
+    environment: the boot guard can demote a requested position, and a hook that
+    read the variable itself could act on a position the guard already refused.
+    """
+    runtime = _runtime
+    return SwitchPosition.OFF if runtime is None else runtime.position
+
+
+def queue_owns_delivery() -> bool:
+    """True at ``on``: the queue serves the seat and D6's surfaces are MUTED.
+
+    This is the whole of sub-phase 3b's muting, in one predicate.  K1 through K7
+    are still present — they are deleted in 3c — and each asks this before it
+    emits, so the single-emitter property in 3b rests on the SWITCH while in 3c
+    it rests on the deletions.  Case 17 therefore tests the muting, and a second
+    emitter in its ``on`` arm is a leaky mute rather than a missing deletion.
+
+    ``drain`` is deliberately false.  Under ``drain`` the tick finishes
+    delivering rows already enqueued while new traffic goes back to the legacy
+    inbox (§6), so legacy must keep emitting for those rows; muting there would
+    leave the new traffic with no carrier at all.
+    """
+    return queue_position() is SwitchPosition.ON
+
+
+def queue_owns_new_traffic() -> bool:
+    """True at ``on``: a new enqueue becomes a ``mode='live'`` queue row.
+
+    False at ``drain``, which is the position's whole point — it accepts no new
+    queue rows, so it empties on its own budget while new enqueues go to the
+    legacy inbox (§6, D9).
+    """
+    return queue_position() is SwitchPosition.ON
+
+
+def record_enqueue(fact: LegacyEnqueue) -> None:
+    """Mirror one committed legacy insert as a SHADOW row (3a's hook).
+
+    Sub-phase 3a's observational copy, and it stays exactly that. Two positions
+    write nothing at all:
+
+    * ``drain`` accepts no new queue rows — that is the position's whole point,
+      since it empties on its own budget while new traffic goes back to the
+      legacy inbox (§6);
+    * ``on`` has no legacy insert to mirror. There the queue is the AUTHORITY and
+      :func:`write_through` is what wrote the row, before the caller reached its
+      own insert. Mirroring here as well would produce the second row for one
+      message that §6 excludes as a fifth carrier — the exact defect the flip is
+      supposed to remove.
+
+    Returns ``None`` always, and callers in legacy code are written to ignore it.
     """
     runtime = _runtime
     if runtime is None:
         return
-    _guarded(lambda: runtime.mirror.enqueue(fact), "enqueue", str(fact.legacy_message_id))
+    if runtime.position in (SwitchPosition.DRAIN, SwitchPosition.ON):
+        return
+    _guarded(
+        lambda: runtime.mirror.enqueue(fact, mode=QueueMode.SHADOW),
+        "enqueue",
+        str(fact.legacy_message_id),
+    )
 
 
 def record_outcome(fact: LegacyOutcome) -> None:
-    """Advance one shadow row from the legacy row's current status."""
+    """Advance one SHADOW row from the legacy row's current status.
+
+    Inert once the queue owns delivery: at ``on`` the queue's own attempt rows
+    and states are the authority (I5), and letting a legacy edge settle a live
+    row would give one id two authorities — which is the defect D13 scopes the
+    legacy ledger out for.
+    """
     runtime = _runtime
-    if runtime is None:
+    if runtime is None or runtime.position is SwitchPosition.ON:
         return
     _guarded(lambda: runtime.mirror.observe(fact), "outcome", str(fact.legacy_message_id))
 
 
-def record_veto(fact: LegacyVeto) -> None:
-    """Record an injection the legacy path declined."""
+def record_seat_wake(fact: LegacySeatWake) -> None:
+    """Record the attempt row for one native seat wake legacy emitted (§A1.5).
+
+    ``off``, ``shadow`` and ``drain`` are the positions where the F136 chain IS
+    the seat's carrier, and this is what puts that emission on the record. At
+    ``on`` it is inert twice over: the doorbell is muted there (D6/K3) so nothing
+    calls this, and the tick's own attempt rows are the authority for a live row
+    (I5) — a legacy edge writing one would give a single id two authorities,
+    which is the defect D13 scopes the legacy ledger out for.
+
+    Inert at ``off`` by construction rather than by a position test: nothing is
+    installed there, so there is no shadow row to file an attempt against.
+    """
     runtime = _runtime
-    if runtime is None:
+    if runtime is None or runtime.position is SwitchPosition.ON:
+        return
+    _guarded(
+        lambda: runtime.mirror.observe_seat_wake(fact),
+        "seat_wake",
+        str(fact.legacy_message_id),
+    )
+
+
+def record_veto(fact: LegacyVeto) -> None:
+    """Record an injection the legacy path declined.  Inert at ``on``, as above."""
+    runtime = _runtime
+    if runtime is None or runtime.position is SwitchPosition.ON:
         return
     _guarded(
         lambda: runtime.mirror.observe_veto(fact),
         "veto",
         ",".join(str(mid) for mid in fact.legacy_message_ids),
     )
+
+
+def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
+    """Enqueue new traffic into the QUEUE instead of the legacy inbox (§6).
+
+    Returns ``(surrogate_id, msg_id)``, or ``None`` when the queue does not own
+    new traffic — in which case the caller writes its legacy row exactly as it
+    does today.
+
+    This is the flip §6 describes: "the legacy inbox goes read-only: it stops
+    accepting inserts, existing rows drain through the old path, and new rows go
+    to ``delivery_msg``". Sub-phase 3a's ``record_enqueue`` mirror still exists
+    and still runs at ``shadow``; the difference here is authority, so the two
+    are deliberately separate functions rather than one with a mode flag.
+
+    Dual-write is excluded, and the reason is in the same paragraph: a
+    dual-written row is a fifth carrier and would reproduce #506 inside the fix.
+
+    **D13's carried effects that are NOT here happen in the caller**, because
+    they operate on the barrier tables and the legacy predicate has to see them
+    in its own transaction: the dispatch-barrier attach, the open-barrier
+    association, the late-callback rewrite and the F578 supersession. What IS
+    here is the F475 window check, because at ``on`` there is no legacy row for
+    the legacy predicate to find.
+
+    Never raises into the caller: a queue that cannot be written returns
+    ``None``, and the caller writes its legacy row. That degrades to the
+    pre-flip behaviour rather than losing the message.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is not SwitchPosition.ON:
+        return None
+    try:
+        now = runtime.clock.now()
+        duplicate = runtime.store.find_recent_duplicate(
+            sender_id=fact.sender_id,
+            receiver_id=fact.receiver_id,
+            content_hash=fact.content_hash or "",
+            window_s=DELIVERY_DEDUP_WINDOW_S,
+            now=now,
+            park_warm=fact.park_warm,
+            barrier_id=fact.barrier_id,
+        )
+        if duplicate is not None and duplicate.legacy_message_id is not None:
+            # A suppressed duplicate returns the EXISTING row, which is what the
+            # legacy path returns today — never a fabricated id.
+            return int(duplicate.legacy_message_id), duplicate.msg_id
+
+        surrogate = runtime.store.next_surrogate_id()
+        message = runtime.store.enqueue(
+            EnqueueDraft(
+                idempotency_key=f"live-inbox:{surrogate}",
+                receiver_id=fact.receiver_id,
+                sender_id=fact.sender_id,
+                kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
+                payload=fact.message,
+                mode=QueueMode.LIVE,
+                expire_after_s=fact.expire_after_s,
+                supersede_key=fact.supersede_key,
+                content_hash=fact.content_hash,
+                park_warm=fact.park_warm,
+                barrier_id=fact.barrier_id,
+                barrier_member_key=fact.barrier_member_key,
+                enqueue_generation=fact.enqueue_generation,
+                legacy_message_id=surrogate,
+            )
+        )
+        return surrogate, message.msg_id
+    except Exception:  # noqa: BLE001 — a queue write may never break a send
+        logger.warning(
+            "delivery write-through failed; the caller falls back to the legacy insert",
+            exc_info=True,
+        )
+        return None
+
+
+def record_completion(receiver_id: str) -> tuple[str, ...]:
+    """D8's completion-cancel, driven by the RECEIVER'S OWN completion.
+
+    ``supersede_key`` handles the same-mailbox case at enqueue and does NOT reach
+    #435, where the aged steer is addressed to the worker and the completion
+    callback to the supervisor, so no newer row ever lands in the worker's
+    mailbox.  This is the mechanism that does reach it.
+
+    Evaluated once per completion EVENT rather than as a standing predicate, and
+    over ``ready`` rows only: a steer already leased at completion still lands,
+    and a steer reclaimed to ``ready`` after the completion is not retroactively
+    cancelled.  Both limits are stated rather than hidden, and both stay
+    diagnosable through ``cao diag <msg_id>``.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is not SwitchPosition.ON:
+        return ()
+    try:
+        return runtime.store.cancel_on_complete(receiver_id, now=runtime.clock.now())
+    except Exception:  # noqa: BLE001 — a cancel that cannot run must not break completion
+        logger.warning("delivery: completion-cancel failed for %s", receiver_id, exc_info=True)
+        return ()
 
 
 def _guarded(call: object, hook: str, subject: str) -> None:

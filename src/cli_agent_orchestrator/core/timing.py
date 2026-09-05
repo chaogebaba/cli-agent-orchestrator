@@ -40,6 +40,7 @@ __all__ = [
     "DELIVERY_TICK_S",
     "DELIVERY_VETO_CEILING_S",
     "IDLE_STALL_AGE_S",
+    "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
     "PANE_HEARTBEAT_S",
     "PANE_MISS_TICKS",
@@ -190,6 +191,13 @@ DELIVERY_RETENTION_DAYS = 30
 #: two invariants passing against a number the server no longer uses.
 IDLE_STALL_AGE_S = 1800
 
+#: The age past which the seat's Claude Code registry record is refused, MIRRORED
+#: from ``supervisor.wake.max_record_age_s`` (``services/config_service.py``) for
+#: the same reason ``IDLE_STALL_AGE_S`` is mirrored: ``core`` may not import a
+#: legacy service, and T1 has to be raisable at import.  A test asserts the two
+#: agree.
+WAKE_MAX_RECORD_AGE_S = 900
+
 
 def check_delivery_orderings() -> None:
     """Raise ``ValueError`` if any §5c ordering invariant is violated.
@@ -255,6 +263,18 @@ def check_delivery_orderings() -> None:
         raise ValueError(f"DELIVERY_RETENTION_DAYS ({DELIVERY_RETENTION_DAYS}) must be >= 1")
     if DELIVERY_DEDUP_WINDOW_S < 1:
         raise ValueError(f"DELIVERY_DEDUP_WINDOW_S ({DELIVERY_DEDUP_WINDOW_S}) must be >= 1")
+    if WAKE_MAX_RECORD_AGE_S >= DELIVERY_MAX_LIFETIME_S:
+        # T1 (§A1.4).  Deliberately in a SEPARATE label space from §3's
+        # invariants, which have collided with these since r2: a row must outlive
+        # a full staleness window, or a seat whose registry record is merely
+        # stale loses its messages before the record can heal.  An operator who
+        # raises the config key past the lifetime loses the property, and that
+        # duty is written down here rather than mechanised — it is the first
+        # constant to revisit if seats are seen dying unreached.
+        raise ValueError(
+            f"T1: WAKE_MAX_RECORD_AGE_S ({WAKE_MAX_RECORD_AGE_S}) must be < "
+            f"DELIVERY_MAX_LIFETIME_S ({DELIVERY_MAX_LIFETIME_S})"
+        )
 
 
 check_delivery_orderings()

@@ -32,24 +32,50 @@ from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.timing import DELIVERY_MAX_ATTEMPTS, DELIVERY_MAX_LIFETIME_S
 
 __all__ = [
+    "ATTEMPT_BUDGET_OUTCOMES",
     "AttemptOutcome",
+    "CARRIER_PANE",
+    "CARRIER_SEAT_WAKE",
+    "DELIVERY_SENDER_ADDRESS",
     "DeadLetter",
     "DeadReason",
+    "DeadRow",
     "DeliveryAttempt",
     "EnqueueDraft",
     "GuardOutcome",
+    "InjectionResult",
     "MsgKind",
     "MsgState",
     "NON_DELIVERY_OUTCOMES",
     "QueueMessage",
     "QueueMode",
     "QueueOccupancy",
+    "ReceiverResolution",
+    "ReclaimResult",
+    "SENDER_SUBSTITUTED",
     "SeatDigest",
     "SwitchPosition",
     "TERMINAL_STATES",
+    "UNVERIFIED_STREAK_LEASES",
+    "WAKE_ANNOTATION_REASONS",
+    "WAKE_EMITTED_UNVERIFIED_REASONS",
+    "WAKE_ID_CAP",
+    "WAKE_PANE_ABSENT",
+    "WAKE_PASTE_ATTEMPTED",
+    "WAKE_REASONS",
+    "WAKE_UNREACHABLE_REASONS",
+    "WAKE_UNRESOLVABLE_REASONS",
+    "WAKE_UNVERIFIED_STREAK",
+    "WakeClassification",
+    "WakeEmission",
+    "WakeSender",
+    "build_digest_line",
+    "classify_wake_reason",
     "compute_dead_by",
     "parse_switch",
     "resolve_switch",
+    "resolve_wake_sender",
+    "spends_attempt",
 ]
 
 
@@ -141,6 +167,40 @@ class AttemptOutcome(StrEnum):
     3a exists to make, so they are recorded under this value with the legacy
     outcome and reason verbatim in ``detail``.  Nothing in mode ``live`` ever
     writes it; a test asserts that.
+
+    Sub-phase 3b adds A1's four.  ``EMITTED_UNVERIFIED`` is deliberately not a
+    refusal: ``verify_wake`` polls the registry file for a timestamp CLAUDE CODE
+    writes, so a seat that is compacting or merely busy fails the poll with the
+    message sitting in its queue.  Counting that as a failure would raise
+    ``DIAG-SEAT-WAKE-UNREACHABLE`` against every busy seat, and a finding that
+    fires in normal operation is one nobody reads (§A1.4).
+
+    ``DELIVERED`` = "delivered"
+    ``VETO_DIALOG`` = "veto_dialog"
+    ``VETO_UNVERIFIED`` = "veto_unverified"
+    ``PANE_ABSENT`` = "pane_absent"
+    ``LEGACY_OTHER`` = "legacy_other"
+    ``EMITTED_UNVERIFIED``  — written and not confirmed inside the verify
+                              timeout, or the connect timed out.  The wake
+                              COUNTS AS SENT: the row keeps its lease and the
+                              next lease re-wakes if the epoch is still open.
+    ``WAKE_UNREACHABLE``    — the carrier is absent and returns when the session
+                              does.  Bounded by the row's own ``dead_by`` ALONE,
+                              with no attempt increment: a registry record is
+                              stale for up to 900 s and heals on its own, while
+                              the attempt budget spans 325 s, so the budget would
+                              dead-letter messages to a HEALTHY seat (§A1.4, T1).
+    ``WAKE_UNRESOLVABLE``   — the seat cannot be identified safely and will not
+                              be until its session or the install changes: a
+                              PID-reuse mismatch, no descendant record, an
+                              ambiguous pair, or a version-guard refusal.  None
+                              of those heals on the republish argument that
+                              justifies the deadline bound, so D12's own
+                              principle puts it on the attempt budget.
+    ``PASTE_ATTEMPTED``     — a seat row reached ``inject_worker``.  A DEFECT,
+                              not an operating state, and deterministic: the
+                              next lease routes it identically, so it spends the
+                              attempt budget and dies at 325 s with the finding.
     """
 
     DELIVERED = "delivered"
@@ -148,13 +208,424 @@ class AttemptOutcome(StrEnum):
     VETO_UNVERIFIED = "veto_unverified"
     PANE_ABSENT = "pane_absent"
     LEGACY_OTHER = "legacy_other"
+    EMITTED_UNVERIFIED = "emitted_unverified"
+    WAKE_UNREACHABLE = "wake_unreachable"
+    WAKE_UNRESOLVABLE = "wake_unresolvable"
+    PASTE_ATTEMPTED = "paste_attempted"
 
 
-#: D12's three non-delivery outcomes, in one place so the retention rule and the
-#: accounting split cannot drift from each other.
+#: D12's non-delivery outcomes, in one place so the retention rule and the
+#: accounting split cannot drift from each other.  All of them KEEP the row
+#: leased with ``lease_expires_at`` unchanged and write their attempt row;
+#: lease retention is what makes an outcome observable by ``reclaim`` at all.
 NON_DELIVERY_OUTCOMES = frozenset(
-    {AttemptOutcome.VETO_DIALOG, AttemptOutcome.VETO_UNVERIFIED, AttemptOutcome.PANE_ABSENT}
+    {
+        AttemptOutcome.VETO_DIALOG,
+        AttemptOutcome.VETO_UNVERIFIED,
+        AttemptOutcome.PANE_ABSENT,
+        AttemptOutcome.WAKE_UNREACHABLE,
+        AttemptOutcome.WAKE_UNRESOLVABLE,
+        AttemptOutcome.PASTE_ATTEMPTED,
+    }
 )
+
+#: The outcomes that SPEND an attempt, which is the only question ``reclaim``
+#: asks of an expired lease (D12's accounting column, as one set).
+#:
+#: A poison message and a worker waiting on a dialog card are different
+#: conditions and the first should die faster, so the split is per outcome
+#: rather than per row.  Everything NOT here re-offers without incrementing —
+#: ``veto_dialog`` on its own ceiling, ``wake_unreachable`` on the row's
+#: ``dead_by``, and both ``delivered`` and ``emitted_unverified`` because a
+#: seat that reads the line and stops without acking is supported, not an
+#: error (§5b): the epoch stays open, the lease expires, ``reclaim`` re-offers,
+#: and the same epoch is re-woken with a fresh ordinal.
+#:
+#: ``LEGACY_OTHER`` is absent because it is a 3a mirror-writer value on a shadow
+#: row, and shadow rows are never leased, so ``reclaim`` never sees one.
+ATTEMPT_BUDGET_OUTCOMES = frozenset(
+    {
+        AttemptOutcome.VETO_UNVERIFIED,
+        AttemptOutcome.PANE_ABSENT,
+        AttemptOutcome.WAKE_UNRESOLVABLE,
+        AttemptOutcome.PASTE_ATTEMPTED,
+    }
+)
+
+
+def spends_attempt(outcome: AttemptOutcome | None) -> bool:
+    """Does an expired lease that ended this way cost the row an attempt?
+
+    ``None`` means the lease expired with NO attempt recorded for that claim —
+    the server died mid-flight, or the injector never ran — and that DOES spend
+    one.  Nothing was observed, so the honest accounting is the failing one: the
+    alternative lets a row whose injector never runs live to its deadline
+    re-offering forever, which is a pending row with no attempt bound.
+    """
+    return outcome is None or outcome in ATTEMPT_BUDGET_OUTCOMES
+
+
+# ---------------------------------------------------------------------------
+# §A1.4 — the carrier's refusals, classified precedent-first
+#
+# The table below is TOTAL over every reason the carrier can return, and that
+# totality is a rule rather than a courtesy.  THREE producers feed it:
+# ``resolve_target``, ``write_to_socket`` and ``check_version_guard``, whose
+# refusals reach the wake path because the doorbell falls back on any of them.
+# A phase that adds a refusal string must classify it HERE before it ships — an
+# unclassified reason would otherwise inherit whichever bound the builder
+# guessed, which is the defect A1's r16 round raised.
+#
+# :func:`classify_wake_reason` is total by construction: an unknown string is
+# not a KeyError but the conservative classification, and a test enumerates the
+# closed set so a producer that grows a string without a row here fails.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReceiverResolution:
+    """Where one durable mailbox id currently lives, and what it is.
+
+    Produced by the legacy directory and consumed by the dispatch, so ``app``
+    can decide a carrier without importing a service.
+
+    ``is_supervisor`` is FAIL-CLOSED: an unanswerable probe reports *supervisor*,
+    because the cost of a wrong ``False`` is typing into the user's own pane.
+    A1 keeps that direction and that reason — a worker wrongly read as a seat is
+    never pasted and its rows die at ``dead_by`` with a finding, which is the
+    safe direction.  A builder who "fixes" it to fail open has reverted the
+    amendment.
+
+    ``terminal_id`` empty means the mailbox has no live incarnation: injection
+    writes ``pane_absent`` and the rows age toward ``delivery_dead`` on their own
+    budget, while the digest stays open (D10).
+    """
+
+    receiver_id: str
+    terminal_id: str = ""
+    is_supervisor: bool = True
+    pane_present: bool = False
+    display_name: str = ""
+
+    @property
+    def live(self) -> bool:
+        return bool(self.terminal_id)
+
+
+@dataclass(frozen=True)
+class WakeEmission:
+    """What the native carrier did with one wake (§A1.1, §A1.4).
+
+    ``reason`` is the carrier's own typed refusal, or ``None`` for a write that
+    completed.  ``annotations`` carry the reasons that are NOT refusals and rode
+    along anyway — ``record_stale`` is the one this phase adds, demoted from a
+    refusal because ``updatedAt`` measures how long the seat has been quiet and
+    an idle seat's record ages without bound.
+
+    ``verified`` distinguishes a confirmed wake from one merely written.  It is
+    NOT evidence of failure when false: ``verify_wake`` polls a timestamp Claude
+    Code writes, so a compacting seat fails the poll with the message sitting in
+    its queue.
+    """
+
+    reason: str | None = None
+    verified: bool = False
+    annotations: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class InjectionResult:
+    """What the pane seam did with one paste (D7, D12).
+
+    The vetoes are legacy's own and stay in force: ``veto_dialog`` when the
+    dialog gate held, ``veto_unverified`` when the safety probe could not be
+    read.  Both RETAIN the lease and write their attempt row, which is what
+    makes them observable by ``reclaim`` at all.
+    """
+
+    outcome: AttemptOutcome
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class DeadRow:
+    """One row ``reclaim`` moved to ``delivery_dead``, and what a human is owed.
+
+    The store returns these rather than a count because two of the phase's
+    commitments are made by the CALLER, not by the transition: a time-bound
+    death raises ``DIAG-DELIVERY-TIME-BOUND``, and a dead-letter enqueues the
+    seat-visible sender notice that replaces K7's escalation line.  A count
+    cannot carry either, and "no row reaches ``delivery_dead`` silently" is the
+    commitment (§13d).
+
+    ``is_notice`` is D14's flag: a notice that dead-letters records the finding
+    ALONE and enqueues nothing, so the chain is one notice deep by construction
+    rather than by rate.
+    """
+
+    msg_id: str
+    receiver_id: str
+    sender_id: str
+    reason: DeadReason
+    is_notice: bool = False
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
+class ReclaimResult:
+    """What one ``reclaim`` did (D3, D12).
+
+    ``incremented`` is a subset of ``reoffered``: a re-offer spends an attempt
+    only when the last recorded outcome was one of D12's attempt-budget
+    outcomes, so a dialog-held row and a row whose seat carrier is refused are
+    re-offered without moving the budget they are not on.
+    """
+
+    reoffered: int = 0
+    incremented: int = 0
+    dead: tuple[DeadRow, ...] = ()
+
+    @property
+    def dead_count(self) -> int:
+        return len(self.dead)
+
+
+@dataclass(frozen=True)
+class WakeClassification:
+    """What one carrier reason means for the row (§A1.4).
+
+    ``outcome`` is the attempt row's outcome.  ``emitted`` says whether the wake
+    counts as SENT — the difference between "the seat may have it" and "the seat
+    certainly does not".  ``annotation`` marks the one reason that is not a
+    refusal at all: it rides on the attempt row and the emission proceeds.
+    ``finding`` says whether this reason raises ``DIAG-SEAT-WAKE-UNREACHABLE``
+    for the epoch.
+    """
+
+    reason: str
+    outcome: AttemptOutcome
+    emitted: bool = False
+    annotation: bool = False
+    finding: bool = False
+
+    @property
+    def spends_attempt(self) -> bool:
+        return spends_attempt(self.outcome)
+
+
+#: The carrier is absent and RETURNS WHEN THE SESSION DOES.  Bounded by the
+#: row's own ``dead_by``, with no attempt increment: the seat is alive and its
+#: carrier is not, and a Claude Code restart changes the socket path and
+#: produces exactly this window (T1).
+WAKE_UNREACHABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "socket_enoent",
+        "socket_econnrefused",
+        "socket_eperm",
+        "socket_einval",
+        "socket_path_empty",
+        "socket_unpublished",
+        "no_registry_records",
+        "pane_pid_failed",
+        "proc_start_unreadable",
+    }
+)
+
+#: The seat cannot be identified SAFELY, and will not be until its session
+#: restarts or the install changes.  None of these heals on the republish
+#: argument that justifies the deadline bound, so they take the attempt budget.
+#: The last four are ``check_version_guard``'s whole return set.
+WAKE_UNRESOLVABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "proc_start_mismatch",
+        "no_descendant_record",
+        "target_ambiguous",
+        "version_out_of_band",
+        "version_absent",
+        "version_config_invalid",
+        "peer_protocol",
+        # The two the bridge itself can return before any of the three producers
+        # runs: a terminal with no metadata row, or one with no tmux coordinates.
+        # Neither heals while the terminal exists in that shape, so they take the
+        # same bound as the identity refusals rather than the deadline.
+        "no_terminal_metadata",
+        "no_tmux_coordinates",
+    }
+)
+
+#: Sent, confirmation not obtained.  NOT a refusal: ``socket_timeout`` bounds a
+#: connect that may or may not have completed, so calling it a failure asserts
+#: something unobserved.  Under D2 a duplicate wake costs nothing and I3 bounds
+#: it to one per lease, while a false unreachable costs a finding and, on the
+#: attempt budget, a dead message at 325 s.
+WAKE_EMITTED_UNVERIFIED_REASONS: frozenset[str] = frozenset({"wake_unverified", "socket_timeout"})
+
+#: Not a refusal at all — an annotation on the attempt row, and the emission
+#: proceeds (§A1.4, #613 sample 5).  ``updatedAt`` is written by Claude Code's
+#: own process, so its age measures how long the seat has been QUIET, which for
+#: an idle seat is unbounded.  A gate that refuses to wake an idle seat fails in
+#: exactly the case #604 is about.
+WAKE_ANNOTATION_REASONS: frozenset[str] = frozenset({"record_stale"})
+
+#: Every reason the three producers can return, so a test can assert the table
+#: is total over the closed set rather than over the rows someone remembered.
+#: ``socket_error:<errno>`` is a FAMILY and is matched by prefix, not listed.
+WAKE_REASONS: frozenset[str] = (
+    WAKE_UNREACHABLE_REASONS
+    | WAKE_UNRESOLVABLE_REASONS
+    | WAKE_EMITTED_UNVERIFIED_REASONS
+    | WAKE_ANNOTATION_REASONS
+)
+
+#: The errno family ``write_to_socket`` returns for any other ``OSError``.
+_SOCKET_ERRNO_PREFIX = "socket_error:"
+
+#: Reason strings that are conditions of the DISPATCH rather than of a carrier.
+#: ``pane_absent`` keeps the existing outcome unchanged; ``paste_attempted`` is
+#: a defect a seat row reaching ``inject_worker`` raises.
+WAKE_PANE_ABSENT = "pane_absent"
+WAKE_PASTE_ATTEMPTED = "paste_attempted"
+
+#: The reason ``DIAG-SEAT-WAKE-UNREACHABLE`` carries when an open epoch's wake
+#: has been emitted and left unconfirmed for three consecutive leases.  It
+#: changes NO bound — the row stays on its ordinary lease, because the wake may
+#: well be landing — so it is the one reason that reports a suspicion rather
+#: than a settled outcome, which is why it takes a streak rather than a sample.
+WAKE_UNVERIFIED_STREAK = "unverified_streak"
+
+#: How many consecutive unconfirmed leases make a hung seat.  Three leases is
+#: 180 s or more, comfortably past a compaction, so the finding stays out of
+#: normal operation while a session that is dead-but-listening becomes
+#: diagnosable AS an unreachable seat rather than only as a row that later died.
+UNVERIFIED_STREAK_LEASES = 3
+
+
+def classify_wake_reason(reason: str | None) -> WakeClassification:
+    """A1.4's table as a total function over the carrier's closed reason set.
+
+    ``None`` is the success case and classifies as ``DELIVERED``.  An unknown
+    string classifies as ``WAKE_UNRESOLVABLE`` — the conservative direction,
+    because an unclassified reason is one nobody has argued heals, and D12's
+    principle is that a condition which cannot clear should die faster.  It is
+    conservative rather than correct on purpose: the test that enumerates the
+    producers' returns is what stops an unknown string ever reaching here.
+    """
+    if reason is None or reason == "":
+        return WakeClassification(reason="", outcome=AttemptOutcome.DELIVERED, emitted=True)
+    if reason in WAKE_ANNOTATION_REASONS:
+        # The emission proceeds; the caller records this on the attempt row it
+        # goes on to write for the socket's own answer.
+        return WakeClassification(
+            reason=reason,
+            outcome=AttemptOutcome.DELIVERED,
+            emitted=True,
+            annotation=True,
+        )
+    if reason in WAKE_EMITTED_UNVERIFIED_REASONS:
+        return WakeClassification(
+            reason=reason, outcome=AttemptOutcome.EMITTED_UNVERIFIED, emitted=True
+        )
+    if reason == WAKE_PANE_ABSENT:
+        return WakeClassification(reason=reason, outcome=AttemptOutcome.PANE_ABSENT)
+    if reason == WAKE_PASTE_ATTEMPTED:
+        return WakeClassification(
+            reason=reason, outcome=AttemptOutcome.PASTE_ATTEMPTED, finding=True
+        )
+    if reason in WAKE_UNREACHABLE_REASONS or reason.startswith(_SOCKET_ERRNO_PREFIX):
+        return WakeClassification(
+            reason=reason, outcome=AttemptOutcome.WAKE_UNREACHABLE, finding=True
+        )
+    return WakeClassification(reason=reason, outcome=AttemptOutcome.WAKE_UNRESOLVABLE, finding=True)
+
+
+# ---------------------------------------------------------------------------
+# §A1.1 — the wake's sender, and §5b's line
+# ---------------------------------------------------------------------------
+
+#: The two carriers a ``delivery_attempt`` row can name, and they are the whole
+#: set: D7 splits by the receiver's role and there is no third seam.  Written as
+#: constants because ``cao diag <msg_id>`` groups on them and case 17 counts
+#: them, so a typo in one call site would be a criterion silently measuring
+#: nothing.
+CARRIER_SEAT_WAKE = "seat_wake"
+CARRIER_PANE = "pane"
+
+#: The address a wake carries when the epoch has several senders, and the
+#: substitute when the resolved address is the receiver's own.
+DELIVERY_SENDER_ADDRESS = "cao-delivery"
+
+#: Recorded on the attempt row when the resolved sender WAS the receiver.  It
+#: adds no outcome, no bound and no finding, because nothing failed (§A1.1).
+SENDER_SUBSTITUTED = "sender_substituted"
+
+#: How many ids a wake line carries before it summarises the rest.  A
+#: FORMATTING bound rather than a timing constant, so §5c's arithmetic is
+#: untouched; it exists because ``k`` has no ceiling and a wake must stay one
+#: line.
+WAKE_ID_CAP = 10
+
+
+@dataclass(frozen=True)
+class WakeSender:
+    """Who a wake says it is from (§A1.1), and whether that was substituted.
+
+    ``name`` is the display name the envelope's ``from-name`` carries; ``key``
+    is the token ``bridge:cao-<key>`` is built from.
+    """
+
+    key: str
+    name: str
+    substituted: bool = False
+
+
+def resolve_wake_sender(senders: tuple[str, ...], *, receiver_key: str) -> WakeSender:
+    """The three-case sender rule, total and in order (§A1.1, #314, #381).
+
+    1. The epoch's messages share ONE originating sender — the common case, and
+       the case #613 sampled — so the wake is worker-named.
+    2. The epoch spans several senders, so naming one would be false.
+    3. The resolved address is the RECEIVER'S OWN, and it is SUBSTITUTED rather
+       than refused.  Refusing would strand the row: server-generated notices
+       addressed to the seat legitimately resolve a sender that is the seat, and
+       a wake refused on that ground would park a real message behind a guard
+       until its deadline.  The substitution keeps #381 fixed — no wake ever
+       leaves naming its own receiver — while the message still arrives.
+    """
+    distinct = tuple(dict.fromkeys(s for s in senders if s))
+    if len(distinct) == 1:
+        only = distinct[0]
+        if only == receiver_key:
+            return WakeSender(key=DELIVERY_SENDER_ADDRESS, name="delivery", substituted=True)
+        return WakeSender(key=only, name=only)
+    if len(distinct) == 0:
+        return WakeSender(key=DELIVERY_SENDER_ADDRESS, name="delivery")
+    return WakeSender(key=DELIVERY_SENDER_ADDRESS, name=f"{len(distinct)} workers")
+
+
+def build_digest_line(*, epoch: int, msgs: int, wake: int, msg_ids: tuple[str, ...]) -> str:
+    """§5b's line: ids and a count, and NO message content (#613 ask 2).
+
+    Ids are in and bodies are out, and the line between them is I3's.  Carrying
+    the ids costs a bounded number of tokens and lets a reader match the wake
+    against ``cao diag <msg_id>`` without a round trip; carrying the bodies
+    costs ``k`` message bodies in the seat's context per wake, which is the
+    context-hygiene rule made structural.
+
+    ``wake`` is the ORDINAL, and it is what carries a re-wake past the
+    transport's per-sender content-hash window: an unconsumed epoch whose count
+    is stable would otherwise re-send a byte-identical line and have it silently
+    swallowed for twenty leases — a wake path that fails without saying so,
+    which is the failure class this phase exists to remove (§A1.2).
+    """
+    shown = list(msg_ids[:WAKE_ID_CAP])
+    if len(msg_ids) > WAKE_ID_CAP:
+        shown.append(f"+{len(msg_ids) - WAKE_ID_CAP} more")
+    ids = ",".join(shown)
+    return (
+        f"[cao] digest epoch={epoch} msgs={msgs} wake={wake} ids={ids}. "
+        f"Drain: list_messages(epoch={epoch}) -> ack_messages"
+    )
 
 
 class SwitchPosition(StrEnum):
@@ -607,6 +1078,18 @@ class SeatDigest(BaseModel):
     built_at: datetime
     consumed_at: datetime | None = None
     consumed_via: str | None = None
+    #: A1: lease periods in which this epoch was woken, and the ordinal the wake
+    #: line carries.  It advances ONCE PER LEASE PERIOD in which the epoch is
+    #: re-offered, not once per emission — the two readings differ observably,
+    #: and only this one makes I3 countable: ``wake_count`` may never exceed the
+    #: number of lease periods the epoch has been open for.
+    #:
+    #: The DURABLE enforcement is this column, not the transport's window.  The
+    #: window is a module-level dict cleared by any ``cao-server`` bounce and it
+    #: fails OPEN on a payload it cannot parse, so it is a second line of defence
+    #: a restart can drop, while the column in the emit transaction is what makes
+    #: I3 hold across one (§A1.2).
+    wake_count: int = Field(default=0, ge=0)
 
     @field_validator("built_at")
     @classmethod

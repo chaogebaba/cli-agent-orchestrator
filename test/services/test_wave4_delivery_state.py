@@ -527,12 +527,24 @@ def test_wpq1_three_preopen_identity_failures_notice_once_without_attempt(
 
 
 def _logical_identity_message(wave4_db, enqueue_generation):
+    """A LOGICAL (mailbox-addressed) row whose receiver is a worker.
+
+    WP-ARCH 3b / A1.5: the role moved from ``supervisor`` to ``worker``. What
+    these three proofs are about is the identity-authority episode and the
+    generation token a LOGICAL address carries — neither of which is a property
+    of the receiver's role. The supervisor role was only how mailbox addressing
+    happened to land, and after the amendment a supervisor-role receiver is
+    short-circuited before the episode can open at all, because the seat's
+    composer is never written to. Keeping the role here would turn three proofs
+    about generation tokens into three proofs about the paste ban, which has its
+    own coverage.
+    """
     with wave4_db.begin() as db:
         db.add(
             database.MailboxModel(
                 id="mb_identity",
                 session_name="session",
-                role="supervisor",
+                role="worker",
                 current_terminal_id="receiver",
                 generation=7,
                 consumed_through_id=0,
