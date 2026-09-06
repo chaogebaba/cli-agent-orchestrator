@@ -40,6 +40,19 @@ throttled ``fleet-events-sync.sh`` trigger (``:203-226``), the 20-entry error
 ring (``:82-84``) with its debug and snapshot surfaces, and the ``--interval`` /
 ``--once`` / tmux-session-auto-detect launch contract (``:548-565``).
 
+**Second parity round (F702 #557, 2026-09-04).** The five items the first round
+left: the age colouring of the last column (``idle_color``, ``:245-250``, now
+:func:`elapsed_style`), the ``(no workers)`` line under an empty table
+(``:416-417``), the peek's line clipping (``ansi_clip``, ``:451``, now the
+``#peek`` rule's ``text-wrap``), the captured pane's id in the peek banner
+(``:442``), and a notice line that expires instead of holding the last message
+forever (``:427-429``). The one item deliberately *not* restored is the
+script's launch-time window pin (``:490-545``): it swaps whatever sits at index
+1 out of the way, which renumbers a live worker's window and breaks every
+``session:index`` reference already handed out. The window is created at index
+1 server-side instead, and appended when the slot is taken
+(``services/fleet_window_service.py:150-157``).
+
 **Section layout (F702 #557 "look" round).** The frame is the script's, section
 for section and blank line for blank line (``:336-450``): the ``▌`` header, the
 table under its own header row and thin rule, ``▌ recent``, one status line,
@@ -127,6 +140,7 @@ __all__ = [
     "main",
     "render_once",
     "elapsed_cell",
+    "elapsed_style",
 ]
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:9889"
@@ -153,10 +167,15 @@ STYLE_SUPERVISOR_ID: Final[str] = "bold magenta"
 #: Worker rows: WIN dim, ID cyan (``:414-415``).
 STYLE_WORKER_ID: Final[str] = "cyan"
 STYLE_DIM: Final[str] = "dim"
-#: IDLE column, ``idle_color`` (``:245-250``): dim under 5 s, yellow at 5 min.
-STYLE_IDLE_STALE: Final[str] = "yellow"
-IDLE_FRESH_SECONDS: Final[float] = 5.0
-IDLE_STALE_SECONDS: Final[float] = 300.0
+#: Age colouring for the last column, ported from ``idle_color``
+#: (``fleet-tui.py:245-250``): dim under 5 s, plain between, yellow at 5 min.
+#: The script applied it to seconds-since-output; the column now carries time in
+#: the current status (see :data:`ELAPSED_COLUMN`), and the thresholds read the
+#: same way against it — a fresh transition is quiet, a status a seat has held
+#: for five minutes is the one worth a colour.
+STYLE_ELAPSED_STALE: Final[str] = "yellow"
+ELAPSED_FRESH_SECONDS: Final[float] = 5.0
+ELAPSED_STALE_SECONDS: Final[float] = 300.0
 #: The selection gutter glyph.
 STYLE_MARKER: Final[str] = "bold"
 #: The loud server-down line (``:335``).
@@ -234,8 +253,20 @@ WORK_APPROX_SUFFIX: Final[str] = "+"
 STYLE_WORKING: Final[str] = "green"
 #: Rendered when the clock has no spell for a row (only before its first fold).
 ELAPSED_UNKNOWN: Final[str] = "-"
+#: The line drawn in place of the rows when the fleet is empty
+#: (``fleet-tui.py:416-417``). The table's header and rule stay, as they do
+#: there — an empty table under its own header says "nothing is running", an
+#: empty screen says "the TUI is broken".
+EMPTY_ROWS_TEXT: Final[str] = "(no workers)"
+#: How long a ``#flash`` notice stays on screen. The script clears its flash
+#: after the frame that showed it (``fleet-tui.py:427-429``), which at its 2 s
+#: poll is about this long; here the notice is written once and expires on the
+#: elapsed tick, so a jump message does not sit under the table forever.
+FLASH_SECONDS: Final[float] = 4.0
 #: How often the ELAPSED column re-renders, independently of the fetch loop.
 ELAPSED_TICK_SECONDS: Final[float] = 1.0
+#: How often :meth:`FleetApp.expire_flash` looks at the notice line.
+FLASH_TICK_SECONDS: Final[float] = 1.0
 
 #: The tmux verbs this app is allowed to run. Only ``select-window`` mutates
 #: anything; the rest are reads (AC4).
@@ -432,6 +463,25 @@ def elapsed_cell(seconds: float, exact: bool, working: bool) -> str:
     return f"{glyph}{fmt_age(seconds)}" + ("" if exact else WORK_APPROX_SUFFIX)
 
 
+def elapsed_style(seconds: float | None, working: bool) -> str:
+    """The ELAPSED cell's colour — the script's ``idle_color`` (``:245-250``).
+
+    A working seat is green, beside its green ``● working``; that one is the
+    app's own (the script had no such state in this column). Every other row
+    follows the script's three-band age rule verbatim: dim under five seconds,
+    unstyled between, yellow once the seat has held the status for five
+    minutes. The bands are what make a stalled seat findable in a long table —
+    flattening them to a single dim was the regression this restores.
+    """
+    if working:
+        return STYLE_WORKING
+    if seconds is None or seconds < ELAPSED_FRESH_SECONDS:
+        return STYLE_DIM
+    if seconds >= ELAPSED_STALE_SECONDS:
+        return STYLE_ELAPSED_STALE
+    return ""
+
+
 def read_labels(path: Path) -> Dict[str, str]:
     """``fleet-labels.tsv`` as ``{terminal_id: label}`` (``fleet-tui.py:172-182``).
 
@@ -473,6 +523,52 @@ def read_window_ages(
         if len(parts) == 2 and parts[1].isdigit():
             ages[parts[0]] = max(0.0, wall - int(parts[1]))
     return ages
+
+
+def read_pane_id(tmux: Runner, session: str, window_index: int) -> str | None:
+    """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``).
+
+    F544: a window target resolves to the *active* pane, so every reader names
+    the first pane — the one CAO started — by id instead.
+
+    Module-level so the live app and ``--once`` issue the same tmux read; the
+    app passes its own gated runner, which is what keeps the verb allowlist
+    (AC4) over both paths.
+    """
+    panes = tmux(["list-panes", "-t", f"{session}:{window_index}", "-F", "#{pane_id}"])
+    if not panes:
+        return None
+    first = panes.splitlines()[0].strip()
+    return first or None
+
+
+def read_pane_tail(
+    tmux: Runner,
+    session: str,
+    window_index: int,
+    lines_wanted: int,
+    pane: str | None = None,
+) -> List[str]:
+    """Last ``lines_wanted`` non-blank-tail lines of a pane (``:138-148``)."""
+    target = pane or f"{session}:{window_index}"
+    out = tmux(["capture-pane", "-p", "-e", "-S", "-200", "-t", target])
+    if out is None:
+        return ["(capture failed)"]
+    lines = [line.rstrip() for line in out.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines[-lines_wanted:] if lines else ["(blank)"]
+
+
+def capture_once(
+    tmux: Runner,
+    session: str,
+    window_index: int,
+    lines_wanted: int,
+) -> Tuple[str | None, List[str]]:
+    """``(pane id, tail)`` for the ``--once`` peek — one resolve, one capture."""
+    pane = read_pane_id(tmux, session, window_index)
+    return pane, read_pane_tail(tmux, session, window_index, lines_wanted, pane)
 
 
 def sort_terminals(terminals: Sequence[TerminalState]) -> List[TerminalState]:
@@ -561,7 +657,13 @@ def row_values(
     return values
 
 
-def row_styles(term: TerminalState, labelled: bool, *, working: bool = False) -> List[str]:
+def row_styles(
+    term: TerminalState,
+    labelled: bool,
+    *,
+    working: bool = False,
+    elapsed_seconds: float | None = None,
+) -> List[str]:
     """The per-cell styles of one row, in the order of :func:`row_values`.
 
     The colour language of ``fleet-tui.py:410-415``: a supervisor row is
@@ -569,10 +671,9 @@ def row_styles(term: TerminalState, labelled: bool, *, working: bool = False) ->
     and an unlabeled TASK is dim. STATUS carries its own style from
     :func:`status_cell`, so its slot here is empty.
 
-    ``working`` gives the ELAPSED cell the status colour, so a working seat's
-    elapsed time is green beside its green ``● working``; every other state is
-    dim. That one difference is what makes the column readable at a glance,
-    and it is why no second column was needed to carry it.
+    The ELAPSED cell is :func:`elapsed_style` of ``working`` and
+    ``elapsed_seconds`` — green while working, and otherwise the script's own
+    three-band age colouring.
     """
     is_supervisor = not term.parent_id
     return [
@@ -581,7 +682,7 @@ def row_styles(term: TerminalState, labelled: bool, *, working: bool = False) ->
         STYLE_SUPERVISOR if is_supervisor else "",  # PROFILE
         "" if labelled else STYLE_DIM,  # TASK
         "",  # STATUS — status_cell owns it
-        STYLE_WORKING if working else STYLE_DIM,  # ELAPSED
+        elapsed_style(elapsed_seconds, working),  # ELAPSED
     ]
 
 
@@ -621,12 +722,18 @@ class FleetApp(App[None]):
     #table-head { height: 1; margin-top: 1; }
     #table-rule { height: 1; }
     #fleet { height: auto; max-height: 1fr; background: transparent; }
+    #empty { height: 1; }
     #events-title { height: 1; margin-top: 1; }
     #events { height: auto; }
     #debug { height: auto; max-height: 12; margin-top: 1; overflow-y: hidden; }
     #flash { height: 1; color: yellow; }
     #hints { height: 1; }
-    #peek { height: 1fr; margin-top: 1; }
+    /* text-wrap/text-overflow are the script's `ansi_clip`
+       (fleet-tui.py:151-169,451): one captured line is one line on
+       screen. Without them a 400-column log line wraps to four rows and
+       silently pushes three of the peek's last-N lines off the bottom,
+       so the pane's last N lines are not the last N lines shown. */
+    #peek { height: 1fr; margin-top: 1; text-wrap: nowrap; text-overflow: clip; }
     DataTable { background: transparent; }
     /* An id selector: DataTable's own DEFAULT_CSS styles this component class
        from inside a nested `DataTable { ... }` block, which outranks a plain
@@ -697,6 +804,8 @@ class FleetApp(App[None]):
         self.peek_lines = PEEK_LINES_DEFAULT
         self.debug_visible = False
         self.flash = ""
+        #: When :attr:`flash` was set, for :meth:`expire_flash`.
+        self._flash_at: float | None = None
         #: Every tmux argv this app has run, in order — the AC4 audit trail.
         self.tmux_calls: List[List[str]] = []
         #: ``(HH:MM:SS, message)`` ring (``fleet-tui.py:82-84``).
@@ -820,6 +929,7 @@ class FleetApp(App[None]):
             yield Static(id="table-head")
             yield Static(id="table-rule")
             yield DataTable(id="fleet")
+            yield Static(id="empty")
             yield Static(id="events-title")
             yield Static(id="events")
             yield Static(id="debug")
@@ -841,12 +951,17 @@ class FleetApp(App[None]):
         self._install_columns()
         self.query_one("#peek", Static).display = self.peek_visible
         self.query_one("#debug", Static).display = self.debug_visible
+        self.query_one("#empty", Static).display = False
         self.query_one("#hints", Static).update(hint_renderable())
         self.refresh_view()
         self.fetch_worker()
         # The clock ticks on its own: the fetch loop is too slow to watch a
         # number count up, and too expensive to run at this rate.
         self.set_interval(ELAPSED_TICK_SECONDS, self.refresh_elapsed)
+        # Its own timer, not a line in refresh_elapsed: the notice line and the
+        # ELAPSED column have nothing to do with each other, and the test that
+        # names the elapsed timer's callback should keep naming one thing.
+        self.set_interval(FLASH_TICK_SECONDS, self.expire_flash)
 
     def frame_width(self) -> int:
         """Full-width for the two rules and the selection bar.
@@ -924,6 +1039,7 @@ class FleetApp(App[None]):
             self.flash = (
                 f"render error; snapshot: {path}" if path else "render error (snapshot failed)"
             )
+            self._flash_at = self._now()
             try:
                 self.query_one("#flash", Static).update(self.flash)
             except Exception:
@@ -954,27 +1070,40 @@ class FleetApp(App[None]):
 
     # ── the ELAPSED column ───────────────────────────────────────────────────
 
+    def elapsed_ages(self) -> Dict[str, float]:
+        """``{terminal_id: seconds in the current status}`` for timed rows.
+
+        The one source both the cell text and the cell colour read, so a row
+        can never be coloured for an age its own number contradicts.
+        """
+        now = self._now()
+        ages: Dict[str, float] = {}
+        for term in self.state.terminals:
+            spell = self._clock.spell(term.id)
+            if spell is not None:
+                ages[term.id] = max(0.0, now - spell.since)
+        return ages
+
     def elapsed_cells(self) -> Dict[str, str]:
         """``{terminal_id: "● 12m"}`` for every row the clock is timing."""
-        now = self._now()
+        ages = self.elapsed_ages()
         cells: Dict[str, str] = {}
         for term in self.state.terminals:
             spell = self._clock.spell(term.id)
             if spell is None:
                 continue
-            cells[term.id] = elapsed_cell(
-                max(0.0, now - spell.since), spell.exact, is_working(term)
-            )
+            cells[term.id] = elapsed_cell(ages[term.id], spell.exact, is_working(term))
         return cells
 
     def elapsed_text(self, term: TerminalState, now: float) -> Text:
-        """One ELAPSED cell, styled: green while working, dim otherwise."""
+        """One ELAPSED cell, styled by :func:`elapsed_style`."""
         spell = self._clock.spell(term.id)
         working = is_working(term)
         if spell is None:
-            return Text(ELAPSED_UNKNOWN, style=STYLE_DIM)
-        plain = elapsed_cell(max(0.0, now - spell.since), spell.exact, working)
-        return Text(plain, style=STYLE_WORKING if working else STYLE_DIM)
+            return Text(ELAPSED_UNKNOWN, style=elapsed_style(None, working))
+        seconds = max(0.0, now - spell.since)
+        plain = elapsed_cell(seconds, spell.exact, working)
+        return Text(plain, style=elapsed_style(seconds, working))
 
     def refresh_elapsed(self) -> None:
         """Re-render just the ELAPSED cells. Driven by a 1 Hz timer.
@@ -1007,13 +1136,19 @@ class FleetApp(App[None]):
         term: TerminalState,
         labels: Mapping[str, str],
         values: Sequence[str] | None = None,
+        ages: Mapping[str, float] | None = None,
     ) -> List[Any]:
         """One row, in the order of :attr:`view_columns`.
 
         Every cell is a :class:`rich.text.Text` (D4/B12) so ``get_cell_at``
         hands a test back both the plain value and the style — which is how the
         restored colour language is asserted.
+
+        ``ages`` is :meth:`elapsed_ages` when the caller already has it; the
+        frame computes it once rather than once per row.
         """
+        if ages is None:
+            ages = self.elapsed_ages()
         if values is None:
             values = row_values(
                 term,
@@ -1021,7 +1156,12 @@ class FleetApp(App[None]):
                 with_new_columns=self.show_new_columns,
                 elapsed_cells=self.elapsed_cells(),
             )
-        styles = row_styles(term, term.id in labels, working=is_working(term))
+        styles = row_styles(
+            term,
+            term.id in labels,
+            working=is_working(term),
+            elapsed_seconds=ages.get(term.id),
+        )
         cells: List[Any] = [Text(MARKER_BLANK, style=STYLE_MARKER)]
         for index, value in enumerate(values):
             if index == PARITY_COLUMNS.index("STATUS"):
@@ -1064,6 +1204,7 @@ class FleetApp(App[None]):
         # Fold this snapshot into the clock before anything reads it, so a
         # status that changed on this fetch is already timed from now.
         self._clock.observe(rows, self._now())
+        ages = self.elapsed_ages()
         elapsed = self.elapsed_cells()
         values = [
             row_values(
@@ -1077,13 +1218,26 @@ class FleetApp(App[None]):
         self._install_columns(self.frame_widths(values))
         self.refresh_table_head()
         for term, row in zip(rows, values):
-            table.add_row(*self.row_cells(term, labels, row), key=term.id)
+            table.add_row(*self.row_cells(term, labels, row, ages), key=term.id)
+        self.refresh_empty_line(bool(rows))
         if not rows:
             return
         ids = [t.id for t in rows]
         index = ids.index(selected) if selected in ids else 0
         table.move_cursor(row=index)
         self.refresh_marker()
+
+    def refresh_empty_line(self, has_rows: bool) -> None:
+        """Show ``(no workers)`` under the header when the table is empty.
+
+        The script keeps its header and rule and writes the line where the
+        rows would be (``fleet-tui.py:416-417``); an empty table with nothing
+        under it reads as a broken TUI rather than an empty fleet.
+        """
+        empty = self.query_one("#empty", Static)
+        empty.display = not has_rows
+        if not has_rows:
+            empty.update(Text(" " * GUTTER_WIDTH + EMPTY_ROWS_TEXT, style=STYLE_DIM))
 
     def refresh_marker(self) -> None:
         """Put ``▶`` on the cursor row and nothing on the others (``:399``)."""
@@ -1200,29 +1354,33 @@ class FleetApp(App[None]):
             return None
         return next((t for t in self.state.terminals if t.id == selected), None)
 
-    def capture_window(self, window_index: int, peek: Static | None = None) -> List[str]:
-        """Tail of the selected window's CAO pane (``fleet-tui.py:128-148``).
+    def resolve_pane(self, window_index: int) -> str | None:
+        """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``)."""
+        return read_pane_id(self.tmux, self.session, window_index)
 
-        F544: a window target resolves to the *active* pane, so the first pane
-        id is resolved first and captured by id.
+    def capture_window(
+        self,
+        window_index: int,
+        peek: Static | None = None,
+        pane: str | None = None,
+    ) -> List[str]:
+        """Tail of the selected window's CAO pane (``fleet-tui.py:138-148``).
+
+        ``pane`` is :meth:`resolve_pane` when the caller already has it, so one
+        frame issues one ``list-panes`` rather than one per reader.
         """
-        target = f"{self.session}:{window_index}"
-        panes = self.tmux(["list-panes", "-t", target, "-F", "#{pane_id}"])
-        if panes:
-            first = panes.splitlines()[0].strip()
-            if first:
-                target = first
-        out = self.tmux(["capture-pane", "-p", "-e", "-S", "-200", "-t", target])
-        if out is None:
-            return ["(capture failed)"]
-        lines = [line.rstrip() for line in out.splitlines()]
-        while lines and not lines[-1].strip():
-            lines.pop()
+        if pane is None:
+            pane = self.resolve_pane(window_index)
         wanted = self.peek_lines if peek is None else self.peek_capacity(peek)
-        return lines[-wanted:] if lines else ["(blank)"]
+        return read_pane_tail(self.tmux, self.session, window_index, wanted, pane)
 
-    def peek_title(self, term: TerminalState) -> str:
+    def peek_title(self, term: TerminalState, pane: str | None = None) -> str:
         """The peek banner (``fleet-tui.py:441-443``): who, where, how idle.
+
+        ``pane`` is the captured pane's id, which the script prints here
+        (``:442``) and which is the only place the F544 resolution is visible:
+        a peek showing the wrong pane's output is diagnosable from the banner
+        alone. ``?`` when tmux could not answer.
 
         Two different clocks, both named for what they measure. ``for`` is time
         in the current status, the same number the row's ELAPSED cell shows.
@@ -1240,6 +1398,7 @@ class FleetApp(App[None]):
             held = elapsed_cell(max(0.0, self._now() - spell.since), spell.exact, False)
         return (
             f"▌ peek · {term.profile}-{term.id} · win {window_key(term)}"
+            f" · {pane or '?'}"
             f" · {status} · for {held} · quiet {fmt_age(self._ages.get(window_key(term)))}"
         )
 
@@ -1253,18 +1412,29 @@ class FleetApp(App[None]):
         available = peek.size.height - PEEK_CHROME_LINES  # banner + double rule
         return max(self.peek_lines, available)
 
-    def peek_banner(self, term: TerminalState | None) -> Text:
+    def peek_banner(self, term: TerminalState | None, pane: str | None = None) -> Text:
         """The two chrome lines of the peek section (``fleet-tui.py:441-445``).
 
         Title in the section accent, then a full-width double rule in the same
         accent — the heavier rule is what marks the peek as the last section
         rather than another row of the table above it.
         """
-        title = self.peek_title(term) if term is not None else f"{SECTION_MARK} peek"
+        title = self.peek_title(term, pane) if term is not None else f"{SECTION_MARK} peek"
         banner = Text(title, style=STYLE_SECTION, no_wrap=True)
         banner.append("\n")
         banner.append(PEEK_RULE_GLYPH * self.frame_width(), style=STYLE_SECTION)
         return banner
+
+    @staticmethod
+    def stacked(*parts: Text) -> Text:
+        """Join ``parts`` with newlines into the peek's single renderable.
+
+        Clipping is the ``#peek`` rule's job, not this function's: a ``Static``
+        converts the ``Text`` it is handed into Textual's own ``Content``, which
+        does not carry ``no_wrap``/``overflow``, so setting them here would look
+        right and do nothing.
+        """
+        return Text("\n").join(parts)
 
     def refresh_peek(self) -> None:
         peek = self.query_one("#peek", Static)
@@ -1274,10 +1444,11 @@ class FleetApp(App[None]):
             return
         term = self.selected_terminal()
         if term is None or term.window_index is None:
-            peek.update(Text("\n").join([self.peek_banner(term), Text("(nothing selected)")]))
+            peek.update(self.stacked(self.peek_banner(term), Text("(nothing selected)")))
             return
-        body = Text.from_ansi("\n".join(self.capture_window(term.window_index, peek)))
-        peek.update(Text("\n").join([self.peek_banner(term), body]))
+        pane = self.resolve_pane(term.window_index)
+        body = Text.from_ansi("\n".join(self.capture_window(term.window_index, peek, pane)))
+        peek.update(self.stacked(self.peek_banner(term, pane), body))
 
     def error_ring_lines(self, limit: int = ERROR_RING_SHOWN) -> List[str]:
         """The tail of the error ring, or a single "(empty)" line."""
@@ -1362,8 +1533,26 @@ class FleetApp(App[None]):
         self.set_flash(f"snapshot written: {self.write_snapshot()}")
 
     def set_flash(self, message: str) -> None:
+        """Show a transient notice on the reserved ``#flash`` line."""
         self.flash = message
+        self._flash_at = self._now()
         self.query_one("#flash", Static).update(message)
+
+    def expire_flash(self) -> None:
+        """Clear a notice older than :data:`FLASH_SECONDS`.
+
+        The script's flash lives for exactly the frame that drew it
+        (``fleet-tui.py:427-429``). Here the line is reserved and written once,
+        so it needs its own expiry or a "jumped to …" from ten minutes ago
+        still sits under the table.
+        """
+        if not self.flash or self._flash_at is None:
+            return
+        if (self._now() - self._flash_at) < FLASH_SECONDS:
+            return
+        self.flash = ""
+        self._flash_at = None
+        self.query_one("#flash", Static).update("")
 
     def write_snapshot(self, reason: str = "manual") -> Path:
         """Write a debugging snapshot (``fleet-tui.py:273-296``). Not a tmux call.
@@ -1406,6 +1595,56 @@ class FleetApp(App[None]):
 # ── one-shot rendering (`--once`) ────────────────────────────────────────────
 
 
+def snapshot_elapsed(
+    rows: Sequence[TerminalState],
+    ages: Mapping[str, float] | None,
+) -> Dict[str, str]:
+    """ELAPSED cells for a frame with no history behind it (``--once``).
+
+    The live view times the status itself, against the previous fetch. One
+    snapshot has no previous fetch, so the age has to come from the snapshot:
+    tmux ``window_activity``, which is the number the retiring script printed
+    under ``IDLE`` for exactly this reason (``fleet-tui.py:326,352-353``).
+
+    It is a weaker claim than the live column's, and it is marked as one — the
+    ``+`` suffix already means "at least this long, the transition in was never
+    seen", which is precisely what "the pane has been silent this long" licenses
+    for a resting seat. A working row still carries its ``●`` so the two-signal
+    language matches the live table.
+
+    When the server grows the ``status_since`` field
+    (:class:`~cli_agent_orchestrator.tui.fleet_state.StatusClock` names it),
+    this is the function that should read it and drop the ``+``.
+    """
+    if not ages:
+        return {}
+    cells: Dict[str, str] = {}
+    for term in rows:
+        age = ages.get(window_key(term))
+        if age is None:
+            continue
+        cells[term.id] = elapsed_cell(age, False, is_working(term))
+    return cells
+
+
+def snapshot_peek_title(
+    term: TerminalState,
+    pane: str | None,
+    ages: Mapping[str, float] | None,
+) -> str:
+    """The ``--once`` peek banner (``fleet-tui.py:441-443``).
+
+    The live banner names two clocks; this one can only name ``quiet``, for the
+    same reason :func:`snapshot_elapsed` exists.
+    """
+    status = status_cell(status_row(term)).plain.removeprefix("· ")
+    quiet = (ages or {}).get(window_key(term))
+    return (
+        f"{SECTION_MARK} peek · {term.profile}-{term.id} · win {window_key(term)}"
+        f" · {pane or '?'} · {status} · quiet {fmt_age(quiet)}"
+    )
+
+
 def format_frame(
     session: str,
     state: FleetState,
@@ -1415,6 +1654,9 @@ def format_frame(
     latency_ms: int | None = None,
     clock: str = "",
     selected: str | None = None,
+    ages: Mapping[str, float] | None = None,
+    peek: Sequence[str] | None = None,
+    pane: str | None = None,
 ) -> str:
     """One plain-text frame — what ``--once`` prints (``fleet-tui.py:571-574``).
 
@@ -1422,11 +1664,20 @@ def format_frame(
     widest cell, plus a two-space gutter (``:362-370``). No colour: the output
     is meant for a pipe, a snapshot or a bug report.
 
-    ELAPSED reads ``-`` throughout: one fetch has no earlier fetch to time a
-    transition against, and no server field carries the transition stamp (see
-    :class:`StatusClock`). Printing a window-activity age there instead would
-    put a number under the new column's name that does not mean what the column
-    says.
+    ``ages`` is ``{window_index: seconds since that pane last printed}`` — the
+    script's own IDLE source (``fleet-tui.py:115-118``) and the only age a
+    single snapshot can carry, since no server field records when a status
+    began (see :class:`StatusClock`). It is rendered with the ``+`` the live
+    view uses for the same claim: *at least* this long, because the transition
+    into the status was never witnessed. A working row keeps its ``●``. Passing
+    nothing leaves every cell ``-``.
+
+    ``peek`` and ``pane`` are the selected row's captured tail and the pane id
+    it came from; given them, the frame ends with the script's peek section
+    (``:440-451``) instead of stopping after the hints. The capture is **not**
+    clipped to a terminal width the way the script clips it: ``--once`` writes
+    to a pipe, and truncating there would drop the very information a bug
+    report is being taken for.
     """
     rows = sort_terminals(state.terminals)
     workers = sum(1 for term in rows if term.parent_id)
@@ -1438,7 +1689,7 @@ def format_frame(
         f"{SECTION_MARK} CAO fleet · {session}  {clock} · {workers} workers · fetch {latency}"
     )
     out.append("")
-    values = [row_values(term, labels) for term in rows]
+    values = [row_values(term, labels, elapsed_cells=snapshot_elapsed(rows, ages)) for term in rows]
     widths = column_widths(PARITY_COLUMNS, values)
     header = header_line(PARITY_COLUMNS, widths)
     out.append(header)
@@ -1447,10 +1698,15 @@ def format_frame(
         marker = f"{MARKER_SELECTED} " if term.id == selected else "  "
         out.append((marker + "".join(cell.ljust(w) for cell, w in zip(row, widths))).rstrip())
     if not rows:
-        out.append("  (no workers)")
+        out.append(" " * GUTTER_WIDTH + EMPTY_ROWS_TEXT)
     if events:
         out += ["", f"{SECTION_MARK} recent"] + [f"{EVENT_INDENT}{line}" for line in events]
     out += ["", hint_text()]
+    if peek is not None:
+        chosen = next((term for term in rows if term.id == selected), None)
+        if chosen is not None:
+            out += ["", snapshot_peek_title(chosen, pane, ages), PEEK_RULE_GLYPH * len(header)]
+            out += list(peek)
     return "\n".join(out) + "\n"
 
 
@@ -1463,8 +1719,20 @@ def render_once(
     labels_path: Path = LABELS_PATH,
     events_path: Path = EVENTS_PATH,
     now: Callable[[], float] = time.time,
+    peek_lines: int = PEEK_LINES_DEFAULT,
 ) -> str:
-    """Fetch once and return the frame; no Textual app, no terminal needed."""
+    """Fetch once and return the frame; no Textual app, no terminal needed.
+
+    Everything the live view shows is in this frame: the script's ``--once``
+    prints the age column and the peek section too (``fleet-tui.py:571-574``
+    renders the same function the loop does), and a frame that silently drops
+    them is a worse bug report than a wider one.
+
+    The three tmux reads it takes to do that — ``list-windows`` for the ages,
+    ``list-panes`` and ``capture-pane`` for the peek — are all reads (AC4). Each
+    degrades on its own: no tmux means ``ELAPSED -`` and no peek section, never
+    a failure.
+    """
     url = f"{endpoint.rstrip('/')}/sessions/{session}/fleet"
     started = now()
     latency: int | None = None
@@ -1476,6 +1744,11 @@ def render_once(
         latency = int((now() - started) * 1000)
         state = FleetState.from_dict(raw, fetched_at=now())
     rows = sort_terminals(state.terminals)
+    ages = read_window_ages(runner, session, now=now)
+    pane: str | None = None
+    peek: List[str] | None = None
+    if rows and rows[0].window_index is not None:
+        pane, peek = capture_once(runner, session, rows[0].window_index, peek_lines)
     return format_frame(
         session,
         state,
@@ -1484,6 +1757,9 @@ def render_once(
         latency_ms=latency,
         clock=time.strftime("%H:%M:%S", time.localtime(now())),
         selected=rows[0].id if rows else None,
+        ages=ages,
+        peek=peek,
+        pane=pane,
     )
 
 
