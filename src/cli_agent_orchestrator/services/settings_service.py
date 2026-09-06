@@ -150,14 +150,17 @@ def resolve_provider_string_option(
 #                    its own default, which CAO cannot observe → column shows
 #                    ``-``).
 #
-# kiro_cli is absent: it has no effort knob, so it always resolves to ``None``
-# (``-``). This is the one bound provider that legitimately shows ``-`` — the
-# user's "never ``-`` for a bound provider" holds only where the CLI has a knob.
+# kiro_cli is absent from this table's DEFAULTS but has a knob: kiro-cli's
+# `chat --effort <low|medium|high|xhigh|max>` flag (verified against kiro-cli
+# 2.21.1 `chat --help`, F780 #637 review). It uses the same `reasoning_effort`
+# toml key and, like codex/grok/claude, has no CAO-side built-in default — an
+# unset chain leaves the flag off and the CLI chooses (column shows `-`).
 _REASONING_EFFORT_KNOBS: Dict[str, Tuple[str, str, Optional[str]]] = {
     "codex": ("reasoning_effort", "reasoningEffort", None),
     "grok_cli": ("reasoning_effort", "reasoningEffort", None),
     "claude_code": ("reasoning_effort", "reasoningEffort", None),
     "cline_cli": ("thinking", "reasoningEffort", "high"),
+    "kiro_cli": ("reasoning_effort", "reasoningEffort", None),
 }
 
 

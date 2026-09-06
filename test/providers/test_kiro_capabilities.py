@@ -373,7 +373,37 @@ def test_builds_explicit_v2_and_deterministic_kas_commands():
     ]
 
 
-def test_build_kiro_command_appends_resume_id_kas():
+def test_build_kiro_command_appends_effort_after_model():
+    """F780 (#637): --effort follows --model and precedes --agent.
+
+    kiro-cli exposes `chat --effort <low|medium|high|xhigh|max>` (2.21.1). The
+    flag is omitted entirely when effort is None (kiro's own default).
+    """
+    assert build_kiro_command(KiroEngine.KAS, "kiro_dev", model="fixture-model", effort="high") == [
+        "kiro-cli",
+        "--v3",
+        "chat",
+        "--trust-all-tools",
+        "--model",
+        "fixture-model",
+        "--effort",
+        "high",
+        "--agent",
+        "kiro_dev",
+    ]
+    # None → no --effort flag at all.
+    assert "--effort" not in build_kiro_command(KiroEngine.KAS, "kiro_dev", model="m")
+    # Effort without a model still emits, after `chat`/trust.
+    assert build_kiro_command(KiroEngine.KAS, "kiro_dev", effort="xhigh") == [
+        "kiro-cli",
+        "--v3",
+        "chat",
+        "--trust-all-tools",
+        "--effort",
+        "xhigh",
+        "--agent",
+        "kiro_dev",
+    ]
     """F560: --resume-id sits after `chat`/trust flags on the KAS engine."""
     assert build_kiro_command(KiroEngine.KAS, "kiro_dev", resume_session_id="sess_abc-123") == [
         "kiro-cli",

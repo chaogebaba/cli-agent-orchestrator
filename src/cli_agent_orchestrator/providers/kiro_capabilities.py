@@ -397,6 +397,7 @@ def build_kiro_command(
     agent_profile: str,
     *,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     yolo: bool = False,
     legacy_ui: bool = False,
     resume_session_id: Optional[str] = None,
@@ -415,6 +416,12 @@ def build_kiro_command(
     (verified against ``kiro-cli chat --help``, 2.20.1); the flag sits right
     after ``chat`` in both forms. The id is opaque and stored verbatim
     (KAS ids are ``sess_``-prefixed, classic are bare UUIDs).
+
+    ``effort`` (F780 #637): when set, append ``--effort <level>`` — kiro-cli's
+    ``chat --effort <low|medium|high|xhigh|max>`` reasoning-effort flag (verified
+    against kiro-cli 2.21.1 ``chat --help``). Omitted when None so kiro uses its
+    own default. Resolved through the shared providers.toml precedence
+    (``settings_service.resolve_reasoning_effort``), same as ``--model``.
     """
     if engine == KiroEngine.KAS:
         # F107 B1: KAS honors --trust-all-tools as a session-scope override
@@ -430,6 +437,8 @@ def build_kiro_command(
         command.extend(["--resume-id", resume_session_id])
     if model:
         command.extend(["--model", model])
+    if effort:
+        command.extend(["--effort", effort])
     command.extend(["--agent", agent_profile])
     return command
 

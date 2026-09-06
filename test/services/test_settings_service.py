@@ -242,10 +242,16 @@ class TestResolveReasoningEffort:
         provider = {"thinking": "medium", "reasoning_effort": "ignored"}
         assert resolve_reasoning_effort("cline_cli", {}, provider, None) == "medium"
 
-    def test_kiro_has_no_knob_returns_none(self):
-        """kiro_cli has no effort knob: always None (the one bound provider at '-')."""
-        provider = {"reasoning_effort": "high", "thinking": "high"}
-        assert resolve_reasoning_effort("kiro_cli", {}, provider, None) is None
+    def test_kiro_reads_reasoning_effort_key(self):
+        """F780 (#637): kiro_cli DOES have an effort knob (chat --effort); it
+        reads the `reasoning_effort` toml key with no CAO built-in default."""
+        provider = {"reasoning_effort": "xhigh"}
+        assert resolve_reasoning_effort("kiro_cli", {}, provider, None) == "xhigh"
+        # Silent chain → None (kiro's own default; column '-').
+        assert resolve_reasoning_effort("kiro_cli", {}, {}, None) is None
+        # Profile field is the last layer before the (absent) built-in default.
+        prof = SimpleNamespace(reasoningEffort="medium")
+        assert resolve_reasoning_effort("kiro_cli", {}, {}, prof) == "medium"
 
     def test_unknown_provider_returns_none(self):
         assert resolve_reasoning_effort("no_such_cli", {}, {"reasoning_effort": "x"}, None) is None
