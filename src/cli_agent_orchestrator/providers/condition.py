@@ -38,10 +38,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 # Imported lazily-safe at module import: these are module-level constants in the
 # provider modules and carry no import cycle back to this module.
 from cli_agent_orchestrator.providers.codex import (  # noqa: E402
+    CODEX_ACTIVITY_MARKER_PATTERN,
     SYSTEM_NOTICE_PATTERN,
     TRANSIENT_API_ERROR_PATTERNS,
     TRANSIENT_ERROR_EXCLUSIONS,
     USER_PREFIX_PATTERN,
+    codex_activity_marker_live,
 )
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -260,6 +262,41 @@ _CLINE_BUSY = re.compile(r"\[thinking\]|\[run_commands\]", re.IGNORECASE)
 # the provider via pane_current_command == shell_baseline — see D5/precedence 1).
 _CLINE_PROC_EXITED = re.compile(r"\[Command exited with code \d+\]")
 
+# F775 (#632): reset anchor for scoping the PROC_EXITED text evidence. A stale
+# ``[Command exited with code N]`` line in scrollback must NOT keep re-asserting
+# PROC_EXITED once the pane has moved past it. The reliable boundary is the SHELL
+# PROMPT — the starship ``❯`` baseline the pane returns to when the process ends
+# and a NEW session/turn begins below it. A chained cline tool marker
+# (``[run_commands]`` / ``[search_codebase]`` …) is NOT a boundary: cline runs
+# several tool calls inside ONE turn and ``[Command exited …]`` is just one tool's
+# result, so the exit line is still live evidence while the same turn continues
+# (see fixture cline-cli-proc-exited-1: a ``[search_codebase]`` follows the exit
+# within the same turn and the corpus still expects PROC_EXITED). Tail-limiting to
+# BUSY_TAIL_ROWS + the F752 quiescent downgrade handle the live-worker sticky case.
+_CLINE_SHELL_PROMPT = re.compile(r"^\s*❯")
+
+
+def _scoped_proc_exited_evidence(brows: List[str]) -> Optional[str]:
+    """F775 (#632): the exit-code line ONLY when it is live evidence.
+
+    Scopes the ``[Command exited with code N]`` scan to the BUSY_TAIL_ROWS window
+    (same tail bound BUSY uses — a statement about the present is only believable
+    in the live tail) AND clears it once a NEWER shell prompt appears after it
+    (the process returned to shell / a new turn began below the exit line).
+    Returns the exit-code row, or ``None`` when the evidence is stale or absent.
+    """
+    tail = brows[-BUSY_TAIL_ROWS:]
+    last_exit = -1
+    for i, row in enumerate(tail):
+        if _CLINE_PROC_EXITED.search(row):
+            last_exit = i
+    if last_exit < 0:
+        return None
+    for row in tail[last_exit + 1 :]:
+        if _CLINE_SHELL_PROMPT.match(row):
+            return None
+    return tail[last_exit].strip()
+
 
 def _first_evidence(rows: List[str], pattern: "re.Pattern[str]") -> Optional[str]:
     for row in rows:
@@ -435,6 +472,23 @@ def _classify_transient(provider: str, brows: List[str]) -> Optional[Condition]:
 BUSY_TAIL_ROWS: int = 45
 
 
+def _codex_activity_evidence(pane: str) -> Optional[str]:
+    """F782 (#639): the first codex activity bullet newer than the last ``›``
+    prompt, for use as the BUSY condition's evidence row. Mirrors the position
+    walk in ``codex.codex_activity_marker_live`` so evidence and verdict agree.
+    """
+    rows = [strip_terminal_escapes(r) for r in pane.splitlines()]
+    last_prompt = -1
+    for i, row in enumerate(rows):
+        stripped = row.lstrip()
+        if stripped.startswith("›") and "Ask Codex to do anything" not in row:
+            last_prompt = i
+    for row in rows[last_prompt + 1 :]:
+        if CODEX_ACTIVITY_MARKER_PATTERN.match(row):
+            return row.strip()
+    return None
+
+
 def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     pat, subtype = {
         "codex": (_CODEX_BUSY, "working_marker"),
@@ -488,7 +542,10 @@ def classify_condition(
     candidates: List[Condition] = []
 
     # PROC_EXITED (precedence 1): process-state fact OR a text exit-code line.
-    text_exit = _first_evidence(brows, _CLINE_PROC_EXITED) if provider == "cline_cli" else None
+    # F775 (#632): the text line is scoped to the live tail and cleared by a
+    # newer turn marker / shell prompt, so a stale scrollback exit line no longer
+    # re-asserts PROC_EXITED on a worker that has since moved on.
+    text_exit = _scoped_proc_exited_evidence(brows) if provider == "cline_cli" else None
     if text_exit is not None:
         candidates.append(
             Condition(
@@ -514,6 +571,26 @@ def classify_condition(
         cond = classifier(provider, brows)
         if cond is not None:
             candidates.append(cond)
+
+    # F782 (#639): codex has a SECOND live-work marker class beyond the
+    # ``• Working (… esc to interrupt)`` footer that ``_classify_busy`` matches:
+    # the ``• Waiting for agents`` wait loop and any ``• <Verb>ing …`` activity
+    # bullet newer than the last ``›`` prompt. That test is position-aware, so it
+    # runs on the RAW pane (``banner_rows`` strips the composer prompt used as the
+    # position anchor), not on ``brows``. Only add it when the footer path did not
+    # already surface BUSY, so evidence stays specific.
+    if provider == "codex" and not any(c.kind is ConditionKind.BUSY for c in candidates):
+        if codex_activity_marker_live(pane):
+            ev = _codex_activity_evidence(pane)
+            candidates.append(
+                Condition(
+                    ConditionKind.BUSY,
+                    provider,
+                    "activity_marker",
+                    ev or "• activity marker",
+                    Confidence.HIGH,
+                )
+            )
 
     if not candidates:
         return None

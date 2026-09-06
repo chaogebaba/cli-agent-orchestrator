@@ -1,0 +1,11 @@
+{
+  "provider": "codex",
+  "condition": "BUSY",
+  "subtype": "activity_marker",
+  "reset_hint_raw": "",
+  "source_path": "tmux capture-pane -p -t cao-claude-orch5:codex_empirical_reviewer-bcce0ff5 -S -90",
+  "source_line_range": "live capture 2026-09-06",
+  "captured_at": "2026-09-06 (live pane capture for F782 #639)",
+  "sha256": "e00be4b14ec5401ebd5ed72467490ab5366c09b5761c9348a3bd8b565b04f318",
+  "note": "codex wait-for-agents tool loop with NO 'esc to interrupt' footer; the '. Waiting for agents' / '. Finished waiting' / 'ss No agents completed yet' activity lines are newer than the last  prompt, and the idle composer 'Ask Codex to do anything' is present but is NOT the last non-blank row (the path/context footer is). Under the pre-F782 logic this read completed/idle."
+}

@@ -1,0 +1,10 @@
+[run_commands] rg 'no-such-pattern-anywhere' src/
+   ⎿ [Command exited with code 1]
+
+cli-subagents on  quirks-merge-train [!] via 🐍 v3.14.7 on ☁️  usr@example.invalid
+❯ >....
+[thinking] The grep returned nothing, which just means the pattern is absent — not an error. Continuing to answer the query.
+[search_codebase] where does classify_condition live
+   ⎿ Found 1 result: src/cli_agent_orchestrator/providers/condition.py:...
+[use_mcp_tool] cao-mcp-server send_message
+   ⎿ {"success":true,"message_id":2001}
