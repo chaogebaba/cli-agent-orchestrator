@@ -44,6 +44,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -1641,8 +1642,28 @@ def _toml_override(key: str, value: Any) -> str:
 
 def _resolved_codex_profile_config(
     profile: Any, profile_name: str | None = None
-) -> tuple[str | None, dict[str, Any]]:
-    """Single model/config resolver shared by interactive and seed launches."""
+) -> tuple[str | None, dict[str, Any], str | None]:
+    """Single model/config/effort resolver shared by interactive and seed launches.
+
+    F777/F780 gate r1 B1: ONE source of truth for the effective reasoning
+    effort. The launch command's ``model_reasoning_effort`` and the persisted
+    ``resolved_reasoning_effort`` MUST agree, so both come from the single
+    ``effort`` this returns. Precedence (empty string clears at any layer):
+
+        [codex.profiles.<name>].reasoning_effort
+      > [codex].reasoning_effort
+      > profile.reasoningEffort          (the CAO profile field)
+      > codexConfig.model_reasoning_effort
+      > built-in (None → CLI default, flag omitted)
+
+    The first three layers are exactly ``resolve_reasoning_effort('codex', …)``;
+    the ``codexConfig.model_reasoning_effort`` fallback is codex-specific and
+    applied here only when the shared chain is silent (and did not explicitly
+    clear). The returned ``config`` carries the resolved effort in
+    ``model_reasoning_effort`` (or has it removed on an explicit clear), so the
+    ``-c model_reasoning_effort=…`` override the launch emits and the persisted
+    value are the same string.
+    """
     defaults = get_provider_defaults("codex")
     declared_name = getattr(profile, "name", None) if profile is not None else None
     resolved_profile_name = (
@@ -1651,20 +1672,48 @@ def _resolved_codex_profile_config(
     profile_defaults = get_provider_profile_defaults(defaults, resolved_profile_name)
     model = resolve_provider_string_option(profile_defaults, defaults, profile, "model", "model")
     config = dict(getattr(profile, "codexConfig", None) or {})
-    effort = None
-    effort_configured = False
+
+    # Was the effort EXPLICITLY set (to a value or to "" = clear) by one of the
+    # three shared layers? Presence of the key at any of them is authoritative;
+    # this mirrors resolve_provider_string_option's own empty-clear semantics.
+    shared_effort = resolve_reasoning_effort("codex", profile_defaults, defaults, profile)
+    shared_explicit = _codex_effort_explicit(profile_defaults, defaults, profile)
+
+    if shared_explicit:
+        # A shared layer decided it (value or clear). shared_effort is the
+        # effective value (None on clear or on an unparsable value).
+        effort = shared_effort
+    else:
+        # Fall back to codexConfig.model_reasoning_effort when the shared chain
+        # said nothing at all.
+        cfg_effort = config.get("model_reasoning_effort")
+        effort = cfg_effort if isinstance(cfg_effort, str) and cfg_effort else None
+
+    # Reflect the single effective effort back into the launch config so the
+    # emitted `-c model_reasoning_effort=…` matches what we persist.
+    if effort:
+        config["model_reasoning_effort"] = effort
+    else:
+        config.pop("model_reasoning_effort", None)
+    return model, config, effort
+
+
+def _codex_effort_explicit(
+    profile_defaults: dict[str, Any], defaults: dict[str, Any], profile: Any
+) -> bool:
+    """True when one of the three shared layers EXPLICITLY set reasoning effort.
+
+    "Explicit" means the ``reasoning_effort`` key is present in the profile TOML
+    layer or the provider TOML layer (even as ``""`` = clear), or the CAO
+    profile carries a non-empty ``reasoningEffort`` field. Distinguishes "a
+    layer cleared it" (which must suppress the codexConfig fallback) from "no
+    layer mentioned it" (fall back to codexConfig).
+    """
     for layer in (profile_defaults, defaults):
-        candidate = layer.get("reasoning_effort")
-        if "reasoning_effort" in layer and isinstance(candidate, str):
-            effort = candidate
-            effort_configured = True
-            break
-    if effort_configured:
-        if effort:
-            config["model_reasoning_effort"] = effort
-        else:
-            config.pop("model_reasoning_effort", None)
-    return model, config
+        if isinstance(layer, dict) and "reasoning_effort" in layer:
+            return True
+    field = getattr(profile, "reasoningEffort", None) if profile is not None else None
+    return isinstance(field, str) and bool(field)
 
 
 def _has_update_dialog_in_bottom(clean_output: str) -> bool:
@@ -2175,7 +2224,7 @@ class CodexProvider(BaseProvider):
         """Create and validate a native Codex rollout without CAO coordinates."""
         profile = load_agent_profile(agent_profile)
         argv = [resolve_provider_binary("codex"), "exec", "--skip-git-repo-check", "-C", cwd]
-        model, config = _resolved_codex_profile_config(profile, agent_profile)
+        model, config, _effort = _resolved_codex_profile_config(profile, agent_profile)
         if isinstance(model, str) and model:
             argv.extend(["--model", model])
         for key, value in config.items():
@@ -2376,11 +2425,19 @@ class CodexProvider(BaseProvider):
         if self._supports_hook_trust_bypass():
             command_parts.append("--dangerously-bypass-hook-trust")
 
-        model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
+        model, codex_config, effort = _resolved_codex_profile_config(profile, self._agent_profile)
         resolved_model = self._model if self._model is not None else model
         self._resolved_model = resolved_model if resolved_model else None
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
+
+        # F777/F780 gate r1 B1: ONE source of truth. `effort` above is the single
+        # effective reasoning effort — it is already reflected into
+        # `codex_config["model_reasoning_effort"]` (emitted below as
+        # `-c model_reasoning_effort=…`), so the launched command and the
+        # persisted value cannot disagree. Precedence incl. the codexConfig
+        # fallback and empty-clear lives in _resolved_codex_profile_config.
+        self._resolved_reasoning_effort = effort
 
         # Set below, only when there is a non-empty system_prompt to inject -- appended, raw and
         # deliberately unquoted by shlex, after the shlex.join() of everything else at the very
@@ -3621,6 +3678,11 @@ class CodexProvider(BaseProvider):
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
         return getattr(self, "_resolved_model", None)
+
+    @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): the effective reasoning effort resolved at command build."""
+        return getattr(self, "_resolved_reasoning_effort", None)
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:

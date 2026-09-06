@@ -43,7 +43,11 @@ GOLDEN = Path(__file__).parent / "fixtures" / "main_screen.txt"
 
 #: Wide enough that no parity column is squeezed, tall enough that every
 #: section — table, recent, hints and the peek under them — is on screen.
-SCREEN_SIZE = (100, 34)
+#: F777 (#634) widened the default column set (PROVIDER/MODEL/EFFORT added
+#: between PROFILE and TASK), so the width was raised from 100 to 130 to keep
+#: the full row — through ELAPSED — on one line, which is what
+#: ``test_the_golden_frame_carries_every_section_in_the_scripts_order`` checks.
+SCREEN_SIZE = (130, 34)
 
 LABELS = "term-0001\tsupervisor seat\nterm-0002\twp-arch phase 3 build\n"
 EVENTS = "12:00:01 term-0002 assigned\n12:00:09 term-0003 completed\n"
@@ -102,9 +106,20 @@ async def test_the_golden_frame_carries_every_section_in_the_scripts_order(
     # header first, peek last — the script's order (fleet-tui.py:336-450)
     assert marks == sorted(marks)
     assert titles[-1].startswith("▌ peek · ")
-    # the six parity headers, on one line, above the rows
+    # the parity headers, on one line, above the rows. F777 (#634) inserted
+    # PROVIDER/MODEL/EFFORT between PROFILE and TASK.
     head = next(line for line in frame if line.lstrip().startswith("WIN"))
-    for column in ("WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED"):
+    for column in (
+        "WIN",
+        "ID",
+        "PROFILE",
+        "PROVIDER",
+        "MODEL",
+        "EFFORT",
+        "TASK",
+        "STATUS",
+        "ELAPSED",
+    ):
         assert column in head
     assert frame.index(head) < marks[1]
     # the selection gutter marks exactly one row

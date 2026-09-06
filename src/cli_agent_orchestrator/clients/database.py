@@ -195,6 +195,9 @@ class TerminalModel(Base):
     last_active = Column(DateTime(timezone=True), default=_utcnow)
     # F127: resolved model string persisted post-initialize
     resolved_model = Column(String, nullable=True)
+    # F777 (#634): effective reasoning effort persisted post-initialize, resolved
+    # through the same providers.toml precedence as resolved_model.
+    reasoning_effort = Column(String, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -1784,6 +1787,7 @@ def init_db() -> None:
     _migrate_f218_dead_supervisor_safety()
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
+    _migrate_f777_reasoning_effort()
     _migrate_terminal_auth_token()
     _migrate_f476_wake_recovery()
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
@@ -1967,6 +1971,23 @@ def _migrate_f127_resolved_model() -> None:
         if columns and not any(column["name"] == "resolved_model" for column in columns):
             connection.execute(
                 _text("ALTER TABLE terminals ADD COLUMN resolved_model TEXT DEFAULT NULL")
+            )
+
+
+def _migrate_f777_reasoning_effort() -> None:
+    """F777 (#634): Add nullable reasoning_effort column to terminals table.
+
+    Additive, idempotent — mirrors _migrate_f127_resolved_model. Persists the
+    effective reasoning effort resolved at spawn so the `cao-fleet` EFFORT
+    column has a per-terminal value.
+    """
+    from sqlalchemy import text as _text
+
+    with engine.begin() as connection:
+        columns = connection.execute(_text("PRAGMA table_info(terminals)")).mappings().all()
+        if columns and not any(column["name"] == "reasoning_effort" for column in columns):
+            connection.execute(
+                _text("ALTER TABLE terminals ADD COLUMN reasoning_effort TEXT DEFAULT NULL")
             )
 
 
@@ -4234,6 +4255,11 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "init_deadline_s": terminal.init_deadline_s,
             "lifecycle_generation": terminal.lifecycle_generation,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
+            # F127 / F777 (#634): resolved model + effective reasoning effort.
+            # Previously omitted here, so get_terminal()'s resolved_model always
+            # read None; added so the terminal API model carries both.
+            "resolved_model": terminal.resolved_model,
+            "reasoning_effort": terminal.reasoning_effort,
             "group": group,
             "metadata": metadata,
             "worktree_info": worktree_info_raw,
@@ -4837,6 +4863,12 @@ def _terminal_row_dict(t: Any) -> Dict[str, Any]:
         "init_failure_token": t.init_failure_token,
         "init_deadline_s": t.init_deadline_s,
         "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+        # F127 / F777 (#634): the resolved model + effective reasoning effort,
+        # projected so build_fleet can surface them in the fleet payload (and
+        # the `cao-fleet` MODEL / EFFORT columns). Prior to F777 this projection
+        # omitted resolved_model, so the fleet MODEL column always read "-".
+        "resolved_model": t.resolved_model,
+        "reasoning_effort": t.reasoning_effort,
         "last_active": t.last_active,
         "metadata": (__import__("json").loads(t.metadata_json) if t.metadata_json else None),
     }
@@ -4945,6 +4977,18 @@ def update_terminal_resolved_model(terminal_id: str, resolved_model: str) -> boo
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.resolved_model = resolved_model
+            db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
+            return True
+        return False
+
+
+def update_terminal_reasoning_effort(terminal_id: str, reasoning_effort: str) -> bool:
+    """F777 (#634): Persist the effective reasoning-effort string for a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.reasoning_effort = reasoning_effort
             db.commit()
             invalidate_terminal_metadata_cache(terminal_id)
             return True

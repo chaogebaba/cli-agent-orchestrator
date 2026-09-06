@@ -253,6 +253,32 @@ WORK_APPROX_SUFFIX: Final[str] = "+"
 STYLE_WORKING: Final[str] = "green"
 #: Rendered when the clock has no spell for a row (only before its first fold).
 ELAPSED_UNKNOWN: Final[str] = "-"
+#: F777 (#634): what an unknown/empty MODEL, PROVIDER or EFFORT cell renders as.
+CELL_UNKNOWN: Final[str] = "-"
+#: F777 (#634): the short CLI name shown in the PROVIDER column. The persisted
+#: `provider` is CAO's internal id (``kiro_cli``); the operator wants the CLI's
+#: own name (``kiro``). Anything not in this map is shown verbatim.
+PROVIDER_SHORT_NAMES: Final[dict[str, str]] = {
+    "kiro_cli": "kiro",
+    "cline_cli": "cline",
+    "grok_cli": "grok",
+    "claude_code": "claude",
+    "codex": "codex",
+}
+
+
+def provider_short(provider: str | None) -> str:
+    """The PROVIDER cell text: the short CLI name, or ``-`` when unknown.
+
+    ``kiro_cli``→``kiro``, ``cline_cli``→``cline``, ``grok_cli``→``grok``,
+    ``claude_code``→``claude`` (F777 #634). An id not in the map renders
+    verbatim; ``None``/empty renders ``-``.
+    """
+    if not provider:
+        return CELL_UNKNOWN
+    return PROVIDER_SHORT_NAMES.get(provider, provider)
+
+
 #: The line drawn in place of the rows when the fleet is empty
 #: (``fleet-tui.py:416-417``). The table's header and rule stay, as they do
 #: there — an empty table under its own header says "nothing is running", an
@@ -638,10 +664,17 @@ def row_values(
     elapsed = ELAPSED_UNKNOWN
     if elapsed_cells is not None:
         elapsed = elapsed_cells.get(term.id, ELAPSED_UNKNOWN)
+    # F777 (#634): PROVIDER/MODEL/EFFORT are now default-visible parity columns,
+    # sitting between PROFILE and TASK. Their order here must match
+    # columns.PARITY_COLUMNS exactly, because row_cells maps the STATUS cell by
+    # PARITY_COLUMNS.index("STATUS").
     values = [
         window_key(term),
         term.id,
         term.profile or "?",
+        provider_short(term.provider),
+        term.resolved_model or CELL_UNKNOWN,
+        term.reasoning_effort or CELL_UNKNOWN,
         labels.get(term.id, default_label)[:40],
         status_cell(status_row(term)).plain,
         elapsed,
@@ -652,7 +685,6 @@ def row_values(
             f"delegating ({term.children_count})" if term.delegating else "-",
             "*" if term.fusion_changed else "",
             term.lifecycle,
-            term.resolved_model or "-",
         ]
     return values
 
@@ -680,6 +712,9 @@ def row_styles(
         STYLE_SUPERVISOR if is_supervisor else STYLE_DIM,  # WIN
         STYLE_SUPERVISOR_ID if is_supervisor else STYLE_WORKER_ID,  # ID
         STYLE_SUPERVISOR if is_supervisor else "",  # PROFILE
+        STYLE_DIM,  # PROVIDER (F777) — secondary identity, dim
+        STYLE_DIM,  # MODEL (F777)
+        STYLE_DIM,  # EFFORT (F777)
         "" if labelled else STYLE_DIM,  # TASK
         "",  # STATUS — status_cell owns it
         elapsed_style(elapsed_seconds, working),  # ELAPSED

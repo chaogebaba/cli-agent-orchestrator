@@ -54,6 +54,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
@@ -274,6 +275,11 @@ class ClineCliProvider(BaseProvider):
         return getattr(self, "_resolved_model", None)
 
     @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): the effective reasoning effort resolved at command build."""
+        return getattr(self, "_resolved_reasoning_effort", None)
+
+    @property
     def session_id(self) -> Optional[str]:
         """Return the correlated cline session ID, if known."""
         return self._session_id
@@ -428,14 +434,26 @@ class ClineCliProvider(BaseProvider):
         return provider_defaults.get("api_provider") or "cline-pass"
 
     def _resolve_thinking(self) -> Optional[str]:
-        """Resolve reasoning effort level for --thinking flag.
+        """Resolve reasoning effort level for the --thinking flag.
 
-        Resolution: [cline_cli.profiles.<name>] thinking > [cline_cli] thinking >
-        profile.reasoningEffort field > default 'high'.
+        F777/F780 gate r1 B2: routed through the ONE shared resolver
+        (``settings_service.resolve_reasoning_effort('cline_cli', …)``), which
+        encodes cline's precedence AND its ``high`` built-in default in one
+        place:
+
+            [cline_cli.profiles.<name>].thinking
+          > [cline_cli].thinking
+          > profile.reasoningEffort
+          > built-in 'high'
+
+        Crucially the shared resolver honours the EXPLICIT-EMPTY CLEAR: an
+        explicit ``thinking = ""`` at a TOML layer returns ``None`` (flag
+        omitted, persisted None) rather than falling through to the ``high``
+        built-in — the bug the gate reproduced when this method called
+        ``resolve_provider_string_option`` (which collapses ``""`` to ``None``)
+        and then unconditionally defaulted to ``high``.
+
         Valid values: none|low|medium|high|xhigh (per cline --help).
-
-        An explicit empty string ("") in providers.toml suppresses the flag
-        entirely (falls back to Cline's own provider default).
         """
         profile = None
         try:
@@ -446,16 +464,7 @@ class ClineCliProvider(BaseProvider):
         provider_defaults = get_provider_defaults("cline_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
         profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
-        resolved = resolve_provider_string_option(
-            profile_defaults,
-            provider_defaults,
-            profile,
-            "thinking",
-            "reasoningEffort",
-        )
-        if isinstance(resolved, str):
-            return resolved
-        return "high"
+        return resolve_reasoning_effort("cline_cli", profile_defaults, provider_defaults, profile)
 
     def _data_dir(self) -> Path:
         """Return this worker's sandbox data directory path."""
@@ -582,6 +591,14 @@ class ClineCliProvider(BaseProvider):
         thinking = self._resolve_thinking()
         if isinstance(thinking, str) and thinking:
             command_parts.extend(["--thinking", thinking])
+        # F777/F780 gate r1 B2: persist the EFFECTIVE effort exactly as the
+        # --thinking flag reflects it. _resolve_thinking now routes through the
+        # ONE shared resolve_reasoning_effort seam, which honours the explicit
+        # empty-clear (`[cline_cli] thinking = ""` → None → flag omitted AND
+        # persisted None) and the 'high' built-in only when nothing is set.
+        self._resolved_reasoning_effort = (
+            thinking if isinstance(thinking, str) and thinking else None
+        )
 
         # System prompt from agent profile.
         profile = None

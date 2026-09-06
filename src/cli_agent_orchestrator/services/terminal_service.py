@@ -70,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     update_provider_session_snapshot,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_reasoning_effort,
     update_terminal_resolved_model,
     update_terminal_shell_command,
     update_terminal_tmux_window,
@@ -150,6 +151,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_provider_profile_defaults,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
@@ -2113,10 +2115,26 @@ async def create_terminal(
                     "model",
                 )
             model = resolved_model
+            # F777/F780 gate r1 B3: resolve the effective reasoning effort with
+            # the SAME providers.toml precedence the kiro provider uses at
+            # launch, BEFORE the pre-allocation probe, and request the `effort`
+            # capability when it is non-empty. This makes a wrapper that lacks
+            # `--effort` fail the probe pre-allocation instead of accepting the
+            # launch argv and rejecting it after DB/tmux state exists. Mirrors
+            # the model pre-resolution directly above.
+            _kiro_provider_defaults = get_provider_defaults("kiro_cli")
+            _kiro_profile_name = getattr(profile, "name", None) or agent_profile
+            _kiro_profile_defaults = get_provider_profile_defaults(
+                _kiro_provider_defaults, _kiro_profile_name
+            )
+            resolved_effort = resolve_reasoning_effort(
+                "kiro_cli", _kiro_profile_defaults, _kiro_provider_defaults, profile
+            )
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=model,
                 yolo=True,
+                effort=resolved_effort,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             await asyncio.to_thread(probe, resolved_engine, requested)
@@ -3039,6 +3057,7 @@ async def create_terminal(
             condition=None,
             last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
+            reasoning_effort=None,
         )
 
         logger.info(
@@ -5613,6 +5632,21 @@ def _schedule_deferred_init(
                     terminal_id,
                     _f127_resolved,
                 )
+            # F777 (#634): persist the effective reasoning effort post-initialize,
+            # next to resolved_model and by the same mechanism. None (a provider
+            # with no effort knob, or a toml that clears it) is left unpersisted
+            # so the column reads "-".
+            _f777_effort = getattr(provider_instance, "resolved_reasoning_effort", None)
+            if _f777_effort is not None:
+                await _tracked_blocking(
+                    terminal_id,
+                    generation,
+                    "abandonable",
+                    "capture_persist",
+                    update_terminal_reasoning_effort,
+                    terminal_id,
+                    _f777_effort,
+                )
             if prepared_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server; _assign_impl on the MCP-server side already
@@ -5975,6 +6009,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider_session_id": metadata.get("provider_session_id"),
             "engine": metadata.get("engine"),
             "resolved_model": metadata.get("resolved_model"),
+            "reasoning_effort": metadata.get("reasoning_effort"),
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,

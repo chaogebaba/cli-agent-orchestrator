@@ -305,6 +305,9 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "since_last_input": since_last_input,
                 "lifecycle": row.get("lifecycle", "ephemeral"),
                 "resolved_model": row.get("resolved_model"),
+                # F777 (#634): the effective reasoning effort persisted at spawn,
+                # rendered by the `cao-fleet` EFFORT column. None → "-".
+                "reasoning_effort": row.get("reasoning_effort"),
                 "reparented_from": row.get("reparented_from"),
                 # F295 AC2: config_stale for grok_cli terminals
                 "config_stale": _is_config_stale(row, grok_canonical_hash),

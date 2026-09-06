@@ -394,22 +394,37 @@ def test_sort_terminals_puts_supervisors_first(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_view_is_exactly_the_six_parity_columns(tmp_path: Path) -> None:
-    """AC5: the default view is parity, in the order of fleet-tui.py:344."""
+async def test_default_view_is_exactly_the_parity_columns(tmp_path: Path) -> None:
+    """AC5 + F777: the default view is the parity set, PROVIDER/MODEL/EFFORT included."""
     app, feed, _ = make_app([load_payload("healthy")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
         table = app.table
         labels = [str(col.label) for col in table.columns.values()]
         assert labels == list(PARITY_VIEW)
-        # AC5: the six parity headers, verbatim, after the header-less gutter.
-        assert labels[1:] == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED"]
+        # F777 (#634): PROVIDER/MODEL/EFFORT sit between PROFILE and TASK; MODEL
+        # is now default-visible (moved out of NEW_COLUMNS). ELAPSED stays last.
+        assert labels[1:] == [
+            "WIN",
+            "ID",
+            "PROFILE",
+            "PROVIDER",
+            "MODEL",
+            "EFFORT",
+            "TASK",
+            "STATUS",
+            "ELAPSED",
+        ]
         assert labels[MARKER_INDEX] == ""
 
 
 @pytest.mark.asyncio
-async def test_c_reveals_the_five_new_columns_and_toggles_back(tmp_path: Path) -> None:
-    """AC5: `c` adds exactly the five new columns, after the six parity ones."""
+async def test_c_reveals_the_new_columns_and_toggles_back(tmp_path: Path) -> None:
+    """AC5 + F777: `c` adds exactly the remaining NEW_COLUMNS, after the parity ones.
+
+    MODEL is no longer among them — F777 promoted it to the default parity set —
+    so it is asserted via its parity position, still populated in either view.
+    """
     app, feed, _ = make_app([load_payload("delegating")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
@@ -480,6 +495,106 @@ async def test_healthy_fixture_status_cells_carry_glyph_and_style(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_provider_model_effort_columns_render(tmp_path: Path) -> None:
+    """F777 (#634): PROVIDER (short CLI name), MODEL and EFFORT are default-visible.
+
+    term-0001 claude_code/claude-opus-5/high, term-0002 codex/gpt-5.1-codex/medium,
+    term-0003 grok_cli/grok-4.6 with no effort key → EFFORT reads ``-``.
+    """
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        table = app.table
+        provider = PARITY_VIEW.index("PROVIDER")
+        model = PARITY_VIEW.index("MODEL")
+        effort = PARITY_VIEW.index("EFFORT")
+
+        # PROVIDER shortens the internal id to the CLI name.
+        assert plain(table, 0, provider) == "claude"
+        assert plain(table, 1, provider) == "codex"
+        assert plain(table, 2, provider) == "grok"
+
+        assert plain(table, 0, model) == "claude-opus-5"
+        assert plain(table, 1, model) == "gpt-5.1-codex"
+        assert plain(table, 2, model) == "grok-4.6"
+
+        assert plain(table, 0, effort) == "high"
+        assert plain(table, 1, effort) == "medium"
+        # A bound provider with no effort key at any level renders "-".
+        assert plain(table, 2, effort) == "-"
+
+
+def _capped_codex_payload() -> Dict[str, Any]:
+    """A minimal build_fleet-shaped payload: a codex worker capped while its
+    fused status reads `completed` (the reported F777 scope-add scenario)."""
+    return {
+        "session_name": "f702-capped",
+        "terminals": [
+            {
+                "id": "term-c001",
+                "profile": "codex_dev",
+                "provider": "codex",
+                "window_index": 0,
+                "window_name": "codex_dev",
+                "parent_id": None,
+                "depth": 0,
+                "orphan": False,
+                "status": "completed",
+                "condition": "CAPPED",
+                "fusion_changed": False,
+                "fusion_reason": None,
+                "delegating": False,
+                "children_count": 0,
+                "init_state": "ready",
+                "init_health": "ready",
+                "since_last_input": 5.0,
+                "lifecycle": "ephemeral",
+                "resolved_model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "reparented_from": None,
+                "config_stale": False,
+                "wedge_suspect": False,
+            }
+        ],
+        "wake_exhaustion_alarms": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_capped_codex_status_shows_capped_not_completed(tmp_path: Path) -> None:
+    """F777 (#634) scope add: STATUS renders the typed condition (CAPPED) as the
+    headline, in bold red, instead of the bare `completed` — through the full
+    app render path, not just the pure cell fn. Raw status stays in the COND
+    column and in the STATUS parenthetical."""
+    app, feed, _ = make_app([_capped_codex_payload()], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        table = app.table
+        status = PARITY_VIEW.index("STATUS")
+        assert plain(table, 0, status) == "⚠ CAPPED (completed)"
+        assert cell(table, 0, status).style == "bold red"
+        # The raw condition is still carried in the opt-in COND column.
+        await pilot.press("c")
+        await pilot.pause()
+        assert plain(app.table, 0, ALL_VIEW.index("COND")) == "CAPPED"
+
+
+@pytest.mark.asyncio
+async def test_busy_codex_status_unchanged(tmp_path: Path) -> None:
+    """F777 (#634): a BUSY condition never headlines — a working codex seat
+    still reads `● working [BUSY]`, not a CAPPED-style headline."""
+    payload = _capped_codex_payload()
+    payload["terminals"][0]["status"] = "processing"
+    payload["terminals"][0]["condition"] = "BUSY"
+    app, feed, _ = make_app([payload], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        status = PARITY_VIEW.index("STATUS")
+        assert plain(app.table, 0, status) == "● working [BUSY]"
+        assert cell(app.table, 0, status).style == "green"
+
+
+@pytest.mark.asyncio
 async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
     tmp_path: Path,
 ) -> None:
@@ -488,7 +603,8 @@ async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
         await settle(pilot, feed)
         status = PARITY_VIEW.index("STATUS")
         assert plain(app.table, 1, status) == "· error"
-        assert plain(app.table, 2, status) == "· error [CAPPED]"
+        # F777 (#634): the capped seat headlines CAPPED over its raw `error`.
+        assert plain(app.table, 2, status) == "⚠ CAPPED (error)"
         assert cell(app.table, 2, status).style == "bold red"
 
     app2, feed2, _ = make_app([load_payload("wake_alarm")], tmp_path)
@@ -1253,6 +1369,9 @@ def test_row_values_is_the_single_source_of_the_row_text() -> None:
         "0",
         "term-0001",
         "chao_supervisor",
+        "claude",  # PROVIDER (F777): claude_code shortened
+        "claude-opus-5",  # MODEL (F777)
+        "high",  # EFFORT (F777)
         "(supervisor seat)",
         "◌ idle",
         ELAPSED_UNKNOWN,  # no clock passed: one frame cannot time a transition
@@ -1365,7 +1484,12 @@ async def test_the_table_columns_carry_the_scripts_two_space_gutter(tmp_path: Pa
         # except the last, which is stretched to the edge of the screen
         expected = column_widths(PARITY_COLUMNS, values)
         assert widths[1:-1] == expected[:-1]
-        assert sum(widths) == app.frame_width()
+        # The last column is stretched to the screen edge only when the natural
+        # widths leave spare. F777 (#634) made the default view wider (PROVIDER/
+        # MODEL/EFFORT), so on a narrow frame the columns can already overflow,
+        # in which case nothing is stretched and the total is the natural sum.
+        natural_total = GUTTER_WIDTH + sum(expected)
+        assert sum(widths) == max(natural_total, app.frame_width())
 
 
 def test_the_selection_bar_uses_the_scripts_accent_not_the_textual_theme() -> None:
@@ -1391,9 +1515,16 @@ def test_a_busy_tag_is_dimmed_but_the_condition_still_owns_the_cell_style() -> N
 
 
 def test_a_loud_condition_tag_is_not_dimmed() -> None:
+    """F777 (#634): CAPPED headlines the cell in bold red; only the raw-status
+    `(idle)` parenthetical is dimmed, never the CAPPED word itself."""
     cell = status_cell({"status": "idle", "condition": "CAPPED"})
+    assert cell.plain == "⚠ CAPPED (idle)"
     assert cell.style == "bold red"
-    assert [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG] == []
+    dimmed = [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG]
+    assert len(dimmed) == 1
+    # The dim span is exactly the parenthetical, not the CAPPED headline.
+    assert cell.plain[dimmed[0].start : dimmed[0].end] == " (idle)"
+    assert "CAPPED" not in cell.plain[dimmed[0].start : dimmed[0].end]
 
 
 # ── the working-elapsed readout (F702 #557 "look" round) ─────────────────────

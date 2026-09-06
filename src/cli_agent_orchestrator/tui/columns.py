@@ -2,12 +2,14 @@
 
 Two disjoint groups:
 
-* :data:`PARITY_COLUMNS` — the six headers of the retiring stdlib script
-  (root repo ``scripts/fleet-tui.py:344``), in its order. They are the default
-  view (AC5). Five are verbatim; the sixth is ``ELAPSED``, renamed from the
-  script's ``IDLE`` — see :data:`ELAPSED_COLUMN`.
-* :data:`NEW_COLUMNS` — the five keys ``build_fleet()`` publishes that no code
-  renders today (blueprint B7). Hidden by default, toggled with ``c``.
+* :data:`PARITY_COLUMNS` — the default-visible columns (AC5). The first six are
+  the retiring stdlib script's headers (root repo ``scripts/fleet-tui.py:344``),
+  in its order, except ``ELAPSED`` was renamed from the script's ``IDLE`` (see
+  :data:`ELAPSED_COLUMN`). F777 (#634) inserted three more default-visible
+  columns — ``PROVIDER``, ``MODEL``, ``EFFORT`` — between ``PROFILE`` and
+  ``TASK``; ``MODEL`` moved here out of :data:`NEW_COLUMNS`.
+* :data:`NEW_COLUMNS` — the remaining keys ``build_fleet()`` publishes that are
+  hidden by default and toggled with ``c`` (blueprint B7, minus ``MODEL``).
 
 Names only. Widths, styles, and the ``DataTable`` wiring belong to J2's app
 module; this module has no Textual dependency so it stays importable anywhere.
@@ -32,24 +34,33 @@ from typing import Final, Tuple
 #: stretched to the screen edge, so no other column moves.
 ELAPSED_COLUMN: Final[str] = "ELAPSED"
 
-#: The six parity headers, in the order of ``scripts/fleet-tui.py:344``.
+#: The parity headers, in render order (F702 #557 order, extended by F777 #634).
+#:
+#: F777 (#634) makes PROVIDER, MODEL and EFFORT default-visible: the operator
+#: sees each seat's CLI, model and thinking effort without pressing ``c``. They
+#: sit between PROFILE and TASK so the seat-identity columns group together, and
+#: ELAPSED stays the last (screen-edge-stretched) column. MODEL moved here from
+#: :data:`NEW_COLUMNS` — it is no longer behind the toggle.
 PARITY_COLUMNS: Final[Tuple[str, ...]] = (
     "WIN",
     "ID",
     "PROFILE",
+    "PROVIDER",
+    "MODEL",
+    "EFFORT",
     "TASK",
     "STATUS",
     ELAPSED_COLUMN,
 )
 
-#: The five new columns (blueprint D3): ``condition``, ``delegating``/
-#: ``children_count``, ``fusion_changed``, ``lifecycle``, ``resolved_model``.
+#: The four remaining new columns (blueprint D3 minus MODEL, which F777 promoted
+#: to the default parity set): ``condition``, ``delegating``/``children_count``,
+#: ``fusion_changed``, ``lifecycle``. Hidden by default, toggled with ``c``.
 NEW_COLUMNS: Final[Tuple[str, ...]] = (
     "COND",
     "DELEG",
     "*",
     "LIFE",
-    "MODEL",
 )
 
 #: Parity first, then the new columns — the order used when ``c`` reveals them.

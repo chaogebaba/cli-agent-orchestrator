@@ -136,6 +136,68 @@ def resolve_provider_string_option(
     return value if isinstance(value, str) and value else None
 
 
+# F777 (#634): the single reasoning-effort resolver every provider routes
+# through, so the effective effort persisted per terminal (and shown in the
+# `cao-fleet` EFFORT column) is resolved by ONE precedence rule rather than five
+# copies drifting apart. Each CLI names its effort knob differently in
+# providers.toml, and only some carry a CAO-side built-in default when the toml
+# is silent; both facts live in this table, keyed by provider.
+#
+#   toml_key       — the providers.toml / [<provider>.profiles.<name>] key.
+#   profile_attr   — the CAO profile field (always ``reasoningEffort`` today).
+#   builtin        — the value CAO passes when nothing in the chain specifies
+#                    one, or ``None`` to leave the flag off (let the CLI choose
+#                    its own default, which CAO cannot observe → column shows
+#                    ``-``).
+#
+# kiro_cli is absent from this table's DEFAULTS but has a knob: kiro-cli's
+# `chat --effort <low|medium|high|xhigh|max>` flag (verified against kiro-cli
+# 2.21.1 `chat --help`, F780 #637 review). It uses the same `reasoning_effort`
+# toml key and, like codex/grok/claude, has no CAO-side built-in default — an
+# unset chain leaves the flag off and the CLI chooses (column shows `-`).
+_REASONING_EFFORT_KNOBS: Dict[str, Tuple[str, str, Optional[str]]] = {
+    "codex": ("reasoning_effort", "reasoningEffort", None),
+    "grok_cli": ("reasoning_effort", "reasoningEffort", None),
+    "claude_code": ("reasoning_effort", "reasoningEffort", None),
+    "cline_cli": ("thinking", "reasoningEffort", "high"),
+    "kiro_cli": ("reasoning_effort", "reasoningEffort", None),
+}
+
+
+def resolve_reasoning_effort(
+    provider: str,
+    profile_defaults: Dict[str, Any],
+    provider_defaults: Dict[str, Any],
+    profile: Any,
+) -> Optional[str]:
+    """Resolve the effective reasoning effort for *provider* (F777 #634).
+
+    Precedence mirrors :func:`resolve_provider_string_option` exactly —
+    ``[<provider>.profiles.<name>] > [<provider>] > profile field`` — with a
+    per-provider CLI built-in default applied last when the whole chain is
+    silent. An explicit empty string (``""``) at any layer clears the value
+    (suppresses the flag), yielding ``None``, the same as
+    :func:`resolve_provider_string_option`.
+
+    Returns the string effort, or ``None`` when the provider has no effort knob,
+    the toml clears it, or nothing specifies one and the provider has no
+    built-in default. ``None`` is what the fleet EFFORT column renders as ``-``.
+    """
+    knob = _REASONING_EFFORT_KNOBS.get(provider)
+    if knob is None:
+        return None
+    toml_key, profile_attr, builtin = knob
+    # A present key at any layer (even "") is authoritative: honour the clear.
+    for defaults in (profile_defaults, provider_defaults):
+        if toml_key in defaults:
+            value = defaults[toml_key]
+            return value or None if isinstance(value, str) else None
+    profile_value = getattr(profile, profile_attr, None) if profile is not None else None
+    if isinstance(profile_value, str) and profile_value:
+        return profile_value
+    return builtin
+
+
 def get_default_fork_base(provider: str, profile_name: str) -> Optional[str]:
     """Resolve the profile-over-provider default base without caching TOML."""
     provider_defaults = get_provider_defaults(provider)

@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import (
@@ -333,6 +334,17 @@ class KiroCliProvider(BaseProvider):
         """Return the effective model resolved by the service layer."""
         return getattr(self, "_model", None)
 
+    @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634) / F780 (#637): the effective reasoning effort resolved at
+        launch. kiro-cli DOES have an effort knob (``chat --effort``, verified
+        against 2.21.1), so this is resolved through the shared
+        ``settings_service.resolve_reasoning_effort`` precedence during
+        ``initialize`` and emitted as ``--effort``. None until initialize runs,
+        or when nothing in the providers.toml chain specifies an effort (kiro
+        then uses its own default and the fleet EFFORT column shows ``-``)."""
+        return getattr(self, "_resolved_reasoning_effort", None)
+
     def resume_session_uuid(self) -> str | None:
         """F560: the resume seed, used by the create path's settlement logic.
 
@@ -454,6 +466,27 @@ class KiroCliProvider(BaseProvider):
             "model",
             "model",
         )
+
+    def _resolve_reasoning_effort(self) -> Optional[str]:
+        """F780 (#637): resolve kiro's effective reasoning effort via the ONE
+        shared helper, same precedence/profile-name resolution as the model
+        (spawn model does NOT pin effort; effort is its own toml key). kiro-cli
+        exposes ``chat --effort <low|medium|high|xhigh|max>``; None leaves the
+        flag off (kiro's own default). Best-effort profile load, like
+        ``_get_profile_model``."""
+        profile = None
+        try:
+            profile = load_agent_profile(self._agent_profile)
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.debug(
+                "Profile '%s' not loadable by CAO; effort falls back to providers.toml: %s",
+                self._agent_profile,
+                exc,
+            )
+        provider_defaults = get_provider_defaults("kiro_cli")
+        profile_name = getattr(profile, "name", None) or self._agent_profile
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        return resolve_reasoning_effort("kiro_cli", profile_defaults, provider_defaults, profile)
 
     def _assert_kiro_identity_guard(self) -> None:
         """F118 §7 loud identity guard — runs at the top of initialize().
@@ -610,6 +643,11 @@ class KiroCliProvider(BaseProvider):
         #   timeout, preserving prior behavior for older kiro-cli versions).
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
+        # F780 (#637): resolve the effective reasoning effort once and persist
+        # it on the instance so terminal_service can read resolved_reasoning_effort
+        # post-init; passed as --effort to every build_kiro_command call below.
+        effort = self._resolve_reasoning_effort()
+        self._resolved_reasoning_effort = effort
         # F566: pass --resume-id ONLY when re-attaching to a real prior session
         # id (the resume path). None on a fresh spawn, so build_kiro_command
         # omits the flag and kiro takes session/new — which applies --agent and
@@ -636,6 +674,7 @@ class KiroCliProvider(BaseProvider):
                 self._engine,
                 self._agent_profile,
                 model=model,
+                effort=effort,
                 yolo=True,
                 legacy_ui=True,
                 resume_session_id=resume_id,
@@ -647,6 +686,7 @@ class KiroCliProvider(BaseProvider):
                 self._engine,
                 self._agent_profile,
                 model=model,
+                effort=effort,
                 yolo=True,
                 resume_session_id=resume_id,
             )
@@ -723,6 +763,7 @@ class KiroCliProvider(BaseProvider):
                 self._engine,
                 self._agent_profile,
                 model=model,
+                effort=effort,
                 yolo=True,
                 legacy_ui=True,
                 resume_session_id=resume_id,

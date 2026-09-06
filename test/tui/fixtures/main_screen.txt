@@ -1,10 +1,10 @@
 ▌ CAO fleet · f702-test  HH:MM:SS · 2 workers · fetch 0ms · live
 
-  WIN  ID         PROFILE          TASK                   STATUS       ELAPSED
-────────────────────────────────────────────────────────────────────────────────────────────────────
-▶ 0    term-0001  chao_supervisor  supervisor seat        ◌ idle       0s+
-  2    term-0002  codex_dev        wp-arch phase 3 build  ● working    ● 0s+
-  3    term-0003  grok_doc_keeper  (unlabeled)            · completed  0s+
+  WIN  ID         PROFILE          PROVIDER  MODEL          EFFORT  TASK                   STATUS       ELAPSED
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▶ 0    term-0001  chao_supervisor  claude    claude-opus-5  high    supervisor seat        ◌ idle       0s+
+  2    term-0002  codex_dev        codex     gpt-5.1-codex  medium  wp-arch phase 3 build  ● working    ● 0s+
+  3    term-0003  grok_doc_keeper  grok      grok-4.6       -       (unlabeled)            · completed  0s+
 
 ▌ recent
   HH:MM:SS term-0002 assigned
@@ -13,7 +13,7 @@
 ↑↓/jk select · ⏎/o jump · p peek · +/- size · g/G ends · c columns · d debug · s snapshot · q quit
 
 ▌ peek · chao_supervisor-term-0001 · win 0 · %7 · ◌ idle · for 0s+ · quiet 11s
-════════════════════════════════════════════════════════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 pane line
 
 

@@ -19,6 +19,7 @@ ProbeRunner = Callable[..., subprocess.CompletedProcess[str]]
 _FLAG_CAPABILITIES = {
     "profile": "--agent",
     "model": "--model",
+    "effort": "--effort",
     "ui": "--legacy-ui",
     "trust": "--trust-all-tools",
     "mcp_startup": "--require-mcp-startup",
@@ -31,7 +32,7 @@ _BARE_BOOLEAN_FLAGS = frozenset(
         "--require-mcp-startup",
     }
 )
-_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model"})
+_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model", "--effort"})
 _REQUESTED_FLAGS = frozenset(
     {
         "--agent-engine",
@@ -397,6 +398,7 @@ def build_kiro_command(
     agent_profile: str,
     *,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     yolo: bool = False,
     legacy_ui: bool = False,
     resume_session_id: Optional[str] = None,
@@ -415,6 +417,12 @@ def build_kiro_command(
     (verified against ``kiro-cli chat --help``, 2.20.1); the flag sits right
     after ``chat`` in both forms. The id is opaque and stored verbatim
     (KAS ids are ``sess_``-prefixed, classic are bare UUIDs).
+
+    ``effort`` (F780 #637): when set, append ``--effort <level>`` — kiro-cli's
+    ``chat --effort <low|medium|high|xhigh|max>`` reasoning-effort flag (verified
+    against kiro-cli 2.21.1 ``chat --help``). Omitted when None so kiro uses its
+    own default. Resolved through the shared providers.toml precedence
+    (``settings_service.resolve_reasoning_effort``), same as ``--model``.
     """
     if engine == KiroEngine.KAS:
         # F107 B1: KAS honors --trust-all-tools as a session-scope override
@@ -430,12 +438,14 @@ def build_kiro_command(
         command.extend(["--resume-id", resume_session_id])
     if model:
         command.extend(["--model", model])
+    if effort:
+        command.extend(["--effort", effort])
     command.extend(["--agent", agent_profile])
     return command
 
 
 def requested_kiro_capabilities(
-    engine: KiroEngine, *, model: Optional[str], yolo: bool
+    engine: KiroEngine, *, model: Optional[str], yolo: bool, effort: Optional[str] = None
 ) -> set[str]:
     """Return every wrapper feature used by the launch lifecycle.
 
@@ -444,10 +454,21 @@ def requested_kiro_capabilities(
     ``--agent-engine=v2`` and its bare form drops the wrapper to the v1 engine,
     which serves no MCP tools. Requiring it would also reject wrappers that are
     otherwise fully usable. See ``build_kiro_command``.
+
+    F777/F780 gate r1 B3: ``effort`` mirrors ``model`` — when a non-empty
+    reasoning effort will be launched (``build_kiro_command(effort=…)`` emits
+    ``--effort``), the ``effort`` capability is requested so the pre-allocation
+    probe verifies the wrapper advertises ``--effort``. A wrapper predating the
+    flag then fails the probe BEFORE any DB/tmux allocation, rather than
+    accepting the launch argv and rejecting it after allocation. When no effort
+    is configured the capability is not requested, so older wrappers are
+    unaffected (same gating as ``model``).
     """
     requested = {"profile"}
     if model:
         requested.add("model")
+    if effort:
+        requested.add("effort")
     if engine == KiroEngine.KAS:
         # F107 B1: KAS launch always passes --trust-all-tools.
         requested.add("trust")

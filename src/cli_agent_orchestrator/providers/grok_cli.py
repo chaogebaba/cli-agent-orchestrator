@@ -40,6 +40,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.grok_config import ensure_grok_mcp_servers
@@ -171,6 +172,11 @@ class GrokCliProvider(BaseProvider):
         return getattr(self, "_resolved_model", None)
 
     @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): the effective reasoning effort resolved at command build."""
+        return getattr(self, "_resolved_reasoning_effort", None)
+
+    @property
     def paste_enter_count(self) -> int:
         """Grok submits bracketed-pasted input with one Enter."""
         return 1
@@ -254,6 +260,10 @@ class GrokCliProvider(BaseProvider):
         )
         if isinstance(reasoning_effort, str) and reasoning_effort:
             command_parts.extend(["--reasoning-effort", reasoning_effort])
+        # F777 (#634): persist the EFFECTIVE effort (same precedence, one helper).
+        self._resolved_reasoning_effort = resolve_reasoning_effort(
+            "grok_cli", profile_defaults, provider_defaults, profile
+        )
 
         system_prompt = profile.system_prompt if profile and profile.system_prompt else ""
         system_prompt = self._apply_skill_prompt(system_prompt)
@@ -357,13 +367,7 @@ class GrokCliProvider(BaseProvider):
         the session, so validate on the session directory plus ANY non-empty seed
         artifact grok writes at startup.
         """
-        session_dir = (
-            Path.home()
-            / ".grok"
-            / "sessions"
-            / quote(cwd, safe="")
-            / session_uuid
-        )
+        session_dir = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid
         # The directory itself is the earliest liveness signal grok emits; before
         # it exists the session has not started, so keep retrying until the deadline.
         if not session_dir.is_dir():

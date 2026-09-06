@@ -2729,3 +2729,77 @@ def test_no_upsert_against_the_terminals_table():
         "upsert against terminals would break the ownership ordering contract "
         "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+class TestF777ReasoningEffortMigration:
+    """F777 (#634): the additive terminals.reasoning_effort column + migration."""
+
+    def test_migration_adds_column_and_is_idempotent(self, tmp_path, monkeypatch):
+        """A legacy terminals table with no reasoning_effort gets the column,
+        nullable, defaulting NULL; re-running the migration is a no-op."""
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        migration_engine = create_engine(f"sqlite:///{tmp_path / 'f777.db'}")
+        # Legacy shape: a terminals table WITHOUT the reasoning_effort column.
+        with migration_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE terminals ("
+                    "id VARCHAR NOT NULL PRIMARY KEY, tmux_session VARCHAR, "
+                    "tmux_window VARCHAR, provider VARCHAR, resolved_model TEXT)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO terminals (id, tmux_session, tmux_window, provider, "
+                    "resolved_model) VALUES ('t0000001', 'sess', 'w0', 'codex', 'gpt-5.6-sol')"
+                )
+            )
+        monkeypatch.setattr(db_mod, "engine", migration_engine)
+
+        def _has_column() -> bool:
+            with migration_engine.begin() as connection:
+                cols = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
+            return any(c["name"] == "reasoning_effort" for c in cols)
+
+        assert not _has_column()
+        db_mod._migrate_f777_reasoning_effort()
+        assert _has_column()
+
+        with migration_engine.begin() as connection:
+            col = next(
+                c
+                for c in connection.execute(text("PRAGMA table_info(terminals)")).mappings()
+                if c["name"] == "reasoning_effort"
+            )
+            # nullable, no NOT NULL, defaults NULL for the pre-existing row.
+            assert col["notnull"] == 0
+            existing = connection.execute(
+                text("SELECT reasoning_effort FROM terminals WHERE id='t0000001'")
+            ).scalar()
+        assert existing is None
+
+        # Idempotent: a second run neither raises nor duplicates the column.
+        db_mod._migrate_f777_reasoning_effort()
+        with migration_engine.begin() as connection:
+            cols = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
+        assert sum(1 for c in cols if c["name"] == "reasoning_effort") == 1
+
+    def test_update_terminal_reasoning_effort_persists(self, tmp_path, monkeypatch):
+        """update_terminal_reasoning_effort writes the value on the ORM model."""
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'f777b.db'}")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", Session)
+        monkeypatch.setattr(db_mod, "engine", engine)
+        db_mod.clear_terminal_metadata_cache()
+
+        db_mod.create_terminal("t0000002", "sess", "w1", "grok_cli", agent_profile="grok_dev")
+        assert db_mod.update_terminal_reasoning_effort("t0000002", "high") is True
+        with Session() as db:
+            row = db.query(TerminalModel).filter(TerminalModel.id == "t0000002").first()
+            assert row.reasoning_effort == "high"
+        # Missing terminal → False, no raise.
+        assert db_mod.update_terminal_reasoning_effort("nosuch99", "low") is False

@@ -54,7 +54,7 @@ def _argv_patches(monkeypatch):
     monkeypatch.setattr(codex_mod, "load_agent_profile", lambda _p: {})
     monkeypatch.setattr(codex_mod, "resolve_provider_binary", lambda _n: "/bin/true")
     monkeypatch.setattr(
-        codex_mod, "_resolved_codex_profile_config", lambda _prof, _name: (None, {})
+        codex_mod, "_resolved_codex_profile_config", lambda _prof, _name: (None, {}, None)
     )
 
 

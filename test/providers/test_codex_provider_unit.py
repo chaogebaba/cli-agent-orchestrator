@@ -1364,6 +1364,107 @@ class TestCodexProviderCodexConfig:
         assert 'model_reasoning_effort="medium"' not in command
 
 
+class TestCodexEffortSingleSourceOfTruth:
+    """F777/F780 gate r1 B1: the launched --effort and the persisted
+    resolved_reasoning_effort come from ONE resolver and always agree."""
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_profile_field_xhigh_silent_toml_emits_and_persists_xhigh(
+        self, mock_load, provider_defaults_file
+    ):
+        """profile.reasoningEffort=xhigh, silent TOML → command emits xhigh AND
+        resolved_reasoning_effort == 'xhigh' (the direction the gate reproduced
+        as command-missing / persist-xhigh)."""
+        mock_profile = MagicMock(
+            model=None,
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig=None,
+        )
+        mock_profile.name = "agent"
+        mock_profile.reasoningEffort = "xhigh"
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text("[codex]\n", encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="xhigh"' in command
+        assert provider.resolved_reasoning_effort == "xhigh"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codexconfig_high_only_emits_and_persists_high(self, mock_load, provider_defaults_file):
+        """codexConfig.model_reasoning_effort=high, no profile/TOML effort →
+        command emits high AND resolved_reasoning_effort == 'high' (the direction
+        the gate reproduced as command-high / persist-None)."""
+        mock_profile = MagicMock(
+            model=None,
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig={"model_reasoning_effort": "high"},
+        )
+        mock_profile.name = "agent"
+        mock_profile.reasoningEffort = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text("[codex]\n", encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="high"' in command
+        assert provider.resolved_reasoning_effort == "high"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_toml_profile_layer_wins_and_persists_that(self, mock_load, provider_defaults_file):
+        """[codex.profiles.<name>] > [codex] > profile.reasoningEffort >
+        codexConfig: the winning layer is BOTH emitted and persisted."""
+        mock_profile = MagicMock(
+            model=None,
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig={"model_reasoning_effort": "low"},
+        )
+        mock_profile.name = "agent"
+        mock_profile.reasoningEffort = "medium"
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nreasoning_effort = "high"\n'
+            '[codex.profiles.agent]\nreasoning_effort = "xhigh"\n',
+            encoding="utf-8",
+        )
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="xhigh"' in command
+        assert provider.resolved_reasoning_effort == "xhigh"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_empty_clear_omits_flag_and_persists_none(self, mock_load, provider_defaults_file):
+        """[codex] reasoning_effort = "" clears: no flag emitted AND
+        resolved_reasoning_effort is None, even with a codexConfig fallback."""
+        mock_profile = MagicMock(
+            model=None,
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig={"model_reasoning_effort": "xhigh"},
+        )
+        mock_profile.name = "agent"
+        mock_profile.reasoningEffort = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text('[codex]\nreasoning_effort = ""\n', encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "model_reasoning_effort" not in command
+        assert provider.resolved_reasoning_effort is None
+
+
 class TestCodexProviderStatusDetection:
     def test_get_status_idle(self):
         output = load_fixture("codex_idle_output.txt")
@@ -5311,7 +5412,7 @@ class TestCodexSeedResumeIdentity:
         """(a) The argv passed to subprocess.run requires the SEED_OK literal and is not
         the F587 'Say hello.' prompt. Kills a mutant that reverts the prompt."""
         mock_load.return_value = MagicMock()
-        mock_cfg.return_value = (None, {})
+        mock_cfg.return_value = (None, {}, None)
         mock_run.return_value = SimpleNamespace(
             returncode=0,
             stdout="SEED_OK\nsession id: 12345678-1234-1234-1234-1234567890ab\n",
@@ -5339,7 +5440,7 @@ class TestCodexSeedResumeIdentity:
         """rc==0 but no SEED_OK in stdout must FAIL. Kills a mutant that drops the marker
         check and trusts rc==0 + a parseable session id alone."""
         mock_load.return_value = MagicMock()
-        mock_cfg.return_value = (None, {})
+        mock_cfg.return_value = (None, {}, None)
         mock_run.return_value = SimpleNamespace(
             returncode=0,
             # A valid session id is present, so only the marker check can reject this.
@@ -5367,7 +5468,7 @@ class TestCodexSeedResumeIdentity:
         """(b) rc!=0 with a flagged-content stdout raises RuntimeError naming the cause
         and logs the tail at ERROR."""
         mock_load.return_value = MagicMock()
-        mock_cfg.return_value = (None, {})
+        mock_cfg.return_value = (None, {}, None)
         mock_run.return_value = SimpleNamespace(
             returncode=1,
             stdout="ERROR: This content was flagged for possible cybersecurity risk\n",
