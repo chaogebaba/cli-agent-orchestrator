@@ -21,6 +21,7 @@ import pytest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.cline_cli import (
+    _BASELINE_CONFIRM_S,
     CLINE_BINARY,
     DISPATCHER_IDLE_CMD,
     ERROR_PATTERN,
@@ -424,18 +425,39 @@ class TestClineCliStatusDetection:
         provider = self._make_provider(initialized=True, dispatched=True)
         assert provider.get_status("") == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
-    def test_error_shell_baseline(self, mock_backend):
-        """pane_current_command == shell_baseline → ERROR (dispatcher crashed)."""
+    def test_first_shell_baseline_is_processing(self, mock_backend, _monitor):
+        """F794 (#651): ONE sample at the shell baseline is a healthy
+        inter-iteration turn of the dispatcher loop, not a crash → PROCESSING."""
         mock_backend.return_value.get_pane_current_command.return_value = "zsh"
         provider = self._make_provider(initialized=True, dispatched=True)
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.cline_cli.time")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_error_shell_baseline_once_persistent(self, mock_backend, mock_time, _monitor):
+        """A dispatcher that never returns to `cat` still reports ERROR, once
+        the baseline reading has persisted past the confirm window."""
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        mock_time.monotonic.return_value = 0.0
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+        mock_time.monotonic.return_value = _BASELINE_CONFIRM_S + 0.1
         assert provider.get_status("") == TerminalStatus.ERROR
 
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.cline_cli.time")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
-    def test_error_shell_baseline_before_dispatch(self, mock_backend):
-        """Shell baseline before dispatch also = ERROR."""
+    def test_error_shell_baseline_before_dispatch(self, mock_backend, mock_time, _monitor):
+        """Persistent shell baseline before dispatch is ERROR too (a dispatcher
+        that never came up); the first sample is still only PROCESSING."""
         mock_backend.return_value.get_pane_current_command.return_value = "zsh"
         provider = self._make_provider(initialized=True, dispatched=False)
+        mock_time.monotonic.return_value = 0.0
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+        mock_time.monotonic.return_value = _BASELINE_CONFIRM_S + 0.1
         assert provider.get_status("") == TerminalStatus.ERROR
 
     def test_uninitialized_unknown(self):

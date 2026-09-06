@@ -149,6 +149,15 @@ ABORT_LINE = "[abort] aborted by another client"
 # the run as IDLE. The provider owns this report/hold state.
 _ABORT_REPORT_HOLD_S = 2.0
 
+# F794 (#651): how long the pane must PERSIST at the dispatcher shell's own
+# baseline command before that reading is believed to mean "the dispatcher
+# died". The healthy inter-iteration window (one-shot `cline` exits, the `while`
+# loop bumps its counter and re-blocks on `cat`) is sub-millisecond; a real
+# crash never leaves the baseline. Two seconds is four orders of magnitude of
+# margin and matches the abort branch's hold, which re-arms detection the same
+# way.
+_BASELINE_CONFIRM_S = 2.0
+
 # F345: Default MCP connect timeout (ms) for cline workers.  The cline CLI
 # uses MCP_CONNECT_TIMEOUT_MS to bound the MCP server initialization handshake.
 # Under concurrent worker load, cao-mcp-server can exceed the default timeout
@@ -268,6 +277,9 @@ class ClineCliProvider(BaseProvider):
         self._abort_reported_occ = 0
         self._abort_reported_at: float | None = None
         self._abort_retry_armed = False
+        # F794 (#651): monotonic timestamp of the first sample in the current
+        # shell-baseline episode; None whenever the pane is not at the baseline.
+        self._baseline_first_seen: float | None = None
 
     @property
     def resolved_model(self) -> Optional[str]:
@@ -745,7 +757,9 @@ class ClineCliProvider(BaseProvider):
             COMPLETED (after task)
           - dispatcher idle but the tail shows ABORT_LINE → ERROR
           - pane_current_command contains "cline" → PROCESSING
-          - pane_current_command == shell_baseline → ERROR (dispatcher crashed)
+          - pane_current_command == shell_baseline → ERROR only once the
+            reading has PERSISTED for ``_BASELINE_CONFIRM_S`` (F794 #651); a
+            first sighting is a healthy inter-iteration turn → PROCESSING
           - Otherwise → PROCESSING (transitioning)
         """
         native = self._resolve_native_status()
@@ -759,6 +773,10 @@ class ClineCliProvider(BaseProvider):
 
         # Dispatcher idle: cat is waiting for input.
         if current_cmd == DISPATCHER_IDLE_CMD:
+            # F794 (#651): the loop is demonstrably alive — close any open
+            # shell-baseline episode so a later, unrelated sighting starts its
+            # own confirmation window instead of inheriting a stale timestamp.
+            self._baseline_first_seen = None
             if self._task_dispatched_flag:
                 from cli_agent_orchestrator.services.pane_liveness import (
                     PANE_LIVENESS_TAIL_LINES,
@@ -800,11 +818,42 @@ class ClineCliProvider(BaseProvider):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
-        # Dispatcher exited back to shell → error.
+        # F794 (#651): the shell baseline is NOT by itself proof the dispatcher
+        # crashed. The dispatcher loop RUNS IN that same shell (see
+        # _build_dispatcher_script): each iteration bumps `_cao_msg_n`, tests
+        # `[ -s "$_cao_msgfile" ]` and only then re-blocks on `cat`, so between
+        # the one-shot `cline` exiting and that `cat` the pane legitimately
+        # reads the shell baseline. A detection tick landing in that window used
+        # to publish ERROR for a perfectly healthy worker — and because status
+        # detection is output-driven (StatusMonitor detects on pipe-pane chunks
+        # plus one quiescence tick after the last chunk), a worker that then
+        # parks at `cat` emits nothing more, so that wrong verdict was the LAST
+        # one. Observed live on terminal f5824e3d: "accepted error generation"
+        # at 17:55:47 right after the answer printed, then status=error for the
+        # rest of the seat's life with its inbox starved (delivery pastes only
+        # to IDLE/COMPLETED).
+        #
+        # A genuinely dead dispatcher never leaves the baseline, so requiring
+        # the reading to PERSIST for _BASELINE_CONFIRM_S separates the two
+        # without losing crash detection: the first sighting reports
+        # PROCESSING and re-arms a detection tick (the same mechanism the abort
+        # branch above uses), and only a still-baseline re-read reports ERROR.
         if self.shell_baseline and current_cmd == self.shell_baseline:
+            now = time.monotonic()
+            if self._baseline_first_seen is None:
+                self._baseline_first_seen = now
+            if now - self._baseline_first_seen < _BASELINE_CONFIRM_S:
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                status_monitor.schedule_detection_retry(
+                    self.terminal_id, delay_s=_BASELINE_CONFIRM_S
+                )
+                return TerminalStatus.PROCESSING
             return TerminalStatus.ERROR
 
-        # Cline is running (or dispatcher is transitioning).
+        # Cline is running (or dispatcher is transitioning): the baseline
+        # episode, if any, is over.
+        self._baseline_first_seen = None
         return TerminalStatus.PROCESSING
 
     def classify_injection_hazard(self, rows: list[str]) -> str | None:

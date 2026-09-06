@@ -714,8 +714,9 @@ class StalledCallbackWatchdog:
                 continue
 
             # D15: re-derive from the independent pane sample after a signalled
-            # stream drop, plus the low-frequency PROCESSING backstop. This adds
-            # no capture: peek() returns the tail observe() already retained.
+            # stream drop, plus the low-frequency PROCESSING/ERROR backstop
+            # (F794 #651 added ERROR). This adds no capture: peek() returns the
+            # tail observe() already retained.
             retained = pane_liveness.peek(terminal_id, now=now)
             if retained is not None:
                 status_monitor.resync_from_pane_tail(terminal_id, retained.filtered_tail, now=now)
