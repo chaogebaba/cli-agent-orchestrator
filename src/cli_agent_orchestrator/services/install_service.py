@@ -21,6 +21,7 @@ from cli_agent_orchestrator.constants import (
     PROVIDERS,
     SKILLS_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -354,6 +355,193 @@ def _build_provider_config(
     )
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Write ``content`` to ``target`` atomically (temp file + os.replace).
+
+    Writes to a uniquely-named temp file in the SAME directory (so the final
+    ``os.replace`` is a same-filesystem rename, which is atomic on POSIX) and
+    fsyncs before the rename so a crash cannot leave a half-written agent JSON
+    in place. A partially-written temp file is cleaned up on failure.
+    """
+    import tempfile
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def build_kiro_agent_config(
+    profile: AgentProfile,
+    *,
+    context_file: Path,
+    allowed_tools: List[str],
+) -> KiroAgentConfig:
+    """Build the ``KiroAgentConfig`` for a profile (F778: single source of truth).
+
+    Factored out of ``install_agent`` so both ``cao install`` AND the kiro
+    prelaunch on-demand materialisation (F778 #635) build byte-identical JSON.
+    Enforces the F107/F113 KAS field rules and defaults the KAS permissions
+    block exactly as the install path always has.
+    """
+    # F107 A8: v3 honors v2 JSON agent configs by backward compat.
+    # Reject only v2-ONLY fields on KAS profiles (toolsSettings, hooks),
+    # not the engine itself.
+    if profile.engine == KiroEngine.KAS and (
+        profile.toolsSettings is not None or profile.hooks is not None
+    ):
+        raise ValueError(
+            "Kiro KAS profiles cannot set toolsSettings or hooks "
+            "(v2-only fields; v3 uses permissions). Remove those fields "
+            "or set engine: v2."
+        )
+
+    # F113 D2 tripwire: v2 tolerance of an extra permissions key is
+    # unverified — warn when a non-KAS profile declares one.
+    if profile.engine != KiroEngine.KAS and profile.permissions is not None:
+        logger.warning(
+            "Profile '%s' declares permissions but engine is %s "
+            "(v2 tolerance of this key is unverified).",
+            profile.name,
+            profile.engine,
+        )
+
+    # F113: KAS profiles require a permissions block for registry load.
+    # Default to the standard autonomous-worker rules when not declared;
+    # explicit permissions (including {}) pass through verbatim.
+    kiro_permissions: Optional[Dict[str, Any]] = profile.permissions
+    if profile.engine == KiroEngine.KAS and kiro_permissions is None:
+        kiro_permissions = {
+            "rules": [
+                {"capability": "shell", "effect": "allow"},
+                {"capability": "web_fetch", "effect": "allow"},
+                {
+                    "capability": "mcp",
+                    "match": ["builtin/*", "cao-mcp-server/*"],
+                    "effect": "allow",
+                },
+            ]
+        }
+
+    # Kiro natively supports skill:// resources with progressive loading
+    # (metadata at startup, full content on demand).
+    kiro_resources = [
+        f"file://{context_file.absolute()}",
+        f"skill://{SKILLS_DIR}/**/SKILL.md",
+    ]
+    raw_prompt = profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
+    return KiroAgentConfig(
+        name=profile.name,
+        description=profile.description,
+        tools=profile.tools if profile.tools is not None else ["*"],
+        allowedTools=allowed_tools,
+        resources=kiro_resources,
+        prompt=raw_prompt,
+        # Raise the cao-mcp-server tool-call timeout so kiro doesn't
+        # cancel long handoff RPCs client-side (see helper docstring).
+        # F118: inject ${VAR} identity env into every MCP entry so
+        # kiro-cli expands CAO_TERMINAL_ID et al from its pane env.
+        mcpServers=_inject_kiro_identity_env(_inject_kiro_mcp_timeout(profile.mcpServers)),
+        toolAliases=profile.toolAliases,
+        toolsSettings=profile.toolsSettings,
+        hooks=profile.hooks,
+        model=profile.model,
+        permissions=kiro_permissions,
+    )
+
+
+def write_kiro_agent_file(
+    profile: AgentProfile,
+    *,
+    context_file: Path,
+    allowed_tools: List[str],
+    safe_filename: str,
+) -> Path:
+    """Serialise ``profile`` to its kiro agent JSON and write it atomically.
+
+    Returns the written path (``<kiro_agents_dir>/<safe_filename>.json``). The
+    single writer used by BOTH ``cao install`` and the F778 prelaunch on-demand
+    materialisation, so the two produce byte-identical files. ``safe_filename``
+    is the caller's already-flattened name (``"/"``→``"__"`` via
+    ``flatten_path_separators``); the write is atomic (temp file + os.replace).
+    """
+    from cli_agent_orchestrator.constants import kiro_agents_dir
+
+    kiro_dir = kiro_agents_dir()
+    kiro_dir.mkdir(parents=True, exist_ok=True)
+    config = build_kiro_agent_config(
+        profile, context_file=context_file, allowed_tools=allowed_tools
+    )
+    agent_file = kiro_dir / f"{safe_filename}.json"
+    _atomic_write_text(
+        agent_file,
+        config.model_dump_json(indent=2, exclude_none=True),
+    )
+    return agent_file
+
+
+def materialize_kiro_agent_json(
+    profile: AgentProfile, *, composed_source: Optional[str] = None
+) -> Path:
+    """Materialise the kiro agent JSON for an already-composed ``profile`` (F778 #635).
+
+    Rebuilds the same two per-profile artefacts ``cao install`` writes for a
+    kiro profile — the shared CONTEXT FILE (kiro's persona resource) and the
+    kiro AGENT JSON — from a profile object the caller already resolved. This
+    is the on-demand path for a POSITION-COMPOSED spawn name
+    (``<provider>_<position>``, D6/D7) whose JSON ``cao install`` never wrote
+    because the composed profile has no installed source file of its own.
+
+    Byte-identical to the install path: it reuses ``_write_context_file`` (via
+    the composed SOURCE), ``resolve_allowed_tools``, ``flatten_path_separators``
+    and ``write_kiro_agent_file`` — the exact helpers ``install_agent`` uses.
+    When ``composed_source`` is supplied (the composed markdown the resolver
+    produced) the context file is byte-identical to the install path's; without
+    it a minimal source is re-serialised from the profile's own fields. Either
+    way the AGENT JSON is byte-identical, since its ``resources`` reference the
+    context file PATH, not its content. Idempotent: re-running overwrites with
+    identical content.
+    """
+    if composed_source is None:
+        import frontmatter as _frontmatter
+
+        # Re-serialise the composed profile to a markdown SOURCE so the context
+        # file carries the persona body. The profile is already composed at the
+        # resolver seam, so this frontmatter round-trip matches the shape
+        # _write_context_file expects.
+        body = profile.prompt or ""
+        post = _frontmatter.Post(
+            body,
+            name=profile.name,
+            description=profile.description or "",
+        )
+        composed_source = str(_frontmatter.dumps(post)) + "\n"
+
+    context_file = _write_context_file(profile.name, composed_source)
+    mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+    allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
+    safe_filename = flatten_path_separators(profile.name)
+    return write_kiro_agent_file(
+        profile,
+        context_file=context_file,
+        allowed_tools=allowed_tools,
+        safe_filename=safe_filename,
+    )
+
+
 def install_agent(
     source: str,
     provider: Optional[str] = None,
@@ -563,80 +751,11 @@ def install_agent(
         safe_filename = flatten_path_separators(profile.name)
 
         if provider == ProviderType.KIRO_CLI.value:
-            # F107 A8: v3 honors v2 JSON agent configs by backward compat.
-            # Reject only v2-ONLY fields on KAS profiles (toolsSettings, hooks),
-            # not the engine itself.
-            if profile.engine == KiroEngine.KAS and (
-                profile.toolsSettings is not None or profile.hooks is not None
-            ):
-                raise ValueError(
-                    "Kiro KAS profiles cannot set toolsSettings or hooks "
-                    "(v2-only fields; v3 uses permissions). Remove those fields "
-                    "or set engine: v2."
-                )
-
-            # F113 D2 tripwire: v2 tolerance of an extra permissions key is
-            # unverified — warn when a non-KAS profile declares one.
-            if profile.engine != KiroEngine.KAS and profile.permissions is not None:
-                logger.warning(
-                    "Profile '%s' declares permissions but engine is %s "
-                    "(v2 tolerance of this key is unverified).",
-                    profile.name,
-                    profile.engine,
-                )
-
-            # F113: KAS profiles require a permissions block for registry load.
-            # Default to the standard autonomous-worker rules when not declared;
-            # explicit permissions (including {}) pass through verbatim.
-            kiro_permissions: Optional[Dict[str, Any]] = profile.permissions
-            if profile.engine == KiroEngine.KAS and kiro_permissions is None:
-                kiro_permissions = {
-                    "rules": [
-                        {"capability": "shell", "effect": "allow"},
-                        {"capability": "web_fetch", "effect": "allow"},
-                        {
-                            "capability": "mcp",
-                            "match": ["builtin/*", "cao-mcp-server/*"],
-                            "effect": "allow",
-                        },
-                    ]
-                }
-
-            from cli_agent_orchestrator.constants import kiro_agents_dir
-
-            _kiro_dir = kiro_agents_dir()
-            _kiro_dir.mkdir(parents=True, exist_ok=True)
-            # Kiro natively supports skill:// resources with progressive loading
-            # (metadata at startup, full content on demand).
-            kiro_resources = [
-                f"file://{context_file.absolute()}",
-                f"skill://{SKILLS_DIR}/**/SKILL.md",
-            ]
-            raw_prompt = (
-                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
-            )
-            kiro_agent_config = KiroAgentConfig(
-                name=profile.name,
-                description=profile.description,
-                tools=profile.tools if profile.tools is not None else ["*"],
-                allowedTools=allowed_tools,
-                resources=kiro_resources,
-                prompt=raw_prompt,
-                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
-                # cancel long handoff RPCs client-side (see helper docstring).
-                # F118: inject ${VAR} identity env into every MCP entry so
-                # kiro-cli expands CAO_TERMINAL_ID et al from its pane env.
-                mcpServers=_inject_kiro_identity_env(_inject_kiro_mcp_timeout(profile.mcpServers)),
-                toolAliases=profile.toolAliases,
-                toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
-                model=profile.model,
-                permissions=kiro_permissions,
-            )
-            agent_file = _kiro_dir / f"{safe_filename}.json"
-            agent_file.write_text(
-                kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
+            agent_file = write_kiro_agent_file(
+                profile,
+                context_file=context_file,
+                allowed_tools=allowed_tools,
+                safe_filename=safe_filename,
             )
 
         elif provider == ProviderType.COPILOT_CLI.value:

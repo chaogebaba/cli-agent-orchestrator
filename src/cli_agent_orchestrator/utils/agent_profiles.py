@@ -892,3 +892,65 @@ def _find_alias_for_cell(position_name: str, provider: str) -> Optional[str]:
         if pos == position_name and meta.get("provider") == provider:
             return path.stem
     return None
+
+
+def compose_position_profile_for_spawn(
+    spawn_name: str, provider: str
+) -> "Optional[tuple[AgentProfile, str]]":
+    """Reconstruct the composed profile for a position-composed spawn name (F778 #635).
+
+    A position-composed assign synthesises the spawn name ``<provider>_<position>``
+    (D6/D7, ``_synthesise_position_profile_name``) purely in memory — no ``.md``
+    file exists for it, so ``load_agent_profile(spawn_name)`` raises
+    ``FileNotFoundError``. This recovers the composition inputs from the name:
+    strip the ``<provider>_`` prefix and, when the remainder is an existing
+    position file, compose that position with ``provider`` exactly as the
+    resolver seam would.
+
+    Returns ``(composed_profile, composed_source)`` when ``spawn_name`` is a
+    resolvable ``<provider>_<position>`` synthesis for THIS ``provider``; returns
+    ``None`` for any legacy/uninstalled name (no matching position), so the
+    caller keeps the genuine-legacy failure path. ``composed_source`` is the
+    UNRESOLVED composed markdown (``compose_agent_profile_source`` shape) so a
+    caller can write a context file byte-identical to the install path.
+    """
+    prefix = f"{provider}_"
+    if not spawn_name.startswith(prefix):
+        return None
+    position_name = spawn_name[len(prefix) :]
+    if not position_name or not _position_exists(position_name):
+        return None
+
+    from cli_agent_orchestrator.utils.profile_composition import (
+        compose_profile,
+        compose_source_body,
+    )
+
+    try:
+        # AgentProfile: env-resolved layers, D6 name = the synthesised spawn name.
+        layers = _resolve_composition_layers(position_name, provider, resolve_env=True)
+        composed = compose_profile(
+            spawn_name,
+            layers,
+            position_name=position_name,
+            provider=provider,
+        )
+        # Composed SOURCE (unresolved) for the context file, matching the shape
+        # compose_agent_profile_source produces for an alias stub.
+        src_layers = _resolve_composition_layers(position_name, provider, resolve_env=False)
+        composed_body = compose_source_body(src_layers)
+        out_meta = {
+            "name": spawn_name,
+            "description": composed.description or "",
+            "provider": provider,
+            "position": position_name,
+        }
+        post = frontmatter.Post(composed_body, **out_meta)
+        composed_source = str(frontmatter.dumps(post)) + "\n"
+    except ValueError:
+        # CompositionError subclasses ValueError — an unresolvable cell (bad
+        # overlay, provider not in the position allowlist) is not a spawn we can
+        # materialise; fall back to the caller's genuine-legacy failure path.
+        return None
+
+    return composed, composed_source
