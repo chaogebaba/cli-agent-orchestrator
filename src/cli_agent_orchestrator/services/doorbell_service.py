@@ -256,9 +256,42 @@ def ring_supervisor_doorbell(
                     _mark_socket_delivered(max_written_row_id)
                 except Exception:
                     pass
+                # F783 #640: a native ring that carried the callback BODY is the
+                # guaranteed-render agent-message delivery the user's decision
+                # counts as consumption. Recording it here mutes the doorbell /
+                # re-push / coalescer / hook duplicates for this id server-side.
+                # A bodyless generic ping is NOT a delivered body, so it does not
+                # consume — the seat still needs the drain to surface the text.
+                try:
+                    from cli_agent_orchestrator.services.mailbox_service import (
+                        consume_on_native_delivery,
+                    )
+
+                    consume_on_native_delivery(max_written_row_id)
+                except Exception:
+                    logger.debug(
+                        "f783 consume-on-native failed (row %s)", max_written_row_id, exc_info=True
+                    )
             return "rang"
         # decision is None or a refusal reason — fall through to fx168
         native_refusal = decision
+        # F783 #640 point 3: a native send that reported a refusal/failure leaves
+        # the id PENDING and records a typed, auditable failure so the fallback
+        # (doorbell -> re-push -> hook) is traceable. Only when a body was in
+        # flight — a disabled/bodyless attempt is not a missed body delivery.
+        if native_refusal is not None and message_body is not None:
+            try:
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    record_native_delivery_failure,
+                )
+
+                record_native_delivery_failure(max_written_row_id, str(native_refusal))
+            except Exception:
+                logger.debug(
+                    "f783 record-native-failure failed (row %s)",
+                    max_written_row_id,
+                    exc_info=True,
+                )
     else:
         native_refusal = None
 

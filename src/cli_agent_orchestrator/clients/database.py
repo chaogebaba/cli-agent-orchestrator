@@ -13275,13 +13275,18 @@ def hook_claim_ids(
         return []
     ids = [int(r) for r in candidate_ids]
     # ids already claimed by a DIFFERENT carrier (native/doorbell/replay) — the
-    # hook must not reprint these.
+    # hook must not reprint these. F783 #640: a non-hook emission that FAILED is
+    # NOT a claim that mutes the hook — a native send that missed hands the id
+    # BACK to the fallback (doorbell -> re-push -> hook), so a `failed` outcome
+    # must let the hook win. Only a carrier that actually carried the id (or is
+    # still carrying it: pending/succeeded/carrier_unavailable) excludes it.
     already = {
         int(row.message_id)
         for row in db.query(DeliveryEmissionModel.message_id)
         .filter(
             DeliveryEmissionModel.message_id.in_(ids),
             DeliveryEmissionModel.carrier != Carrier.HOOK.value,
+            DeliveryEmissionModel.outcome != EmissionOutcome.FAILED.value,
         )
         .all()
     }
