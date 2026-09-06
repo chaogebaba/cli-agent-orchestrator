@@ -256,42 +256,21 @@ def ring_supervisor_doorbell(
                     _mark_socket_delivered(max_written_row_id)
                 except Exception:
                     pass
-                # F783 #640: a native ring that carried the callback BODY is the
-                # guaranteed-render agent-message delivery the user's decision
-                # counts as consumption. Recording it here mutes the doorbell /
-                # re-push / coalescer / hook duplicates for this id server-side.
-                # A bodyless generic ping is NOT a delivered body, so it does not
-                # consume — the seat still needs the drain to surface the text.
-                try:
-                    from cli_agent_orchestrator.services.mailbox_service import (
-                        consume_on_native_delivery,
-                    )
-
-                    consume_on_native_delivery(max_written_row_id)
-                except Exception:
-                    logger.debug(
-                        "f783 consume-on-native failed (row %s)", max_written_row_id, exc_info=True
-                    )
+            # F783 #640: consumption is NOT recorded here. It attaches at the
+            # socket-WRITE success inside `_attempt_native_ring` (which fires for
+            # a body-carrying wake even when verify_wake later reports
+            # wake_unverified — a busy seat still rendered the body). Recording
+            # it on the verified "rang" return would miss every busy-seat
+            # delivery, which the live traces show is the common case.
             return "rang"
-        # decision is None or a refusal reason — fall through to fx168
+        # decision is None or a refusal reason — fall through to fx168.
+        # F783 #640 point 3: NATIVE FAILED for a body-carrying attempt is
+        # recorded INSIDE `_attempt_native_ring` at its socket-write-failure arm
+        # (the one place that knows write vs verify). A pre-write refusal
+        # (no metadata / no coordinates / resolve / version / socket_unpublished)
+        # is recorded there too via the same failure recorder when a body was in
+        # flight, so the fallback stays auditable without double-recording here.
         native_refusal = decision
-        # F783 #640 point 3: a native send that reported a refusal/failure leaves
-        # the id PENDING and records a typed, auditable failure so the fallback
-        # (doorbell -> re-push -> hook) is traceable. Only when a body was in
-        # flight — a disabled/bodyless attempt is not a missed body delivery.
-        if native_refusal is not None and message_body is not None:
-            try:
-                from cli_agent_orchestrator.services.mailbox_service import (
-                    record_native_delivery_failure,
-                )
-
-                record_native_delivery_failure(max_written_row_id, str(native_refusal))
-            except Exception:
-                logger.debug(
-                    "f783 record-native-failure failed (row %s)",
-                    max_written_row_id,
-                    exc_info=True,
-                )
     else:
         native_refusal = None
 
@@ -371,6 +350,27 @@ def _attempt_native_ring(
         write_to_socket,
     )
 
+    def _f783_note_native_failure(reason: str) -> None:
+        """F783 #640 point 3: record a typed NATIVE FAILED emission for a
+        body-carrying attempt that could not deliver, so the fallback
+        (doorbell -> re-push -> hook) is auditable. No-op for a bodyless ids-only
+        ping (not a missed body delivery)."""
+        if message_body is None:
+            return
+        try:
+            from cli_agent_orchestrator.services.mailbox_service import (
+                record_native_delivery_failure,
+            )
+
+            record_native_delivery_failure(max_written_row_id, reason)
+        except Exception:
+            logger.debug(
+                "f783 record-native-failure (%s) failed row %s",
+                reason,
+                max_written_row_id,
+                exc_info=True,
+            )
+
     # Get terminal's tmux coordinates
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
@@ -436,6 +436,7 @@ def _attempt_native_ring(
             record.version,
             max_written_row_id,
         )
+        _f783_note_native_failure("socket_unpublished")
         return "socket_unpublished"
 
     # F337: read auth token from per-session key file
@@ -454,7 +455,37 @@ def _attempt_native_ring(
             record.version,
             max_written_row_id,
         )
+        # F783 #640 point 3: a native BODY envelope that failed to write leaves
+        # the id pending and records a typed NATIVE FAILED emission so the
+        # fallback (doorbell -> re-push -> hook) is auditable.
+        _f783_note_native_failure(str(write_err))
         return write_err
+
+    # F783 #640: THE BODY ENVELOPE HAS BEEN WRITTEN TO THE SEAT SOCKET.
+    #
+    # This is the "bridge's successful body envelope write" the contract counts
+    # as consumption (user decision 2026-09-06): a native cross-session-message
+    # that carried the callback body is guaranteed to render in the seat's TUI
+    # — "as long as it showed up in the TUI screen it should be counted as a
+    # consumed message" — EVEN IF verify_wake below cannot confirm it (a busy /
+    # compacting seat does not move statusUpdatedAt, and wake_unverified is the
+    # common live outcome). So consumption attaches HERE, at write success, not
+    # at the verified "rang" return — otherwise every busy-seat delivery would
+    # be missed. A bodyless ids-only ping does NOT consume (the seat still needs
+    # the drain to surface the text).
+    if message_body is not None:
+        try:
+            from cli_agent_orchestrator.services.mailbox_service import (
+                consume_on_native_delivery,
+            )
+
+            consume_on_native_delivery(max_written_row_id)
+        except Exception:
+            logger.debug(
+                "f783 consume-on-native (write success) failed row %s",
+                max_written_row_id,
+                exc_info=True,
+            )
 
     # D8: verify wake
     woke = verify_wake(record, pre_status_updated_at)

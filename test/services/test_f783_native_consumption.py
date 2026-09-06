@@ -490,3 +490,130 @@ def test_ac3_http_failed_native_still_claimable_by_hook(http_client):
 
     won = _claim_hook_via_http(http_client, SEAT)
     assert won == [84]
+
+
+# ── r1 fixes: REAL-ENTRY through _attempt_native_ring (the production body carrier) ──
+#
+# Gate r1/B1 showed the earlier wiring never fired in production: in the live
+# CAO_DELIVERY_QUEUE=shadow config the seat has no content path, so the callback
+# body reaches the seat ONLY as a native cross-session envelope written by
+# `_attempt_native_ring` (build_wake_payload + write_to_socket). These tests
+# drive that REAL function with the cc_session_registry socket layer mocked, and
+# assert consumption attaches at socket-WRITE success (even when verify_wake is
+# unconfirmed — the common busy-seat case) and NATIVE FAILED at write failure.
+
+import contextlib
+
+import cli_agent_orchestrator.services.doorbell_service as _dbs
+
+
+class _FakeRecord:
+    pid = 4242
+    proc_start = 111
+    version = "1.0.0"
+    status_updated_at = "2026-01-01T00:00:00Z"
+
+    def __init__(self, socket_path: str = "/tmp/does-not-matter.sock") -> None:
+        self.messaging_socket_path = socket_path
+
+
+@contextlib.contextmanager
+def _native_socket(monkeypatch, *, write_err, verify=False, socket_path="/x.sock"):
+    """Mock the cc_session_registry seam used by _attempt_native_ring so the
+    real function runs end-to-end without a live Claude Code session.
+
+    write_err=None => socket write SUCCEEDS. verify => verify_wake result (the
+    body-write consumption must not depend on it)."""
+    import cli_agent_orchestrator.services.cc_session_registry as _reg
+
+    rec = _FakeRecord(socket_path)
+    monkeypatch.setattr(
+        _dbs, "get_terminal_metadata", lambda tid: {"tmux_session": "s", "tmux_window": "w"}
+    )
+    monkeypatch.setattr(_reg, "resolve_target", lambda *a, **k: _reg.ResolveResult(record=rec))
+    monkeypatch.setattr(_reg, "check_version_guard", lambda record: None)
+    monkeypatch.setattr(_reg, "read_peer_token", lambda *a, **k: None)
+    monkeypatch.setattr(_reg, "write_to_socket", lambda *a, **k: write_err)
+    monkeypatch.setattr(_reg, "verify_wake", lambda *a, **k: verify)
+    yield
+
+
+def test_r1_real_native_write_success_consumes_even_when_unverified(db_env, monkeypatch):
+    """G7-shaped: the body envelope is WRITTEN to the seat socket but verify_wake
+    is False (busy seat under the spinner). Per the user's decision this still
+    counts as consumed. Driving the real _attempt_native_ring must produce
+    native_consumed + a NATIVE SUCCEEDED emission, and the hook wins nothing."""
+    with db_env() as db:
+        _add_row(db, 200)
+        db.commit()
+
+    with _native_socket(monkeypatch, write_err=None, verify=False):
+        decision = _dbs._attempt_native_ring(SEAT, 200, message_body="F783_BODY_200")
+
+    # write succeeded but verify failed → the function reports wake_unverified …
+    assert decision == "wake_unverified"
+    # … yet the row is CONSUMED because the body was written to the TUI socket.
+    assert _status(db_env, 200) == MessageStatus.DELIVERED.value
+    assert _emissions(db_env, 200) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
+    assert _cursor(db_env) == 200
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[200]) == []
+        db.commit()
+
+
+def test_r1_real_native_write_success_verified_also_consumes(db_env, monkeypatch):
+    with db_env() as db:
+        _add_row(db, 201)
+        db.commit()
+    with _native_socket(monkeypatch, write_err=None, verify=True):
+        decision = _dbs._attempt_native_ring(SEAT, 201, message_body="F783_BODY_201")
+    assert decision == "rang"
+    assert _status(db_env, 201) == MessageStatus.DELIVERED.value
+    assert _emissions(db_env, 201) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
+
+
+def test_r1_real_native_write_failure_keeps_pending_and_records_failed(db_env, monkeypatch):
+    """Refused socket (write error): row stays PENDING, a typed NATIVE FAILED
+    emission is recorded, and the hook still WINS the id (fallback owns it)."""
+    with db_env() as db:
+        _add_row(db, 202)
+        db.commit()
+    with _native_socket(monkeypatch, write_err="socket_econnrefused"):
+        decision = _dbs._attempt_native_ring(SEAT, 202, message_body="F783_BODY_202")
+    assert decision == "socket_econnrefused"
+    assert _status(db_env, 202) == MessageStatus.PENDING.value
+    assert _emissions(db_env, 202) == {Carrier.NATIVE.value: EmissionOutcome.FAILED.value}
+    assert _cursor(db_env) == 0
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[202]) == [202]
+        db.commit()
+
+
+def test_r1_real_native_socket_unpublished_records_failed(db_env, monkeypatch):
+    """No published socket for a body-carrying attempt → NATIVE FAILED + pending."""
+    with db_env() as db:
+        _add_row(db, 203)
+        db.commit()
+    with _native_socket(monkeypatch, write_err=None, socket_path=""):
+        decision = _dbs._attempt_native_ring(SEAT, 203, message_body="F783_BODY_203")
+    assert decision == "socket_unpublished"
+    assert _status(db_env, 203) == MessageStatus.PENDING.value
+    assert _emissions(db_env, 203) == {Carrier.NATIVE.value: EmissionOutcome.FAILED.value}
+
+
+def test_r1_bodyless_ids_only_ping_does_not_consume(db_env, monkeypatch):
+    """An ids-only wake (message_body=None) is NOT a body delivery: it must
+    neither consume nor record any NATIVE emission — the seat still needs the
+    drain to surface the text (this is what preserves #613)."""
+    with db_env() as db:
+        _add_row(db, 204)
+        db.commit()
+    with _native_socket(monkeypatch, write_err=None, verify=True):
+        decision = _dbs._attempt_native_ring(SEAT, 204, message_body=None)
+    assert decision == "rang"
+    assert _status(db_env, 204) == MessageStatus.PENDING.value
+    assert _emissions(db_env, 204) == {}
+    # the hook still owns a bodyless-wake id
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[204]) == [204]
+        db.commit()

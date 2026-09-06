@@ -566,49 +566,18 @@ def attempt_rung1(
                 logger.debug(
                     "f547 mark_socket_delivered failed for row %s", inbox_row_id, exc_info=True
                 )
-            # F783 #640: a rung-1 native ring that carried the body is the
-            # guaranteed-render delivery the user's decision counts as
-            # consumption — record it so the doorbell / re-push / coalescer /
-            # hook duplicates stay silent for this id and this row stops being
-            # re-rung. Idempotent with the ring_supervisor_doorbell call site.
-            if message_body is not None:
-                try:
-                    from cli_agent_orchestrator.services.mailbox_service import (
-                        consume_on_native_delivery,
-                    )
-
-                    consume_on_native_delivery(inbox_row_id)
-                except Exception:
-                    logger.debug(
-                        "f783 consume-on-native (rung1) failed for row %s",
-                        inbox_row_id,
-                        exc_info=True,
-                    )
+            # F783 #640: native consumption + typed NATIVE FAILED are recorded
+            # INSIDE `_attempt_native_ring` at its socket-write success / failure
+            # arms (the single authority that distinguishes write from verify),
+            # so this rung records neither here — doing so would double-record
+            # and would miss the wake_unverified case (body written, verify
+            # unconfirmed) that the write-success attach point already consumes.
             return LadderResult(
                 delivered=True,
                 phase="transport_attempt",
                 decision="proceed",
                 reason=None,
             )
-        # F783 #640 point 3: a rung-1 native attempt that carried a body but
-        # failed leaves the id pending and records a typed, auditable failure so
-        # the fallback path is traceable. `result` None means resolution could
-        # not proceed (also a fallback); a string is the refusal reason.
-        if message_body is not None:
-            try:
-                from cli_agent_orchestrator.services.mailbox_service import (
-                    record_native_delivery_failure,
-                )
-
-                record_native_delivery_failure(
-                    inbox_row_id, str(result) if result else "wake_unverified"
-                )
-            except Exception:
-                logger.debug(
-                    "f783 record-native-failure (rung1) failed for row %s",
-                    inbox_row_id,
-                    exc_info=True,
-                )
         return LadderResult(
             delivered=False,
             phase="transport_attempt",
