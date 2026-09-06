@@ -104,19 +104,78 @@ def _load_provider_defaults() -> Dict[str, Any]:
         data: Dict[str, Any] = tomllib.loads(raw.decode("utf-8"))
     except Exception:
         data = {}
+    # F786 D5 — a legacy (RETIRED_PROFILES) key under any
+    # ``[<provider>.profiles.<key>]`` is an ERROR at load, not silently ignored:
+    # a silently ignored effort override is the F777 B1 class. Model/effort keys
+    # are position-keyed now; the refusal names the position key to use instead.
+    _reject_legacy_profile_keys(data)
     with _provider_defaults_lock:
         _provider_defaults_cache = (key, data)
     return data
 
 
+# F786 D5 — the load-time refusal code for a providers.toml profile stanza keyed
+# on a RETIRED legacy name.
+E_LEGACY_PROFILE_KEY = "E-LEGACY-PROFILE-KEY"
+
+
+class LegacyProfileKeyError(ValueError):
+    """A providers.toml ``[<provider>.profiles.<legacy>]`` stanza names a retired profile (D5)."""
+
+
+def _reject_legacy_profile_keys(data: Dict[str, Any]) -> None:
+    """Raise ``LegacyProfileKeyError`` for any RETIRED_PROFILES profiles key (D5).
+
+    Model/effort overrides are position-keyed after F786. A stanza still keyed on
+    a retired legacy name (``[codex.profiles.codex_empirical_reviewer]``) would
+    silently never apply once the resolver looks up by position — the F777 B1
+    silent-override class — so it fails closed at load, naming the position key
+    to use instead. Non-legacy keys (positions, and profiles like
+    ``claude_blueprint_maker`` that are NOT retired) are untouched.
+    """
+    from cli_agent_orchestrator.utils.routing_guard import RETIRED_PROFILES
+
+    if not isinstance(data, dict):
+        return
+    for provider, section in data.items():
+        if not isinstance(section, dict):
+            continue
+        profiles = section.get("profiles")
+        if not isinstance(profiles, dict):
+            continue
+        for legacy_key in profiles:
+            if legacy_key in RETIRED_PROFILES:
+                position = RETIRED_PROFILES[legacy_key]
+                fix = (
+                    f"[{provider}.profiles.{position}]"
+                    if position is not None
+                    else "the position key that lane now fills"
+                )
+                raise LegacyProfileKeyError(
+                    f"{E_LEGACY_PROFILE_KEY}: providers.toml stanza "
+                    f"[{provider}.profiles.{legacy_key}] names retired profile "
+                    f"'{legacy_key}'; model/effort keys are position-keyed now — "
+                    f"use {fix} instead."
+                )
+
+
 def get_provider_profile_defaults(
-    provider_defaults: Dict[str, Any], profile_name: Optional[str]
+    provider_defaults: Dict[str, Any], profile_key: Optional[str]
 ) -> Dict[str, Any]:
-    """Return one nested providers.toml profile layer, or an empty mapping."""
+    """Return one nested providers.toml ``[<provider>.profiles.<key>]`` layer.
+
+    F786 D5/D6: ``profile_key`` is the POSITION for a composed spawn (the
+    resolver-set ``AgentProfile.position``, e.g. ``empirical_reviewer``), so
+    model/effort overrides are position-keyed; for a legacy passthrough profile
+    (``position`` is None) callers pass the profile name and today's lookup is
+    preserved. Empty when the key is unset or names no stanza. A stanza keyed on
+    a RETIRED legacy name never reaches here — it fails closed at load
+    (``E-LEGACY-PROFILE-KEY``), rather than silently returning ``{}``.
+    """
     profiles = provider_defaults.get("profiles")
-    if not profile_name or not isinstance(profiles, dict):
+    if not profile_key or not isinstance(profiles, dict):
         return {}
-    defaults = profiles.get(profile_name)
+    defaults = profiles.get(profile_key)
     return dict(defaults) if isinstance(defaults, dict) else {}
 
 

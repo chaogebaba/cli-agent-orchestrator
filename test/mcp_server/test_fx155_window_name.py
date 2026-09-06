@@ -10,7 +10,6 @@ from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.mcp_server.server import _assign_impl, _handoff_impl
 from cli_agent_orchestrator.utils.terminal import generate_window_name
 
-
 _SERVER = "cli_agent_orchestrator.mcp_server.server"
 
 
@@ -29,10 +28,10 @@ class TestAssignWindowName:
     def test_assign_returns_window_name(self, mock_create, _fork_base, _nudge, monkeypatch):
         """assign payload includes window_name matching generate_window_name(profile, tid)."""
         monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
-        result = _assign_impl("kiro_dev", "do something")
+        result = _assign_impl("developer", "do something")
         assert result["success"] is True
-        assert result["window_name"] == generate_window_name("kiro_dev", "a1b2c3d4")
-        assert result["window_name"] == "kiro_dev-a1b2c3d4"
+        assert result["window_name"] == generate_window_name("developer", "a1b2c3d4")
+        assert result["window_name"] == "developer-a1b2c3d4"
 
     @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
     @patch(f"{_SERVER}._configured_default_fork_base", return_value=None)
@@ -40,13 +39,15 @@ class TestAssignWindowName:
     def test_assign_message_names_window(self, mock_create, _fork_base, _nudge, monkeypatch):
         """assign message string contains the window name."""
         monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
-        result = _assign_impl("kiro_dev", "do something")
-        assert "kiro_dev-a1b2c3d4" in result["message"]
+        result = _assign_impl("developer", "do something")
+        assert "developer-a1b2c3d4" in result["message"]
 
     @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
     @patch(f"{_SERVER}._configured_default_fork_base", return_value=None)
     @patch(f"{_SERVER}._create_terminal", return_value=("a1b2c3d4", "kiro_cli"))
-    def test_assign_window_name_equals_persisted(self, mock_create, _fork_base, _nudge, monkeypatch):
+    def test_assign_window_name_equals_persisted(
+        self, mock_create, _fork_base, _nudge, monkeypatch
+    ):
         """The returned window_name is byte-equal to what create_terminal would persist.
 
         Proves the local computation agrees with what create_terminal wrote
@@ -54,9 +55,9 @@ class TestAssignWindowName:
         generator formula that create_terminal itself uses.
         """
         monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
-        result = _assign_impl("kiro_dev", "do something")
+        result = _assign_impl("developer", "do something")
         # The persisted value is generate_window_name(profile, tid) — same formula
-        expected_persisted = f"kiro_dev-a1b2c3d4"
+        expected_persisted = f"developer-a1b2c3d4"
         assert result["window_name"] == expected_persisted
 
 

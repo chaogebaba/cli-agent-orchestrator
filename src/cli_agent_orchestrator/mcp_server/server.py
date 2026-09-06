@@ -2531,6 +2531,28 @@ def _assign_impl(
                 _d9_position = _res.fallback_position
                 _d9_cell = _res.fallback_cell
 
+        # F786 (#643) D8 — materialise the composed profile for whatever
+        # effective name resolution produced (position spawn OR D11 general
+        # fallback) BEFORE the spawn loads it, so a position-composed name is
+        # never profile-less. The writer is a no-op for a legacy passthrough
+        # name (nothing to compose). Best-effort: a write failure is not fatal
+        # here because terminal_service fails closed with E-PROFILE-MISSING if
+        # the profile still cannot load (D8), which is the real guarantee.
+        if _resolved_provider:
+            try:
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    write_composed_profile_for_spawn,
+                )
+
+                write_composed_profile_for_spawn(agent_profile, _resolved_provider)
+            except Exception as exc:
+                logger.warning(
+                    "F786 D8: composed-profile write for '%s' (%s) failed: %s",
+                    agent_profile,
+                    _resolved_provider,
+                    exc,
+                )
+
         fork_context = None
         refresh_base_name = None
         assignment_preamble = None

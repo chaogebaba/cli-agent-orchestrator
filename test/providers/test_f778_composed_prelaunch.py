@@ -2,7 +2,7 @@
 
 ``_assert_kiro_identity_guard`` used to hard-fail when
 ``~/.kiro/agents/<spawn>.json`` was missing. For a POSITION-COMPOSED spawn name
-(``kiro_cli_dev`` from ``assign(agent_profile="dev", provider="kiro_cli")``) the
+(``dev-kiro_cli`` from ``assign(agent_profile="dev", provider="kiro_cli")``) the
 JSON was never written because the composed profile has no installed source
 file, so every dev+kiro_cli assign died at prelaunch. The guard now materialises
 the JSON on demand from the composition; a genuine uninstalled-legacy name still
@@ -73,18 +73,18 @@ def composed_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, P
 
 class TestComposedMaterialisesOnDemand:
     def test_composed_missing_json_is_written_and_guard_passes(self, composed_env):
-        """kiro_cli_dev: missing JSON -> materialised from the dev position -> passes."""
+        """dev-kiro_cli: missing JSON -> materialised from the dev position -> passes."""
         kiro_dir = composed_env["kiro_dir"]
-        assert not (kiro_dir / "kiro_cli_dev.json").exists()
+        assert not (kiro_dir / "dev-kiro_cli.json").exists()
 
-        provider = KiroCliProvider("ab12cd34", "sess", "win-0", "kiro_cli_dev")
+        provider = KiroCliProvider("ab12cd34", "sess", "win-0", "dev-kiro_cli")
         # Should NOT raise — the guard materialises the composed JSON.
         provider._assert_kiro_identity_guard()
 
-        written = kiro_dir / "kiro_cli_dev.json"
+        written = kiro_dir / "dev-kiro_cli.json"
         assert written.exists()
         data = json.loads(written.read_text(encoding="utf-8"))
-        assert data["name"] == "kiro_cli_dev"
+        assert data["name"] == "dev-kiro_cli"
         # The dev position's cao-mcp-server survives composition into the JSON.
         assert "cao-mcp-server" in data["mcpServers"]
 
@@ -144,8 +144,8 @@ class TestExistingJsonUntouched:
         import time
 
         kiro_dir = composed_env["kiro_dir"]
-        existing = kiro_dir / "kiro_cli_dev.json"
-        original = json.dumps({"name": "kiro_cli_dev", "hand": "written"}, indent=2)
+        existing = kiro_dir / "dev-kiro_cli.json"
+        original = json.dumps({"name": "dev-kiro_cli", "hand": "written"}, indent=2)
         existing.write_text(original, encoding="utf-8")
         # Backdate mtime so an accidental rewrite is detectable.
         old = time.time() - 1000
@@ -153,7 +153,7 @@ class TestExistingJsonUntouched:
         mtime_before = existing.stat().st_mtime_ns
         bytes_before = existing.read_bytes()
 
-        provider = KiroCliProvider("ab12cd34", "sess", "win-0", "kiro_cli_dev")
+        provider = KiroCliProvider("ab12cd34", "sess", "win-0", "dev-kiro_cli")
         provider._assert_kiro_identity_guard()
 
         assert existing.read_bytes() == bytes_before

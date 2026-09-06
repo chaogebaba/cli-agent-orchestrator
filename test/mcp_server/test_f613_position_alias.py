@@ -1,20 +1,13 @@
-"""F613 #469 — fork hotfix: general-fallback alias resolution + provider threading.
+"""F613 #469 + F786 D11 — general-fallback name derivation + provider threading.
 
-Two bugs closed:
-
-  1. ``utils/routing.py`` non-gate general fallback returned the RAW
-     ``f"{provider}_general"`` (``cline_cli_general``) instead of the INSTALLED
-     alias stub stem (``cline_general``). The raw name is not an installed
-     profile; the server fails to load it and silently re-derives to claude_code.
-     Fix: resolve the stub via ``_find_alias_for_cell(general, provider)`` and
-     raise ``RoutingError(E-ALIAS-MISSING)`` when no stub exists.
-
-  2. ``mcp_server/server.py`` ``_assign_impl`` computed ``_resolved_provider``
-     but did not pass it to ``_create_terminal``, which re-derived the provider
-     via ``resolve_provider(..., fallback=supervisor provider)`` → claude_code
-     when the (position/alias) name failed to load. Fix: thread
-     ``provider=_resolved_provider`` through; when given it wins, when absent the
-     behaviour is byte-identical.
+F613's original fix resolved the non-gate general fallback through a flat-store
+alias-stub scan (``_find_alias_for_cell``) and raised ``E-ALIAS-MISSING`` when no
+stub existed. F786 D11 REPLACES that scan: the fallback now DERIVES the composed
+name ``general-<provider>`` purely, and the D8 writer materialises it — there is
+no stub scan and no E-ALIAS-MISSING path. The provider's ``general`` PASS row
+(checked first) is what gates the provider. The Bug-2 provider-threading
+behaviour (``_assign_impl`` passes ``_resolved_provider`` to ``_create_terminal``)
+is unchanged and still covered below.
 """
 
 import textwrap
@@ -23,77 +16,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# --------------------------------------------------------------------------
-# Bug 1 — general alias resolution per provider
-# --------------------------------------------------------------------------
-
-# provider id -> installed alias stub stem (the F613 mapping the bug got wrong)
-_PROVIDER_TO_ALIAS = {
-    "cline_cli": "cline_general",
-    "kiro_cli": "kiro_general",
-    "grok_cli": "grok_general",
-    "codex": "codex_general",
-    "claude_code": "claude_general",
-}
-
-
-def _seed_general_stub(store: Path, stem: str, provider: str) -> None:
-    store.mkdir(parents=True, exist_ok=True)
-    (store / f"{stem}.md").write_text(
-        textwrap.dedent(f"""\
-            ---
-            extends: general
-            name: {stem}
-            provider: {provider}
-            ---
-            # {stem}
-            """),
-        encoding="utf-8",
-    )
-
-
-@pytest.mark.parametrize(("provider", "expected_alias"), sorted(_PROVIDER_TO_ALIAS.items()))
-def test_general_fallback_resolves_installed_alias_stub(
-    tmp_path, monkeypatch, provider, expected_alias
-):
-    """The non-gate general fallback binds the INSTALLED alias stub stem
-    (``<short>_general``), never the raw ``<provider>_general`` f-string."""
-    from cli_agent_orchestrator import constants
-    from cli_agent_orchestrator.utils import agent_profiles
-
-    store = tmp_path / "agent-store"
-    _seed_general_stub(store, expected_alias, provider)
-    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
-    # _find_alias_for_cell reads local_agent_store_dir() (CAO_HOME_DIR/agent-store).
-    assert constants.local_agent_store_dir() == store
-    alias = agent_profiles._find_alias_for_cell("general", provider)
-    assert alias == expected_alias
-    # For cline_cli / kiro_cli / grok_cli the raw f-string DIVERGES from the stub
-    # stem — the exact bug. Assert the resolver did NOT return the raw name.
-    if provider not in ("codex",):  # codex raw == stem coincidentally
-        assert alias != f"{provider}_general"
-
-
-def test_general_fallback_unknown_provider_is_none(tmp_path, monkeypatch):
-    """A provider with no installed general stub resolves to None (the caller
-    raises E-ALIAS-MISSING)."""
-    from cli_agent_orchestrator.utils import agent_profiles
-
-    (tmp_path / "agent-store").mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
-    assert agent_profiles._find_alias_for_cell("general", "nonesuch_cli") is None
-
 
 # --------------------------------------------------------------------------
-# Bug 1 — resolve_routing_binding end to end (fallback binds the stub; unknown
-# provider raises E-ALIAS-MISSING). Reuses the D9 harness helpers.
+# F786 D11 — the general fallback derives general-<provider> (no stub scan)
 # --------------------------------------------------------------------------
-
-
-def _routing_fallback_env(tmp_path, monkeypatch, provider, alias_stem, *, seed_stub):
+def _routing_fallback_env(tmp_path, monkeypatch, provider):
     """Build a positions store with a non-gate 'dev' cell that is UNCERTIFIED so
-    resolve_routing_binding takes the general-fallback path; optionally seed the
-    (general, provider) alias stub in the flat store."""
+    resolve_routing_binding takes the general-fallback path (D11 derivation)."""
     from test.mcp_server.test_f497_routing_d9 import _CLAUSES_TOML, _GENERAL_BODY, _certify, _write
 
     positions = tmp_path / "agent-store" / "positions"
@@ -110,49 +39,38 @@ def _routing_fallback_env(tmp_path, monkeypatch, provider, alias_stem, *, seed_s
     )
     _write(overlays / f"{provider}.md", f"## Provider notes ({provider})\nq.\n")
     _certify(positions, "general", provider, "PASS")
-    if seed_stub:
-        _seed_general_stub(tmp_path / "agent-store", alias_stem, provider)
     monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
     return positions
 
 
-def test_routing_binding_fallback_binds_alias_stub_for_cline(tmp_path, monkeypatch):
-    """cline_cli: the general fallback binds ``cline_general`` (stub), NOT
-    ``cline_cli_general`` (the pre-F613 defect)."""
+@pytest.mark.parametrize("provider", ["cline_cli", "kiro_cli", "grok_cli", "codex"])
+def test_general_fallback_derives_general_hyphen_provider(tmp_path, monkeypatch, provider):
+    """D11: the non-gate general fallback binds the DERIVED composed name
+    ``general-<provider>`` — no installed alias stub, no <provider>_general."""
     from cli_agent_orchestrator.utils import routing
 
-    positions = _routing_fallback_env(
-        tmp_path, monkeypatch, "cline_cli", "cline_general", seed_stub=True
-    )
+    positions = _routing_fallback_env(tmp_path, monkeypatch, provider)
     table = routing.bindings_to_table(
-        [routing.Binding(position="dev", provider="cline_cli", kind="cao")]
+        [routing.Binding(position="dev", provider=provider, kind="cao")]
     )
-    res = routing.resolve_routing_binding("dev", "cline_cli", table=table, positions_dir=positions)
-    assert res.spawn_profile == "cline_general"
-    assert res.fallback_profile == "cline_general"
-    assert res.spawn_profile != "cline_cli_general"
+    res = routing.resolve_routing_binding("dev", provider, table=table, positions_dir=positions)
+    assert res.spawn_profile == f"general-{provider}"
+    assert res.fallback_profile == f"general-{provider}"
+    assert res.spawn_profile != f"{provider}_general"
 
 
-def test_routing_binding_fallback_missing_stub_raises_e_alias_missing(tmp_path, monkeypatch):
-    """No installed general stub for the provider → RoutingError E-ALIAS-MISSING
-    (never hand the unresolved f-string to the server)."""
-    from cli_agent_orchestrator.utils import routing
+def test_find_alias_for_cell_and_alias_missing_are_deleted():
+    """D11 removes the stub-scan helper; E-ALIAS-MISSING is never raised now."""
+    from cli_agent_orchestrator.utils import agent_profiles, routing
 
-    positions = _routing_fallback_env(
-        tmp_path, monkeypatch, "cline_cli", "cline_general", seed_stub=False
-    )
-    table = routing.bindings_to_table(
-        [routing.Binding(position="dev", provider="cline_cli", kind="cao")]
-    )
-    with pytest.raises(routing.RoutingError) as ei:
-        routing.resolve_routing_binding("dev", "cline_cli", table=table, positions_dir=positions)
-    assert ei.value.code == routing.E_ALIAS_MISSING
-    assert ei.value.code == "E-ALIAS-MISSING"
+    assert not hasattr(agent_profiles, "_find_alias_for_cell")
+    # The constant is kept (stable code) but the fallback path no longer raises it.
+    assert routing.E_ALIAS_MISSING == "E-ALIAS-MISSING"
 
 
 # --------------------------------------------------------------------------
 # Bug 2 — _assign_impl threads _resolved_provider into _create_terminal, and the
-# HTTP terminal-create call carries provider=cline_cli.
+# HTTP terminal-create call carries provider=cline_cli. (Unchanged by F786.)
 # --------------------------------------------------------------------------
 
 
@@ -182,7 +100,6 @@ def test_assign_impl_threads_resolved_provider_to_create_terminal(tmp_path, monk
     _write(overlays / "cline_cli.md", "## Provider notes (cline_cli)\nq.\n")
     _certify(positions, "general", "cline_cli", "PASS")
     _certify(positions, "secretary", "cline_cli", "PASS")
-    _seed_general_stub(home / "agent-store", "cline_general", "cline_cli")
 
     rt = tmp_path / "routing.toml"
     _write(
@@ -215,6 +132,8 @@ def test_assign_impl_threads_resolved_provider_to_create_terminal(tmp_path, monk
     assert result["success"] is True, result
     # The resolved provider (cline_cli) was threaded to _create_terminal.
     assert captured["provider"] == "cline_cli"
+    # D2b: the effective spawn name is the composed <position>-<provider>.
+    assert captured["agent_profile"] == "secretary-cline_cli"
 
 
 def test_create_terminal_supplied_provider_wins_and_reaches_http(monkeypatch):

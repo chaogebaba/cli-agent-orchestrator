@@ -28,6 +28,7 @@ _TERMINAL_KEYS: frozenset[str] = frozenset(
         "id",
         "profile",
         "provider",
+        "position",
         "window_index",
         "window_name",
         "parent_id",
@@ -122,6 +123,7 @@ class TerminalState:
     id: str
     profile: str | None = None
     provider: str | None = None
+    position: str | None = None
     window_index: int | None = None
     window_name: str | None = None
     parent_id: str | None = None
@@ -151,6 +153,7 @@ class TerminalState:
             id=_as_str(raw.get("id")),
             profile=_as_opt_str(raw.get("profile")),
             provider=_as_opt_str(raw.get("provider")),
+            position=_as_opt_str(raw.get("position")),
             window_index=_as_window_index(raw.get("window_index")),
             window_name=_as_opt_str(raw.get("window_name")),
             parent_id=_as_opt_str(raw.get("parent_id")),

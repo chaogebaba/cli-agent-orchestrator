@@ -159,8 +159,42 @@ def _preflight(row, session_name):
         return _result(row["name"], "artifact_missing", unscoped=row.get("session_name") is None)
     if provider_session_owner(row["session_uuid"])["state"] != "gone":
         return _result(row["name"], "skipped_live_owner", unscoped=row.get("session_name") is None)
+    # F786 (#643) D9 — a grandfathered row whose agent_profile is a RETIRED
+    # legacy name (or which carries a D6 position column) resumes under the
+    # effective ``<position>-<provider>`` name, NOT the stored legacy bytes
+    # (no row rewrite). Compute it, refuse an unmapped legacy name, and
+    # materialise the composed profile (D8) so the effective name loads. A bare
+    # position / already-composed / plain-legacy name that is not in
+    # RETIRED_PROFILES keeps the pre-F786 path unchanged.
+    from cli_agent_orchestrator.utils.agent_profiles import (
+        AssignmentResolutionError,
+        resolve_resume_effective_name,
+        write_composed_profile_for_spawn,
+    )
+    from cli_agent_orchestrator.utils.routing_guard import RETIRED_PROFILES
+
+    effective_profile = row["agent_profile"]
+    if row.get("position") or row["agent_profile"] in RETIRED_PROFILES:
+        try:
+            effective_profile, _pos, _src = resolve_resume_effective_name(
+                row["agent_profile"], row["provider"], row.get("position")
+            )
+        except AssignmentResolutionError:
+            # Unmapped retired name (e.g. grok_reviewer) → no lane is guessed.
+            return _result(
+                row["name"],
+                "profile_unresolvable",
+                error_code="legacy_profile_retired",
+                unscoped=row.get("session_name") is None,
+            )
+        if effective_profile != row["agent_profile"]:
+            try:
+                write_composed_profile_for_spawn(effective_profile, row["provider"])
+            except Exception:
+                pass
+    row["_f786_effective_profile"] = effective_profile
     try:
-        load_agent_profile(row["agent_profile"])
+        load_agent_profile(effective_profile)
     except Exception:
         return _result(
             row["name"],
@@ -168,7 +202,7 @@ def _preflight(row, session_name):
             error_code="profile_load_failed",
             unscoped=row.get("session_name") is None,
         )
-    provider = resolve_provider(row["agent_profile"], row["provider"])
+    provider = resolve_provider(effective_profile, row["provider"])
     if provider != row["provider"]:
         return _result(
             row["name"],
@@ -256,7 +290,7 @@ async def _recover_row(row, session_name):
         try:
             terminal = await create_terminal(
                 provider=row["provider"],
-                agent_profile=row["agent_profile"],
+                agent_profile=row.get("_f786_effective_profile", row["agent_profile"]),
                 session_name=session_name,
                 new_session=False,
                 working_directory=row["cwd"],

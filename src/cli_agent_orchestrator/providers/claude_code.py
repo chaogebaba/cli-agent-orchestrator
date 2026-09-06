@@ -884,7 +884,8 @@ class ClaudeCodeProvider(BaseProvider):
                 if isinstance(declared_name, str) and declared_name
                 else self._agent_profile
             )
-            profile_defaults = get_provider_profile_defaults(defaults, profile_name)
+            profile_key = getattr(profile, "position", None) or profile_name
+            profile_defaults = get_provider_profile_defaults(defaults, profile_key)
             model = resolve_provider_string_option(
                 profile_defaults, defaults, profile, "model", "model"
             )

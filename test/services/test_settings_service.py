@@ -148,7 +148,7 @@ class TestGetProviderDefaults:
             "[grok_cli]\n"
             'model = "grok-provider-model"\n'
             "\n"
-            "[grok_cli.profiles.grok_dev]\n"
+            "[grok_cli.profiles.dev]\n"
             'model = "grok-profile-model"\n'
             'reasoning_effort = "high"\n',
             encoding="utf-8",
@@ -156,7 +156,7 @@ class TestGetProviderDefaults:
         assert get_provider_defaults("grok_cli") == {
             "model": "grok-provider-model",
             "profiles": {
-                "grok_dev": {
+                "dev": {
                     "model": "grok-profile-model",
                     "reasoning_effort": "high",
                 }
