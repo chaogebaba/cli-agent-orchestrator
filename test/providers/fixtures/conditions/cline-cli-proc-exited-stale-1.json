@@ -1,0 +1,11 @@
+{
+  "provider": "cline_cli",
+  "condition": "not_PROC_EXITED",
+  "subtype": "stale_command_exit_code_reset_by_shell_prompt",
+  "reset_hint_raw": "",
+  "source_path": "synthetic (F775 #632); carries only the anchors named in providers/condition.py",
+  "source_line_range": "n/a",
+  "captured_at": "2026-09-06 (F775 #632 regression fixture)",
+  "sha256": "b7bdebcef7d7c0588090f33477a0c01951697b7f2ebfccd72a4ddee4892e143e",
+  "note": "An OLD '[Command exited with code 1]' (from a bare rg with zero matches) followed by a shell prompt and a LATER successful turn. The exit line is stale: the shell prompt is a session/turn boundary newer than it, so classify_condition must NOT raise PROC_EXITED. Under the pre-F775 full-pane scan the stale line re-affirmed 'completed [PROC_EXITED]' on a live worker."
+}

@@ -399,3 +399,109 @@ def test_event_render_shape() -> None:
     assert "host=grok-box-006" in line
     assert "credential_plane=box" in line
     assert "confidence=high" in line
+
+
+# ── F782 (#639): codex activity-marker BUSY class (second live-work marker) ─────
+# A codex tool call that draws no "• Working (… esc to interrupt)" footer — the
+# wait-for-agents loop, any "• <Verb>ing …" line — must classify BUSY, not
+# idle/completed. Fixture is the byte-exact footer-less capture of reviewer
+# bcce0ff5 under fixtures/busy_marker/codex/.
+_BUSY_MARKER = _FIX / "busy_marker" / "codex"
+
+
+def test_f782_wait_agents_loop_classifies_busy() -> None:
+    text = (_BUSY_MARKER / "busy-3-wait-agents.txt").read_text(encoding="utf-8")
+    cond = classify_condition(text, "codex")
+    assert cond is not None
+    assert cond.kind is ConditionKind.BUSY
+    assert cond.subtype == "activity_marker"
+    # Evidence is the activity bullet itself, newer than the last real prompt.
+    assert "•" in cond.evidence
+
+
+def test_f782_true_idle_pane_is_not_busy() -> None:
+    """Prompt last, no activity after it → the classifier surfaces no BUSY (and
+    no other condition) for a genuinely idle codex pane."""
+    idle = (
+        "› fix the failing test\n\n"
+        "• Done — applied the patch and reran the focused suite.\n"
+        "  └ 12 passed\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  ~/proj · main · gpt-5.6 high · Context 70% left"
+    )
+    cond = classify_condition(idle, "codex")
+    assert cond is None
+
+
+def test_f782_working_footer_still_classifies_busy() -> None:
+    """Regression guard: the ORIGINAL footer path is unchanged and still wins as
+    the working_marker subtype (not the new activity_marker)."""
+    text = (_BUSY_MARKER / "busy-2.txt").read_text(encoding="utf-8")
+    cond = classify_condition(text, "codex")
+    assert cond is not None
+    assert cond.kind is ConditionKind.BUSY
+    assert cond.subtype == "working_marker"
+
+
+def test_f782_prior_turn_activity_above_newer_prompt_is_not_busy() -> None:
+    """Activity bullets above a newer submitted prompt are scrollback, not live
+    work — the classifier must not raise BUSY on them."""
+    pane = (
+        "• Waiting for agents\n"
+        "• Finished waiting\n"
+        "  └ No agents completed yet\n\n"
+        "› a brand new instruction\n\n"
+        "› Ask Codex to do anything\n\n  ~/p · main"
+    )
+    cond = classify_condition(pane, "codex")
+    assert cond is None
+
+
+# ── F775 (#632): PROC_EXITED text evidence is scoped, not a full-pane scan ─────
+# A stale ``[Command exited with code N]`` in scrollback must not keep asserting
+# PROC_EXITED on a live worker. The evidence is tail-limited (BUSY_TAIL_ROWS) and
+# cleared once a newer shell prompt (a session/turn boundary) appears below it.
+
+
+def test_f775_stale_exit_before_a_later_turn_is_not_proc_exited() -> None:
+    """The #632 shape: an old exit line, then a shell prompt and a later
+    successful turn → NOT PROC_EXITED (the exit is stale)."""
+    text = _load("cline-cli-proc-exited-stale-1")
+    cond = classify_condition(text, "cline_cli")
+    # PROC_EXITED (precedence 1) must NOT win; the exit line is behind a prompt.
+    assert cond is None or cond.kind is not ConditionKind.PROC_EXITED
+
+
+def test_f775_genuine_trailing_exit_still_proc_exited() -> None:
+    """Control: the ORIGINAL corpus fixture (exit line live in the same turn, no
+    shell prompt after it) still classifies PROC_EXITED."""
+    text = _load("cline-cli-proc-exited-1")
+    cond = classify_condition(text, "cline_cli")
+    assert cond is not None
+    assert cond.kind is ConditionKind.PROC_EXITED
+    assert cond.subtype == "command_exit_code"
+
+
+def test_f775_exit_outside_the_tail_window_is_not_proc_exited() -> None:
+    """Tail-limit guard: an exit line older than BUSY_TAIL_ROWS rows is out of
+    the live window and no longer counts as evidence."""
+    from cli_agent_orchestrator.providers.condition import BUSY_TAIL_ROWS
+
+    pane = "\n".join(
+        ["[run_commands] old", "   ⎿ [Command exited with code 1]"]
+        + [f"line {i}" for i in range(BUSY_TAIL_ROWS + 5)]
+    )
+    cond = classify_condition(pane, "cline_cli")
+    assert cond is None or cond.kind is not ConditionKind.PROC_EXITED
+
+
+def test_f775_process_state_signal_survives_scoping() -> None:
+    """The genuine process-state PROC_EXITED (proc_exited=True, no text line) is
+    unaffected by the text-evidence scoping."""
+    from cli_agent_orchestrator.providers.condition import Confidence
+
+    cond = classify_condition("", "cline_cli", proc_exited=True)
+    assert cond is not None
+    assert cond.kind is ConditionKind.PROC_EXITED
+    assert cond.subtype == "shell_baseline_return"
+    assert cond.confidence is Confidence.LOW

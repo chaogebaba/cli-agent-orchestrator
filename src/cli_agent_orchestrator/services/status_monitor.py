@@ -2076,9 +2076,26 @@ class StatusMonitor:
         if cond is not None and status in _QUIESCENT_STATUSES:
             from cli_agent_orchestrator.providers.condition import ConditionKind
 
-            if getattr(cond, "kind", None) is ConditionKind.BUSY:
+            kind = getattr(cond, "kind", None)
+            # F752: BUSY asserts "working RIGHT NOW", false by construction on a
+            # transition to idle/completed. F775 (#632): the TEXT exit-code
+            # PROC_EXITED (subtype command_exit_code) is the same shape — a
+            # residual ``[Command exited with code N]`` scrollback line that
+            # re-affirms itself on every quiescent transition and sticks the row
+            # to ``completed [PROC_EXITED]`` on a live worker. Downgrade it too so
+            # the delivery seam CLEARS the latched label. The GENUINE process-state
+            # signal (subtype shell_baseline_return, from
+            # pane_current_command == shell_baseline) is a real dead process and
+            # is NOT downgraded — a cline worker whose process actually exited is
+            # legitimately quiescent.
+            downgrade = kind is ConditionKind.BUSY or (
+                kind is ConditionKind.PROC_EXITED
+                and getattr(cond, "subtype", None) == "command_exit_code"
+            )
+            if downgrade:
                 logger.debug(
-                    "suppressing BUSY condition for %s: status is %s",
+                    "suppressing %s condition for %s: status is %s",
+                    kind.value if kind is not None else None,
                     terminal_id,
                     status.value if status is not None else None,
                 )
