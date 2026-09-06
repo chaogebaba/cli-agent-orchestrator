@@ -482,14 +482,59 @@ class KiroCliProvider(BaseProvider):
                 exc,
             )
 
-        # (b) Base agent JSON must exist (installed by `cao install`).
+        # (b) Base agent JSON must exist. `cao install` writes it for a legacy
+        # kiro profile, but a POSITION-COMPOSED spawn name (`<provider>_<position>`,
+        # F497 D6/D7) is synthesised purely in memory and has no installed source
+        # file, so `cao install` never wrote its JSON (F778 #635). When the JSON
+        # is missing AND the spawn name resolves to a composed profile, materialise
+        # it on demand from the composition (same writer `cao install` uses,
+        # idempotent). Only a name that is NOT a composed profile — the genuine
+        # uninstalled-legacy case — falls through to the loud RuntimeError.
         base = KIRO_AGENTS_DIR / f"{self._agent_profile.replace('/', '__')}.json"
+        if not base.exists():
+            self._materialize_composed_agent_json_if_possible()
         if not base.exists():
             raise RuntimeError(
                 f"kiro base agent JSON missing: {base} (profile '{self._agent_profile}' has no "
                 f"installed kiro agent; re-run `cao install` for a kiro variant, or fix the "
                 f"provider routing). Refusing to launch unprofiled kiro_default."
             )
+
+    def _materialize_composed_agent_json_if_possible(self) -> None:
+        """F778 #635 — write the kiro agent JSON on demand for a composed spawn name.
+
+        A position-composed assign (`agent_profile="dev", provider="kiro_cli"`)
+        spawns under the synthesised name `kiro_cli_dev`, which has no installed
+        source file — so its agent JSON was never written and prelaunch would
+        die. When the current spawn name resolves to a `<provider>_<position>`
+        composition for kiro_cli, reconstruct the composed profile and write its
+        JSON with the SAME writer `cao install` uses. A best-effort helper: any
+        failure (not a composed name, unresolvable cell) leaves the base absent
+        so the caller raises the genuine-legacy RuntimeError.
+        """
+        from cli_agent_orchestrator.services.install_service import materialize_kiro_agent_json
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            compose_position_profile_for_spawn,
+        )
+
+        resolved = compose_position_profile_for_spawn(self._agent_profile, "kiro_cli")
+        if resolved is None:
+            return
+        composed_profile, composed_source = resolved
+        try:
+            path = materialize_kiro_agent_json(composed_profile, composed_source=composed_source)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "F778: on-demand kiro agent JSON materialisation failed for '%s': %s",
+                self._agent_profile,
+                exc,
+            )
+            return
+        logger.info(
+            "F778: materialised composed kiro agent JSON on demand for '%s' at %s",
+            self._agent_profile,
+            path,
+        )
 
     def _assert_postlaunch_identity(self) -> None:
         """F118 §7.2 post-launch assertion — verify status bar shows expected agent.
