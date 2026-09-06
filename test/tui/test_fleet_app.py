@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
@@ -67,6 +68,7 @@ from cli_agent_orchestrator.tui.fleet_app import (
     parse_args,
     read_events,
     read_labels,
+    read_window_ages,
     render_once,
     row_styles,
     row_values,
@@ -295,6 +297,79 @@ def test_fmt_age_matches_the_script_thresholds() -> None:
     assert fmt_age(120) == "2m"
     assert fmt_age(7199) == "119m"
     assert fmt_age(7200) == "2h"
+
+
+def test_read_window_ages_pins_the_window_activity_format_field() -> None:
+    """The age MUST be read from ``#{window_activity}``, not the window's id/index.
+
+    ``window_activity`` is tmux's last-output epoch; ``window_index`` / ``window_id``
+    are identity fields with no time meaning. Swapping the age's source field to an
+    identity field (mutant M18) is a real behavioural regression, so the exact
+    ``list-windows -F`` format string is contractual: it must request
+    ``#{window_activity}`` and that must be the field the age subtracts from ``now``.
+    """
+    captured: List[Sequence[str]] = []
+
+    def spy(args: Sequence[str]) -> str:
+        captured.append(list(args))
+        return ""
+
+    read_window_ages(spy, "sess", now=lambda: 1000.0)
+
+    assert captured, "read_window_ages must issue exactly one tmux read"
+    argv = list(captured[0])
+    assert argv[:3] == ["list-windows", "-t", "sess"]
+    assert argv[3] == "-F"
+    fmt = argv[4]
+    # The activity field must be present and must be the *age* source: the format
+    # pairs an index with the activity epoch, and the age is now - activity.
+    assert "#{window_activity}" in fmt
+    assert "#{window_index}" in fmt
+    # Guard against the mutant that keeps a two-field shape but sources the age
+    # from an identity field: the activity token must not be an id/index alias.
+    assert "#{window_id}" not in fmt
+    # window_activity is the trailing (value) field the parser reads as the epoch.
+    assert fmt.strip().endswith("#{window_activity}")
+
+
+def test_read_window_ages_computes_age_from_activity_not_index() -> None:
+    """A fake tmux that HONOURS the requested ``-F`` fields kills mutant M18.
+
+    Each window's ``window_index`` / ``window_id`` deliberately differ from its
+    ``window_activity`` epoch. A reader that subtracts the wrong field from ``now``
+    yields the wrong age, so the assertion ``age == now - window_activity`` fails
+    for the ``#{window_index}`` (and ``#{window_id}``) mutants while passing for
+    the real ``#{window_activity}`` source.
+    """
+    # window_index, window_id, window_activity(epoch) — all three distinct per row.
+    rows = {
+        "0": {"window_index": "0", "window_id": "@40", "window_activity": "900"},
+        "2": {"window_index": "2", "window_id": "@42", "window_activity": "950"},
+        "3": {"window_index": "3", "window_id": "@43", "window_activity": "999"},
+    }
+    field_re = re.compile(r"#\{(\w+)\}")
+
+    def honouring_tmux(args: Sequence[str]) -> str:
+        argv = list(args)
+        assert argv[0] == "list-windows"
+        fmt = argv[argv.index("-F") + 1]
+        # Emit each requested field's real value, in the order the format lists
+        # them, so asking for the wrong field genuinely returns the wrong number.
+        fields = field_re.findall(fmt)
+        return "".join(" ".join(row[name] for name in fields) + "\n" for row in rows.values())
+
+    now = 1000.0
+    ages = read_window_ages(honouring_tmux, "sess", now=lambda: now)
+
+    # Keyed by window_index; value is now - window_activity (NOT now - index/id).
+    assert ages == {
+        "0": now - 900,  # 100.0, not now - 0 (=1000) and not now - @40
+        "2": now - 950,  # 50.0,  not now - 2 (=998)
+        "3": now - 999,  # 1.0,   not now - 3 (=997)
+    }
+    # Explicit anti-mutant witnesses: the wrong-field ages would be these.
+    assert ages["0"] != now - 0  # #{window_index} mutant would give 1000.0
+    assert ages["2"] != now - 2
 
 
 def test_read_labels_skips_lines_without_a_tab(tmp_path: Path) -> None:
