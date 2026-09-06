@@ -15,11 +15,11 @@ tmux is mocked throughout — no test here starts a tmux server or a window.
 
 import contextlib
 import importlib.util
+import os
 import shutil
 import subprocess
 from collections.abc import Iterator
 from typing import Any
-
 from unittest.mock import AsyncMock, MagicMock, _patch, patch
 
 import pytest
@@ -43,6 +43,22 @@ def _fleet_extra(present: bool = True) -> _patch[MagicMock]:
         importlib.util,
         "find_spec",
         MagicMock(return_value=MagicMock() if present else None),
+    )
+
+
+def _no_venv_script(tmp_path: Any) -> _patch[str]:
+    """Point ``sys.executable`` at a dir with no ``cao-fleet`` beside it.
+
+    The resolver (#633) probes ``Path(sys.executable).parent / "cao-fleet"``
+    before ``shutil.which``. In a real venv that sibling exists, which would
+    short-circuit before the PATH fallback the ``shutil.which`` tests exercise.
+    Repointing ``sys.executable`` at an empty tmp dir forces resolution down to
+    the PATH branch deterministically, independent of the test venv's layout.
+    """
+    return patch.object(
+        fleet_window_service.sys,
+        "executable",
+        str(tmp_path / "python"),
     )
 
 
@@ -111,9 +127,10 @@ class TestOptOutFlag:
 class TestWindowCreation:
     """Placement, idempotence and the exact tmux command line."""
 
-    def test_creates_at_index_1_when_free(self) -> None:
+    def test_creates_at_index_1_when_free(self, tmp_path: Any) -> None:
         run = _tmux_runner(_completed(stdout="0 chao_supervisor-abc123\n"))
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -132,9 +149,10 @@ class TestWindowCreation:
             f"{CAO_FLEET_PATH} --session cao-foreign",
         ]
 
-    def test_appends_when_index_1_is_taken(self) -> None:
+    def test_appends_when_index_1_is_taken(self, tmp_path: Any) -> None:
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n1 kiro_dev-b\n"))
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -147,9 +165,10 @@ class TestWindowCreation:
         # that already holds index 1.
         assert argv[4] == "cao-foreign"
 
-    def test_existing_fleet_window_is_left_alone(self) -> None:
+    def test_existing_fleet_window_is_left_alone(self, tmp_path: Any) -> None:
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n1 fleet\n"))
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -158,10 +177,11 @@ class TestWindowCreation:
 
         assert _new_window_argv(run) is None
 
-    def test_window_name_is_matched_exactly_not_by_prefix(self) -> None:
+    def test_window_name_is_matched_exactly_not_by_prefix(self, tmp_path: Any) -> None:
         """A window called ``fleet-notes`` is not the fleet window."""
         run = _tmux_runner(_completed(stdout="0 supervisor-a\n2 fleet-notes\n"))
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -174,10 +194,11 @@ class TestWindowCreation:
 class TestNeverRaises:
     """Every failure mode is a logged False, never an exception."""
 
-    def test_absent_console_script_is_a_no_op(self) -> None:
-        """No ``cao-fleet`` on PATH at all: tmux is untouched."""
+    def test_absent_console_script_is_a_no_op(self, tmp_path: Any) -> None:
+        """No ``cao-fleet`` beside the interpreter or on PATH: tmux is untouched."""
         run = MagicMock()
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=None) as mock_which,
             patch.object(subprocess, "run", run),
         ):
@@ -186,7 +207,7 @@ class TestNeverRaises:
         mock_which.assert_called_once_with(FLEET_CONSOLE_SCRIPT)
         run.assert_not_called()
 
-    def test_absent_fleet_extra_is_a_no_op(self) -> None:
+    def test_absent_fleet_extra_is_a_no_op(self, tmp_path: Any) -> None:
         """The script is on PATH but textual is not: a server-only install.
 
         pyproject declares ``cao-fleet`` unconditionally, so PATH alone does not
@@ -195,6 +216,7 @@ class TestNeverRaises:
         """
         run = MagicMock()
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(present=False) as mock_find_spec,
             patch.object(subprocess, "run", run),
@@ -204,10 +226,11 @@ class TestNeverRaises:
         mock_find_spec.assert_called_once_with(FLEET_TUI_MODULE)
         run.assert_not_called()
 
-    def test_list_windows_failure_creates_nothing(self) -> None:
+    def test_list_windows_failure_creates_nothing(self, tmp_path: Any) -> None:
         """An unknown inventory must not be guessed at."""
         run = _tmux_runner(_completed(returncode=1, stderr="no server running"))
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -216,12 +239,13 @@ class TestNeverRaises:
 
         assert _new_window_argv(run) is None
 
-    def test_new_window_failure_returns_false(self) -> None:
+    def test_new_window_failure_returns_false(self, tmp_path: Any) -> None:
         run = _tmux_runner(
             _completed(stdout="0 supervisor-a\n"),
             _completed(returncode=1, stderr="can't create window"),
         )
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", run),
@@ -236,19 +260,98 @@ class TestNeverRaises:
             RuntimeError("something unforeseen"),
         ],
     )
-    def test_subprocess_explosion_is_swallowed(self, boom: Exception) -> None:
+    def test_subprocess_explosion_is_swallowed(self, boom: Exception, tmp_path: Any) -> None:
         with (
+            _no_venv_script(tmp_path),
             patch.object(shutil, "which", return_value=CAO_FLEET_PATH),
             _fleet_extra(),
             patch.object(subprocess, "run", MagicMock(side_effect=boom)),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
 
-    def test_which_explosion_is_swallowed(self) -> None:
-        with patch.object(
-            shutil, "which", MagicMock(side_effect=RuntimeError("boom"))
+    def test_which_explosion_is_swallowed(self, tmp_path: Any) -> None:
+        with (
+            _no_venv_script(tmp_path),
+            patch.object(shutil, "which", MagicMock(side_effect=RuntimeError("boom"))),
         ):
             assert ensure_fleet_window("cao-foreign", {}) is False
+
+
+class TestConsoleScriptResolution:
+    """#633 — resolve ``cao-fleet`` beside ``sys.executable`` before PATH.
+
+    cao-server is a systemd user unit whose PATH is the systemd default
+    (``/usr/local/bin:/usr/bin``), so the venv ``bin`` is not on it and a
+    ``shutil.which`` alone finds nothing — every server-side fleet window was
+    skipped. The console script lives beside the interpreter running the
+    server, so that sibling is probed first.
+    """
+
+    @staticmethod
+    def _make_fake_script(directory: Any) -> Any:
+        """Create an executable ``cao-fleet`` beside a fake interpreter."""
+        script = directory / FLEET_CONSOLE_SCRIPT
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        return script
+
+    def test_resolves_venv_script_with_empty_path(self, tmp_path: Any) -> None:
+        """PATH is empty; the script beside ``sys.executable`` still reaches tmux."""
+        venv_bin = tmp_path / "bin"
+        venv_bin.mkdir()
+        script = self._make_fake_script(venv_bin)
+        run = _tmux_runner(_completed(stdout="0 chao_supervisor-abc123\n"))
+        with (
+            patch.object(fleet_window_service.sys, "executable", str(venv_bin / "python")),
+            patch.dict(os.environ, {"PATH": ""}, clear=False),
+            patch.object(shutil, "which", return_value=None) as mock_which,
+            _fleet_extra(),
+            patch.object(subprocess, "run", run),
+        ):
+            assert ensure_fleet_window("cao-foreign", {}) is True
+
+        # The venv sibling won, so the PATH fallback was never consulted.
+        mock_which.assert_not_called()
+        argv = _new_window_argv(run)
+        assert argv is not None
+        assert argv[-1] == f"{script} --session cao-foreign"
+
+    def test_non_executable_venv_sibling_falls_back_to_path(self, tmp_path: Any) -> None:
+        """A ``cao-fleet`` beside the interpreter that is not executable is skipped."""
+        venv_bin = tmp_path / "bin"
+        venv_bin.mkdir()
+        script = venv_bin / FLEET_CONSOLE_SCRIPT
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o644)  # not executable
+        run = _tmux_runner(_completed(stdout="0 supervisor-a\n"))
+        with (
+            patch.object(fleet_window_service.sys, "executable", str(venv_bin / "python")),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH) as mock_which,
+            _fleet_extra(),
+            patch.object(subprocess, "run", run),
+        ):
+            assert ensure_fleet_window("cao-foreign", {}) is True
+
+        mock_which.assert_called_once_with(FLEET_CONSOLE_SCRIPT)
+        argv = _new_window_argv(run)
+        assert argv is not None
+        assert argv[-1] == f"{CAO_FLEET_PATH} --session cao-foreign"
+
+    def test_missing_venv_script_falls_back_to_path(self, tmp_path: Any) -> None:
+        """No script beside the interpreter: resolution falls back to PATH."""
+        run = _tmux_runner(_completed(stdout="0 supervisor-a\n"))
+        with (
+            _no_venv_script(tmp_path),
+            patch.object(shutil, "which", return_value=CAO_FLEET_PATH) as mock_which,
+            _fleet_extra(),
+            patch.object(subprocess, "run", run),
+        ):
+            assert ensure_fleet_window("cao-foreign", {}) is True
+
+        mock_which.assert_called_once_with(FLEET_CONSOLE_SCRIPT)
+        argv = _new_window_argv(run)
+        assert argv is not None
+        assert argv[-1] == f"{CAO_FLEET_PATH} --session cao-foreign"
 
 
 def _supervisor_session_patches(terminal: MagicMock) -> tuple[_patch[Any], ...]:
