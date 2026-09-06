@@ -40,7 +40,7 @@ __all__ = [
     "CheckOutcome",
     "CheckRegistry",
     "EventCheck",
-    "LegacyDisagreementCheck",
+    "PaneDisagreementCheck",
     "bad_transition_check",
     "ghost_transition_check",
     "record_migration_failure",
@@ -123,8 +123,9 @@ class CheckRegistry:
 # * **Structural** — ``DIAG-GHOST-TRANSITION`` and ``DIAG-BAD-TRANSITION`` read
 #   nothing but the row that was just appended, so they are plain ``EventCheck``
 #   callables in the registry above and run on every append.
-# * **Durational** — ``DIAG-LEGACY-DISAGREE`` is defined as a disagreement that
-#   has LASTED longer than ``PANE_HEARTBEAT_S``, so no single row can decide it.
+# * **Durational** — ``DIAG-PANE-DISAGREE`` (``DIAG-LEGACY-DISAGREE`` before
+#   phase 2's D5 repointed it) is defined as a disagreement that has LASTED
+#   longer than ``PANE_HEARTBEAT_S``, so no single row can decide it.
 #   It reads the projection, which during ``on_append`` is one event stale by
 #   construction: the store commits, THEN the projector applies.  A registry
 #   check would therefore race the projector and report disagreements that exist
@@ -216,14 +217,32 @@ def bad_transition_check(event: WorkerEvent) -> CheckOutcome | None:
     )
 
 
-class LegacyDisagreementCheck:
-    """``DIAG-LEGACY-DISAGREE``: shadow ≠ legacy for longer than one heartbeat.
+class PaneDisagreementCheck:
+    """``DIAG-PANE-DISAGREE``: shadow ≠ the pane's reading for over one heartbeat.
 
-    Durational, so it reads the projection and the legacy publishes together and
-    is driven by the projector after each fold and by the sweep every heartbeat.
-    It is not a registry check: during ``on_append`` the projection is one event
-    stale by construction, and a check that raced the projector would report
-    disagreements that exist only inside that window.
+    Durational, so it reads the projection and the pane's classifications together
+    and is driven by the projector after each fold and by the sweep every
+    heartbeat.  It is not a registry check: during ``on_append`` the projection is
+    one event stale by construction, and a check that raced the projector would
+    report disagreements that exist only inside that window.
+
+    **What phase 2's D5 changed, and why it is not a rename.**  Phase 1 compared
+    the projection against ``status.legacy_published`` — the row the egress writes
+    for what the fleet and the inbox actually consume.  Phase 2's D1 makes the
+    projection publish through that same egress, so from that moment the published
+    status is *caused by* the projection and the check compares the projection
+    with itself: perfect agreement, forever, reported by a check that is still
+    running.  The comparison would go quiet rather than break, which is the
+    failure mode phase 1's own AC10 was corrected for in the opposite direction.
+
+    So the check reads ``status.pane_classified`` instead (D1c), which the
+    classification site appends whether or not the publish happens.  Pointing it
+    at "the raw classification the pane path still computes" was the r2 draft and
+    is not enough on its own: a computation is not a record, and for a sourced
+    terminal nothing was writing one.
+
+    The old code ``DIAG-LEGACY-DISAGREE`` is retained in the enum and never
+    raised (D9b), so findings written before the cutover stay readable.
     """
 
     def __init__(
@@ -254,7 +273,7 @@ class LegacyDisagreementCheck:
         if projection is None:
             return False
         rows = self._event_store.read(
-            terminal_id, kinds=frozenset({EventKind.STATUS_LEGACY_PUBLISHED})
+            terminal_id, kinds=frozenset({EventKind.STATUS_PANE_CLASSIFIED})
         )
         if not rows:
             return False
@@ -275,12 +294,11 @@ class LegacyDisagreementCheck:
             return False
 
         self._finding_store.record(
-            FindingCode.DIAG_LEGACY_DISAGREE,
+            FindingCode.DIAG_PANE_DISAGREE,
             terminal_id=terminal_id,
             dedupe_key=f"{projection.state.value}|{raw}",
             detail=(
-                f"shadow {projection.state.value} vs legacy {raw} "
-                f"for {age.total_seconds():.0f}s"
+                f"shadow {projection.state.value} vs pane {raw} " f"for {age.total_seconds():.0f}s"
             ),
             sample_event_id=sample.event_id,
         )
@@ -292,17 +310,17 @@ class LegacyDisagreementCheck:
     ) -> tuple[datetime, WorkerEvent]:
         """When the CURRENT disagreement began, and the row that opened it.
 
-        Measuring from the LATEST publish would be wrong in the case that matters
-        most: a pane republishing the same wrong status every few seconds would
-        reset the clock forever and never fire, which is precisely the
+        Measuring from the LATEST classification would be wrong in the case that
+        matters most: a pane re-reading the same wrong status every few seconds
+        would reset the clock forever and never fire, which is precisely the
         long-running disagreement worth a finding.  So walk back through the
-        consecutive publishes that carry the same mapped state and take the
+        consecutive classifications that carry the same mapped state and take the
         earliest.
 
-        The shadow side bounds it too.  A publish that predates the current
-        shadow ``state`` was not disagreeing with THIS state, so the onset is the
-        later of the two: the run's first publish, or the moment the shadow
-        arrived where it now is.
+        The shadow side bounds it too.  A classification that predates the
+        current shadow ``state`` was not disagreeing with THIS state, so the onset
+        is the later of the two: the run's first classification, or the moment the
+        shadow arrived where it now is.
         """
         first = rows[-1]
         for row in reversed(rows[:-1]):

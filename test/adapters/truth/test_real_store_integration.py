@@ -110,16 +110,36 @@ async def test_the_switch_on_lands_producer_rows_in_sqlite(db: Path) -> None:
         )
         server_decisions.record_delivery_attempt("t-1", carrier="send_input")
 
+        # WP-ARCH phase 2, A1: the composition root now hands the projector in as
+        # the ``StateFolder`` port, so ``emit`` folds every appended row and the
+        # projector writes its own ``status.transition`` decisions into this same
+        # store. Those rows are the point of the fold — AC-2a's agreement report
+        # compares them — so what this test asserts is the PRODUCER rows, and it
+        # says so rather than widening to "some rows appeared".
         rows = store.read("t-1")
-        kinds = [row.kind for row in rows]
+        produced = [row for row in rows if row.decision is not DecisionKind.STATUS_TRANSITION]
+        kinds = [row.kind for row in produced]
         assert kinds == [
             EventKind.STATUS_LEGACY_PUBLISHED,
             EventKind.STATUS_LEGACY_PUBLISHED,
             DecisionKind.DELIVERY_ATTEMPT,
         ]
-        assert [row.seq for row in rows] == [1, 2, 3]
+        # Contiguity (B7) is asserted over EVERY row, producer and projection
+        # alike: the sequence is per-terminal and the fold's own appends take
+        # numbers from it, so a gap here is exactly the defect B7 forbids.
+        assert [row.seq for row in rows] == list(range(1, len(rows) + 1))
+        # Interleaved, and the pattern is the fold's signature: each of the two
+        # status publishes moves the projection and so is followed immediately by
+        # its ``status.transition`` (starting->idle, then idle->busy), while the
+        # ``delivery.attempt`` is a server decision the projector deliberately
+        # does not act on. Hence producers at 1, 3, 5 rather than 1, 2, 3.
+        assert [row.seq for row in produced] == [1, 3, 5]
+        assert [row.kind for row in rows if row.decision is DecisionKind.STATUS_TRANSITION] == [
+            DecisionKind.STATUS_TRANSITION,
+            DecisionKind.STATUS_TRANSITION,
+        ]
 
-        first, second, attempt = rows
+        first, second, attempt = produced
         assert first.payload["latched_status"] == "idle"
         assert first.payload["raw_classification"] == "classified"
         assert second.payload["latched_status"] == "processing"

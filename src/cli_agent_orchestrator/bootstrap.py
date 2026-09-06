@@ -53,7 +53,7 @@ from cli_agent_orchestrator.app.diag.report import DiagSources
 from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
-    LegacyDisagreementCheck,
+    PaneDisagreementCheck,
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
@@ -71,12 +71,21 @@ from cli_agent_orchestrator.core.ports import (
     QueueStore,
     StateStore,
 )
+from cli_agent_orchestrator.core.status_cutover import (
+    StatusGuardOutcome,
+    StatusPosition,
+    parse_providers,
+    parse_status_switch,
+    resolve_status_switch,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DELIVERY_ENV_VAR",
     "INGEST_ENV_VAR",
+    "STATUS_ENV_VAR",
+    "STATUS_PROVIDERS_ENV_VAR",
     "WorkerTruthRuntime",
     "build_legacy_inbox_status",
     "build_readonly_diag_stores",
@@ -86,6 +95,7 @@ __all__ = [
     "ingest_enabled",
     "shutdown_worker_truth",
     "start_worker_truth",
+    "status_position",
 ]
 
 INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
@@ -96,6 +106,13 @@ INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
 #: rollback to a phase-3 rollback; this is a different switch, not the second
 #: spelling this module's own docstring warns against.
 DELIVERY_ENV_VAR = "CAO_DELIVERY_QUEUE"
+
+#: The status cutover's own switch (phase 2, D9), and its per-provider allowlist.
+#: A THIRD variable beside the other two, for the reason the second one exists:
+#: one master strangler flag would couple a phase-1 rollback to a phase-2
+#: rollback, and each phase must be backable out on its own.
+STATUS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS"
+STATUS_PROVIDERS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS_PROVIDERS"
 
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
@@ -119,6 +136,18 @@ def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition:
     """
     source = os.environ if env is None else env
     return parse_switch(source.get(DELIVERY_ENV_VAR))
+
+
+def status_position(env: dict[str, str] | None = None) -> StatusPosition:
+    """The REQUESTED status-cutover position, before D9's guard resolves it.
+
+    Requested, not effective, for the same reason :func:`delivery_position` says
+    so: the guard demotes ``shadow`` and ``on`` to ``off`` when ingestion is off,
+    and ``on`` to ``shadow`` over an empty allowlist.  The effective position is
+    on the runtime.
+    """
+    source = os.environ if env is None else env
+    return parse_status_switch(source.get(STATUS_ENV_VAR))
 
 
 @dataclass
@@ -148,6 +177,10 @@ class WorkerTruthRuntime:
     #: be a coupling neither blueprint asks for.
     delivery: GuardOutcome | None = None
     queue_store: QueueStore | None = None
+    #: The status cutover's RESOLVED position (phase 2, D9) and the guard's
+    #: reasoning.  Present whatever the ingestion switch says, because the guard's
+    #: whole job in the ingestion-off cells is to record that it demoted.
+    status: StatusGuardOutcome | None = None
     #: §5c's tick, present only for a position that is SERVED (``on`` or
     #: ``drain``).  Held here so shutdown can stop it and so a test can drive
     #: ``run_once`` directly rather than waiting on a cadence.
@@ -332,6 +365,68 @@ def _build_delivery_tick(
         return None
 
 
+def _resolve_status_cutover(
+    pool: ConnectionPool,
+    clock: Clock,
+    *,
+    enabled: bool,
+    env: dict[str, str] | None = None,
+) -> StatusGuardOutcome:
+    """Resolve ``CAO_WORKER_TRUTH_STATUS`` through D9's guard.  Never raises.
+
+    The startup check §12 asks for.  D9's resolution table raises
+    ``DIAG-STATUS-GUARD`` in three of its six cells and no acceptance criterion
+    drove any of them, so the finding is asserted here — a boot per demoting cell
+    — which is cheaper as a startup test than as a live session case.
+
+    Sub-phase 2a implements ``off`` and ``shadow`` only: the feed is D1's and
+    lands in 2b.  A boot that resolves to ``on`` therefore gets a loud warning and
+    NO publisher, rather than being quietly reinterpreted as ``shadow`` — the
+    shape ``_start_delivery`` uses above, and for its reason: an operator who
+    asked for the feed and silently got a shadow run would believe consumers were
+    reading the projection when they were not.
+    """
+    source = os.environ if env is None else env
+    requested = parse_status_switch(source.get(STATUS_ENV_VAR))
+    providers = parse_providers(source.get(STATUS_PROVIDERS_ENV_VAR))
+    outcome = resolve_status_switch(requested, ingest_enabled=enabled, providers=providers)
+
+    if outcome.finding is not None:
+        try:
+            SqliteFindingStore(pool, clock=clock).record(
+                outcome.finding,
+                dedupe_key=f"{outcome.requested.value}->{outcome.position.value}",
+                detail=outcome.detail,
+            )
+        except Exception:  # noqa: BLE001 — a notice that cannot be written is logged
+            logger.warning(
+                "status cutover boot guard: %s (finding could not be recorded)",
+                outcome.detail,
+                exc_info=True,
+            )
+
+    if outcome.demoted:
+        logger.warning(
+            "status cutover boot guard resolved %s=%s to %s: %s",
+            STATUS_ENV_VAR,
+            outcome.requested.value,
+            outcome.position.value,
+            outcome.detail,
+        )
+
+    if outcome.position is StatusPosition.ON:
+        logger.warning(
+            "%s resolved to on, which sub-phase 2a does not implement: the "
+            "projection is NOT being published and every consumer still reads the "
+            "pane path. Set %s=shadow, or unset it, until sub-phase 2b ships.",
+            STATUS_ENV_VAR,
+            STATUS_ENV_VAR,
+        )
+    elif outcome.position is StatusPosition.SHADOW:
+        logger.info("status cutover armed in SHADOW mode (%s)", STATUS_ENV_VAR)
+    return outcome
+
+
 async def start_worker_truth(
     *,
     db_path: Path | None = None,
@@ -385,6 +480,11 @@ async def start_worker_truth(
         # happened to be ingesting would be a coupling neither blueprint asks
         # for — and, worse, a delivery safety net with a second precondition.
         await delivery_tick.start()
+    # Resolved BEFORE the ingestion-off early return, because the ingestion-off
+    # cells are two of the three the guard exists to report: an operator who set
+    # the cutover without the ingestion gate learns it from the finding, and
+    # returning early would be the one path on which they learn nothing.
+    status = _resolve_status_cutover(pool, resolved_clock, enabled=enabled, env=env)
 
     if not enabled:
         # Tables exist and phase 1 is inert.  No event store, no tasks, nothing
@@ -396,6 +496,7 @@ async def start_worker_truth(
             pool=pool,
             delivery=delivery,
             queue_store=queue_store,
+            status=status,
             delivery_tick=delivery_tick,
         )
         return _runtime
@@ -415,7 +516,7 @@ async def start_worker_truth(
             state_store,
             resolved_clock,
             sources,
-            legacy_check=LegacyDisagreementCheck(
+            legacy_check=PaneDisagreementCheck(
                 finding_store, event_store, state_store, resolved_clock
             ),
         )
@@ -436,12 +537,21 @@ async def start_worker_truth(
         # events apply in full, and r9's source precedence silently never
         # engages — with both lanes' own tests still green, because each injects
         # its own double here.
+        # WP-ARCH phase 2, A1: the projector built above is also HANDED IN, as
+        # the ``StateFolder`` port, so ``emit`` folds every appended event. At
+        # phase 1's anchor this line passed everything but the projector, so the
+        # local was dropped and ``Projector.project`` had no call site anywhere —
+        # the fold that writes ``status.transition`` never ran, and AC-2a's
+        # agreement report compares exactly those rows. The field is typed on the
+        # Protocol, so nothing under ``adapters/`` names ``Projector``; this is
+        # the one module allowed to know both halves.
         truth_wiring.install_producers(
             truth_wiring.ProducerRuntime(
                 store=event_store,
                 clock=resolved_clock,
                 state_store=state_store,
                 findings=finding_store,
+                folder=projector,
             )
         )
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either
@@ -454,6 +564,7 @@ async def start_worker_truth(
             pool=pool,
             delivery=delivery,
             queue_store=queue_store,
+            status=status,
             delivery_tick=delivery_tick,
         )
         return _runtime
@@ -472,6 +583,7 @@ async def start_worker_truth(
         retention=retention,
         delivery=delivery,
         queue_store=queue_store,
+        status=status,
         delivery_tick=delivery_tick,
     )
     logger.info("worker-truth ingestion ENABLED (%s=1)", INGEST_ENV_VAR)

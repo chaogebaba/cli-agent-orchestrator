@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from test.app.fakes import FakeClock
+from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.findings import SqliteFindingStore
@@ -20,18 +21,21 @@ from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
-    LegacyDisagreementCheck,
+    PaneDisagreementCheck,
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.cli.commands.diag import INGEST_ENV_VAR, _parse_since, diag
 from cli_agent_orchestrator.core.events import (
+    AnyKind,
     Confidence,
     DecisionKind,
     EventDraft,
     EventKind,
     Producer,
+    WorkerEvent,
 )
+from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
 TERMINAL = "term-cli"
@@ -54,10 +58,10 @@ def db(tmp_path: Path) -> Path:
         states,
         clock,
         StaticSourceRegistry(),
-        legacy_check=LegacyDisagreementCheck(findings, events, states, clock),
+        legacy_check=PaneDisagreementCheck(findings, events, states, clock),
     )
 
-    def emit(kind, **kw):
+    def emit(kind: AnyKind, **kw: Any) -> WorkerEvent:
         stored = events.append(
             EventDraft(
                 terminal_id=TERMINAL,
@@ -86,7 +90,7 @@ def db(tmp_path: Path) -> Path:
     return path
 
 
-def _run(db: Path, *args: str):
+def _run(db: Path, *args: str) -> Result:
     return CliRunner().invoke(diag, [*args, "--db", str(db)])
 
 
@@ -176,7 +180,7 @@ def test_an_unknown_terminal_reports_rather_than_failing(db: Path) -> None:
     assert "never been projected" in result.output
 
 
-def test_the_ingest_note_follows_the_environment(db: Path, monkeypatch) -> None:
+def test_the_ingest_note_follows_the_environment(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(INGEST_ENV_VAR, raising=False)
     off = _run(db, TERMINAL)
 
@@ -237,6 +241,51 @@ def test_an_unknown_finding_code_is_a_usage_error(db: Path) -> None:
 
     assert result.exit_code != 0
     assert "unknown finding code" in result.output
+
+
+def test_both_disagreement_codes_print_across_the_cutover_boundary(
+    db: Path, tmp_path: Path
+) -> None:
+    """D9b's rename continuity, asserted where the claim is made.
+
+    Phase 2's D5 repoints the disagreement check and renames its code.  The rule
+    is that the new code is ADDED and the old one RETAINED in the enum as
+    accepted-but-never-raised, so a finding written BEFORE the cutover is still
+    readable after it.  Deleting the old member would orphan its rows in the very
+    table phase 1 built to be the evidence base; renaming the string in place
+    would make ``count`` on a repeat ambiguous across the boundary — the same
+    reading would be two findings, or one finding whose count spans two different
+    checks.
+
+    Both halves are asserted: the old code still resolves as a ``--code`` filter
+    (so an operator can go and find its rows), and an unfiltered listing prints
+    the two side by side.
+    """
+    result, pool = migrate(db, busy_timeout_ms=5000)
+    assert result.ok and pool is not None
+    store = SqliteFindingStore(pool, clock=FakeClock())
+    store.record(
+        FindingCode.DIAG_LEGACY_DISAGREE,
+        terminal_id=TERMINAL,
+        dedupe_key="busy|idle",
+        detail="written before the cutover",
+    )
+    store.record(
+        FindingCode.DIAG_PANE_DISAGREE,
+        terminal_id=TERMINAL,
+        dedupe_key="busy|idle",
+        detail="written after it",
+    )
+    pool.close_all()
+
+    listed = _run(db, "findings", "--state", "all")
+    assert listed.exit_code == 0
+    assert "DIAG-LEGACY-DISAGREE" in listed.output
+    assert "DIAG-PANE-DISAGREE" in listed.output
+
+    retired = _run(db, "findings", "--state", "all", "--code", "DIAG-LEGACY-DISAGREE")
+    assert retired.exit_code == 0
+    assert "written before the cutover" in retired.output
 
 
 # ------------------------------------------------------------------- agreement

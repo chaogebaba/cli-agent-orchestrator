@@ -34,6 +34,7 @@ _AUDIT_KINDS = {
     "usage.capped",
     "process.exited",
     "status.legacy_published",
+    "status.pane_classified",
     "pane.missing",
     "pane.recovered",
 }

@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, Tu
 
 # WP-ARCH phase 1 (F725 #581) hook point 2 — legacy status egress producer.
 from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
+from cli_agent_orchestrator.adapters.truth import pane_classification as _wt_pane_classification
 from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -1316,6 +1317,22 @@ class StatusMonitor:
                             pass_outcome = pass_outcome_for_source(pass_source, "accepted")
                             publish_external = True
             finally:
+                # WP-ARCH phase 2 D1c: record the pane's own reading HERE, at the
+                # classification site, not at the egress. Phase 2's D1 will stop
+                # the publish below for a source-healthy terminal, and the egress
+                # producer would go quiet with it — leaving DIAG-PANE-DISAGREE
+                # with one side of its comparison for exactly the terminals the
+                # comparison is about. This call is that second side, and it runs
+                # before the publish so a publish that raises still leaves the
+                # reading recorded.
+                _wt_pane_classification.record_pane_classification(
+                    terminal_id,
+                    self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
+                    None,
+                    "incremental",
+                    pass_outcome,
+                    raw_classification,
+                )
                 try:
                     evidence_kwargs = (
                         {"raw_classification": raw_classification}

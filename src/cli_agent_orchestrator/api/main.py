@@ -154,6 +154,9 @@ from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
     approval_store,
+)
+from cli_agent_orchestrator.services import claude_truth_hooks as _wt_claude_truth
+from cli_agent_orchestrator.services import (
     codex_review_service,
     flow_service,
     manifest_freeze,
@@ -1186,6 +1189,13 @@ class InteractionMarkerRequest(BaseModel):
     tool_name: Optional[str] = None
     ts: Optional[str] = None
     nonce: Optional[str] = None
+    # WP-ARCH phase 2, D4. Caller-supplied and OPTIONAL: a marker POSTed by an
+    # older worker's hook carries none, and the marker must still be applied —
+    # the field buys append-once for the event log, and refusing the request
+    # without it would trade a dialog signal for a dedup guarantee. Distinct
+    # from ``nonce``, which is the marker's own opaque uniqueness token: this one
+    # is stable across a RETRY of the same POST, which is the whole property.
+    idempotency_key: Optional[str] = None
 
 
 class ChildrenLedgerRequest(BaseModel):
@@ -4856,6 +4866,12 @@ async def bind_transcript(
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
         inbox_service.reset_binding_episodes(terminal_id)
+        # WP-ARCH phase 2 D3, §5: the transcript path is HANDED IN here, at the
+        # binding epoch, and never discovered by the adapter. Census finding 4 is
+        # what makes this the right seam: a resume writes the SAME file under a
+        # NEW epoch, so the tailer has to learn about the epoch to announce
+        # ``session.resumed`` while keeping the cursor that stops it replaying.
+        _wt_claude_truth.attach_transcript_source(terminal_id, candidate_real, body.session_id)
         return {"success": True, "binding": row}
     except ValueError as exc:
         raise HTTPException(
@@ -4896,6 +4912,17 @@ async def push_interaction_marker(
         body.kind,
         source_layer="hook",
         tool_name=body.tool_name,
+    )
+    # WP-ARCH phase 2 D3b: the hook producer is a server-side append AT THIS
+    # ROUTE. It runs after push_marker, not before: the marker is what the
+    # auto-responder and the fusion helper read, and a truth append that could
+    # delay it would put a diagnostic ahead of the behaviour it observes.
+    _wt_claude_truth.record_interaction_marker(
+        terminal_id,
+        body.kind,
+        hook_event=body.event,
+        tool_name=body.tool_name,
+        idempotency_key=body.idempotency_key,
     )
     return {"success": True, "terminal_id": terminal_id, "kind": body.kind}
 

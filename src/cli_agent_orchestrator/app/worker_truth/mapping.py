@@ -62,8 +62,17 @@ _IMPLIED: dict[EventKind, WorkerState] = {
 }
 
 #: The kinds that assert a state.  Everything else — ``status.legacy_published``
-#: (whose state is in its payload), ``pane.recovered`` (a restore) and every
-#: decision kind — is handled by a named rule in the projector.
+#: (whose state is in its payload), ``status.pane_classified``, ``pane.recovered``
+#: (a restore) and every decision kind — is handled by a named rule in the
+#: projector.
+#:
+#: ``status.pane_classified`` (phase 2, D1c) is absent DELIBERATELY, and its
+#: absence is the decision rather than an omission.  The row records what the pane
+#: classifier WOULD have published; letting it assert a state would put the pane
+#: path back in charge of the projection through a door phase 2 built for the
+#: opposite purpose, and I1 would be false as designed.  It folds to
+#: ``no_implied_state``, which is exactly right: it is evidence for the D5
+#: comparison, not an observation of the worker.
 STATE_ASSERTING_KINDS: frozenset[EventKind] = frozenset(_IMPLIED)
 
 #: The legacy ``TerminalStatus`` vocabulary in the new one.  ``unknown`` and

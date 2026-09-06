@@ -55,6 +55,7 @@ __all__ = [
     "QueueStore",
     "ReceiverDirectory",
     "SeatCarrier",
+    "StateFolder",
     "StateProjection",
     "StateStore",
 ]
@@ -164,6 +165,36 @@ class CheckRunner(Protocol):
     """
 
     def on_append(self, event: WorkerEvent) -> None: ...
+
+
+@runtime_checkable
+class StateFolder(Protocol):
+    """Folds one appended event into the shadow projection (WP-ARCH phase 2, A1).
+
+    The fold's driver, and it exists here for exactly the reason
+    :class:`CheckRunner` does: the projector lives in ``app`` and the adapter that
+    would call it lives in ``adapters``, which may not import ``app``
+    (``adapters-are-leaves``, asserted by ``test_adapters_never_import_app``).
+    So the adapter holds the PORT and the composition root fills it with the
+    concrete projector, which satisfies this Protocol structurally rather than by
+    inheritance.  What crosses into ``adapters/`` is this type; ``Projector`` is
+    never imported or named there.
+
+    A field typed on the concrete class would put the forbidden import back while
+    looking like a port, which is why the runtime's field is annotated with this
+    Protocol and a mutant that retypes it must fail the leaves test.
+
+    ``Projector.project`` returns a ``ProjectionOutcome``; this port declares the
+    return as ``object`` because no caller in ``adapters`` reads it — ``emit``
+    folds and discards. Declaring the richer type would drag ``app``'s vocabulary
+    across the boundary for a value nobody on this side uses.
+
+    Implementations MUST NOT raise, the same contract :class:`CheckRunner` gives:
+    the fold rides the one path from a hook to the store, and a projector bug that
+    reached the status publish path would break AC11's no-behaviour-change claim.
+    """
+
+    def project(self, event: WorkerEvent) -> object: ...
 
 
 class StateProjection(Protocol):

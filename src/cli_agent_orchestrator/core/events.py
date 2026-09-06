@@ -29,14 +29,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 __all__ = [
     "FLEET_TERMINAL_ID",
+    "PROJECTION_ORIGIN",
+    "SOURCE_REF_PREFIXES",
     "Confidence",
     "DecisionKind",
     "EventDraft",
     "EventKind",
     "Producer",
+    "SourceRefScheme",
     "WorkerEvent",
     "AnyKind",
     "parse_kind",
+    "source_ref",
 ]
 
 #: The ``terminal_id`` for a row that is about the FLEET, not about one
@@ -58,6 +62,19 @@ __all__ = [
 #: The double-underscore prefix is deliberate: CAO terminal ids are hex session
 #: identifiers, so this can never collide with a real one.
 FLEET_TERMINAL_ID = "__fleet__"
+
+#: The ``origin`` WP-ARCH phase 2's D1 publisher stamps on a status the PROJECTION
+#: caused, and the value its ``fed_by`` payload field then carries (D5).
+#:
+#: It lives here for the same reason ``FLEET_TERMINAL_ID`` does: the producer that
+#: writes it is an adapter and the agreement classifier that must drop rows
+#: carrying it sits in ``app``, which the ``adapters-only-via-composition-root``
+#: contract forbids from importing ``adapters`` at all.  A constant both sides
+#: must agree on, with no import path between them, is a core vocabulary constant.
+#: A second spelling would be exactly the defect D5 exists to prevent, arriving by
+#: a different door: the classifier would stop recognising the echoes and the
+#: agreement report would go back to comparing the projection with itself.
+PROJECTION_ORIGIN = "worker_truth"
 
 
 class Producer(StrEnum):
@@ -96,6 +113,21 @@ class EventKind(StrEnum):
       row.
     * ``PANE_MISSING``/``PANE_RECOVERED`` are probe EDGES.  Heartbeats are
       projection columns.
+    * ``STATUS_PANE_CLASSIFIED`` is phase 2's fifteenth kind (D1c).  Phase 1
+      fixed the set at the audit's fourteen and asserted it by strict equality
+      (``test_event_kinds_are_exactly_the_audit_list``), so growing it is a
+      deliberate amendment in TWO places — here and that test's hardcoded list
+      — carrying the weight phase 3 carried when it added five finding codes.
+
+      It exists because phase 2's D1 suppresses the pane path's PUBLISH for a
+      source-healthy terminal, and phase 1's ``status.legacy_published`` producer
+      is hooked at the EGRESS: suppressing the publish would suppress the record
+      of the reading too, leaving ``DIAG-PANE-DISAGREE`` with one side of its
+      comparison.  The classifier keeps running (I7), so the reading exists; only
+      its record was lost.  This kind is that record, appended at the
+      classification site and EDGE-TRIGGERED on the same ``(latched_status,
+      origin)`` pair the legacy producer uses, so a sourced terminal costs one
+      row per classification edge rather than one per output chunk.
     """
 
     SESSION_STARTED = "session.started"
@@ -110,6 +142,7 @@ class EventKind(StrEnum):
     USAGE_CAPPED = "usage.capped"
     PROCESS_EXITED = "process.exited"
     STATUS_LEGACY_PUBLISHED = "status.legacy_published"
+    STATUS_PANE_CLASSIFIED = "status.pane_classified"
     PANE_MISSING = "pane.missing"
     PANE_RECOVERED = "pane.recovered"
 
@@ -149,6 +182,69 @@ def parse_kind(value: str) -> AnyKind:
         return DecisionKind(value)
 
 
+class SourceRefScheme(StrEnum):
+    """The closed set of ``source_ref`` schemes phase 2's producers may build.
+
+    D4's correction, stated as what the code does rather than as what an earlier
+    draft hoped: ``source_ref`` is a **provenance** field, not a join key.  There
+    are three schemes, one per producer, and no two are alike —
+
+    ============  ============================================  ==============
+    scheme        shape                                         producer
+    ============  ============================================  ==============
+    ``TRANSCRIPT``  ``transcript:<resolved path>#<record uuid>``   the tailer
+    ``HOOK``        ``hook:<hook_event_name>#<idempotency_key>``   the hook route
+    ``PANE``        ``pane:<terminal_id>#<seq>``                   the classifier
+    ============  ============================================  ==============
+
+    A key of ``(terminal_id, kind, source_ref)`` therefore does NOT collapse a
+    pair of producers observing one fact, and it is not meant to: the fold's
+    idempotency is per-producer, and two observations of one fact land on the
+    transition table's diagonal, which is a ``NO_OP``.  Both rows are retained,
+    which is what the ``producer`` column is for.
+
+    Built in ONE place so a fourth producer cannot invent a fourth shape
+    unnoticed — the prefix set is asserted by a test (AC-2a).
+
+    The pre-existing ``rollout:`` prefix of phase 1's codex tailer
+    (``adapters/truth/codex_rollout.py``) is deliberately NOT a member: this
+    constructor is the closed set for the schemes phase 2 introduces, and
+    rewriting a shipped producer's provenance format is not in this sub-phase's
+    build line.
+    """
+
+    TRANSCRIPT = "transcript"
+    HOOK = "hook"
+    PANE = "pane"
+
+
+#: Exactly the prefixes :func:`source_ref` can produce, with their separators.
+#: AC-2a asserts this set is exactly these three; a fourth fails it.
+SOURCE_REF_PREFIXES: frozenset[str] = frozenset(f"{scheme.value}:" for scheme in SourceRefScheme)
+
+
+def source_ref(scheme: SourceRefScheme, subject: str, discriminator: str | object) -> str:
+    """Build one ``source_ref``.  The only sanctioned constructor.
+
+    ``subject`` is the scheme's first field — a resolved absolute path for
+    ``TRANSCRIPT`` (the form the tailer already keys its offset by, parent §4
+    AC4/B5), a ``hook_event_name`` for ``HOOK``, a ``terminal_id`` for ``PANE``.
+    ``discriminator`` is the second: a record uuid, an idempotency key, a
+    sequence number.
+
+    Both halves are required to be non-empty.  A ``source_ref`` missing its
+    discriminator would look like provenance and identify nothing, which is
+    worse than a null: a reader would believe the row could be traced.
+    """
+    subject_text = str(subject).strip()
+    discriminator_text = str(discriminator).strip()
+    if not subject_text:
+        raise ValueError(f"source_ref {scheme.value} requires a non-empty subject")
+    if not discriminator_text:
+        raise ValueError(f"source_ref {scheme.value} requires a non-empty discriminator")
+    return f"{scheme.value}:{subject_text}#{discriminator_text}"
+
+
 class EventDraft(BaseModel):
     """What a PRODUCER hands to the store.
 
@@ -171,6 +267,12 @@ class EventDraft(BaseModel):
     msg_id: str | None = None
     decision: DecisionKind | None = None
     evidence: str | None = None
+    #: WP-ARCH phase 2, D4.  Caller-supplied, and null for every producer that
+    #: cannot be retried by a transport this server does not control — which is
+    #: all of them but the claude_code hook route.  Supplying it makes the append
+    #: replay-safe: a second append under the same key returns the row already
+    #: stored, consuming no sequence number.
+    idempotency_key: str | None = None
 
     @field_validator("observed_at")
     @classmethod

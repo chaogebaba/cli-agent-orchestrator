@@ -130,7 +130,9 @@ def test_a_recovery_into_an_anomalous_cell_is_also_flagged(rig: Rig) -> None:
     mis-attributed launch.  Checking only ``status.transition`` would lose it.
     """
     rig.pane(TERMINAL, EventKind.PANE_MISSING)
-    assert rig.states.get(TERMINAL).prior_state is WorkerState.STARTING
+    degraded = rig.states.get(TERMINAL)
+    assert degraded is not None
+    assert degraded.prior_state is WorkerState.STARTING
 
     rig.pane(TERMINAL, EventKind.PANE_RECOVERED)
 
@@ -170,28 +172,28 @@ def test_a_disagreement_younger_than_one_heartbeat_is_lag_not_a_finding(
     rig.sources.add(TERMINAL)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "idle")
+    rig.classified(TERMINAL, "idle")
 
-    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+    assert rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE) == []
 
 
 def test_a_disagreement_older_than_one_heartbeat_fires(rig: Rig) -> None:
     rig.sources.add(TERMINAL)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "idle")
+    rig.classified(TERMINAL, "idle")
 
     rig.clock.advance(PANE_HEARTBEAT_S + 1)
     assert rig.checks(TERMINAL) is True
 
-    findings = rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)
+    findings = rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE)
     assert len(findings) == 1
     assert findings[0].dedupe_key == "busy|idle"
 
 
 def test_agreement_produces_no_finding_however_long_it_lasts(rig: Rig) -> None:
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "processing")
+    rig.classified(TERMINAL, "processing")
 
     rig.clock.advance(PANE_HEARTBEAT_S * 100)
 
@@ -204,7 +206,7 @@ def test_the_sweep_measures_a_terminal_that_stopped_producing_events(rig: Rig) -
     rig.sources.add(TERMINAL)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "idle")
+    rig.classified(TERMINAL, "idle")
 
     rig.clock.advance(PANE_HEARTBEAT_S + 1)
     rig.states.touch_probe(
@@ -213,12 +215,12 @@ def test_the_sweep_measures_a_terminal_that_stopped_producing_events(rig: Rig) -
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.projector.sweep()
 
-    assert len(rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)) == 1
+    assert len(rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE)) == 1
 
 
-def test_an_unknown_legacy_status_is_no_opinion_not_a_disagreement(rig: Rig) -> None:
+def test_an_unknown_pane_status_is_no_opinion_not_a_disagreement(rig: Rig) -> None:
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "a_status_this_map_has_never_seen")
+    rig.classified(TERMINAL, "a_status_this_map_has_never_seen")
 
     rig.clock.advance(PANE_HEARTBEAT_S * 5)
 
@@ -241,6 +243,7 @@ def test_repeats_increment_and_keep_the_first_sample(rig: Rig) -> None:
 
     findings = rig.findings.list_findings(code=FindingCode.DIAG_BAD_TRANSITION)
     assert len(findings) == 1
+    assert first is not None
     assert findings[0].count == 4
     assert findings[0].sample_event_id == first.sample_event_id
     assert findings[0].first_seen_at == first.first_seen_at
@@ -274,24 +277,24 @@ def test_migration_failure_dedupes_on_the_step(rig: Rig) -> None:
     assert findings[0].state is FindingState.OPEN
 
 
-def test_a_muted_legacy_publish_still_gets_measured(rig: Rig) -> None:
+def test_a_muted_pane_classification_still_gets_measured(rig: Rig) -> None:
     """The muted path is where disagreements BEGIN, so it runs the check too.
 
     The pane said one thing while a healthy source said another: that is the
-    definition of a legacy disagreement, and leaving it to the sweep alone would
+    definition of a pane disagreement, and leaving it to the sweep alone would
     delay the most interesting case by up to a heartbeat.
     """
     rig.sources.add(TERMINAL)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "idle")  # muted: the source is healthy
+    rig.classified(TERMINAL, "idle")  # muted: the source is healthy
     assert rig.state_of(TERMINAL) is WorkerState.BUSY
 
     rig.clock.advance(PANE_HEARTBEAT_S + 1)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
-    rig.legacy(TERMINAL, "idle")  # muted again; the FIRST one is now stale
+    rig.classified(TERMINAL, "idle")  # muted again; the FIRST one is now stale
 
-    findings = rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)
+    findings = rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE)
     assert len(findings) == 1
     assert findings[0].dedupe_key == "busy|idle"
 
@@ -302,9 +305,9 @@ def test_the_muted_path_cannot_fire_the_check_spuriously(rig: Rig) -> None:
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
 
-    rig.legacy(TERMINAL, "idle")
+    rig.classified(TERMINAL, "idle")
 
-    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+    assert rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE) == []
 
 
 def test_a_pane_republishing_the_same_wrong_status_still_fires(rig: Rig) -> None:
@@ -322,9 +325,9 @@ def test_a_pane_republishing_the_same_wrong_status_still_fires(rig: Rig) -> None
     for _ in range(12):
         rig.clock.advance(5)
         rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
-        rig.legacy(TERMINAL, "idle")
+        rig.classified(TERMINAL, "idle")
 
-    findings = rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)
+    findings = rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE)
     assert len(findings) == 1
     assert findings[0].dedupe_key == "busy|idle"
 
@@ -341,13 +344,13 @@ def test_the_onset_never_predates_the_current_shadow_state(rig: Rig) -> None:
     for _ in range(6):
         rig.clock.advance(10)
         rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
-        rig.legacy(TERMINAL, "idle")  # agrees: shadow is idle too
-    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+        rig.classified(TERMINAL, "idle")  # agrees: shadow is idle too
+    assert rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE) == []
 
     # The shadow moves to busy.  The disagreement starts NOW, not 60s ago.
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
     rig.clock.advance(2)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
-    rig.legacy(TERMINAL, "idle")
+    rig.classified(TERMINAL, "idle")
 
-    assert rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE) == []
+    assert rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE) == []

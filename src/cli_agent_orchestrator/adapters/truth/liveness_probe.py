@@ -127,6 +127,24 @@ class LivenessProbe:
     returns the terminals to judge.  ``teardown_lookup`` is optional and exists
     only for tests that want to bypass the event-log read; production leaves it
     ``None`` and the exit reason comes from the ``teardown.intended`` rows.
+
+    ``sampler_tick`` is WP-ARCH phase 2's §12 seam, and it is here because phase 2
+    is the phase that notices a cross-phase defect neither phase owns.  The
+    pane-delta sampler that ``fuse_status``'s rules 3a/3b read is driven from
+    exactly one place, the stalled-callback watchdog's tick — and that module is
+    phase 3's D6 K4, deleted in 3c.  After that deletion the rules would read a
+    sample nothing refreshes, which by the sampler's own no-evidence rule degrades
+    to ``None`` and silently disables the pane-delta downgrade for every UNSOURCED
+    terminal: the ones I7 promises are unaffected, and with no acceptance
+    criterion in phase 3 to catch it.  This probe already owns the fleet's
+    periodic tmux work on the same ``PANE_HEARTBEAT_S`` cadence, so it is where
+    the drive belongs.
+
+    The probe supplies the TICK, not the capture.  The F506 single-sampler ban
+    stands: the callable handed in is the sampler's own entry point, and nothing
+    here reads a pane.  A ``sampler_tick`` that raises cannot reach the probe's
+    own work — a re-drive that could break the liveness probe would be a strictly
+    worse trade than the regression it prevents.
     """
 
     def __init__(
@@ -135,10 +153,12 @@ class LivenessProbe:
         list_panes: Callable[[], Iterable[PaneRecord]],
         fleet: Callable[[], Iterable[TerminalRef]],
         teardown_lookup: Callable[[str], bool] | None = None,
+        sampler_tick: Callable[[], None] | None = None,
     ) -> None:
         self._list_panes = list_panes
         self._fleet = fleet
         self._teardown_lookup = teardown_lookup
+        self._sampler_tick = sampler_tick
         self._state = _ProbeState()
         self._task: asyncio.Task[None] | None = None
         self._stopping = threading.Event()
@@ -191,6 +211,7 @@ class LivenessProbe:
         runtime = producer_runtime()
         if runtime is None:
             return
+        self._drive_sampler()
         try:
             panes: list[PaneRecord] | None
             try:
@@ -206,6 +227,22 @@ class LivenessProbe:
             self._on_successful_probe(runtime, panes)
         except Exception:  # pragma: no cover - the never-break-the-server rule
             logger.debug("liveness probe failed", exc_info=True)
+
+    def _drive_sampler(self) -> None:
+        """WP-ARCH phase 2 §12 — one pane-delta sample per tick.  Never raises.
+
+        Runs BEFORE the probe's own work rather than after, so a probe that fails
+        and returns early still refreshes the sample: the sampler's freshness is
+        about the pane, and a tmux listing that could not be read says nothing
+        about whether an individual pane changed.
+        """
+        tick = self._sampler_tick
+        if tick is None:
+            return
+        try:
+            tick()
+        except Exception:  # pragma: no cover - the never-break-the-probe rule
+            logger.debug("pane-delta sampler tick failed", exc_info=True)
 
     # -- failure path --------------------------------------------------------
 

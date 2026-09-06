@@ -53,7 +53,8 @@ __all__ = ["SqliteEventStore"]
 
 _COLUMNS = (
     "event_id, terminal_id, seq, kind, producer, confidence, observed_at, "
-    "ingested_at, payload, source_ref, run_id, msg_id, decision, evidence"
+    "ingested_at, payload, source_ref, run_id, msg_id, decision, evidence, "
+    "idempotency_key"
 )
 
 
@@ -86,12 +87,32 @@ class SqliteEventStore:
 
         The whole point of this method is the transaction boundary.  Everything
         else here is bookkeeping.
+
+        A draft carrying an ``idempotency_key`` (WP-ARCH phase 2, D4) is
+        replay-safe: a second append under the same key returns the row already
+        stored.  The lookup happens BEFORE the high-water bump and inside the
+        same ``BEGIN IMMEDIATE``, and both halves of that matter.  Before,
+        because a duplicate that consumed a sequence number would leave a gap the
+        moment it returned early, and B7 makes gaps illegal.  Inside, because the
+        single-writer discipline is what makes a SELECT-then-INSERT safe here at
+        all — checking outside the transaction would be a race with itself.
         """
         ingested_at = self._clock.now()
         event_id = new_ulid()
         conn = self._pool.connection()
 
         with immediate_transaction(conn):
+            if draft.idempotency_key is not None:
+                existing = conn.execute(
+                    f"SELECT {_COLUMNS} FROM worker_event WHERE idempotency_key = ?",
+                    (draft.idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    # The retry's own checks are deliberately NOT re-run: the
+                    # first append already ran them, and a repeat would count one
+                    # breach twice in a table whose whole point is that a repeat
+                    # increments rather than accumulates.
+                    return _row_to_event(existing)
             row = conn.execute(
                 "SELECT high_water FROM worker_event_seq WHERE terminal_id = ?",
                 (draft.terminal_id,),
@@ -106,7 +127,7 @@ class SqliteEventStore:
                 self._after_seq_bump()
             conn.execute(
                 f"INSERT INTO worker_event ({_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_id,
                     draft.terminal_id,
@@ -122,6 +143,7 @@ class SqliteEventStore:
                     draft.msg_id,
                     draft.decision.value if draft.decision is not None else None,
                     draft.evidence,
+                    draft.idempotency_key,
                 ),
             )
 
@@ -252,4 +274,8 @@ def _row_to_event(row: sqlite3.Row) -> WorkerEvent:
         msg_id=mapping["msg_id"],
         decision=DecisionKind(decision) if decision is not None else None,
         evidence=mapping["evidence"],
+        # ``.get`` rather than a subscript: ``cao diag`` opens the live database
+        # read-only, and a reader that started before the phase-2 migration ran
+        # would otherwise raise on every row it reads.
+        idempotency_key=mapping.get("idempotency_key"),
     )

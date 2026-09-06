@@ -46,6 +46,20 @@ AC11_LEGACY_IMPORTERS = {
     # same reason: the contact surface a reviewer has to read stays at one file
     # instead of spreading across the two largest legacy packages.
     "services/delivery_mirror.py",
+    # WP-ARCH phase 2a (#583) adds ONE entry, and it is not the file the blueprint
+    # named. §5 lists ``api/main.py`` as the seventh, because D3b puts the hook
+    # producer's append inside the two shipped route handlers — which is the right
+    # place for the APPEND and an impossible place for the IMPORT: the fifth
+    # import-linter contract, ``adapters-only-via-composition-root``, forbids
+    # ``cli_agent_orchestrator.api`` from naming an adapter at all.
+    #
+    # So the append happens where D3b says and the handlers reach it through
+    # ``services/claude_truth_hooks.py``, which is legacy and may import the new
+    # tree. That is lane C's ``cli/commands/diag.py`` pattern and phase 3a's
+    # ``services/delivery_mirror.py`` pattern applied a third time, for the third
+    # time's own reason: the contact surface a reviewer reads stays at one file.
+    # The set grows by one as §5 requires; only the file's name differs.
+    "services/claude_truth_hooks.py",
     # WP-ARCH phase 3b (#584) adds ONE more, and for the third time the same
     # reason. 3b's legacy contact surface is wide — the seat's role gate in
     # ``inbox_service``, the mutes on the doorbell, the ladder, the teammate

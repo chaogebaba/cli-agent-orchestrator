@@ -39,6 +39,7 @@ from typing import Any
 
 from cli_agent_orchestrator.adapters.truth.wiring import emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
+    PROJECTION_ORIGIN,
     Confidence,
     DecisionKind,
     EventDraft,
@@ -48,6 +49,10 @@ from cli_agent_orchestrator.core.events import (
 
 __all__ = [
     "CAPPED_CONDITION_LABEL",
+    "PROJECTION_ORIGIN",
+    "as_text",
+    "fed_by",
+    "effective_origin",
     "forget",
     "last_published_event_id",
     "record_fleet_override",
@@ -62,6 +67,27 @@ logger = logging.getLogger(__name__)
 #: string.  Matching the label rather than the kind is deliberate — the label is
 #: what the fleet row, the capped-lane policy and the operator all read.
 CAPPED_CONDITION_LABEL = "CAPPED"
+
+
+def fed_by(origin: str) -> str:
+    """Which producer of record caused this publish (D5).
+
+    D5's hazard, and the reason a one-word field is worth a decision: the moment
+    D1 publishes the projection through this same egress, the published status is
+    *caused by* the projection, so ``DIAG-LEGACY-DISAGREE`` would compare the
+    projection with itself and report perfect agreement forever.  The comparison
+    would not break; it would go quiet, which is worse.  Dark launching's shared
+    invariant — Scientist is "only safe for wrapping methods that aren't changing
+    data", Envoy's mirrored responses "are always ignored" — is that the candidate
+    stays causally inert with respect to the control, and D1 ends that.
+
+    So every publish names its feeder, and the agreement classifier drops the ones
+    the projection fed.  In sub-phase 2a there is no such publisher yet and this
+    always answers ``pane``; the field lands now anyway, because D5 must be
+    written BEFORE D1 or the report 2b's gate rests on is self-confirming.
+    """
+    return PROJECTION_ORIGIN if origin == PROJECTION_ORIGIN else Producer.PANE.value
+
 
 _lock = threading.Lock()
 #: terminal_id -> the last published ``(latched_status, origin)`` pair.
@@ -137,6 +163,17 @@ def _effective_origin(origin: str | None, pass_outcome: Any) -> str:
     return "forced" if _as_text(pass_outcome) == "forced" else "incremental"
 
 
+#: Public aliases for the two renderers WP-ARCH phase 2's classification-site
+#: producer (D1c) must reuse rather than reimplement.  Both producers edge-trigger
+#: on the SAME ``(latched_status, origin)`` pair, and that pair has to be computed
+#: by the same expression: a second copy would drift, and a drifted pair means one
+#: producer emits an edge the other does not — which D5's comparison would then
+#: report as a disagreement between the projection and the pane, when what
+#: actually disagreed was two renderings of one string.
+as_text = _as_text
+effective_origin = _effective_origin
+
+
 def record_legacy_publish(
     monitor: Any,
     terminal_id: str,
@@ -207,6 +244,7 @@ def record_legacy_publish(
                         "raw_classification": _as_text(raw_classification),
                         "fusion_reason": fusion_reason,
                         "condition": condition,
+                        "fed_by": fed_by(origin_text),
                     },
                 )
             )

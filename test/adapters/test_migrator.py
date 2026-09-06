@@ -36,17 +36,30 @@ _AUDIT_WORKER_EVENT_COLUMNS = [
     "evidence",
 ]
 
+#: WP-ARCH phase 2, D4/R1 adds the fifteenth column to the SAME migrator — no
+#: second migrator, which is the commitment both phase 2 and phase 3 make because
+#: a second one is how one schema comes to have two authorities.
+_PHASE2_WORKER_EVENT_COLUMNS = _AUDIT_WORKER_EVENT_COLUMNS + ["idempotency_key"]
+
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
 def test_worker_event_columns_match_the_audit_ddl(db_path: Path) -> None:
-    """All fourteen columns, in the audit's order — run_id/msg_id/decision/evidence included."""
+    """The audit's fourteen in the audit's ORDER, then phase 2's one.
+
+    Order is asserted, not membership, and the two halves are asserted separately
+    so the amendment is visible: the audit's prefix is unchanged and phase 2's
+    column is appended.  A column inserted into the middle would pass a set
+    comparison and break every positional reader.
+    """
     result, pool = migrate(db_path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
     assert result.ok
     assert pool is not None
-    assert _columns(pool.connection(), "worker_event") == _AUDIT_WORKER_EVENT_COLUMNS
+    columns = _columns(pool.connection(), "worker_event")
+    assert columns[: len(_AUDIT_WORKER_EVENT_COLUMNS)] == _AUDIT_WORKER_EVENT_COLUMNS
+    assert columns == _PHASE2_WORKER_EVENT_COLUMNS
     pool.close_all()
 
 

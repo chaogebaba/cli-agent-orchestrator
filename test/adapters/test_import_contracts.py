@@ -48,6 +48,15 @@ AC11_LEGACY_IMPORTERS = {
     # same reason: the contact surface a reviewer has to read stays at one file
     # instead of spreading across the two largest legacy packages.
     "services/delivery_mirror.py",
+    # WP-ARCH phase 2a (#583) adds ONE entry, and it is a shim for the same
+    # reason ``services/delivery_mirror.py`` is. D3b puts the hook producer's
+    # append inside the two shipped route handlers (``api/main.py:4788`` and
+    # ``:4830``), which is the right place for the APPEND and an impossible one
+    # for the IMPORT: the ``adapters-only-via-composition-root`` contract forbids
+    # ``cli_agent_orchestrator.api`` from naming an adapter at all. So the
+    # handlers call this one-file shim, which is legacy and may import the new
+    # tree, and ``api/main.py`` itself names nothing in it (blueprint A1-1).
+    "services/claude_truth_hooks.py",
     # WP-ARCH phase 3b (#584): one more, same pattern. Every legacy file 3b
     # touches reaches the new tree through ``services/queue_carrier.py``, which
     # is also where D7's split gets its three ``core.ports`` implementations —
