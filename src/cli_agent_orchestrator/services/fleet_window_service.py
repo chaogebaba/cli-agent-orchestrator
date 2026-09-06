@@ -33,8 +33,11 @@ binary, which is why step 2 below probes ``PATH`` before touching tmux.
 
 import importlib.util
 import logging
+import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,22 @@ def fleet_tui_enabled(env: Optional[Mapping[str, str]]) -> bool:
     if env is None:
         return True
     return str(env.get(FLEET_TUI_ENV, "1")) != "0"
+
+
+def _resolve_console_script() -> Optional[str]:
+    """Locate ``cao-fleet``, preferring the venv beside ``sys.executable``.
+
+    ``cao-server`` runs as a systemd user unit whose PATH is the systemd
+    default (``/usr/local/bin:/usr/bin``), not the venv's ``bin`` — so a
+    ``shutil.which`` alone finds nothing and every server-side fleet window is
+    skipped (#633). The console script is installed beside the interpreter that
+    runs the server, so probe ``Path(sys.executable).parent / "cao-fleet"``
+    first and only fall back to PATH when it is not an executable file there.
+    """
+    candidate = Path(sys.executable).parent / FLEET_CONSOLE_SCRIPT
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return shutil.which(FLEET_CONSOLE_SCRIPT)
 
 
 def _run_tmux(args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
@@ -118,15 +137,16 @@ def ensure_fleet_window(
             logger.debug("fleet window: %s=0, skipping for %s", FLEET_TUI_ENV, session_name)
             return False
 
-        executable = shutil.which(FLEET_CONSOLE_SCRIPT)
+        executable = _resolve_console_script()
         if executable is None:
             logger.info(
-                "fleet window: %s is not on PATH, skipping for %s "
+                "fleet window: %s is not beside the interpreter or on PATH, skipping for %s "
                 "(install the 'cli-agent-orchestrator[fleet]' extra to enable it)",
                 FLEET_CONSOLE_SCRIPT,
                 session_name,
             )
             return False
+        logger.info("fleet window: resolved %s to %s", FLEET_CONSOLE_SCRIPT, executable)
         # The console script is declared unconditionally in pyproject, so it is
         # on PATH even for a server-only install; the extra is what adds
         # textual. Probing the library rather than the script is what keeps a
