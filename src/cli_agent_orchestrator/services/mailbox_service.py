@@ -1488,6 +1488,238 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
         lock.release()
 
 
+def consume_on_native_delivery(inbox_row_id: int) -> dict[str, Any]:
+    """F783 #640: a SUCCESSFUL native seat-wake for ``inbox_row_id`` IS the ack.
+
+    The user's decision (2026-09-06, "Native only; others silent"): a native
+    agent-message that reaches the seat's TUI is guaranteed-rendered — it is not
+    routed through the user's input box — so it is a consumed message the moment
+    the socket write succeeds, even if it landed under the spinner. Every other
+    surface (the bridge doorbell, the ``re-push N`` nag, the ``[cao-fleet]``
+    coalesced digest, and the drain hook's body re-injection) must then stay
+    silent for that id. This is where that consumption is recorded.
+
+    Three effects, in ONE ``BEGIN IMMEDIATE`` transaction so a reader never sees
+    a half-consumed row:
+
+    1. **NATIVE emission (SUCCEEDED)** on the F642 delivery ledger. This is the
+       server-side switch that mutes the hook: ``hook_claim_ids`` returns only
+       ids with NO prior emission by another carrier, so an id the native
+       carrier has claimed is one the hook can never win — the drain prints
+       nothing for it, decided in the server rather than filtered in the shell.
+
+    2. **Inbox row status ``pending`` → ``delivered``** (reason
+       ``native_consumed``). The doorbell and the coalescer both re-check
+       ``_is_row_still_pending`` at fire time and return ``skipped_acked`` for a
+       non-pending row, so an already-scheduled ring becomes a no-op (idempotence,
+       AC5); the drain's ``--status pending`` filter drops it server-side too; and
+       rung-1 re-push gates on the same pending check.
+
+    3. **Cursor-safe watermark advance.** ``consumed_through_id`` is a single
+       high-water integer, so it may only move to ``X`` when EVERY id ``≤ X`` in
+       the mailbox scope is already consumed (contiguity). If an older id is still
+       pending — the out-of-order case AC4 pins — the cursor is LEFT WHERE IT IS
+       and this row is consumed individually by its status flip alone; moving the
+       watermark past a still-pending older id would silently hide it from the
+       seat's next ``list_messages`` clamp. When the older id is later consumed,
+       an ordinary advance sweeps past both.
+
+    Idempotent: a second call for the same id wins no emission (UNIQUE) and finds
+    the row already non-pending, so it changes nothing and reports
+    ``changed=False``. Never raises the delivery path's caller: a resolution
+    failure returns ``consumed=False`` rather than propagating.
+
+    Returns a dict describing what happened, for the caller's audit log and the
+    acceptance tests. Does NOT touch BUSY-class condition-ping suppression
+    (F639 #494, F718 #574) — that path owns its own muting and is out of scope.
+    """
+    from cli_agent_orchestrator.clients import database as _db_mod
+    from cli_agent_orchestrator.clients.database import DeliveryObligationModel as _DObl
+    from cli_agent_orchestrator.clients.delivery_ledger import Carrier, EmissionOutcome
+
+    result: dict[str, Any] = {
+        "inbox_row_id": int(inbox_row_id),
+        "consumed": False,
+        "emission_won": False,
+        "status_flipped": False,
+        "cursor_advanced": False,
+        "consumed_through_id": None,
+        "changed": False,
+    }
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+            row: Any = db.query(InboxModel).filter(InboxModel.id == int(inbox_row_id)).one_or_none()
+            if row is None:
+                db.rollback()
+                result["reason"] = "row_absent"
+                return result
+
+            # (1) NATIVE emission — the server-side hook mute. Claim then record
+            # SUCCEEDED. A lost claim (another native attempt already recorded)
+            # is fine: the id is still natively carried, so the mute holds.
+            won = _db_mod.claim_emission(db, message_id=int(inbox_row_id), carrier=Carrier.NATIVE)
+            result["emission_won"] = bool(won)
+            _db_mod.record_emission_outcome(
+                db,
+                message_id=int(inbox_row_id),
+                carrier=Carrier.NATIVE,
+                outcome=EmissionOutcome.SUCCEEDED,
+            )
+
+            # (2) status pending -> delivered (only a still-pending row; never
+            # clobber a terminal state such as superseded/expired/cancelled).
+            if row.status == MessageStatus.PENDING.value:
+                row.status = MessageStatus.DELIVERED.value
+                row.failure_reason = "native_consumed"
+                result["status_flipped"] = True
+                # Settle any OPEN delivery obligation so the FX191 floor does not
+                # re-ring a row the seat has already received.
+                db.query(_DObl).filter(
+                    _DObl.inbox_row_id == int(inbox_row_id),
+                    _DObl.state == "OPEN",
+                ).update(
+                    {
+                        _DObl.state: "ACKED",
+                        _DObl.terminal_at: _utcnow(),
+                        _DObl.terminal_reason: "native_consumed",
+                    },
+                    synchronize_session=False,
+                )
+
+            # (3) cursor-safe watermark advance, mailbox-scoped.
+            mailbox_id = row.logical_receiver_id
+            if mailbox_id:
+                mailbox: Any = (
+                    db.query(MailboxModel).filter(MailboxModel.id == mailbox_id).one_or_none()
+                )
+                if mailbox is not None:
+                    prior_cursor = int(mailbox.consumed_through_id)
+                    result["consumed_through_id"] = prior_cursor
+                    addresses = _address_ids(db, mailbox_id)
+                    address_scope = or_(
+                        InboxModel.logical_receiver_id == mailbox_id,
+                        InboxModel.receiver_id.in_(addresses),
+                    )
+                    # The watermark may advance ONLY over a contiguous run of
+                    # consumed ids from ``prior_cursor``. The first id above the
+                    # cursor that the seat could still be owed — PENDING or HELD —
+                    # is the wall: the cursor rises to just below it. If there is
+                    # no such id above the cursor, it rises to the current max id
+                    # in scope. This both refuses to jump over an older
+                    # not-yet-consumed id (AC4) and sweeps past every id that
+                    # became contiguous once the straggler was consumed.
+                    unconsumed_statuses = [
+                        MessageStatus.PENDING.value,
+                        MessageStatus.HELD.value,
+                    ]
+                    oldest_pending = (
+                        db.query(func.min(InboxModel.id))
+                        .filter(
+                            InboxModel.id > prior_cursor,
+                            InboxModel.status.in_(unconsumed_statuses),
+                            address_scope,
+                        )
+                        .scalar()
+                    )
+                    if oldest_pending is None:
+                        ceiling = (
+                            db.query(func.max(InboxModel.id))
+                            .filter(InboxModel.id > prior_cursor, address_scope)
+                            .scalar()
+                        )
+                    else:
+                        # highest consumed id strictly below the first pending id
+                        ceiling = (
+                            db.query(func.max(InboxModel.id))
+                            .filter(
+                                InboxModel.id > prior_cursor,
+                                InboxModel.id < int(oldest_pending),
+                                address_scope,
+                            )
+                            .scalar()
+                        )
+                    if ceiling is not None and int(ceiling) > prior_cursor:
+                        mailbox.consumed_through_id = int(ceiling)
+                        mailbox.updated_at = _utcnow()
+                        result["cursor_advanced"] = True
+                    result["consumed_through_id"] = int(mailbox.consumed_through_id)
+
+            db.commit()
+            result["consumed"] = result["status_flipped"] or result["emission_won"]
+            result["changed"] = result["status_flipped"] or result["cursor_advanced"]
+
+        # Post-commit best-effort side effects, mirroring ack_messages: disarm a
+        # scheduled nudge and re-evaluate the pending sentinel so the doorbell /
+        # re-push machinery sees the consumption immediately.
+        if result["status_flipped"] and mailbox_id:
+            try:
+                from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+                nudge_discipline.on_cursor_advance(row.receiver_id, str(mailbox_id))
+            except Exception:
+                logger.debug("f783 nudge disarm best-effort failed", exc_info=True)
+            try:
+                from cli_agent_orchestrator.clients.database import (
+                    _remove_supervisor_pending_flag_if_drained,
+                )
+
+                _remove_supervisor_pending_flag_if_drained()
+            except Exception:
+                logger.debug("f783 pending-sentinel refresh best-effort failed", exc_info=True)
+        return result
+    except Exception:
+        # A consumption that cannot be recorded must NOT break the native send:
+        # the id stays pending and today's doorbell -> re-push -> hook fallback
+        # runs for it, which is the safe direction (an extra copy, never a loss).
+        logger.debug(
+            "f783 consume_on_native_delivery failed for row %s", inbox_row_id, exc_info=True
+        )
+        result["reason"] = "exception"
+        return result
+
+
+def record_native_delivery_failure(inbox_row_id: int, reason: str) -> None:
+    """F783 #640 point 3: a FAILED native send leaves the row pending and adds a
+    typed, auditable failure marker so the fallback (doorbell -> re-push -> hook)
+    is traceable to the native attempt that missed.
+
+    Records a ``NATIVE`` emission with outcome ``failed`` (the claim is retained,
+    so a later native retry reuses the row and a dropped socket does not burn the
+    carrier) and a namespaced trace row carrying the reason. Never raises into
+    the delivery path; never flips status or moves the cursor — the fallback owns
+    the id exactly as it does today.
+    """
+    from cli_agent_orchestrator.clients import database as _db_mod
+    from cli_agent_orchestrator.clients.delivery_ledger import Carrier, EmissionOutcome
+
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+            _db_mod.claim_emission(db, message_id=int(inbox_row_id), carrier=Carrier.NATIVE)
+            _db_mod.record_emission_outcome(
+                db,
+                message_id=int(inbox_row_id),
+                carrier=Carrier.NATIVE,
+                outcome=EmissionOutcome.FAILED,
+            )
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=int(inbox_row_id),
+                    kind="f783.native_delivery_failed",
+                    phase="native_delivery",
+                    decision="fallback",
+                    reason=str(reason)[:200],
+                    payload={},
+                )
+            )
+            db.commit()
+    except Exception:
+        logger.debug(
+            "f783 record_native_delivery_failure failed for row %s", inbox_row_id, exc_info=True
+        )
+
+
 def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
     """Settle malformed PENDING rows as DELIVERY_FAILED (quarantine sweep).
 
