@@ -808,15 +808,26 @@ class ConditionDelivery:
         return self._last.get(terminal_id) == key
 
     def _inbox_declined(self, kind: str, subtype: str) -> bool:
-        """D5 / F790 (#647): does the drain-class predicate decline the inbox leg?
-        Only consulted when a log store is wired (spine active); otherwise F611's
-        fan-out is unchanged. Keyed on ``(kind, subtype)`` so the command_exit
-        PROC_EXITED case matches the drain hook exactly (F718 #574)."""
+        """D5 / F790 (#647): does the inbox leg decline for this condition?
+
+        Declined when EITHER the drain-class predicate matches (BUSY, or a
+        command_exit PROC_EXITED — the SAME class the supervisor-inbox-drain hook
+        withholds, F718 #574) OR the F642 routing map (``KIND_SURFACES``) has no
+        inbox surface for the kind. The second arm preserves base behaviour for
+        the map's other inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD):
+        F790 must only STOP enqueuing the drain class, never START enqueuing a
+        kind the map already declined (gate r1 B1). Keyed on ``(kind, subtype)``
+        so the command_exit PROC_EXITED case is matched exactly. Only consulted
+        when a log store is wired (spine active); otherwise F611's fan-out is
+        unchanged."""
         if self._log_store is None:
             return False
-        from cli_agent_orchestrator.clients.delivery_ledger import drain_class_declines_inbox
+        from cli_agent_orchestrator.clients.delivery_ledger import (
+            drain_class_declines_inbox,
+            surfaces_for_kind,
+        )
 
-        return drain_class_declines_inbox(kind, subtype)
+        return drain_class_declines_inbox(kind, subtype) or not surfaces_for_kind(kind).inbox
 
     @staticmethod
     def _surfaces_str(kind: str) -> str:

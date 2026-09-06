@@ -124,6 +124,54 @@ def test_cut1_mutant_flipped_class_predicate_pushes_command_exit():
     assert mutant_predicate("PROC_EXITED", "command_exit_code") is False
 
 
+# ══ gate r1 B1: map-declined kinds (NET/TRANSIENT) stay silent as on base ════
+@pytest.mark.parametrize(
+    "kind",
+    [ConditionKind.NET_INTERRUPTED, ConditionKind.TRANSIENT_OVERLOAD],
+)
+def test_r1b1_map_declined_kinds_never_enqueue(db_env, kind):
+    """gate r1 B1: NET_INTERRUPTED / TRANSIENT_OVERLOAD map to inbox=False in
+    KIND_SURFACES, so they were declined at the producer on base and MUST stay
+    declined. F790 must only STOP enqueuing the drain class — never START
+    enqueuing a kind the F642 routing map already declined. `_inbox_declined`
+    declines when the drain class matches OR the map has no inbox surface."""
+    inbox = []
+    d = ConditionDelivery(
+        inbox_sink=lambda t, c: inbox.append((t, c.kind.value)),
+        log_store=DbConditionLogStore(),
+    )
+    res = d.deliver("wrk", _cond(kind), epoch=1)
+    assert res.delivered is True  # still fleet + bus
+    assert res.inbox_pushes == 0  # but NEVER the seat inbox
+    assert inbox == []
+
+
+# ══ gate r1 B2: ANOMALY-class conditions still push to the seat inbox ═════════
+@pytest.mark.parametrize(
+    ("kind", "subtype"),
+    [
+        (ConditionKind.DIALOG_BLOCKED, "trust_dir_dialog"),
+        (ConditionKind.CAPPED, "usage_limit_hard"),
+        (ConditionKind.AUTH_EXPIRED, "token_refresh_failed"),
+        (ConditionKind.CONTEXT_EXHAUSTED, "footer_percent_status"),
+        (ConditionKind.PROC_EXITED, "shell_baseline_return"),
+    ],
+)
+def test_r1b2_anomaly_class_still_enqueues(db_env, kind, subtype):
+    """gate r1 B2: the ANOMALY-class conditions (KIND_SURFACES inbox=True) still
+    push to the supervisor inbox exactly once — F790 preserves today's behaviour
+    for them. Proven by the shipped test set, not an ad-hoc probe."""
+    inbox = []
+    d = ConditionDelivery(
+        inbox_sink=lambda t, c: inbox.append((t, c.kind.value)),
+        log_store=DbConditionLogStore(),
+    )
+    res = d.deliver("wrk", _cond(kind, subtype=subtype), epoch=1)
+    assert res.delivered is True
+    assert res.inbox_pushes == 1
+    assert inbox == [("wrk", kind.value)]  # the sink actually received the push
+
+
 # ══ Cut 2: envelope None for condition/watchdog; else 1500-char cap ══════════
 def test_cut2_envelope_none_for_condition_and_watchdog():
     """A [CONDITION]/[watchdog] body collapses to None so the native envelope
