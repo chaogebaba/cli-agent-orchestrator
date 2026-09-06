@@ -57,6 +57,16 @@ def db_env(monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions, raising=False)
     database.clear_terminal_metadata_cache()
+    # Neutralise the two best-effort post-commit side effects of consumption so
+    # the hermetic-home guard (F549) does not trip on the real CAO home sentinel
+    # / nudge state. They are transport hygiene, not part of AC1-AC6, and are
+    # already wrapped in try/except in production.
+    monkeypatch.setattr(
+        database, "_remove_supervisor_pending_flag_if_drained", lambda: None, raising=False
+    )
+    import cli_agent_orchestrator.services.nudge_discipline as _nd
+
+    monkeypatch.setattr(_nd.nudge_discipline, "on_cursor_advance", lambda *a, **k: None)
     with sessions() as db:
         _make_mailbox(db, consumed_through_id=0)
         db.commit()
