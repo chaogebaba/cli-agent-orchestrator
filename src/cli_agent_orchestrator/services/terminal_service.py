@@ -151,6 +151,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_provider_profile_defaults,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
@@ -2114,10 +2115,26 @@ async def create_terminal(
                     "model",
                 )
             model = resolved_model
+            # F777/F780 gate r1 B3: resolve the effective reasoning effort with
+            # the SAME providers.toml precedence the kiro provider uses at
+            # launch, BEFORE the pre-allocation probe, and request the `effort`
+            # capability when it is non-empty. This makes a wrapper that lacks
+            # `--effort` fail the probe pre-allocation instead of accepting the
+            # launch argv and rejecting it after DB/tmux state exists. Mirrors
+            # the model pre-resolution directly above.
+            _kiro_provider_defaults = get_provider_defaults("kiro_cli")
+            _kiro_profile_name = getattr(profile, "name", None) or agent_profile
+            _kiro_profile_defaults = get_provider_profile_defaults(
+                _kiro_provider_defaults, _kiro_profile_name
+            )
+            resolved_effort = resolve_reasoning_effort(
+                "kiro_cli", _kiro_profile_defaults, _kiro_provider_defaults, profile
+            )
             requested = requested_kiro_capabilities(
                 resolved_engine,
                 model=model,
                 yolo=True,
+                effort=resolved_effort,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             await asyncio.to_thread(probe, resolved_engine, requested)

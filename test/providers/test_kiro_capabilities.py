@@ -39,6 +39,54 @@ def test_probe_accepts_v2_and_requested_wrapper_features():
     assert result.agent_engines == frozenset({"v1", "v2", "v3"})
 
 
+# ── F777/F780 gate r1 B3: --effort capability probed pre-allocation ───────────
+
+_HELP_WITH_EFFORT = (
+    "kiro-cli version 2.21.1\n"
+    "--agent-engine v2|v1|v3\n--v3\n--agent NAME\n--model MODEL\n--effort EFFORT\n"
+    "--legacy-ui\n--trust-all-tools\n--require-mcp-startup\n"
+)
+
+
+def _runner_with_effort(command, **_kwargs):
+    output = "kiro-cli version 2.21.1" if command[-1] == "--version" else _HELP_WITH_EFFORT
+    return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+
+def test_requested_kiro_capabilities_includes_effort_only_when_set():
+    """effort mirrors model: requested iff a non-empty effort will be launched."""
+    with_effort = requested_kiro_capabilities(KiroEngine.KAS, model="m", yolo=True, effort="high")
+    assert "effort" in with_effort
+    without = requested_kiro_capabilities(KiroEngine.KAS, model="m", yolo=True, effort=None)
+    assert "effort" not in without
+    # default (no effort kwarg) is backward-compatible: no effort capability.
+    assert "effort" not in requested_kiro_capabilities(KiroEngine.KAS, model="m", yolo=True)
+
+
+def test_probe_accepts_effort_when_wrapper_advertises_it():
+    """A wrapper that advertises --effort passes the probe with effort requested."""
+    result = probe_kiro_capabilities(
+        KiroEngine.V2, {"profile", "model", "effort", "trust"}, runner=_runner_with_effort
+    )
+    assert result.supports("--effort")
+    assert result.version == "2.21.1"
+
+
+def test_probe_rejects_effort_when_wrapper_lacks_it_preallocation():
+    """Gate r1 B3: a wrapper WITHOUT --effort fails the pre-allocation probe
+    when the effort capability is requested — it never reaches launch/allocation.
+
+    The `_runner` fixture help omits --effort; requesting `effort` must raise
+    an unsupported_capability KiroCapabilityError naming --effort.
+    """
+    with pytest.raises(KiroCapabilityError) as exc_info:
+        probe_kiro_capabilities(
+            KiroEngine.V2, {"profile", "model", "effort", "trust"}, runner=_runner
+        )
+    assert exc_info.value.kind == "unsupported_capability"
+    assert "--effort" in str(exc_info.value)
+
+
 def test_probe_accepts_released_wrapper_help_before_explicit_v2_construction():
     """The released wrapper splits root commands from chat engine capabilities."""
     calls = []

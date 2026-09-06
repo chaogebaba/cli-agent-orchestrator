@@ -306,18 +306,22 @@ class TestClineCliModelResolution:
 
 
 class TestClineCliThinking:
-    """Tests for --thinking flag resolution."""
+    """Tests for --thinking flag resolution.
+
+    F777/F780 gate r1 B2: _resolve_thinking now routes through the shared
+    settings_service.resolve_reasoning_effort seam, so these drive the real
+    resolver against mocked providers.toml layers rather than mocking
+    resolve_provider_string_option (which _resolve_thinking no longer calls).
+    """
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
-    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_default_thinking_high(self, mock_load, mock_resolve, mock_prof, mock_defaults):
-        """Without any override, thinking defaults to 'high'."""
+    def test_default_thinking_high(self, mock_load, mock_prof, mock_defaults):
+        """Without any override, thinking defaults to the 'high' built-in."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {}
         mock_prof.return_value = {}
-        mock_resolve.return_value = None
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         result = provider._resolve_thinking()
@@ -325,14 +329,12 @@ class TestClineCliThinking:
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
-    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_toml_thinking_override(self, mock_load, mock_resolve, mock_prof, mock_defaults):
-        """providers.toml thinking value overrides the default."""
+    def test_toml_thinking_override(self, mock_load, mock_prof, mock_defaults):
+        """providers.toml [cline_cli] thinking value overrides the default."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"thinking": "medium"}
         mock_prof.return_value = {}
-        mock_resolve.return_value = "medium"
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         result = provider._resolve_thinking()
@@ -353,38 +355,32 @@ class TestClineCliThinking:
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
-    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_explicit_empty_suppresses_thinking(
-        self, mock_load, mock_resolve, mock_prof, mock_defaults
-    ):
-        """Explicit empty string in providers.toml suppresses the --thinking flag."""
+    def test_explicit_empty_suppresses_thinking(self, mock_load, mock_prof, mock_defaults):
+        """Gate r1 B2: `[cline_cli] thinking = ""` resolves to None (not '' and
+        not the 'high' built-in) — the flag is suppressed and None is persisted."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"thinking": ""}
         mock_prof.return_value = {}
-        mock_resolve.return_value = ""
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        assert provider._resolve_thinking() == ""
+        assert provider._resolve_thinking() is None
 
-    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_empty_thinking_omits_flag_from_base_args(
-        self, mock_load, mock_defaults, mock_prof, mock_resolve
-    ):
-        """Empty thinking value results in no --thinking flag in base args."""
+    def test_empty_thinking_omits_flag_from_base_args(self, mock_load, mock_defaults, mock_prof):
+        """Gate r1 B2: an explicit empty thinking omits --thinking from base args
+        AND persists None (mirrored empty-clear contract, Verify 1)."""
         mock_load.side_effect = FileNotFoundError("no profile")
-        mock_defaults.return_value = {"api_provider": "cline-pass"}
+        mock_defaults.return_value = {"api_provider": "cline-pass", "thinking": ""}
         mock_prof.return_value = {}
-        # First call for model (returns None), second call for thinking (returns "")
-        mock_resolve.side_effect = [None, ""]
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         parts = shlex.split(provider._build_base_args())
 
         assert "--thinking" not in parts
+        assert provider._resolve_thinking() is None
 
 
 # ─── Status detection ─────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ ProbeRunner = Callable[..., subprocess.CompletedProcess[str]]
 _FLAG_CAPABILITIES = {
     "profile": "--agent",
     "model": "--model",
+    "effort": "--effort",
     "ui": "--legacy-ui",
     "trust": "--trust-all-tools",
     "mcp_startup": "--require-mcp-startup",
@@ -31,7 +32,7 @@ _BARE_BOOLEAN_FLAGS = frozenset(
         "--require-mcp-startup",
     }
 )
-_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model"})
+_VALUE_BEARING_FLAGS = frozenset({"--agent", "--model", "--effort"})
 _REQUESTED_FLAGS = frozenset(
     {
         "--agent-engine",
@@ -444,7 +445,7 @@ def build_kiro_command(
 
 
 def requested_kiro_capabilities(
-    engine: KiroEngine, *, model: Optional[str], yolo: bool
+    engine: KiroEngine, *, model: Optional[str], yolo: bool, effort: Optional[str] = None
 ) -> set[str]:
     """Return every wrapper feature used by the launch lifecycle.
 
@@ -453,10 +454,21 @@ def requested_kiro_capabilities(
     ``--agent-engine=v2`` and its bare form drops the wrapper to the v1 engine,
     which serves no MCP tools. Requiring it would also reject wrappers that are
     otherwise fully usable. See ``build_kiro_command``.
+
+    F777/F780 gate r1 B3: ``effort`` mirrors ``model`` — when a non-empty
+    reasoning effort will be launched (``build_kiro_command(effort=…)`` emits
+    ``--effort``), the ``effort`` capability is requested so the pre-allocation
+    probe verifies the wrapper advertises ``--effort``. A wrapper predating the
+    flag then fails the probe BEFORE any DB/tmux allocation, rather than
+    accepting the launch argv and rejecting it after allocation. When no effort
+    is configured the capability is not requested, so older wrappers are
+    unaffected (same gating as ``model``).
     """
     requested = {"profile"}
     if model:
         requested.add("model")
+    if effort:
+        requested.add("effort")
     if engine == KiroEngine.KAS:
         # F107 B1: KAS launch always passes --trust-all-tools.
         requested.add("trust")
