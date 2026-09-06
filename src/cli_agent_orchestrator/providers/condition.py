@@ -63,6 +63,15 @@ class ConditionKind(str, Enum):
     PROC_EXITED = "PROC_EXITED"
     TRANSIENT_OVERLOAD = "TRANSIENT_OVERLOAD"
     BUSY = "BUSY"
+    # F792 (#649): an EXPECTED (not-anomalous) operating state — the seat has
+    # ENDED its own turn and is idle while one or more in-harness background
+    # AGENT lanes run (claude_code's "Waiting for N background agent(s) to
+    # finish" line). It is NOT busy and NOT a notice: it is never delivered to
+    # the supervisor inbox (it joins the F790 drain-class decline), it renders as
+    # `· waiting`, and it is meaningful on an idle/completed seat (so it is
+    # deliberately NOT a BUSY_CLASS_LABEL, which get_condition drops on a
+    # quiescent seat).
+    WAITING_ON_SUBAGENTS = "WAITING_ON_SUBAGENTS"
 
 
 class Confidence(str, Enum):
@@ -86,6 +95,12 @@ PRECEDENCE: Dict[ConditionKind, float] = {
     ConditionKind.CONTEXT_EXHAUSTED: 5.0,
     ConditionKind.TRANSIENT_OVERLOAD: 6.0,
     ConditionKind.BUSY: 7.0,
+    # F792 (#649): LAST — a live seat spinner (BUSY, 7.0) always wins over the
+    # subagent-wait line, so a seat that is genuinely working its own turn is
+    # never mislabelled `· waiting`. In practice the two are mutually exclusive
+    # (the wait line carries no spinner ellipsis), but the ordering makes the
+    # "working beats waiting" tie-break explicit.
+    ConditionKind.WAITING_ON_SUBAGENTS: 8.0,
 }
 
 
@@ -276,6 +291,16 @@ _CLINE_SELF_ABORT = re.compile(r"\[abort\] aborted by another client")
 _CODEX_BUSY = re.compile(r"Working \(.*esc to interrupt\)", re.IGNORECASE)
 _KIRO_BUSY = re.compile(r"Thinking\.\.\. \(esc to cancel\)|Kiro is working", re.IGNORECASE)
 _CLAUDE_BUSY = re.compile(r"[✶✢✽✻✳·*][^\n]*\u2026|Cooked for|Cultivat", re.IGNORECASE)
+# F792 (#649): claude_code's subagent-wait line — "✻ Waiting for N background
+# agent(s) to finish" (glyph optional/animating). An EXPECTED not-busy state:
+# the seat ended its own turn and is idle while an in-harness Agent lane runs.
+# Kept in sync with claude_code.SUBAGENT_WAIT_PATTERN by shape (a provider module
+# must not import a peer provider's regex here — same convention as the BUSY
+# anchors). The "agent" keyword after "Waiting for" is what distinguishes it from
+# the GH #392 "dynamic workflow/task to finish" line (which stays BUSY/working).
+_CLAUDE_SUBAGENT_WAIT = re.compile(
+    r"[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b[^\n]*\bagents?\b", re.IGNORECASE
+)
 _GROK_BUSY = re.compile(r"Waiting for response", re.IGNORECASE)
 _CLINE_BUSY = re.compile(r"\[thinking\]|\[run_commands\]", re.IGNORECASE)
 
@@ -526,6 +551,27 @@ def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     return None
 
 
+def _classify_waiting_on_subagents(provider: str, brows: List[str]) -> Optional[Condition]:
+    """F792 (#649): claude_code seat idle while a background AGENT lane runs.
+
+    Matches the "Waiting for N background agent(s) to finish" line in the live
+    tail (a statement about the present, like BUSY — tail-scoped so a stale
+    scrollback line cannot re-assert it). Returns the EXPECTED, not-busy
+    ``WAITING_ON_SUBAGENTS`` condition. Only claude_code renders this line."""
+    if provider != "claude_code":
+        return None
+    ev = _first_evidence(brows[-BUSY_TAIL_ROWS:], _CLAUDE_SUBAGENT_WAIT)
+    if ev:
+        return Condition(
+            ConditionKind.WAITING_ON_SUBAGENTS,
+            provider,
+            "background_agents",
+            ev,
+            Confidence.HIGH,
+        )
+    return None
+
+
 # The per-kind classifiers, applied then ranked by §2.2 precedence.
 _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] = (
     _classify_capped,
@@ -535,6 +581,7 @@ _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] =
     _classify_dialog,
     _classify_transient,
     _classify_busy,
+    _classify_waiting_on_subagents,
 )
 
 

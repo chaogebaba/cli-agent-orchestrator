@@ -1,0 +1,10 @@
+● The modular-core architecture blueprint is DESIGN-GATE-YES at r4.
+
+✻ Crunched for 14s · done 7:39 AM
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
