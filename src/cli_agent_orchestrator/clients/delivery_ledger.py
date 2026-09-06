@@ -230,6 +230,34 @@ def busy_class_declines_inbox(kind: str) -> bool:
     return surf.fleet and surf.bus and not surf.inbox
 
 
+def drain_class_declines_inbox(kind: str, subtype: Optional[str]) -> bool:
+    """F790 (#647): the SAME class the supervisor-inbox-drain hook withholds.
+
+    The hook (``.claude/hooks/supervisor-inbox-drain.sh``, F639 #494 / F718 #574)
+    keeps a condition body OUT of the seat when it is a BUSY-class ping OR a
+    ``command_exit_code`` process exit — decision-free liveness noise. F790 moves
+    that suppression UPSTREAM to the producer: such a condition is recorded
+    (fleet + bus + the durable ``condition_ledger``) but is NEVER enqueued to the
+    supervisor mailbox, so no native envelope can bypass the hook.
+
+    This is the ONE definition of that class, keyed on ``(kind, subtype)`` exactly
+    as the hook's shell predicate is::
+
+        body.startswith('[CONDITION]') and (
+            'kind=BUSY' in body
+            or ('kind=PROC_EXITED' in body and 'subtype=command_exit_code' in body))
+
+    ANOMALY-class conditions (DIALOG_BLOCKED, CAPPED, AUTH_EXPIRED, an unknown
+    kind, a non-``command_exit_code`` PROC_EXITED, …) return False and keep the
+    inbox leg — F790 does not touch their behaviour.
+    """
+    if kind == "BUSY":
+        return True
+    if kind == "PROC_EXITED" and subtype == "command_exit_code":
+        return True
+    return False
+
+
 # ─── D7: condition-plane decisions and the durable de-dup rule (AC21) ───────────
 class ConditionDecision(str, Enum):
     """One value per live ``deliver()`` exit path (blueprint §2, r3/B1).

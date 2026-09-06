@@ -141,10 +141,11 @@ class TestF459Truncation:
     """Bodies exceeding 8KB are defensively truncated."""
 
     def test_body_under_8kb_not_truncated(self):
-        """A body under 8KB is preserved verbatim."""
+        """F790 (#647): the active body cap is now 1,500 chars (was 8KB). A body
+        WITHIN the 1,500-char cap is preserved verbatim."""
         from cli_agent_orchestrator.services.cc_session_registry import build_wake_payload
 
-        body = "A" * 4000
+        body = "A" * 1400
         payload_json = build_wake_payload("w01", 1, message_body=body)
         payload = json.loads(payload_json)
         content = payload["message"]["content"]
@@ -153,9 +154,11 @@ class TestF459Truncation:
         assert "[truncated" not in content
 
     def test_body_over_8kb_truncated(self):
-        """A body over 8KB is truncated with a tail pointer."""
+        """F790 (#647): a non-condition body over the 1,500-char cap is truncated
+        with the F790 marker. The old 8KB `_F459_MAX_BODY_BYTES` bound is now dead
+        for non-condition bodies because 1,500 < 8192 fires first."""
         from cli_agent_orchestrator.services.cc_session_registry import (
-            _F459_MAX_BODY_BYTES,
+            _F790_WAKE_BODY_MAX_CHARS,
             build_wake_payload,
         )
 
@@ -164,22 +167,23 @@ class TestF459Truncation:
         payload = json.loads(payload_json)
         content = payload["message"]["content"]
 
-        # Truncated indicator present
+        # F790 truncation marker present
         assert "[truncated" in content
-        assert "inbox row 77" in content
+        assert "full body in the inbox digest" in content
         # Full body NOT present
         assert body not in content
-        # First 8KB IS present
-        assert "B" * _F459_MAX_BODY_BYTES in content
+        # First 1,500 chars ARE present; the 8KB run is NOT
+        assert "B" * _F790_WAKE_BODY_MAX_CHARS in content
+        assert "B" * (_F790_WAKE_BODY_MAX_CHARS + 1) not in content
 
     def test_truncation_boundary_exact(self):
-        """A body at exactly 8KB is NOT truncated."""
+        """F790 (#647): a body at exactly the 1,500-char cap is NOT truncated."""
         from cli_agent_orchestrator.services.cc_session_registry import (
-            _F459_MAX_BODY_BYTES,
+            _F790_WAKE_BODY_MAX_CHARS,
             build_wake_payload,
         )
 
-        body = "C" * _F459_MAX_BODY_BYTES
+        body = "C" * _F790_WAKE_BODY_MAX_CHARS
         payload_json = build_wake_payload("w01", 1, message_body=body)
         payload = json.loads(payload_json)
         content = payload["message"]["content"]
