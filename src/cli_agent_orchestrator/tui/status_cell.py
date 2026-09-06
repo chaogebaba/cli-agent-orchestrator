@@ -39,6 +39,14 @@ columns, so the full value is written here.
 
 ``fusion_changed`` is **not** rendered in this cell — D3 gives it its own ``*``
 column.
+
+**F777 (#634) scope add — a typed condition headlines the cell.** A non-BUSY
+condition (already confidence-filtered to high/medium by the delivery seam)
+replaces the bare status word: ``⚠ CAPPED (completed)`` instead of
+``· completed [CAPPED]``, styled by the condition. The raw status word is kept
+as a dim parenthetical (and remains in the COND column / peek detail). BUSY is
+the exception — it asserts live work, so it stays a dim ``[BUSY]`` tag on the
+status word. ``wedge_suspect`` still outranks any condition.
 """
 
 from __future__ import annotations
@@ -110,6 +118,40 @@ _LIVE_WORK_CONDITIONS: Final[frozenset[str]] = frozenset({"BUSY"})
 #: The statuses that make those labels a contradiction.
 _QUIESCENT_STATUSES: Final[frozenset[str]] = frozenset({"idle", "completed"})
 
+# ─── F777 (#634) scope add: a typed condition HEADLINES the STATUS cell ───────
+#
+# User word 2026-09-06: "when codex capped it will show capped, not completed".
+# A typed, non-BUSY condition (already confidence-filtered to high/medium by the
+# delivery seam, providers/condition.py §2.3) is the operator-actionable fact —
+# a capped seat that reads `· completed` hides exactly what the operator needs
+# to see. So such a condition REPLACES the bare status word as the cell's
+# headline (`⚠ CAPPED`), styled by the condition, with the raw status kept
+# visible as a dim parenthetical (`⚠ CAPPED (completed)`) and still carried in
+# the COND column and the peek detail. BUSY is the one exception: it asserts
+# LIVE WORK, not a stall, so it stays a dim `[BUSY]` tag on the status word
+# (`● working [BUSY]`) exactly as before — never a headline.
+#:
+#: The glyph that opens a headlined condition. `⚠` reads as "attention" at a
+#: glance without claiming which condition it is (the word says that).
+_CONDITION_GLYPH: Final[str] = "⚠"
+#: Conditions that stay a suffix tag rather than headlining. BUSY only, today.
+_TAG_ONLY_CONDITIONS: Final[frozenset[str]] = frozenset({"BUSY"})
+#: The bare status WORD (no glyph) shown in the `(…)` parenthetical when a
+#: condition headlines the cell. Falls back to the raw status string for an
+#: unknown value.
+_STATUS_WORDS: Final[Dict[str, str]] = {
+    "processing": "working",
+    "waiting_user_answer": "waiting",
+    "idle": "idle",
+    "completed": "completed",
+    "error": "error",
+    "unknown": "unknown",
+    "render_uncertain": "render_uncertain",
+}
+#: The style of the raw-status parenthetical — recessive, so the condition word
+#: owns the operator's attention while the raw status stays legible.
+STYLE_RAW_STATUS: Final[str] = "dim"
+
 
 def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
     """The status half of the cell: (text, style), before any condition suffix.
@@ -148,6 +190,21 @@ def _contradicts_status(raw_status: Any, raw_condition: Any) -> bool:
     return str(raw_status) in _QUIESCENT_STATUSES and str(raw_condition) in _LIVE_WORK_CONDITIONS
 
 
+def _raw_status_word(row: Mapping[str, Any]) -> str:
+    """The bare status word for a headlined condition's ``(…)`` parenthetical.
+
+    Always the row's underlying ``status`` (never the ``delegating``/
+    ``wedge_suspect`` rewrite), because that is the raw status the operator
+    wants preserved when a condition takes the headline. Unknown/empty status
+    falls back to the raw string so nothing is silently dropped.
+    """
+    raw = row.get("status")
+    if not raw:
+        return "?"
+    status = str(raw)
+    return _STATUS_WORDS.get(status, status)
+
+
 def status_cell(row: Mapping[str, Any]) -> Text:
     """Render one fleet row's STATUS cell.
 
@@ -158,31 +215,55 @@ def status_cell(row: Mapping[str, Any]) -> Text:
             be of an unexpected type.
 
     Returns:
-        A :class:`rich.text.Text` whose ``.plain`` is the glyph plus label
-        (plus ``[CONDITION]`` when the row carries one) and whose ``.style`` is
-        the whole-cell style. Never raises.
+        A :class:`rich.text.Text` carrying glyph, label and whole-cell style.
+        Never raises.
+
+    F777 (#634) scope add: a typed, non-BUSY condition HEADLINES the cell —
+    ``⚠ CAPPED (completed)`` rather than ``· completed [CAPPED]`` — styled by
+    the condition, with the raw status word kept as a dim parenthetical. BUSY
+    stays a dim ``[BUSY]`` suffix tag on the status word (it asserts live work,
+    not a stall). ``wedge_suspect`` still outranks any condition and keeps its
+    own style/label with the condition as a tag.
     """
     text, style = _base_cell(row)
     raw_condition = row.get("condition")
     if raw_condition and _contradicts_status(row.get("status"), raw_condition):
         raw_condition = None
-    quiet_tag = False
-    if raw_condition:
-        condition = str(raw_condition)
-        condition_style = _CONDITION_STYLES.get(condition)
+    if not raw_condition:
+        return Text(text, style=style)
+
+    condition = str(raw_condition)
+    condition_style = _CONDITION_STYLES.get(condition)
+    is_wedge = style == STYLE_WEDGE
+    tag_only = condition in _TAG_ONLY_CONDITIONS
+
+    # BUSY (and any wedge row) keep the status word and append the tag — a wedge
+    # is the loudest signal on the row and never yields its headline, and BUSY
+    # is live work rather than an actionable stall.
+    if tag_only or is_wedge:
         if condition_style is None:
             suffix = f" [? {condition}]"
-            condition_style = STYLE_UNKNOWN_VALUE
+            cell_style = STYLE_UNKNOWN_VALUE
         else:
             suffix = f" [{condition}]"
-            quiet_tag = condition in _QUIET_CONDITION_TAGS
+            cell_style = condition_style
         base_length = len(text)
         text = f"{text}{suffix}"
-        # A wedge is the loudest thing on the row; nothing overrides its style.
-        if style != STYLE_WEDGE:
-            style = condition_style
-        cell = Text(text, style=style)
-        if quiet_tag:
+        # A wedge keeps its own style; otherwise the condition owns it.
+        cell = Text(text, style=STYLE_WEDGE if is_wedge else cell_style)
+        if condition in _QUIET_CONDITION_TAGS:
             cell.stylize(STYLE_QUIET_TAG, base_length, len(text))
         return cell
-    return Text(text, style=style)
+
+    # A non-BUSY condition HEADLINES: `⚠ CAPPED (completed)`, condition-styled,
+    # with the raw status word kept legible-but-recessive in the parenthetical.
+    if condition_style is None:
+        head = f"{_CONDITION_GLYPH} ? {condition}"
+        cell_style = STYLE_UNKNOWN_VALUE
+    else:
+        head = f"{_CONDITION_GLYPH} {condition}"
+        cell_style = condition_style
+    paren = f" ({_raw_status_word(row)})"
+    cell = Text(f"{head}{paren}", style=cell_style)
+    cell.stylize(STYLE_RAW_STATUS, len(head), len(head) + len(paren))
+    return cell

@@ -412,6 +412,76 @@ async def test_provider_model_effort_columns_render(tmp_path: Path) -> None:
         assert plain(table, 2, effort) == "-"
 
 
+def _capped_codex_payload() -> Dict[str, Any]:
+    """A minimal build_fleet-shaped payload: a codex worker capped while its
+    fused status reads `completed` (the reported F777 scope-add scenario)."""
+    return {
+        "session_name": "f702-capped",
+        "terminals": [
+            {
+                "id": "term-c001",
+                "profile": "codex_dev",
+                "provider": "codex",
+                "window_index": 0,
+                "window_name": "codex_dev",
+                "parent_id": None,
+                "depth": 0,
+                "orphan": False,
+                "status": "completed",
+                "condition": "CAPPED",
+                "fusion_changed": False,
+                "fusion_reason": None,
+                "delegating": False,
+                "children_count": 0,
+                "init_state": "ready",
+                "init_health": "ready",
+                "since_last_input": 5.0,
+                "lifecycle": "ephemeral",
+                "resolved_model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "reparented_from": None,
+                "config_stale": False,
+                "wedge_suspect": False,
+            }
+        ],
+        "wake_exhaustion_alarms": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_capped_codex_status_shows_capped_not_completed(tmp_path: Path) -> None:
+    """F777 (#634) scope add: STATUS renders the typed condition (CAPPED) as the
+    headline, in bold red, instead of the bare `completed` — through the full
+    app render path, not just the pure cell fn. Raw status stays in the COND
+    column and in the STATUS parenthetical."""
+    app, feed, _ = make_app([_capped_codex_payload()], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        table = app.table
+        status = PARITY_VIEW.index("STATUS")
+        assert plain(table, 0, status) == "⚠ CAPPED (completed)"
+        assert cell(table, 0, status).style == "bold red"
+        # The raw condition is still carried in the opt-in COND column.
+        await pilot.press("c")
+        await pilot.pause()
+        assert plain(app.table, 0, ALL_VIEW.index("COND")) == "CAPPED"
+
+
+@pytest.mark.asyncio
+async def test_busy_codex_status_unchanged(tmp_path: Path) -> None:
+    """F777 (#634): a BUSY condition never headlines — a working codex seat
+    still reads `● working [BUSY]`, not a CAPPED-style headline."""
+    payload = _capped_codex_payload()
+    payload["terminals"][0]["status"] = "processing"
+    payload["terminals"][0]["condition"] = "BUSY"
+    app, feed, _ = make_app([payload], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        status = PARITY_VIEW.index("STATUS")
+        assert plain(app.table, 0, status) == "● working [BUSY]"
+        assert cell(app.table, 0, status).style == "green"
+
+
 @pytest.mark.asyncio
 async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
     tmp_path: Path,
@@ -421,7 +491,8 @@ async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
         await settle(pilot, feed)
         status = PARITY_VIEW.index("STATUS")
         assert plain(app.table, 1, status) == "· error"
-        assert plain(app.table, 2, status) == "· error [CAPPED]"
+        # F777 (#634): the capped seat headlines CAPPED over its raw `error`.
+        assert plain(app.table, 2, status) == "⚠ CAPPED (error)"
         assert cell(app.table, 2, status).style == "bold red"
 
     app2, feed2, _ = make_app([load_payload("wake_alarm")], tmp_path)
@@ -1329,9 +1400,16 @@ def test_a_busy_tag_is_dimmed_but_the_condition_still_owns_the_cell_style() -> N
 
 
 def test_a_loud_condition_tag_is_not_dimmed() -> None:
+    """F777 (#634): CAPPED headlines the cell in bold red; only the raw-status
+    `(idle)` parenthetical is dimmed, never the CAPPED word itself."""
     cell = status_cell({"status": "idle", "condition": "CAPPED"})
+    assert cell.plain == "⚠ CAPPED (idle)"
     assert cell.style == "bold red"
-    assert [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG] == []
+    dimmed = [span for span in cell.spans if str(span.style) == STYLE_QUIET_TAG]
+    assert len(dimmed) == 1
+    # The dim span is exactly the parenthetical, not the CAPPED headline.
+    assert cell.plain[dimmed[0].start : dimmed[0].end] == " (idle)"
+    assert "CAPPED" not in cell.plain[dimmed[0].start : dimmed[0].end]
 
 
 # ── the working-elapsed readout (F702 #557 "look" round) ─────────────────────

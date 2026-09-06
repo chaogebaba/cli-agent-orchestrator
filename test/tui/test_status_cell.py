@@ -101,23 +101,40 @@ SUPPRESSED_PAIRS: List[Tuple[str, str]] = [
     ("completed", "BUSY"),
 ]
 
+# F777 (#634): the bare status word shown in a headlined condition's `(…)`.
+STATUS_WORDS: Dict[str, str] = {
+    "processing": "working",
+    "waiting_user_answer": "waiting",
+    "idle": "idle",
+    "completed": "completed",
+    "error": "error",
+    "unknown": "unknown",
+    "render_uncertain": "render_uncertain",
+}
+
 
 @pytest.mark.parametrize("status,plain,style", STATUS_CASES)
 @pytest.mark.parametrize("condition,cond_style", CONDITION_CASES)
 def test_status_with_condition(
     status: str, plain: str, style: str, condition: str, cond_style: str
 ) -> None:
-    """The condition is appended and owns the cell style.
-
-    The exception is a contradiction: on a quiescent status a BUSY tag is
-    dropped entirely and the row renders as the bare status.
+    """F777 (#634): a non-BUSY condition HEADLINES the cell, styled by itself,
+    with the raw status word kept as a dim parenthetical. BUSY stays a suffix
+    tag on the status word. A contradiction (BUSY on a quiescent status) is
+    dropped and the row renders as the bare status.
     """
     cell = status_cell(row(status=status, condition=condition))
     if (status, condition) in SUPPRESSED_PAIRS:
         assert cell.plain == plain
         assert cell.style == style
         return
-    assert cell.plain == f"{plain} [{condition}]"
+    if condition == "BUSY":
+        # BUSY is live work, not a stall: still a suffix tag on the status word.
+        assert cell.plain == f"{plain} [BUSY]"
+        assert cell.style == cond_style
+        return
+    # A non-BUSY condition headlines: `⚠ CAPPED (completed)`.
+    assert cell.plain == f"⚠ {condition} ({STATUS_WORDS[status]})"
     assert cell.style == cond_style
 
 
@@ -148,12 +165,16 @@ def test_busy_tag_survives_every_non_quiescent_status(status: str) -> None:
 
 @pytest.mark.parametrize("condition,_cond_style", CONDITION_CASES)
 def test_only_busy_is_suppressed_on_an_idle_row(condition: str, _cond_style: str) -> None:
-    """A cap, an auth expiry or a blocked dialog are all TRUE of a resting seat."""
+    """A cap, an auth expiry or a blocked dialog are all TRUE of a resting seat.
+
+    F777 (#634): a non-BUSY condition headlines the cell (`⚠ CAPPED (idle)`);
+    BUSY is the only one dropped on a quiescent row.
+    """
     cell = status_cell(row(status="idle", condition=condition))
     if condition == "BUSY":
         assert cell.plain == "◌ idle"
     else:
-        assert cell.plain == f"◌ idle [{condition}]"
+        assert cell.plain == f"⚠ {condition} (idle)"
 
 
 def test_busy_is_dropped_on_a_delegating_row() -> None:
@@ -161,6 +182,44 @@ def test_busy_is_dropped_on_a_delegating_row() -> None:
     cell = status_cell(row(status="idle", delegating=True, children_count=2, condition="BUSY"))
     assert cell.plain == "◇ delegating (2)"
     assert cell.style == "cyan"
+
+
+# ─── F777 (#634): a typed condition headlines the STATUS cell ─────────────────
+
+
+def test_capped_codex_shows_capped_not_completed() -> None:
+    """The reported case: a capped codex seat reads CAPPED, not completed.
+
+    User word 2026-09-06: "when codex capped it will show capped, not
+    completed". The condition headlines the cell in bold red; the raw
+    `completed` is kept as a dim parenthetical, not the headline.
+    """
+    cell = status_cell(row(status="completed", condition="CAPPED"))
+    assert cell.plain == "⚠ CAPPED (completed)"
+    assert cell.style == "bold red"
+    assert "completed" in cell.plain  # raw status stays visible
+    # The parenthetical is dim; the CAPPED word is not.
+    dim_spans = [s for s in cell.spans if str(s.style) == "dim"]
+    assert dim_spans, "raw-status parenthetical should be dim"
+
+
+def test_busy_condition_leaves_status_unchanged_as_a_tag() -> None:
+    """A BUSY condition never headlines — it stays a dim [BUSY] tag on working."""
+    cell = status_cell(row(status="processing", condition="BUSY"))
+    assert cell.plain == "● working [BUSY]"
+    assert cell.style == "green"
+
+
+def test_proc_exited_headlines_over_idle() -> None:
+    cell = status_cell(row(status="idle", condition="PROC_EXITED"))
+    assert cell.plain == "⚠ PROC_EXITED (idle)"
+    assert cell.style == "bold red"
+
+
+def test_transient_overload_headlines_yellow() -> None:
+    cell = status_cell(row(status="completed", condition="TRANSIENT_OVERLOAD"))
+    assert cell.plain == "⚠ TRANSIENT_OVERLOAD (completed)"
+    assert cell.style == "yellow"
 
 
 def test_busy_still_shows_on_a_wedge_row_whose_status_is_not_quiescent() -> None:
@@ -207,8 +266,10 @@ def test_wedge_outranks_delegating() -> None:
 
 
 def test_delegating_with_condition() -> None:
-    cell = status_cell(row(delegating=True, children_count=2, condition="CAPPED"))
-    assert cell.plain == "◇ delegating (2) [CAPPED]"
+    """F777 (#634): a non-BUSY condition headlines even over a delegating seat;
+    the raw status (idle underneath) stays in the parenthetical."""
+    cell = status_cell(row(status="idle", delegating=True, children_count=2, condition="CAPPED"))
+    assert cell.plain == "⚠ CAPPED (idle)"
     assert cell.style == "bold red"
 
 
@@ -222,8 +283,9 @@ def test_unknown_status_renders_visibly() -> None:
 
 
 def test_unknown_condition_renders_visibly() -> None:
+    """F777 (#634): an unknown condition still headlines, visibly marked."""
     cell = status_cell(row(status="idle", condition="ON_FIRE"))
-    assert cell.plain == "◌ idle [? ON_FIRE]"
+    assert cell.plain == "⚠ ? ON_FIRE (idle)"
     assert cell.style == "magenta"
 
 
@@ -359,7 +421,8 @@ def test_error_latched_fixture_cells() -> None:
     terminals = load("error_latched")["terminals"]
     assert [t["init_state"] for t in terminals[1:]] == ["ready", "ready"]
     cells = [status_cell(t) for t in terminals]
-    assert [c.plain for c in cells] == ["◌ idle", "· error", "· error [CAPPED]"]
+    # F777 (#634): the capped seat headlines CAPPED over its raw `error` status.
+    assert [c.plain for c in cells] == ["◌ idle", "· error", "⚠ CAPPED (error)"]
     assert [c.style for c in cells] == ["yellow", "dim", "bold red"]
 
 
