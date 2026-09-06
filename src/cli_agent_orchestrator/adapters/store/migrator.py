@@ -470,7 +470,7 @@ def migrate(
         )
         return MigrationResult(ok=False, failed_step="finding", error=repr(exc)), pool
 
-    steps: list[tuple[str, tuple[str, ...]]] = list(MIGRATION_STEPS)
+    steps: list[tuple[str, tuple[MigrationStatement, ...]]] = list(MIGRATION_STEPS)
     additive = _pending_additive_columns(conn)
     if additive:
         steps.append(("additive_columns", additive))
