@@ -4998,7 +4998,7 @@ async def push_turn_marker(
     terminal_id: TerminalId,
     body: TurnMarkerRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict:
+) -> Dict[str, Any]:
     """Accept one F792 (#649) turn-boundary edge (turn_ended/turn_active).
 
     Same shape as the F507 interaction-marker endpoint: 404 on an unknown

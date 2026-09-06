@@ -50,6 +50,7 @@ CONDITION_CASES: List[Tuple[str, str]] = [
     ("PROC_EXITED", "bold red"),
     ("TRANSIENT_OVERLOAD", "yellow"),
     ("BUSY", "green"),
+    ("WAITING_ON_SUBAGENTS", "yellow"),
     ("DIALOG_BLOCKED", "bold red"),
     ("AUTH_EXPIRED", "bold red"),
 ]
@@ -128,6 +129,12 @@ def test_status_with_condition(
         assert cell.plain == plain
         assert cell.style == style
         return
+    if condition == "WAITING_ON_SUBAGENTS":
+        # F792 (#649): a calm `· waiting` headline for every non-wedge status,
+        # never the `⚠ …` headline (see tui/status_cell.py:_WAITING_ON_SUBAGENTS).
+        assert cell.plain == "· waiting"
+        assert cell.style == cond_style
+        return
     if condition == "BUSY":
         # BUSY is live work, not a stall: still a suffix tag on the status word.
         assert cell.plain == f"{plain} [BUSY]"
@@ -173,6 +180,9 @@ def test_only_busy_is_suppressed_on_an_idle_row(condition: str, _cond_style: str
     cell = status_cell(row(status="idle", condition=condition))
     if condition == "BUSY":
         assert cell.plain == "◌ idle"
+    elif condition == "WAITING_ON_SUBAGENTS":
+        # F792 (#649): a calm `· waiting` headline, not a `⚠` stall.
+        assert cell.plain == "· waiting"
     else:
         assert cell.plain == f"⚠ {condition} (idle)"
 
