@@ -704,26 +704,98 @@ SCREEN_FALLBACK_PROCESSING_PATTERN = re.compile(r"\A[\s\S]*\Z")
 # interrupt hint so agent output that merely quotes "Working" cannot flip it.
 CODEX_BUSY_MARKER_PATTERN = re.compile(TUI_PROGRESS_PATTERN)
 
+# F782 D-a (#639): a SECOND codex live-work marker class. A codex tool call that
+# draws no ``• Working (… esc to interrupt)`` footer still prints activity lines
+# on the normal screen: the ``• Waiting for agents`` / ``• Finished waiting`` /
+# ``└ No agents completed yet`` wait-for-agents loop, and generally any
+# ``• <Verb>ing …`` activity bullet (``• Running exact shell command …``,
+# ``• Finished waiting``). Keyed ONLY on the ``• Working (… esc to interrupt)``
+# footer, the pre-F782 detector read this state as completed/idle (the fleet row
+# for reviewer bcce0ff5 showed ``· completed`` while the pane cycled the loop).
+#
+# The bullet glyph ``•`` also prefixes finished assistant output, so this marker
+# is POSITION-AWARE, never a bare substring: it counts only as live work when an
+# activity bullet appears AFTER the last idle prompt row (``›``). A ``•`` line
+# above the last ``›`` is prior-turn scrollback and does not assert live work.
+# Anchored on the ``ing`` verb tail / the two literal wait-loop phrases so agent
+# output that merely quotes "Working" cannot flip it (same guard as the footer).
+CODEX_ACTIVITY_MARKER_PATTERN = re.compile(
+    r"^\s*•\s+(?:"
+    r"Waiting for agents"
+    r"|Finished waiting"
+    r"|\w+ing\b"  # • Running…, • Reading…, • Editing…, • Thinking…, • Starting…
+    r")",
+    re.IGNORECASE,
+)
+# The idle composer prompt row string. Anchors the "newer than the last real
+# prompt" test and the LAST-non-blank-row veto tightening (F782 D-b).
+_CODEX_IDLE_COMPOSER = "Ask Codex to do anything"
+
+
+def codex_activity_marker_live(text: str) -> bool:
+    """F782 (#639): is a codex activity bullet live AFTER the last real prompt?
+
+    ``True`` iff an activity bullet (the wait-for-agents loop or any
+    ``• <Verb>ing …`` line) appears strictly below the last SUBMITTED ``›``
+    prompt row — i.e. it belongs to the CURRENT turn, not prior-turn scrollback.
+
+    The position anchor is the last ``›`` prompt that carries real submitted text
+    (``› continue``, ``› STOP …``), NOT the persistent idle composer box
+    (``› Ask Codex to do anything``). The composer is always redrawn at the
+    bottom of the pane, below the live activity, so anchoring on it would make
+    every wait-loop sample look "older than the prompt" — which is exactly the
+    #639 misread. Operates on the plain (escape-stripped) pane string; no second
+    capture.
+    """
+    clean = strip_terminal_escapes(text)
+    rows = clean.splitlines()
+    last_prompt = -1
+    for i, row in enumerate(rows):
+        stripped = row.lstrip()
+        if stripped.startswith("›") and _CODEX_IDLE_COMPOSER not in row:
+            last_prompt = i
+    for row in rows[last_prompt + 1 :]:
+        if CODEX_ACTIVITY_MARKER_PATTERN.match(row):
+            return True
+    return False
+
 
 def codex_busy_marker_live(text: str) -> bool | None:
-    """F581 D16: is the codex seat's own TUI activity marker live in ``text``?
+    """F581 D16 / F782 (#639): is the codex seat's own TUI activity marker live?
 
     Truth table (same as D12d / claude_code / the kiro leg):
       * ``True``  — the Working/Thinking spinner with the "esc to interrupt"
-        hint is present (the agent's turn is live).
-      * ``False`` — no busy marker BUT the idle composer placeholder
-        ("Ask Codex to do anything") is present: the seat's own turn is over,
+        hint is present, OR (F782 #639) an activity bullet — the
+        ``• Waiting for agents`` wait loop or any ``• <Verb>ing …`` line — is
+        newer than the last ``›`` prompt. Either means the agent's turn is live.
+      * ``False`` — no busy/activity marker BUT the idle composer placeholder
+        ("Ask Codex to do anything") is present AND is the LAST non-blank row
+        with no activity newer than the last prompt: the seat's own turn is over,
         so veto this sample's upgrade.
       * ``None``  — no identifiable codex TUI (no marker, no idle composer):
         legacy rule 3a applies unchanged.
+
+    F782 D-b tightens the idle veto: the pre-F782 leg vetoed whenever the idle
+    composer string appeared ANYWHERE on screen, which the wait-loop shape
+    triggers (the composer is drawn under a live loop). The composer only proves
+    the turn is over when it is the LAST non-blank row AND no activity line is
+    newer than the last ``›`` prompt.
 
     Operates on the plain (escape-stripped) pane string; no second capture.
     """
     clean = strip_terminal_escapes(text)
     if CODEX_BUSY_MARKER_PATTERN.search(clean):
         return True
-    if "Ask Codex to do anything" in clean:
-        return False
+    if codex_activity_marker_live(clean):
+        return True
+    if _CODEX_IDLE_COMPOSER in clean:
+        # F782 D-b: only a veto when the composer is genuinely the trailing row
+        # (turn is over), not merely present under a live loop.
+        nonblank = [r for r in clean.splitlines() if r.strip()]
+        if nonblank and _CODEX_IDLE_COMPOSER in nonblank[-1]:
+            return False
+        # Composer present but buried under later output: not a clean idle
+        # verdict. Fall through to None so legacy rule 3a applies unchanged.
     return None
 
 

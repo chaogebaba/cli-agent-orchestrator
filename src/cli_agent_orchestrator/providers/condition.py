@@ -38,10 +38,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 # Imported lazily-safe at module import: these are module-level constants in the
 # provider modules and carry no import cycle back to this module.
 from cli_agent_orchestrator.providers.codex import (  # noqa: E402
+    CODEX_ACTIVITY_MARKER_PATTERN,
     SYSTEM_NOTICE_PATTERN,
     TRANSIENT_API_ERROR_PATTERNS,
     TRANSIENT_ERROR_EXCLUSIONS,
     USER_PREFIX_PATTERN,
+    codex_activity_marker_live,
 )
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -435,6 +437,23 @@ def _classify_transient(provider: str, brows: List[str]) -> Optional[Condition]:
 BUSY_TAIL_ROWS: int = 45
 
 
+def _codex_activity_evidence(pane: str) -> Optional[str]:
+    """F782 (#639): the first codex activity bullet newer than the last ``›``
+    prompt, for use as the BUSY condition's evidence row. Mirrors the position
+    walk in ``codex.codex_activity_marker_live`` so evidence and verdict agree.
+    """
+    rows = [strip_terminal_escapes(r) for r in pane.splitlines()]
+    last_prompt = -1
+    for i, row in enumerate(rows):
+        stripped = row.lstrip()
+        if stripped.startswith("›") and "Ask Codex to do anything" not in row:
+            last_prompt = i
+    for row in rows[last_prompt + 1 :]:
+        if CODEX_ACTIVITY_MARKER_PATTERN.match(row):
+            return row.strip()
+    return None
+
+
 def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     pat, subtype = {
         "codex": (_CODEX_BUSY, "working_marker"),
@@ -514,6 +533,26 @@ def classify_condition(
         cond = classifier(provider, brows)
         if cond is not None:
             candidates.append(cond)
+
+    # F782 (#639): codex has a SECOND live-work marker class beyond the
+    # ``• Working (… esc to interrupt)`` footer that ``_classify_busy`` matches:
+    # the ``• Waiting for agents`` wait loop and any ``• <Verb>ing …`` activity
+    # bullet newer than the last ``›`` prompt. That test is position-aware, so it
+    # runs on the RAW pane (``banner_rows`` strips the composer prompt used as the
+    # position anchor), not on ``brows``. Only add it when the footer path did not
+    # already surface BUSY, so evidence stays specific.
+    if provider == "codex" and not any(c.kind is ConditionKind.BUSY for c in candidates):
+        if codex_activity_marker_live(pane):
+            ev = _codex_activity_evidence(pane)
+            candidates.append(
+                Condition(
+                    ConditionKind.BUSY,
+                    provider,
+                    "activity_marker",
+                    ev or "• activity marker",
+                    Confidence.HIGH,
+                )
+            )
 
     if not candidates:
         return None

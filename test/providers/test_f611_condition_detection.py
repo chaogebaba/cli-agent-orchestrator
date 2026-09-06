@@ -399,3 +399,59 @@ def test_event_render_shape() -> None:
     assert "host=grok-box-006" in line
     assert "credential_plane=box" in line
     assert "confidence=high" in line
+
+
+# ── F782 (#639): codex activity-marker BUSY class (second live-work marker) ─────
+# A codex tool call that draws no "• Working (… esc to interrupt)" footer — the
+# wait-for-agents loop, any "• <Verb>ing …" line — must classify BUSY, not
+# idle/completed. Fixture is the byte-exact footer-less capture of reviewer
+# bcce0ff5 under fixtures/busy_marker/codex/.
+_BUSY_MARKER = _FIX / "busy_marker" / "codex"
+
+
+def test_f782_wait_agents_loop_classifies_busy() -> None:
+    text = (_BUSY_MARKER / "busy-3-wait-agents.txt").read_text(encoding="utf-8")
+    cond = classify_condition(text, "codex")
+    assert cond is not None
+    assert cond.kind is ConditionKind.BUSY
+    assert cond.subtype == "activity_marker"
+    # Evidence is the activity bullet itself, newer than the last real prompt.
+    assert "•" in cond.evidence
+
+
+def test_f782_true_idle_pane_is_not_busy() -> None:
+    """Prompt last, no activity after it → the classifier surfaces no BUSY (and
+    no other condition) for a genuinely idle codex pane."""
+    idle = (
+        "› fix the failing test\n\n"
+        "• Done — applied the patch and reran the focused suite.\n"
+        "  └ 12 passed\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  ~/proj · main · gpt-5.6 high · Context 70% left"
+    )
+    cond = classify_condition(idle, "codex")
+    assert cond is None
+
+
+def test_f782_working_footer_still_classifies_busy() -> None:
+    """Regression guard: the ORIGINAL footer path is unchanged and still wins as
+    the working_marker subtype (not the new activity_marker)."""
+    text = (_BUSY_MARKER / "busy-2.txt").read_text(encoding="utf-8")
+    cond = classify_condition(text, "codex")
+    assert cond is not None
+    assert cond.kind is ConditionKind.BUSY
+    assert cond.subtype == "working_marker"
+
+
+def test_f782_prior_turn_activity_above_newer_prompt_is_not_busy() -> None:
+    """Activity bullets above a newer submitted prompt are scrollback, not live
+    work — the classifier must not raise BUSY on them."""
+    pane = (
+        "• Waiting for agents\n"
+        "• Finished waiting\n"
+        "  └ No agents completed yet\n\n"
+        "› a brand new instruction\n\n"
+        "› Ask Codex to do anything\n\n  ~/p · main"
+    )
+    cond = classify_condition(pane, "codex")
+    assert cond is None
