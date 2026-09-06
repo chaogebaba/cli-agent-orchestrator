@@ -323,3 +323,94 @@ def test_apply_detection_transition_to_idle_clears_the_busy_latch(monkeypatch: A
 
     assert rec["fleet"] == [(tid, None)], "the idle transition must clear the label"
     assert rec["inbox"] == [], "a parked seat must not push a BUSY event"
+
+
+# ── F775 (#632): the delivery seam also downgrades a STALE text PROC_EXITED ────
+# The text ``[Command exited with code N]`` PROC_EXITED (subtype
+# command_exit_code) is the same self-re-affirming shape as BUSY: a residual
+# scrollback line that stuck the row to ``completed [PROC_EXITED]`` on a live
+# worker. On a quiescent transition it is downgraded like BUSY so the fleet label
+# clears. The GENUINE process-state signal (subtype shell_baseline_return) is a
+# real dead process and must NOT be downgraded.
+
+# A cline pane whose newest content is a command-exit line → PROC_EXITED
+# (command_exit_code) from the classifier.
+CLINE_TEXT_EXIT_PANE = "\n".join(
+    [
+        "cline v3",
+        "[run_commands] make build",
+        "   ⎿ [Command exited with code 1]",
+    ]
+)
+
+
+def test_text_proc_exited_is_downgraded_on_a_transition_to_idle() -> None:
+    """A stale text exit line must CLEAR the fleet label on the idle transition,
+    exactly like the BUSY latch."""
+    tid = "34a7b2c1"
+    sm = _monitor(tid)
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+
+    # sanity: the pane classifies as the text PROC_EXITED subtype
+    cond = classify_condition(CLINE_TEXT_EXIT_PANE, "cline_cli")
+    assert cond is not None and cond.kind is ConditionKind.PROC_EXITED
+    assert cond.subtype == "command_exit_code"
+
+    sm._classify_and_deliver_condition(
+        tid, _ClineProvider(), CLINE_TEXT_EXIT_PANE, status=TerminalStatus.IDLE
+    )
+    assert rec["fleet"] == [(tid, None)], "the idle transition must CLEAR the label"
+    assert rec["inbox"] == []
+    assert rec["cli"] == []
+
+
+def test_text_proc_exited_is_downgraded_on_a_transition_to_completed() -> None:
+    tid = "34a7b2c2"
+    sm = _monitor(tid)
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+    sm._classify_and_deliver_condition(
+        tid, _ClineProvider(), CLINE_TEXT_EXIT_PANE, status=TerminalStatus.COMPLETED
+    )
+    assert rec["fleet"] == [(tid, None)]
+
+
+def test_text_proc_exited_is_delivered_while_processing() -> None:
+    """PROCESSING/UNKNOWN do not contradict the exit line; it is delivered."""
+    tid = "34a7b2c3"
+    sm = _monitor(tid)
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+    sm._classify_and_deliver_condition(
+        tid, _ClineProvider(), CLINE_TEXT_EXIT_PANE, status=TerminalStatus.PROCESSING
+    )
+    assert rec["fleet"] == [(tid, "PROC_EXITED")]
+
+
+class _ProcStateClineProvider:
+    """Classifies the genuine process-state PROC_EXITED (no text exit line)."""
+
+    def classify_condition(self, pane: str, **_kw: object) -> object:
+        return classify_condition(pane, "cline_cli", proc_exited=True)
+
+
+def test_process_state_proc_exited_is_not_downgraded_on_idle() -> None:
+    """A real dead process (subtype shell_baseline_return) is legitimately
+    quiescent — the quiescent downgrade must NOT suppress it. It is LOW
+    confidence, so it does not deliver, but it is NOT force-cleared as a stale
+    label either: the fleet sink receives nothing, never an explicit clear."""
+    tid = "34a7b2c4"
+    sm = _monitor(tid)
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+    # empty pane + proc_exited=True → shell_baseline_return, LOW confidence
+    sm._classify_and_deliver_condition(
+        tid, _ProcStateClineProvider(), "", status=TerminalStatus.IDLE
+    )
+    # LOW-confidence conditions do not deliver (D3 gate); the point of this arm is
+    # that the seam did NOT rewrite it to None-as-a-BUSY-style-clear. The delivery
+    # object gates on confidence, so fleet stays empty regardless — assert the
+    # condition itself was not misclassified as the downgradable text subtype.
+    cond = classify_condition("", "cline_cli", proc_exited=True)
+    assert cond is not None and cond.subtype == "shell_baseline_return"

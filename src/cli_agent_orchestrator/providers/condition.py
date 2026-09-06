@@ -262,6 +262,41 @@ _CLINE_BUSY = re.compile(r"\[thinking\]|\[run_commands\]", re.IGNORECASE)
 # the provider via pane_current_command == shell_baseline — see D5/precedence 1).
 _CLINE_PROC_EXITED = re.compile(r"\[Command exited with code \d+\]")
 
+# F775 (#632): reset anchor for scoping the PROC_EXITED text evidence. A stale
+# ``[Command exited with code N]`` line in scrollback must NOT keep re-asserting
+# PROC_EXITED once the pane has moved past it. The reliable boundary is the SHELL
+# PROMPT — the starship ``❯`` baseline the pane returns to when the process ends
+# and a NEW session/turn begins below it. A chained cline tool marker
+# (``[run_commands]`` / ``[search_codebase]`` …) is NOT a boundary: cline runs
+# several tool calls inside ONE turn and ``[Command exited …]`` is just one tool's
+# result, so the exit line is still live evidence while the same turn continues
+# (see fixture cline-cli-proc-exited-1: a ``[search_codebase]`` follows the exit
+# within the same turn and the corpus still expects PROC_EXITED). Tail-limiting to
+# BUSY_TAIL_ROWS + the F752 quiescent downgrade handle the live-worker sticky case.
+_CLINE_SHELL_PROMPT = re.compile(r"^\s*❯")
+
+
+def _scoped_proc_exited_evidence(brows: List[str]) -> Optional[str]:
+    """F775 (#632): the exit-code line ONLY when it is live evidence.
+
+    Scopes the ``[Command exited with code N]`` scan to the BUSY_TAIL_ROWS window
+    (same tail bound BUSY uses — a statement about the present is only believable
+    in the live tail) AND clears it once a NEWER shell prompt appears after it
+    (the process returned to shell / a new turn began below the exit line).
+    Returns the exit-code row, or ``None`` when the evidence is stale or absent.
+    """
+    tail = brows[-BUSY_TAIL_ROWS:]
+    last_exit = -1
+    for i, row in enumerate(tail):
+        if _CLINE_PROC_EXITED.search(row):
+            last_exit = i
+    if last_exit < 0:
+        return None
+    for row in tail[last_exit + 1 :]:
+        if _CLINE_SHELL_PROMPT.match(row):
+            return None
+    return tail[last_exit].strip()
+
 
 def _first_evidence(rows: List[str], pattern: "re.Pattern[str]") -> Optional[str]:
     for row in rows:
@@ -507,7 +542,10 @@ def classify_condition(
     candidates: List[Condition] = []
 
     # PROC_EXITED (precedence 1): process-state fact OR a text exit-code line.
-    text_exit = _first_evidence(brows, _CLINE_PROC_EXITED) if provider == "cline_cli" else None
+    # F775 (#632): the text line is scoped to the live tail and cleared by a
+    # newer turn marker / shell prompt, so a stale scrollback exit line no longer
+    # re-asserts PROC_EXITED on a worker that has since moved on.
+    text_exit = _scoped_proc_exited_evidence(brows) if provider == "cline_cli" else None
     if text_exit is not None:
         candidates.append(
             Condition(
