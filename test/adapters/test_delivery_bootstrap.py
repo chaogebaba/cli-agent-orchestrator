@@ -216,14 +216,21 @@ async def test_a_drained_queue_promotes_drain_back_to_shadow(
 
 
 @pytest.mark.parametrize("position", ["drain", "on"])
-async def test_a_position_this_sub_phase_does_not_implement_arms_nothing(
+async def test_a_served_position_arms_the_hooks_and_registers_the_tick(
     db_path: Path, clock: FakeClock, position: str
 ) -> None:
-    """Not reinterpreted as ``shadow`` — refused, loudly.
+    """Sub-phase 3b implements both served positions, and they differ (§6, §7b).
 
-    An operator who asked for write-through and silently got a shadow queue would
-    believe the seat was being served from the queue when it was not, which is a
-    worse outcome than a position that plainly does nothing yet.
+    Until 3b these two were refused loudly rather than reinterpreted as
+    ``shadow`` — an operator who asked for write-through and silently got a
+    shadow queue would believe the seat was being served when it was not. Now
+    both are served, and the difference between them is what this asserts:
+
+    * ``on`` owns NEW traffic, so a legacy enqueue becomes a ``mode='live'`` row;
+    * ``drain`` accepts no new queue rows at all, which is the position's whole
+      point — it finishes the rows already enqueued on their own budget while
+      new traffic goes back to the legacy inbox, and that is the only way back
+      out of ``on`` that does not orphan them.
 
     ``drain`` reaches this test with a non-empty live queue, since over an empty
     one the guard promotes it to ``shadow`` (asserted above).
@@ -238,11 +245,30 @@ async def test_a_position_this_sub_phase_does_not_implement_arms_nothing(
     rebooted = await boot(db_path, position, clock)
     assert rebooted.delivery is not None
     assert rebooted.delivery.position.value == position
-    assert wiring.queue_enabled() is False
+    assert wiring.queue_enabled() is True
+    assert rebooted.delivery_tick is not None, "a served position must have an observer"
 
+    before = rebooted.queue_store.count() if rebooted.queue_store else 0
     wiring.record_enqueue(fact(99))
     assert rebooted.queue_store is not None
+    after = rebooted.queue_store.count()
+    # NEITHER position mirrors, and for opposite reasons (§6).
+    #
+    # `drain` accepts no new queue rows at all — that is what lets it empty on
+    # its own budget while new traffic goes back to the legacy inbox.
+    #
+    # `on` has no legacy insert to mirror: the inbox is read-only there, and
+    # `write_through` already wrote the authority row before the caller reached
+    # its own insert. Mirroring on top of it would be the second row for one
+    # message that §6 excludes as a fifth carrier.
+    assert after == before
     assert rebooted.queue_store.count(mode=QueueMode.SHADOW) == 0
+    if position == "on":
+        assert wiring.queue_owns_new_traffic() is True
+        assert wiring.write_through(fact(101)) is not None, "the write-through is the path"
+        assert rebooted.queue_store.count(mode=QueueMode.LIVE) == 2
+    else:
+        assert wiring.queue_owns_new_traffic() is False
 
     await bootstrap.shutdown_worker_truth()
 

@@ -258,6 +258,16 @@ STALE_PROCESSING_BUFFER_QUIET_S = 3.0
 STALE_PROCESSING_CONFIRM_TTL_S = 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
 
 
+def _queue_note_status(terminal_id: str, latched_status: object) -> None:
+    """Forward one status edge to the delivery queue (D8).  Never raises."""
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import note_terminal_status
+
+        note_terminal_status(terminal_id, latched_status)
+    except Exception:  # pragma: no cover — a cancel may never break a publish
+        pass
+
+
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
 
@@ -814,6 +824,16 @@ class StatusMonitor:
             pass_outcome,
             raw_classification,
         )
+
+        # WP-ARCH phase 3b (D8) — the completion EDGE, on the same single egress.
+        #
+        # A receiver's own completion is what cancels its flagged `ready` steers,
+        # and it is the mechanism that actually reaches #435: `supersede_key`
+        # handles the same-mailbox case at enqueue, but there the aged steer is
+        # addressed to the worker and the completion callback to the supervisor,
+        # so no newer row ever lands in the worker's mailbox. Edge-triggered and
+        # fail-silent inside; inert unless the queue owns delivery.
+        _queue_note_status(terminal_id, latched_status)
 
         if metadata is None:
             raise LookupError(f"terminal metadata unavailable for {terminal_id}")

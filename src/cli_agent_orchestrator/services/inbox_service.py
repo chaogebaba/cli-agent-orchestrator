@@ -539,13 +539,34 @@ def _get_backoff_delay(terminal_id: str) -> float:
     return _BACKOFF_SCHEDULE[idx]
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting.)
+
+    One import, wrapped: an admission signal is unnecessary once the tick polls
+    (§13b), but a mute that could raise into the delivery path would be worse
+    than no mute at all.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 def request_delivery(terminal_id: str) -> None:
     """D7/D15: Signal that deliverable work exists for a terminal.
 
     O(1) admission: increments dirty_epoch, invalidates delayed token,
     and admits at most one immediate callback. Never calls deliver_pending
     inline and never writes the native inbox.
+
+    WP-ARCH 3b: inert while the queue owns delivery. §13b marks it REPLACED —
+    an admission signal is unnecessary once something polls the durable rows on
+    a schedule no wake path can suppress.
     """
+    if _queue_owns_delivery():
+        return
     service = globals().get("inbox_service")
     if not isinstance(service, InboxService):
         return
@@ -904,22 +925,42 @@ class InboxService:
                 terminal_id=terminal_id,
                 generation=generation,
             )
-            if not healed:
-                return CallbackRunOutcome(
-                    reason="no_path",
-                    retry_delay_s=_get_backoff_delay(terminal_id),
-                    retryable_failure_count=1,
-                )
-            # Re-read inbox path after heal
-            with SessionLocal() as db:
-                mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
-                inbox_path_str = mb.cc_inbox_path if mb else None
-            if not inbox_path_str:
-                return CallbackRunOutcome(
-                    reason="no_path",
-                    retry_delay_s=_get_backoff_delay(terminal_id),
-                    retryable_failure_count=1,
-                )
+            if healed:
+                # Re-read inbox path after heal
+                with SessionLocal() as db:
+                    mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+                    inbox_path_str = mb.cc_inbox_path if mb else None
+
+        # WP-ARCH 3b / A1.5: a missing CC inbox path is no longer a REFUSAL.
+        #
+        # ``cc_inbox_path`` is K2's on-disk ``team-lead.json`` — the pull-mode
+        # CONTENT channel — and it is configured only when ``supervisor.mailbox_pull``
+        # is on. A1.5 keeps that flag at its shipped ``False``, because the seat's
+        # paste ban no longer depends on it. So on a default deployment a
+        # supervisor mailbox has no path, and returning ``no_path`` here left
+        # ``written`` at zero, which left ``_f136_post_delivery``'s
+        # ``outcome.written > 0`` gate shut and the doorbell silent.
+        #
+        # That is the whole of the shadow failure: the role gate routes the seat
+        # here, this returned ``no_path``, and the seat was NEITHER pasted NOR
+        # woken — #604 arriving through the amendment written to end it. A1.5
+        # says the carrier in the three non-``on`` positions IS this chain into
+        # ``ring_supervisor_doorbell``, so the chain has to reach it.
+        #
+        # The cursor is what matters and it is kept: ``claim_unnotified_wake``
+        # and ``commit_wake`` still run, so an acked or aged id is still gated
+        # and #388 stays closed. What is dropped when there is no path is only
+        # the FILE — which D6 deletes as K2 anyway, and which A1 replaces with
+        # the seat draining ids by ``list_messages``/``ack_messages``.
+        content_channel = bool(inbox_path_str)
+        if not content_channel:
+            logger.info(
+                "f136 wake without a content channel terminal=%s mailbox=%s: "
+                "no cc_inbox_path (supervisor.mailbox_pull is off), so the wake "
+                "carries ids and the seat drains bodies by ack",
+                terminal_id,
+                mailbox_id,
+            )
 
         # D10: acquire delivery_lock (authority lock is inside claim/commit)
         delivery_lock = get_delivery_lock(terminal_id)
@@ -1024,7 +1065,7 @@ class InboxService:
                 )
 
             # F476 D3: EMIT — write CC inbox entries AFTER commit
-            inbox_path = Path(os.path.expanduser(inbox_path_str))
+            inbox_path = Path(os.path.expanduser(inbox_path_str)) if content_channel else None
             deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
             written = 0
             _max_written_row_id = 0
@@ -1034,6 +1075,19 @@ class InboxService:
             for row in claim.rows:
                 if time.monotonic() >= deadline_mono:
                     break
+
+                if not content_channel:
+                    # WP-ARCH 3b / A1.5: no K2 file, and the row is still
+                    # WAKE-ELIGIBLE. ``written`` is the doorbell's gate, not a
+                    # count of files, and the cursor above has already decided
+                    # this id is unacked and unaged. The body is deliberately
+                    # NOT carried: A1's wake is ids and a count, and #613's
+                    # first observation was a full body riding the native
+                    # message, which the context-hygiene rule files as a defect.
+                    written += 1
+                    if row.inbox_row_id > _max_written_row_id:
+                        _max_written_row_id = row.inbox_row_id
+                    continue
 
                 msg = InboxMessage(
                     id=row.inbox_row_id,
@@ -2238,6 +2292,22 @@ class InboxService:
         (test_message_trace_inbox_matrix::
         test_waiter_queued_during_ambiguous_settlement_skips_same_wake).
         """
+        # WP-ARCH 3b: MUTED while the queue owns delivery (D6, §13b).
+        #
+        # deliver_pending is REPLACED by §5c's tick — its idle-gate admission is
+        # the status precondition D1 removes, and its fall-through paste is K8's
+        # first anchor. 3b mutes it and 3c deletes it. Muting rather than
+        # deleting is the reason 3b and 3c are separate commits: the `drain`
+        # position needs this path alive for new traffic while the tick finishes
+        # the rows already enqueued (§6).
+        #
+        # Note what this mute does NOT carry: the paste ban. That is role-gated
+        # further down and holds in every switch position, because muting follows
+        # the position and the ban does not (§A1.5).
+        if _queue_owns_delivery():
+            self._log_delivery_skip(terminal_id, "queue_owns_delivery")
+            return
+
         # F339: skip delivery for terminals already abandoned as ghosts.
         if self._f339_is_abandoned(terminal_id):
             self._log_delivery_skip(terminal_id, "f339_abandoned")
@@ -2426,14 +2496,37 @@ class InboxService:
                 return
 
             # --- WP-MAILBOX-CHANNEL: pull-mode gate (D6) ---
-            # If the supervisor.mailbox_pull flag is on AND this terminal is the
-            # current supervisor mailbox incarnation, skip the push entirely.
-            # Rows stay PENDING; the supervisor drains them via list_messages/ack.
+            # WP-ARCH 3b / K8 anchor 1 (§A1.3, §A1.5). This branch used to ask
+            # is_supervisor_mailbox_pull_terminal, which returns False before it
+            # looks at the terminal at all whenever supervisor.mailbox_pull is
+            # unset — so with the shipped defaults the branch was NOT taken and a
+            # supervisor-mailbox row fell straight through to prepare_input and
+            # send_prepared_input. THAT is the path that produced the pasted
+            # "[Message from ...]" blocks in the seat's composer (#613 emitter 3),
+            # and #613 is the evidence: with only wake.native set, the paste
+            # fired anyway.
+            #
+            # It now asks is_supervisor_role_terminal — the same fail-closed
+            # probe D7's dispatch and the rung-2 exemption already use. The ban
+            # is therefore a property of the RECEIVER'S ROLE, not of a switch
+            # position or a config flag:
+            #
+            #   * muting follows the switch position and the ban does not. Under
+            #     `off`, `shadow` and `drain` this path still serves new traffic,
+            #     and `drain` is a position D9's boot guard can impose without an
+            #     operator asking for it. Scoping the ban to CAO_DELIVERY_QUEUE=on
+            #     would leave it false in three of four positions (#488).
+            #   * a config-gated ban is exactly what F210 declined to build when
+            #     it made the rung-2 exemption role-based; an operator could
+            #     unset the flag and the user's decision would evaporate.
+            #
+            # Rows stay PENDING; the seat drains them via list_messages/ack, and
+            # the wake reaches it over the native cross-session channel.
             from cli_agent_orchestrator.services.mailbox_service import (
-                is_supervisor_mailbox_pull_terminal,
+                probe_supervisor_role,
             )
 
-            if is_supervisor_mailbox_pull_terminal(terminal_id):
+            if probe_supervisor_role(terminal_id):
                 # F476 r3 (#388): the supervisor teammate-push wake MUST route
                 # through the single wake cursor, never attempt_teammate_push
                 # directly. Calling attempt_teammate_push here bypassed

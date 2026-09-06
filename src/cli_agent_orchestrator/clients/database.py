@@ -7726,6 +7726,85 @@ def _remove_supervisor_pending_flag_if_drained() -> None:
         pass  # Best-effort; stale flag just costs one empty drain.
 
 
+def _refresh_if_persistent(db: Any, row: Any) -> None:
+    """Refresh a row only when the session actually holds it.
+
+    WP-ARCH 3b: at position ``on`` the choke point returns a POPULATED but
+    never-added ``InboxModel`` — §6 makes the legacy inbox read-only, so there is
+    no INSERT to refresh from. ``Session.refresh`` raises on a transient
+    instance, so the two call sites ask first. Everywhere else this is the
+    refresh they have always done.
+    """
+    try:
+        db.refresh(row)
+    except Exception:  # noqa: BLE001 — a refresh that cannot run is not a failure
+        # TRIED rather than pre-checked with ``inspect(row).persistent``.
+        # A mocked session holds no identity map, so a row added to one is never
+        # "persistent" and a pre-check would skip the refresh the caller's own
+        # double is standing in for — turning a passing legacy test red for a
+        # path that has not changed. The only row this is expected to raise on
+        # is the write-through's never-added instance, whose fields the choke
+        # point has already filled in.
+        logger.debug("wp_arch_refresh_skipped", exc_info=True)
+
+
+def _queue_write_through(
+    fields: dict[str, Any],
+    *,
+    receiver_id: str,
+    logical_receiver_id: str | None,
+    orchestration_type: OrchestrationType,
+    content_hash: str | None,
+    park_warm: bool,
+    barrier_id: int | None,
+    barrier_member_key: str | None,
+    expire_after_s: int | None,
+    supersede_key: str | None,
+) -> tuple[int, str] | None:
+    """Hand one new message to the queue instead of the inbox (§6, WP-ARCH 3b).
+
+    Returns ``(surrogate_id, msg_id)`` at position ``on``, and ``None``
+    everywhere else — ``off`` and ``shadow`` write their legacy row exactly as
+    they do today, and ``shadow`` additionally mirrors it. Never raises: a queue
+    that cannot be written returns ``None`` and the caller falls back to the
+    legacy insert, which degrades to the pre-flip behaviour rather than losing
+    the message.
+
+    The receiver written to the queue is the MAILBOX id where one exists (§5
+    item 2), because queue rows are addressed to the durable mailbox and are not
+    generation-gated — that is what lets a fresh incarnation inherit them with
+    no rewrite (#33).
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import (
+            legacy_enqueue_fact,
+            write_through_enqueue,
+        )
+
+        return write_through_enqueue(
+            legacy_enqueue_fact(
+                legacy_message_id=0,
+                sender_id=str(fields.get("sender_id") or ""),
+                receiver_id=logical_receiver_id or receiver_id,
+                message=str(fields.get("message") or ""),
+                status=MessageStatus.PENDING.value,
+                created_at=fields.get("created_at") or _utcnow(),
+                orchestration_type=orchestration_type.value,
+                is_callback=orchestration_type == OrchestrationType.SEND_MESSAGE,
+                content_hash=content_hash,
+                park_warm=bool(park_warm),
+                barrier_id=barrier_id,
+                barrier_member_key=barrier_member_key,
+                enqueue_generation=fields.get("enqueue_generation"),
+                expire_after_s=expire_after_s,
+                supersede_key=supersede_key,
+            )
+        )
+    except Exception:  # noqa: BLE001 — a write-through may never break a send
+        logger.debug("wp_arch_write_through_failed", exc_info=True)
+        return None
+
+
 def _insert_routed_inbox_row(
     db: Any,
     *,
@@ -7919,6 +7998,73 @@ def _insert_routed_inbox_row(
             effective_receiver,
             supersede_key,
         )
+    # WP-ARCH 3b / §6: at `on` the legacy inbox is READ-ONLY.
+    #
+    # "At the shadow-to-on flip the legacy inbox goes read-only: it stops
+    # accepting inserts, existing rows drain through the old path, and new rows
+    # go to delivery_msg. Dual-write is excluded, a dual-written row being a
+    # fifth carrier that would reproduce #506 inside the fix."
+    #
+    # Everything above this line has already run and is D13's carried effect
+    # list: the dispatch-barrier attach, the open-barrier association, the
+    # late-callback rewrite, the enqueue-generation stamp and F578 supersession.
+    # They stay in this transaction because they operate on the barrier and
+    # inbox tables and the legacy predicates have to see them. What moves is the
+    # ROW.
+    #
+    # The returned object is a fully-populated InboxModel that is NEVER added to
+    # the session, so every caller keeps its contract — `.id`, `.message`,
+    # `.status`, `_inbox_message_from_row(row)` — while the table gains nothing.
+    _wt = _queue_write_through(
+        fields,
+        receiver_id=receiver_id,
+        logical_receiver_id=logical_receiver_id,
+        orchestration_type=orchestration_type,
+        content_hash=content_hash,
+        park_warm=park_warm,
+        barrier_id=barrier_id,
+        barrier_member_key=barrier_member_key,
+        expire_after_s=expire_after_s,
+        supersede_key=supersede_key,
+    )
+    if _wt is not None:
+        surrogate_id, _queue_msg_id = _wt
+        row = InboxModel(**fields)
+        row.id = surrogate_id
+        # The column defaults an INSERT would have applied have to be applied
+        # here instead, because there is no INSERT. `created_at` is the one that
+        # bites: `_inbox_message_from_row` requires it and the model default is a
+        # server-side one, so a detached row hands the caller a validation error
+        # for a message that was in fact enqueued.
+        if getattr(row, "created_at", None) is None:
+            row.created_at = created_at or _utcnow()
+        if getattr(row, "status", None) is None:
+            row.status = status.value
+        for _column, _default in (
+            ("failure_reason", None),
+            ("digested_into", None),
+            ("owner_receiver_id", None),
+            ("owner_generation", None),
+            ("park_warm", bool(park_warm)),
+        ):
+            if getattr(row, _column, None) is None:
+                setattr(row, _column, _default)
+        # The barrier member still needs an integer handle, and the surrogate is
+        # allocated above the high-water of BOTH tables so it cannot collide with
+        # a historical inbox id.
+        if match is not None:
+            barrier, member = match
+            if member.state == "AWAITING":
+                member.state = "ARRIVED"
+                member.failure_class = None
+                member.message_id = surrogate_id
+                member.arrived_at = _barrier_now()
+            _maybe_fire_completed_barrier(db, barrier)
+        # F642's ledger row is deliberately absent: D13 scopes it out, because
+        # `delivery_msg`'s own state with its `delivery_attempt` rows is the
+        # replacement authority (I5) and writing both would give one id two.
+        return row
+
     row = InboxModel(**fields)
     db.add(row)
     db.flush()
@@ -8415,7 +8561,7 @@ def create_digest_pending_notice(
                 park_warm=True,
             )
             db.commit()
-            db.refresh(row)
+            _refresh_if_persistent(db, row)
             return _inbox_message_from_row(row)
         except Exception:
             db.rollback()
@@ -8466,7 +8612,7 @@ def _create_inbox_message_unfenced(
             supersede_key=supersede_key,
         )
         db.commit()
-        db.refresh(inbox_msg)
+        _refresh_if_persistent(db, inbox_msg)
         # WP-ARCH phase 3a, hook point 1 — the shadow queue mirrors this row.
         # POST-COMMIT deliberately: the queue's store holds its own connection to
         # this same SQLite file, so writing from inside the transaction above

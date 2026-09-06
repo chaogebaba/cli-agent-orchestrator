@@ -150,6 +150,34 @@ def is_supervisor_role_terminal(terminal_id: str, db: Any | None = None) -> bool
         return _check(session)
 
 
+def probe_supervisor_role(terminal_id: str | None) -> bool:
+    """The role probe, FAIL-CLOSED — the one D7's dispatch and K8's ban both use.
+
+    An unanswerable probe reports *supervisor*, because the cost of a wrong
+    ``False`` is typing into the user's own pane. That direction and that reason
+    are F210's, and WP-ARCH 3b keeps both while moving the wrapper here: the
+    wrapper used to live in ``delivery_service`` (the FX191 ladder), which the
+    phase deletes, and A1.1 puts the probe in its own module so it outlives the
+    ladder.
+
+    The misclassification cost is stated rather than hidden. A worker wrongly
+    read as a seat is never pasted, and its rows die at ``dead_by`` with a
+    ``DIAG-SEAT-WAKE-UNREACHABLE`` finding — loud, bounded, and the safe
+    direction. A seat wrongly read as a worker is a paste into a human's
+    composer, which is the thing the user ended.
+
+    A builder who "fixes" this to fail open has reverted the amendment.
+    """
+    if not terminal_id:
+        return True
+    try:
+        with SessionLocal() as db:
+            return is_supervisor_role_terminal(terminal_id, db)
+    except Exception:
+        logger.debug("supervisor-role probe failed for %s", terminal_id, exc_info=True)
+        return True
+
+
 def get_current_supervisor_terminal_id() -> str | None:
     """F138: Return the terminal_id of the current live supervisor mailbox, or None.
 
@@ -944,6 +972,128 @@ def _attempt_outcome(db: Any, message_id: int) -> str:
     )
 
 
+def _queue_owns_new_traffic() -> bool:
+    """Is the write-through position live? (WP-ARCH 3b, §6.)
+
+    Never raises: a wiring module that cannot answer leaves the drain reading the
+    inbox, which is the pre-flip behaviour.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_new_traffic
+
+        return queue_owns_new_traffic()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
+def _list_from_queue(receiver: str, *, after_id: int | None, limit: int) -> dict[str, Any] | None:
+    """§5b's fetch, served from ``delivery_msg``.
+
+    Returns ``None`` when the queue cannot answer — no runtime, or a receiver it
+    holds nothing for — and the caller then reads the inbox as before. That
+    matters at the boundary: a seat drains rows the legacy path enqueued BEFORE
+    the flip out of the inbox, and rows enqueued after it out of the queue, and
+    neither table is asked to know about the other.
+
+    The item shape is legacy's, field for field, because the seat's drain loop
+    and every hook that reads it are unchanged by this phase. ``id`` is the
+    surrogate the write-through minted, which is what makes ``ack_messages``'s
+    integer cursor keep working across the flip.
+    """
+    from cli_agent_orchestrator.services.queue_carrier import queue_runtime
+
+    runtime = queue_runtime()
+    if runtime is None:
+        return None
+    try:
+        rows = runtime.store.pending_for_receiver(
+            receiver, after_id=int(after_id or 0), limit=limit + 1
+        )
+    except Exception:  # noqa: BLE001 — a queue read may never break the drain
+        logger.warning("wp_arch list_messages could not read the queue", exc_info=True)
+        return None
+    if not rows:
+        return None
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items: list[dict[str, Any]] = [
+        {
+            "id": row.legacy_message_id,
+            "sender_id": row.sender_id,
+            "receiver_id": row.receiver_id,
+            "logical_receiver_id": row.receiver_id if row.receiver_id.startswith("mb_") else None,
+            "message": row.payload,
+            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+            "status": MessageStatus.PENDING.value,
+            "failure_reason": None,
+            "digested_into": None,
+            "enqueue_generation": row.enqueue_generation,
+            "barrier_id": row.barrier_id,
+            "barrier_member_key": row.barrier_member_key,
+            "last_attempt_outcome": None,
+            "created_at": row.created_at.isoformat(),
+            # The one field legacy has no column for, and it is the reason a
+            # reader can tie a listed row back to `cao diag <msg_id>` (I5).
+            "msg_id": row.msg_id,
+        }
+        for row in rows
+    ]
+    return {
+        "items": items,
+        "next_after_id": items[-1]["id"] if has_more and items else None,
+        "has_more": has_more,
+    }
+
+
+def _ack_on_queue(terminal_id: str, up_to_id: int) -> dict[str, Any] | None:
+    """§5b's consume, over ``delivery_msg``, closing the covering epoch (D10).
+
+    Settles the rows at or below the seat's cursor and stamps the digest
+    ``consumed_at``/``consumed_via='mcp_ack'``, which is what makes I4 hold: a
+    consumed epoch is TERMINAL, so a later arrival opens a new epoch rather than
+    reopening this one, and #568's re-announcement becomes unreachable rather
+    than filtered.
+
+    Returns ``None`` when the queue settled nothing, so the caller falls through
+    to the legacy ack for rows the inbox still holds from before the flip.
+    """
+    from cli_agent_orchestrator.services.queue_carrier import queue_runtime
+
+    runtime = queue_runtime()
+    if runtime is None:
+        return None
+    with SessionLocal() as db:
+        mailbox: Any = (
+            db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
+        )
+        if mailbox is None:
+            return None
+        mailbox_id = str(mailbox.id)
+    try:
+        now = runtime.clock.now()
+        settled = runtime.store.settle_through(mailbox_id, up_to_id=up_to_id, now=now)
+        if not settled:
+            return None
+        digest = runtime.store.open_digest(mailbox_id)
+        if digest is not None and runtime.store.all_terminal(digest.msg_ids):
+            runtime.store.close_digest(mailbox_id, digest.epoch, via="mcp_ack", now=now)
+    except Exception:  # noqa: BLE001 — an ack that cannot run must not raise at the seat
+        logger.warning("wp_arch ack_messages could not settle queue rows", exc_info=True)
+        return None
+
+    with SessionLocal() as db:
+        row: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if row is not None and int(row.consumed_through_id or 0) < up_to_id:
+            row.consumed_through_id = up_to_id
+            row.updated_at = _utcnow()
+            db.commit()
+            consumed = up_to_id
+        else:
+            consumed = int(row.consumed_through_id or 0) if row is not None else up_to_id
+    return {"mailbox_id": mailbox_id, "consumed_through_id": consumed, "changed": True}
+
+
 def list_messages(
     receiver: str,
     *,
@@ -967,6 +1117,30 @@ def list_messages(
             "parked_query_requires_incarnation",
             "parked queries require generation or original_receiver_id",
         )
+
+    # WP-ARCH 3b / §6: at `on` the queue holds new traffic and the inbox is
+    # read-only, so the seat's drain reads from `delivery_msg`.
+    #
+    # This is §5b's consumer contract: the wake carries ids and a count, and the
+    # seat fetches the bodies with `list_messages` and consumes with
+    # `ack_messages`. If this still read the inbox, a seat woken at `on` would
+    # look for its messages in a table nothing writes any more and drain
+    # nothing — which is the silent loss the phase exists to remove, arriving
+    # through the flip.
+    #
+    # Only the ordinary pull is served here. An audit browse, a parked query or
+    # a status filter is legacy archaeology over rows the queue never held, and
+    # those keep reading the inbox.
+    if (
+        _queue_owns_new_traffic()
+        and not audit_browse
+        and status is None
+        and original_receiver_id is None
+    ):
+        queued = _list_from_queue(receiver, after_id=after_id, limit=limit)
+        if queued is not None:
+            return queued
+
     with SessionLocal() as db:
         query = db.query(InboxModel)
         if receiver.startswith("mb_"):
@@ -1087,6 +1261,13 @@ def list_messages(
 
 
 def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
+    # WP-ARCH 3b / §5b: at `on` the rows the seat is acking live in the queue.
+    # Tried first and falling through when it settles nothing, so a seat that
+    # still holds pre-flip inbox rows acks those the legacy way.
+    if _queue_owns_new_traffic():
+        settled = _ack_on_queue(terminal_id, up_to_id)
+        if settled is not None:
+            return settled
     with SessionLocal() as db:
         mailbox: Any = (
             db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()

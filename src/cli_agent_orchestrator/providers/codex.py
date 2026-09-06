@@ -1,6 +1,7 @@
 """Codex CLI provider implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import sqlite3
 import subprocess
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -165,6 +167,416 @@ def _pretrust_cwd_in_codex_home(cwd: str, codex_home: Path) -> bool:
     except OSError:
         logger.exception("codex pre-trust: failed to write %s", config_path)
         return False
+
+
+# --------------------------------------------------------------------------
+# F729: spawn-time re-assert of the codex startup-dialog answers.
+#
+# Three separate startup cards each stall a fresh codex seat, and each persists
+# its answer under a DIFFERENT key in the codex user layer ($CODEX_HOME/
+# config.toml).  F597 above owns only the first of them:
+#
+#   1. trust-directory card -> projects."<dir>".trust_level = "trusted"
+#   2. hooks-review card    -> hooks.state."<key>".trusted_hash = "sha256:<hex>"
+#   3. resume-cwd card      -> tui.resume_cwd = "current"
+#
+# They come back for two independent reasons.  (a) Every fresh .cao worktree is
+# a new absolute path, and BOTH the project-trust key and the hooks-trust key
+# are keyed by absolute path, so a never-seen seat is always untrusted.  (b) The
+# operator switches accounts with cc-switch, which stores a whole config.toml
+# snapshot per provider profile and writes it over ~/.codex/config.toml on a
+# switch; any key added while on another profile is gone.  Measured 2026-09-05:
+# ~/.codex/config.toml is a purely additive superset of the incoming profile's
+# stored snapshot (93-line diff, zero deletions), and the 2026-08-29 backup that
+# predates the switch still carries the resume_cwd, hooks.state and repo trust
+# entries the live file has since lost.
+#
+# CAO therefore OWNS these keys and re-asserts them at every codex spawn rather
+# than relying on an answer that some other tool is free to drop.  The
+# auto-responder rules stay as the fallback layer.
+# --------------------------------------------------------------------------
+
+# The card's "Always use current directory" option.  codex's ResumeCwdMode enum
+# has exactly two variants, "current" and "session" (verified in the 0.153.4
+# binary alongside the error string `tui.resume_cwd = "current"` requires
+# `--cd` when using a remote workspace).  "current" is what CAO wants: the pane
+# is already sitting in the worktree the seat was provisioned with.
+CODEX_RESUME_CWD_MODE = "current"
+
+# codex normalizes a command hook to this timeout when the hook does not set one
+# (the value is part of the hashed identity, so it must match exactly).
+_CODEX_HOOK_DEFAULT_TIMEOUT = 600
+
+# Directory names that are never a project root worth trusting even when they
+# happen to contain a .git entry.
+_CODEX_TRUST_ROOT_SCAN_LIMIT = 12
+
+
+def _codex_hook_event_label(event: str) -> str:
+    """Map a hooks.json event name to the label codex uses in a trust key.
+
+    codex writes ``PreToolUse`` as ``pre_tool_use``.  The mapping is a plain
+    CamelCase -> snake_case fold; an event that is already snake_case (or that a
+    future codex spells differently) passes through unchanged rather than being
+    mangled.
+    """
+    if not event or "_" in event or event.islower():
+        return event
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+
+
+def _codex_hook_trusted_hash(
+    event_label: str, matcher: str, handler: Mapping[str, Any]
+) -> str | None:
+    """Return codex's ``sha256:<hex>`` trust hash for one command handler.
+
+    Algorithm (reproduced exactly against two independent ground-truth entries
+    recorded by codex itself — see the module tests): sha256 over the canonical
+    JSON (sorted keys, compact separators) of the normalized identity
+
+        {"event_name": <label>, "matcher": <matcher>,
+         "hooks": [{"async": <bool>, "command": <str>,
+                    "timeout": <int>, "type": "command"}]}
+
+    The identity contains no path, so the SAME hooks.json content yields the
+    SAME hash in every worktree — which is what makes a spawn-time re-assert
+    possible at all.  Verified 2026-09-05: two different repositories shipping a
+    byte-identical .codex/hooks.json carry the identical trusted_hash in codex's
+    own recorded state.
+
+    Returns None for any handler shape we cannot normalize with confidence (a
+    non-command handler such as an MCP tool, or a non-string command).  A hash
+    we are not sure of is worse than no hash: codex would treat the mismatch as
+    "changed" and show the card anyway, and a wrong entry is state CAO wrote for
+    a hook it did not understand.  The auto-responder covers that case.
+    """
+    if handler.get("type") not in (None, "command"):
+        return None
+    command = handler.get("command")
+    if not isinstance(command, str) or not command:
+        return None
+    timeout = handler.get("timeout", _CODEX_HOOK_DEFAULT_TIMEOUT)
+    if not isinstance(timeout, int) or isinstance(timeout, bool):
+        return None
+    is_async = handler.get("async", False)
+    if not isinstance(is_async, bool):
+        return None
+    identity = {
+        "event_name": event_label,
+        "matcher": matcher,
+        "hooks": [
+            {
+                "async": is_async,
+                "command": command,
+                "timeout": timeout,
+                "type": "command",
+            }
+        ],
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _codex_hook_trust_entries(hooks_file: Path) -> list[tuple[str, str]]:
+    """Return ``(hooks.state key, trusted_hash)`` for every handler in a hooks.json.
+
+    The key is codex's positional identifier
+    ``<abs hooks.json path>:<event_label>:<group index>:<handler index>``.
+    Indices are the handler's real position in the file, so a repo that grows a
+    second group keeps the first group's key stable.
+
+    A malformed or unreadable hooks.json yields no entries: this is a
+    convenience layer, never a launch blocker.
+    """
+    try:
+        raw = json.loads(hooks_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("codex hook-trust: %s is not readable JSON; skipping", hooks_file)
+        return []
+    if not isinstance(raw, dict):
+        return []
+    events = raw.get("hooks")
+    if not isinstance(events, dict):
+        return []
+    key_path = str(hooks_file)
+    entries: list[tuple[str, str]] = []
+    for event, groups in events.items():
+        if not isinstance(event, str) or not isinstance(groups, list):
+            continue
+        label = _codex_hook_event_label(event)
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher", "")
+            if not isinstance(matcher, str):
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                continue
+            for handler_index, handler in enumerate(handlers):
+                if not isinstance(handler, dict):
+                    continue
+                digest = _codex_hook_trusted_hash(label, matcher, handler)
+                if digest is None:
+                    continue
+                entries.append((f"{key_path}:{label}:{group_index}:{handler_index}", digest))
+    return entries
+
+
+def _codex_trust_root_is_forbidden(candidate: Path, home: Path | None) -> bool:
+    """True when ``candidate`` is too broad a directory for CAO to trust.
+
+    ``candidate`` must already be resolved.  The filesystem root, the user's
+    home directory and every ancestor of it are refused: a ``projects`` entry
+    for any of them trusts every directory below it, now and forever, which is
+    a decision only the operator gets to make at codex's own card.
+    """
+    if candidate == candidate.parent:  # filesystem root
+        return True
+    if home is not None and (candidate == home or candidate in home.parents):
+        return True
+    return False
+
+
+def _codex_trust_roots(cwd: Path) -> list[Path]:
+    """Return ``cwd`` plus each enclosing repository root, nearest first.
+
+    A CAO seat runs in ``<repo>/.cao/worktrees/<id>``, and a nested fork puts a
+    second repository between that seat and the outer checkout — the two repo
+    roots the operator has to re-trust by hand every time the config is reset.
+    An ancestor that carries a ``.git`` entry (a directory for a checkout, a
+    file for a linked worktree) is exactly the granularity codex's own
+    trust-this-directory answer uses, so trusting it is not a widening of what
+    the operator already approves at the card.
+
+    Bounded deliberately: no returned root is ever the user's home directory,
+    an ancestor of it, or the filesystem root, and the walk never climbs more
+    than ``_CODEX_TRUST_ROOT_SCAN_LIMIT`` levels.  Trusting $HOME or / would
+    trust every future directory on the machine, which is not CAO's call to
+    make.  The boundary is on what may be TRUSTED, not on where the walk may
+    start: CAO provisions seats under a scratch mount outside $HOME, and
+    stopping the walk at the home boundary would have left those seats with no
+    repo root at all.
+
+    The boundary applies to ``cwd`` itself, not only to its ancestors.  A
+    caller that hands us ``$HOME`` or ``/`` directly gets an empty list — the
+    ancestors of such a cwd are forbidden by construction too, so there is
+    nothing left to walk for.
+    """
+    try:
+        home: Path | None = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home = None
+    try:
+        resolved_cwd = cwd.resolve()
+    except OSError:
+        return []
+    if _codex_trust_root_is_forbidden(resolved_cwd, home):
+        logger.warning(
+            "codex hook-trust: refusing to trust %s (home, an ancestor of it, or /)", cwd
+        )
+        return []
+    roots = [cwd]
+    current = cwd.parent
+    for _ in range(_CODEX_TRUST_ROOT_SCAN_LIMIT):
+        try:
+            resolved = current.resolve()
+        except OSError:
+            break
+        if _codex_trust_root_is_forbidden(resolved, home):
+            break
+        if (current / ".git").exists() and current not in roots:
+            roots.append(current)
+        current = current.parent
+    return roots
+
+
+def _codex_owned_startup_keys(cwd: Path) -> tuple[list[str], list[tuple[str, str]]]:
+    """Return the (trusted dirs, hook trust entries) CAO owns for this launch."""
+    roots = _codex_trust_roots(cwd)
+    hook_entries: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for root in roots:
+        hooks_file = root / ".codex" / "hooks.json"
+        if not hooks_file.is_file():
+            continue
+        for key, digest in _codex_hook_trust_entries(hooks_file):
+            if key not in seen_keys:
+                seen_keys.add(key)
+                hook_entries.append((key, digest))
+    return [str(root) for root in roots], hook_entries
+
+
+def _toml_basic_string(value: str) -> str:
+    """Escape ``value`` for use inside a TOML basic string (quotes included)."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _insert_into_existing_table(lines: list[str], table: str, assignment: str) -> bool:
+    """Insert ``assignment`` directly under an existing ``[table]`` header.
+
+    Appending a second ``[tui]`` header would make the file invalid TOML, and
+    codex would then fall back to defaults for EVERY key — far worse than the
+    dialog we are suppressing.  So the one key that lives in a table the user
+    already owns is inserted as a single new line right after that header,
+    touching nothing that is already there.  Returns False when the header is
+    absent, leaving the caller to append a fresh table instead.
+    """
+    header = f"[{table}]"
+    for index, line in enumerate(lines):
+        if line.strip() == header:
+            lines.insert(index + 1, assignment)
+            return True
+    return False
+
+
+def _reassert_codex_startup_keys(cwd: str | os.PathLike[str], codex_home: Path) -> bool:
+    """Idempotently re-assert CAO's owned codex startup answers in ``codex_home``.
+
+    Writes, and ONLY writes, three key families:
+
+    * ``projects."<dir>".trust_level = "trusted"`` for the worker cwd and each
+      enclosing repository root (:func:`_codex_trust_roots`);
+    * ``hooks.state."<key>".trusted_hash`` for every command handler in a
+      ``.codex/hooks.json`` under those roots;
+    * ``tui.resume_cwd = "current"``.
+
+    Everything else in the file is out of bounds.  In particular this never
+    touches ``auth.json``, never reads or writes any provider, ``base_url``,
+    bearer-token or API-key field, and never rewrites, reorders or deletes an
+    existing line — additions are appended, with the single exception of the
+    one-line insert under an existing ``[tui]`` header.
+
+    Idempotent: a key already present with the wanted value is left alone, so a
+    second call on the same home is a no-op and no duplicate table is ever
+    emitted.  The cwd guard from F703 (#558) is kept verbatim — a mocked
+    backend's MagicMock cwd is not a path, and letting one through is how 52
+    junk trust tables landed in the operator's live config on 2026-09-01.
+
+    Returns True when the file ends up carrying every owned key, False on any
+    error.  Never raises into the launch path: a seat that boots with the
+    dialog showing is recoverable by the auto-responder, a seat that does not
+    boot is not.
+    """
+    import tomllib
+
+    if not isinstance(cwd, (str, os.PathLike)):
+        logger.warning(
+            "codex key re-assert: cwd is not a path (%r); not writing", type(cwd).__name__
+        )
+        return False
+    cwd = os.fspath(cwd)
+    if not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        logger.warning(
+            "codex key re-assert: cwd %r is not an existing absolute directory; not writing", cwd
+        )
+        return False
+
+    cwd_path = Path(os.path.abspath(cwd))
+    config_path = codex_home / "config.toml"
+    try:
+        codex_home.mkdir(parents=True, exist_ok=True)
+        original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        if original:
+            try:
+                parsed = tomllib.loads(original)
+            except tomllib.TOMLDecodeError:
+                logger.warning(
+                    "codex key re-assert: %s is not valid TOML; not modifying", config_path
+                )
+                return False
+        else:
+            parsed = {}
+
+        trusted_dirs, hook_entries = _codex_owned_startup_keys(cwd_path)
+
+        projects = parsed.get("projects")
+        projects = projects if isinstance(projects, dict) else {}
+        hooks_state = parsed.get("hooks")
+        hooks_state = hooks_state.get("state") if isinstance(hooks_state, dict) else None
+        hooks_state = hooks_state if isinstance(hooks_state, dict) else {}
+        tui = parsed.get("tui")
+        tui = tui if isinstance(tui, dict) else {}
+
+        appended: list[str] = []
+        for directory in trusted_dirs:
+            entry = projects.get(directory)
+            if isinstance(entry, dict) and entry.get("trust_level") == "trusted":
+                continue
+            appended.append(
+                f'\n[projects.{_toml_basic_string(directory)}]\ntrust_level = "trusted"\n'
+            )
+        for key, digest in hook_entries:
+            entry = hooks_state.get(key)
+            if isinstance(entry, dict) and entry.get("trusted_hash") == digest:
+                continue
+            appended.append(
+                f"\n[hooks.state.{_toml_basic_string(key)}]\n"
+                f"trusted_hash = {_toml_basic_string(digest)}\n"
+            )
+
+        needs_resume = tui.get("resume_cwd") != CODEX_RESUME_CWD_MODE
+        if not appended and not needs_resume:
+            return True  # already asserted — idempotent no-op
+
+        lines = original.splitlines(keepends=True)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        if needs_resume:
+            assignment = f'resume_cwd = "{CODEX_RESUME_CWD_MODE}"\n'
+            if "resume_cwd" in tui:
+                # Present with the wrong value.  Rewriting the operator's line is
+                # outside what CAO owns here; leave it and let the responder answer.
+                logger.warning(
+                    "codex key re-assert: tui.resume_cwd is set to %r; leaving it alone",
+                    tui.get("resume_cwd"),
+                )
+            elif not _insert_into_existing_table(lines, "tui", assignment):
+                appended.append(f"\n[tui]\n{assignment}")
+
+        candidate = "".join(lines) + "".join(appended)
+        if candidate == original:
+            return _codex_keys_are_asserted(parsed, trusted_dirs, hook_entries)
+        try:
+            reparsed = tomllib.loads(candidate)
+        except tomllib.TOMLDecodeError:
+            logger.warning(
+                "codex key re-assert: refusing to write %s (result would not parse)", config_path
+            )
+            return False
+
+        config_path.write_text(candidate, encoding="utf-8")
+        try:
+            config_path.chmod(0o600)
+        except OSError:
+            pass
+        return _codex_keys_are_asserted(reparsed, trusted_dirs, hook_entries)
+    except OSError:
+        logger.exception("codex key re-assert: failed to write %s", config_path)
+        return False
+
+
+def _codex_keys_are_asserted(
+    parsed: Mapping[str, Any],
+    trusted_dirs: list[str],
+    hook_entries: list[tuple[str, str]],
+) -> bool:
+    """True when ``parsed`` carries every owned key with the wanted value."""
+    projects = parsed.get("projects")
+    projects = projects if isinstance(projects, Mapping) else {}
+    for directory in trusted_dirs:
+        entry = projects.get(directory)
+        if not isinstance(entry, Mapping) or entry.get("trust_level") != "trusted":
+            return False
+    hooks = parsed.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, Mapping) else None
+    state = state if isinstance(state, Mapping) else {}
+    for key, digest in hook_entries:
+        entry = state.get(key)
+        if not isinstance(entry, Mapping) or entry.get("trusted_hash") != digest:
+            return False
+    return True
 
 
 # Regex patterns for Codex output analysis
@@ -596,6 +1008,8 @@ def _is_codex_paste_chip_chrome(draft: str) -> bool:
     if not draft:
         return False
     return CODEX_PASTE_CHIP_LEAD_PATTERN.match(draft.strip()) is not None
+
+
 # Grace before the first submission check: give the TUI a beat to register the
 # paste and process the submit Enter under load.
 CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
@@ -1643,8 +2057,7 @@ class CodexProvider(BaseProvider):
             if isinstance(rendered, str) and _codex_tui_is_ready_for_submit(rendered):
                 if waited:
                     logger.info(
-                        "F643c readiness gate: terminal %s TUI ready; proceeding "
-                        "with paste",
+                        "F643c readiness gate: terminal %s TUI ready; proceeding " "with paste",
                         self.terminal_id,
                     )
                 return
@@ -2805,10 +3218,26 @@ class CodexProvider(BaseProvider):
         # CODEX_HOME this launch uses. The pane's cwd is the launch cwd; if it
         # cannot be resolved the launch proceeds and the yaml auto-answer rule
         # remains the belt-and-braces fallback.
+        #
+        # F729: the trust-directory card is only one of three startup cards, and
+        # the answers to all three are dropped whenever cc-switch restores another
+        # account profile's stored config.toml over ~/.codex/config.toml. So the
+        # same pane cwd also drives _reassert_codex_startup_keys, which re-asserts
+        # the hooks-review and resume-cwd answers alongside project trust. It runs
+        # against BOTH the home this launch uses and the real ~/.codex: a persona
+        # home is rebuilt from the real config on every spawn, so an answer only
+        # written to the persona copy is gone by the next seat.
         try:
             pane_cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name)
             if pane_cwd:
-                _pretrust_cwd_in_codex_home(pane_cwd, _resolved_codex_home(self.terminal_id))
+                launch_home = _resolved_codex_home(self.terminal_id)
+                _pretrust_cwd_in_codex_home(pane_cwd, launch_home)
+                homes = [launch_home]
+                real_home = provider_home("codex").home
+                if real_home not in homes:
+                    homes.append(real_home)
+                for home in homes:
+                    _reassert_codex_startup_keys(pane_cwd, home)
         except Exception:
             logger.exception("codex pre-trust: skipped (cwd resolution failed)")
 

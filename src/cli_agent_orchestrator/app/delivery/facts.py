@@ -24,6 +24,7 @@ __all__ = [
     "LegacyAttempt",
     "LegacyEnqueue",
     "LegacyOutcome",
+    "LegacySeatWake",
     "LegacyVeto",
 ]
 
@@ -105,6 +106,32 @@ class LegacyOutcome:
     status: str
     failure_reason: str | None = None
     attempts: tuple[LegacyAttempt, ...] = ()
+
+
+@dataclass(frozen=True)
+class LegacySeatWake:
+    """One native seat wake the legacy F136 chain actually emitted (§A1.5).
+
+    Under ``off``, ``shadow`` and ``drain`` the queue does not serve the seat, so
+    the carrier is ``ring_supervisor_doorbell``'s native ring rather than the
+    tick's ``wake_seat``.  I5 asks one query to return a msg_id's full delivery
+    history, and an emission with no ``delivery_attempt`` row is the pane
+    archaeology I5 exists to end: the socket bytes left, and the stored rows said
+    nothing happened — which is #604's unreadability arriving through the
+    amendment written to end it.
+
+    ``legacy_message_id`` is the epoch's high-water inbox row — the same
+    ``max_written_row_id`` the ring is keyed on — so ONE emitted epoch produces
+    exactly one attempt row rather than one per message in it.
+
+    ``at`` is the emission's own instant, not the message's: this fact records
+    what a carrier DID, and the started_at of an attempt is when the attempt
+    started.
+    """
+
+    legacy_message_id: int
+    at: datetime
+    detail: str = ""
 
 
 @dataclass(frozen=True)

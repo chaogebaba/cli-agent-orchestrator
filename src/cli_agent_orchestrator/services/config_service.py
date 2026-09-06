@@ -204,10 +204,14 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", False),
     "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", True),
     # FX170: native wake config paths (D11)
-    # F337-r2 B1: default MUST be False (ship dark) — canonical source is
-    # cc_session_registry.WAKE_NATIVE_DEFAULT; duplicated here because the
-    # registry dict is evaluated at import-time before service imports resolve.
-    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", False),
+    # Canonical source is cc_session_registry.WAKE_NATIVE_DEFAULT; duplicated
+    # here because the registry dict is evaluated at import-time before service
+    # imports resolve, and a test asserts the two agree.
+    # WP-ARCH 3b / A1.5: True from 3b. Once the seat's composer injection is
+    # role-gated away in every switch position, this is the seat's ONLY carrier,
+    # and leaving it False would buy silence instead of a paste — which is #604,
+    # not a fix.
+    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", True),
     "CAO_SUPERVISOR_WAKE_MIN_VERSION": ("supervisor.wake.min_version", "str", "2.1.0"),
     "CAO_SUPERVISOR_WAKE_MAX_VERSION": ("supervisor.wake.max_version", "str", "2.2.0"),
     "CAO_SUPERVISOR_WAKE_PRIORITY": ("supervisor.wake.priority", "str", "next"),

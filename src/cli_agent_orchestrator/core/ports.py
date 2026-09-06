@@ -29,11 +29,15 @@ from cli_agent_orchestrator.core.delivery import (
     DeadReason,
     DeliveryAttempt,
     EnqueueDraft,
+    InjectionResult,
     MsgState,
     QueueMessage,
     QueueMode,
     QueueOccupancy,
+    ReceiverResolution,
+    ReclaimResult,
     SeatDigest,
+    WakeEmission,
 )
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
@@ -46,8 +50,11 @@ __all__ = [
     "EventStore",
     "FindingStore",
     "GateStore",
+    "PaneInjector",
     "ProviderAdapter",
     "QueueStore",
+    "ReceiverDirectory",
+    "SeatCarrier",
     "StateFolder",
     "StateProjection",
     "StateStore",
@@ -354,14 +361,19 @@ class QueueStore(Protocol):
         """
         ...
 
-    def reclaim(self, *, now: datetime) -> tuple[int, int]:
+    def reclaim(self, *, now: datetime) -> ReclaimResult:
         """Return expired leases to ``ready`` and dead-letter the exhausted.
 
-        Returns ``(reclaimed, dead_lettered)``.  Increments ``attempts`` and adds
-        ``DELIVERY_BACKOFF_S`` to ``available_at`` on each re-offer, and is the
-        SOLE writer of that column.  It does NOT touch ``dead_by``: recomputing
-        the deadline from the current ``available_at`` here would extend it on
-        every re-offer and the row would never die (D12).
+        Adds ``DELIVERY_BACKOFF_S`` to ``available_at`` on each re-offer and is
+        the SOLE writer of that column.  It does NOT touch ``dead_by``:
+        recomputing the deadline from the current ``available_at`` here would
+        extend it on every re-offer and the row would never die (D12).
+
+        ``attempts`` moves only for the outcomes on the attempt budget (D12's
+        accounting column).  The result names each row that died and why, because
+        the caller owes a finding and, for a non-notice row, the sender notice
+        that replaces K7's escalation line: "no row reaches ``delivery_dead``
+        silently" is a commitment a pair of counts cannot keep.
         """
         ...
 
@@ -451,6 +463,191 @@ class QueueStore(Protocol):
         every-message-terminal test vacuously.
         """
         ...
+
+    def build_digest(
+        self, receiver_id: str, msg_ids: tuple[str, ...], *, now: datetime
+    ) -> SeatDigest:
+        """Open an epoch holding ``msg_ids``, one above the receiver's highest."""
+        ...
+
+    def extend_digest(
+        self, receiver_id: str, epoch: int, msg_ids: tuple[str, ...], *, now: datetime
+    ) -> SeatDigest | None:
+        """Add ids that belong to no epoch yet to this OPEN one.
+
+        Strictly additive, and that is what keeps §5 item 6's rule intact: the
+        one event that REWRITES a digest — moving an id out of one epoch and into
+        another — is the re-parent, and it is a single transaction in
+        :meth:`reparent`.  Nothing here removes an id or moves one.
+
+        Additive rather than nothing at all, because the alternative leaves every
+        row that arrives while an epoch is open outside EVERY digest until that
+        epoch closes: behind an unconsumed epoch at a seat that is not acking,
+        those rows would reach ``dead_by`` never having been woken about, which is
+        #604's shape for exactly the messages the phase exists to deliver.
+        """
+        ...
+
+    def digest_at(self, receiver_id: str, epoch: int) -> SeatDigest | None:
+        """One digest by its primary key, open or closed."""
+        ...
+
+    def open_digests(self) -> list[SeatDigest]:
+        """Every open epoch, oldest first — the tick's re-emit and closure set."""
+        ...
+
+    def bump_wake_count(self, receiver_id: str, epoch: int, *, now: datetime) -> int:
+        """Advance one open epoch's wake ordinal and return the new value.
+
+        Zero means the epoch is closed or absent, which the caller reads as "do
+        not emit": a wake for a consumed epoch is unreachable rather than
+        suppressed (I4).  Called once per LEASE PERIOD in which the epoch is
+        re-offered, never once per emission (§A1.2).
+        """
+        ...
+
+    def close_digest(self, receiver_id: str, epoch: int, *, via: str, now: datetime) -> bool:
+        """Close an OPEN epoch (D10).  False when it was already closed.
+
+        Open-only is the whole of #568's fix here: a late tick must not overwrite
+        a recorded ``mcp_ack`` with its own closure.
+        """
+        ...
+
+    def ready_receivers(self) -> list[str]:
+        """Receivers holding at least one non-terminal LIVE row."""
+        ...
+
+    def undelivered_ids(self, receiver_id: str) -> tuple[str, ...]:
+        """The receiver's non-terminal live ids, in arrival order."""
+        ...
+
+    def senders_of(self, msg_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """The sender ids behind an epoch's messages, in arrival order."""
+        ...
+
+    def all_terminal(self, msg_ids: tuple[str, ...]) -> bool:
+        """True when every id has ended.  An empty set is terminal vacuously."""
+        ...
+
+    def sweep_shadow(self, *, now: datetime) -> int:
+        """End every surviving shadow row — the write-through flip's first act."""
+        ...
+
+    def cancel_on_complete(self, receiver_id: str, *, now: datetime) -> tuple[str, ...]:
+        """D8's completion-cancel over this receiver's flagged ``ready`` rows."""
+        ...
+
+    def prune(self, *, now: datetime, protected: frozenset[str] = frozenset()) -> int:
+        """Retention over the queue's tables, keeping open digests and evidence."""
+        ...
+
+    # -- the write-through (§6) ---------------------------------------------
+
+    def next_surrogate_id(self) -> int:
+        """The integer handle a write-through row carries instead of an inbox id.
+
+        §6 makes the legacy inbox read-only at ``on``, so no ``inbox`` row is
+        written and its autoincrement never advances — while the public surface
+        stays integer-keyed. The floor is the high-water of BOTH tables, so a
+        surrogate can never collide with a historical inbox id and an
+        ``ack_messages`` cursor cannot settle across the boundary between the two
+        eras.
+        """
+        ...
+
+    def find_recent_duplicate(
+        self,
+        *,
+        sender_id: str,
+        receiver_id: str,
+        content_hash: str,
+        window_s: int,
+        now: datetime,
+        park_warm: bool = False,
+        barrier_id: int | None = None,
+    ) -> QueueMessage | None:
+        """D13's F475 window check, with all five conjuncts.
+
+        Carried rather than approximated: at ``on`` the legacy predicate scans an
+        inbox nothing writes any more, and the queue's ``idempotency_key``
+        constraint has neither the window nor any conjunct.
+        """
+        ...
+
+    def pending_for_receiver(
+        self, receiver_id: str, *, after_id: int = 0, limit: int = 25
+    ) -> list[QueueMessage]:
+        """The receiver's undelivered live rows, in surrogate-id order (§5b)."""
+        ...
+
+    def settle_through(self, receiver_id: str, *, up_to_id: int, now: datetime) -> tuple[str, ...]:
+        """Settle rows at or below the seat's ack cursor; returns the ids (§5b)."""
+        ...
+
+
+@runtime_checkable
+class ReceiverDirectory(Protocol):
+    """Where a durable mailbox id currently lives, and what role it plays.
+
+    The one place ``app`` learns anything about terminals.  D7 dispatches on the
+    ROLE this returns, and A1.1 reuses the probe the codebase already trusts
+    rather than inventing one — ``is_supervisor_role_terminal``, the probe the
+    rung-2 ladder consults before it will type into a pane, wrapped FAIL-CLOSED
+    so an unanswerable probe reports *supervisor*.
+    """
+
+    def resolve(self, receiver_id: str) -> ReceiverResolution:
+        """Resolve the mailbox to its current incarnation.
+
+        Never raises and never returns ``None``: a receiver it cannot resolve is
+        a resolution with no ``terminal_id``, which the dispatch reads as
+        ``pane_absent`` — a stored fact rather than an exception the tick would
+        have to interpret.
+        """
+        ...
+
+
+@runtime_checkable
+class SeatCarrier(Protocol):
+    """The supervisor seat's native cross-session channel (§A1.1).
+
+    ONE producer, named without ambiguity: ``write_to_socket``, server-side,
+    inside the process that holds the rows.  The port is coarse on purpose — one
+    ``emit`` covering resolve, write and verify — because §A1.5 puts the
+    staleness demotion inside the shared RESOLUTION path rather than in the
+    queue's emitter, so that an idle seat is still woken in the positions where
+    the doorbell, not the tick, is the emitter.  Splitting the port would move
+    that decision up here and lose exactly that property.
+    """
+
+    def emit(
+        self,
+        *,
+        terminal_id: str,
+        line: str,
+        sender_key: str,
+        sender_name: str,
+        msg_id: str,
+    ) -> WakeEmission:
+        """Write one wake and report what happened, in typed reasons not exceptions."""
+        ...
+
+
+@runtime_checkable
+class PaneInjector(Protocol):
+    """D7's worker seam — the composer paste, unchanged for worker receivers.
+
+    Deliberately a SEPARATE port from :class:`SeatCarrier` rather than one port
+    with a role flag.  K8's kill is then a property of the call graph: the seat
+    branch holds no reference to this at all, so no conditional inside an
+    injector can be got wrong later.  The implementation re-asserts the role
+    probe at entry and REFUSES a supervisor-role target, returning
+    ``paste_attempted`` rather than pasting, so a future caller that routes
+    wrongly is loud rather than silent.
+    """
+
+    def inject(self, *, terminal_id: str, line: str) -> InjectionResult: ...
 
 
 @runtime_checkable

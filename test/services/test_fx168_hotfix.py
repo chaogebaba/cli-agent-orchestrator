@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -58,6 +58,7 @@ class TestFix1PostArmsF136:
         create_inbox_message and before deliver_pending.
         """
         import inspect
+
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
         source = inspect.getsource(create_inbox_message_endpoint)
@@ -71,6 +72,7 @@ class TestFix1PostArmsF136:
     def test_request_delivery_wrapped_in_try_except(self):
         """request_delivery is wrapped in try/except to not break the endpoint."""
         import inspect
+
         from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
 
         source = inspect.getsource(create_inbox_message_endpoint)
@@ -224,8 +226,8 @@ class TestFix2StalePathSelfHeal:
         F476 contract: claim → commit → stale-path check → emit. When the
         mailbox path matches metadata, the runner proceeds to write normally.
         """
-        from cli_agent_orchestrator.services.inbox_service import InboxService
         from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
+        from cli_agent_orchestrator.services.inbox_service import InboxService
 
         service = InboxService.__new__(InboxService)
         service._tnf_lock = threading.Lock()
@@ -447,7 +449,7 @@ class TestFix4DeadD9Removed:
     (request_delivery), never a direct teammate push or doorbell ring (F476 r3)."""
 
     def test_deliver_pending_mailbox_pull_no_doorbell(self):
-        """F476 r3 (#388): when is_supervisor_mailbox_pull_terminal=True, the gate
+        """F476 r3 (#388): when the seat's role probe says supervisor, the gate
         signals request_delivery (cursor path) and calls neither attempt_teammate_push
         (the closed bypass) nor ring_supervisor_doorbell directly."""
         from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -467,7 +469,7 @@ class TestFix4DeadD9Removed:
                 "cli_agent_orchestrator.services.inbox_service.get_pending_messages"
             ) as mock_pending,
             patch(
-                "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal"
+                "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role"
             ) as mock_pull,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"

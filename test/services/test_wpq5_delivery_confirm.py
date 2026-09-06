@@ -358,7 +358,13 @@ def test_wpq5_p_logical_row_challenge_is_cap_confirmable(wpq5_db, monkeypatch):
             MailboxModel(
                 id="mb_wpq5",
                 session_name="s",
-                role="supervisor",
+                # WP-ARCH 3b / A1.5: a WORKER receiver. This proof is about a
+                # LOGICAL row's delivery confirmation being cap-confirmable —
+                # a property of mailbox addressing, not of the receiver's role.
+                # A supervisor-role receiver is short-circuited before any
+                # confirmation can be observed, because the seat's composer is
+                # never written to in any switch position.
+                role="worker",
                 current_terminal_id="receiver",
                 generation=1,
                 consumed_through_id=0,

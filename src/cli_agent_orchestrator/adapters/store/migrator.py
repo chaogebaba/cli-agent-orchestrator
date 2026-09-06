@@ -258,8 +258,31 @@ CREATE TABLE IF NOT EXISTS seat_digest (
   built_at     TEXT NOT NULL,
   consumed_at  TEXT,
   consumed_via TEXT,
+  wake_count   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (receiver_id, epoch))
 """
+
+# ---------------------------------------------------------------------------
+# Additive columns, applied idempotently AFTER the create steps.
+#
+# ``CREATE TABLE IF NOT EXISTS`` is a no-op against a table 3a already created,
+# so a column added to a DDL above reaches a fresh install and NOT a deployment
+# that has been running the shadow queue.  ``ALTER TABLE … ADD COLUMN`` is the
+# other half, and it is not idempotent — a second boot raises "duplicate column
+# name", which under this migrator's all-or-nothing step loop would fail the
+# whole migration on every boot and take the delivery queue down with it.  So
+# each entry is guarded by ``PRAGMA table_info`` and skipped when the column is
+# already there.
+#
+# ``(table, column, definition)``.  Definitions must carry a DEFAULT: SQLite
+# fills existing rows with it, and a NOT NULL column without one is refused.
+# ---------------------------------------------------------------------------
+ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # A1: the wake ordinal.  Lease periods in which this epoch was woken — the
+    # durable half of I3's enforcement, the transport's content window being the
+    # half a server bounce clears.
+    ("seat_digest", "wake_count", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)
 # so a test can substitute a failing step and watch boot survive it.
@@ -388,6 +411,30 @@ def _record_migration_failure(
     logger.error("worker-truth migration failed: %s", fields)
 
 
+def _pending_additive_columns(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """The ``ALTER TABLE`` statements this database still needs, in order.
+
+    Read before the step runs rather than tolerated inside it: a step that
+    swallowed "duplicate column name" would also swallow a genuine ALTER
+    failure, and the migrator's whole contract is that a failed step is
+    RECORDED.  A table that does not exist yet returns no rows from
+    ``PRAGMA table_info`` and is skipped, because its CREATE step above already
+    carries the column.
+    """
+    pending: list[str] = []
+    for table, column, definition in ADDITIVE_COLUMNS:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        except sqlite3.Error:  # pragma: no cover — a pragma that cannot run
+            continue
+        if not rows:
+            continue
+        existing = {str(row[1]) for row in rows}
+        if column not in existing:
+            pending.append(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    return tuple(pending)
+
+
 def migrate(
     db_path: Path, *, busy_timeout_ms: int
 ) -> tuple[MigrationResult, ConnectionPool | None]:
@@ -423,8 +470,13 @@ def migrate(
         )
         return MigrationResult(ok=False, failed_step="finding", error=repr(exc)), pool
 
+    steps: list[tuple[str, tuple[str, ...]]] = list(MIGRATION_STEPS)
+    additive = _pending_additive_columns(conn)
+    if additive:
+        steps.append(("additive_columns", additive))
+
     applied: list[str] = ["finding"]
-    for name, statements in MIGRATION_STEPS:
+    for name, statements in steps:
         try:
             conn.execute("BEGIN IMMEDIATE")
             for statement in statements:

@@ -647,6 +647,7 @@ def message_payload(
         "ingest_on": ingest_on,
         "generated_at": now.isoformat(),
         "header": header,
+        "digest": _digest_payload(sources, message),
         "attempts": [
             {
                 "claim_id": attempt.claim_id,
@@ -673,6 +674,40 @@ def message_payload(
             for row in related
         ],
     }
+
+
+def _digest_payload(sources: DiagSources, message: Any) -> dict[str, Any] | None:
+    """The epoch this id was woken in, if any (WP-ARCH 3b, §5, §A1.2).
+
+    Added because the attempt rows say what the carrier DID and the digest says
+    what the receiver was TOLD — and after A1 those are different facts. A reader
+    holding a msg_id and a seat transcript needs ``wake=<w>`` to match a line
+    they can see against the row that produced it, and ``wake_count`` is also the
+    countable form of I3: it may never exceed the number of lease periods the
+    epoch has been open for.
+
+    ``None`` when the queue was not consulted, when the row is unknown, or when
+    the id belongs to no epoch — a row can be enqueued and terminal before a tick
+    ever opened one, which is exactly D8's completion-cancel.
+    """
+    if sources.queue is None or message is None:
+        return None
+    finder = getattr(sources.queue, "open_digests", None)
+    if finder is None:  # pragma: no cover — a queue double without the method
+        return None
+    for digest in finder():
+        if message.msg_id in digest.msg_ids:
+            return {
+                "epoch": digest.epoch,
+                "receiver_id": digest.receiver_id,
+                "msgs": len(digest.msg_ids),
+                "wake_count": digest.wake_count,
+                "built_at": _iso(digest.built_at),
+                "consumed_at": _iso(digest.consumed_at),
+                "consumed_via": digest.consumed_via,
+                "open": digest.open,
+            }
+    return None
 
 
 def render_message(
@@ -716,6 +751,18 @@ def render_message(
             lines.append(f"  ended        {_age(now, _parse(header['terminated_at']))}")
         if header.get("legacy_message_id") is not None:
             lines.append(f"  mirrors      legacy inbox row {header['legacy_message_id']}")
+
+    digest = data.get("digest")
+    if digest is not None:
+        # The wake ordinal is here rather than only in the attempt detail because
+        # it is what a reader matches against a line they can SEE at the seat:
+        # `[cao] digest epoch=<n> msgs=<k> wake=<w> ...`. It is also I3 in
+        # countable form (§A1.2).
+        state = "open" if digest["open"] else f"closed({digest['consumed_via']})"
+        lines.append(
+            f"  digest       epoch={digest['epoch']}  msgs={digest['msgs']}"
+            f"  wake={digest['wake_count']}  {state}"
+        )
 
     lines.append(_SEPARATOR)
     if not data["attempts"]:

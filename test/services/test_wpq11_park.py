@@ -377,16 +377,36 @@ def test_reactivated_row_reaches_ordinary_delivery(park_db, variant):
 
     pasted = _deliver_and_capture(target)
 
+    # WP-ARCH 3b / A1.5 splits this assertion by variant, and the split is the
+    # amendment rather than a weakening.
+    #
+    # The LOGICAL variant addresses the supervisor MAILBOX, so the target
+    # resolves to the seat — and the seat's composer is no longer written to in
+    # any switch position, the ban being a property of the receiver's role
+    # rather than of a flag. That row therefore reaches ordinary delivery and
+    # then WAITS to be drained through list_messages/ack_messages.
+    #
+    # The RAW variants address a terminal id directly and are not the seat, so
+    # they paste exactly as before. What this test is really about — the row
+    # leaving PARKED with its park ownership columns unrewritten — is asserted
+    # in both arms.
+    seat_bound = logical_receiver_id is not None
     with park_db() as db:
         delivered = db.get(InboxModel, message_id)
-        assert delivered.status == MessageStatus.DELIVERED.value
+        if seat_bound:
+            assert delivered.status == MessageStatus.PENDING.value
+        else:
+            assert delivered.status == MessageStatus.DELIVERED.value
         assert (delivered.owner_receiver_id, delivered.owner_generation) == (
             source,
             owner_generation,
         )
-    assert len(pasted) == 1
-    assert pasted[0][0] == target
-    assert variant in pasted[0][1]
+    if seat_bound:
+        assert pasted == [], "a supervisor-role receiver is never pasted (K8)"
+    else:
+        assert len(pasted) == 1
+        assert pasted[0][0] == target
+        assert variant in pasted[0][1]
 
 
 def test_fresh_successor_reparks_fallback_commit_without_rewriting_owner(park_db):
