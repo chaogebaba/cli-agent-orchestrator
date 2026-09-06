@@ -48,6 +48,7 @@ from cli_agent_orchestrator.core.delivery import (
     AttemptOutcome,
     DeadLetter,
     DeadReason,
+    DeadRow,
     DeliveryAttempt,
     EnqueueDraft,
     MsgKind,
@@ -55,12 +56,20 @@ from cli_agent_orchestrator.core.delivery import (
     QueueMessage,
     QueueMode,
     QueueOccupancy,
+    ReclaimResult,
     SeatDigest,
     compute_dead_by,
+    spends_attempt,
 )
 from cli_agent_orchestrator.core.ids import new_ulid
 from cli_agent_orchestrator.core.ports import Clock
-from cli_agent_orchestrator.core.timing import DELIVERY_BACKOFF_S, DELIVERY_LEASE_S
+from cli_agent_orchestrator.core.timing import (
+    DELIVERY_BACKOFF_S,
+    DELIVERY_LEASE_S,
+    DELIVERY_MAX_LIFETIME_S,
+    DELIVERY_RETENTION_DAYS,
+    DELIVERY_VETO_CEILING_S,
+)
 
 __all__ = ["IdempotencyConflict", "SqliteQueueStore"]
 
@@ -254,29 +263,86 @@ class SqliteQueueStore:
             )
             return cursor.rowcount > 0
 
-    def reclaim(self, *, now: datetime) -> tuple[int, int]:
+    def reclaim(self, *, now: datetime) -> ReclaimResult:
         """Return expired leases to ``ready``; dead-letter the exhausted.
 
-        The single statement the audit says replaces a 2,311-line watchdog
-        service, plus the dead-letter move it names in the same row.  Note what
-        is NOT in the ``SET`` clause: ``dead_by``.  ``available_at`` moves by
-        ``DELIVERY_BACKOFF_S`` on every re-offer and the deadline does not
-        follow it, which is the whole of D12's once-only rule as code.
+        The statement the audit says replaces a 2,311-line watchdog service,
+        plus the dead-letter move it names in the same row.  Note what is NOT in
+        any ``SET`` clause here: ``dead_by``.  ``available_at`` moves by
+        ``DELIVERY_BACKOFF_S`` on every re-offer and the deadline does not follow
+        it, which is the whole of D12's once-only rule as code.
+
+        **The increment is per outcome, not per re-offer** (D12's accounting
+        column).  A blanket ``attempts = attempts + 1`` would put every outcome
+        on one budget, and that is the r4 draft the design rejected: a worker
+        behind an unknown-dialog episode, which waits on a human and routinely
+        outlives five minutes, would dead-letter valid steers at 325 s, and after
+        A1 a seat whose registry record is merely stale would lose its messages
+        inside a window that heals on its own at 900 s.  So the row's LAST
+        recorded outcome for the claim being reclaimed decides, through
+        :func:`~core.delivery.spends_attempt`, and a lease that expired with
+        nothing recorded spends one because nothing was observed.
+
+        Three ways a row can die here, and each is reported rather than counted:
+
+        * the attempt budget ran out — ``max_attempts``;
+        * the dialog ceiling elapsed — ``veto_ceiling``, measured from
+          ``held_since``, which the injector sets on the first ``veto_dialog``
+          and any other outcome clears;
+        * a time bound passed — ``max_lifetime``, or ``expired`` when the
+          caller's own ``expire_after_s`` is what set the deadline.
+
+        The caller raises the findings and enqueues the sender notice, because
+        "no row reaches ``delivery_dead`` silently" is a commitment a count
+        cannot keep (§13d, case 15).
         """
         conn = self._pool.connection()
         stamp = render_timestamp(now)
         backoff_until = render_timestamp(
             datetime.fromtimestamp(now.timestamp() + DELIVERY_BACKOFF_S, tz=UTC)
         )
+        ceiling_before = render_timestamp(
+            datetime.fromtimestamp(now.timestamp() - DELIVERY_VETO_CEILING_S, tz=UTC)
+        )
+        reoffered = 0
+        incremented = 0
+        dead: list[DeadRow] = []
+
         with immediate_transaction(conn):
-            cursor = conn.execute(
-                "UPDATE delivery_msg SET state = 'ready', claim_id = claim_id + 1, "
-                "attempts = attempts + 1, available_at = ?, "
-                "lease_owner = NULL, lease_expires_at = NULL "
+            expired = conn.execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
                 "WHERE state = 'leased' AND lease_expires_at < ?",
-                (backoff_until, stamp),
-            )
-            reclaimed = cursor.rowcount
+                (stamp,),
+            ).fetchall()
+            for row in expired:
+                message = _row_to_message(row)
+                outcome = self._last_outcome_in(conn, message.msg_id, message.claim_id)
+                spends = spends_attempt(outcome)
+                conn.execute(
+                    "UPDATE delivery_msg SET state = 'ready', claim_id = claim_id + 1, "
+                    "attempts = attempts + ?, available_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE msg_id = ? AND state = 'leased'",
+                    (1 if spends else 0, backoff_until, message.msg_id),
+                )
+                reoffered += 1
+                incremented += 1 if spends else 0
+
+            # The dialog ceiling is a DURATION and is evaluated here rather than
+            # by the injector: a row whose gate never clears is never injected
+            # again, so a check that only ran on an injection would never fire
+            # for the very case the ceiling exists to bound.
+            held = conn.execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
+                "WHERE state IN ('ready', 'leased') AND held_since IS NOT NULL "
+                "AND held_since <= ?",
+                (ceiling_before,),
+            ).fetchall()
+            for row in held:
+                message = _row_to_message(row)
+                self._kill(conn, message, reason=DeadReason.VETO_CEILING, now=now)
+                dead.append(_dead_row(message, DeadReason.VETO_CEILING))
+
             exhausted = conn.execute(
                 f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
                 "WHERE state = 'ready' AND (attempts >= max_attempts OR dead_by <= ?)",
@@ -284,17 +350,34 @@ class SqliteQueueStore:
             ).fetchall()
             for row in exhausted:
                 message = _row_to_message(row)
-                reason = (
-                    DeadReason.MAX_ATTEMPTS
-                    if message.attempts >= message.max_attempts
-                    else (
-                        DeadReason.EXPIRED
-                        if message.expire_after_s is not None
-                        else DeadReason.MAX_LIFETIME
-                    )
-                )
+                reason = _dead_reason_for(message, now=now)
                 self._kill(conn, message, reason=reason, now=now)
-            return reclaimed, len(exhausted)
+                dead.append(_dead_row(message, reason))
+
+        return ReclaimResult(reoffered=reoffered, incremented=incremented, dead=tuple(dead))
+
+    @staticmethod
+    def _last_outcome_in(
+        conn: sqlite3.Connection, msg_id: str, claim_id: int
+    ) -> AttemptOutcome | None:
+        """The outcome recorded for THIS claim, or ``None`` if nothing was.
+
+        Scoped to the claim rather than to the message: an earlier claim's
+        ``pane_absent`` must not spend a second attempt for a lease that expired
+        with the injector never running, and the fencing token is what separates
+        the two.
+        """
+        row = conn.execute(
+            "SELECT outcome FROM delivery_attempt WHERE msg_id = ? AND claim_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (msg_id, int(claim_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return AttemptOutcome(row["outcome"])
+        except ValueError:  # pragma: no cover — an outcome this build cannot name
+            return None
 
     # -- reads --------------------------------------------------------------
 
@@ -551,7 +634,7 @@ class SqliteQueueStore:
         row = (
             self._pool.connection()
             .execute(
-                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via "
+                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, wake_count "
                 "FROM seat_digest WHERE receiver_id = ? AND consumed_at IS NULL "
                 "ORDER BY epoch DESC LIMIT 1",
                 (receiver_id,),
@@ -628,8 +711,8 @@ class SqliteQueueStore:
                 next_epoch = self._next_epoch_in(conn, new_receiver_id)
                 conn.execute(
                     "INSERT INTO seat_digest "
-                    "(receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via) "
-                    "VALUES (?, ?, ?, ?, NULL, NULL)",
+                    "(receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, "
+                    "wake_count) VALUES (?, ?, ?, ?, NULL, NULL, 0)",
                     (
                         new_receiver_id,
                         next_epoch,
@@ -658,8 +741,8 @@ class SqliteQueueStore:
             epoch = self._next_epoch_in(conn, receiver_id)
             conn.execute(
                 "INSERT INTO seat_digest "
-                "(receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via) "
-                "VALUES (?, ?, ?, ?, NULL, NULL)",
+                "(receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, "
+                "wake_count) VALUES (?, ?, ?, ?, NULL, NULL, 0)",
                 (receiver_id, epoch, json.dumps(list(msg_ids)), render_timestamp(now)),
             )
         digest = self.open_digest(receiver_id)
@@ -670,7 +753,7 @@ class SqliteQueueStore:
         row = (
             self._pool.connection()
             .execute(
-                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via "
+                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, wake_count "
                 "FROM seat_digest WHERE receiver_id = ? AND epoch = ?",
                 (receiver_id, int(epoch)),
             )
@@ -678,10 +761,420 @@ class SqliteQueueStore:
         )
         return None if row is None else _row_to_digest(row)
 
+    def extend_digest(
+        self, receiver_id: str, epoch: int, msg_ids: tuple[str, ...], *, now: datetime
+    ) -> SeatDigest | None:
+        """Add ids to an OPEN epoch, strictly additively (§5 item 6).
+
+        The array is otherwise immutable: nothing here removes an id or moves
+        one, and the single event that rewrites a digest — a re-parent moving an
+        id out of one epoch and into another — is :meth:`reparent`'s own
+        transaction.  What this covers is the row that arrives WHILE an epoch is
+        open, which would otherwise belong to no epoch at all until that epoch
+        closed and would reach ``dead_by`` never having been woken about, behind
+        a seat that is not acking.
+
+        Returns the digest unchanged when it holds the ids already, and ``None``
+        when the epoch is closed or absent — a closed epoch is terminal, so a
+        later arrival opens a NEW one.
+        """
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            row = conn.execute(
+                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, "
+                "wake_count FROM seat_digest WHERE receiver_id = ? AND epoch = ? "
+                "AND consumed_at IS NULL",
+                (receiver_id, int(epoch)),
+            ).fetchone()
+            if row is None:
+                return None
+            digest = _row_to_digest(row)
+            fresh = tuple(mid for mid in msg_ids if mid not in digest.msg_ids)
+            if not fresh:
+                return digest
+            merged = (*digest.msg_ids, *fresh)
+            conn.execute(
+                "UPDATE seat_digest SET msg_ids = ? WHERE receiver_id = ? AND epoch = ?",
+                (json.dumps(list(merged)), receiver_id, int(epoch)),
+            )
+            return digest.model_copy(update={"msg_ids": merged})
+
+    def bump_wake_count(self, receiver_id: str, epoch: int, *, now: datetime) -> int:
+        """Advance the wake ordinal for one open epoch and return its new value.
+
+        Called ONCE PER LEASE PERIOD in which the epoch is re-offered, inside the
+        transaction that opens that lease's wake — never once per emission.  The
+        two readings differ observably (§A1.2): a re-emission inside one lease
+        re-sends the identical line by design, so the transport's content window
+        drops it, which is I3 enforced at the transport rather than asserted
+        about; each NEW lease's wake carries a fresh ordinal, so it is a distinct
+        hash and passes the window, and the window's 20-entry depth stops
+        mattering.
+
+        Returns 0 for an epoch that is closed or absent, which the caller reads
+        as "do not emit": a wake for a consumed epoch is unreachable rather than
+        suppressed (I4).
+        """
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "UPDATE seat_digest SET wake_count = wake_count + 1 "
+                "WHERE receiver_id = ? AND epoch = ? AND consumed_at IS NULL",
+                (receiver_id, int(epoch)),
+            )
+            if cursor.rowcount == 0:
+                return 0
+            row = conn.execute(
+                "SELECT wake_count FROM seat_digest WHERE receiver_id = ? AND epoch = ?",
+                (receiver_id, int(epoch)),
+            ).fetchone()
+            return 0 if row is None else int(row["wake_count"])
+
+    def close_digest(self, receiver_id: str, epoch: int, *, via: str, now: datetime) -> bool:
+        """Close an OPEN epoch on consumption, cancellation or abandonment (D10).
+
+        Open only, and that qualification is the whole of #568's fix here: a late
+        tick must not overwrite a recorded ``mcp_ack`` with its own closure, and
+        a consumed epoch is terminal, so a later arrival opens a NEW epoch rather
+        than reopening this one.
+
+        Returns False when the epoch was already closed or does not exist.
+        """
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "UPDATE seat_digest SET consumed_at = ?, consumed_via = ? "
+                "WHERE receiver_id = ? AND epoch = ? AND consumed_at IS NULL",
+                (render_timestamp(now), via, receiver_id, int(epoch)),
+            )
+            return cursor.rowcount > 0
+
+    def open_digests(self) -> list[SeatDigest]:
+        """Every open epoch, oldest first — the tick's re-emit and closure set."""
+        rows = (
+            self._pool.connection()
+            .execute(
+                "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, "
+                "wake_count FROM seat_digest WHERE consumed_at IS NULL "
+                "ORDER BY built_at, receiver_id, epoch"
+            )
+            .fetchall()
+        )
+        return [_row_to_digest(row) for row in rows]
+
+    def ready_receivers(self) -> list[str]:
+        """Receivers holding at least one claimable row, oldest arrival first.
+
+        ``mode='live'`` here as well as in ``claim``: the filter's home is the
+        claim statement, and this is the redundant defence D9 names rather than
+        the enforcement.  A receiver whose only rows are shadow copies must not
+        have an epoch opened for it, or the tick would wake a seat about
+        messages the legacy path already delivered.
+        """
+        rows = (
+            self._pool.connection()
+            .execute(
+                "SELECT receiver_id, MIN(created_at) AS first_at FROM delivery_msg "
+                "WHERE state IN ('ready', 'leased') AND mode = 'live' "
+                "GROUP BY receiver_id ORDER BY first_at, receiver_id"
+            )
+            .fetchall()
+        )
+        return [str(row["receiver_id"]) for row in rows]
+
+    def undelivered_ids(self, receiver_id: str) -> tuple[str, ...]:
+        """The receiver's non-terminal live ids, in arrival order.
+
+        What an epoch is opened over.  ``leased`` counts as well as ``ready``:
+        an epoch built from ``ready`` alone would drop a row the tick had just
+        claimed, and the digest would then under-report what the receiver is
+        owed for the life of that epoch.
+        """
+        rows = (
+            self._pool.connection()
+            .execute(
+                "SELECT msg_id FROM delivery_msg WHERE receiver_id = ? AND mode = 'live' "
+                "AND state IN ('ready', 'leased') ORDER BY created_at, msg_id",
+                (receiver_id,),
+            )
+            .fetchall()
+        )
+        return tuple(str(row["msg_id"]) for row in rows)
+
+    def senders_of(self, msg_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """The sender ids behind an epoch's messages, in arrival order.
+
+        §A1.1's sender rule is a function of this tuple, and it is read from the
+        rows rather than remembered on the digest so a re-parent or a supersede
+        cannot leave the wake naming a sender the epoch no longer has.
+        """
+        if not msg_ids:
+            return ()
+        placeholders = ",".join("?" for _ in msg_ids)
+        rows = (
+            self._pool.connection()
+            .execute(
+                f"SELECT sender_id FROM delivery_msg WHERE msg_id IN ({placeholders}) "
+                "ORDER BY created_at, msg_id",
+                tuple(msg_ids),
+            )
+            .fetchall()
+        )
+        return tuple(str(row["sender_id"] or "") for row in rows)
+
+    def all_terminal(self, msg_ids: tuple[str, ...]) -> bool:
+        """True when every id has reached a terminal state (D10's first conjunct).
+
+        An EMPTY set is terminal vacuously, which is what makes ``abandoned`` the
+        right value for an epoch a re-parent emptied.
+        """
+        if not msg_ids:
+            return True
+        placeholders = ",".join("?" for _ in msg_ids)
+        row = (
+            self._pool.connection()
+            .execute(
+                f"SELECT COUNT(*) AS n FROM delivery_msg WHERE msg_id IN ({placeholders}) "
+                f"AND state NOT IN ({','.join('?' for _ in _TERMINAL_VALUES)})",
+                (*msg_ids, *_TERMINAL_VALUES),
+            )
+            .fetchone()
+        )
+        return row is None or int(row["n"]) == 0
+
+    def sweep_shadow(self, *, now: datetime) -> int:
+        """The write-through flip's first act: end every surviving shadow row.
+
+        A shadow row the mirror writer never resolved stays ``ready`` with no
+        terminal state — unclaimable through ``claim``'s ``mode`` filter, but
+        still a durable row with no ending.  This and the filter are
+        INDEPENDENT: either alone prevents the delivery, and together they also
+        stop the row sitting open forever (§7a).
+        """
+        conn = self._pool.connection()
+        stamp = render_timestamp(now)
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "UPDATE delivery_msg SET state = 'superseded', terminated_at = ?, "
+                "lease_owner = NULL, lease_expires_at = NULL, held_since = NULL "
+                f"WHERE mode = 'shadow' AND state NOT IN ({','.join('?' for _ in _TERMINAL_VALUES)})",
+                (stamp, *_TERMINAL_VALUES),
+            )
+            return int(cursor.rowcount)
+
+    def cancel_on_complete(self, receiver_id: str, *, now: datetime) -> tuple[str, ...]:
+        """D8's completion-cancel: supersede this receiver's flagged READY rows.
+
+        Evaluated ONCE PER COMPLETION EVENT, not as a standing predicate over
+        ``ready`` rows, and that is what keeps its limit true: a steer reclaimed
+        to ``ready`` after the completion is not retroactively cancelled.
+        ``ready`` only, so a steer already leased at completion still lands, and
+        it stays diagnosable through ``cao diag <msg_id>``.
+
+        This is the mechanism that actually reaches #435, where the aged steer is
+        addressed to the worker and the completion callback to the supervisor, so
+        no newer row lands in the worker's mailbox and ``supersede_key`` alone
+        never fires.
+        """
+        conn = self._pool.connection()
+        stamp = render_timestamp(now)
+        cancelled: list[str] = []
+        with immediate_transaction(conn):
+            rows = conn.execute(
+                "SELECT msg_id FROM delivery_msg WHERE receiver_id = ? AND state = 'ready' "
+                "AND cancel_on_complete = 1 AND mode = 'live'",
+                (receiver_id,),
+            ).fetchall()
+            for row in rows:
+                msg_id = str(row["msg_id"])
+                conn.execute(
+                    "UPDATE delivery_msg SET state = 'superseded', terminated_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL, held_since = NULL "
+                    "WHERE msg_id = ? AND state = 'ready'",
+                    (stamp, msg_id),
+                )
+                cancelled.append(msg_id)
+        return tuple(cancelled)
+
+    def next_surrogate_id(self) -> int:
+        """The integer handle a write-through row carries in place of an inbox id.
+
+        §6 makes the legacy inbox READ-ONLY from the flip, so at ``on`` no
+        ``inbox_messages`` row is written and its autoincrement never advances.
+        The public surface is still integer-keyed — ``message_id`` in the HTTP
+        response, ``up_to_id`` in ``ack_messages``, ``member.message_id`` on a
+        barrier — so the queue mints the integer instead, and stores it in
+        ``legacy_message_id`` where ``cao diag`` and the mirror already look.
+
+        The floor is ``MAX`` over BOTH tables. Taking only the queue's own column
+        would hand out an id a historical inbox row already used, and an
+        ``ack_messages(up_to_id=N)`` would then settle across the boundary
+        between the two eras. Allocated inside the caller's transaction, which is
+        the single writer.
+        """
+        conn = self._pool.connection()
+        high = 0
+        row = conn.execute("SELECT MAX(legacy_message_id) AS v FROM delivery_msg").fetchone()
+        if row is not None and row["v"] is not None:
+            high = int(row["v"])
+        try:
+            # The legacy table shares this file but belongs to the other tree, so
+            # it is read defensively: a deployment whose inbox has not been
+            # created yet is a valid state, and the queue's own high-water is
+            # then the whole floor.
+            legacy = conn.execute("SELECT MAX(id) AS v FROM inbox").fetchone()
+        except sqlite3.Error:
+            legacy = None
+        if legacy is not None and legacy["v"] is not None:
+            high = max(high, int(legacy["v"]))
+        return high + 1
+
+    def find_recent_duplicate(
+        self,
+        *,
+        sender_id: str,
+        receiver_id: str,
+        content_hash: str,
+        window_s: int,
+        now: datetime,
+        park_warm: bool = False,
+        barrier_id: int | None = None,
+    ) -> QueueMessage | None:
+        """D13's F475 window check, reproduced with all five conjuncts.
+
+        Same sender, same receiver, matching content hash, ``park_warm`` not true
+        and ``barrier_id`` null, inside a rolling window. Reproduced rather than
+        approximated because the legacy predicate is what decides how many
+        messages are delivered, and the queue's ``idempotency_key`` constraint
+        has neither the window nor any conjunct: two identical sends more than a
+        minute apart are ordinary traffic here and must both land.
+
+        Returns the existing row so the caller can hand it back, which is what
+        legacy returns today — never a fabricated success id for a message that
+        was not enqueued.
+        """
+        if park_warm or barrier_id is not None or not content_hash:
+            return None
+        cutoff = render_timestamp(datetime.fromtimestamp(now.timestamp() - window_s, tz=UTC))
+        row = (
+            self._pool.connection()
+            .execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
+                "WHERE sender_id = ? AND receiver_id = ? AND content_hash = ? "
+                "AND created_at >= ? AND park_warm = 0 AND barrier_id IS NULL "
+                "ORDER BY created_at DESC LIMIT 1",
+                (sender_id, receiver_id, content_hash, cutoff),
+            )
+            .fetchone()
+        )
+        return None if row is None else _row_to_message(row)
+
+    def pending_for_receiver(
+        self, receiver_id: str, *, after_id: int = 0, limit: int = 25
+    ) -> list[QueueMessage]:
+        """The receiver's undelivered live rows, in surrogate-id order.
+
+        What ``list_messages`` serves from once the queue owns new traffic. The
+        ordering and the ``after_id`` cursor are the legacy call's, so the seat's
+        drain loop is unchanged on the other side of the flip.
+        """
+        rows = (
+            self._pool.connection()
+            .execute(
+                f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE receiver_id = ? "
+                "AND mode = 'live' AND state IN ('ready', 'leased') "
+                "AND legacy_message_id > ? "
+                "ORDER BY legacy_message_id LIMIT ?",
+                (receiver_id, int(after_id), int(limit)),
+            )
+            .fetchall()
+        )
+        return [_row_to_message(row) for row in rows]
+
+    def settle_through(self, receiver_id: str, *, up_to_id: int, now: datetime) -> tuple[str, ...]:
+        """Mark the receiver's rows delivered up to a surrogate id (§5b's ack).
+
+        The cursor semantics are legacy's, unchanged: everything at or below the
+        id the seat names is settled, and the digest stamp is the caller's to
+        write. Returns the ids settled so the caller can close the covering
+        epoch with ``consumed_via='mcp_ack'``.
+        """
+        conn = self._pool.connection()
+        stamp = render_timestamp(now)
+        settled: list[str] = []
+        with immediate_transaction(conn):
+            rows = conn.execute(
+                "SELECT msg_id FROM delivery_msg WHERE receiver_id = ? AND mode = 'live' "
+                "AND legacy_message_id IS NOT NULL AND legacy_message_id <= ? "
+                f"AND state NOT IN ({','.join('?' for _ in _TERMINAL_VALUES)})",
+                (receiver_id, int(up_to_id), *_TERMINAL_VALUES),
+            ).fetchall()
+            for row in rows:
+                msg_id = str(row["msg_id"])
+                conn.execute(
+                    "UPDATE delivery_msg SET state = 'delivered', terminated_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL, held_since = NULL "
+                    "WHERE msg_id = ?",
+                    (stamp, msg_id),
+                )
+                settled.append(msg_id)
+        return tuple(settled)
+
+    def prune(self, *, now: datetime, protected: frozenset[str] = frozenset()) -> int:
+        """Retention over the new tables (§13d), returning rows removed.
+
+        Terminal ``delivery_msg`` rows past ``DELIVERY_RETENTION_DAYS`` go with
+        their ``delivery_attempt`` rows and their ``delivery_dead`` entry, and a
+        CLOSED digest of the same age goes too.  Two things never go:
+
+        * an **open** digest, whatever its age — that is the record of what is
+          owed while its messages live, which is the correction to §5 item 1's
+          blanket exclusion;
+        * any row in ``protected``, the ids named by an OPEN finding.  Phase 1
+          carries the same rule for events, and its docstring calls it keeping
+          open evidence: a finding that points at a pruned row is a diagnosis
+          with its evidence deleted, which is the pane archaeology I5 exists to
+          end.
+        """
+        horizon = render_timestamp(
+            datetime.fromtimestamp(now.timestamp() - DELIVERY_RETENTION_DAYS * 86400.0, tz=UTC)
+        )
+        conn = self._pool.connection()
+        removed = 0
+        with immediate_transaction(conn):
+            rows = conn.execute(
+                "SELECT msg_id FROM delivery_msg WHERE terminated_at IS NOT NULL "
+                "AND terminated_at < ?",
+                (horizon,),
+            ).fetchall()
+            for row in rows:
+                msg_id = str(row["msg_id"])
+                if msg_id in protected:
+                    continue
+                conn.execute("DELETE FROM delivery_attempt WHERE msg_id = ?", (msg_id,))
+                conn.execute("DELETE FROM delivery_dead WHERE msg_id = ?", (msg_id,))
+                conn.execute("DELETE FROM delivery_msg WHERE msg_id = ?", (msg_id,))
+                removed += 1
+            digests = conn.execute(
+                "SELECT receiver_id, epoch, msg_ids FROM seat_digest "
+                "WHERE consumed_at IS NOT NULL AND consumed_at < ?",
+                (horizon,),
+            ).fetchall()
+            for row in digests:
+                ids = json.loads(row["msg_ids"]) if row["msg_ids"] else []
+                if any(str(value) in protected for value in ids):
+                    continue
+                conn.execute(
+                    "DELETE FROM seat_digest WHERE receiver_id = ? AND epoch = ?",
+                    (row["receiver_id"], row["epoch"]),
+                )
+                removed += 1
+        return removed
+
     @staticmethod
     def _open_digest_in(conn: sqlite3.Connection, receiver_id: str) -> SeatDigest | None:
         row = conn.execute(
-            "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via "
+            "SELECT receiver_id, epoch, msg_ids, built_at, consumed_at, consumed_via, wake_count "
             "FROM seat_digest WHERE receiver_id = ? AND consumed_at IS NULL "
             "ORDER BY epoch DESC LIMIT 1",
             (receiver_id,),
@@ -739,6 +1232,34 @@ def _row_to_message(row: sqlite3.Row) -> QueueMessage:
     )
 
 
+def _dead_reason_for(message: QueueMessage, *, now: datetime) -> DeadReason:
+    """Which of I1's four reasons ended this row.
+
+    The attempt budget first, because it is the one an operator can act on.
+    Then the two time bounds, and the split between them is NOT "did the caller
+    supply an expiry" but "did the caller's expiry SET the deadline": a message
+    sent with ``expire_after_s`` longer than ``DELIVERY_MAX_LIFETIME_S`` dies on
+    the lifetime, and reporting that as ``expired`` would tell a reader the
+    caller asked for a death the caller did not ask for.
+    """
+    if message.attempts >= message.max_attempts:
+        return DeadReason.MAX_ATTEMPTS
+    if message.expire_after_s is not None and message.expire_after_s <= DELIVERY_MAX_LIFETIME_S:
+        return DeadReason.EXPIRED
+    return DeadReason.MAX_LIFETIME
+
+
+def _dead_row(message: QueueMessage, reason: DeadReason) -> DeadRow:
+    return DeadRow(
+        msg_id=message.msg_id,
+        receiver_id=message.receiver_id,
+        sender_id=message.sender_id,
+        reason=reason,
+        is_notice=message.is_notice,
+        attempts=message.attempts,
+    )
+
+
 def _row_to_digest(row: sqlite3.Row) -> SeatDigest:
     raw = json.loads(row["msg_ids"]) if row["msg_ids"] else []
     return SeatDigest(
@@ -748,6 +1269,7 @@ def _row_to_digest(row: sqlite3.Row) -> SeatDigest:
         built_at=parse_timestamp(row["built_at"]),
         consumed_at=_maybe_time(row["consumed_at"]),
         consumed_via=row["consumed_via"],
+        wake_count=int(row["wake_count"] or 0),
     )
 
 

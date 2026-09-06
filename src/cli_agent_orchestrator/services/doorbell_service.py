@@ -125,6 +125,38 @@ def is_socket_delivered(row_id: int) -> bool:
         return False
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting.)
+
+    Asked through the delivery wiring rather than the environment: the boot guard
+    can demote a requested position, and a surface that read the variable itself
+    could mute on a position the guard already refused. Never raises — a wiring
+    module that cannot answer leaves legacy behaving exactly as it does today,
+    which is the safe direction for a mute.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
+def _record_seat_wake_attempt(max_written_row_id: int) -> None:
+    """File this ring's ``delivery_attempt`` row through 3b's one bridge.
+
+    Reached through ``queue_carrier`` like every other legacy contact with the
+    new tree (AC11), and swallowing its own failures there, so a queue that
+    cannot be written leaves the wake exactly as it is today.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import record_legacy_seat_wake
+
+        record_legacy_seat_wake(max_written_row_id, detail="ring_supervisor_doorbell native")
+    except Exception:  # pragma: no cover — an unimportable bridge records nothing
+        logger.debug("wp_arch seat-wake attempt bridge unavailable", exc_info=True)
+
+
 def ring_supervisor_doorbell(
     terminal_id: str,
     max_written_row_id: int,
@@ -144,6 +176,22 @@ def ring_supervisor_doorbell(
     F459: message_body/sender_display_name carry the worker's actual callback
     text and display name through to the native bridge message.
     """
+    # WP-ARCH 3b: K3 is MUTED while the queue owns delivery (D6, §7b).
+    #
+    # The module is still here — 3c deletes it — so the mute is what stops it
+    # emitting, and case 17's emitter count is what tests the mute. A second
+    # emitter in the `on` arm is a LEAKY MUTE rather than a missing deletion.
+    # `drain` deliberately does not mute: there the tick finishes rows already
+    # enqueued while NEW traffic goes back to the legacy inbox, so muting would
+    # leave that traffic with no carrier at all (§6).
+    if _queue_owns_delivery():
+        logger.info(
+            "f170_doorbell terminal=%s decision=skipped_muted reason=queue_owns_delivery row=%s",
+            terminal_id,
+            max_written_row_id,
+        )
+        return "skipped_disabled"
+
     # D10 (fx168): outer switch — off means no bell of any kind.
     if not ConfigService.get("supervisor.doorbell", default=True):
         logger.info(
@@ -189,6 +237,19 @@ def ring_supervisor_doorbell(
             decision = None
 
         if decision == "rang":
+            # WP-ARCH 3b / I5: this ring IS the seat's carrier under `off`,
+            # `shadow` and `drain` (§A1.5), and it opens no
+            # `inbox_delivery_attempt` row of its own, so the emission owed the
+            # queue a `delivery_attempt` row and wrote none. The r2 sandbox is
+            # the evidence: 500 bytes on the socket, `delivery_msg=3`,
+            # `delivery_attempt=0` — the carrier fired and the stored rows said
+            # nothing happened, which is #604's unreadability arriving through
+            # the amendment written to end it.
+            #
+            # Recorded here rather than inside `_attempt_native_ring` because
+            # this is the one branch where the ring is the DECISION, and a "rang"
+            # that the caller then discards is not an epoch anyone was woken for.
+            _record_seat_wake_attempt(max_written_row_id)
             # F459: mark row as socket-delivered (best-effort)
             if message_body is not None:
                 try:

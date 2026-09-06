@@ -37,12 +37,12 @@ class FindingCode(StrEnum):
                                 created FIRST and in its own transaction: it has
                                 to survive its own migration failing.
 
-    Phase 3 adds the two codes D9's boot guard raises.  The phase names five in
-    all; the other three (``DIAG-DUP-DELIVERY``, ``DIAG-DOUBLE-WAKE`` and
-    ``DIAG-DELIVERY-TIME-BOUND``) belong to sub-phases 3b and 3c and land with
-    the code that can raise them.  A finding code no code path reaches is a
-    promise the enum cannot keep, and ``cao diag findings`` would offer an
-    operator a filter that never matches.
+    Phase 3 names SIX codes (D5, as amended by A1).  Sub-phase 3a landed the two
+    D9's boot guard raises; 3b adds the two its own transitions can reach.  The
+    remaining two (``DIAG-DUP-DELIVERY`` and ``DIAG-DOUBLE-WAKE``) belong to 3c
+    and land with the code that can raise them.  A finding code no code path
+    reaches is a promise the enum cannot keep, and ``cao diag findings`` would
+    offer an operator a filter that never matches.
 
     ``DIAG_QUEUE_ORPHAN_GUARD``   — the boot guard demoted the requested switch
                                     position to ``drain`` because live
@@ -55,6 +55,23 @@ class FindingCode(StrEnum):
                                     barrier was still OPEN, so the flip was held
                                     at ``shadow`` rather than splitting that
                                     barrier's members across two tables (D9).
+    ``DIAG_DELIVERY_TIME_BOUND``  — a row died on a TIME bound rather than an
+                                    attempt bound: ``dead_by`` passed, the
+                                    dialog ceiling elapsed, or the caller's own
+                                    expiry came first (D12).  It exists because
+                                    ``cao diag <msg_id>`` is pull-based, and a
+                                    loss discoverable only by asking is the
+                                    failure class this phase removes.
+    ``DIAG_SEAT_WAKE_UNREACHABLE`` — the supervisor seat's native carrier could
+                                    not be reached, or reached the wrong
+                                    injector, or went three leases unconfirmed
+                                    (§A1.4).  Raised ONCE PER OPEN EPOCH rather
+                                    than once per row: ``k`` messages behind one
+                                    dead socket are one condition, not ``k``.
+                                    Its four reasons are
+                                    :class:`~cli_agent_orchestrator.core.delivery.WakeOutcome`'s
+                                    non-emitting members plus ``unverified_streak``,
+                                    each classified to a bound by A1.4's table.
     """
 
     DIAG_BAD_TRANSITION = "DIAG-BAD-TRANSITION"
@@ -63,6 +80,8 @@ class FindingCode(StrEnum):
     DIAG_MIGRATION_FAILED = "DIAG-MIGRATION-FAILED"
     DIAG_QUEUE_ORPHAN_GUARD = "DIAG-QUEUE-ORPHAN-GUARD"
     DIAG_BARRIER_OPEN_AT_FLIP = "DIAG-BARRIER-OPEN-AT-FLIP"
+    DIAG_DELIVERY_TIME_BOUND = "DIAG-DELIVERY-TIME-BOUND"
+    DIAG_SEAT_WAKE_UNREACHABLE = "DIAG-SEAT-WAKE-UNREACHABLE"
 
 
 class FindingState(StrEnum):

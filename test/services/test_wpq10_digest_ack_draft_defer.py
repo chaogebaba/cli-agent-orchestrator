@@ -34,8 +34,8 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.services import mailbox_service, terminal_service
 from cli_agent_orchestrator.services import inbox_service as inbox_service_module
+from cli_agent_orchestrator.services import mailbox_service, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.mailbox_service import (
@@ -43,11 +43,11 @@ from cli_agent_orchestrator.services.mailbox_service import (
     claim_mailbox,
     publish_supervisor_incarnation,
 )
-from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
     TranscriptResolution,
 )
+from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
 @pytest.fixture
@@ -83,12 +83,13 @@ def _mailbox(
     mailbox_id: str = "mb_wpq10aa",
     session_name: str = "wpq10-session",
     terminal_id: str = "old",
+    role: str = "supervisor",
 ) -> MailboxModel:
     now = datetime.now()
     row = MailboxModel(
         id=mailbox_id,
         session_name=session_name,
-        role="supervisor",
+        role=role,
         current_terminal_id=terminal_id,
         generation=1,
         consumed_through_id=0,
@@ -548,8 +549,17 @@ def test_wpq10_deferred_composer_attempt_stays_pending(wpq10_db, monkeypatch):
 
 
 def test_wpq10_delivery_engine_uses_native_composer_defer_path(wpq10_db, monkeypatch):
+    # WP-ARCH 3b / A1.5: a WORKER receiver, unlike the rest of this file.
+    #
+    # The subject here is the native composer DEFER path — what the draft guard
+    # does when a paste meets a non-empty composer — and that path exists only
+    # for receivers who are still pasted. After the amendment the seat is not
+    # one of them: its composer is never written to in any switch position, so
+    # a supervisor-role receiver is short-circuited before the classify step
+    # this test observes. The digest and publication tests around it keep the
+    # supervisor role, because for them it IS the subject.
     with wpq10_db.begin() as db:
-        _mailbox(db, terminal_id="receiver")
+        _mailbox(db, terminal_id="receiver", role="worker")
         _terminal(db, "receiver")
         row = _message(db, "receiver")
     events: list[str] = []

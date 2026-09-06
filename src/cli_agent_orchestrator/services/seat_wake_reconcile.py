@@ -272,6 +272,16 @@ def _reconcile_one(mailbox: Any, cutoff: datetime) -> SeatWakeDecision:
     )
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6/D11's muting of K6.)"""
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 def reconcile_seat_wakes(*, now: Optional[datetime] = None) -> list[SeatWakeDecision]:
     """Sweep every supervisor mailbox once and emit at most one wake each.
 
@@ -279,6 +289,18 @@ def reconcile_seat_wakes(*, now: Optional[datetime] = None) -> list[SeatWakeDeci
     mailbox is isolated: it is logged and the sweep continues.
     """
     if not _enabled():
+        return []
+
+    # WP-ARCH 3b: K6 is MUTED while the queue owns delivery (D6, D11).
+    #
+    # D11 is explicit that this is a kill-list ENTRY rather than a component to
+    # integrate: it is server-side and so a genuine improvement on the dead
+    # client-side hook, but it still repairs a NOTIFICATION path rather than
+    # making the durable row's observation unconditional, and it drives the
+    # legacy inbox. Left running at `on` it is a second wake emitter over rows
+    # the tick already owns, which is the emitter count case 17 forbids.
+    # 3b mutes it; 3c deletes it with the rest of D6.
+    if _queue_owns_delivery():
         return []
 
     from cli_agent_orchestrator.clients.database import MailboxModel, SessionLocal

@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ===========================================================================
 # Fixtures
 # ===========================================================================
@@ -104,9 +103,7 @@ class TestAC1AuthFrame:
         from cli_agent_orchestrator.services.cc_session_registry import write_to_socket
 
         payload = '{"msgV":1,"type":"user","message":{"role":"user","content":"test"}}'
-        err = write_to_socket(
-            socket_stub.socket_path, payload, auth_token="my_secret_token"
-        )
+        err = write_to_socket(socket_stub.socket_path, payload, auth_token="my_secret_token")
         assert err is None
         lines = socket_stub.lines
         assert len(lines) == 2
@@ -152,7 +149,10 @@ class TestAC2ReadPeerToken:
         """Reads peerToken from a correctly formatted key file."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"secret_token_123","procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
@@ -176,7 +176,10 @@ class TestAC2ReadPeerToken:
         """Returns None when key file contains invalid JSON."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text("not json")
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
@@ -186,7 +189,10 @@ class TestAC2ReadPeerToken:
         """Returns None when key file JSON lacks peerToken field."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
@@ -197,10 +203,16 @@ class TestAC2ReadPeerToken:
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
         # Key for PID 111 (exactly 64 hex chars in suffix)
-        kf1 = sessions_dir / "111.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        kf1 = (
+            sessions_dir
+            / "111.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf1.write_text('{"peerToken":"token_111","procStart":"111"}')
         # Key for PID 222
-        kf2 = sessions_dir / "222.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        kf2 = (
+            sessions_dir
+            / "222.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf2.write_text('{"peerToken":"token_222","procStart":"222"}')
 
         assert read_peer_token(111, sessions_dir=sessions_dir) == "token_111"
@@ -259,7 +271,10 @@ class TestAC4NativeRingPassesAuth:
         }
         (sessions_dir / f"{pid}.json").write_text(json.dumps(record_data))
         # Key file
-        key_file = sessions_dir / f"{pid}.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / f"{pid}.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"my_auth_token_xyz","procStart":"12345"}')
 
         # Mock the dependencies to isolate _attempt_native_ring
@@ -409,6 +424,7 @@ class TestAC5WakeNativeGateTerminalService:
     def test_inbox_path_not_derived_when_native_disabled(self, monkeypatch):
         """Production helper: wake.native=false → _derive NOT called."""
         from unittest.mock import MagicMock
+
         from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.terminal_service import (
             _maybe_derive_cc_team_inbox_path,
@@ -443,6 +459,7 @@ class TestAC5WakeNativeGateTerminalService:
     def test_inbox_path_derived_when_native_enabled(self, monkeypatch):
         """Production helper: wake.native=true → _derive IS called."""
         from unittest.mock import MagicMock
+
         from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.terminal_service import (
             _maybe_derive_cc_team_inbox_path,
@@ -481,14 +498,30 @@ class TestAC5WakeNativeGateTerminalService:
 
 
 class TestF337R2DefaultDark:
-    """B1 regression: absent setting → zero native-path calls from all five gate sites."""
+    """B1's shape, re-aimed by WP-ARCH 3b / A1.5: the default is now True.
 
-    def test_absent_setting_doorbell_service_takes_legacy_path(self):
-        """With no setting, doorbell_service.ring_supervisor_doorbell skips the native path."""
-        from unittest.mock import patch, MagicMock
+    F337 B1 shipped ``supervisor.wake.native`` DARK, and these tests were the
+    regression that held it there. The amendment flips it, and the reason is
+    that removing the seat's composer paste from every switch position is only
+    half the job: with the paste role-gated away and this default False, the
+    seat would be NEITHER pasted NOR woken under ``off``, ``shadow`` and
+    ``drain`` — which is #604, not a fix. A paste is an ugly carrier; silence is
+    the bug the phase exists to remove.
+
+    What B1's regression was really protecting — that the gate is READ from one
+    canonical constant, and that every call site obeys it rather than deciding
+    for itself — is preserved: the tests below still drive the constant through
+    the gates, and now assert the native path IS taken. A test that pinned the
+    VALUE alone would have been a test of a decision rather than of a mechanism.
+    """
+
+    def test_absent_setting_doorbell_service_takes_the_native_path(self):
+        """With no setting, ring_supervisor_doorbell takes the NATIVE path (A1.5)."""
+        from unittest.mock import MagicMock, patch
+
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-        assert WAKE_NATIVE_DEFAULT is False, "Canonical default must be False"
+        assert WAKE_NATIVE_DEFAULT is True, "A1.5: the canonical default is True from 3b"
 
         # Simulate ConfigService returning the canonical default for wake.native,
         # and True for supervisor.doorbell (so it doesn't bail out early).
@@ -522,16 +555,29 @@ class TestF337R2DefaultDark:
             from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
 
             result = ring_supervisor_doorbell("term-1", 1, written_count=1)
-        # Native ring must NOT be attempted
-        mock_attempt_native_ring.assert_not_called()
+        # The native ring IS the carrier now, and it is the only one: the pane
+        # fallback below it stays unreachable because supervisor.teammate_push
+        # remains False, which is what A1.5 keeps it for.
+        # The CALL is the assertion. What the ring then returns is decided by
+        # the mock, and the fallback below it stays unreachable regardless
+        # because supervisor.teammate_push remains False — which is exactly what
+        # A1.5 keeps that flag for.
+        mock_attempt_native_ring.assert_called_once()
+        assert result != ""
 
-    def test_absent_setting_delivery_service_skips_native(self, tmp_path):
-        """With no setting, delivery rung1 returns skipped_disabled."""
+    def test_absent_setting_delivery_service_attempts_native(self, tmp_path):
+        """With no setting, rung1 no longer declines on the flag (A1.5).
+
+        It may still defer for its own reasons — an unresolvable target, a
+        socket that is not there — and that is the point: the decision moves
+        from a config value to the carrier's own typed answer.
+        """
         from unittest.mock import patch
+
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
         from cli_agent_orchestrator.services.delivery_service import (
-            attempt_rung1,
             DeliveryTarget,
+            attempt_rung1,
         )
 
         # cc_inbox_path must have an existing parent dir to pass the path_usable check
@@ -550,21 +596,28 @@ class TestF337R2DefaultDark:
             return_value=WAKE_NATIVE_DEFAULT,
         ):
             result = attempt_rung1(target, 99)
-        assert result.decision == "skipped_disabled"
+        assert result.decision != "skipped_disabled"
 
-    def test_config_registry_default_is_false(self):
-        """The config registry entry for CAO_SUPERVISOR_WAKE_NATIVE defaults to False."""
+    def test_the_registry_and_the_canonical_constant_agree(self):
+        """The property B1 was really defending: ONE spelling of the default.
+
+        The value is duplicated because the config registry dict is evaluated at
+        import time, before service imports resolve. A duplicated default that
+        can drift is how a flag comes to mean two things, so this asserts the
+        two agree rather than asserting either one's value in isolation.
+        """
+        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
         from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
 
         entry = ENV_REGISTRY["CAO_SUPERVISOR_WAKE_NATIVE"]
         # entry = (key_path, type, default)
-        assert entry[2] is False
+        assert entry[2] is WAKE_NATIVE_DEFAULT
 
-    def test_canonical_constant_is_false(self):
-        """WAKE_NATIVE_DEFAULT in cc_session_registry is False."""
+    def test_the_shipped_default_is_true_from_sub_phase_3b(self):
+        """A1.5, stated once so a reader finds the decision from the test."""
         from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
 
-        assert WAKE_NATIVE_DEFAULT is False
+        assert WAKE_NATIVE_DEFAULT is True
 
 
 class TestF337R2ProcStartBinding:
@@ -574,7 +627,10 @@ class TestF337R2ProcStartBinding:
         """Stale key with wrong procStart → None (no auth frame sent)."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"stale_token","procStart":"99999"}')
 
         # Live process has procStart=88888, key says 99999 — mismatch
@@ -585,7 +641,10 @@ class TestF337R2ProcStartBinding:
         """Matching procStart → token returned normally."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"valid_token","procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -595,7 +654,10 @@ class TestF337R2ProcStartBinding:
         """Backward compat: no expected_proc_start → skips the check."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"any_token","procStart":"12345"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
@@ -605,7 +667,10 @@ class TestF337R2ProcStartBinding:
         """procStart that isn't coercible to int → treated as mismatch."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('{"peerToken":"tok","procStart":"not_a_number"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -630,8 +695,11 @@ class TestF337R2MalformedKeyJSON:
         """Valid JSON but not an object (array) → None, no crash."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
-        key_file.write_text('[1, 2, 3]')
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
+        key_file.write_text("[1, 2, 3]")
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
         assert token is None
@@ -640,7 +708,10 @@ class TestF337R2MalformedKeyJSON:
         """Valid JSON but a bare string → None, no crash."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         key_file.write_text('"just a string"')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
@@ -650,8 +721,11 @@ class TestF337R2MalformedKeyJSON:
         """Valid JSON but a number → None, no crash."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
-        key_file.write_text('42')
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
+        key_file.write_text("42")
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
         assert token is None
@@ -660,8 +734,11 @@ class TestF337R2MalformedKeyJSON:
         """Valid JSON null → None, no crash."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
-        key_file.write_text('null')
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
+        key_file.write_text("null")
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
         assert token is None
@@ -670,12 +747,14 @@ class TestF337R2MalformedKeyJSON:
         """Empty file → None via JSONDecodeError, no crash."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        key_file = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
-        key_file.write_text('')
+        key_file = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
+        key_file.write_text("")
 
         token = read_peer_token(12345, sessions_dir=sessions_dir)
         assert token is None
-
 
 
 # ===========================================================================
@@ -691,9 +770,15 @@ class TestF337R3Ambiguity:
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
         # Two valid key files for PID 12345, both with procStart 99999
-        kf1 = sessions_dir / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        kf1 = (
+            sessions_dir
+            / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf1.write_text('{"peerToken":"TOKEN_A","procStart":"99999"}')
-        kf2 = sessions_dir / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        kf2 = (
+            sessions_dir
+            / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf2.write_text('{"peerToken":"TOKEN_B","procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -703,9 +788,15 @@ class TestF337R3Ambiguity:
         """Two files with SAME token still fail — ambiguity is about files, not values."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        kf1 = sessions_dir / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        kf1 = (
+            sessions_dir
+            / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf1.write_text('{"peerToken":"SAME_TOKEN","procStart":"99999"}')
-        kf2 = sessions_dir / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        kf2 = (
+            sessions_dir
+            / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf2.write_text('{"peerToken":"SAME_TOKEN","procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -715,9 +806,15 @@ class TestF337R3Ambiguity:
         """One matching procStart + one mismatched → single candidate → returns token."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        kf1 = sessions_dir / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        kf1 = (
+            sessions_dir
+            / "12345.aaaa000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf1.write_text('{"peerToken":"GOOD_TOKEN","procStart":"99999"}')
-        kf2 = sessions_dir / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        kf2 = (
+            sessions_dir
+            / "12345.bbbb000011112222333344445555666677778888999900001111222233334444.key"
+        )
         kf2.write_text('{"peerToken":"STALE_TOKEN","procStart":"11111"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -727,7 +824,10 @@ class TestF337R3Ambiguity:
         """Exactly one valid candidate → normal return."""
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
-        kf = sessions_dir / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        kf = (
+            sessions_dir
+            / "12345.abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.key"
+        )
         kf.write_text('{"peerToken":"ONLY_TOKEN","procStart":"99999"}')
 
         token = read_peer_token(12345, sessions_dir=sessions_dir, expected_proc_start=99999)
@@ -740,6 +840,7 @@ class TestF337R3IterdirError:
     def test_iterdir_oserror_returns_none(self, tmp_path):
         """Unreadable sessions directory → None, no exception."""
         from unittest.mock import patch
+
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
         sessions_dir = tmp_path / "sessions"
@@ -754,13 +855,12 @@ class TestF337R3IterdirError:
     def test_iterdir_permission_error_returns_none(self, tmp_path):
         """PermissionError on iterdir → None, no crash."""
         from unittest.mock import patch
+
         from cli_agent_orchestrator.services.cc_session_registry import read_peer_token
 
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
 
-        with patch.object(
-            type(sessions_dir), "iterdir", side_effect=PermissionError("no access")
-        ):
+        with patch.object(type(sessions_dir), "iterdir", side_effect=PermissionError("no access")):
             token = read_peer_token(12345, sessions_dir=sessions_dir)
         assert token is None

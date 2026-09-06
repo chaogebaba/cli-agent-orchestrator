@@ -229,6 +229,22 @@ class ReadyBacklogEpisode:
     fired: bool = False
 
 
+def _queue_owns_delivery() -> bool:
+    """Is sub-phase 3b's write-through position live? (D6's muting of K4.)
+
+    §13d reduces this 2,311-line service to one ``reclaim`` statement: its
+    stalled notice is the fallback that re-announces an already-acked id (#568),
+    and its re-drive paths are a second engine over rows the tick owns. 3b mutes
+    every tick entry point; 3c deletes the module.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+
+        return queue_owns_delivery()
+    except Exception:  # pragma: no cover — an unimportable switch is "not on"
+        return False
+
+
 class StalledCallbackWatchdog:
     def __init__(
         self,
@@ -1381,6 +1397,9 @@ class StalledCallbackWatchdog:
         registry: PluginRegistry | None = None,
         now: float | None = None,
     ) -> None:
+        # WP-ARCH 3b: K4 is MUTED while the queue owns delivery (D6).
+        if _queue_owns_delivery():
+            return
         from cli_agent_orchestrator.services.auto_responder import auto_responder
         from cli_agent_orchestrator.services.inbox_service import inbox_service
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -1516,6 +1535,9 @@ class StalledCallbackWatchdog:
         now: float | None = None,
     ) -> None:
         """Alert on an idle, aged pending backlog whose attempts make no progress."""
+        # WP-ARCH 3b: K4 is MUTED while the queue owns delivery (D6).
+        if _queue_owns_delivery():
+            return
         from cli_agent_orchestrator.services.inbox_service import inbox_service
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -1661,6 +1683,9 @@ class StalledCallbackWatchdog:
         Wrapped fail-silent (D8): exceptions never escape, never starve sibling ticks.
         Per-caller evaluation is isolated: one caller's exception never suppresses another's ring.
         """
+        # WP-ARCH 3b: K4 is MUTED while the queue owns delivery (D6).
+        if _queue_owns_delivery():
+            return
         try:
             self._tick_quiescence_inner(now)
         except Exception:
@@ -1958,6 +1983,9 @@ class StalledCallbackWatchdog:
 
     def tick_no_progress(self, now: float | None = None) -> None:
         """F228-b: heuristic advisory for workers stuck at PROCESSING with no screen change."""
+        # WP-ARCH 3b: K4 is MUTED while the queue owns delivery (D6).
+        if _queue_owns_delivery():
+            return
         try:
             self._tick_no_progress_inner(now)
         except Exception:
@@ -2080,6 +2108,9 @@ class StalledCallbackWatchdog:
 
     def tick_wedge(self) -> None:
         """F295 Half 2: absolute-age arm for grok_cli terminals (D7/D9/D10)."""
+        # WP-ARCH 3b: K4 is MUTED while the queue owns delivery (D6).
+        if _queue_owns_delivery():
+            return
         try:
             self._tick_wedge_inner()
         except Exception:

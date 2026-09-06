@@ -18,10 +18,10 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -208,6 +208,7 @@ class TestAC2WireFormat:
     def test_from_address_matches_pattern(self, socket_stub):
         """from field matches ^bridge:cao-[A-Za-z0-9._-]{1,64}$."""
         import re
+
         from cli_agent_orchestrator.services.cc_session_registry import (
             build_wake_payload,
             write_to_socket,
@@ -299,6 +300,7 @@ class TestAC3NoAuthFrame:
 
         # More direct: verify the module never references .key files
         import inspect
+
         import cli_agent_orchestrator.services.cc_session_registry as mod
 
         source = inspect.getsource(mod)
@@ -548,7 +550,15 @@ class TestAC6ResolutionRefusals:
 
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
-        assert result.refusal_reason == "record_stale"
+        # WP-ARCH 3b / A1.4: the staleness gate is DEMOTED from a refusal to an
+        # annotation. ``updatedAt`` is written by Claude Code's own process, so
+        # its age measures how long the seat has been QUIET — unbounded for an
+        # idle seat — and refusing on it refused exactly the idle seats #604 is
+        # about (#613 sample 5). The identity guards stay hard refusals; this one
+        # rides on the attempt row and the socket's errno is the liveness test.
+        assert result.refusal_reason is None
+        assert result.stale is True
+        assert result.record is not None
 
     def test_two_descendants_both_match_pane_ambiguous(self, sessions_dir):
         """Two descendant records both matching pane tmux => target_ambiguous."""
@@ -1234,6 +1244,7 @@ class TestAC13SocketErrorsFallback:
     def test_timeout_does_not_raise(self):
         """Socket timeout => returns error string."""
         import socket as sock_mod
+
         from cli_agent_orchestrator.services.cc_session_registry import write_to_socket
 
         with patch("socket.socket.connect", side_effect=sock_mod.timeout("timed out")):
@@ -1665,8 +1676,8 @@ class TestFX170S2StringCoercion:
         (sessions_dir / "500.json").write_text(json.dumps(record_data))
 
         from cli_agent_orchestrator.services.cc_session_registry import (
-            read_registry,
             check_version_guard,
+            read_registry,
         )
 
         records = read_registry(sessions_dir)
