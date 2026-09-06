@@ -420,8 +420,21 @@ GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
 # - "\xa0" is allowed as the gap, matching IDLE_PROMPT_PATTERN's handling of
 #   the TUI's non-breaking-space rendering.
 BACKGROUND_WAIT_PATTERN = re.compile(
-    r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b"
-    r"(?=[^\n]*\b(?:workflows?|tasks?|to finish|background)\b)"
+    r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b" r"(?=[^\n]*\b(?:workflows?|tasks?)\b)"
+)
+# F792 (#649): the SUBAGENT wait line, e.g. "✻ Waiting for 1 background agent to
+# finish" (with or without the animating spinner glyph). This is DISTINCT from
+# BACKGROUND_WAIT_PATTERN above: a backgrounded *workflow/task* keeps the seat's
+# own turn open (GH #392 — still PROCESSING), but a seat "waiting for N
+# background AGENT(s)" has ENDED its own turn and is idle while an in-harness
+# Agent lane runs. The disambiguator is the noun "agent(s)": this classifies the
+# seat NOT-busy (idle/completed) and carries the typed WAITING_ON_SUBAGENTS
+# condition (EXPECTED class), never PROCESSING. The glyph class keeps "·"/"*"
+# (the TUI cycles "· ✢ * ✶ ✻ ✽") so a bare-asterisk frame is caught too; the
+# required "agent" keyword after "Waiting for" is what a settled response bullet
+# ("* Waiting for review") can never satisfy together with the start anchor.
+SUBAGENT_WAIT_PATTERN = re.compile(
+    r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b" r"(?=[^\n]*\bagents?\b)"
 )
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
@@ -1128,6 +1141,21 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         ack_hooks = [{"type": "command", "command": ack_command, "timeout": 5}]
+        # F792 (#649): the turn-boundary hook. Same env/credential shape as the
+        # F507/F568 hooks. Fired on Stop (turn_ended), UserPromptSubmit and
+        # PreToolUse (turn_active); the module classifies each event. The server
+        # applies it to turn_state, which fuse_status reads to give hook-truth
+        # precedence over pane delta (AC3).
+        turn_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.turn_marker",
+            ]
+        )
+        turn_hooks = [{"type": "command", "command": turn_command, "timeout": 5}]
         settings = {
             "hooks": {
                 "SessionStart": [
@@ -1162,6 +1190,19 @@ class ClaudeCodeProvider(BaseProvider):
                         "matcher": "Agent|Task",
                         "hooks": ledger_hooks,
                     },
+                    {
+                        # F792 (#649): any PreToolUse means the seat is running a
+                        # tool inside its own turn — a turn-START edge that clears
+                        # any prior turn-ended marker. No matcher = all tools.
+                        "hooks": turn_hooks,
+                    },
+                ],
+                # F792 (#649): a fresh human prompt starts a new turn — clears the
+                # turn-ended marker so the seat is no longer pinned non-busy.
+                "UserPromptSubmit": [
+                    {
+                        "hooks": turn_hooks,
+                    }
                 ],
                 # CLEAR edges (D7):
                 #   PostToolUse / PostToolUseFailure matcher AskUserQuestion
@@ -1180,7 +1221,7 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
                 "Stop": [
                     {
-                        "hooks": marker_hooks + ack_hooks,
+                        "hooks": marker_hooks + ack_hooks + turn_hooks,
                     }
                 ],
                 # F568 D12a release edge: the subagent's Stop (converted to

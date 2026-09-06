@@ -204,6 +204,12 @@ KIND_SURFACES: dict[str, Surfaces] = {
     "NET_INTERRUPTED": Surfaces(fleet=True, bus=True, inbox=False),
     "TRANSIENT_OVERLOAD": Surfaces(fleet=True, bus=True, inbox=False),
     "CONTEXT_EXHAUSTED": Surfaces(fleet=True, bus=True, inbox=True),
+    # F792 (#649): EXPECTED not-busy state — fleet + bus carry `· waiting`, but
+    # the seat inbox NEVER does (inbox=False). A seat idle-waiting on its own
+    # background agents is decision-free liveness, exactly the class the
+    # supervisor-inbox-drain hook withholds; declining the inbox leg here keeps
+    # it off the seat entirely (reuses this map as the drain-class predicate).
+    "WAITING_ON_SUBAGENTS": Surfaces(fleet=True, bus=True, inbox=False),
 }
 
 # Default for an unmapped kind (AC6): fleet + bus carry it, inbox does NOT.

@@ -43,6 +43,7 @@ TRANSIENT_OVERLOAD.
 | claude-code-busy-1 | claude_code | BUSY | asterisk_spinner | — | 82b743ab.scrollback:19-27 | 6b29b25c3549 |
 | cline-cli-proc-exited-1 | cline_cli | PROC_EXITED | command_exit_code | — | 0b970e6c.scrollback:72-75 | baedd3768dbc |
 | cline-cli-self-abort-1 | cline_cli | TRANSIENT_OVERLOAD | self_abort_loop_limit | — (none on screen) | f738-build-report.md §4 Arm A | d5aecdaf9ba7 |
+| claude-code-waiting-on-subagents-1 | claude_code | WAITING_ON_SUBAGENTS | background_agents | — | c8047ddc live pane cao-claude-orch5:0 2026-09-06 (F792 #649) | — |
 
 Notes:
 - codex-context-exhausted-1 and codex-busy-1 are the same source excerpt (footer with

@@ -1220,6 +1220,25 @@ class ChildrenLedgerRequest(BaseModel):
     nonce: Optional[str] = None
 
 
+class TurnMarkerRequest(BaseModel):
+    """F792 (#649) turn-boundary edge pushed by the seat's own hooks.
+
+    ``kind`` is the only closed vocabulary: ``turn_ended`` on the ``Stop`` hook,
+    ``turn_active`` on ``UserPromptSubmit`` / ``PreToolUse``. Provider-agnostic —
+    ``event``/``source`` are opaque descriptive tags. The server applies the edge
+    to the in-process ``turn_state`` service, which ``fuse_status`` reads to give
+    hook-truth precedence over pane delta (a turn-ended seat cannot be flipped to
+    ``working`` by a background Agent animating the pane).
+    """
+
+    terminal_id: str
+    kind: Literal["turn_ended", "turn_active"]
+    source: str = ""
+    event: str = ""
+    ts: Optional[str] = None
+    nonce: Optional[str] = None
+
+
 class InstallAgentProfileRequest(BaseModel):
     """Request body for installing an agent profile.
 
@@ -4972,6 +4991,34 @@ async def push_children_ledger(
         "op": body.op,
         "children_count": count,
     }
+
+
+@app.post("/terminals/{terminal_id}/turn-marker")
+async def push_turn_marker(
+    terminal_id: TerminalId,
+    body: TurnMarkerRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Accept one F792 (#649) turn-boundary edge (turn_ended/turn_active).
+
+    Same shape as the F507 interaction-marker endpoint: 404 on an unknown
+    terminal, 400 when the body ``terminal_id`` does not match the route. No
+    filesystem, no transcript. The edge is applied to the in-process
+    ``turn_state`` service; ``fuse_status`` reads it so a Stop-hook turn-end
+    pins the seat non-busy until the next turn start — pane delta cannot
+    override it (AC3). Provider-agnostic (nothing CC-specific required).
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_turn_marker: terminal_id does not match route",
+        )
+    from cli_agent_orchestrator.services.turn_state import turn_state
+
+    turn_state.mark(terminal_id, body.kind)
+    return {"success": True, "terminal_id": terminal_id, "kind": body.kind}
 
 
 class InboxDrainRequest(BaseModel):

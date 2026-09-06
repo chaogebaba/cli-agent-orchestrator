@@ -70,6 +70,14 @@ def _render_fleet(payload: dict[str, Any]) -> None:
         # over the FINAL status + children ledger; the CLI only formats it.
         if terminal.get("delegating"):
             status_cell = f"delegating ({int(terminal.get('children_count', 0))})"
+        # F792 (#649): a seat idle-waiting on its own background AGENT lanes reads
+        # `· waiting` in the STATUS cell — a not-busy, EXPECTED state carried by
+        # the `condition` sibling key the fleet builder already projected. Kept
+        # distinct from `delegating (N)`: `waiting` is the seat's OWN pane truth
+        # (the "Waiting for N background agent…" line), independent of the
+        # children ledger, so it renders even when the ledger count is 0.
+        if terminal.get("condition") == "WAITING_ON_SUBAGENTS":
+            status_cell = "· waiting"
         rows.append(
             (
                 str(terminal["window_index"]) if terminal["window_index"] is not None else _MISSING,
