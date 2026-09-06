@@ -44,6 +44,7 @@ _TERMINAL_KEYS: frozenset[str] = frozenset(
         "since_last_input",
         "lifecycle",
         "resolved_model",
+        "reasoning_effort",
         "reparented_from",
         "config_stale",
         "wedge_suspect",
@@ -137,6 +138,7 @@ class TerminalState:
     since_last_input: float | None = None
     lifecycle: str = "ephemeral"
     resolved_model: str | None = None
+    reasoning_effort: str | None = None
     reparented_from: str | None = None
     config_stale: bool = False
     wedge_suspect: bool = False
@@ -165,6 +167,7 @@ class TerminalState:
             since_last_input=_as_opt_float(raw.get("since_last_input")),
             lifecycle=_as_str(raw.get("lifecycle")) or "ephemeral",
             resolved_model=_as_opt_str(raw.get("resolved_model")),
+            reasoning_effort=_as_opt_str(raw.get("reasoning_effort")),
             reparented_from=_as_opt_str(raw.get("reparented_from")),
             config_stale=bool(raw.get("config_stale")),
             wedge_suspect=bool(raw.get("wedge_suspect")),

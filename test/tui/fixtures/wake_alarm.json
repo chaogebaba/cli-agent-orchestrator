@@ -21,6 +21,7 @@
       "since_last_input": 1800.0,
       "lifecycle": "persistent",
       "resolved_model": "claude-opus-5",
+      "reasoning_effort": "high",
       "reparented_from": null,
       "config_stale": false,
       "wedge_suspect": false
@@ -45,6 +46,7 @@
       "since_last_input": 600.0,
       "lifecycle": "ephemeral",
       "resolved_model": "cline-pass/glm-5.3",
+      "reasoning_effort": "high",
       "reparented_from": null,
       "config_stale": true,
       "wedge_suspect": true

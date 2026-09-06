@@ -103,6 +103,7 @@ class Terminal(BaseModel):
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     resolved_model: Optional[str] = Field(None, description="Effective model resolved at init time")
+    reasoning_effort: Optional[str] = Field(None, description="F777: effective reasoning effort")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )

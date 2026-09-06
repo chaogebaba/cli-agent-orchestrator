@@ -19,6 +19,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_provider_profile_defaults,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
     set_agent_dirs,
     set_extra_agent_dirs,
     set_extra_skill_dirs,
@@ -198,6 +199,56 @@ class TestGetProviderDefaults:
             is None
         )
         assert get_provider_profile_defaults(provider, "missing") == {}
+
+
+class TestResolveReasoningEffort:
+    """F777 (#634): the single per-provider reasoning-effort resolver."""
+
+    def test_precedence_profile_over_provider_over_frontmatter(self):
+        provider = {
+            "reasoning_effort": "provider",
+            "profiles": {"dev": {"reasoning_effort": "profile"}},
+        }
+        profile_layer = get_provider_profile_defaults(provider, "dev")
+        profile = SimpleNamespace(reasoningEffort="frontmatter")
+        assert resolve_reasoning_effort("codex", profile_layer, provider, profile) == "profile"
+
+    def test_provider_layer_when_no_profile_layer(self):
+        provider = {"reasoning_effort": "provider"}
+        profile = SimpleNamespace(reasoningEffort="frontmatter")
+        assert resolve_reasoning_effort("codex", {}, provider, profile) == "provider"
+
+    def test_frontmatter_when_toml_silent(self):
+        profile = SimpleNamespace(reasoningEffort="frontmatter")
+        assert resolve_reasoning_effort("codex", {}, {}, profile) == "frontmatter"
+
+    def test_empty_string_clears_to_none(self):
+        """An explicit "" at any layer suppresses (None), like the model resolver."""
+        provider = {"reasoning_effort": ""}
+        profile = SimpleNamespace(reasoningEffort="frontmatter")
+        assert resolve_reasoning_effort("codex", {}, provider, profile) is None
+
+    def test_codex_grok_claude_have_no_builtin_default(self):
+        """Nothing specified anywhere → None (the CLI's own default; column '-')."""
+        for provider_name in ("codex", "grok_cli", "claude_code"):
+            assert resolve_reasoning_effort(provider_name, {}, {}, None) is None
+
+    def test_cline_builtin_default_is_high(self):
+        """cline_cli carries a CAO-side built-in default of 'high' when silent."""
+        assert resolve_reasoning_effort("cline_cli", {}, {}, None) == "high"
+
+    def test_cline_uses_thinking_key(self):
+        """cline_cli reads the `thinking` toml key, not `reasoning_effort`."""
+        provider = {"thinking": "medium", "reasoning_effort": "ignored"}
+        assert resolve_reasoning_effort("cline_cli", {}, provider, None) == "medium"
+
+    def test_kiro_has_no_knob_returns_none(self):
+        """kiro_cli has no effort knob: always None (the one bound provider at '-')."""
+        provider = {"reasoning_effort": "high", "thinking": "high"}
+        assert resolve_reasoning_effort("kiro_cli", {}, provider, None) is None
+
+    def test_unknown_provider_returns_none(self):
+        assert resolve_reasoning_effort("no_such_cli", {}, {"reasoning_effort": "x"}, None) is None
 
 
 class TestGetAgentDirs:

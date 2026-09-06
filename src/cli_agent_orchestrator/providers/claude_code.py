@@ -34,6 +34,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.http import resolve_endpoint
@@ -660,6 +661,15 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return getattr(self, "_resolved_model", None)
 
+    @property
+    def resolved_reasoning_effort(self) -> "Optional[str]":
+        """F777 (#634): the effective reasoning effort resolved at command build.
+
+        None for the native_agent / bare-``--agent`` paths, which never reach
+        the effort resolution (CAO does not control the CLI's effort there).
+        """
+        return getattr(self, "_resolved_reasoning_effort", None)
+
     def __init__(
         self,
         terminal_id: str,
@@ -911,6 +921,18 @@ class ClaudeCodeProvider(BaseProvider):
                 command_parts.extend(["--effort", effort])
             if fallback_model:
                 command_parts.extend(["--fallback-model", str(fallback_model)])
+            # F777 (#634): persist the EFFECTIVE effort. The base value comes
+            # from the one shared helper (same precedence as `model`); the
+            # claudeConfig.effort override above REPLACES it here too, so the
+            # persisted value matches the `--effort` flag actually emitted.
+            resolved_effort = resolve_reasoning_effort(
+                "claude_code", profile_defaults, defaults, profile
+            )
+            if isinstance(claude_config, dict):
+                config_effort = claude_config.get("effort")
+                if config_effort:
+                    resolved_effort = str(config_effort)
+            self._resolved_reasoning_effort = resolved_effort
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""

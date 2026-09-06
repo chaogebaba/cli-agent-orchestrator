@@ -282,22 +282,37 @@ def test_sort_terminals_puts_supervisors_first(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_view_is_exactly_the_six_parity_columns(tmp_path: Path) -> None:
-    """AC5: the default view is parity, in the order of fleet-tui.py:344."""
+async def test_default_view_is_exactly_the_parity_columns(tmp_path: Path) -> None:
+    """AC5 + F777: the default view is the parity set, PROVIDER/MODEL/EFFORT included."""
     app, feed, _ = make_app([load_payload("healthy")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
         table = app.table
         labels = [str(col.label) for col in table.columns.values()]
         assert labels == list(PARITY_VIEW)
-        # AC5: the six parity headers, verbatim, after the header-less gutter.
-        assert labels[1:] == ["WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED"]
+        # F777 (#634): PROVIDER/MODEL/EFFORT sit between PROFILE and TASK; MODEL
+        # is now default-visible (moved out of NEW_COLUMNS). ELAPSED stays last.
+        assert labels[1:] == [
+            "WIN",
+            "ID",
+            "PROFILE",
+            "PROVIDER",
+            "MODEL",
+            "EFFORT",
+            "TASK",
+            "STATUS",
+            "ELAPSED",
+        ]
         assert labels[MARKER_INDEX] == ""
 
 
 @pytest.mark.asyncio
-async def test_c_reveals_the_five_new_columns_and_toggles_back(tmp_path: Path) -> None:
-    """AC5: `c` adds exactly the five new columns, after the six parity ones."""
+async def test_c_reveals_the_new_columns_and_toggles_back(tmp_path: Path) -> None:
+    """AC5 + F777: `c` adds exactly the remaining NEW_COLUMNS, after the parity ones.
+
+    MODEL is no longer among them — F777 promoted it to the default parity set —
+    so it is asserted via its parity position, still populated in either view.
+    """
     app, feed, _ = make_app([load_payload("delegating")], tmp_path)
     async with app.run_test() as pilot:
         await settle(pilot, feed)
@@ -365,6 +380,36 @@ async def test_healthy_fixture_status_cells_carry_glyph_and_style(tmp_path: Path
         # ELAPSED: term-0003 has been `completed` since the clock first saw it,
         # so it reads zero with the lower-bound marker.
         assert plain(table, 2, PARITY_VIEW.index(ELAPSED_COLUMN)) == "0s+"
+
+
+@pytest.mark.asyncio
+async def test_provider_model_effort_columns_render(tmp_path: Path) -> None:
+    """F777 (#634): PROVIDER (short CLI name), MODEL and EFFORT are default-visible.
+
+    term-0001 claude_code/claude-opus-5/high, term-0002 codex/gpt-5.1-codex/medium,
+    term-0003 grok_cli/grok-4.6 with no effort key → EFFORT reads ``-``.
+    """
+    app, feed, _ = make_app([load_payload("healthy")], tmp_path)
+    async with app.run_test() as pilot:
+        await settle(pilot, feed)
+        table = app.table
+        provider = PARITY_VIEW.index("PROVIDER")
+        model = PARITY_VIEW.index("MODEL")
+        effort = PARITY_VIEW.index("EFFORT")
+
+        # PROVIDER shortens the internal id to the CLI name.
+        assert plain(table, 0, provider) == "claude"
+        assert plain(table, 1, provider) == "codex"
+        assert plain(table, 2, provider) == "grok"
+
+        assert plain(table, 0, model) == "claude-opus-5"
+        assert plain(table, 1, model) == "gpt-5.1-codex"
+        assert plain(table, 2, model) == "grok-4.6"
+
+        assert plain(table, 0, effort) == "high"
+        assert plain(table, 1, effort) == "medium"
+        # A bound provider with no effort key at any level renders "-".
+        assert plain(table, 2, effort) == "-"
 
 
 @pytest.mark.asyncio
@@ -1141,6 +1186,9 @@ def test_row_values_is_the_single_source_of_the_row_text() -> None:
         "0",
         "term-0001",
         "chao_supervisor",
+        "claude",  # PROVIDER (F777): claude_code shortened
+        "claude-opus-5",  # MODEL (F777)
+        "high",  # EFFORT (F777)
         "(supervisor seat)",
         "◌ idle",
         ELAPSED_UNKNOWN,  # no clock passed: one frame cannot time a transition
@@ -1250,7 +1298,12 @@ async def test_the_table_columns_carry_the_scripts_two_space_gutter(tmp_path: Pa
         # except the last, which is stretched to the edge of the screen
         expected = column_widths(PARITY_COLUMNS, values)
         assert widths[1:-1] == expected[:-1]
-        assert sum(widths) == app.frame_width()
+        # The last column is stretched to the screen edge only when the natural
+        # widths leave spare. F777 (#634) made the default view wider (PROVIDER/
+        # MODEL/EFFORT), so on a narrow frame the columns can already overflow,
+        # in which case nothing is stretched and the total is the natural sum.
+        natural_total = GUTTER_WIDTH + sum(expected)
+        assert sum(widths) == max(natural_total, app.frame_width())
 
 
 def test_the_selection_bar_uses_the_scripts_accent_not_the_textual_theme() -> None:

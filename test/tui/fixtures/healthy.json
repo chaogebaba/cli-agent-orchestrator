@@ -21,6 +21,7 @@
       "since_last_input": 12.5,
       "lifecycle": "persistent",
       "resolved_model": "claude-opus-5",
+      "reasoning_effort": "high",
       "reparented_from": null,
       "config_stale": false,
       "wedge_suspect": false
@@ -45,6 +46,7 @@
       "since_last_input": 1.0,
       "lifecycle": "ephemeral",
       "resolved_model": "gpt-5.1-codex",
+      "reasoning_effort": "medium",
       "reparented_from": null,
       "config_stale": false,
       "wedge_suspect": false
@@ -69,6 +71,7 @@
       "since_last_input": 310.0,
       "lifecycle": "ephemeral",
       "resolved_model": "grok-4.6",
+      "reasoning_effort": null,
       "reparented_from": null,
       "config_stale": false,
       "wedge_suspect": false

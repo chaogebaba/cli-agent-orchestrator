@@ -44,6 +44,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -2280,6 +2281,25 @@ class CodexProvider(BaseProvider):
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 
+        # F777 (#634): persist the EFFECTIVE reasoning effort through the one
+        # shared helper, resolved with the same profile-name precedence codex
+        # uses for model/config above (declared profile name wins over the
+        # agent-profile key). codex's toml key is `reasoning_effort`; it has no
+        # CAO-side built-in default, so an unset chain persists None (`-`).
+        _codex_defaults = get_provider_defaults("codex")
+        _codex_declared = getattr(profile, "name", None) if profile is not None else None
+        _codex_profile_name = (
+            _codex_declared
+            if isinstance(_codex_declared, str) and _codex_declared
+            else self._agent_profile
+        )
+        _codex_profile_defaults = get_provider_profile_defaults(
+            _codex_defaults, _codex_profile_name
+        )
+        self._resolved_reasoning_effort = resolve_reasoning_effort(
+            "codex", _codex_profile_defaults, _codex_defaults, profile
+        )
+
         # Set below, only when there is a non-empty system_prompt to inject -- appended, raw and
         # deliberately unquoted by shlex, after the shlex.join() of everything else at the very
         # end of this method. See the long comment at its assignment site for why.
@@ -3519,6 +3539,11 @@ class CodexProvider(BaseProvider):
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
         return getattr(self, "_resolved_model", None)
+
+    @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): the effective reasoning effort resolved at command build."""
+        return getattr(self, "_resolved_reasoning_effort", None)
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:

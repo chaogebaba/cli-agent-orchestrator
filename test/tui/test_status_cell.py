@@ -246,20 +246,32 @@ def test_non_string_status_never_raises() -> None:
 # ─── columns (D3 / AC5) ───────────────────────────────────────────────────────
 
 
-def test_parity_columns_are_the_six_script_headers_in_order() -> None:
-    """Five verbatim from the script; the sixth renamed IDLE -> ELAPSED.
+def test_parity_columns_are_the_default_visible_headers_in_order() -> None:
+    """The six F702 headers plus F777's PROVIDER/MODEL/EFFORT, in render order.
 
-    The column no longer shows how long a pane has been quiet under a header
-    that asserts the seat is idle — it shows time in the current status, for
-    every status — so the header had to stop naming one of them.
+    The last column is still ELAPSED (renamed from the script's IDLE): it shows
+    time in the current status, for every status. F777 (#634) inserted
+    PROVIDER/MODEL/EFFORT between PROFILE and TASK and promoted MODEL out of
+    NEW_COLUMNS, so the default view now carries the CLI, model and effort.
     """
-    assert PARITY_COLUMNS == ("WIN", "ID", "PROFILE", "TASK", "STATUS", "ELAPSED")
+    assert PARITY_COLUMNS == (
+        "WIN",
+        "ID",
+        "PROFILE",
+        "PROVIDER",
+        "MODEL",
+        "EFFORT",
+        "TASK",
+        "STATUS",
+        "ELAPSED",
+    )
     assert PARITY_COLUMNS[-1] == ELAPSED_COLUMN
-    assert PARITY_COLUMNS[:5] == ("WIN", "ID", "PROFILE", "TASK", "STATUS")
+    assert PARITY_COLUMNS[:3] == ("WIN", "ID", "PROFILE")
 
 
-def test_new_columns_are_the_five_unrendered_keys() -> None:
-    assert NEW_COLUMNS == ("COND", "DELEG", "*", "LIFE", "MODEL")
+def test_new_columns_are_the_remaining_unrendered_keys() -> None:
+    # F777 (#634) promoted MODEL to the default parity set; four remain.
+    assert NEW_COLUMNS == ("COND", "DELEG", "*", "LIFE")
 
 
 def test_all_columns_is_parity_then_new() -> None:
@@ -292,6 +304,7 @@ TERMINAL_KEYS = {
     "since_last_input",
     "lifecycle",
     "resolved_model",
+    "reasoning_effort",
     "reparented_from",
     "config_stale",
     "wedge_suspect",

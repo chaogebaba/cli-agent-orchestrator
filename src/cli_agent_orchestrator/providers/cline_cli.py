@@ -274,6 +274,11 @@ class ClineCliProvider(BaseProvider):
         return getattr(self, "_resolved_model", None)
 
     @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): the effective reasoning effort resolved at command build."""
+        return getattr(self, "_resolved_reasoning_effort", None)
+
+    @property
     def session_id(self) -> Optional[str]:
         """Return the correlated cline session ID, if known."""
         return self._session_id
@@ -582,6 +587,15 @@ class ClineCliProvider(BaseProvider):
         thinking = self._resolve_thinking()
         if isinstance(thinking, str) and thinking:
             command_parts.extend(["--thinking", thinking])
+        # F777 (#634): persist the EFFECTIVE effort exactly as the --thinking
+        # flag reflects it — the non-empty resolved value (which already carries
+        # cline's built-in `high` default via _resolve_thinking), or None when
+        # the flag is suppressed. _resolve_thinking is the cline arm of the
+        # shared reasoning-effort precedence (settings_service.resolve_reasoning_effort
+        # encodes the same cline_cli→thinking→"high" rule).
+        self._resolved_reasoning_effort = (
+            thinking if isinstance(thinking, str) and thinking else None
+        )
 
         # System prompt from agent profile.
         profile = None

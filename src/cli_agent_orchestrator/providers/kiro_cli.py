@@ -333,6 +333,16 @@ class KiroCliProvider(BaseProvider):
         """Return the effective model resolved by the service layer."""
         return getattr(self, "_model", None)
 
+    @property
+    def resolved_reasoning_effort(self) -> Optional[str]:
+        """F777 (#634): kiro-cli has no reasoning-effort knob, so this is always
+        None — the one bound provider that legitimately renders ``-`` in the
+        fleet EFFORT column. Kept as a property (parity with the other four
+        providers) so terminal_service persists it uniformly; the shared
+        ``settings_service.resolve_reasoning_effort`` returns None for kiro_cli
+        by the same rule (no entry in its knob table)."""
+        return None
+
     def resume_session_uuid(self) -> str | None:
         """F560: the resume seed, used by the create path's settlement logic.
 

@@ -70,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     update_provider_session_snapshot,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_reasoning_effort,
     update_terminal_resolved_model,
     update_terminal_shell_command,
     update_terminal_tmux_window,
@@ -3039,6 +3040,7 @@ async def create_terminal(
             condition=None,
             last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
+            reasoning_effort=None,
         )
 
         logger.info(
@@ -5613,6 +5615,21 @@ def _schedule_deferred_init(
                     terminal_id,
                     _f127_resolved,
                 )
+            # F777 (#634): persist the effective reasoning effort post-initialize,
+            # next to resolved_model and by the same mechanism. None (a provider
+            # with no effort knob, or a toml that clears it) is left unpersisted
+            # so the column reads "-".
+            _f777_effort = getattr(provider_instance, "resolved_reasoning_effort", None)
+            if _f777_effort is not None:
+                await _tracked_blocking(
+                    terminal_id,
+                    generation,
+                    "abandonable",
+                    "capture_persist",
+                    update_terminal_reasoning_effort,
+                    terminal_id,
+                    _f777_effort,
+                )
             if prepared_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server; _assign_impl on the MCP-server side already
@@ -5975,6 +5992,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider_session_id": metadata.get("provider_session_id"),
             "engine": metadata.get("engine"),
             "resolved_model": metadata.get("resolved_model"),
+            "reasoning_effort": metadata.get("reasoning_effort"),
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,
