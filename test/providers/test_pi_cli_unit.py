@@ -317,6 +317,41 @@ class TestStatusDetection:
         ):
             assert provider.get_status(_fixture("pi_completed.txt")) == TerminalStatus.PROCESSING
 
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_empty_pushed_buffer_live_reads_idle_pane(self, _native) -> None:
+        """F798 r2 B-1 fix #2: pi's persistent TUI does not feed the tmux FIFO
+        push buffer at rest, so a parked worker's pushed buffer is empty. When it
+        is, _resolve_buffer must do ONE live pane read and classify THAT — an
+        empty buffer over an idle pane is IDLE (not UNKNOWN), else the
+        IDLE-gated inbox delivery never fires and callbacks are lost.
+        """
+        provider = self._provider(dispatched=False)
+        with patch.object(
+            PiCliProvider, "_read_pane", return_value=_fixture("pi_idle_padded.txt")
+        ) as read:
+            assert provider.get_status("") == TerminalStatus.IDLE
+            read.assert_called_once()
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_empty_pushed_buffer_live_reads_non_idle_pane(self, _native) -> None:
+        """Empty pushed buffer + a live pane with no idle chrome → NOT idle
+        (UNKNOWN here): the live-read fallback must not manufacture readiness.
+        """
+        provider = self._provider(dispatched=False)
+        with patch.object(PiCliProvider, "_read_pane", return_value="just a shell prompt $ ") as read:
+            assert provider.get_status("") == TerminalStatus.UNKNOWN
+            read.assert_called_once()
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_non_empty_pushed_buffer_skips_live_read(self, _native) -> None:
+        """A non-empty pushed buffer is classified as-is — no extra pane read
+        (no backend round-trip when there is already content to classify).
+        """
+        provider = self._provider(dispatched=False)
+        with patch.object(PiCliProvider, "_read_pane") as read:
+            assert provider.get_status(_fixture("pi_idle.txt")) == TerminalStatus.IDLE
+            read.assert_not_called()
+
 
 # ─── Response extraction ────────────────────────────────────────────────────────
 

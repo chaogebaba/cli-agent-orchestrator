@@ -419,6 +419,27 @@ class PiCliProvider(BaseProvider):
             logger.debug("pi worker %s: pane read failed: %s", self.terminal_id, exc)
             return ""
 
+    def _resolve_buffer(self, buffer: Optional[str]) -> str:
+        """Resolve the buffer ``get_status()`` parses; live-read when empty.
+
+        Pi runs as a persistent alt-screen TUI and does NOT feed the tmux FIFO
+        ``pipe-pane`` push pipeline once it has drawn its frame — so at rest the
+        StatusMonitor's pushed buffer for a parked pi worker is empty. The base
+        resolver only falls back to a live ``get_history()`` read for
+        event-inbox backends (herdr); on tmux it passes the empty buffer through
+        unchanged, and ``get_status`` then returns UNKNOWN even though the live
+        pane shows idle chrome. Because inbox delivery is IDLE-gated, that parked
+        worker would never receive its callbacks (F798 r2 B-1).
+
+        Override: when the pushed buffer is empty/whitespace, do ONE live pane
+        read before classifying. A non-empty pushed buffer is passed through
+        unchanged (no extra backend round-trip), so this only costs a capture
+        when there was nothing to classify anyway.
+        """
+        if buffer and buffer.strip():
+            return buffer
+        return self._read_pane()
+
     @staticmethod
     def _has_idle_chrome(clean: str) -> bool:
         """Return whether the stripped buffer shows Pi's idle/completed chrome.
