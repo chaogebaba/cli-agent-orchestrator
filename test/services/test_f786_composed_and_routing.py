@@ -45,8 +45,10 @@ def cao_home(tmp_path, monkeypatch):
     (store / "overlays" / "kiro_cli.md").write_text(
         "---\nprovider: kiro_cli\n---\n\n# kiro overlay\n"
     )
-    # Re-import constants + agent_profiles so CAO_HOME_DIR takes effect for the
-    # module-level LOCAL_AGENT_STORE_DIR constant used by some helpers.
+    # Reload constants ONLY so CAO_HOME_DIR takes effect for the module-level
+    # LOCAL_AGENT_STORE_DIR constant used by some helpers. (agent_profiles is
+    # NOT reloaded — reloading it swaps its class objects, an xdist-order skew;
+    # the composed store is read via the call-time composed_store_dir().)
     importlib.reload(constants)
     try:
         yield tmp_path
@@ -170,6 +172,98 @@ class TestAC8ComposedStore:
             # Fail-closed BEFORE any tmux window / DB row.
             mock_backend.create_window.assert_not_called()
             mock_db_create.assert_not_called()
+
+
+class TestAC8SeamWitness:
+    """AC8 / MUTANT #10 — the D8 composed-writer SEAM in ``_assign_impl``.
+
+    r2 BLOCKER (B-1): mutant #10 is the server-seam guard
+    ``if _resolved_provider:`` → ``if False:`` at
+    ``mcp_server/server.py`` (the ``write_composed_profile_for_spawn`` call).
+    Neither named AC test killed it: ``TestAC8ComposedStore`` calls the writer
+    DIRECTLY (never through the mutated seam), and
+    ``test_d7_position_plus_provider_spawns_composed`` patches ``_create_terminal``
+    and asserts only the RESOLVED NAME — never the ``composed/`` side-effect.
+
+    This drives the REAL ``_assign_impl`` for a position + provider against the
+    ``cao_home`` temp store and asserts the composed profile is materialised
+    under ``composed_store_dir()`` with the expected name and byte-content.
+    Terminal creation is stubbed at the LOWEST seam BELOW the writer — the
+    module-level ``cao_http`` HTTP client that ``_create_terminal`` calls — NOT
+    ``_create_terminal`` itself (which the r2 AC3 test patched, above the seam
+    of interest). With mutant #10 applied the ``composed/`` write is skipped and
+    the file never appears, so this FAILS; unmutated it PASSES.
+    """
+
+    def test_assign_impl_materialises_composed_profile_through_seam(self, cao_home, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        from cli_agent_orchestrator.constants import composed_store_dir
+        from cli_agent_orchestrator.mcp_server import server
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            compose_position_profile_for_spawn,
+            load_agent_profile,
+        )
+
+        # A CAO_TERMINAL_ID is required so _assign_impl / _create_terminal take
+        # the existing-session branch (the only branch that stubs cleanly and
+        # the one a real assign uses).
+        monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+
+        # LOWEST seam below the writer: _create_terminal's two HTTP calls.
+        # .get -> the caller's terminal metadata (status 200, provider+session);
+        # .post -> the created worker terminal row. Everything ABOVE this in
+        # _assign_impl — including the D8 composed-writer guard — runs for real.
+        def _fake_get(path, *a, **k):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(
+                return_value={
+                    "provider": "kiro_cli",
+                    "session_name": "sess-witness",
+                    "allowed_tools": ["*"],
+                }
+            )
+            return resp
+
+        def _fake_post(path, *a, **k):
+            resp = MagicMock()
+            resp.status_code = 201
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value={"id": "worker77"})
+            return resp
+
+        fake_http = MagicMock()
+        fake_http.get = MagicMock(side_effect=_fake_get)
+        fake_http.post = MagicMock(side_effect=_fake_post)
+
+        target = composed_store_dir() / "dev-kiro_cli.md"
+        assert not target.exists()  # nothing written before the assign
+
+        with patch.object(server, "cao_http", fake_http):
+            result = server._assign_impl(
+                "dev", "implement the widget", working_directory="/repo", provider="kiro_cli"
+            )
+
+        # The assign resolved and reached the create seam (post was hit) …
+        assert result["success"] is True, result
+        assert result["terminal_id"] == "worker77"
+        fake_http.post.assert_called_once()
+
+        # … and the D8 seam materialised the composed profile under composed/.
+        assert target.exists(), "composed/dev-kiro_cli.md not materialised by the assign seam"
+        assert target.parent.name == "composed"
+
+        # Byte-content parity with the direct composer (same source the writer used).
+        _prof, expected_source = compose_position_profile_for_spawn("dev-kiro_cli", "kiro_cli")
+        assert target.read_text(encoding="utf-8") == expected_source
+
+        # The materialised file loads as the composed profile it names.
+        loaded = load_agent_profile("dev-kiro_cli")
+        assert loaded.name == "dev-kiro_cli"
+        assert loaded.position == "dev"
+        assert loaded.provider == "kiro_cli"
 
 
 class TestProfileMissingError:

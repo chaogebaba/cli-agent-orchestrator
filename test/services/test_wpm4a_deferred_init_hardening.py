@@ -609,6 +609,10 @@ async def test_f786_deferred_init_legacy_passthrough_leaves_position_null(monkey
     await asyncio.gather(*list(terminals._deferred_init_tasks))
     assert events == ["send", "ready"]
     assert positions == []
+
+
+@pytest.mark.asyncio
+async def test_quiesce_wins_between_ready_guard_and_persist(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
     ready: list[str] = []

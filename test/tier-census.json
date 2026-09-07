@@ -10146,6 +10146,8 @@
     "test/services/test_wpm4a_deferred_init_hardening.py::test_h1_retries_only_validation_then_succeeds": "unit",
     "test/services/test_wpm4a_deferred_init_hardening.py::test_h1_lawful_past_deadline_result_is_final": "unit",
     "test/services/test_wpm4a_deferred_init_hardening.py::test_ready_commits_only_after_initial_send": "unit",
+    "test/services/test_wpm4a_deferred_init_hardening.py::test_f786_deferred_init_persists_threaded_position": "unit",
+    "test/services/test_wpm4a_deferred_init_hardening.py::test_f786_deferred_init_legacy_passthrough_leaves_position_null": "unit",
     "test/services/test_wpm4a_deferred_init_hardening.py::test_quiesce_wins_between_ready_guard_and_persist": "unit",
     "test/services/test_wpm4a_deferred_init_hardening.py::test_quiesce_wins_after_ready_sync_call_starts": "unit",
     "test/services/test_wpm4a_deferred_init_hardening.py::test_quiesce_reports_ready_when_commit_precedes_helper_publication": "unit",
