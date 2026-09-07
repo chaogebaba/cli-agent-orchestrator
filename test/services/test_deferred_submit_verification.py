@@ -292,6 +292,7 @@ class TestConfirmWorkerStartedOrResubmit:
             orchestration_type=None,
             defer_on_dialog=True,
             expect_callback=False,
+            first_dispatch=True,
         )
 
     async def test_returns_false_when_worker_never_starts(self):

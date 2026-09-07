@@ -4517,9 +4517,7 @@ class CodexProvider(BaseProvider):
         """
         if not captured:
             return "<no pane captured>"
-        plain_lines = [
-            strip_terminal_escapes(line).rstrip() for line in captured.splitlines()
-        ]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in captured.splitlines()]
         nonblank = [line for line in plain_lines if line.strip()]
         if not nonblank:
             return "<empty pane>"
@@ -5073,6 +5071,59 @@ class CodexProvider(BaseProvider):
                         and _f802_status != TerminalStatus.WAITING_USER_ANSWER
                         and self._composer_holds_unsubmitted_text(_f802_captured)
                     ):
+                        # B-2 (#658 r2): MUST re-check rollout immediately
+                        # before the recovery Enter, mirroring the owned-chip
+                        # path's final re-check. A delayed original submission
+                        # can land during the status/composer observations
+                        # above; without this the F802 branch would double-send.
+                        # Re-check is a CONFIRMATION only — never an action.
+                        if _rollout_confirms():
+                            logger.info(
+                                "F802 submit-verify: terminal %s confirmed via "
+                                "rollout re-check before first-dispatch recovery "
+                                "Enter (race avoided)",
+                                self.terminal_id,
+                            )
+                            return
+                        # B-2 (#658 r2): NARROW THE TOCTOU — re-read the pane
+                        # immediately before the keystroke and require the
+                        # composer STILL holds our unsubmitted content. If it
+                        # vanished (the submit may have just landed), skip this
+                        # Enter and re-poll. Fail-closed on read/status change.
+                        try:
+                            _f802_pre_enter = backend.get_history(
+                                session,
+                                window,
+                                tail_lines=PYTE_SCREEN_ROWS,
+                                strip_escapes=False,
+                            )
+                        except Exception:
+                            _f802_pre_enter = None
+                        try:
+                            _f802_pre_status = _f802_status_monitor.get_status(self.terminal_id)
+                        except Exception:
+                            _f802_pre_status = None
+                        if not (
+                            isinstance(_f802_pre_enter, str)
+                            and _f802_pre_status != TerminalStatus.WAITING_USER_ANSWER
+                            and self._composer_holds_unsubmitted_text(_f802_pre_enter)
+                        ):
+                            logger.info(
+                                "F802 submit-verify: terminal %s unsubmitted "
+                                "content vanished on pre-Enter reread (TOCTOU "
+                                "avoided, attempt %d)",
+                                self.terminal_id,
+                                attempt,
+                            )
+                            time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                            if _rollout_confirms():
+                                logger.info(
+                                    "F802 submit-verify: terminal %s confirmed via "
+                                    "rollout after unsubmitted-content vanished reread",
+                                    self.terminal_id,
+                                )
+                                return
+                            continue
                         logger.warning(
                             "F802 submit-verify: terminal %s first-dispatch composer "
                             "holds unsubmitted content with no owned chip/draft and no "

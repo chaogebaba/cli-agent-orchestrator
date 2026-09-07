@@ -218,8 +218,8 @@ class TestF802UnownedPasteRecovers:
         baseline = _baseline(rollout_dir)
 
         backend = MagicMock()
-        backend.get_history.side_effect = (
-            lambda *a, **k: _pane_raw_draft("Please implement the widget refactor and run tests")
+        backend.get_history.side_effect = lambda *a, **k: _pane_raw_draft(
+            "Please implement the widget refactor and run tests"
         )
 
         def _on_enter(session, window, key):
@@ -266,6 +266,62 @@ class TestF802DoubleSendGuard:
 
 
 # ---------------------------------------------------------------------------
+# (b2) #658 r2 B-2: the original submit lands DURING the first-dispatch branch —
+#      after the branch-entry rollout check saw negative but BEFORE the recovery
+#      Enter. The final re-check immediately before the Enter must catch it and
+#      send ZERO Enters. Without that re-check the branch double-sends.
+# ---------------------------------------------------------------------------
+
+
+class TestF802FinalReCheckBeforeEnter:
+    def test_rollout_appears_mid_branch_no_enter(self, rollout_dir: Path, patched_codex_home: Path):
+        """Race: rollout confirms between the F802 branch entry and the Enter.
+
+        The pane keeps showing the unowned stuck chip throughout, so the only
+        thing that stops the recovery Enter is the B-2 final rollout re-check
+        placed immediately before the keystroke. We drive it by controlling the
+        provider's own ``_rollout_has_user_event`` — the substrate check backing
+        ``_rollout_confirms()``:
+
+          * call 1 = the branch-entry (F643c) re-check  -> False  (still stuck)
+          * call 2 = the B-2 pre-Enter re-check         -> True   (submit landed)
+
+        Post-fix: the B-2 re-check catches the landing and returns success with
+        zero Enters. Pre-fix (no final re-check): the branch would send its Enter
+        and duplicate the just-landed submission.
+        """
+        msg = "Implement the widget refactor and run the full suite now"
+        baseline = _baseline(rollout_dir)
+
+        backend = _backend_seq(_pane_chip_mismatch(999))
+        provider = _provider()
+
+        calls = {"n": 0}
+
+        def _rollout_seq(*_a: Any, **_k: Any) -> bool:
+            calls["n"] += 1
+            # First re-check (branch entry) is still negative; the original
+            # submit lands in the window, so the second re-check (pre-Enter)
+            # confirms.
+            return calls["n"] >= 2
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                side_effect=_not_waiting,
+            ),
+            patch.object(provider, "_rollout_has_user_event", side_effect=_rollout_seq),
+        ):
+            provider.verify_submission_after_send(
+                _metadata(), backend, message=msg, baseline=baseline, first_dispatch=True
+            )
+        # The pre-Enter re-check caught the landed submit: zero recovery Enters.
+        assert _enter_calls(backend) == 0
+        # And the re-check was actually consulted a second time (the B-2 gate).
+        assert calls["n"] >= 2
+
+
+# ---------------------------------------------------------------------------
 # (c) dialog visible -> defer, no Enter (fail-closed).
 # ---------------------------------------------------------------------------
 
@@ -284,15 +340,19 @@ class TestF802DialogFailsClosed:
         backend = _backend_seq(_pane_chip_mismatch(999))
         provider = _provider()
 
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.WAITING_USER_ANSWER,
-        ), patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
-            return_value=["dialog"],
-        ), patch(
-            "cli_agent_orchestrator.services.auto_responder.auto_responder.on_screen",
-            return_value=None,
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+                return_value=TerminalStatus.WAITING_USER_ANSWER,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+                return_value=["dialog"],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.on_screen",
+                return_value=None,
+            ),
         ):
             with pytest.raises(CodexSubmitStuckError):
                 provider.verify_submission_after_send(
@@ -300,9 +360,7 @@ class TestF802DialogFailsClosed:
                 )
         assert _enter_calls(backend) == 0
 
-    def test_empty_glyph_composer_never_enters(
-        self, rollout_dir: Path, patched_codex_home: Path
-    ):
+    def test_empty_glyph_composer_never_enters(self, rollout_dir: Path, patched_codex_home: Path):
         """An empty composer (bare ``›`` glyph, no text) is NOT unsubmitted
         content — even on first_dispatch it must send zero Enters (submitting an
         empty prompt would be wrong). Kills a mutant that drops the empty-body
@@ -426,9 +484,7 @@ class TestF802ErrorCarriesComposerExcerpt:
 
 
 class TestF802NormalSendStaysStrict:
-    def test_normal_send_unowned_chip_no_enter(
-        self, rollout_dir: Path, patched_codex_home: Path
-    ):
+    def test_normal_send_unowned_chip_no_enter(self, rollout_dir: Path, patched_codex_home: Path):
         """first_dispatch defaults False on send_input/send_prepared_input. A
         composer holding an UNOWNED chip on a normal send must NOT be Entered —
         the strict-ownership guards (r5/r6/f643c/split-paste) are untouched."""
