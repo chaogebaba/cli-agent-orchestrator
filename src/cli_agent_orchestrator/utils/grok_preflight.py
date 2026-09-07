@@ -58,8 +58,18 @@ def _canonical_config_path() -> Path:
 def _resolve_model(agent_profile: str | None, model: str | None) -> str | None:
     """Resolve the model with the same precedence as _build_grok_command."""
     provider_defaults = get_provider_defaults("grok_cli")
-    profile_name = agent_profile or ""
-    profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+    # F786 D5 — model/effort keys are POSITION-keyed. The preflight only has the
+    # effective spawn name (no composed profile object here), so it derives the
+    # position from ``<position>-<provider>`` to key the same stanza the launch
+    # path (_build_grok_command, which reads AgentProfile.position) will use;
+    # the two MUST agree (F777 B1). A legacy name splits to None → key by the
+    # raw name, preserving today's behaviour.
+    from cli_agent_orchestrator.utils.agent_profiles import split_effective_name
+
+    name = agent_profile or ""
+    split = split_effective_name(name)
+    profile_key = split[0] if split is not None else name
+    profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
 
     # Explicit model override takes precedence
     if model and isinstance(model, str):
@@ -214,7 +224,11 @@ def run_preflight(
     except requests.ConnectionError as exc:
         # DNS failures also arrive as ConnectionError in requests
         exc_str = str(exc).lower()
-        kind = "dns" if "name or service not known" in exc_str or "nodename" in exc_str else "connect_refused"
+        kind = (
+            "dns"
+            if "name or service not known" in exc_str or "nodename" in exc_str
+            else "connect_refused"
+        )
         raise RelayPreflightFailed(
             _failure_detail(base_url, resolved_model, kind, str(exc)[:_BODY_TAIL_LIMIT], api_key)
         ) from exc
@@ -224,5 +238,7 @@ def run_preflight(
         ) from exc
     except requests.RequestException as exc:
         raise RelayPreflightFailed(
-            _failure_detail(base_url, resolved_model, "connect_refused", str(exc)[:_BODY_TAIL_LIMIT], api_key)
+            _failure_detail(
+                base_url, resolved_model, "connect_refused", str(exc)[:_BODY_TAIL_LIMIT], api_key
+            )
         ) from exc

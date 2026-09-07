@@ -671,7 +671,7 @@ def row_values(
     values = [
         window_key(term),
         term.id,
-        term.profile or "?",
+        term.position or term.profile or "?",
         provider_short(term.provider),
         term.resolved_model or CELL_UNKNOWN,
         term.reasoning_effort or CELL_UNKNOWN,

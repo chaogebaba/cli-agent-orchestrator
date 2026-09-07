@@ -68,8 +68,10 @@ E_ROW_CLAUSES_MISSING = "E-ROW-CLAUSES-MISSING"
 # (general, provider) — its stem is ``<short>_general`` (e.g. ``cline_general``),
 # NOT the raw ``<provider>_general`` f-string (``cline_cli_general``), which is
 # not an installed profile and would be handed to the server as an unknown name.
-# When no alias stub exists for the provider's general cell, refuse with this
-# code rather than emit an unresolvable spawn profile.
+# F786 D11 RETIRES this refusal: the non-gate general fallback now DERIVES
+# ``general-<provider>`` purely and the D8 writer materialises it, so no stub
+# scan and no E-ALIAS-MISSING path remain. The constant is kept (stable code,
+# still imported by tests asserting the old arm is gone) but is never raised.
 E_ALIAS_MISSING = "E-ALIAS-MISSING"
 
 # Valid ``kind`` discriminator values (D9).
@@ -323,7 +325,7 @@ def _present_clause_ids(position: str, provider: str, positions_dir: Path) -> Li
 class RoutingResolution:
     """Outcome of ``resolve_routing_binding`` for a bound (position, provider).
 
-    ``spawn_profile`` is the position (normal) or ``<provider>_general`` (D12
+    ``spawn_profile`` is the position (normal) or ``general-<provider>`` (D11
     fallback). ``fallback_profile`` is non-None only on the general substitution
     path (mirrored into the assign result). ``fallback_position`` / ``fallback_cell``
     feed the ``[COLD-FALLBACK position=<pos> cell=<outcome>]`` preamble fields.
@@ -372,7 +374,18 @@ def resolve_routing_binding(
 
     table_path = clause_table_path or (positions_dir / "_clauses.toml")
     clause_table = load_clause_table(table_path)
-    required = list(clause_table.required.get(position, []))
+    # F786 D12b — a MISSING [required] row fails closed here (mirrors the
+    # lint-time check clause_lint._position_required_ids), rather than the old
+    # silent ``.get(position, [])`` that treated an absent row as an empty (i.e.
+    # non-gate) clause set. A future rename cannot silently demote a gate.
+    if position not in clause_table.required:
+        raise RoutingError(
+            f"{E_ROW_CLAUSES_MISSING}: cell ({position}, {provider}) has no "
+            f"[required] row in the clause table (fail-closed: a position's first "
+            f"commit must add its row) — {table_path}",
+            code=E_ROW_CLAUSES_MISSING,
+        )
+    required = list(clause_table.required[position])
     present = set(_present_clause_ids(position, provider, positions_dir))
     missing = [cid for cid in required if cid not in present]
     if missing:
@@ -385,7 +398,18 @@ def resolve_routing_binding(
     # (3) CELL certification.
     cell_pass, cell_outcome = cell_certified(position, provider, positions_dir)
     if cell_pass:
-        return RoutingResolution(spawn_profile=position, provider=provider)
+        # F786 D2c — a certified cell resolves to the effective composed name
+        # ``<position>-<provider>`` (was the bare position), which the D8 writer
+        # materialises and the spawn loads. The bare-position emission is gone,
+        # which is why the flat ``secretary.md`` becomes dead (D3 deletes it).
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            _synthesise_position_profile_name,
+        )
+
+        return RoutingResolution(
+            spawn_profile=_synthesise_position_profile_name(position, provider),
+            provider=provider,
+        )
 
     # Non-PASS cell: gate → refusal, non-gate → general substitution (D12).
     if _is_gate_position(position, positions_dir, clause_table_path):
@@ -395,26 +419,17 @@ def resolve_routing_binding(
             f"general — refusing (no spawn)",
             code=E_ROW_CLAUSES_MISSING,
         )
-    # F613 #469: substitute the provider's general cell (D12). The spawn profile
-    # is the INSTALLED alias stub for (general, provider) — its stem is
-    # ``<short>_general`` (cline_general, kiro_general, …), resolved by scanning
-    # the agent store for a composition stub with ``extends/position == general``
-    # AND ``provider == provider``. The raw ``f"{provider}_{GENERAL_POSITION}"``
-    # (``cline_cli_general``) is NOT an installed profile; handing it to the
-    # server yields a load failure that silently re-derives to claude_code. Only
-    # bind the general fallback when such a stub exists; otherwise refuse with
-    # E-ALIAS-MISSING rather than emit an unresolvable name.
-    from cli_agent_orchestrator.utils.agent_profiles import _find_alias_for_cell
+    # F786 D11 — the non-gate general fallback DERIVES the effective composed
+    # name ``general-<provider>`` purely (no flat-store stub scan; the
+    # _find_alias_for_cell scan and its E-ALIAS-MISSING refusal are deleted).
+    # The provider's ``general`` cell PASS row (checked as step (1) above) is
+    # what still gates the provider, so a provider that reaches here always has
+    # a composable general cell. The caller at the server seam invokes the D8
+    # writer for this returned name before spawning, so the composed file exists
+    # when load runs. ``routing.py`` performs no filesystem writes.
+    from cli_agent_orchestrator.utils.agent_profiles import _synthesise_position_profile_name
 
-    fallback = _find_alias_for_cell(GENERAL_POSITION, provider)
-    if fallback is None:
-        raise RoutingError(
-            f"{E_ALIAS_MISSING}: no installed general alias stub for provider "
-            f"'{provider}' (looked for a composition stub with extends/position="
-            f"'{GENERAL_POSITION}' and provider='{provider}'); refusing rather "
-            f"than spawning the unresolved name '{provider}_{GENERAL_POSITION}'",
-            code=E_ALIAS_MISSING,
-        )
+    fallback = _synthesise_position_profile_name(GENERAL_POSITION, provider)
     return RoutingResolution(
         spawn_profile=fallback,
         provider=provider,

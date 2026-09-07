@@ -63,16 +63,10 @@ def test_d7_legacy_name_unchanged(monkeypatch):
 
 
 def test_d7_uninstalled_legacy_name_passthrough_clean_store(monkeypatch):
-    """r2 B1: a legacy name NOT in the store (clean store) still passes through to
-    _create_terminal unchanged, rather than hard-failing E-UNKNOWN-POSITION.
-
-    Option (b): with no provider= and the name not a bare position file, the
-    resolver does NOT engage — no store lookup, no shape inference. This is the
-    regression the r1 gate caught (kiro_dev/codex_profile hard-failed on a clean
-    box). Includes the <provider>_<position>-shaped legacy names codex_dev/grok_dev
-    (codex/grok_cli are providers, dev is a real position) — option (b) does NOT
-    infer synthesis shape in P3, so they pass through untouched.
-    """
+    """r2 B1 + F786 D3: a NON-retired legacy name NOT in the store still passes
+    through to _create_terminal unchanged (no store lookup, no shape inference).
+    A RETIRED name (codex_dev/grok_dev/kiro_dev) is now REFUSED with
+    E-LEGACY-PROFILE-RETIRED before the passthrough (D3)."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     captured = {}
 
@@ -80,28 +74,35 @@ def test_d7_uninstalled_legacy_name_passthrough_clean_store(monkeypatch):
         captured["agent_profile"] = agent_profile
         return ("worker9", "kiro_cli")
 
-    # 'dev' IS a real position here — proving codex_dev/grok_dev are NOT treated
-    # as <provider>_<position> misses (no shape inference in P3, option b).
-    for name in ("kiro_dev", "codex_profile", "codex_dev", "grok_dev"):
-        captured.clear()
+    # A non-retired legacy name still passes through untouched on a clean store.
+    with (
+        _patch_positions({"dev": {"providers": ["codex", "grok_cli", "kiro_cli"]}}),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
+        ) as create,
+    ):
+        result = _assign_impl("codex_profile", "task", working_directory="/repo")
+    assert result["success"] is True
+    create.assert_called_once()
+    assert captured["agent_profile"] == "codex_profile"
+
+    # RETIRED provider-prefixed names are refused (D3), no terminal created.
+    for retired in ("kiro_dev", "codex_dev", "grok_dev"):
         with (
             _patch_positions({"dev": {"providers": ["codex", "grok_cli", "kiro_cli"]}}),
-            patch(
-                "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
-            ) as create,
+            patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
         ):
-            result = _assign_impl(name, "task", working_directory="/repo")
-        assert result["success"] is True, f"{name} should pass through on a clean store"
-        create.assert_called_once()
-        assert captured["agent_profile"] == name
+            result = _assign_impl(retired, "task", working_directory="/repo")
+        assert result["success"] is False, retired
+        assert "E-LEGACY-PROFILE-RETIRED" in result["message"], retired
+        create.assert_not_called()
 
 
 def test_d7_position_plus_provider_spawns_composed(monkeypatch):
     """A position name + an allowed provider resolves and spawns (composed cell).
 
-    P4/D6: the effective spawn name is the deterministic ``<provider>_<position>``
-    synthesis when no legacy alias stub resolves the cell (the mocked store here
-    has no alias), so the composed cell spawns as ``codex_empirical_reviewer``.
+    F786 D2b: the effective spawn name is ``<position>-<provider>``, so the
+    composed cell spawns as ``empirical_reviewer-codex``.
     """
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     captured = {}
@@ -122,8 +123,8 @@ def test_d7_position_plus_provider_spawns_composed(monkeypatch):
 
     assert result["success"] is True
     create.assert_called_once()
-    # D6 synthesis: no alias stub in the mocked store → <provider>_<position>.
-    assert captured["agent_profile"] == "codex_empirical_reviewer"
+    # D2b synthesis: <position>-<provider>.
+    assert captured["agent_profile"] == "empirical_reviewer-codex"
 
 
 def test_d7_position_without_provider_hard_fails(monkeypatch):
@@ -158,18 +159,22 @@ def test_d7_disallowed_provider_hard_fails_no_terminal(monkeypatch):
 
 def test_d7_provider_on_non_position_hard_fails(monkeypatch):
     """Option (b): passing provider= requests POSITION MODE; if the name is not a
-    bare position file, that is E-UNKNOWN-POSITION (no <provider>_<position>
-    synthesis inference in P3 — that is P4). Covers both a synthesis-shaped name
-    (codex_empirical_reviewer) and an arbitrary name — with provider= both fail."""
+    bare position file, that is E-UNKNOWN-POSITION. F786 D3: a RETIRED name
+    (codex_empirical_reviewer) is refused EARLIER with E-LEGACY-PROFILE-RETIRED,
+    before position mode. Both fail with no terminal created."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    for name in ("codex_empirical_reviewer", "no_such_thing"):
+    expected = {
+        "codex_empirical_reviewer": "E-LEGACY-PROFILE-RETIRED",
+        "no_such_thing": "E-UNKNOWN-POSITION",
+    }
+    for name, code in expected.items():
         with (
             _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
             patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
         ):
             result = _assign_impl(name, "task", working_directory="/repo", provider="codex")
         assert result["success"] is False, name
-        assert "E-UNKNOWN-POSITION" in result["message"], name
+        assert code in result["message"], name
         create.assert_not_called()
 
 

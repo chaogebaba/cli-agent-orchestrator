@@ -16,11 +16,10 @@ def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
 
 @pytest.mark.parametrize("path", ["relative/path", "/does/not/exist", "/tmp"])
 def test_invalid_workdir_rejected_before_identifier_backend_or_db(path):
-    with patch(
-        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id"
-    ) as generate, patch(
-        "cli_agent_orchestrator.services.terminal_service.get_backend"
-    ) as backend:
+    with (
+        patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id") as generate,
+        patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+    ):
         with patch(
             "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
         ) as db_create:
@@ -34,23 +33,21 @@ def test_invalid_workdir_rejected_before_identifier_backend_or_db(path):
 def test_regular_file_rejected_before_identifier_backend_or_db(tmp_path):
     file_path = tmp_path / "file.txt"
     file_path.write_text("x")
-    with patch(
-        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id"
-    ) as generate, patch(
-        "cli_agent_orchestrator.services.terminal_service.get_backend"
-    ) as backend, patch(
-        "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
-    ) as db_create:
+    with (
+        patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id") as generate,
+        patch("cli_agent_orchestrator.services.terminal_service.get_backend") as backend,
+        patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal") as db_create,
+    ):
         with pytest.raises(ValueError, match="invalid_working_directory"):
-            asyncio.run(
-                create_terminal("codex", "developer", working_directory=str(file_path))
-            )
+            asyncio.run(create_terminal("codex", "developer", working_directory=str(file_path)))
     generate.assert_not_called()
     backend.assert_not_called()
     db_create.assert_not_called()
 
 
 def test_explicit_workdir_is_canonicalized_before_backend(tmp_path):
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
     target = tmp_path / "target"
     target.mkdir()
     alias = tmp_path / "alias"
@@ -58,17 +55,25 @@ def test_explicit_workdir_is_canonicalized_before_backend(tmp_path):
     backend = __import__("unittest.mock").mock.MagicMock()
     backend.session_exists.return_value = True
     backend.create_window.return_value = "window"
-    with patch(
-        "cli_agent_orchestrator.services.terminal_service.get_backend", return_value=backend
-    ), patch(
-        "cli_agent_orchestrator.services.terminal_service.load_agent_profile", side_effect=FileNotFoundError
-    ), patch(
-        "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
-    ), patch(
-        "cli_agent_orchestrator.services.terminal_service.provider_manager.create_provider"
-    ) as provider:
+    with (
+        patch("cli_agent_orchestrator.services.terminal_service.get_backend", return_value=backend),
+        patch(
+            # F786 (#643) D8: a NAMED profile must LOAD or create_terminal fails
+            # closed (E-PROFILE-MISSING) before the backend — so this test, which is
+            # about workdir canonicalization, now needs a loadable profile rather
+            # than the pre-F786 missing-profile → None fallback.
+            "cli_agent_orchestrator.services.terminal_service.load_agent_profile",
+            return_value=AgentProfile(name="developer", description="Developer"),
+        ),
+        patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal"),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.create_provider"
+        ) as provider,
+    ):
         provider.return_value.initialize = __import__("unittest.mock").mock.AsyncMock()
         asyncio.run(
-            create_terminal("codex", "developer", session_name="cao-test", working_directory=str(alias))
+            create_terminal(
+                "codex", "developer", session_name="cao-test", working_directory=str(alias)
+            )
         )
     assert backend.create_window.call_args.args[3] == str(target.resolve())

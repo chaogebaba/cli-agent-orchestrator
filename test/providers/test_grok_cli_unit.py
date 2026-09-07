@@ -31,11 +31,13 @@ def _provider() -> GrokCliProvider:
 def _profile(
     *,
     name: str = "grok_dev",
+    position: str | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
 ):
     return SimpleNamespace(
         name=name,
+        position=position,
         model=model,
         reasoningEffort=reasoning_effort,
         mcpServers=None,
@@ -534,17 +536,20 @@ def test_grok_command_absent_defaults_preserves_current_behavior(monkeypatch) ->
 
 
 def test_grok_command_per_profile_effort_wins(provider_defaults_file, monkeypatch) -> None:
+    # F786 (#643) D5: model/effort keys are POSITION-keyed; the profile carries
+    # its resolved position and the toml key is that position (legacy name keys
+    # like [grok_cli.profiles.grok_dev] now raise E-LEGACY-PROFILE-KEY at load).
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'reasoning_effort = "low"\n'
         "\n"
-        "[grok_cli.profiles.grok_dev]\n"
+        "[grok_cli.profiles.dev]\n"
         'reasoning_effort = "high"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
-        lambda _name: _profile(reasoning_effort="medium"),
+        lambda _name: _profile(position="dev", reasoning_effort="medium"),
     )
 
     command = _provider()._build_grok_command()
@@ -597,17 +602,18 @@ def test_grok_command_absent_effort_omits_flag(monkeypatch) -> None:
 def test_grok_command_empty_per_profile_effort_clears_lower_tiers(
     provider_defaults_file, monkeypatch
 ) -> None:
+    # F786 (#643) D5: position-keyed effort layer (empty clears).
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'reasoning_effort = "medium"\n'
         "\n"
-        "[grok_cli.profiles.grok_dev]\n"
+        "[grok_cli.profiles.dev]\n"
         'reasoning_effort = ""\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
-        lambda _name: _profile(reasoning_effort="high"),
+        lambda _name: _profile(position="dev", reasoning_effort="high"),
     )
 
     command = _provider()._build_grok_command()
@@ -618,17 +624,18 @@ def test_grok_command_empty_per_profile_effort_clears_lower_tiers(
 
 
 def test_grok_command_per_profile_model_wins(provider_defaults_file, monkeypatch) -> None:
+    # F786 (#643) D5: position-keyed model layer.
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'model = "grok-provider-model"\n'
         "\n"
-        "[grok_cli.profiles.grok_dev]\n"
+        "[grok_cli.profiles.dev]\n"
         'model = "grok-profile-table-model"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
-        lambda _name: _profile(model="grok-frontmatter-model"),
+        lambda _name: _profile(position="dev", model="grok-frontmatter-model"),
     )
 
     command = _provider()._build_grok_command()
@@ -641,17 +648,18 @@ def test_grok_command_per_profile_model_wins(provider_defaults_file, monkeypatch
 def test_grok_command_empty_per_profile_model_clears_lower_tiers(
     provider_defaults_file, monkeypatch
 ) -> None:
+    # F786 (#643) D5: position-keyed model layer (empty clears).
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'model = "grok-provider-model"\n'
         "\n"
-        "[grok_cli.profiles.grok_dev]\n"
+        "[grok_cli.profiles.dev]\n"
         'model = ""\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
-        lambda _name: _profile(model="grok-frontmatter-model"),
+        lambda _name: _profile(position="dev", model="grok-frontmatter-model"),
     )
 
     command = _provider()._build_grok_command()
@@ -659,7 +667,6 @@ def test_grok_command_empty_per_profile_model_clears_lower_tiers(
     assert " -m " not in command
     assert "grok-provider-model" not in command
     assert "grok-frontmatter-model" not in command
-
 
 
 # --- F235: Explicit model override tests ---
@@ -721,9 +728,7 @@ def test_grok_command_model_none_preserves_layered_resolution(
 
 def test_grok_command_model_none_no_toml_no_profile_emits_nothing(monkeypatch) -> None:
     """AC-3: model=None with no toml and no profile.model -> no -m flag."""
-    profile = type(
-        "Profile", (), {"model": None, "mcpServers": None, "system_prompt": None}
-    )()
+    profile = type("Profile", (), {"model": None, "mcpServers": None, "system_prompt": None})()
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.grok_cli.load_agent_profile", lambda _name: profile
     )
@@ -756,9 +761,7 @@ def test_manager_forwards_model_to_grok(monkeypatch) -> None:
         def __init__(self, *args, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.providers.manager.GrokCliProvider", FakeGrok
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.providers.manager.GrokCliProvider", FakeGrok)
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.manager.ProviderManager.commit_provider",
         lambda self, tid, prov: prov,
@@ -766,13 +769,16 @@ def test_manager_forwards_model_to_grok(monkeypatch) -> None:
 
     mgr = ProviderManager()
     mgr.create_provider(
-        "grok_cli", "t1", "sess", "win",
-        agent_profile="grok_dev", model="grok-3-mini",
+        "grok_cli",
+        "t1",
+        "sess",
+        "win",
+        agent_profile="grok_dev",
+        model="grok-3-mini",
         persona_plan=None,
     )
 
     assert captured["model"] == "grok-3-mini"
-
 
 
 # --- F238: Grok skill instruction in launch command ---
@@ -829,7 +835,6 @@ def test_ac7_grok_command_skill_instruction_uses_correct_tool_name(monkeypatch) 
     assert "mcp__cao-mcp-server__load_skill" not in command
 
 
-
 def test_ac9_all_grok_profiles_register_cao_mcp_server() -> None:
     """AC9: All six shipped grok_*.md profiles register the CAO MCP server under
     exactly the key 'cao-mcp-server', pinning the D3 literal."""
@@ -859,9 +864,7 @@ def test_ac9_all_grok_profiles_register_cao_mcp_server() -> None:
                 break
             current = current.parent
 
-    assert profiles_dir is not None, (
-        "Could not locate profiles/ directory with grok_base.md"
-    )
+    assert profiles_dir is not None, "Could not locate profiles/ directory with grok_base.md"
 
     expected_profiles = [
         "grok_base.md",
@@ -882,14 +885,11 @@ def test_ac9_all_grok_profiles_register_cao_mcp_server() -> None:
         assert len(parts) >= 3, f"No YAML frontmatter in {profile_name}"
         frontmatter_data = yaml.safe_load(parts[1])
 
-        assert "mcpServers" in frontmatter_data, (
-            f"{profile_name} has no mcpServers in frontmatter"
-        )
+        assert "mcpServers" in frontmatter_data, f"{profile_name} has no mcpServers in frontmatter"
         assert "cao-mcp-server" in frontmatter_data["mcpServers"], (
             f"{profile_name} does not register 'cao-mcp-server' — found keys: "
             f"{list(frontmatter_data['mcpServers'].keys())}"
         )
-
 
 
 # --- F361 (#216): Collapsed tool-result expander classification ---
@@ -912,10 +912,7 @@ def test_grok_read_composer_draft_collapsed_expander_no_footer() -> None:
     """F361: collapsed expander replaces footer in viewport → still classifies empty."""
     provider = _provider()
     fixture = (
-        Path(__file__).parents[1]
-        / "fixtures"
-        / "fx6"
-        / "fx6-grok-collapsed-expander-no-footer.txt"
+        Path(__file__).parents[1] / "fixtures" / "fx6" / "fx6-grok-collapsed-expander-no-footer.txt"
     )
     screen = [
         line

@@ -630,3 +630,49 @@ class TestDeleteTerminal:
 
         with pytest.raises(Exception, match="DB error"):
             delete_terminal("tid1")
+
+
+class TestF786D8FailClosed:
+    """F786 D8 — create_terminal fails closed with E-PROFILE-MISSING for a NAMED
+    profile that will not load (mutant: profile-less fallback restored)."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+        return_value="tid1",
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_named_profile_that_fails_to_load_fails_closed(
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            ProfileMissingError,
+            create_terminal,
+        )
+
+        mock_load_profile.side_effect = FileNotFoundError("no such profile")
+
+        with pytest.raises(ProfileMissingError, match="E-PROFILE-MISSING"):
+            await create_terminal(
+                provider="kiro_cli",
+                agent_profile="empirical_reviewer-codex",  # composed name, no file
+                new_session=True,
+                allowed_tools=["*"],
+            )
+        # Fail-closed BEFORE any tmux window / DB row is created.
+        mock_tmux.create_window.assert_not_called()
+        mock_db_create.assert_not_called()

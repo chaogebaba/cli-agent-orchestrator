@@ -198,6 +198,12 @@ class TerminalModel(Base):
     # F777 (#634): effective reasoning effort persisted post-initialize, resolved
     # through the same providers.toml precedence as resolved_model.
     reasoning_effort = Column(String, nullable=True)
+    # F786 (#643) A1: the resolved POSITION for this terminal, written at assign
+    # from the (position, provider) pair. Nullable — legacy/grandfathered rows
+    # and native spawns leave it NULL and the fleet payload falls back to
+    # splitting agent_profile (then the raw name). ``provider`` already exists
+    # above (line ~151); F786 adds exactly this one column (A1).
+    position = Column(String, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -1788,6 +1794,7 @@ def init_db() -> None:
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
     _migrate_f777_reasoning_effort()
+    _migrate_f786_position()
     _migrate_terminal_auth_token()
     _migrate_f476_wake_recovery()
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
@@ -1989,6 +1996,22 @@ def _migrate_f777_reasoning_effort() -> None:
             connection.execute(
                 _text("ALTER TABLE terminals ADD COLUMN reasoning_effort TEXT DEFAULT NULL")
             )
+
+
+def _migrate_f786_position() -> None:
+    """F786 (#643) A1: Add nullable position column to terminals table.
+
+    Additive, idempotent — mirrors _migrate_f777_reasoning_effort exactly.
+    Persists the resolved POSITION at assign so the fleet payload / TUI PROFILE
+    column can render the position without re-parsing the effective name.
+    ``provider`` already exists; A1 adds exactly this one column.
+    """
+    from sqlalchemy import text as _text
+
+    with engine.begin() as connection:
+        columns = connection.execute(_text("PRAGMA table_info(terminals)")).mappings().all()
+        if columns and not any(column["name"] == "position" for column in columns):
+            connection.execute(_text("ALTER TABLE terminals ADD COLUMN position TEXT DEFAULT NULL"))
 
 
 def _migrate_terminal_auth_token() -> None:
@@ -4869,6 +4892,10 @@ def _terminal_row_dict(t: Any) -> Dict[str, Any]:
         # omitted resolved_model, so the fleet MODEL column always read "-".
         "resolved_model": t.resolved_model,
         "reasoning_effort": t.reasoning_effort,
+        # F786 (#643) D6: the resolved POSITION, projected so build_fleet can
+        # render the PROFILE column as the position (falling back to the raw
+        # agent_profile for a legacy/grandfathered NULL-position row).
+        "position": t.position,
         "last_active": t.last_active,
         "metadata": (__import__("json").loads(t.metadata_json) if t.metadata_json else None),
     }
@@ -4989,6 +5016,24 @@ def update_terminal_reasoning_effort(terminal_id: str, reasoning_effort: str) ->
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.reasoning_effort = reasoning_effort
+            db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
+            return True
+        return False
+
+
+def update_terminal_position(terminal_id: str, position: str) -> bool:
+    """F786 (#643) D6: Persist the resolved POSITION for a terminal.
+
+    Written post-initialize by the same mechanism as resolved_model/effort. A
+    legacy passthrough profile has no position (``AgentProfile.position`` is
+    None), so nothing is persisted and the column stays NULL — the fleet payload
+    falls back to splitting the effective name (then the raw name).
+    """
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.position = position
             db.commit()
             invalidate_terminal_metadata_cache(terminal_id)
             return True

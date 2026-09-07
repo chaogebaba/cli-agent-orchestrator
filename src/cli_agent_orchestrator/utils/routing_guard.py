@@ -68,23 +68,103 @@ PROFILE_POSITION_TABLE: Dict[str, str] = {
 #                          - the maker lane fills no routed position.
 #   chao_supervisor        - the seat itself; it is not dispatched into a
 #                            position.
-#   developer-opus,
-#   developer-sonnet       - harness lanes, not CAO cells.
-# (These three are listed explicitly rather than relying on "has no provider":
-#  the repo's profiles/ copies carry no `provider:`, but the INSTALLED
-#  agent-store copies do — verified 2026-09-04, where all three read
-#  `provider: kiro_cli`. The guard reads the installed store, so the exclusion
-#  has to hold on the artifact it actually parses.)
+# (These are listed explicitly rather than relying on "has no provider": the
+#  repo's profiles/ copies carry no `provider:`, but the INSTALLED agent-store
+#  copies do. The guard reads the installed store, so the exclusion has to hold
+#  on the artifact it actually parses.) ``developer-opus``/``developer-sonnet``
+#  USED to sit here as harness lanes; F786 D3 RETIRES them (→ ``dev``), so they
+#  now live in ``RETIRED_PROFILES`` below and are removed from this set.
 UNMAPPED_BY_DESIGN = frozenset(
     {
         "grok_reviewer",
         "claude_blueprint_maker",
         "claude_blueprint_maker_tester",
         "chao_supervisor",
-        "developer-opus",
-        "developer-sonnet",
     }
 )
+
+# ---------------------------------------------------------------------------
+# F786 D3 — retired legacy profiles
+# ---------------------------------------------------------------------------
+# Every provider-prefixed role name is retired: the supervisor dispatches the
+# POSITION and routing.toml binds the provider (the sole binding authority since
+# 2026-09-01). A dispatch (or an F444 resume) that still names one of these is
+# REFUSED with ``E-LEGACY-PROFILE-RETIRED`` BEFORE the legacy passthrough, so no
+# retired name can reach a spawn. The mapping IS the list — no provider-prefix
+# pattern matching (r1 B1). Membership is exactly 22 names:
+#   * 14 role files,
+#   * the 5 ``<provider>_general`` alias stubs (all fold into the ``general``
+#     position by composition, D12),
+#   * the flat ``secretary`` profile (load-bearing only for the bare-name
+#     emission D2c removes), and
+#   * ``developer-opus``/``developer-sonnet`` (the superseded in-harness opus-dev
+#     era) — REMOVED from ``UNMAPPED_BY_DESIGN`` above and mapped to ``dev`` here.
+# The value is the position the name filled, used to name the fix in the refusal
+# and by the D9 resume path (``RETIRED_PROFILES[agent_profile]`` as the position).
+# ``grok_reviewer`` maps to ``None`` — "reviewer" does not say WHICH gate, and the
+# guard refuses to guess (kept on record); its refusal names the alternatives.
+RETIRED_PROFILES: Dict[str, Optional[str]] = {
+    # 14 role files
+    "grok_doc_keeper": "doc_keeper",
+    "grok_oracle": "oracle",
+    "grok_tester": "tester",
+    "grok_dev": "dev",
+    "grok_reviewer": None,
+    "kiro_dev": "dev",
+    "kiro_oracle": "oracle",
+    "kiro_reviewer": "empirical_reviewer",
+    "kiro_design_reviewer": "design_reviewer",
+    "codex_dev": "dev",
+    "codex_design_reviewer": "design_reviewer",
+    "codex_empirical_reviewer": "empirical_reviewer",
+    "claude_design_reviewer": "design_reviewer",
+    "cline_dev": "dev",
+    # 5 <provider>_general alias stubs
+    "claude_general": "general",
+    "cline_general": "general",
+    "codex_general": "general",
+    "grok_general": "general",
+    "kiro_general": "general",
+    # flat secretary
+    "secretary": "secretary",
+    # superseded in-harness opus-dev era
+    "developer-opus": "dev",
+    "developer-sonnet": "dev",
+}
+
+# The one entry whose value is None (``grok_reviewer``): its refusal names the
+# positions to reach for instead, keeping the guard's deliberate refusal to
+# guess between the DESIGN and EMPIRICAL gates on record.
+_RETIRED_NO_POSITION_ADVICE: Dict[str, str] = {
+    "grok_reviewer": "no position: use `tester` for probes, `grunt` for chores",
+}
+
+
+def retired_profile_refusal(profile: str) -> Optional[str]:
+    """Refusal text when ``profile`` is a RETIRED legacy name, else ``None`` (D3).
+
+    Names the position the profile filled (or, for ``grok_reviewer``, why there
+    is none and what to use instead) so the operator gets the fix, not just a
+    rejection. Returns ``None`` for every non-retired name, so the caller falls
+    through to its normal resolution.
+    """
+    if profile not in RETIRED_PROFILES:
+        return None
+    position = RETIRED_PROFILES[profile]
+    if position is None:
+        target = _RETIRED_NO_POSITION_ADVICE.get(profile, "no position")
+        return (
+            f"E-LEGACY-PROFILE-RETIRED: profile '{profile}' is retired ({target}). "
+            f"Dispatch a POSITION name and let routing.toml bind the provider — "
+            f"provider-prefixed role names no longer exist."
+        )
+    return (
+        f"E-LEGACY-PROFILE-RETIRED: profile '{profile}' is retired; it filled "
+        f"position '{position}'. Dispatch assign('{position}') (no provider=) and "
+        f"let routing.toml bind the provider — provider-prefixed role names no "
+        f"longer exist."
+    )
+
 
 _FRONTMATTER_LINE_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*):[ \t]*(?P<value>.*)$")
 

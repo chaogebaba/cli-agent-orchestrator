@@ -458,7 +458,8 @@ class KiroCliProvider(BaseProvider):
             )
         provider_defaults = get_provider_defaults("kiro_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        profile_key = getattr(profile, "position", None) or profile_name
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
         return resolve_provider_string_option(
             profile_defaults,
             provider_defaults,
@@ -485,7 +486,8 @@ class KiroCliProvider(BaseProvider):
             )
         provider_defaults = get_provider_defaults("kiro_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        profile_key = getattr(profile, "position", None) or profile_name
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
         return resolve_reasoning_effort("kiro_cli", profile_defaults, provider_defaults, profile)
 
     def _assert_kiro_identity_guard(self) -> None:
@@ -537,13 +539,14 @@ class KiroCliProvider(BaseProvider):
         """F778 #635 — write the kiro agent JSON on demand for a composed spawn name.
 
         A position-composed assign (`agent_profile="dev", provider="kiro_cli"`)
-        spawns under the synthesised name `kiro_cli_dev`, which has no installed
-        source file — so its agent JSON was never written and prelaunch would
-        die. When the current spawn name resolves to a `<provider>_<position>`
-        composition for kiro_cli, reconstruct the composed profile and write its
-        JSON with the SAME writer `cao install` uses. A best-effort helper: any
-        failure (not a composed name, unresolvable cell) leaves the base absent
-        so the caller raises the genuine-legacy RuntimeError.
+        spawns under the synthesised name `dev-kiro_cli` (F786 D2b), which has no
+        installed source file — its agent JSON was never written and prelaunch
+        would die. When the current spawn name resolves to a
+        `<position>-<provider>` composition for kiro_cli, reconstruct the composed
+        profile (the same bytes D8's writer materialised into `composed/`) and
+        write its JSON with the SAME writer `cao install` uses. A best-effort
+        helper: any failure (not a composed name, unresolvable cell) leaves the
+        base absent so the caller raises the genuine-legacy RuntimeError.
         """
         from cli_agent_orchestrator.services.install_service import materialize_kiro_agent_json
         from cli_agent_orchestrator.utils.agent_profiles import (

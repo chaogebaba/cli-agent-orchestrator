@@ -1,7 +1,7 @@
 """F778 (#635): on-demand kiro agent-JSON materialisation for composed spawns.
 
 A position-composed assign (``agent_profile="dev", provider="kiro_cli"``)
-synthesises the spawn name ``kiro_cli_dev`` in memory (D6/D7); ``cao install``
+synthesises the spawn name ``dev-kiro_cli`` in memory (D6/D7); ``cao install``
 never wrote its agent JSON because the composed profile has no installed source
 file. These tests cover the reusable writer factored out of ``install_agent``
 and the byte-for-byte parity between the on-demand path and the install path.
@@ -50,7 +50,7 @@ def kiro_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Pat
     }
 
 
-def _kas_profile(name: str = "kiro_cli_dev") -> AgentProfile:
+def _kas_profile(name: str = "dev-kiro_cli") -> AgentProfile:
     return AgentProfile(
         name=name,
         description="Composed dev cell",
@@ -73,19 +73,19 @@ class TestWriteKiroAgentFile:
 
     def test_writes_json_named_by_safe_filename(self, kiro_paths):
         profile = _kas_profile()
-        context_file = kiro_paths["context_dir"] / "kiro_cli_dev.md"
+        context_file = kiro_paths["context_dir"] / "dev-kiro_cli.md"
         context_file.write_text("persona", encoding="utf-8")
 
         path = write_kiro_agent_file(
             profile,
             context_file=context_file,
             allowed_tools=["fs_read"],
-            safe_filename="kiro_cli_dev",
+            safe_filename="dev-kiro_cli",
         )
 
-        assert path == kiro_paths["kiro_dir"] / "kiro_cli_dev.json"
+        assert path == kiro_paths["kiro_dir"] / "dev-kiro_cli.json"
         data = json.loads(path.read_text(encoding="utf-8"))
-        assert data["name"] == "kiro_cli_dev"
+        assert data["name"] == "dev-kiro_cli"
         # KAS profile defaults the permissions block.
         assert data["permissions"]["rules"][0]["capability"] == "shell"
         # F118: identity env injected into every MCP entry.
@@ -126,13 +126,13 @@ class TestMaterializeIdempotent:
     def test_rerun_produces_identical_bytes(self, kiro_paths):
         profile = _kas_profile()
         p1 = materialize_kiro_agent_json(
-            profile, composed_source="---\nname: kiro_cli_dev\n---\nx\n"
+            profile, composed_source="---\nname: dev-kiro_cli\n---\nx\n"
         )
         first = p1.read_bytes()
         mtime1 = p1.stat().st_mtime_ns
 
         p2 = materialize_kiro_agent_json(
-            profile, composed_source="---\nname: kiro_cli_dev\n---\nx\n"
+            profile, composed_source="---\nname: dev-kiro_cli\n---\nx\n"
         )
         assert p2 == p1
         assert p2.read_bytes() == first

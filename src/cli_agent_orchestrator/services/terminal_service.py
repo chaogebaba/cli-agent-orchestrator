@@ -70,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     update_provider_session_snapshot,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_position,
     update_terminal_reasoning_effort,
     update_terminal_resolved_model,
     update_terminal_shell_command,
@@ -216,9 +217,19 @@ class TerminalCapExceeded(RuntimeError):
         }
 
 
+class ProfileMissingError(ValueError):
+    """F786 (#643) D8: a NAMED agent profile could not be loaded, so the spawn is refused.
+
+    Fail-closed: a synthesized ``<position>-<provider>`` name whose ``composed/``
+    file is missing (deleted after assign, or never written), or a legacy name
+    with no store file, must never silently degrade to a None profile + native
+    spawn. Raised before any window/DB/FIFO allocation, so no tmux window is
+    created. Carries the stable ``E-PROFILE-MISSING`` code in its message.
+    """
+
+
 class IdentityAmbiguousError(RuntimeError):
     """Raised when purge_stale_terminal_records finds multiple windows claiming the same terminal ID.
-
     D11 (F202): this is a loud structured error — the sane path (D6 explicit kill)
     makes this state unreachable, so reaching it means an invariant broke.
     """
@@ -2072,7 +2083,19 @@ async def create_terminal(
         # provider process (F107: KAS is enabled once the probe accepts it).
         try:
             profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            # F786 (#643) D8 — fail CLOSED for any NAMED profile that will not
+            # load: a synthesized position name whose composed/ file is missing
+            # (or a legacy name with no store file) must NOT silently become a
+            # None profile and a native spawn. Raise before any window/DB/FIFO
+            # allocation. A bare native spawn (no agent_profile) is unaffected —
+            # it never names a profile and never reaches the position resolver.
+            if agent_profile:
+                raise ProfileMissingError(
+                    f"E-PROFILE-MISSING: agent profile '{agent_profile}' could not "
+                    f"be loaded (no flat, composed, or built-in store file); "
+                    f"refusing to spawn profile-less."
+                ) from exc
             profile = None
         # Production loaders return AgentProfile. Treat a test double or an
         # otherwise malformed object as no selected profile rather than
@@ -2106,7 +2129,8 @@ async def create_terminal(
             else:
                 provider_defaults = get_provider_defaults("kiro_cli")
                 profile_name = getattr(profile, "name", None) or agent_profile
-                profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+                profile_key = getattr(profile, "position", None) or profile_name
+                profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
                 resolved_model = resolve_provider_string_option(
                     profile_defaults,
                     provider_defaults,
@@ -2124,8 +2148,9 @@ async def create_terminal(
             # the model pre-resolution directly above.
             _kiro_provider_defaults = get_provider_defaults("kiro_cli")
             _kiro_profile_name = getattr(profile, "name", None) or agent_profile
+            _kiro_profile_key = getattr(profile, "position", None) or _kiro_profile_name
             _kiro_profile_defaults = get_provider_profile_defaults(
-                _kiro_provider_defaults, _kiro_profile_name
+                _kiro_provider_defaults, _kiro_profile_key
             )
             resolved_effort = resolve_reasoning_effort(
                 "kiro_cli", _kiro_profile_defaults, _kiro_provider_defaults, profile
@@ -2983,6 +3008,7 @@ async def create_terminal(
                 refresh_base_name=refresh_base_name,
                 park_warm=park_warm,
                 f138_incarnation_id=_f138_incarnation_id,
+                profile_position=getattr(profile, "position", None),
             )
         else:
             # D21: Exposure boundary = pane+token already bound before initialize
@@ -5504,6 +5530,7 @@ def _schedule_deferred_init(
     refresh_base_name: str | None = None,
     park_warm: bool = False,
     f138_incarnation_id: str | None = None,
+    profile_position: str | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -5667,6 +5694,24 @@ def _schedule_deferred_init(
                     update_terminal_resolved_model,
                     terminal_id,
                     _f127_resolved,
+                )
+            # F786 (#643) D6: persist the resolved POSITION post-initialize, by
+            # the same mechanism. Sourced from AgentProfile.position (the
+            # resolver-set field — NOT a re-parse of the effective name),
+            # threaded in from create_terminal as ``profile_position`` (the
+            # ``profile`` object is not in this module-level scope); a legacy
+            # passthrough profile has None here, so the column stays NULL and the
+            # fleet payload falls back to splitting the name.
+            _f786_position = profile_position
+            if _f786_position:
+                await _tracked_blocking(
+                    terminal_id,
+                    generation,
+                    "abandonable",
+                    "capture_persist",
+                    update_terminal_position,
+                    terminal_id,
+                    _f786_position,
                 )
             # F777 (#634): persist the effective reasoning effort post-initialize,
             # next to resolved_model and by the same mechanism. None (a provider

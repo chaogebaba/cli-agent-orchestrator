@@ -28,6 +28,26 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc)
 
 
+def _fleet_position(column_value: Any, agent_profile: Any) -> Any:
+    """F786 D6 — the POSITION to render for a fleet row.
+
+    The resolved ``position`` column wins (written at assign). For a legacy or
+    grandfathered row where it is NULL, fall back to
+    :func:`split_effective_name` over ``agent_profile``; when THAT is None (a
+    genuine legacy flat name like ``kiro_dev``) render the raw ``agent_profile``.
+    This is the one-way legacy reader — the effective name is a pure rendering,
+    never re-parsed for behaviour.
+    """
+    if column_value:
+        return column_value
+    if not agent_profile:
+        return agent_profile
+    from cli_agent_orchestrator.utils.agent_profiles import split_effective_name
+
+    split = split_effective_name(agent_profile)
+    return split[0] if split is not None else agent_profile
+
+
 def _current_grok_canonical_hash() -> str | None:
     """F295 AC2: compute sha256 of the current canonical grok config.
 
@@ -270,6 +290,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "id": row["id"],
                 "profile": row.get("agent_profile"),
                 "provider": row.get("provider"),
+                # F786 (#643) D6: the resolved POSITION for display. Read the
+                # column first; for a legacy/grandfathered row where it is NULL,
+                # fall back to splitting the effective name, and when that yields
+                # None (a genuine legacy flat name) render the raw agent_profile.
+                "position": _fleet_position(row.get("position"), row.get("agent_profile")),
                 "window_index": window.get("window_index"),
                 "window_name": (
                     (window.get("window_name") if window else row["tmux_window"])
