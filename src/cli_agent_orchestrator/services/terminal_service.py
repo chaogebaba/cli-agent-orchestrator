@@ -2935,6 +2935,12 @@ async def create_terminal(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
+            # F795 (#652): unknown until the background initialize() resolves and
+            # persists them (_schedule_deferred_init._run). Bound here so the
+            # shared Terminal(...) construction below can reference them on both
+            # branches; the deferred row is filled in post-init, as before.
+            sync_resolved_model: Optional[str] = None
+            sync_reasoning_effort: Optional[str] = None
             if fork_context and initial_message and refresh_base_name is None:
                 initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
             # F129: Prepend [FROZEN-AUTHORITY-PINS] block so worker can
@@ -3033,6 +3039,35 @@ async def create_terminal(
             if shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
 
+            # F795 (#652): persist the effective model + reasoning effort on the
+            # SYNCHRONOUS creation path too. Only the deferred-init path
+            # (_schedule_deferred_init._run, "F127: persist resolved_model
+            # post-initialize") wrote these columns, so every terminal created
+            # synchronously — notably the `cao launch` supervisor seat, which has
+            # no initial_message and therefore never defers — left both NULL and
+            # the fleet view rendered `model -` / `effort -` for it. Nothing about
+            # the resolution differs between the two paths: the provider already
+            # resolved both through the one provider chain during build_command
+            # (providers.toml [<provider>] / [<provider>.profiles.<name>] >
+            # profile field > CLI default), so this persists what it resolved, by
+            # the same getattr + update_terminal_* mechanism the deferred path
+            # uses. A provider with no such knob still reports None and the
+            # column stays "-" rather than being invented here.
+            # Both are typed Optional[str] on every provider; the isinstance
+            # narrowing mirrors the shell_command handling directly above so a
+            # provider that hands back something else can never reach the
+            # Terminal model or the row.
+            sync_resolved_model = getattr(provider_instance, "resolved_model", None)
+            if not isinstance(sync_resolved_model, str) or not sync_resolved_model:
+                sync_resolved_model = None
+            if sync_resolved_model is not None:
+                update_terminal_resolved_model(terminal_id, sync_resolved_model)
+            sync_reasoning_effort = getattr(provider_instance, "resolved_reasoning_effort", None)
+            if not isinstance(sync_reasoning_effort, str) or not sync_reasoning_effort:
+                sync_reasoning_effort = None
+            if sync_reasoning_effort is not None:
+                update_terminal_reasoning_effort(terminal_id, sync_reasoning_effort)
+
         # Build and return the Terminal object. In the deferred-init path the
         # provider is still initializing on a background task, so the terminal
         # is NOT ready for input yet — report UNKNOWN (not IDLE) so a client
@@ -3057,7 +3092,8 @@ async def create_terminal(
             condition=None,
             last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
-            reasoning_effort=None,
+            resolved_model=sync_resolved_model,
+            reasoning_effort=sync_reasoning_effort,
         )
 
         logger.info(

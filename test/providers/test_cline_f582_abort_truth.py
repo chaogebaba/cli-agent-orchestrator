@@ -12,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers import cline_cli
 from cli_agent_orchestrator.providers.cline_cli import (
     _ABORT_REPORT_HOLD_S,
+    _BASELINE_CONFIRM_S,
     ABORT_LINE,
     DISPATCHER_IDLE_CMD,
     ClineCliProvider,
@@ -148,10 +149,25 @@ def test_new_run_clean_buffer_never_replays_previous_abort(
 
 def test_dispatcher_crash_remains_error_even_with_visible_abort(
     provider: ClineCliProvider,
+    monkeypatch,
 ) -> None:
+    """A crashed dispatcher is ERROR, and the visible abort line is still not
+    scanned (the abort rule is gated on DISPATCHER_IDLE_CMD).
+
+    F794 (#651) added a confirmation window: ONE shell-baseline sample is a
+    healthy inter-iteration turn of the dispatcher loop, so the first reading is
+    PROCESSING. A crash never leaves the baseline, so the verdict is unchanged
+    once the reading persists — which is what this test now asserts."""
     provider._task_dispatched_flag = True
     provider._pane_cmd = lambda: "zsh"  # type: ignore[method-assign]
     sub_floor_abort = "\n".join(["crashed dispatcher", ABORT_LINE])
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.cline_cli.time.monotonic", lambda: clock["t"]
+    )
+    assert provider.get_status(sub_floor_abort) is TerminalStatus.PROCESSING
+    clock["t"] = _BASELINE_CONFIRM_S + 0.1
 
     assert provider.get_status(sub_floor_abort) is TerminalStatus.ERROR
     assert provider._abort_reported_occ == 0

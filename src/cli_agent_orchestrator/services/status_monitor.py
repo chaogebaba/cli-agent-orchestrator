@@ -192,6 +192,20 @@ _STICKY_READY_STATUSES = frozenset(
 # these it is stale by construction and is neither written nor served.
 _QUIESCENT_STATUSES = frozenset({TerminalStatus.IDLE, TerminalStatus.COMPLETED})
 
+# F794 (#651): the published statuses the low-frequency pane-tail backstop
+# re-derives (see resync_from_pane_tail). Screen/raw detection is OUTPUT-driven
+# — it runs on pipe-pane chunks plus one quiescence tick after the last chunk —
+# so a terminal that stops emitting keeps whatever verdict its final tick
+# produced, forever. PROCESSING was covered from the start (#558's stuck-busy
+# self-heal); ERROR needs the same backstop for the mirror-image failure: a
+# single wrong ERROR on a seat that then goes quiet is permanent, and delivery
+# pastes only to IDLE/COMPLETED, so the seat's inbox starves with it (observed
+# live on cline terminals f5824e3d and 2b31cd53). The backstop adds NO pane
+# capture: pane_liveness.observe already sampled every live terminal this tick
+# and peek() hands back the retained tail. A seat that is genuinely broken
+# re-derives ERROR and publishes nothing (no_change).
+_RESYNC_BACKSTOP_STATUSES = frozenset({TerminalStatus.PROCESSING, TerminalStatus.ERROR})
+
 # F579 D17: consecutive non-PROCESSING status publishes after which the
 # children-ledger publish-time reconcile drops all entries (D3's K). A lost
 # SubagentStop cannot pin a seat at delegating beyond this many ticks.
@@ -2365,7 +2379,7 @@ class StatusMonitor:
             interval_s = self._resync_interval_s()
             dropped = drop_seq != seen_drop_seq
             periodic = (
-                published == TerminalStatus.PROCESSING
+                published in _RESYNC_BACKSTOP_STATUSES
                 and now - published_at >= interval_s
                 and (last_resync is None or now - last_resync >= interval_s)
             )
