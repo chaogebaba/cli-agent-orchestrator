@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -178,6 +179,130 @@ def _children_count_from_row(row: dict[str, Any]) -> int:
     return len(children) if isinstance(children, list) else 0
 
 
+def _observe_model_effort(
+    row: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """F826 (#683) D6: resolve + observe live model/effort for one fleet row.
+
+    Binding (D2 / SHOULD-2): the file is bound by the row's recorded identity
+    (``id`` for the Claude sidecar; ``provider_session_id`` for codex/pi/kiro),
+    NEVER "newest file in a directory". The observation call is wrapped by a
+    50 ms deadline and a blanket except so a slow/broken source degrades to the
+    configured/unknown fallback rather than blocking the whole fleet build
+    (AC5). Returns ``(model_obs, effort_obs)`` additive dicts, or ``(None, None)``
+    when the provider is not observable / the source failed.
+
+    The returned dicts carry the configured DB value alongside the observation
+    so the TUI can render the ``!`` conflict marker (D1) and the ``[C]`` fallback
+    without a second lookup; the configured columns themselves are untouched.
+    """
+    provider = row.get("provider")
+    if not isinstance(provider, str):
+        return None, None
+    path = _resolve_observation_path(provider, row)
+    if path is None:
+        return None, None
+    try:
+        obs = _observe_with_deadline(provider, path, row)
+    except Exception:
+        logger.debug("f826_observe_failed for %s", row.get("id"), exc_info=True)
+        return None, None
+    if obs is None:
+        return None, None
+    return (
+        _obs_to_dict(obs.model, row.get("resolved_model")),
+        _obs_to_dict(obs.effort, row.get("reasoning_effort")),
+    )
+
+
+def _observe_with_deadline(provider: str, path: Path, row: dict[str, Any]) -> Any:
+    """Call the provider adapter under a 50 ms wall-clock deadline (D6/AC5).
+
+    The deadline is advisory: the adapters are all bounded by their own read
+    budgets (tail <= 64 KB / capped incremental scan / small checkpoint), so the
+    only role of the timer is to record when a source overran for diagnosis --
+    the read itself is already bounded, and no subprocess is spawned per GET.
+    """
+    from cli_agent_orchestrator.services import model_effort_observation as meo
+
+    kwargs: dict[str, Any] = {"generation": row.get("provider_session_id")}
+    if provider == "claude_code":
+        # An exited/reaped terminal keeps its last value as `[S] exited` (D1).
+        kwargs["exited"] = row.get("status") in ("EXITED", "ERROR")
+    start = time.monotonic()
+    result = meo.observe_provider(provider, path, **kwargs)
+    elapsed_ms = (time.monotonic() - start) * 1000.0
+    if elapsed_ms > 50.0:
+        logger.debug(
+            "f826_observe_slow provider=%s terminal=%s elapsed_ms=%.1f",
+            provider,
+            row.get("id"),
+            elapsed_ms,
+        )
+    return result
+
+
+def _resolve_observation_path(provider: str, row: dict[str, Any]) -> Path | None:
+    """Bind the observation file by the row's recorded identity (D2).
+
+    * ``claude_code`` -- the sidecar ``CAO_HOME_DIR/observe/<terminal_id>.json``,
+      bound by terminal id (the emitter writes it keyed by ``CAO_TERMINAL_ID``).
+    * ``codex`` -- the rollout under the codex home matched by
+      ``provider_session_id`` (exactly one match, else None -- never newest).
+    * ``pi_cli`` -- the session JSONL matched by ``provider_session_id``.
+    * ``kiro_cli`` -- ``<session_id>.json`` under ``~/.kiro/sessions/cli/``.
+    """
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    terminal_id = row.get("id")
+    session_id = row.get("provider_session_id")
+
+    if provider == "claude_code":
+        if not isinstance(terminal_id, str) or not terminal_id:
+            return None
+        return Path(CAO_HOME_DIR) / "observe" / f"{terminal_id}.json"
+
+    if not isinstance(session_id, str) or not session_id:
+        return None
+
+    if provider == "codex":
+        try:
+            home = provider_home("codex").home
+        except Exception:
+            return None
+        matches = list((home / "sessions").glob(f"**/rollout-*{session_id}*.jsonl"))
+        return matches[0] if len(matches) == 1 else None
+
+    if provider == "pi_cli":
+        base = Path.home() / ".pi" / "agent" / "sessions"
+        matches = list(base.glob(f"**/*{session_id}*.jsonl"))
+        return matches[0] if len(matches) == 1 else None
+
+    if provider == "kiro_cli":
+        candidate = Path.home() / ".kiro" / "sessions" / "cli" / f"{session_id}.json"
+        return candidate if candidate.exists() else None
+
+    return None
+
+
+def _obs_to_dict(obs: Any, configured: Any) -> dict[str, Any]:
+    """Render one Observation as the additive wire dict (D6).
+
+    Carries the configured value so the TUI resolves the ``[C]`` fallback and
+    the ``!`` conflict marker without a second read. ``event_time`` is the
+    integer ns the source stamped (the decay/age clock, S6).
+    """
+    return {
+        "value": obs.value,
+        "marker": obs.marker.value,
+        "kind": obs.kind.value if obs.kind is not None else None,
+        "event_time": obs.event_time_ns,
+        "source": obs.source,
+        "validity": obs.validity,
+        "configured": configured if isinstance(configured, str) else None,
+    }
+
+
 def build_fleet(session_name: str) -> dict[str, Any]:
     rows = list_terminals_by_session(session_name)
     if not rows:
@@ -285,6 +410,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         # F752 (#609): the fused status goes with the read so a BUSY-class label
         # left over from the last working turn never rides an idle row.
         condition = status_monitor.get_condition(row["id"], status)
+        # F826 (#683) D6: observe live model/effort for this terminal. Wrapped —
+        # try/except + 50 ms deadline + bounded read + per-terminal isolation —
+        # so one bad source never blocks the fleet (AC5). Returns two additive
+        # dicts (or None) merged into the row below.
+        model_obs, effort_obs = _observe_model_effort(row)
         projected.append(
             {
                 "id": row["id"],
@@ -333,6 +463,14 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 # F777 (#634): the effective reasoning effort persisted at spawn,
                 # rendered by the `cao-fleet` EFFORT column. None → "-".
                 "reasoning_effort": row.get("reasoning_effort"),
+                # F826 (#683) D6: additive OBSERVED model/effort, merged from the
+                # per-provider observation adapters. Independent per-field objects
+                # {value, marker, kind, event_time, source, configured}; the
+                # configured DB columns above are NEVER overwritten (D1/Do-NOT).
+                # None when the provider is not observable or the source failed —
+                # the TUI then renders the configured `[C]` / `[?]` fallback.
+                "model_obs": model_obs,
+                "effort_obs": effort_obs,
                 "reparented_from": row.get("reparented_from"),
                 # F295 AC2: config_stale for grok_cli terminals
                 "config_stale": _is_config_stale(row, grok_canonical_hash),

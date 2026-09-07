@@ -551,6 +551,27 @@ def get_server_settings() -> Dict[str, Any]:
     return dict(result)
 
 
+def claude_statusline_enabled() -> bool:
+    """F826 (#683) D3 / gate SHOULD-1: whether the Claude statusLine emitter is on.
+
+    Read at OVERLAY-GENERATION time by ``ClaudeCodeProvider._write_terminal_settings``
+    (never at emitter runtime — S1: a runtime read would cost a settings parse
+    per pane per 1500 ms and drag the ``services`` import chain into a process
+    budgeted at 50 ms + "stdlib + json"). The mode is baked into the overlay;
+    flipping the toggle takes effect on RELAUNCH (like D7's seat rule).
+
+    Default ON. Turned off with ``{"observe": {"claude_statusline": false}}`` in
+    ``CAO_HOME_DIR/settings.json`` — the CAO settings file (``SETTINGS_FILE``),
+    NOT Claude's own ``~/.claude/settings.json`` (S1 names the owner). Any
+    non-false value (including a malformed ``observe`` block) keeps it on.
+    """
+    settings = _load()
+    observe = settings.get("observe")
+    if isinstance(observe, dict) and observe.get("claude_statusline") is False:
+        return False
+    return True
+
+
 def get_max_terminals() -> Optional[int]:
     """Max terminals this node will track, or None for unlimited.
 
