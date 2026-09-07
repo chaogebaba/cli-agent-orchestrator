@@ -253,13 +253,24 @@ def drain_class_declines_inbox(kind: str, subtype: Optional[str]) -> bool:
             'kind=BUSY' in body
             or ('kind=PROC_EXITED' in body and 'subtype=command_exit_code' in body))
 
+    F807 (#664) extends the class by ONE subtype: a CONTEXT_EXHAUSTED
+    ``low_context_tip`` is the soft "Running low on context? Type /compact" tip
+    (Confidence.MEDIUM), decision-free liveness noise of the same character as a
+    BUSY ping — declined here so it never reaches the seat. HARD exhaustion
+    (``footer_percent_status``, a footer at/below the threshold) is a real stop
+    and KEEPS its inbox leg (kind CONTEXT_EXHAUSTED stays ``inbox=True`` in the
+    map); only the tip subtype declines.
+
     ANOMALY-class conditions (DIALOG_BLOCKED, CAPPED, AUTH_EXPIRED, an unknown
-    kind, a non-``command_exit_code`` PROC_EXITED, …) return False and keep the
-    inbox leg — F790 does not touch their behaviour.
+    kind, a non-``command_exit_code`` PROC_EXITED, a hard CONTEXT_EXHAUSTED
+    footer, …) return False and keep the inbox leg — F790/F807 do not touch
+    their behaviour.
     """
     if kind == "BUSY":
         return True
     if kind == "PROC_EXITED" and subtype == "command_exit_code":
+        return True
+    if kind == "CONTEXT_EXHAUSTED" and subtype == "low_context_tip":
         return True
     return False
 

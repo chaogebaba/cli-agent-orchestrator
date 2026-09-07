@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 # ─── Reused in-tree provider anchors (never re-implemented, blueprint §2.1) ────
 # Imported lazily-safe at module import: these are module-level constants in the
@@ -717,14 +717,19 @@ CliSink = Callable[[str, "Condition", str], None]  # (terminal_id, condition, fl
 # DB. When NO store is present, ``ConditionDelivery`` falls back to the in-memory
 # ``_last`` dict — byte-identical to F611's behaviour, so nothing that does not
 # opt into the spine changes.
-class ConditionLogStore:
+class ConditionLogStore(Protocol):
     """Protocol for the durable decision log (F642 §2, D7). A production impl
     wraps ``clients.database.suppress_condition_by_log`` /
-    ``record_condition_decision``; a test impl can be an in-memory list."""
+    ``record_condition_decision``; a test impl can be an in-memory list.
+
+    F807 (#664): a structural :class:`typing.Protocol` so the production
+    ``DbConditionLogStore`` (which does NOT nominally inherit this) satisfies the
+    ``log_store`` parameter under ``mypy --strict`` — the seam has always been
+    duck-typed at runtime; this only makes the type checker agree."""
 
     def should_suppress(self, terminal_id: str, kind: str, subtype: str, epoch: int) -> bool:
         """D7: read the latest memory-updating row and decide suppression."""
-        raise NotImplementedError
+        ...
 
     def record(
         self,
@@ -739,7 +744,7 @@ class ConditionLogStore:
         inbox_message_id: Optional[int] = None,
     ) -> None:
         """Append one decision row (one per ``deliver()`` exit, D5/AC20/AC24)."""
-        raise NotImplementedError
+        ...
 
 
 class ConditionDelivery:
@@ -835,7 +840,7 @@ class ConditionDelivery:
             cond.kind.value,
             cond.subtype,
             epoch,
-            surfaces=self._surfaces_str(cond.kind.value),
+            surfaces=self._surfaces_str(cond.kind.value, cond.subtype),
             suppressed_reason="busy_class" if inbox_declined else None,
         )
         return DeliveryResult(True, label, pushes, "delivered")
@@ -855,20 +860,27 @@ class ConditionDelivery:
         return self._last.get(terminal_id) == key
 
     def _inbox_declined(self, kind: str, subtype: str) -> bool:
-        """D5 / F790 (#647): does the inbox leg decline for this condition?
+        """D5 / F790 (#647) / F807 (#664): does the inbox leg decline for this
+        condition?
 
-        Declined when EITHER the drain-class predicate matches (BUSY, or a
-        command_exit PROC_EXITED — the SAME class the supervisor-inbox-drain hook
-        withholds, F718 #574) OR the F642 routing map (``KIND_SURFACES``) has no
-        inbox surface for the kind. The second arm preserves base behaviour for
-        the map's other inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD):
-        F790 must only STOP enqueuing the drain class, never START enqueuing a
-        kind the map already declined (gate r1 B1). Keyed on ``(kind, subtype)``
-        so the command_exit PROC_EXITED case is matched exactly. Only consulted
-        when a log store is wired (spine active); otherwise F611's fan-out is
-        unchanged."""
-        if self._log_store is None:
-            return False
+        Declined when EITHER the drain-class predicate matches (BUSY, a
+        command_exit PROC_EXITED, or a CONTEXT_EXHAUSTED ``low_context_tip`` — the
+        SAME class the supervisor-inbox-drain hook withholds, F718 #574 / F807)
+        OR the F642 routing map (``KIND_SURFACES``) has no inbox surface for the
+        kind. The second arm preserves base behaviour for the map's other
+        inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD): F790 must only
+        STOP enqueuing the drain class, never START enqueuing a kind the map
+        already declined (gate r1 B1). Keyed on ``(kind, subtype)`` so the
+        command_exit PROC_EXITED and low_context_tip cases are matched exactly.
+
+        F807 (#664): this is consulted REGARDLESS of whether a durable log store
+        is wired. F790's decline was previously gated behind a wired
+        ``_log_store`` (early ``return False``), which left it dormant in the
+        production construction that omitted the store — so BUSY-class and
+        low_context_tip rows were still enqueued to the seat. The decline is a
+        pure routing decision over ``(kind, subtype)`` with no dependency on the
+        durable ledger, so it now falls through to the predicate unconditionally;
+        F611's three-surface fan-out for the NON-declined class is unchanged."""
         from cli_agent_orchestrator.clients.delivery_ledger import (
             drain_class_declines_inbox,
             surfaces_for_kind,
@@ -877,16 +889,23 @@ class ConditionDelivery:
         return drain_class_declines_inbox(kind, subtype) or not surfaces_for_kind(kind).inbox
 
     @staticmethod
-    def _surfaces_str(kind: str) -> str:
-        from cli_agent_orchestrator.clients.delivery_ledger import surfaces_for_kind
+    def _surfaces_str(kind: str, subtype: str = "") -> str:
+        from cli_agent_orchestrator.clients.delivery_ledger import (
+            drain_class_declines_inbox,
+            surfaces_for_kind,
+        )
 
         surf = surfaces_for_kind(kind)
+        # F807 (#664): the recorded surfaces string reflects the ACTUAL routing,
+        # so a subtype-level decline (low_context_tip) records "fleet,bus" even
+        # though the kind-keyed map still carries inbox=True for hard exhaustion.
+        inbox = surf.inbox and not drain_class_declines_inbox(kind, subtype)
         parts = []
         if surf.fleet:
             parts.append("fleet")
         if surf.bus:
             parts.append("bus")
-        if surf.inbox:
+        if inbox:
             parts.append("inbox")
         return ",".join(parts)
 
