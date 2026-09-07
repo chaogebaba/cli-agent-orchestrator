@@ -20,12 +20,12 @@ import pytest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.pi_cli import (
+    _FOOTER_CONTEXT,
+    _PI_MCP_TIMEOUT_MS_FLOOR,
     PI_BINARY,
     PI_RUNTIME_ROOT,
     PiCliProvider,
     _resolve_pi_mcp_timeout_ms,
-    _PI_MCP_TIMEOUT_MS_FLOOR,
-    _FOOTER_CONTEXT,
 )
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -64,7 +64,10 @@ class TestCommandConstruction:
 
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_core_flags_present(self, mock_defaults) -> None:
-        mock_defaults.return_value = {"model": "cline-pass/glm-5.3-flash", "reasoning_effort": "high"}
+        mock_defaults.return_value = {
+            "model": "cline-pass/glm-5.3-flash",
+            "reasoning_effort": "high",
+        }
         provider = self._provider()
         parts = shlex.split(provider._build_pi_command())
         assert parts[0] == PI_BINARY
@@ -80,7 +83,10 @@ class TestCommandConstruction:
 
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_model_and_thinking_resolved(self, mock_defaults) -> None:
-        mock_defaults.return_value = {"model": "cline-pass/glm-5.3-flash", "reasoning_effort": "high"}
+        mock_defaults.return_value = {
+            "model": "cline-pass/glm-5.3-flash",
+            "reasoning_effort": "high",
+        }
         provider = self._provider()
         parts = shlex.split(provider._build_pi_command())
         assert parts[parts.index("--model") + 1] == "cline-pass/glm-5.3-flash"
@@ -91,7 +97,10 @@ class TestCommandConstruction:
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_spawn_model_override_wins(self, mock_defaults) -> None:
         """An explicit model kwarg (assign/handoff) overrides providers.toml."""
-        mock_defaults.return_value = {"model": "cline-pass/glm-5.3-flash", "reasoning_effort": "high"}
+        mock_defaults.return_value = {
+            "model": "cline-pass/glm-5.3-flash",
+            "reasoning_effort": "high",
+        }
         provider = self._provider(model="cline-pass/kimi-k3")
         parts = shlex.split(provider._build_pi_command())
         assert parts[parts.index("--model") + 1] == "cline-pass/kimi-k3"
@@ -109,7 +118,10 @@ class TestCommandConstruction:
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_tool_exclusion_for_restricted_worker(self, mock_defaults) -> None:
         """A restricted allowlist produces a --exclude-tools denylist."""
-        mock_defaults.return_value = {"model": "cline-pass/glm-5.3-flash", "reasoning_effort": "high"}
+        mock_defaults.return_value = {
+            "model": "cline-pass/glm-5.3-flash",
+            "reasoning_effort": "high",
+        }
         provider = self._provider(allowed_tools=["fs_read"])
         parts = shlex.split(provider._build_pi_command())
         assert "--exclude-tools" in parts
@@ -121,7 +133,10 @@ class TestCommandConstruction:
 
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_unrestricted_worker_no_exclude(self, mock_defaults) -> None:
-        mock_defaults.return_value = {"model": "cline-pass/glm-5.3-flash", "reasoning_effort": "high"}
+        mock_defaults.return_value = {
+            "model": "cline-pass/glm-5.3-flash",
+            "reasoning_effort": "high",
+        }
         provider = self._provider(allowed_tools=["*"])
         parts = shlex.split(provider._build_pi_command())
         assert "--exclude-tools" not in parts
@@ -338,7 +353,9 @@ class TestStatusDetection:
         (UNKNOWN here): the live-read fallback must not manufacture readiness.
         """
         provider = self._provider(dispatched=False)
-        with patch.object(PiCliProvider, "_read_pane", return_value="just a shell prompt $ ") as read:
+        with patch.object(
+            PiCliProvider, "_read_pane", return_value="just a shell prompt $ "
+        ) as read:
             assert provider.get_status("") == TerminalStatus.UNKNOWN
             read.assert_called_once()
 
