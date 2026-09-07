@@ -2003,12 +2003,22 @@ class StatusMonitor:
         """
         if self._condition_delivery is not None:
             return self._condition_delivery
+        from cli_agent_orchestrator.clients.database import DbConditionLogStore
         from cli_agent_orchestrator.providers.condition import ConditionDelivery
 
+        # F807 (#664): wire the DB-backed durable decision log into the ONE
+        # production seam. F642's spine and F790's upstream BUSY-class / soft
+        # low_context_tip decline were both gated behind a wired ``log_store``;
+        # constructing the seam WITHOUT one left the decline dormant, so liveness
+        # conditions were still enqueued to the supervisor inbox (only downstream
+        # hooks hid them, and the native wake ring still rang the seat). Wiring
+        # the store here activates the durable ``condition_ledger`` AND the
+        # upstream decline; fleet + CLI/bus sinks still fire for every condition.
         self._condition_delivery = ConditionDelivery(
             fleet_sink=self._condition_fleet_sink,
             inbox_sink=self._condition_inbox_sink,
             cli_sink=self._condition_cli_sink,
+            log_store=DbConditionLogStore(),
         )
         return self._condition_delivery
 
