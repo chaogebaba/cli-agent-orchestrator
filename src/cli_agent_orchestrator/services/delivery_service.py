@@ -556,12 +556,20 @@ def attempt_rung1(
             # F547 #403 point 4: record socket_delivered on rung1 success so the
             # delivered-count / backoff machinery sees this ring and _is_row_still
             # _pending is no longer the only thing gating a 5s re-fire.
+            # F803 #660: only when the socket ACTUALLY carried the body
+            # (normalize_wake_body) — an ids-only rung1 wake must not be marked
+            # delivered, or the drain hook's is_socket_delivered dedupe would
+            # skip surfacing the text the seat never received.
             try:
+                from cli_agent_orchestrator.services.cc_session_registry import (
+                    normalize_wake_body,
+                )
                 from cli_agent_orchestrator.services.doorbell_service import (
                     _mark_socket_delivered,
                 )
 
-                _mark_socket_delivered(inbox_row_id)
+                if normalize_wake_body(message_body) is not None:
+                    _mark_socket_delivered(inbox_row_id)
             except Exception:
                 logger.debug(
                     "f547 mark_socket_delivered failed for row %s", inbox_row_id, exc_info=True

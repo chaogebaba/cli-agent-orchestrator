@@ -82,12 +82,23 @@ class EmissionOutcome(str, Enum):
     carrier. ``carrier_unavailable`` — the carrier was in the stored applicable
     set at routing time but is no longer applicable at emit time (r3/S2); a
     TERMINAL, non-retryable outcome that counts toward exhaustion and names why.
+
+    ``wake_only`` (F803 #660) — the native carrier RANG the seat but the socket
+    payload carried NO body (an ids-only wake ping; ``teammate_push=false`` /
+    ``normalize_wake_body`` collapsed the body to ``None``). The seat was woken
+    but received no text, so this is NOT consumption: the row stays ``pending``
+    and the drain hook must still win and inject the body. Like ``failed`` it
+    does NOT mute the hook and does NOT count toward carrier exhaustion (the
+    carrier is still owed a real body-carrying attempt); unlike ``failed`` it
+    records that a wake DID fire, so the delivery trace distinguishes "woke but
+    carried nothing" from "could not even ring".
     """
 
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CARRIER_UNAVAILABLE = "carrier_unavailable"
+    WAKE_ONLY = "wake_only"
 
 
 class SuppressedReason(str, Enum):
