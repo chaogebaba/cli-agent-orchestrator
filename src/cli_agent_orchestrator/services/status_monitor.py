@@ -2691,6 +2691,87 @@ class StatusMonitor:
                         # stale.
                         if current_last_status is not None:
                             return current_last_status
+
+        elif cached == TerminalStatus.UNKNOWN:
+            # F808 (#665): cached-UNKNOWN-at-rest self-heal, opt-in only.
+            #
+            # The PROCESSING branch above heals a stuck-busy latch; this heals the
+            # mirror-image wedge on the QUIESCENT side. A persistent alt-screen TUI
+            # (pi_cli) stops feeding the tmux FIFO once it has drawn its idle frame,
+            # so _process_chunk never runs and the cached _last_status stays at its
+            # initial UNKNOWN forever, even though the live pane shows idle chrome.
+            # Inbox delivery is IDLE/COMPLETED-gated on this cached status, so a
+            # parked worker would never auto-receive its callbacks (F798 r2 §8.3).
+            #
+            # The provider's own get_status() already live-reads the pane when its
+            # pushed buffer is empty (pi_cli._resolve_buffer), but the delivery/HTTP
+            # path calls THIS method, which returns the cache without consulting the
+            # provider on the non-PROCESSING, non-event-inbox path. So re-detect from
+            # a fresh pane capture here — reusing the exact same
+            # _fresh_capture_pane_status machinery (opt-in routing, two-read confirm,
+            # generation-guarded apply) the PROCESSING branch uses.
+            #
+            # Strictly opt-in and fail-closed: only a provider that sets
+            # supports_direct_status_probe (its get_status is safe on a rendered
+            # snapshot) is even considered. Every other provider skips this branch
+            # entirely — no provider resolve, no pane read, no verdict — so their
+            # behaviour is byte-identical to before. This is a SEPARATE opt-in from
+            # the PROCESSING self-heal, which routes INSIDE _fresh_capture_pane_status
+            # on supports_direct_status_probe OR supports_screen_detection; the
+            # UNKNOWN-at-rest wedge is a pi_cli-class TUI phenomenon and
+            # screen-detection providers (claude_code, kiro_cli) do not exhibit it, so
+            # this outer gate deliberately keys on supports_direct_status_probe alone.
+            if self._opts_in_unknown_selfheal(terminal_id, provider_override):
+                # Gate on an empty/whitespace pushed buffer OR a buffer that has been
+                # quiet for the stale window. The empty case is the actual pi-at-rest
+                # signature (the FIFO never delivered a frame, so _buffer_changed_at is
+                # None and the PROCESSING branch's quiet gate would never fire); the
+                # stale-with-content case covers a worker whose last pushed frame parsed
+                # UNKNOWN and then went silent.
+                with self._lock:
+                    push_buffer = self._buffers.get(terminal_id, "")
+                    changed_at = self._buffer_changed_at.get(terminal_id)
+                    # Pin the generation BEFORE the unlocked capture read, exactly as
+                    # the PROCESSING branch does.
+                    generation = self._capture_generation.get(terminal_id, 0)
+                buffer_empty = not push_buffer.strip()
+                buffer_is_quiet = (
+                    changed_at is not None
+                    and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
+                )
+                if buffer_empty or buffer_is_quiet:
+                    fresh_capture = self._fresh_capture_pane_status(terminal_id, generation)
+                    if fresh_capture is not None and fresh_capture not in (
+                        TerminalStatus.PROCESSING,
+                        TerminalStatus.UNKNOWN,
+                    ):
+                        logger.debug(
+                            f"get_status [{terminal_id}]: cached=UNKNOWN self-heal, "
+                            f"fresh capture-pane={fresh_capture.value}"
+                        )
+                        # Same generation-guarded apply as the PROCESSING branch,
+                        # except the apply-time latch guard accepts a still-UNKNOWN
+                        # cache — including a never-written (None) entry, the parked-
+                        # worker case — as the state we are healing FROM.
+                        with self._lock:
+                            current_last_status = self._last_status.get(terminal_id)
+                            generation_current = (
+                                self._capture_generation.get(terminal_id, 0) == generation
+                            )
+                            apply_ok = generation_current and current_last_status in (
+                                None,
+                                TerminalStatus.UNKNOWN,
+                            )
+                        if apply_ok:
+                            self._apply_detection(terminal_id, fresh_capture)
+                            return fresh_capture
+                        logger.debug(
+                            f"get_status [{terminal_id}]: UNKNOWN self-heal result "
+                            "discarded — the terminal moved on while the capture-pane "
+                            "read was in flight"
+                        )
+                        if current_last_status is not None:
+                            return current_last_status
         # F506: fuse the cached egress (bare status, R-S7).
         fused_cached, _reason = self.fuse_status(terminal_id, cached)
         return fused_cached if fused_cached is not None else cached
@@ -2706,6 +2787,26 @@ class StatusMonitor:
         except Exception:
             pass
         return self.get_raw_status(terminal_id)
+
+    def _opts_in_unknown_selfheal(
+        self, terminal_id: str, provider_override: Optional[object] = None
+    ) -> bool:
+        """Whether this terminal's provider opts into the cached-UNKNOWN self-heal.
+
+        F808 (#665): the cached-UNKNOWN-at-rest re-detect (get_raw_status) is
+        strictly opt-in via ``supports_direct_status_probe`` — a provider whose
+        ``get_status`` is line-oriented and safe on a rendered capture-pane
+        snapshot. Resolving the provider is the FIRST thing the UNKNOWN branch
+        does, so this must be cheap and total: any resolution failure returns
+        False (skip the branch, behaviour unchanged), never raises.
+        """
+        try:
+            provider = provider_override or provider_manager.get_provider(terminal_id)
+        except Exception:
+            return False
+        if provider is None:
+            return False
+        return bool(getattr(provider, "supports_direct_status_probe", False))
 
     def _fresh_capture_pane_status(
         self, terminal_id: str, generation: int

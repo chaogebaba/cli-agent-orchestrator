@@ -249,6 +249,19 @@ class TestStatusDetection:
         provider = self._provider(dispatched=False)
         assert provider.get_status(_fixture("pi_idle.txt")) == TerminalStatus.IDLE
 
+    def test_opts_into_cached_unknown_self_heal(self) -> None:
+        """F808 (#665): pi_cli sets supports_direct_status_probe so the
+        StatusMonitor's cached-UNKNOWN-at-rest self-heal (get_raw_status)
+        re-detects a parked worker from a fresh pane capture. Without this the
+        FIFO-fed cache stays UNKNOWN forever and IDLE-gated inbox delivery to a
+        parked pi worker never fires (F798 r2 §8.3)."""
+        assert PiCliProvider.supports_direct_status_probe is True
+        # A raw-stream provider (kiro_cli) must NOT be opted in — the fix is
+        # strictly pi-class, not a blanket default flip.
+        from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+
+        assert KiroCliProvider.supports_direct_status_probe is False
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_idle_chrome_survives_trailing_blank_padding(self, _native) -> None:
         """F798 r2 B-1 regression: pi's short-conversation TUI renders the

@@ -140,6 +140,15 @@ class PiCliProvider(BaseProvider):
     dependency.
     """
 
+    # F808 (#665): opt into the cached-UNKNOWN-at-rest self-heal in the
+    # StatusMonitor (get_raw_status). Pi's persistent alt-screen TUI stops
+    # feeding the tmux FIFO once its idle frame is drawn, so a parked worker's
+    # cached status stays UNKNOWN and IDLE-gated inbox delivery never fires.
+    # Setting this lets get_raw_status re-detect from a fresh pane capture via
+    # get_status(), which is line-oriented and safe on a rendered snapshot (the
+    # same detector _resolve_buffer already runs on a live pane read).
+    supports_direct_status_probe: bool = True
+
     def __init__(
         self,
         terminal_id: str,

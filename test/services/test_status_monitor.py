@@ -821,6 +821,251 @@ class TestStaleProcessingCapturePane:
         assert sm._last_status["t1"] == TerminalStatus.ERROR
 
 
+class TestCachedUnknownSelfHeal:
+    """Cached-UNKNOWN-at-rest self-heal (F808 #665): the mirror image of the
+    stuck-PROCESSING self-heal, on the QUIESCENT side.
+
+    A persistent alt-screen TUI (pi_cli) stops feeding the tmux FIFO once it has
+    drawn its idle frame, so ``_process_chunk`` never runs and the cached
+    ``_last_status`` stays at its initial UNKNOWN forever, even though the live
+    pane shows idle chrome. Inbox delivery is IDLE/COMPLETED-gated on that cached
+    status, so a parked worker would never auto-receive its callbacks. These pin
+    that ``get_raw_status`` re-detects from a fresh pane capture — but ONLY for a
+    provider that opts in via ``supports_direct_status_probe``, and with the same
+    two-read confirm / generation-guard machinery the PROCESSING self-heal uses.
+    """
+
+    @staticmethod
+    def _quiet_since():
+        """A _buffer_changed_at value old enough to satisfy the quiet gate unconditionally."""
+        return -1000.0
+
+    @staticmethod
+    def _probe_provider(status=TerminalStatus.IDLE, opts_in=True):
+        """A provider stub routed through get_status(): direct-status-probe capable.
+
+        Flags are set explicitly — a bare MagicMock's auto-attributes are truthy,
+        which would silently route through the screen path or opt providers in by
+        accident.
+        """
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = False
+        provider.supports_direct_status_probe = opts_in
+        provider.supports_stale_capture_selfheal = True
+        provider.get_status.return_value = status
+        return provider
+
+    # (a) cached UNKNOWN + idle pane → IDLE via self-heal, delivery gate opens.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_idle_pane_self_heals_to_idle(self, mock_pm, mock_get_backend):
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "the real pane -- idle composer, fully rendered"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        # No _last_status entry at all: a parked pi worker whose cache was never
+        # written past its initial UNKNOWN. The pushed buffer is empty because the
+        # FIFO never delivered a frame after the first — the exact at-rest signature.
+        sm._buffers["t1"] = ""
+
+        # First read: a genuine ready candidate, but a single sample is never trusted.
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+        assert backend.get_history.call_count == 1
+
+        # Second, matching read confirms it and the latch moves to IDLE — so the
+        # IDLE-gated delivery pipeline can now fire for this parked worker.
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        assert backend.get_history.call_count == 2
+
+    # (b) cached UNKNOWN + busy pane → not IDLE.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_busy_pane_does_not_self_heal(self, mock_pm, mock_get_backend):
+        provider = self._probe_provider(TerminalStatus.PROCESSING)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "-- Working -- (esc to interrupt)"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = ""
+
+        # A busy pane yields no ready candidate — must never latch IDLE/COMPLETED.
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+
+    # (c) a non-opt-in provider with cached UNKNOWN → unchanged (no pane read).
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_non_opt_in_provider_unchanged_no_pane_read(
+        self, mock_pm, mock_get_backend
+    ):
+        # Provider opts into NEITHER flag: the UNKNOWN self-heal must skip it
+        # entirely — no capture, no verdict — byte-identical to today's behaviour.
+        provider = self._probe_provider(TerminalStatus.IDLE, opts_in=False)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "an idle-looking pane the fallback must NOT read"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = ""
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        backend.get_history.assert_not_called()
+        provider.get_status.assert_not_called()
+
+    # (d) the PROCESSING self-heal is unchanged — a cached PROCESSING still heals,
+    #     even for a provider that would ALSO be eligible for the UNKNOWN branch.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_processing_self_heal_unchanged(self, mock_pm, mock_get_backend):
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle composer, fully rendered"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_raw_status("t1") == TerminalStatus.PROCESSING  # 1st: candidate
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.IDLE  # 2nd: confirmed
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    # A non-empty, still-recent pushed buffer is NOT the at-rest signature: no capture.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_with_recent_nonempty_buffer_skips_capture(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        # A non-empty pushed buffer whose last chunk landed just now: the pipeline is
+        # still live for this terminal, so the at-rest self-heal must not fire.
+        sm._buffers["t1"] = "some recently pushed content"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        backend.get_history.assert_not_called()
+
+    # A non-empty pushed buffer that has since gone QUIET still qualifies (the worker's
+    # last pushed frame parsed UNKNOWN and then it went silent).
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_with_quiet_nonempty_buffer_self_heals(self, mock_pm, mock_get_backend):
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = "last pushed frame parsed UNKNOWN"
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN  # candidate
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.IDLE  # confirmed
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    # A new turn (notify_input_sent) between the two reads must drop the candidate:
+    # the UNKNOWN branch uses the same generation guard as the PROCESSING branch.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_new_turn_between_reads_discards_candidate(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = self._probe_provider(TerminalStatus.IDLE)
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "idle pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = ""
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN  # candidate recorded
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+
+        # New input arms the revert and bumps the capture generation, invalidating the
+        # candidate. Note this leaves _last_status untouched (still absent/UNKNOWN).
+        sm.notify_input_sent("t1")
+        assert "t1" not in sm._pending_stale_capture
+
+        # The next matching read is a FIRST sighting again, not a confirmation.
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = self._quiet_since()
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+
+    # A provider whose lookup raises must skip the branch, no crash, stays UNKNOWN.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_provider_lookup_raises_stays_unknown(self, mock_pm, mock_get_backend):
+        mock_pm.get_provider.side_effect = ValueError("terminal not in db")
+        backend = _backend(event_inbox=False)
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = ""
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        backend.get_history.assert_not_called()
+
+    # A screen-detection-only provider (e.g. kiro_cli) must NOT be opted into the
+    # UNKNOWN self-heal. _fresh_capture_pane_status WOULD route it via the screen
+    # path, so ONLY the outer _opts_in_unknown_selfheal gate (which keys on
+    # supports_direct_status_probe alone) keeps it from capturing at rest — this is
+    # the load-bearing test for that gate. The UNKNOWN-at-rest wedge is a pi-class
+    # phenomenon; a screen-detection provider does not exhibit it and must stay
+    # byte-identical.
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_cached_unknown_screen_only_provider_not_opted_in(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = True
+        provider.supports_direct_status_probe = False
+        provider.supports_stale_capture_selfheal = True
+        provider.get_status_from_screen.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "an idle-looking rendered pane"
+        mock_get_backend.return_value = backend
+
+        sm = StatusMonitor()
+        sm._buffers["t1"] = ""
+
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_raw_status("t1") == TerminalStatus.UNKNOWN
+        backend.get_history.assert_not_called()
+        provider.get_status_from_screen.assert_not_called()
+
+
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
