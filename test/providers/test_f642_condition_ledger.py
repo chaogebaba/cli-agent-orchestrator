@@ -91,12 +91,17 @@ def test_ac5_busy_no_inbox_push_capped_pushes(db_env):
 
 
 def test_ac5_mutant_unconditional_sink_pushes_busy(db_env):
-    """MUTANT: no log_store (the pre-F642 unconditional inbox sink) → BUSY pushes,
-    reintroducing #494's two decision-free BUSY pushes."""
+    """F807 (#664): the BUSY-class decline is NO LONGER gated on a wired
+    log_store. Even without a store the inbox leg is declined — closing F790's
+    dormancy where the production seam (built with no log_store) still pushed
+    BUSY pings. The killed mutant is now reverting that fall-through so a
+    store-less delivery re-enqueues BUSY (see
+    test/providers/test_f807_upstream_decline_wired.py::
+    test_a_mutant_early_return_false_reenqueues_busy)."""
     inbox = []
-    mutant = ConditionDelivery(inbox_sink=lambda t, c: inbox.append((t, c.kind.value)))
-    mutant.deliver("wrk", _cond(ConditionKind.BUSY), epoch=1)
-    assert inbox == [("wrk", "BUSY")]  # the defect
+    d = ConditionDelivery(inbox_sink=lambda t, c: inbox.append((t, c.kind.value)))
+    d.deliver("wrk", _cond(ConditionKind.BUSY), epoch=1)
+    assert inbox == []  # F807: declined with or without a durable log store
 
 
 # ── AC9 ★ / D7: de-dup survives a restart ────────────────────────────────────
@@ -136,8 +141,10 @@ def test_ac20_busy_and_dedup_produce_durable_rows_no_message_id(db_env):
     d.deliver("wrk", _cond(ConditionKind.CAPPED), epoch=1)
     decisions = _decisions(db_env, "wrk")
     # a busy_class delivered row (no message id) and a deduped row (no message id)
-    assert any(dec == "delivered" and reason == "busy_class" and mid is None
-               for dec, _k, reason, mid in decisions)
+    assert any(
+        dec == "delivered" and reason == "busy_class" and mid is None
+        for dec, _k, reason, mid in decisions
+    )
     assert any(dec == "deduped" and mid is None for dec, _k, _r, mid in decisions)
 
 
