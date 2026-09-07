@@ -266,24 +266,39 @@ def test_ac18_certified_gate_cell_binds(tmp_path):
     res = routing.resolve_routing_binding(
         "empirical_reviewer", "codex", table=table, positions_dir=positions
     )
-    assert res.spawn_profile == "empirical_reviewer"
+    assert res.spawn_profile == "empirical_reviewer-codex"
     assert res.fallback_profile is None
 
 
-def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch):
-    """A non-PASS NON-gate cell substitutes the installed general ALIAS STUB
-    (stem ``<short>_general``) with a fallback_profile + a fallback_cell for the
-    [COLD-FALLBACK position=] field. F613 #469: the fallback is now the resolved
-    alias stub, not the raw ``f"{provider}_general"`` — so the flat store must
-    carry the (general, provider) stub."""
+def test_d12b_missing_required_row_fails_closed(tmp_path):
+    """F786 D12b — a position with NO [required] row is refused at routing time
+    with E-ROW-CLAUSES-MISSING (mirrors clause_lint), rather than the old silent
+    ``.get(position, [])`` empty set that treated an absent row as non-gate.
+
+    MUTANT: missing [required] row treated as empty → this would bind/fallback
+    instead of raising."""
     positions = _build_store(tmp_path)
-    # F613: seed the installed general alias stub for (general, codex). Its stem
-    # (codex_general) is what the resolver must return.
-    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
-    _write(
-        tmp_path / "agent-store" / "codex_general.md",
-        "---\nextends: general\nname: codex_general\nprovider: codex\n---\n# codex general\n",
+    _certify(positions, "general", "codex", "PASS")
+    # A bound position whose fragment exists but has NO clause-table [required]
+    # row (docs is not in _CLAUSES_TOML).
+    _write(positions / "doc_keeper.md", "# DOC KEEPER\nwrite docs.\n")
+    table = routing.bindings_to_table(
+        [routing.Binding(position="doc_keeper", provider="codex", kind="cao")]
     )
+    with pytest.raises(routing.RoutingError) as ei:
+        routing.resolve_routing_binding("doc_keeper", "codex", table=table, positions_dir=positions)
+    assert ei.value.code == routing.E_ROW_CLAUSES_MISSING
+    assert "no [required] row" in str(ei.value)
+
+
+def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch):
+    """A non-PASS NON-gate cell substitutes the DERIVED composed general name
+    ``general-<provider>`` (F786 D11) with a fallback_profile + a fallback_cell
+    for the [COLD-FALLBACK position=] field. The flat-store stub scan and the
+    E-ALIAS-MISSING path are gone: the name is derived purely and the D8 writer
+    (invoked by the caller at the server seam) materialises it."""
+    positions = _build_store(tmp_path)
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
     # Add a non-gate position 'dev' that carries only the worker clauses, and a
     # proper dev [required] row in the clause table.
     _write(
@@ -304,8 +319,8 @@ def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch
         [routing.Binding(position="dev", provider="codex", kind="cao")]
     )
     res = routing.resolve_routing_binding("dev", "codex", table=table, positions_dir=positions)
-    assert res.spawn_profile == "codex_general"
-    assert res.fallback_profile == "codex_general"
+    assert res.spawn_profile == "general-codex"
+    assert res.fallback_profile == "general-codex"
     assert res.fallback_position == "dev"
     assert res.fallback_cell == "UNCERTIFIED"
 
@@ -339,12 +354,6 @@ def test_ac18_assign_non_gate_fallback_preamble(tmp_path, monkeypatch):
     )
     _write(overlays / "codex.md", "## Provider notes (codex)\nq.\n")
     _certify(positions, "general", "codex", "PASS")
-    # F613 #469: seed the installed general alias stub so the non-gate fallback
-    # resolves to the stub stem (codex_general), not the raw f-string.
-    _write(
-        home / "agent-store" / "codex_general.md",
-        "---\nextends: general\nname: codex_general\nprovider: codex\n---\n# codex general\n",
-    )
 
     rt = tmp_path / "routing.toml"
     _write(
@@ -376,7 +385,7 @@ def test_ac18_assign_non_gate_fallback_preamble(tmp_path, monkeypatch):
         result = _assign_impl("dev", "task", working_directory="/repo")
 
     assert result["success"] is True
-    assert result.get("fallback_profile") == "codex_general"
-    assert captured["agent_profile"] == "codex_general"
+    assert result.get("fallback_profile") == "general-codex"
+    assert captured["agent_profile"] == "general-codex"
     assert captured["message"].count("[COLD-FALLBACK") == 1
     assert "[COLD-FALLBACK position=dev cell=UNCERTIFIED]" in captured["message"]

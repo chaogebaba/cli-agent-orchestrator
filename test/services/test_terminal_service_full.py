@@ -972,9 +972,12 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_delete_terminals_by_session,
     ):
-        """A runtime-prompt provider with no profile in the CAO store builds the
-        catalog unfiltered (None). The `profile is None` guard must hold — no
-        AttributeError on `profile.skills`."""
+        """F786 (#643) D8: a runtime-prompt provider with a NAMED profile that is
+        not in the CAO store now fails CLOSED (E-PROFILE-MISSING) BEFORE the
+        skill-catalog step — the pre-F786 "missing profile → build catalog with
+        None (unfiltered)" path is dead for a named profile (D8 retired it; only
+        the test-double branch keeps profile=None). So build_skill_catalog is
+        never reached on this path."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -987,10 +990,13 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = MagicMock()
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        await create_terminal("claude_code", "developer", new_session=True)
+        from cli_agent_orchestrator.services.terminal_service import ProfileMissingError
 
-        # No profile → no `skills` filter; catalog built with None (full catalog).
-        mock_build_skill_catalog.assert_called_once_with(None, provider="claude_code")
+        with pytest.raises(ProfileMissingError, match="E-PROFILE-MISSING"):
+            await create_terminal("claude_code", "developer", new_session=True)
+
+        # Fail-closed short-circuits before the catalog is ever built.
+        mock_build_skill_catalog.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])
@@ -1071,7 +1077,12 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_delete_terminals_by_session,
     ):
-        """Terminal creation succeeds when agent profile is not in CAO store (e.g. JSON-only profiles)."""
+        """F786 (#643) D8: a NAMED agent profile that is not in the CAO store
+        now fails CLOSED with E-PROFILE-MISSING — it must NOT silently become a
+        None profile and a native spawn (the pre-F786 "JSON-only profile"
+        behavior this test used to assert). D8 retired that path for any named
+        profile; only the test-double branch (non-AgentProfile object) keeps
+        profile=None."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "my-agent-abcd"
@@ -1084,12 +1095,14 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        result = await create_terminal("kiro_cli", "my-agent", new_session=True)
+        from cli_agent_orchestrator.services.terminal_service import ProfileMissingError
 
-        assert result.id == "test1234"
-        mock_provider.initialize.assert_called_once()
-        # allowed_tools should be None since profile was not found
-        assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
+        with pytest.raises(ProfileMissingError, match="E-PROFILE-MISSING"):
+            await create_terminal("kiro_cli", "my-agent", new_session=True)
+
+        # Fail-closed BEFORE any provider is created or DB row written.
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
 
 
 class TestCreateTerminalWorktree:

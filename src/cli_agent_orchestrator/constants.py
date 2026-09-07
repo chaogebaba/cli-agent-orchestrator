@@ -428,6 +428,16 @@ def positions_store_dir() -> Path:
     return local_agent_store_dir() / "positions"
 
 
+def composed_store_dir() -> Path:
+    """F786 (#643) D8 composed-profile store, resolved at call time.
+
+    Holds ``<position>-<provider>.md`` profiles materialised by the D8 writer at
+    assign time. A sibling of the flat store that the install-time prune (D4)
+    never enters, so a redeploy cannot re-arm the profile-less path.
+    """
+    return local_agent_store_dir() / "composed"
+
+
 def overlays_store_dir() -> Path:
     """F497 overlays store, resolved at call time."""
     return local_agent_store_dir() / "overlays"

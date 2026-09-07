@@ -1669,7 +1669,19 @@ def _resolved_codex_profile_config(
     resolved_profile_name = (
         declared_name if isinstance(declared_name, str) and declared_name else profile_name
     )
-    profile_defaults = get_provider_profile_defaults(defaults, resolved_profile_name)
+    # F786 D5 — model/effort keys are POSITION-keyed. Prefer the resolver-set
+    # AgentProfile.position (the resolved position from the assign path); fall
+    # back to splitting the effective name when only the name is available, and
+    # to the raw name for a legacy passthrough (split → None).
+    _position = getattr(profile, "position", None) if profile is not None else None
+    if _position:
+        profile_key = _position
+    else:
+        from cli_agent_orchestrator.utils.agent_profiles import split_effective_name
+
+        _split = split_effective_name(resolved_profile_name or "")
+        profile_key = _split[0] if _split is not None else resolved_profile_name
+    profile_defaults = get_provider_profile_defaults(defaults, profile_key)
     model = resolve_provider_string_option(profile_defaults, defaults, profile, "model", "model")
     config = dict(getattr(profile, "codexConfig", None) or {})
 

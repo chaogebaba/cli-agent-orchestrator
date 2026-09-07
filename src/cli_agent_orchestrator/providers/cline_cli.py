@@ -428,7 +428,8 @@ class ClineCliProvider(BaseProvider):
             )
         provider_defaults = get_provider_defaults("cline_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        profile_key = getattr(profile, "position", None) or profile_name
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
         return resolve_provider_string_option(
             profile_defaults,
             provider_defaults,
@@ -475,7 +476,8 @@ class ClineCliProvider(BaseProvider):
             pass
         provider_defaults = get_provider_defaults("cline_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        profile_key = getattr(profile, "position", None) or profile_name
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
         return resolve_reasoning_effort("cline_cli", profile_defaults, provider_defaults, profile)
 
     def _data_dir(self) -> Path:

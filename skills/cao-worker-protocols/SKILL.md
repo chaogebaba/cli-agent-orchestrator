@@ -122,11 +122,12 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   never from memory (incident 2026-07-22: a maker misremembered its own id
   and pointed three lanes at a nonexistent callback).
 
-- **The provider comes from the agent PROFILE, never from a model setting.**
-  `assign(agent_profile="grok_dev")` gives a Grok CLI lane; `codex_dev` /
-  `codex_reviewer` give Codex lanes; `developer-sonnet` gives a cheap
-  scratch Claude lane. ALL review lanes are `codex_reviewer` — Fable
-  review lanes are RETIRED (user 2026-07-20); never spawn one.
+- **The provider comes from routing.toml, never from a model setting, and you
+  dispatch the POSITION.** `assign(agent_profile="dev")` resolves the lane's
+  provider from `orchestrator/routing.toml`; `empirical_reviewer` gives the
+  review gate. Provider-prefixed role names (`grok_dev`, `codex_dev`,
+  `developer-sonnet`, …) are RETIRED (F786) — dispatching one is refused with
+  `E-LEGACY-PROFILE-RETIRED`; name the position and let routing bind the lane.
 - **NEVER set, pass, or configure a model yourself** — `providers.toml` owns
   per-profile model defaults.
 - **Grok lanes LOOK like Claude Code** — the grok_cli provider launches a
@@ -134,10 +135,9 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   banner on a grok lane is NORMAL, not a mis-spawn.
 - **Model-select park = provider/relay outage, not your bug.** If a lane sits
   at "issue with the selected model … Run /model" the relay roster is down for
-  that model (it flaps). Do NOT retry the same profile in a loop: ONE retry
-  max, then either re-`assign` the same brief to a working-provider profile
-  (`developer-sonnet` is the standing fallback for dead grok lanes) or report
-  the outage to your caller. `delete_terminal` the parked lane either way.
+  that model (it flaps). Do NOT retry the same position in a loop: ONE retry
+  max, then either re-`assign` the same brief (routing rebinds the provider)
+  or report the outage to your caller. `delete_terminal` the parked lane either way.
 
 ### Lane lifecycle and ownership (delegating workers: maker, architect)
 
@@ -148,7 +148,7 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   up anything you leave behind, but leaving cleanup to the sweep is a
   deviation to cite, not the default.
 - **Reuse shared warm infrastructure before summoning.** If the supervisor's
-  dispatch names a warm shared lane (the session `grok_oracle` above all),
+  dispatch names a warm shared lane (the session `oracle` above all),
   ask IT your questions (ask-then-idle w2w) instead of spawning your own
   duplicate — one warm oracle serves every agent in the fleet. Never delete
   a shared lane; it is not yours even while you use it.
@@ -179,18 +179,18 @@ self-grepping:
   reading any source file; read raw lines only after orientation. The CAO
   fork has its OWN graph inside `cli-agent-orchestrator/` — the root graph
   cannot see gitignored paths.
-- **Warm grok oracle for exact refs**: if a session `grok_oracle` is alive,
+- **Warm oracle for exact refs**: if a session `oracle` lane is alive,
   send it your codebase questions via `send_message` (ask-then-idle: send,
   END YOUR TURN, the answer arrives as a message — busy-waiting deadlocks
   w2w). It returns exact file:line references and snippets. The oracle is
   SHARED session infrastructure — never delete it, never treat it as your
   disposable.
-- **grok_dev grunt lane for mechanical recon**: fire `assign(agent_profile=
-  "grok_dev")` for bounded chores — enumerate call sites, collect diffs,
+- **grunt lane for mechanical recon**: fire `assign(agent_profile="grunt")`
+  for bounded chores — enumerate call sites, collect diffs,
   build an inventory file, run a probe script. Same lane rules as everywhere:
   files-not-prose deliverables, absolute paths in callbacks, delete when done.
 - Division of labor: graphify/oracle answer "where/what is X" cheaply;
-  grok_dev produces artifact files; YOU do only the judgment reading —
+  the grunt lane produces artifact files; YOU do only the judgment reading —
   the deciding lines, not the whole tour.
 
 ### Provider craft (what the supervisor knows — use it)

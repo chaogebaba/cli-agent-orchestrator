@@ -236,7 +236,8 @@ class GrokCliProvider(BaseProvider):
 
         provider_defaults = get_provider_defaults("grok_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        profile_key = getattr(profile, "position", None) or profile_name
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
         if self._model:
             model = self._model
         else:

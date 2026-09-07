@@ -592,6 +592,19 @@ def read_agent_profile_source(agent_name: str) -> str:
         get_extra_agent_dirs,
     )
 
+    # F786 (#643) D8 — a position-composed spawn name (``<position>-<provider>``)
+    # is materialised under ``agent-store/composed/`` by the assign-time writer;
+    # it has no flat store file. Look there FIRST for any name whose suffix is a
+    # known provider so a composed profile always loads by name (the seam that
+    # makes a profile-less spawn impossible). A legacy flat name never matches
+    # split_effective_name, so this is a no-op for the whole legacy corpus.
+    if split_effective_name(agent_name) is not None:
+        from cli_agent_orchestrator.constants import composed_store_dir
+
+        composed = _safe_join(composed_store_dir(), f"{agent_name}.md")
+        if composed is not None and composed.exists():
+            return composed.read_text(encoding="utf-8")
+
     # Honour the disable toggle on the load path too, so disabling a directory
     # actually swaps which same-named profile wins (GH #280), not just what the
     # Settings list shows.
@@ -720,6 +733,10 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
 E_POSITION_NEEDS_PROVIDER = "E-POSITION-NEEDS-PROVIDER"
 E_PROVIDER_NOT_ALLOWED = "E-PROVIDER-NOT-ALLOWED"
 E_UNKNOWN_POSITION = "E-UNKNOWN-POSITION"
+# F786 D3 — a dispatch naming a RETIRED legacy profile is refused BEFORE the
+# legacy passthrough; the mapping and this code live in ``routing_guard`` so the
+# root PreToolUse hook twin shares them (D7).
+E_LEGACY_PROFILE_RETIRED = "E-LEGACY-PROFILE-RETIRED"
 
 
 class AssignmentResolutionError(ValueError):
@@ -728,6 +745,31 @@ class AssignmentResolutionError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def split_effective_name(name: str) -> "Optional[tuple[str, str]]":
+    """F786 D2b — split an effective spawn name ``<position>-<provider>``.
+
+    Returns ``(position, provider)`` when ``name`` ends in ``-<provider>`` for a
+    provider token in :class:`ProviderType`'s values, else ``None``. This is the
+    ONE parser D5, D6, D8 and D9 use over the effective name both resolvers now
+    produce (``_synthesise_position_profile_name`` / ``resolve_routing_binding``).
+
+    The provider token set is exactly ``ProviderType`` — nothing else. Provider
+    tokens carry underscores (``kiro_cli``) but never a hyphen, and after D3
+    deletes ``developer-opus``/``developer-sonnet`` no surviving position or
+    legacy flat name contains a hyphen, so ``rsplit('-', 1)`` recovers the pair
+    unambiguously and a legacy flat name (``kiro_dev``) returns ``None`` — the
+    one-way legacy reader D6 relies on to render the raw name.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    if not isinstance(name, str) or "-" not in name:
+        return None
+    position, _, provider = name.rpartition("-")
+    if not position or provider not in {p.value for p in ProviderType}:
+        return None
+    return position, provider
 
 
 def _position_exists(position_name: str) -> bool:
@@ -775,6 +817,21 @@ def resolve_assignment_target(
     """
     is_position = _position_exists(agent_profile)
 
+    # F786 D3 — a RETIRED legacy profile name is refused BEFORE the legacy
+    # passthrough, naming the position it filled and the routing row, so no
+    # retired name can reach a spawn. EXCEPTION: a name that is ALSO a live
+    # position (``secretary`` is both a retired flat profile AND a routed
+    # position) takes the routed path — the position wins, exactly as the
+    # server's routing-driven detection already treats it. The mapping IS the
+    # list (no provider-prefix pattern matching); it lives in ``routing_guard``
+    # so the root PreToolUse hook twin shares it byte-for-byte (D7).
+    if not is_position:
+        from cli_agent_orchestrator.utils.routing_guard import retired_profile_refusal
+
+        _retired = retired_profile_refusal(agent_profile)
+        if _retired is not None:
+            raise AssignmentResolutionError(E_LEGACY_PROFILE_RETIRED, _retired)
+
     # NOT ENGAGED: no provider= and not a bare position file → legacy passthrough
     # (no store lookup, no shape inference). Pre-D7 behaviour preserved exactly.
     if provider is None and not is_position:
@@ -816,12 +873,9 @@ def resolve_assignment_target(
             f"'{agent_profile}' allowlist {allow}",
         )
 
-    # D6 — synthesise the spawn profile name for a position-name target. When a
-    # legacy alias stub exists for this (provider, position) cell, prefer it (its
-    # ``description`` identity + ``[p.profiles.<name>]`` overrides stay keyed on
-    # the legacy name, D6); otherwise synthesise ``<provider>_<position>``
-    # deterministically. Legacy dev names (``codex_dev``/``grok_dev``) are never
-    # reached here — they are not position files, so this branch is position-only.
+    # D6/D2b — synthesise the effective spawn profile name for a position-name
+    # target: ``<position>-<provider>`` (F786). No legacy-alias scan survives;
+    # the composed profile (D8) is written under this name at the server seam.
     effective = _synthesise_position_profile_name(agent_profile, provider)
     return effective, provider
 
@@ -849,49 +903,16 @@ def _routing_provider_for_position(position_name: str) -> Optional[str]:
 
 
 def _synthesise_position_profile_name(position_name: str, provider: str) -> str:
-    """D6 — resolve a position-name target to its concrete spawn profile name.
+    """D2b — the effective spawn profile name for a (position, provider) cell.
 
-    Prefers an existing LEGACY ALIAS stub for the (provider, position) cell so
-    name-keyed config (``[p.profiles.<name>]``, ``default_fork_base``,
-    ``find_profiles``) stays keyed on the legacy name (D6). Falls back to the
-    deterministic ``<provider>_<position>`` synthesis when no alias resolves it.
-    The alias search reads the flat agent store and matches a stub whose
-    ``extends``/``position`` == this position AND ``provider`` == this provider.
+    ``<position>-<provider>`` (F786), the disjoint composed namespace: the
+    hyphen is legal in both enforced validators (``_VALID_TMUX_NAME`` and the
+    profile ``name`` pattern) and ``resolve_terminal_id`` splits only the
+    trailing ``-<8 hex>``. No legacy-alias scan survives — the composed profile
+    (D8) is materialised under this name at the server seam, and
+    :func:`split_effective_name` is its inverse.
     """
-    synthesized = f"{provider}_{position_name}"
-    try:
-        alias = _find_alias_for_cell(position_name, provider)
-    except Exception:
-        alias = None
-    return alias or synthesized
-
-
-def _find_alias_for_cell(position_name: str, provider: str) -> Optional[str]:
-    """Find a legacy alias stub bound to (position_name, provider), or None.
-
-    Scans the flat agent-store ``*.md`` for a composition stub whose resolved
-    (position, provider) matches. Returns the stub's file stem (the legacy
-    concrete name) so D6 keeps name-keyed consumers working. A synthesised name
-    that IS itself an installed stub is returned as-is by the caller's default.
-    """
-    import frontmatter
-
-    from cli_agent_orchestrator.constants import local_agent_store_dir
-
-    store = local_agent_store_dir()
-    if not store.exists():
-        return None
-    for path in sorted(store.glob("*.md")):
-        try:
-            meta = dict(frontmatter.loads(path.read_text(encoding="utf-8")).metadata)
-        except Exception:
-            continue
-        if not profile_declares_composition(meta):
-            continue
-        pos = meta.get("extends") or meta.get("position")
-        if pos == position_name and meta.get("provider") == provider:
-            return path.stem
-    return None
+    return f"{position_name}-{provider}"
 
 
 def compose_position_profile_for_spawn(
@@ -899,25 +920,26 @@ def compose_position_profile_for_spawn(
 ) -> "Optional[tuple[AgentProfile, str]]":
     """Reconstruct the composed profile for a position-composed spawn name (F778 #635).
 
-    A position-composed assign synthesises the spawn name ``<provider>_<position>``
-    (D6/D7, ``_synthesise_position_profile_name``) purely in memory — no ``.md``
-    file exists for it, so ``load_agent_profile(spawn_name)`` raises
-    ``FileNotFoundError``. This recovers the composition inputs from the name:
-    strip the ``<provider>_`` prefix and, when the remainder is an existing
-    position file, compose that position with ``provider`` exactly as the
-    resolver seam would.
+    A position-composed assign synthesises the spawn name ``<position>-<provider>``
+    (D2b, ``_synthesise_position_profile_name``) purely in memory — no ``.md``
+    file exists for it until D8's writer materialises it. This recovers the
+    composition inputs from the name via :func:`split_effective_name` and, when
+    the position half is an existing position file bound to THIS ``provider``,
+    composes that position exactly as the resolver seam would.
 
     Returns ``(composed_profile, composed_source)`` when ``spawn_name`` is a
-    resolvable ``<provider>_<position>`` synthesis for THIS ``provider``; returns
+    resolvable ``<position>-<provider>`` synthesis for THIS ``provider``; returns
     ``None`` for any legacy/uninstalled name (no matching position), so the
     caller keeps the genuine-legacy failure path. ``composed_source`` is the
     UNRESOLVED composed markdown (``compose_agent_profile_source`` shape) so a
     caller can write a context file byte-identical to the install path.
     """
-    prefix = f"{provider}_"
-    if not spawn_name.startswith(prefix):
+    split = split_effective_name(spawn_name)
+    if split is None:
         return None
-    position_name = spawn_name[len(prefix) :]
+    position_name, name_provider = split
+    if name_provider != provider:
+        return None
     if not position_name or not _position_exists(position_name):
         return None
 
@@ -954,3 +976,85 @@ def compose_position_profile_for_spawn(
         return None
 
     return composed, composed_source
+
+
+def write_composed_profile_for_spawn(spawn_name: str, provider: str) -> "Optional[Path]":
+    """F786 D8 — materialise the composed profile for a position-composed spawn.
+
+    Composes ``<position>-<provider>`` (via
+    :func:`compose_position_profile_for_spawn`) and writes the UNRESOLVED source
+    to ``agent-store/composed/<spawn_name>.md`` atomically (temp+rename) and
+    idempotently — re-writing identical bytes on a repeat assign. This is the
+    ONLY writer of ``composed/``; it is invoked at the server assign seam for
+    whatever effective name resolution returned (position or D11 fallback) so a
+    profile-less spawn is impossible (``load_agent_profile`` then finds the file).
+
+    Returns the written path, or ``None`` when ``spawn_name`` is not a resolvable
+    ``<position>-<provider>`` synthesis for THIS provider (a legacy passthrough
+    name has no composed profile to write — the caller keeps its normal path).
+    """
+    resolved = compose_position_profile_for_spawn(spawn_name, provider)
+    if resolved is None:
+        return None
+    _composed_profile, composed_source = resolved
+
+    from cli_agent_orchestrator.constants import composed_store_dir
+    from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+
+    target = composed_store_dir() / f"{spawn_name}.md"
+    locked_atomic_write(target, composed_source)
+    return target
+
+
+def resolve_resume_effective_name(
+    agent_profile: str, provider: Optional[str], position_column: Optional[str] = None
+) -> "tuple[str, str, str]":
+    """F786 D9 — the effective spawn name to resume a grandfathered row with.
+
+    Nothing rewrites a stored ``agent_profile``; on an F444 resume the effective
+    ``<position>-<provider>`` name is derived from, in order:
+
+      1. the D6 ``position`` column when present (source ``column``) — even if
+         ``agent_profile`` is itself unmapped;
+      2. else ``RETIRED_PROFILES[agent_profile]`` as the position (source
+         ``retired_map``);
+      3. else, when ``agent_profile`` already splits as a composed name, its own
+         position (source ``effective``); a bare position name resumes as-is.
+
+    Returns ``(effective_name, position, source)``. Raises
+    ``AssignmentResolutionError(E_LEGACY_PROFILE_RETIRED)`` when ``agent_profile``
+    is a RETIRED name that maps to no position (``grok_reviewer``) or is
+    otherwise unresolvable — no lane is guessed. ``provider`` must be the row's
+    own ``provider`` column (D9); a missing provider is a hard failure.
+    """
+    from cli_agent_orchestrator.utils.routing_guard import (
+        RETIRED_PROFILES,
+        retired_profile_refusal,
+    )
+
+    if not provider:
+        raise AssignmentResolutionError(
+            E_POSITION_NEEDS_PROVIDER,
+            f"{E_POSITION_NEEDS_PROVIDER}: resume of '{agent_profile}' has no "
+            f"provider column to bind the effective name (D9)",
+        )
+
+    # (1) D6 column wins — even for an unmapped agent_profile.
+    if position_column:
+        return f"{position_column}-{provider}", position_column, "column"
+
+    # (2) retired legacy name → its mapped position (grok_reviewer → refusal).
+    if agent_profile in RETIRED_PROFILES:
+        position = RETIRED_PROFILES[agent_profile]
+        if position is None:
+            raise AssignmentResolutionError(
+                E_LEGACY_PROFILE_RETIRED,
+                retired_profile_refusal(agent_profile) or agent_profile,
+            )
+        return f"{position}-{provider}", position, "retired_map"
+
+    # (3) already a composed name, or a bare position — resume as itself.
+    split = split_effective_name(agent_profile)
+    if split is not None:
+        return agent_profile, split[0], "effective"
+    return f"{agent_profile}-{provider}", agent_profile, "effective"

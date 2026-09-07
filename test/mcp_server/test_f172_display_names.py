@@ -9,7 +9,6 @@ import pytest
 
 from cli_agent_orchestrator.utils.terminal import display_name, resolve_terminal_id
 
-
 _SERVER = "cli_agent_orchestrator.mcp_server.server"
 _UTILS = "cli_agent_orchestrator.utils.terminal"
 _DB = "cli_agent_orchestrator.clients.database"
@@ -120,11 +119,11 @@ class TestAssignDisplayName:
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
-        result = _assign_impl("kiro_dev", "do something")
+        result = _assign_impl("developer", "do something")
         assert result["success"] is True
-        assert result["display_name"] == "kiro_dev-a1b2c3d4"
+        assert result["display_name"] == "developer-a1b2c3d4"
         # message leads with display form
-        assert result["message"].startswith("Task assigned to kiro_dev-a1b2c3d4")
+        assert result["message"].startswith("Task assigned to developer-a1b2c3d4")
 
     @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
     @patch(f"{_SERVER}._configured_default_fork_base", return_value=None)
@@ -135,8 +134,8 @@ class TestAssignDisplayName:
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
-        result = _assign_impl("kiro_dev", "do something")
-        assert "delete_terminal('kiro_dev-a1b2c3d4')" in result["message"]
+        result = _assign_impl("developer", "do something")
+        assert "delete_terminal('developer-a1b2c3d4')" in result["message"]
 
 
 # ─── MCP server render site: peek_terminal input resolution ──────────────────
@@ -184,6 +183,7 @@ class TestSendMessageInjection:
         monkeypatch.setenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
         # Reload the module-level flag
         import cli_agent_orchestrator.mcp_server.server as srv
+
         original = srv.ENABLE_SENDER_ID_INJECTION
         srv.ENABLE_SENDER_ID_INJECTION = True
         try:
@@ -193,7 +193,6 @@ class TestSendMessageInjection:
         # Check the message passed to _send_to_inbox
         sent_message = mock_send.call_args[0][1]
         assert "[Message from kiro_dev-a1b2c3d4 (a1b2c3d4)." in sent_message
-
 
 
 # ─── S1: Handoff error messages use display_name ─────────────────────────────
