@@ -72,6 +72,9 @@ class TestCommandConstruction:
         assert "--session-id" in parts and "t1234567" in parts
         assert "--append-system-prompt" in parts
         assert "--mcp-config" in parts
+        # --no-extensions disables the adapter that registers --mcp-config, so it
+        # must never be passed (see build report §1.2). Lock the hazard closed.
+        assert "--no-extensions" not in parts
 
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
     def test_model_and_thinking_resolved(self, mock_defaults) -> None:
