@@ -79,7 +79,7 @@ def _codex_like_provider(events: list[str], *, stuck: bool) -> MagicMock:
     provider.paste_submit_delay = 0.0
     provider.assume_processing_on_dispatch = False
 
-    def _verify(metadata, backend, message=None, baseline=None):
+    def _verify(metadata, backend, message=None, baseline=None, *, first_dispatch=False):
         events.append("verify")
         if stuck:
             raise CodexSubmitStuckError(

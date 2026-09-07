@@ -708,6 +708,8 @@ class BaseProvider(ABC):
         backend: Any,
         message: str | None = None,
         baseline: Any = None,
+        *,
+        first_dispatch: bool = False,
     ) -> None:
         """Provider hook called immediately after send_keys pastes+submits a message.
 
@@ -730,6 +732,13 @@ class BaseProvider(ABC):
         must never blind-Enter a composer that already submitted, and should
         raise a clear error naming the terminal if submission cannot be
         confirmed after bounded retries.
+
+        ``first_dispatch`` marks the FIRST task delivery of a terminal's life
+        (the deferred-init send / resubmit): the composer can then hold nothing
+        but the task CAO itself just pasted, so a provider MAY relax its strict
+        composer-ownership rule for last-resort recovery on that path only. On
+        the normal send seams it is False, where a human draft is reachable and
+        the strict ownership rule must hold. Other providers ignore it.
         """
 
     def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
