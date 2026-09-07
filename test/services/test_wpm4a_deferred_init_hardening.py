@@ -509,7 +509,106 @@ async def test_ready_commits_only_after_initial_send(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_quiesce_wins_between_ready_guard_and_persist(monkeypatch):
+async def test_f786_deferred_init_persists_threaded_position(monkeypatch):
+    """F786 (#643) B1 regression: the deferred-init persistence block reads the
+    position from the ``profile_position`` param threaded in from
+    create_terminal, NOT an unbound module-scope ``profile`` (which raised
+    NameError the first time a real deferred init reached the block — the
+    runtime face of the 33 new head failures, EMPIRICAL gate r1 B1). Drives
+    ``_run`` past the persistence block and asserts update_terminal_position
+    received the resolver-set position."""
+    events: list[str] = []
+    positions: list[tuple[str, str]] = []
+    provider = SimpleNamespace(
+        initialize=AsyncMock(),
+        supports_reauth_rebind=False,
+        shell_baseline=None,
+    )
+    monkeypatch.setattr(terminals, "send_input", lambda *_a, **_k: events.append("send"))
+    monkeypatch.setattr(
+        terminals,
+        "_confirm_worker_started_or_resubmit",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        terminals,
+        "mark_terminal_init_ready",
+        lambda _terminal, **_kwargs: events.append("ready") or True,
+    )
+    monkeypatch.setattr(
+        terminals,
+        "update_terminal_position",
+        lambda terminal_id, position: positions.append((terminal_id, position)) or True,
+    )
+    snapshot = {
+        "caller_id": "caller",
+        "agent_profile": "dev-grok_cli",
+        "provider": "grok_cli",
+        "init_deadline_s": 1.0,
+    }
+    terminals._schedule_deferred_init(
+        provider,
+        "worker",
+        "task",
+        OrchestrationType.ASSIGN,
+        None,
+        caller_snapshot=snapshot,
+        profile_position="dev",
+    )
+    await asyncio.gather(*list(terminals._deferred_init_tasks))
+    # Init reached the persistence block (no NameError) AND persisted the
+    # threaded position exactly once.
+    assert events == ["send", "ready"]
+    assert positions == [("worker", "dev")]
+
+
+@pytest.mark.asyncio
+async def test_f786_deferred_init_legacy_passthrough_leaves_position_null(monkeypatch):
+    """F786 (#643) B1 regression, negative arm: a legacy passthrough profile has
+    no resolver-set position (``profile_position`` is None), so the persistence
+    block skips the write and the column stays NULL — the fleet payload then
+    falls back to splitting the effective name."""
+    events: list[str] = []
+    positions: list[tuple[str, str]] = []
+    provider = SimpleNamespace(
+        initialize=AsyncMock(),
+        supports_reauth_rebind=False,
+        shell_baseline=None,
+    )
+    monkeypatch.setattr(terminals, "send_input", lambda *_a, **_k: events.append("send"))
+    monkeypatch.setattr(
+        terminals,
+        "_confirm_worker_started_or_resubmit",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        terminals,
+        "mark_terminal_init_ready",
+        lambda _terminal, **_kwargs: events.append("ready") or True,
+    )
+    monkeypatch.setattr(
+        terminals,
+        "update_terminal_position",
+        lambda terminal_id, position: positions.append((terminal_id, position)) or True,
+    )
+    snapshot = {
+        "caller_id": "caller",
+        "agent_profile": "kiro_dev",
+        "provider": "kiro_cli",
+        "init_deadline_s": 1.0,
+    }
+    terminals._schedule_deferred_init(
+        provider,
+        "worker",
+        "task",
+        OrchestrationType.ASSIGN,
+        None,
+        caller_snapshot=snapshot,
+        profile_position=None,
+    )
+    await asyncio.gather(*list(terminals._deferred_init_tasks))
+    assert events == ["send", "ready"]
+    assert positions == []
     entered = threading.Event()
     release = threading.Event()
     ready: list[str] = []

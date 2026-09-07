@@ -81,12 +81,63 @@ class TestAC8ComposedStore:
         assert path.read_text(encoding="utf-8") == source
 
     def test_missing_composed_name_fails_closed(self, cao_home):
-        """AC8 / MUTANT: profile-less fallback restored at terminal_service.
-        A composed name with no file must raise E-PROFILE-MISSING, not spawn."""
-        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+        """AC8 / MUTANT #9: profile-less fallback restored at terminal_service
+        (``if agent_profile:`` → ``if False:``). A composed NAMED profile with
+        no store file must drive ``create_terminal`` to raise E-PROFILE-MISSING
+        BEFORE any tmux window or DB row — not silently become a None profile
+        and a native spawn.
 
-        with pytest.raises(FileNotFoundError):
-            load_agent_profile("empirical_reviewer-codex")  # never written
+        The prior version of this test only asserted ``load_agent_profile`` (a
+        pure helper) raised FileNotFoundError and never entered
+        ``create_terminal``, so it could not observe the fail-closed raise and
+        the mutant survived (EMPIRICAL gate r1 B3). This drives the real
+        create_terminal test seam so the raise site is exercised."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            ProfileMissingError,
+            create_terminal,
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.load_agent_profile",
+                side_effect=FileNotFoundError("no such composed profile"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+                return_value="tid-b3",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_create_terminal"
+            ) as mock_db_create,
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend,
+            patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR"),
+            patch("cli_agent_orchestrator.services.terminal_service.fifo_manager"),
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor"),
+        ):
+            # A never-existing session so the mutant path (which continues past
+            # the raise) cannot incidentally trip the "session exists" guard —
+            # the ONLY lawful exit is the E-PROFILE-MISSING raise.
+            mock_backend.session_exists = MagicMock(return_value=False)
+            mock_backend.create_session = MagicMock()
+            mock_backend.create_window = MagicMock()
+
+            async def _drive():
+                with pytest.raises(ProfileMissingError, match="E-PROFILE-MISSING"):
+                    await create_terminal(
+                        provider="kiro_cli",
+                        agent_profile="empirical_reviewer-codex",  # NAMED, no store file
+                        new_session=True,
+                        allowed_tools=["*"],
+                    )
+
+            asyncio.run(_drive())
+            # Fail-closed BEFORE any tmux window / DB row.
+            mock_backend.create_window.assert_not_called()
+            mock_db_create.assert_not_called()
 
 
 class TestProfileMissingError:

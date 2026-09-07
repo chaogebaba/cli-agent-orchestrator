@@ -3002,6 +3002,7 @@ async def create_terminal(
                 refresh_base_name=refresh_base_name,
                 park_warm=park_warm,
                 f138_incarnation_id=_f138_incarnation_id,
+                profile_position=getattr(profile, "position", None),
             )
         else:
             # D21: Exposure boundary = pane+token already bound before initialize
@@ -5493,6 +5494,7 @@ def _schedule_deferred_init(
     refresh_base_name: str | None = None,
     park_warm: bool = False,
     f138_incarnation_id: str | None = None,
+    profile_position: str | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -5659,10 +5661,12 @@ def _schedule_deferred_init(
                 )
             # F786 (#643) D6: persist the resolved POSITION post-initialize, by
             # the same mechanism. Sourced from AgentProfile.position (the
-            # resolver-set field — NOT a re-parse of the effective name); a
-            # legacy passthrough profile has None here, so the column stays NULL
-            # and the fleet payload falls back to splitting the name.
-            _f786_position = getattr(profile, "position", None)
+            # resolver-set field — NOT a re-parse of the effective name),
+            # threaded in from create_terminal as ``profile_position`` (the
+            # ``profile`` object is not in this module-level scope); a legacy
+            # passthrough profile has None here, so the column stays NULL and the
+            # fleet payload falls back to splitting the name.
+            _f786_position = profile_position
             if _f786_position:
                 await _tracked_blocking(
                     terminal_id,

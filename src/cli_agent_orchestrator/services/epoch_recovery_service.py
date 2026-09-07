@@ -79,12 +79,18 @@ def _recovered_caller_id(row: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
+def _result(
+    base: str,
+    status: str,
+    terminal_id: str | None = None,
+    error_code: str | None = None,
+    unscoped: bool = False,
+) -> dict[str, str | bool | None]:
     retryable = status in {"resume_failed", "skipped_busy"} and error_code not in {
         "rollback_kill_uncertain",
         "quarantine_persist_failed",
     }
-    row = {
+    row: dict[str, str | bool | None] = {
         "base": base,
         "status": status,
         "terminal_id": terminal_id,
