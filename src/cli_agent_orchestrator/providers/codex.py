@@ -5103,8 +5103,16 @@ class CodexProvider(BaseProvider):
                             _f802_pre_status = _f802_status_monitor.get_status(self.terminal_id)
                         except Exception:
                             _f802_pre_status = None
+                        # B-3 (#658 r3): fail CLOSED on a status-read failure.
+                        # ``None != WAITING_USER_ANSWER`` is true, so the r2
+                        # guard authorized the recovery Enter even when the
+                        # pre-Enter status read raised (or the monitor import
+                        # left _f802_status_monitor unbound). Require a
+                        # POSITIVELY obtained, non-dialog status before Enter;
+                        # None/unknown falls through to backoff/raise.
                         if not (
                             isinstance(_f802_pre_enter, str)
+                            and _f802_pre_status is not None
                             and _f802_pre_status != TerminalStatus.WAITING_USER_ANSWER
                             and self._composer_holds_unsubmitted_text(_f802_pre_enter)
                         ):

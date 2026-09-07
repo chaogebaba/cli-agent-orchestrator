@@ -477,6 +477,59 @@ class TestF802ErrorCarriesComposerExcerpt:
 
 
 # ---------------------------------------------------------------------------
+# B-3 (#658 r3): the pre-Enter status reread must FAIL CLOSED when the status
+# read raises or returns None/unknown. ``None != WAITING_USER_ANSWER`` is true,
+# so the r2 guard authorized the recovery Enter on a failed read; the fix
+# requires a positively obtained, non-dialog status before the Enter.
+# ---------------------------------------------------------------------------
+
+
+class TestF802StatusReadFailClosed:
+    def test_status_read_raises_no_enter(self, rollout_dir: Path, patched_codex_home: Path):
+        """B-3: if the pre-Enter status read RAISES, the recovery must not send
+        Enter (fail closed) — it falls through to the backoff/raise path."""
+        msg = "Do the widget refactor with zero status reads"
+        baseline = _baseline(rollout_dir)
+
+        backend = _backend_seq(_pane_chip_mismatch(999))
+        provider = _provider()
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+            side_effect=RuntimeError("status read exploded"),
+        ):
+            with pytest.raises(CodexSubmitStuckError):
+                provider.verify_submission_after_send(
+                    _metadata(), backend, message=msg, baseline=baseline, first_dispatch=True
+                )
+        assert _enter_calls(backend) == 0
+
+    def test_status_read_returns_none_no_enter(self, rollout_dir: Path, patched_codex_home: Path):
+        """B-3: if the pre-Enter status read returns None/unknown, the recovery
+        must not send Enter — None is not a positively obtained non-dialog
+        status, so the branch falls through to the backoff/raise path."""
+        msg = "Do the widget refactor with a None status read"
+        baseline = _baseline(rollout_dir)
+
+        backend = _backend_seq(_pane_chip_mismatch(999))
+        provider = _provider()
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+            return_value=None,
+        ):
+            with pytest.raises(CodexSubmitStuckError):
+                provider.verify_submission_after_send(
+                    _metadata(), backend, message=msg, baseline=baseline, first_dispatch=True
+                )
+        assert _enter_calls(backend) == 0
+
+
+# ---------------------------------------------------------------------------
+# Option-1 guard (supervisor ruling): a NORMAL (non-first-dispatch) send with an
+# unowned composer must still send ZERO Enters — the relaxation is scoped to the
+# deferred-init/first-dispatch path only.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Option-1 guard (supervisor ruling): a NORMAL (non-first-dispatch) send with an
 # unowned composer must still send ZERO Enters — the relaxation is scoped to the
 # deferred-init/first-dispatch path only.
