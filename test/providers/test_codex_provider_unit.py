@@ -712,7 +712,10 @@ class TestCodexProviderModelFlag:
     def test_wpq1_profile_model_layer_wins_over_provider_default(
         self, mock_load, provider_defaults_file
     ):
+        # F786 (#643) D5: model/effort keys are POSITION-keyed. The profile
+        # carries its resolved position and the toml key is that position.
         mock_profile = MagicMock(
+            position="dev",
             model="frontmatter",
             system_prompt=None,
             mcpServers=None,
@@ -721,11 +724,11 @@ class TestCodexProviderModelFlag:
         )
         mock_load.return_value = mock_profile
         provider_defaults_file.write_text(
-            '[codex]\nmodel = "provider"\n[codex.profiles.agent]\nmodel = "profile"\n',
+            '[codex]\nmodel = "provider"\n[codex.profiles.dev]\nmodel = "profile"\n',
             encoding="utf-8",
         )
 
-        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+        command = CodexProvider("tid", "sess", "win", "dev-codex")._build_codex_command()
 
         assert "--model profile" in command
         assert "--model provider" not in command
@@ -734,7 +737,9 @@ class TestCodexProviderModelFlag:
     def test_wpq1_empty_profile_model_layer_clears_all_fallbacks(
         self, mock_load, provider_defaults_file
     ):
+        # F786 (#643) D5: position-keyed model layer (empty clears).
         mock_profile = MagicMock(
+            position="dev",
             model="frontmatter",
             system_prompt=None,
             mcpServers=None,
@@ -743,11 +748,11 @@ class TestCodexProviderModelFlag:
         )
         mock_load.return_value = mock_profile
         provider_defaults_file.write_text(
-            '[codex]\nmodel = "provider"\n[codex.profiles.agent]\nmodel = ""\n',
+            '[codex]\nmodel = "provider"\n[codex.profiles.dev]\nmodel = ""\n',
             encoding="utf-8",
         )
 
-        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+        command = CodexProvider("tid", "sess", "win", "dev-codex")._build_codex_command()
 
         assert "--model" not in command
 
@@ -1344,7 +1349,9 @@ class TestCodexProviderCodexConfig:
     def test_wpq1_profile_reasoning_layer_wins_over_provider_default(
         self, mock_load, provider_defaults_file
     ):
+        # F786 (#643) D5: reasoning_effort key is POSITION-keyed.
         mock_profile = MagicMock(
+            position="dev",
             model=None,
             system_prompt=None,
             mcpServers=None,
@@ -1354,11 +1361,11 @@ class TestCodexProviderCodexConfig:
         mock_load.return_value = mock_profile
         provider_defaults_file.write_text(
             '[codex]\nreasoning_effort = "medium"\n'
-            '[codex.profiles.agent]\nreasoning_effort = "high"\n',
+            '[codex.profiles.dev]\nreasoning_effort = "high"\n',
             encoding="utf-8",
         )
 
-        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+        command = CodexProvider("tid", "sess", "win", "dev-codex")._build_codex_command()
 
         assert 'model_reasoning_effort="high"' in command
         assert 'model_reasoning_effort="medium"' not in command
@@ -1418,25 +1425,27 @@ class TestCodexEffortSingleSourceOfTruth:
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_toml_profile_layer_wins_and_persists_that(self, mock_load, provider_defaults_file):
-        """[codex.profiles.<name>] > [codex] > profile.reasoningEffort >
-        codexConfig: the winning layer is BOTH emitted and persisted."""
+        """[codex.profiles.<position>] > [codex] > profile.reasoningEffort >
+        codexConfig: the winning layer is BOTH emitted and persisted. F786 D5:
+        the profile key is the POSITION."""
         mock_profile = MagicMock(
+            position="dev",
             model=None,
             system_prompt=None,
             mcpServers=None,
             codexProfile=None,
             codexConfig={"model_reasoning_effort": "low"},
         )
-        mock_profile.name = "agent"
+        mock_profile.name = "dev-codex"
         mock_profile.reasoningEffort = "medium"
         mock_load.return_value = mock_profile
         provider_defaults_file.write_text(
             '[codex]\nreasoning_effort = "high"\n'
-            '[codex.profiles.agent]\nreasoning_effort = "xhigh"\n',
+            '[codex.profiles.dev]\nreasoning_effort = "xhigh"\n',
             encoding="utf-8",
         )
 
-        provider = CodexProvider("tid", "sess", "win", "agent")
+        provider = CodexProvider("tid", "sess", "win", "dev-codex")
         command = provider._build_codex_command()
 
         assert 'model_reasoning_effort="xhigh"' in command
