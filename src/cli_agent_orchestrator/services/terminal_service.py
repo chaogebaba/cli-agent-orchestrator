@@ -8000,6 +8000,15 @@ def _delete_terminal_under_lease(
             except Exception as e:
                 logger.warning(f"Failed to clear question_state for {terminal_id}: {e}")
             try:
+                # F792 (#649): drop the per-terminal turn-end marker too, so a
+                # deleted terminal's turn state does not leak (same rationale as
+                # question_state above).
+                from cli_agent_orchestrator.services.turn_state import turn_state
+
+                turn_state.forget(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear turn_state for {terminal_id}: {e}")
+            try:
                 from cli_agent_orchestrator.services.auto_responder import auto_responder
 
                 auto_responder.clear_terminal(terminal_id)

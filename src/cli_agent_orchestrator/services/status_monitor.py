@@ -2225,6 +2225,23 @@ class StatusMonitor:
                         # co-occur, AC-8).
                         if observation.busy_marker is False:
                             return status, "pane_delta_vetoed"
+                        # F792 (#649) OPTION 1: hook-truth precedence. A recorded
+                        # turn-END (Stop hook) newer than the last turn-START pins
+                        # the seat non-busy at a turn boundary — pane-delta churn
+                        # (a background Agent animating the pane) cannot upgrade it
+                        # to PROCESSING. Checked BEFORE the busy_marker in
+                        # (None, True) → PROCESSING arm so the pane delta cannot
+                        # override hook truth (AC3). Admits the PUBLISHED status
+                        # (IDLE/COMPLETED) tagged "turn_ended". SEAM: retired by
+                        # the modular-core D8 worker-truth log (see turn_state.py).
+                        try:
+                            from cli_agent_orchestrator.services.turn_state import turn_state
+
+                            turn_ended = turn_state.is_turn_ended(terminal_id)
+                        except Exception:
+                            turn_ended = False
+                        if turn_ended and status is not TerminalStatus.PROCESSING:
+                            return status, "turn_ended"
                         # F568 D12d (4) busy_marker in (None, True): existing
                         # outcome — PROCESSING/"pane_delta", or the expired admit.
                         if not observation.pane_hold_expired:

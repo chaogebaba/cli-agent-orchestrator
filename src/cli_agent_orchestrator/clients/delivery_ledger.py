@@ -204,6 +204,12 @@ KIND_SURFACES: dict[str, Surfaces] = {
     "NET_INTERRUPTED": Surfaces(fleet=True, bus=True, inbox=False),
     "TRANSIENT_OVERLOAD": Surfaces(fleet=True, bus=True, inbox=False),
     "CONTEXT_EXHAUSTED": Surfaces(fleet=True, bus=True, inbox=True),
+    # F792 (#649): EXPECTED not-busy state — fleet + bus carry `· waiting`, but
+    # the seat inbox NEVER does (inbox=False). A seat idle-waiting on its own
+    # background agents is decision-free liveness, exactly the class the
+    # supervisor-inbox-drain hook withholds; declining the inbox leg here keeps
+    # it off the seat entirely (reuses this map as the drain-class predicate).
+    "WAITING_ON_SUBAGENTS": Surfaces(fleet=True, bus=True, inbox=False),
 }
 
 # Default for an unmapped kind (AC6): fleet + bus carry it, inbox does NOT.
@@ -228,6 +234,34 @@ def busy_class_declines_inbox(kind: str) -> bool:
     row stays INSIDE the de-dup comparison (r3/B1)."""
     surf = surfaces_for_kind(kind)
     return surf.fleet and surf.bus and not surf.inbox
+
+
+def drain_class_declines_inbox(kind: str, subtype: Optional[str]) -> bool:
+    """F790 (#647): the SAME class the supervisor-inbox-drain hook withholds.
+
+    The hook (``.claude/hooks/supervisor-inbox-drain.sh``, F639 #494 / F718 #574)
+    keeps a condition body OUT of the seat when it is a BUSY-class ping OR a
+    ``command_exit_code`` process exit — decision-free liveness noise. F790 moves
+    that suppression UPSTREAM to the producer: such a condition is recorded
+    (fleet + bus + the durable ``condition_ledger``) but is NEVER enqueued to the
+    supervisor mailbox, so no native envelope can bypass the hook.
+
+    This is the ONE definition of that class, keyed on ``(kind, subtype)`` exactly
+    as the hook's shell predicate is::
+
+        body.startswith('[CONDITION]') and (
+            'kind=BUSY' in body
+            or ('kind=PROC_EXITED' in body and 'subtype=command_exit_code' in body))
+
+    ANOMALY-class conditions (DIALOG_BLOCKED, CAPPED, AUTH_EXPIRED, an unknown
+    kind, a non-``command_exit_code`` PROC_EXITED, …) return False and keep the
+    inbox leg — F790 does not touch their behaviour.
+    """
+    if kind == "BUSY":
+        return True
+    if kind == "PROC_EXITED" and subtype == "command_exit_code":
+        return True
+    return False
 
 
 # ─── D7: condition-plane decisions and the durable de-dup rule (AC21) ───────────

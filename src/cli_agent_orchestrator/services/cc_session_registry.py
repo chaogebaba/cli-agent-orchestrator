@@ -551,6 +551,43 @@ def check_version_guard(record: RegistryRecord) -> Optional[str]:
 # F459: Max message body bytes embedded in the native bridge message.
 _F459_MAX_BODY_BYTES = 8192
 
+# F790 (#647): the seat-envelope body rule. A `[CONDITION]`/`[watchdog]` body is
+# decision-free liveness/marker text that the supervisor-inbox-drain hook already
+# withholds from the seat's context; the native wake envelope must not smuggle it
+# in. Any OTHER body is capped so a single ring can never dump a multi-KB pane.
+_F790_WAKE_BODY_MAX_CHARS = 1500
+_F790_BODYLESS_PREFIXES = ("[CONDITION]", "[watchdog]")
+
+
+def normalize_wake_body(message_body: Optional[str]) -> Optional[str]:
+    """F790 (#647): the ONE seat-envelope body rule for ``build_wake_payload``.
+
+    * A body whose stripped text starts with ``[CONDITION]`` or ``[watchdog]``
+      collapses to ``None`` — the native envelope carries the ids ping only, never
+      the pane bytes (the drain hook already keeps these out of the seat context;
+      F639 #494 / F718 #574). The ``None`` return is passed straight through as
+      ``message_body=None``, which yields the legacy generic-ping envelope.
+    * Any other body longer than ``_F790_WAKE_BODY_MAX_CHARS`` (1,500) is
+      truncated to that many chars with a trailing marker naming the dropped count
+      and pointing at the inbox digest for the full text.
+    * A ``None`` input, or a body already within the cap, is returned unchanged.
+
+    This is the single place the rule lives (issue #647 cut 2); every caller of
+    ``build_wake_payload`` reaches it because ``build_wake_payload`` applies it to
+    its own ``message_body`` argument before building the envelope.
+    """
+    if message_body is None:
+        return None
+    if message_body.lstrip().startswith(_F790_BODYLESS_PREFIXES):
+        return None
+    if len(message_body) > _F790_WAKE_BODY_MAX_CHARS:
+        dropped = len(message_body) - _F790_WAKE_BODY_MAX_CHARS
+        return (
+            message_body[:_F790_WAKE_BODY_MAX_CHARS]
+            + f" …[truncated {dropped} chars; full body in the inbox digest]"
+        )
+    return message_body
+
 
 def build_wake_msg_id(
     receiver: str,
@@ -599,6 +636,12 @@ def build_wake_payload(
     """
     if priority is None:
         priority = ConfigService.get("supervisor.wake.priority", default="next")
+
+    # F790 (#647): apply the seat-envelope body rule at the single point every
+    # native-ring caller funnels through (inbox_service:1324 / :3962 via
+    # doorbell_coalesce, delivery_service rung1). A `[CONDITION]`/`[watchdog]`
+    # body collapses to None (ids-only ping); any other over-long body is capped.
+    message_body = normalize_wake_body(message_body)
 
     sender_name = _sanitize_sender_name(worker_name)
     sender_address = f"bridge:cao-{sender_name}"

@@ -95,6 +95,7 @@ _CONDITION_STYLES: Final[Dict[str, str]] = {
     "CONTEXT_EXHAUSTED": "yellow",
     "TRANSIENT_OVERLOAD": "yellow",
     "BUSY": "green",
+    "WAITING_ON_SUBAGENTS": "yellow",
 }
 
 #: Rendered when ``status`` is missing or empty — the script's ``or "?"`` branch.
@@ -151,6 +152,17 @@ _STATUS_WORDS: Final[Dict[str, str]] = {
 #: The style of the raw-status parenthetical — recessive, so the condition word
 #: owns the operator's attention while the raw status stays legible.
 STYLE_RAW_STATUS: Final[str] = "dim"
+
+
+#: F792 (#649): the EXPECTED "seat idle-waiting on its own background agents"
+#: condition. It is NOT a stall and NOT live work — it renders as a calm
+#: ``· waiting`` headline (its own quiet style), never the loud ``⚠`` headline a
+#: CAPPED/AUTH condition gets and never a ``[TAG]`` suffix. Rendered on an
+#: idle/completed seat by construction, so it is deliberately absent from
+#: ``_LIVE_WORK_CONDITIONS`` (it does not contradict a quiescent status).
+_WAITING_ON_SUBAGENTS: Final[str] = "WAITING_ON_SUBAGENTS"
+#: The cell text + style for the waiting-on-subagents condition.
+_WAITING_ON_SUBAGENTS_CELL: Final[Tuple[str, str]] = ("· waiting", STYLE_WAITING)
 
 
 def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
@@ -231,6 +243,13 @@ def status_cell(row: Mapping[str, Any]) -> Text:
         raw_condition = None
     if not raw_condition:
         return Text(text, style=style)
+
+    # F792 (#649): the waiting-on-subagents condition renders as a calm
+    # `· waiting` headline (never `⚠`, never a `[TAG]` suffix) — unless a wedge
+    # is present, which outranks every condition and keeps its own headline.
+    if str(raw_condition) == _WAITING_ON_SUBAGENTS and style != STYLE_WEDGE:
+        wait_text, wait_style = _WAITING_ON_SUBAGENTS_CELL
+        return Text(wait_text, style=wait_style)
 
     condition = str(raw_condition)
     condition_style = _CONDITION_STYLES.get(condition)

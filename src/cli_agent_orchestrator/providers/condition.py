@@ -63,6 +63,15 @@ class ConditionKind(str, Enum):
     PROC_EXITED = "PROC_EXITED"
     TRANSIENT_OVERLOAD = "TRANSIENT_OVERLOAD"
     BUSY = "BUSY"
+    # F792 (#649): an EXPECTED (not-anomalous) operating state — the seat has
+    # ENDED its own turn and is idle while one or more in-harness background
+    # AGENT lanes run (claude_code's "Waiting for N background agent(s) to
+    # finish" line). It is NOT busy and NOT a notice: it is never delivered to
+    # the supervisor inbox (it joins the F790 drain-class decline), it renders as
+    # `· waiting`, and it is meaningful on an idle/completed seat (so it is
+    # deliberately NOT a BUSY_CLASS_LABEL, which get_condition drops on a
+    # quiescent seat).
+    WAITING_ON_SUBAGENTS = "WAITING_ON_SUBAGENTS"
 
 
 class Confidence(str, Enum):
@@ -86,6 +95,12 @@ PRECEDENCE: Dict[ConditionKind, float] = {
     ConditionKind.CONTEXT_EXHAUSTED: 5.0,
     ConditionKind.TRANSIENT_OVERLOAD: 6.0,
     ConditionKind.BUSY: 7.0,
+    # F792 (#649): LAST — a live seat spinner (BUSY, 7.0) always wins over the
+    # subagent-wait line, so a seat that is genuinely working its own turn is
+    # never mislabelled `· waiting`. In practice the two are mutually exclusive
+    # (the wait line carries no spinner ellipsis), but the ordering makes the
+    # "working beats waiting" tie-break explicit.
+    ConditionKind.WAITING_ON_SUBAGENTS: 8.0,
 }
 
 
@@ -100,6 +115,13 @@ BUSY_CLASS_LABELS: "frozenset[str]" = frozenset({ConditionKind.BUSY.value})
 def is_busy_class_label(label: Optional[str]) -> bool:
     """True when ``label`` is a fleet condition label that asserts live work."""
     return label is not None and label in BUSY_CLASS_LABELS
+
+
+#: F790 (#647) cut 3: the write-time cap on a condition's ``evidence`` field. A
+#: raw pane row can run to many hundreds of characters; capping it at render time
+#: keeps a condition event from carrying a multi-KB pane fragment onto any
+#: surface. Kept beside the taxonomy so producer and any renderer share it.
+_F790_EVIDENCE_MAX_CHARS: int = 300
 
 
 @dataclass(frozen=True)
@@ -123,11 +145,25 @@ class Condition:
     scope: str = "provider"
 
     def render_event(self, terminal_id: str) -> str:
-        """Render the ONE typed event line (blueprint §3 event shape)."""
+        """Render the ONE typed event line (blueprint §3 event shape).
+
+        F790 (#647) cut 3: the ``evidence`` field is a raw pane row and can run to
+        many hundreds of characters (a wrapped provider TUI frame). It is capped
+        at :data:`_F790_EVIDENCE_MAX_CHARS` (300) here, at write time, with the
+        same truncation marker the wake-envelope rule uses — so a condition line
+        can never carry a multi-KB pane fragment onto any surface.
+        """
+        evidence = self.evidence
+        if len(evidence) > _F790_EVIDENCE_MAX_CHARS:
+            dropped = len(evidence) - _F790_EVIDENCE_MAX_CHARS
+            evidence = (
+                evidence[:_F790_EVIDENCE_MAX_CHARS]
+                + f" …[truncated {dropped} chars; full body in the inbox digest]"
+            )
         return (
             f"[CONDITION] terminal={terminal_id} kind={self.kind.value} "
             f"provider={self.provider} subtype={self.subtype} "
-            f'evidence="{self.evidence}" '
+            f'evidence="{evidence}" '
             f"reset_hint={self.reset_hint if self.reset_hint else 'none'} "
             f"host={self.host if self.host else 'none'} "
             f"credential_plane={self.credential_plane if self.credential_plane else 'none'} "
@@ -255,6 +291,16 @@ _CLINE_SELF_ABORT = re.compile(r"\[abort\] aborted by another client")
 _CODEX_BUSY = re.compile(r"Working \(.*esc to interrupt\)", re.IGNORECASE)
 _KIRO_BUSY = re.compile(r"Thinking\.\.\. \(esc to cancel\)|Kiro is working", re.IGNORECASE)
 _CLAUDE_BUSY = re.compile(r"[✶✢✽✻✳·*][^\n]*\u2026|Cooked for|Cultivat", re.IGNORECASE)
+# F792 (#649): claude_code's subagent-wait line — "✻ Waiting for N background
+# agent(s) to finish" (glyph optional/animating). An EXPECTED not-busy state:
+# the seat ended its own turn and is idle while an in-harness Agent lane runs.
+# Kept in sync with claude_code.SUBAGENT_WAIT_PATTERN by shape (a provider module
+# must not import a peer provider's regex here — same convention as the BUSY
+# anchors). The "agent" keyword after "Waiting for" is what distinguishes it from
+# the GH #392 "dynamic workflow/task to finish" line (which stays BUSY/working).
+_CLAUDE_SUBAGENT_WAIT = re.compile(
+    r"[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b[^\n]*\bagents?\b", re.IGNORECASE
+)
 _GROK_BUSY = re.compile(r"Waiting for response", re.IGNORECASE)
 _CLINE_BUSY = re.compile(r"\[thinking\]|\[run_commands\]", re.IGNORECASE)
 
@@ -505,6 +551,27 @@ def _classify_busy(provider: str, brows: List[str]) -> Optional[Condition]:
     return None
 
 
+def _classify_waiting_on_subagents(provider: str, brows: List[str]) -> Optional[Condition]:
+    """F792 (#649): claude_code seat idle while a background AGENT lane runs.
+
+    Matches the "Waiting for N background agent(s) to finish" line in the live
+    tail (a statement about the present, like BUSY — tail-scoped so a stale
+    scrollback line cannot re-assert it). Returns the EXPECTED, not-busy
+    ``WAITING_ON_SUBAGENTS`` condition. Only claude_code renders this line."""
+    if provider != "claude_code":
+        return None
+    ev = _first_evidence(brows[-BUSY_TAIL_ROWS:], _CLAUDE_SUBAGENT_WAIT)
+    if ev:
+        return Condition(
+            ConditionKind.WAITING_ON_SUBAGENTS,
+            provider,
+            "background_agents",
+            ev,
+            Confidence.HIGH,
+        )
+    return None
+
+
 # The per-kind classifiers, applied then ranked by §2.2 precedence.
 _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] = (
     _classify_capped,
@@ -514,6 +581,7 @@ _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] =
     _classify_dialog,
     _classify_transient,
     _classify_busy,
+    _classify_waiting_on_subagents,
 )
 
 
@@ -751,11 +819,14 @@ class ConditionDelivery:
         self._last[terminal_id] = key
         # ONE event → three surfaces, fanned out here (never three producers).
         self._set_fleet(terminal_id, label)
-        # F642 D5: the kind→surfaces map gates the INBOX leg. A BUSY-class kind
-        # fires fleet+bus but declines the inbox push; the memory is STILL set
-        # (this stays a `delivered` decision), so the row stays inside the de-dup
-        # comparison (r3/B1) — recorded via suppressed_reason='busy_class'.
-        inbox_declined = self._inbox_declined(cond.kind.value)
+        # F642 D5 / F790 (#647): the drain-class predicate gates the INBOX leg. A
+        # BUSY-class kind OR a command_exit PROC_EXITED fires fleet+bus but
+        # declines the inbox push — the SAME class the supervisor-inbox-drain hook
+        # withholds, moved upstream to the producer so no native envelope can
+        # bypass it. The memory is STILL set (this stays a `delivered` decision),
+        # so the row stays inside the de-dup comparison (r3/B1) — recorded via
+        # suppressed_reason='busy_class'.
+        inbox_declined = self._inbox_declined(cond.kind.value, cond.subtype)
         pushes = 0 if inbox_declined else self._push_inbox(terminal_id, cond)
         self._project_cli(terminal_id, cond, label)
         self._record(
@@ -783,15 +854,27 @@ class ConditionDelivery:
             )
         return self._last.get(terminal_id) == key
 
-    def _inbox_declined(self, kind: str) -> bool:
-        """D5: does the kind→surfaces map decline the inbox leg? Only consulted
+    def _inbox_declined(self, kind: str, subtype: str) -> bool:
+        """D5 / F790 (#647): does the inbox leg decline for this condition?
+
+        Declined when EITHER the drain-class predicate matches (BUSY, or a
+        command_exit PROC_EXITED — the SAME class the supervisor-inbox-drain hook
+        withholds, F718 #574) OR the F642 routing map (``KIND_SURFACES``) has no
+        inbox surface for the kind. The second arm preserves base behaviour for
+        the map's other inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD):
+        F790 must only STOP enqueuing the drain class, never START enqueuing a
+        kind the map already declined (gate r1 B1). Keyed on ``(kind, subtype)``
+        so the command_exit PROC_EXITED case is matched exactly. Only consulted
         when a log store is wired (spine active); otherwise F611's fan-out is
         unchanged."""
         if self._log_store is None:
             return False
-        from cli_agent_orchestrator.clients.delivery_ledger import busy_class_declines_inbox
+        from cli_agent_orchestrator.clients.delivery_ledger import (
+            drain_class_declines_inbox,
+            surfaces_for_kind,
+        )
 
-        return busy_class_declines_inbox(kind)
+        return drain_class_declines_inbox(kind, subtype) or not surfaces_for_kind(kind).inbox
 
     @staticmethod
     def _surfaces_str(kind: str) -> str:

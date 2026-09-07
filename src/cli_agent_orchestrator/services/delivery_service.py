@@ -566,6 +566,12 @@ def attempt_rung1(
                 logger.debug(
                     "f547 mark_socket_delivered failed for row %s", inbox_row_id, exc_info=True
                 )
+            # F783 #640: native consumption + typed NATIVE FAILED are recorded
+            # INSIDE `_attempt_native_ring` at its socket-write success / failure
+            # arms (the single authority that distinguishes write from verify),
+            # so this rung records neither here — doing so would double-record
+            # and would miss the wake_unverified case (body written, verify
+            # unconfirmed) that the write-success attach point already consumes.
             return LadderResult(
                 delivered=True,
                 phase="transport_attempt",
