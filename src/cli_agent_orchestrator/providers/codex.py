@@ -4446,6 +4446,86 @@ class CodexProvider(BaseProvider):
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
+    def _composer_region_text(captured: str) -> str | None:
+        """The whitespace-normalized body of the ACTIVE composer, or ``None``.
+
+        Anchors the current composer with the SAME strict adjacency the chip and
+        draft readers use (footer → ``_find_composer_anchor_index``), strips the
+        leading ``›``/``»``/``codex>`` glyph, and joins the anchor row plus its
+        continuation rows up to the footer. Returns ``None`` when no composer can
+        be anchored. Unlike ``read_composer_draft`` this does NOT apply the
+        human-draft ownership-defer guard (assistant output above ⇒ ``None``):
+        it reports what is literally sitting in the composer, which is exactly
+        what the F802 first-dispatch recovery needs — the stuck pane always has
+        the SEED_OK bullet above the composer, so that guard is what blinded the
+        draft path.
+        """
+        if not captured:
+            return None
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return None
+        search_end = footer_idx
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
+            search_end -= 1
+        region = "\n".join(plain_lines[prompt_idx:search_end])
+        body = re.sub(r"^\s*(?:›|»|❯|codex>)\s?", "", region)
+        return CodexProvider._normalize_pane_text(body)
+
+    @classmethod
+    def _composer_holds_unsubmitted_text(cls, captured: str) -> bool:
+        """F802 (#658): does the active composer plainly hold UNSUBMITTED content?
+
+        True when the anchored composer body is non-empty and is NOT one of the
+        idle placeholder suggestions ("Ask Codex to do anything", …). This is a
+        deliberately weaker signal than ``_pane_shows_stuck_chip`` (owned chip)
+        or ``_composer_holds_own_draft`` (signature-matched draft): it proves
+        only that SOMETHING unsubmitted is sitting in the composer, not that it
+        is provably ours.
+
+        It is ONLY consulted on the FIRST-DISPATCH (deferred-init) delivery path
+        (``first_dispatch=True``), where the terminal has just been created and
+        the composer can hold nothing but the task CAO itself just pasted — no
+        human draft is reachable. On the normal ``send_input`` /
+        ``send_prepared_input`` seams a human draft IS reachable, so those keep
+        the strict ownership rule and never call this (the r5/r6/f643c/split-
+        paste "unrelated composer is never Entered" guards stay intact).
+
+        Returns False (never raises) on any read/anchor failure and for the idle
+        placeholder or an empty composer, so an already-submitted (cleared)
+        composer is never blind-Entered even on the first dispatch.
+        """
+        body = cls._composer_region_text(captured)
+        if not body:
+            return False
+        if body in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
+            return False
+        return True
+
+    @staticmethod
+    def _composer_excerpt(captured: str, *, max_lines: int = 5) -> str:
+        """The last ``max_lines`` non-blank pane rows, for diagnostics.
+
+        Embedded verbatim in the terminal ``CodexSubmitStuckError`` so a reaped
+        worker's failure is diagnosable from the callback (the server-side reap
+        destroys the pane before cao-report.sh can collect it — #658).
+        """
+        if not captured:
+            return "<no pane captured>"
+        plain_lines = [
+            strip_terminal_escapes(line).rstrip() for line in captured.splitlines()
+        ]
+        nonblank = [line for line in plain_lines if line.strip()]
+        if not nonblank:
+            return "<empty pane>"
+        return "\n".join(nonblank[-max_lines:])
+
+    @staticmethod
     def _task_echo_signature(message: str | None) -> str | None:
         """A distinctive normalized prefix of the pasted task for echo matching.
 
@@ -4531,6 +4611,8 @@ class CodexProvider(BaseProvider):
         backend: Any,
         message: str | None = None,
         baseline: "CodexSubmitBaseline | None" = None,
+        *,
+        first_dispatch: bool = False,
     ) -> None:
         """F435 r6: confirm the pasted task SUBMITTED; re-Enter if it stuck.
 
@@ -4745,6 +4827,16 @@ class CodexProvider(BaseProvider):
                 return False
             return signature in self._normalize_pane_text(draft)
 
+        def _excerpt_now() -> str:
+            """Last composer lines for the terminal error (#658 diagnosability)."""
+            try:
+                cap = backend.get_history(
+                    session, window, tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False
+                )
+            except Exception:
+                cap = None
+            return self._composer_excerpt(cap if isinstance(cap, str) else "")
+
         # --- Main verification loop ---
         time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
 
@@ -4866,7 +4958,8 @@ class CodexProvider(BaseProvider):
                     raise CodexSubmitStuckError(
                         f"Codex terminal {self.terminal_id} has an active dialog "
                         f"blocking submission (WAITING_USER_ANSWER); the paste "
-                        f"never submitted. Auto-responder dismiss pending."
+                        f"never submitted. Auto-responder dismiss pending. "
+                        f"Last composer lines:\n{_excerpt_now()}"
                     )
                 logger.info(
                     "F435/F598 submit_verify_rearm: terminal %s dialog cleared; "
@@ -4933,10 +5026,82 @@ class CodexProvider(BaseProvider):
                         )
                         return
                     continue
-                # No stuck chip AND no owned draft: cannot recover with Enter.
-                # The task may have submitted but the rollout flush is slow, OR
-                # the pane is in an indeterminate state. Re-check rollout once
-                # more with an extended wait.
+                # No stuck chip AND no owned draft.
+                #
+                # F802 (#658) FIRST-DISPATCH LAST RESORT: on the deferred-init
+                # delivery path a paste can render in the composer that neither
+                # ownership test claims — a chip whose count fails the ±1/chip
+                # arithmetic (codex-cli split-paste under-report), or raw task
+                # text defeated by ``read_composer_draft``'s ownership-defer
+                # guard (the SEED_OK assistant bullet always sits above the
+                # stuck composer). Pre-F802 this branch only slept + re-checked
+                # rollout and NEVER sent Enter, so the paste sat unsubmitted
+                # until a human pressed Enter or the 180 s deferred-init reaper
+                # killed the worker (3 dispatches × 3 attempts on 2026-09-07,
+                # all logging "no stuck chip visible; re-checking rollout").
+                #
+                # This relaxation is SCOPED to first_dispatch=True, where the
+                # terminal was just created and the composer can hold nothing
+                # but the task CAO itself pasted — no human draft is reachable.
+                # On the normal send seams (first_dispatch=False) ownership stays
+                # strict, so the r5/r6/f643c/split-paste "unrelated composer is
+                # never Entered" guards are untouched. Still fail-closed on a
+                # dialog, and still bounded by the 3 attempts + the rollout
+                # double-send guard above (re-Enter is an ACTION, never a
+                # confirmation — the loop re-verifies via rollout, B1 invariant).
+                if first_dispatch:
+                    try:
+                        _f802_captured = backend.get_history(
+                            session,
+                            window,
+                            tail_lines=PYTE_SCREEN_ROWS,
+                            strip_escapes=False,
+                        )
+                    except Exception:
+                        _f802_captured = None
+                    _f802_status: TerminalStatus | None
+                    try:
+                        from cli_agent_orchestrator.services.status_monitor import (
+                            status_monitor as _f802_status_monitor,
+                        )
+
+                        _f802_status = _f802_status_monitor.get_status(self.terminal_id)
+                    except Exception:
+                        _f802_status = None
+                    if (
+                        isinstance(_f802_captured, str)
+                        and _f802_status != TerminalStatus.WAITING_USER_ANSWER
+                        and self._composer_holds_unsubmitted_text(_f802_captured)
+                    ):
+                        logger.warning(
+                            "F802 submit-verify: terminal %s first-dispatch composer "
+                            "holds unsubmitted content with no owned chip/draft and no "
+                            "rollout turn (attempt %d/%d); sending recovery Enter",
+                            self.terminal_id,
+                            attempt,
+                            CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+                        )
+                        try:
+                            backend.send_special_key(session, window, "Enter")
+                        except Exception as exc:
+                            logger.warning(
+                                "F802 submit-verify: re-Enter failed for terminal %s: %s",
+                                self.terminal_id,
+                                exc,
+                            )
+                        time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                        if _rollout_confirms():
+                            logger.info(
+                                "F802 submit-verify: terminal %s confirmed via rollout "
+                                "after first-dispatch unowned-paste recovery Enter",
+                                self.terminal_id,
+                            )
+                            return
+                        continue
+                # No recoverable owned chip/draft (and no first-dispatch paste to
+                # blind-recover). The task may have submitted but the rollout
+                # flush is slow, OR the pane is in an indeterminate state.
+                # Re-check rollout once more with an extended wait.
                 logger.warning(
                     "F435 submit-verify: terminal %s no stuck chip visible "
                     "(attempt %d/%d); re-checking rollout",
@@ -5094,7 +5259,7 @@ class CodexProvider(BaseProvider):
             f"no matching user-turn record in the rollout JSONL (after offset "
             f"{rollout_offset}), a forked rollout, or the SQLite thread-history "
             f"store, and the composer still holds the unsubmitted task — delivery "
-            f"is structurally unconfirmed"
+            f"is structurally unconfirmed. Last composer lines:\n{_excerpt_now()}"
         )
 
     @staticmethod

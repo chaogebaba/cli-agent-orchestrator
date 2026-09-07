@@ -5217,6 +5217,9 @@ async def _confirm_worker_started_or_resubmit(
                 orchestration_type=orchestration_type,
                 defer_on_dialog=True,
                 expect_callback=False,
+                # F802 #658: the resubmit is still the terminal's first task
+                # delivery (deferred-init) — same relaxation as the initial send.
+                first_dispatch=True,
             )
         if await wait_until_status(
             terminal_id,
@@ -5625,6 +5628,11 @@ def _schedule_deferred_init(
                 "registry": registry,
                 "sender_id": snapshot.get("caller_id"),
                 "orchestration_type": effective_orchestration_type,
+                # F802 #658: this is the terminal's FIRST task delivery — the
+                # composer can hold nothing but the task CAO just pasted, so the
+                # codex verify hook may recover a stuck paste with a bounded
+                # Enter even when strict chip/draft ownership does not match.
+                "first_dispatch": True,
             }
             if park_warm:
                 send_kwargs["expect_callback"] = False
@@ -6270,6 +6278,7 @@ def send_input(
     *,
     expect_callback: bool = True,
     _lifecycle_internal: bool = False,
+    first_dispatch: bool = False,
     frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
@@ -6290,6 +6299,12 @@ def send_input(
     is otherwise none of this function's business — not inspected, not validated,
     not logged. It is defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``) are unaffected.
+
+    ``first_dispatch`` marks the FIRST task delivery of a terminal's life (the
+    deferred-init send / resubmit). It is forwarded to the provider's
+    ``verify_submission_after_send`` so a TUI provider may relax its strict
+    composer-ownership rule for last-resort submit recovery on that path only
+    (F802 #658). Defaults False for every ordinary send.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -6415,7 +6430,11 @@ def send_input(
             # providers are unaffected.
             if provider:
                 provider.verify_submission_after_send(
-                    metadata, backend, message=message, baseline=submit_baseline
+                    metadata,
+                    backend,
+                    message=message,
+                    baseline=submit_baseline,
+                    first_dispatch=first_dispatch,
                 )
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
@@ -6526,8 +6545,14 @@ def send_prepared_input(
     orchestration_type: OrchestrationType | None = None,
     original_message: str | None = None,
     on_submitted=None,
+    first_dispatch: bool = False,
 ):
-    """Send already-shaped bytes; never apply contract or memory shaping again."""
+    """Send already-shaped bytes; never apply contract or memory shaping again.
+
+    ``first_dispatch`` (F802 #658) marks the first task delivery of a terminal's
+    life and is forwarded to the provider verify hook so a TUI provider may relax
+    its composer-ownership rule for last-resort submit recovery on that path only.
+    """
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -6624,7 +6649,11 @@ def send_prepared_input(
             # boundary, and only then is the human draft restored.
             if provider:
                 provider.verify_submission_after_send(
-                    metadata, backend, message=message, baseline=submit_baseline
+                    metadata,
+                    backend,
+                    message=message,
+                    baseline=submit_baseline,
+                    first_dispatch=first_dispatch,
                 )
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
