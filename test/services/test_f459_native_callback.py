@@ -295,8 +295,17 @@ class TestF459MarkerSuppression:
         assert result == "rang"
         mock_mark.assert_called_once_with(100)
 
-    def test_ring_no_marker_without_message_body(self):
-        """No marker when message_body is None (legacy path)."""
+    def test_ring_ids_only_records_one_marker_row_stays_pending(self):
+        """Ids-only successful ring: f459.socket_delivered is TRANSPORT truth.
+
+        F803 #660 r3 ruling: the marker is recorded on EVERY successful native
+        ring, body or not — exactly ONE marker for an ids-only ring. The
+        consumption side stays body-gated and lives inside
+        `_attempt_native_ring` (keyed on `body_carried`): an ids-only ring
+        records a non-muting `wake_only` NATIVE emission there, so the outer
+        `rang` branch attaches NO consumption and the row stays PENDING for
+        the drain hook.
+        """
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
 
         with (
@@ -307,7 +316,7 @@ class TestF459MarkerSuppression:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
                 return_value=True,
-            ),
+            ) as mock_pending,
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
                 return_value="rang",
@@ -315,16 +324,30 @@ class TestF459MarkerSuppression:
             patch(
                 "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
             ) as mock_mark,
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.consume_on_native_delivery"
+            ) as mock_consume,
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.record_native_wake_only"
+            ) as mock_wake_only,
         ):
             result = ring_supervisor_doorbell(
                 "term-01",
                 100,
                 written_count=1,
-                # No message_body — legacy call
+                # Ids-only wake — no message_body, no carried text.
             )
 
         assert result == "rang"
-        mock_mark.assert_not_called()
+        # Transport truth: exactly ONE marker on a successful ids-only ring.
+        mock_mark.assert_called_once_with(100)
+        # The outer rang branch settles nothing: consumption is body-gated
+        # inside `_attempt_native_ring`, so the row stays pending (an ids-only
+        # ring records `wake_only` there, which does not mute the hook).
+        mock_consume.assert_not_called()
+        mock_wake_only.assert_not_called()
+        # The ring fired only because the row was still pending.
+        mock_pending.assert_called_once_with(100)
 
 
 # ===========================================================================
