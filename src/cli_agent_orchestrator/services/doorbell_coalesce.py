@@ -133,9 +133,7 @@ class DoorbellCoalesceService:
         def _schedule() -> None:
             buf = self._buffers.get(terminal_id)
             if buf is not None:
-                buf.timer_handle = loop.call_later(
-                    delay, self._on_timer_fire, terminal_id
-                )
+                buf.timer_handle = loop.call_later(delay, self._on_timer_fire, terminal_id)
 
         try:
             loop.call_soon_threadsafe(_schedule)
@@ -213,17 +211,31 @@ class DoorbellCoalesceService:
                 preview = f"(row {intent.max_written_row_id})"
             summary_lines.append(f"- [{sender}] {preview}")
 
-        combined_body = (
-            f"[cao-fleet] {len(intents)} callbacks coalesced:\n"
-            + "\n".join(summary_lines)
+        digest_body = f"[cao-fleet] {len(intents)} callbacks coalesced:\n" + "\n".join(
+            summary_lines
         )
 
         # Append full bodies (truncated) for each
+        any_body_carried = False
         for intent in intents:
             if intent.message_body:
+                any_body_carried = True
                 sender = intent.sender_display_name or "worker"
-                combined_body += f"\n\n--- from {sender} (row {intent.max_written_row_id}) ---\n"
-                combined_body += intent.message_body
+                digest_body += f"\n\n--- from {sender} (row {intent.max_written_row_id}) ---\n"
+                digest_body += intent.message_body
+
+        # F803 #660 (B1): when EVERY coalesced intent is bodyless (ids-only), the
+        # synthesized `[cao-fleet] N callbacks coalesced:` digest is not real
+        # callback text — it is a header + `(row N)` placeholders the seat can
+        # already see as ids. Passing that non-None digest downstream made
+        # `body_carried = normalize_wake_body(...) is not None` True at the single
+        # authoritative consumption decision (doorbell_service `_attempt_native_ring`),
+        # so an all-bodyless batch was consumed and the drain hook starved. Represent
+        # an all-bodyless batch as bodyless: the wake still fires (ids + count), the
+        # ring records WAKE_ONLY, the rows stay pending, and the hook wins them. When
+        # at least one intent carried a real body the digest genuinely carries text
+        # (its full body is appended above) and consumption proceeds as today.
+        combined_body: str | None = digest_body if any_body_carried else None
 
         try:
             # F461: coalesce timer fires asynchronously — no delivery lock is held

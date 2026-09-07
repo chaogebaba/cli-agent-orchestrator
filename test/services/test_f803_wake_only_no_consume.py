@@ -201,29 +201,111 @@ def _native_socket(monkeypatch, *, write_err, verify=True, socket_path="/x.sock"
 # ── AC(a): ids-only ring → row stays pending, hook_claim wins it ──────────────
 
 
-def test_ac_a_coalesced_digest_is_ids_only_no_consume_hook_wins(db_env, monkeypatch):
-    """teammate_push=false: the coalescer passes a synthesized `[cao-fleet]`
-    digest as message_body, but per the seat-envelope rule the wake carries ids
-    only. This is the exact production defect: the socket write succeeds, yet the
-    row MUST stay pending and the hook MUST win it."""
+def _bind_coalescer_to_native_ring(monkeypatch):
+    """Bind a real DoorbellCoalesceService's fire_fn to the REAL
+    _attempt_native_ring, so a coalesced batch flows end-to-end into the single
+    authoritative body_carried consumption decision. Returns the bound service.
+
+    The coalescer's fire_fn signature mirrors ring_supervisor_doorbell
+    (terminal_id, max_row, *, written_count, message_body, sender_display_name,
+    caller_holds_no_delivery_lock); _attempt_native_ring takes only
+    (terminal_id, row_id, *, message_body, sender_display_name), so the adapter
+    drops the transport-only kwargs.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.services.doorbell_coalesce import DoorbellCoalesceService
+
+    def _fire(terminal_id, max_row, *, message_body=None, sender_display_name=None, **_ignored):
+        return _dbs._attempt_native_ring(
+            terminal_id,
+            max_row,
+            message_body=message_body,
+            sender_display_name=sender_display_name,
+        )
+
+    loop = asyncio.new_event_loop()
+    svc = DoorbellCoalesceService()
+    svc.bind(loop, _fire)
+    # A NON-ZERO window so submit() BUFFERS both intents (coalesce_s=0 would fire
+    # each inline via _fire_single, never reaching _fire_coalesced where the B1
+    # fix lives). The timer is armed on the (un-run) loop and never fires on its
+    # own; the test drains synchronously via flush_all() to force _fire_coalesced.
+    monkeypatch.setattr(type(svc), "_coalesce_s", property(lambda self: 60.0), raising=False)
+    return svc, loop
+
+
+def test_ac_a_coalesced_all_bodyless_batch_stays_pending_hook_wins(db_env, monkeypatch):
+    """B1 (r1 verdict BLOCKER 1): the teammate_push=false coalesced path.
+
+    Two bodyless (ids-only) intents coalesce. The coalescer synthesizes a
+    non-empty `[cao-fleet] N callbacks coalesced:` digest string — but that text
+    is a header + `(row N)` placeholders, NOT real callback text. It MUST be
+    represented as bodyless so the single authoritative body_carried decision in
+    _attempt_native_ring records WAKE_ONLY: the rows stay pending and the hook
+    wins them. Recording native_consumed here (digest counted as a body) was the
+    exact production defect (rows flip to delivered, hook_claim returns [],
+    nothing surfaced).
+
+    This drives the REAL DoorbellCoalesceService end-to-end into the REAL
+    _attempt_native_ring (unlike the prior hand-passed-digest control)."""
     with db_env() as db:
-        _add_row(db, 300)
+        _add_row(db, 305)
+        _add_row(db, 306)
         db.commit()
 
-    # A digest whose FIRST LINE is the [cao-fleet] header — same shape the
-    # coalescer builds. normalize_wake_body keeps this (it is not a
-    # [CONDITION]/[watchdog] body), so this case proves the fix does NOT
-    # over-broadly suppress a genuine multi-line digest body: a real digest with
-    # text DOES carry. We instead exercise the true ids-only path below with a
-    # [CONDITION] body and with message_body=None.
-    with _native_socket(monkeypatch, write_err=None, verify=True):
-        decision = _dbs._attempt_native_ring(
-            SEAT, 300, message_body="[cao-fleet] 2 callbacks coalesced:\n- [w] done"
-        )
-    # This digest carries text → consumed as today (control for over-suppression).
-    assert decision == "rang"
-    assert _status(db_env, 300) == MessageStatus.DELIVERED.value
-    assert _emissions(db_env, 300) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
+    svc, loop = _bind_coalescer_to_native_ring(monkeypatch)
+    try:
+        with _native_socket(monkeypatch, write_err=None, verify=True):
+            # Two bodyless intents for the same seat → buffered, then one
+            # coalesced ring on flush.
+            svc.submit(SEAT, 305, written_count=1, message_body=None, sender_display_name="w1")
+            svc.submit(SEAT, 306, written_count=1, message_body=None, sender_display_name="w2")
+            svc.flush_all()  # force _fire_coalesced synchronously
+    finally:
+        loop.close()
+
+    # The coalesced ring fired against the max row id (306) as an ids-only wake.
+    assert _status(db_env, 306) == MessageStatus.PENDING.value
+    assert _cursor(db_env) == 0
+    assert _emissions(db_env, 306) == {Carrier.NATIVE.value: EmissionOutcome.WAKE_ONLY.value}
+    # The hook WINS the coalesced row — the whole point of B1.
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[306]) == [306]
+        db.commit()
+
+
+def test_ac_a_coalesced_batch_with_a_real_body_still_consumes(db_env, monkeypatch):
+    """Control for over-suppression: a coalesced batch where at least one intent
+    carried a real body DOES carry text (the full body is appended into the
+    digest) and is consumed exactly as today — B1 must not suppress a genuine
+    body. Drives the REAL coalescer end-to-end."""
+    with db_env() as db:
+        _add_row(db, 307)
+        _add_row(db, 308)
+        db.commit()
+
+    svc, loop = _bind_coalescer_to_native_ring(monkeypatch)
+    try:
+        with _native_socket(monkeypatch, write_err=None, verify=True):
+            svc.submit(SEAT, 307, written_count=1, message_body=None, sender_display_name="w1")
+            svc.submit(
+                SEAT,
+                308,
+                written_count=1,
+                message_body="real callback text",
+                sender_display_name="w2",
+            )
+            svc.flush_all()  # force _fire_coalesced synchronously
+    finally:
+        loop.close()
+
+    assert _status(db_env, 308) == MessageStatus.DELIVERED.value
+    assert _emissions(db_env, 308) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
+    # Consumed (row delivered + SUCCEEDED) — the hook does NOT win it.
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[308]) == []
+        db.commit()
 
 
 def test_ac_a_condition_body_collapses_to_ids_only_stays_pending(db_env, monkeypatch):
@@ -359,6 +441,84 @@ def test_ac_c_write_failure_records_no_wake_only_for_ids_only(db_env, monkeypatc
     assert _emissions(db_env, 322) == {}
     with db_env() as db:
         assert hook_claim_ids(db, candidate_ids=[322]) == [322]
+        db.commit()
+
+
+# ── SHOULD (r1 verdict): the f459.socket_delivered TRANSPORT marker is written ─
+# ── by BOTH outer callers (ring_supervisor_doorbell + attempt_rung1) on a ──────
+# ── successful ring, for BOTH body-carrying and ids-only rings, while their ────
+# ── consumption outcomes differ. The AC(c) tests above drive _attempt_native_ ──
+# ── ring directly, which BYPASSES both marker call sites; these drive the ──────
+# ── outer callers so the marker itself is exercised. attempt_rung1 coverage ────
+# ── lives in test_f547_rung1_repush_discipline.py (same seam, delivery_service).
+
+
+def _socket_delivered_traces(sessions, row_id: int) -> int:
+    with sessions() as db:
+        return (
+            db.query(InboxMessageTraceEventModel)
+            .filter(
+                InboxMessageTraceEventModel.message_id == row_id,
+                InboxMessageTraceEventModel.kind == "f459.socket_delivered",
+            )
+            .count()
+        )
+
+
+def _seat_meta_and_flags(monkeypatch):
+    """Satisfy ring_supervisor_doorbell's pre-ring guards so a successful native
+    ring reaches the _mark_socket_delivered call site."""
+    monkeypatch.setattr(_dbs, "_queue_owns_delivery", lambda: False)
+    monkeypatch.setattr(_dbs, "_is_row_still_pending", lambda row_id: True)
+    monkeypatch.setattr(
+        _dbs.ConfigService,
+        "get",
+        staticmethod(lambda key, default=None: default),
+        raising=False,
+    )
+
+
+def test_should_ring_supervisor_doorbell_marks_socket_delivered_for_body(db_env, monkeypatch):
+    """Outer caller ring_supervisor_doorbell, body-carrying ring: writes the
+    f459.socket_delivered TRANSPORT marker AND consumes (SUCCEEDED, row
+    delivered)."""
+    with db_env() as db:
+        _add_row(db, 350)
+        db.commit()
+    _seat_meta_and_flags(monkeypatch)
+    with _native_socket(monkeypatch, write_err=None, verify=True):
+        decision = _dbs.ring_supervisor_doorbell(
+            SEAT, 350, written_count=1, message_body="real callback text"
+        )
+    assert decision == "rang"
+    # TRANSPORT marker present (this is the un-gated call site).
+    assert _socket_delivered_traces(db_env, 350) == 1
+    # CONSUMPTION: body carried → SUCCEEDED, row delivered.
+    assert _status(db_env, 350) == MessageStatus.DELIVERED.value
+    assert _emissions(db_env, 350) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
+
+
+def test_should_ring_supervisor_doorbell_marks_socket_delivered_for_ids_only(db_env, monkeypatch):
+    """Outer caller ring_supervisor_doorbell, ids-only ring: STILL writes the
+    f459.socket_delivered TRANSPORT marker (the socket write succeeded) while
+    CONSUMPTION differs — WAKE_ONLY, row stays pending, hook wins. This is the
+    exact behaviour B2 restored: the marker is transport truth, not body-gated."""
+    with db_env() as db:
+        _add_row(db, 351)
+        db.commit()
+    _seat_meta_and_flags(monkeypatch)
+    with _native_socket(monkeypatch, write_err=None, verify=True):
+        decision = _dbs.ring_supervisor_doorbell(
+            SEAT, 351, written_count=1, message_body="[CONDITION] BUSY subtype=capped"
+        )
+    assert decision == "rang"
+    # TRANSPORT marker present EVEN for the ids-only ring (B2: not body-gated).
+    assert _socket_delivered_traces(db_env, 351) == 1
+    # CONSUMPTION: no body carried → WAKE_ONLY, row pending, hook wins.
+    assert _status(db_env, 351) == MessageStatus.PENDING.value
+    assert _emissions(db_env, 351) == {Carrier.NATIVE.value: EmissionOutcome.WAKE_ONLY.value}
+    with db_env() as db:
+        assert hook_claim_ids(db, candidate_ids=[351]) == [351]
         db.commit()
 
 
