@@ -13367,15 +13367,19 @@ def hook_claim_ids(
     # hook must not reprint these. F783 #640: a non-hook emission that FAILED is
     # NOT a claim that mutes the hook — a native send that missed hands the id
     # BACK to the fallback (doorbell -> re-push -> hook), so a `failed` outcome
-    # must let the hook win. Only a carrier that actually carried the id (or is
-    # still carrying it: pending/succeeded/carrier_unavailable) excludes it.
+    # must let the hook win. F803 #660: a `wake_only` NATIVE emission (an ids-only
+    # wake ping that woke the seat but carried NO body) is the SAME — the seat
+    # still needs the body, so the hook must win it too. Only a carrier that
+    # actually carried the id (or is still carrying it: pending/succeeded/
+    # carrier_unavailable) excludes it.
+    _non_muting = {EmissionOutcome.FAILED.value, EmissionOutcome.WAKE_ONLY.value}
     already = {
         int(row.message_id)
         for row in db.query(DeliveryEmissionModel.message_id)
         .filter(
             DeliveryEmissionModel.message_id.in_(ids),
             DeliveryEmissionModel.carrier != Carrier.HOOK.value,
-            DeliveryEmissionModel.outcome != EmissionOutcome.FAILED.value,
+            DeliveryEmissionModel.outcome.notin_(_non_muting),
         )
         .all()
     }

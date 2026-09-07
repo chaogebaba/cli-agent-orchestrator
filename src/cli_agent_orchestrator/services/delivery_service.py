@@ -556,6 +556,14 @@ def attempt_rung1(
             # F547 #403 point 4: record socket_delivered on rung1 success so the
             # delivered-count / backoff machinery sees this ring and _is_row_still
             # _pending is no longer the only thing gating a 5s re-fire.
+            # F803 #660 r2: socket_delivered is TRANSPORT truth — the socket
+            # write succeeded (`result == "rang"`) — and is NOT body-gated. An
+            # ids-only rung1 wake still reached the seat's socket, so the F547
+            # backoff/delivered-count machinery must see it. CONSUMPTION (the
+            # row flip + NATIVE SUCCEEDED) is the body-gated decision, and it
+            # lives inside `_attempt_native_ring` keyed on `body_carried`; it is
+            # NOT re-derived here. (The r1 gate on normalize_wake_body here broke
+            # the F547 rung-1 pin for exactly this reason.)
             try:
                 from cli_agent_orchestrator.services.doorbell_service import (
                     _mark_socket_delivered,

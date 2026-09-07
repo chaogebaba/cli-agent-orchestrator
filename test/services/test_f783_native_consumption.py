@@ -602,9 +602,11 @@ def test_r1_real_native_socket_unpublished_records_failed(db_env, monkeypatch):
 
 
 def test_r1_bodyless_ids_only_ping_does_not_consume(db_env, monkeypatch):
-    """An ids-only wake (message_body=None) is NOT a body delivery: it must
-    neither consume nor record any NATIVE emission — the seat still needs the
-    drain to surface the text (this is what preserves #613)."""
+    """An ids-only wake (message_body=None) is NOT a body delivery: it must not
+    consume, and the seat still needs the drain to surface the text (this is what
+    preserves #613). F803 #660: it now records a `wake_only` NATIVE emission (the
+    wake DID fire) rather than nothing — a non-muting, non-consuming outcome that
+    leaves the row pending and lets the hook win it."""
     with db_env() as db:
         _add_row(db, 204)
         db.commit()
@@ -612,7 +614,9 @@ def test_r1_bodyless_ids_only_ping_does_not_consume(db_env, monkeypatch):
         decision = _dbs._attempt_native_ring(SEAT, 204, message_body=None)
     assert decision == "rang"
     assert _status(db_env, 204) == MessageStatus.PENDING.value
-    assert _emissions(db_env, 204) == {}
+    # F803 #660: a wake_only emission is recorded (was {} pre-#660). It does not
+    # mute the hook.
+    assert _emissions(db_env, 204) == {Carrier.NATIVE.value: EmissionOutcome.WAKE_ONLY.value}
     # the hook still owns a bodyless-wake id
     with db_env() as db:
         assert hook_claim_ids(db, candidate_ids=[204]) == [204]

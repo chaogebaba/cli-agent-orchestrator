@@ -442,3 +442,57 @@ def test_rung1_non_rang_records_no_socket_delivered(ds_db, tmp_path):
             assert result.delivered is False
         with ds_db() as db:
             assert _delivered_traces(db, 56) == 0
+
+
+def _row_status(db, row_id):
+    return str(db.query(InboxModel.status).filter(InboxModel.id == row_id).scalar())
+
+
+def test_rung1_ids_only_ring_records_socket_delivered_row_stays_pending(
+    ds_db, tmp_path, monkeypatch
+):
+    """F803 #660 r2: an ids-only rung1 ring (message_body collapses to None under
+    normalize_wake_body) STILL records the f459.socket_delivered TRANSPORT trace
+    — the socket write succeeded — while the inbox row stays pending (CONSUMPTION
+    is the body-gated decision, recorded inside _attempt_native_ring, and is NOT
+    exercised here because the native ring is mocked to "rang").
+
+    Mutation: re-gate the delivery_service `_mark_socket_delivered(inbox_row_id)`
+    call on `normalize_wake_body(message_body) is not None` (the r1 shape) → the
+    ids-only body yields None → no trace is written → count 0 → fail. This is the
+    exact r1 regression that broke test_rung1_rang_records_socket_delivered.
+    """
+    inbox = tmp_path / "inbox" / "team-lead.json"
+    inbox.parent.mkdir(parents=True)
+    target = _live_target(cc_inbox_path=str(inbox))
+    # An ids-only body: normalize_wake_body collapses a [CONDITION] wake to None,
+    # so the socket carries ids + a count and NO text.
+    ids_only_body = "[CONDITION] BUSY subtype=capped epoch=3"
+    with ds_db() as db:
+        _seed(db)
+        _add_inbox(db, row_id=57)
+        db.commit()
+    with (
+        patch(
+            "cli_agent_orchestrator.services.config_service.ConfigService.get",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
+            return_value="rang",
+        ),
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
+            return_value=True,
+        ),
+    ):
+        with ds_db() as db:
+            result = attempt_rung1(target, 57, message_body=ids_only_body)
+            assert result.delivered is True
+        with ds_db() as db:
+            # TRANSPORT truth: the socket_delivered trace IS written for an
+            # ids-only ring (the un-gated marker).
+            assert _delivered_traces(db, 57) == 1
+            # The row is untouched — CONSUMPTION did not fire (native ring mocked;
+            # the body-gated flip lives in _attempt_native_ring, bypassed here).
+            assert _row_status(db, 57) == "pending"

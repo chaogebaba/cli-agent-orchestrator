@@ -1720,6 +1720,51 @@ def record_native_delivery_failure(inbox_row_id: int, reason: str) -> None:
         )
 
 
+def record_native_wake_only(inbox_row_id: int, reason: str = "ids_only") -> None:
+    """F803 #660: a native ring FIRED but the socket payload carried NO body (an
+    ids-only wake ping — ``teammate_push=false``, or ``normalize_wake_body``
+    collapsed a ``[CONDITION]``/``[watchdog]`` body to ``None``). The seat was
+    woken but received no text, so this is NOT consumption: the row MUST stay
+    ``pending`` for the drain hook to claim and inject the body.
+
+    Records a ``NATIVE`` emission with outcome ``wake_only`` (the claim is
+    retained so a later body-carrying native retry reuses the row) plus a
+    namespaced trace row, so the delivery trace distinguishes "woke but carried
+    nothing" from "could not even ring" (``record_native_delivery_failure``) and
+    from "carried the body" (``consume_on_native_delivery``). Like the failure
+    recorder it NEVER flips status, NEVER moves the cursor, and NEVER raises into
+    the delivery path — the fallback (doorbell -> re-push -> hook) owns the id
+    exactly as it does today, and ``wake_only`` does not mute the hook
+    (``hook_claim_ids``) nor count toward carrier exhaustion.
+    """
+    from cli_agent_orchestrator.clients import database as _db_mod
+    from cli_agent_orchestrator.clients.delivery_ledger import Carrier, EmissionOutcome
+
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+            _db_mod.claim_emission(db, message_id=int(inbox_row_id), carrier=Carrier.NATIVE)
+            _db_mod.record_emission_outcome(
+                db,
+                message_id=int(inbox_row_id),
+                carrier=Carrier.NATIVE,
+                outcome=EmissionOutcome.WAKE_ONLY,
+            )
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=int(inbox_row_id),
+                    kind="f803.native_wake_only",
+                    phase="native_delivery",
+                    decision="wake_only",
+                    reason=str(reason)[:200],
+                    payload={},
+                )
+            )
+            db.commit()
+    except Exception:
+        logger.debug("f803 record_native_wake_only failed for row %s", inbox_row_id, exc_info=True)
+
+
 def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
     """Settle malformed PENDING rows as DELIVERY_FAILED (quarantine sweep).
 

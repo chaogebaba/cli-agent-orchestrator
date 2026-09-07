@@ -250,12 +250,20 @@ def ring_supervisor_doorbell(
             # this is the one branch where the ring is the DECISION, and a "rang"
             # that the caller then discards is not an epoch anyone was woken for.
             _record_seat_wake_attempt(max_written_row_id)
-            # F459: mark row as socket-delivered (best-effort)
-            if message_body is not None:
-                try:
-                    _mark_socket_delivered(max_written_row_id)
-                except Exception:
-                    pass
+            # F459: mark row as socket-delivered (best-effort).
+            # F803 #660 r2: socket_delivered is TRANSPORT truth — the native
+            # ring returned "rang", i.e. the socket write succeeded — and is NOT
+            # body-gated. The drain hook's duplicate-suppression is driven by the
+            # CONSUMPTION decision (NATIVE SUCCEEDED / row flip), which is the
+            # body-gated part and is recorded inside `_attempt_native_ring` keyed
+            # on `body_carried`. An ids-only wake there records `wake_only`
+            # (non-muting), so the hook still surfaces the text — marking the
+            # transport signal here does not starve it. (The r1 body-gate on this
+            # marker broke the F547 rung-1 socket_delivered pin.)
+            try:
+                _mark_socket_delivered(max_written_row_id)
+            except Exception:
+                pass
             # F783 #640: consumption is NOT recorded here. It attaches at the
             # socket-WRITE success inside `_attempt_native_ring` (which fires for
             # a body-carrying wake even when verify_wake later reports
@@ -344,18 +352,30 @@ def _attempt_native_ring(
         ResolveResult,
         build_wake_payload,
         check_version_guard,
+        normalize_wake_body,
         read_peer_token,
         resolve_target,
         verify_wake,
         write_to_socket,
     )
 
+    # F803 #660: the AUTHORITATIVE "did the socket carry the body?" signal is the
+    # SAME normalization `build_wake_payload` applies to its own body argument —
+    # `normalize_wake_body`. A non-None `message_body` argument does NOT mean the
+    # seat received text: with `teammate_push=false` the coalescer synthesizes a
+    # `[cao-fleet]` digest that is still an ids-only wake to the seat, and a
+    # `[CONDITION]`/`[watchdog]` body collapses to None here (F790). Consumption
+    # (F783) may attach ONLY when the body is actually carried; an ids-only ring
+    # records a `wake_only` NATIVE emission that leaves the row pending for the
+    # drain hook. This is the single decision point both arms below key off.
+    body_carried = normalize_wake_body(message_body) is not None
+
     def _f783_note_native_failure(reason: str) -> None:
         """F783 #640 point 3: record a typed NATIVE FAILED emission for a
         body-carrying attempt that could not deliver, so the fallback
         (doorbell -> re-push -> hook) is auditable. No-op for a bodyless ids-only
         ping (not a missed body delivery)."""
-        if message_body is None:
+        if not body_carried:
             return
         try:
             from cli_agent_orchestrator.services.mailbox_service import (
@@ -471,9 +491,18 @@ def _attempt_native_ring(
     # compacting seat does not move statusUpdatedAt, and wake_unverified is the
     # common live outcome). So consumption attaches HERE, at write success, not
     # at the verified "rang" return — otherwise every busy-seat delivery would
-    # be missed. A bodyless ids-only ping does NOT consume (the seat still needs
-    # the drain to surface the text).
-    if message_body is not None:
+    # be missed.
+    #
+    # F803 #660: consumption keys off `body_carried` (== normalize_wake_body(...)
+    # is not None), NOT the raw `message_body` argument. An ids-only wake ping
+    # (teammate_push=false digest, or a [CONDITION]/[watchdog] body collapsed by
+    # F790) reaches the seat as ids + a count and NO text, so the seat still
+    # needs the drain to surface the body: the row must stay PENDING. Recording
+    # consumption there was the #660 defect — it flipped the row to
+    # native_consumed and starved the hook. Instead we record a `wake_only`
+    # NATIVE emission (the wake DID fire) that leaves the row pending and does
+    # NOT mute the hook.
+    if body_carried:
         try:
             from cli_agent_orchestrator.services.mailbox_service import (
                 consume_on_native_delivery,
@@ -483,6 +512,19 @@ def _attempt_native_ring(
         except Exception:
             logger.debug(
                 "f783 consume-on-native (write success) failed row %s",
+                max_written_row_id,
+                exc_info=True,
+            )
+    else:
+        try:
+            from cli_agent_orchestrator.services.mailbox_service import (
+                record_native_wake_only,
+            )
+
+            record_native_wake_only(max_written_row_id)
+        except Exception:
+            logger.debug(
+                "f803 record-native-wake-only (write success) failed row %s",
                 max_written_row_id,
                 exc_info=True,
             )
