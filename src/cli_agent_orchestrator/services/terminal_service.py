@@ -1113,6 +1113,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLINE_CLI.value,
     ProviderType.GROK_CLI.value,
     ProviderType.MINIMAX_CODE.value,
+    ProviderType.PI_CLI.value,
 }
 
 SESSION_BRIEF_MARKER = "SESSION BRIEF UNAVAILABLE — world-model incomplete"

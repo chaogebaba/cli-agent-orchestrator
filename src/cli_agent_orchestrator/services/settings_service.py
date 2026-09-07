@@ -160,6 +160,7 @@ _REASONING_EFFORT_KNOBS: Dict[str, Tuple[str, str, Optional[str]]] = {
     "grok_cli": ("reasoning_effort", "reasoningEffort", None),
     "claude_code": ("reasoning_effort", "reasoningEffort", None),
     "cline_cli": ("thinking", "reasoningEffort", "high"),
+    "pi_cli": ("reasoning_effort", "reasoningEffort", "high"),
     "kiro_cli": ("reasoning_effort", "reasoningEffort", None),
 }
 

@@ -16,6 +16,7 @@ class ProviderType(str, Enum):
     ANTIGRAVITY_CLI = "antigravity_cli"
     OMP = "omp"
     CLINE_CLI = "cline_cli"
+    PI_CLI = "pi_cli"
     MINIMAX_CODE = "mcode"
     # Credentials-free mock provider for tests/CI (no real CLI binary).
     MOCK_CLI = "mock_cli"

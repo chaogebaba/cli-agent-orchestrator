@@ -72,6 +72,13 @@ api_provider = "cline-pass"
 model = "deepseek/deepseek-v4-flash"
 thinking = "high"
 
+[pi_cli]
+model = "cline-pass/glm-5.3-flash"
+reasoning_effort = "high"
+# Per-request MCP timeout (ms) written into each pi worker's mcp.json so
+# cao-mcp-server has time to init under concurrent load. Floored at 30000.
+# mcp_request_timeout_ms = 60000
+
 # Terminal-log retention + disk guard (F619 / issue #475). Read via the same
 # loader as the provider sections above (settings_service.get_logs_settings /
 # get_disk_settings). Every value falls back to the built-in default shown when
