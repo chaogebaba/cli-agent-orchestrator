@@ -251,20 +251,19 @@ def ring_supervisor_doorbell(
             # that the caller then discards is not an epoch anyone was woken for.
             _record_seat_wake_attempt(max_written_row_id)
             # F459: mark row as socket-delivered (best-effort).
-            # F803 #660: gate on whether the socket ACTUALLY carried the body
-            # (normalize_wake_body), not the raw argument — is_socket_delivered
-            # is the drain hook's duplicate-suppression signal, so an ids-only
-            # wake ping (teammate_push=false digest / [CONDITION] body) must NOT
-            # be marked delivered or the hook would skip surfacing the text.
-            from cli_agent_orchestrator.services.cc_session_registry import (
-                normalize_wake_body as _norm_body,
-            )
-
-            if _norm_body(message_body) is not None:
-                try:
-                    _mark_socket_delivered(max_written_row_id)
-                except Exception:
-                    pass
+            # F803 #660 r2: socket_delivered is TRANSPORT truth — the native
+            # ring returned "rang", i.e. the socket write succeeded — and is NOT
+            # body-gated. The drain hook's duplicate-suppression is driven by the
+            # CONSUMPTION decision (NATIVE SUCCEEDED / row flip), which is the
+            # body-gated part and is recorded inside `_attempt_native_ring` keyed
+            # on `body_carried`. An ids-only wake there records `wake_only`
+            # (non-muting), so the hook still surfaces the text — marking the
+            # transport signal here does not starve it. (The r1 body-gate on this
+            # marker broke the F547 rung-1 socket_delivered pin.)
+            try:
+                _mark_socket_delivered(max_written_row_id)
+            except Exception:
+                pass
             # F783 #640: consumption is NOT recorded here. It attaches at the
             # socket-WRITE success inside `_attempt_native_ring` (which fires for
             # a body-carrying wake even when verify_wake later reports
