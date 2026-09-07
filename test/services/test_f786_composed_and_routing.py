@@ -13,7 +13,25 @@ import pytest
 
 @pytest.fixture
 def cao_home(tmp_path, monkeypatch):
-    """A temp CAO home with a minimal positions store and a provider overlay."""
+    """A temp CAO home with a minimal positions store and a provider overlay.
+
+    F786 (#643) r2: this fixture ``importlib.reload(constants)`` so the
+    module-level store/DB paths pick up CAO_HOME_DIR. That reload is NOT undone
+    by monkeypatch's env revert, so WITHOUT an explicit teardown reload the
+    reloaded ``constants`` (incl. ``DATABASE_FILE``) stays bound to this
+    now-deleted tmp home — poisoning every LATER test on the same xdist worker
+    with ``unable to open database file`` / ``init_db`` failures (the r2 A/B
+    head-only leak: test_worktree_branch_integrity, test_seam_parity_promotion).
+    We reload constants (and agent_profiles, which caches store dirs at import)
+    a SECOND time on teardown, after restoring the real CAO_HOME_DIR, so module
+    state re-binds to the real home.
+    """
+    import os
+
+    import cli_agent_orchestrator.constants as constants
+
+    _prev_home = os.environ.get("CAO_HOME_DIR")
+
     monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
     store = tmp_path / "agent-store"
     (store / "positions").mkdir(parents=True)
@@ -29,10 +47,21 @@ def cao_home(tmp_path, monkeypatch):
     )
     # Re-import constants + agent_profiles so CAO_HOME_DIR takes effect for the
     # module-level LOCAL_AGENT_STORE_DIR constant used by some helpers.
-    import cli_agent_orchestrator.constants as constants
-
     importlib.reload(constants)
-    yield tmp_path
+    try:
+        yield tmp_path
+    finally:
+        # Restore the real CAO_HOME_DIR BEFORE the reload so module-level paths
+        # re-bind to the real home (monkeypatch's own env revert runs only after
+        # this fixture unwinds, which would be too late for the reload).
+        if _prev_home is None:
+            os.environ.pop("CAO_HOME_DIR", None)
+        else:
+            os.environ["CAO_HOME_DIR"] = _prev_home
+        importlib.reload(constants)
+        import cli_agent_orchestrator.utils.agent_profiles as _agent_profiles
+
+        importlib.reload(_agent_profiles)
 
 
 # ---------------------------------------------------------------------------
