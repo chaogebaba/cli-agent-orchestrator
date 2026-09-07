@@ -58,10 +58,13 @@ def cao_home(tmp_path, monkeypatch):
             os.environ.pop("CAO_HOME_DIR", None)
         else:
             os.environ["CAO_HOME_DIR"] = _prev_home
+        # Reload ONLY constants: that is what carries DATABASE_FILE and the store
+        # dirs the leak poisoned. Do NOT reload agent_profiles here — reloading a
+        # module swaps its class objects (e.g. AssignmentResolutionError), and
+        # any test holding a module-import reference to the OLD class would then
+        # see pytest.raises(...) miss a NEW-class instance (an xdist-order skew of
+        # the same shape as the DB leak). constants defines no such classes.
         importlib.reload(constants)
-        import cli_agent_orchestrator.utils.agent_profiles as _agent_profiles
-
-        importlib.reload(_agent_profiles)
 
 
 # ---------------------------------------------------------------------------
