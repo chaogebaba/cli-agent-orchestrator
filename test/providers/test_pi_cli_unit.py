@@ -25,7 +25,9 @@ from cli_agent_orchestrator.providers.pi_cli import (
     PiCliProvider,
     _resolve_pi_mcp_timeout_ms,
     _PI_MCP_TIMEOUT_MS_FLOOR,
+    _FOOTER_CONTEXT,
 )
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -231,6 +233,42 @@ class TestStatusDetection:
     def test_idle_before_dispatch(self, _native) -> None:
         provider = self._provider(dispatched=False)
         assert provider.get_status(_fixture("pi_idle.txt")) == TerminalStatus.IDLE
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_idle_chrome_survives_trailing_blank_padding(self, _native) -> None:
+        """F798 r2 B-1 regression: pi's short-conversation TUI renders the
+        composer/footer near the TOP and pads the pane with ~24 trailing blank
+        lines. The real box capture (``pi_idle_padded.txt``, 50 lines, 24 of them
+        trailing blanks) must still read IDLE — the old ``lines[-25:]`` tail
+        landed entirely on the blank pad and missed the chrome, so a
+        server-issued pi worker timed out at init despite a healthy idle frame.
+        ``_has_idle_chrome`` now strips trailing whitespace-only lines before the
+        tail window.
+        """
+        raw = _fixture("pi_idle_padded.txt")
+        clean = strip_terminal_escapes(raw)
+        # Precondition: the frame really does end in a run of blank lines.
+        trailing_blanks = 0
+        for line in reversed(clean.splitlines()):
+            if line.strip():
+                break
+            trailing_blanks += 1
+        assert trailing_blanks >= 20, f"fixture lost its padding: {trailing_blanks}"
+        assert PiCliProvider._has_idle_chrome(clean) is True
+        provider = self._provider(dispatched=False)
+        assert provider.get_status(raw) == TerminalStatus.IDLE
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_padded_frame_without_footer_is_not_idle(self, _native) -> None:
+        """Same padded frame with the ``%/…(auto)`` footer line removed must NOT
+        read idle — proves the trailing-blank strip did not weaken the footer
+        requirement into a bare rule-count match.
+        """
+        clean = strip_terminal_escapes(_fixture("pi_idle_padded.txt"))
+        no_footer = "\n".join(
+            line for line in clean.splitlines() if not _FOOTER_CONTEXT.search(line)
+        )
+        assert PiCliProvider._has_idle_chrome(no_footer) is False
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_processing_working_spinner(self, _native) -> None:

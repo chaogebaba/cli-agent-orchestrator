@@ -425,10 +425,21 @@ class PiCliProvider(BaseProvider):
 
         Idle chrome = at least two composer box rules in the tail AND a footer
         context/budget readout, with no active "Working" spinner.
+
+        Pi's regular TUI renders the composer/footer near the TOP when the
+        conversation is short and PADS the pane with trailing blank lines (a real
+        box capture showed ~24 whitespace-only lines after the footer). A naive
+        ``lines[-25:]`` tail is then all blanks and misses the chrome entirely,
+        so we STRIP trailing blank/whitespace-only lines BEFORE taking the tail
+        window. Blank lines interspersed within the chrome are preserved.
         """
         if _WORKING.search(clean):
             return False
         lines = clean.splitlines()
+        # Drop trailing whitespace-only lines (pi's bottom padding) so the tail
+        # window lands on the real chrome rather than the blank pad.
+        while lines and not lines[-1].strip():
+            lines.pop()
         tail = lines[-25:]
         rule_count = sum(bool(_EDITOR_RULE.match(line)) for line in tail)
         has_footer = bool(_FOOTER_CONTEXT.search("\n".join(tail)))
