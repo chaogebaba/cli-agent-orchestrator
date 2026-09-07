@@ -88,6 +88,17 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         ],
         "web_fetch": ["web_fetch", "google_web_search"],
     },
+    # Pi's built-in tools (pi 0.85.1). These names are the ones Pi accepts in
+    # its ``--exclude-tools`` denylist and match the RESERVED_PI_TOOL_NAMES the
+    # pi-mcp-adapter refuses to shadow (bash/read/edit/write/grep/find/ls).
+    # Hard enforcement: unlisted native tools are passed to ``--exclude-tools``.
+    "pi_cli": {
+        "execute_bash": ["bash"],
+        "fs_read": ["read", "ls"],
+        "fs_write": ["edit", "write"],
+        "fs_list": ["grep", "find", "ls"],
+        "fs_*": ["read", "edit", "write", "grep", "find", "ls"],
+    },
 }
 
 # Complete set of all native tools per provider (used to compute disallowed set).

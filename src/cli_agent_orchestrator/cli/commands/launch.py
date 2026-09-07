@@ -41,6 +41,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "mcode",
     "opencode_cli",
     "omp",
+    "pi_cli",
 }
 
 # Validation constraints for ``--env`` forwarded vars live in

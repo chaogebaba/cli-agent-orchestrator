@@ -1,0 +1,3 @@
+/data/claude-scratch/worker-scratch/f798/probe
+Error: failed to initialize model catalog: connection refused
+pi: error: could not start session

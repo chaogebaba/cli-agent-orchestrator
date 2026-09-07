@@ -26,6 +26,7 @@ from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
 
 logger = logging.getLogger(__name__)
 _NO_PERSONA_PLAN = object()
@@ -43,6 +44,7 @@ PROVIDER_CLASSES = {
     ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
     ProviderType.OMP.value: OmpProvider,
     ProviderType.CLINE_CLI.value: ClineCliProvider,
+    ProviderType.PI_CLI.value: PiCliProvider,
     ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
     ProviderType.MOCK_CLI.value: MockCliProvider,
 }
@@ -246,6 +248,16 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.CLINE_CLI.value:
                 provider = ClineCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.PI_CLI.value:
+                provider = PiCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

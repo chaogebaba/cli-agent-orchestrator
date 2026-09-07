@@ -1,0 +1,50 @@
+
+[38;2;240;198;116m[Skills][39m
+[38;2;102;102;102m  firecrawl-crawl, firecrawl-deep-research, firecrawl-developer-index, firecrawl-map, firecrawl-scrape, firecrawl-search, mcp-scripting[39m
+
+[38;2;240;198;116m[Extensions][39m
+[38;2;102;102;102m  pi-mcp-adapter[39m
+
+
+ [38;2;255;255;0mWarning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.[39m
+
+[48;2;52;53;65m
+ [38;2;212;212;212mCall the probe_echo tool with text=HELLO2. Then say DONE2.[39m
+
+
+[38;2;128;128;128m[49mTool "probe_echo" not found. Use mcp({ search: "..." }) to search.[39m
+
+[38;2;212;212;212mmcp search echo[39m → [38;2;128;128;128mNo tools matching "echo"[39m
+
+[38;2;212;212;212mmcp status[39m → [38;2;128;128;128mMCP: 0/1 servers, 0 tools … (Ctrl+O to expand)[39m
+
+ [3m[38;2;128;128;128mThinking...[0m
+
+[38;2;212;212;212mmcp connect echo-probe[39m → [38;2;128;128;128mecho-probe (1 tools): … (Ctrl+O to expand)[39m
+
+[38;2;212;212;212mmcp call probe_echo @ echo-probe[39m [38;2;128;128;128m{ "text": "HELLO2" }[39m → [38;2;128;128;128mPROBE_TOOL_CALLED:HELLO2[39m
+
+ The probe_echo tool returned: [38;2;138;190;183mPROBE_TOOL_CALLED:HELLO2[39m
+
+ DONE2
+
+[48;2;52;53;65m
+ [38;2;212;212;212mCall probe_echo again with text=PERSIST3, then say DONE3.[39m
+
+
+[38;2;212;212;212m[49mmcp call probe_echo @ echo-probe[39m [38;2;128;128;128m{ "text": "PERSIST3" }[39m → [38;2;128;128;128mPROBE_TOOL_CALLED:PERSIST3[39m
+
+ probe_echo returned: [38;2;138;190;183mPROBE_TOOL_CALLED:PERSIST3[39m
+
+ DONE3
+
+[48;2;52;53;65m
+ [38;2;212;212;212mCount slowly from 1 to 40 with a short sentence about each number.[39m
+
+
+[38;2;178;148;187m[49m── ⠧[39m [38;2;178;148;187mWorking ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[7m[39m [0m
+[38;2;178;148;187m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;2;102;102;102m/data/claude-scratch/worker-scratch/f798/probe[39m
+[38;2;102;102;102m↑26k ↓172 R3.9k CH97.6% $0.002 0.4%/1.0M (auto)                                                                                                                          cline-pass/glm-5.3-flash • high
+[38;2;138;190;183m🔌 MCP: 1 server enabled (1 connected)[39m
