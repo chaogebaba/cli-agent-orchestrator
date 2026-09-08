@@ -214,15 +214,14 @@ class TestCreateAndRemoveWorktree:
         )
         assert branch_result.stdout.strip() == ""
 
-    def test_remove_worktree_retains_a_branch_with_unmerged_commits(self, repo: Path) -> None:
-        """A worker that committed real work to its branch before completing
-        must not have that history destroyed.
+    def test_remove_worktree_abandon_discards_checkout_keeps_branch(self, repo: Path) -> None:
+        """A worker that committed real work keeps its BRANCH (history is not
+        destroyed) but the checkout DIRECTORY is discarded.
 
-        RESUME HOT-FIX (deliverable 3c): the directory is now KEPT too (not only
-        the branch), because a reaped kiro session is keyed by the checkout cwd
-        and a resume must be able to re-attach to the still-present path.
-        Tonight's incident (evidence §1.2/§1.5): reap force-removed a kiro
-        worktree and resume had to guess/re-create the exact path by hand."""
+        RESUME HOT-FIX (addendum r1 #3): a normal reap RETAINS the worktree —
+        remove_worktree is now only the ABANDON path (force delete), where
+        discarding the checkout is the intent. The branch is still only
+        safe-deleted (git branch -d), so committed work survives as a branch."""
         terminal_id = "term_committed01"
         path = create_worktree(str(repo), terminal_id)
         (Path(path) / "result.txt").write_text("important output\n")
@@ -234,9 +233,9 @@ class TestCreateAndRemoveWorktree:
             capture_output=True,
         )
 
-        remove_worktree(str(repo), terminal_id)  # must not raise
+        remove_worktree(str(repo), terminal_id)  # must not raise (abandon path)
 
-        assert Path(path).exists()  # checkout KEPT — a resume may re-attach to it
+        assert not Path(path).exists()  # checkout discarded on abandon
         branch_result = subprocess.run(
             ["git", "branch", "--list", branch_for(terminal_id)],
             cwd=repo,
@@ -244,7 +243,7 @@ class TestCreateAndRemoveWorktree:
             text=True,
             check=True,
         )
-        # Branch survives -- a leak for Phase 3 to sweep, not data loss.
+        # Branch survives -- committed work is not destroyed.
         assert branch_for(terminal_id) in branch_result.stdout
 
     def test_remove_worktree_force_removes_uncommitted_and_untracked_content(

@@ -312,6 +312,14 @@ class TerminalIdentityModel(Base):
     # terminal owned, so a resume can re-create the checkout at the SAME path a
     # reaped kiro session is keyed by. NULL for a non-worktree terminal.
     worktree_path = Column(String, nullable=True)
+    # RESUME HOT-FIX (addendum r1 #7): the worktree's branch, recorded so a cwd
+    # reconstruction binds to the recorded branch (verified tip) rather than a
+    # cao/<id> name guess. NULL for a non-worktree terminal.
+    worktree_branch = Column(String, nullable=True)
+    # RESUME HOT-FIX (r1 #7): the repo the worktree belongs to — the anchor for
+    # `git worktree add` when reconstructing a gone off-repo checkout (its own
+    # parent chain is not inside the repo). NULL for a non-worktree terminal.
+    worktree_repo_root = Column(String, nullable=True)
     lifecycle = Column(String, nullable=False, default="live", server_default="live")
     git_sha = Column(String, nullable=True)
     dirty_hashes = Column(Text, nullable=True)
@@ -2653,6 +2661,8 @@ def _migrate_f631_terminal_identity() -> None:
                 "base_name VARCHAR NOT NULL, "
                 "retained_persona_home VARCHAR, "
                 "worktree_path VARCHAR, "
+                "worktree_branch VARCHAR, "
+                "worktree_repo_root VARCHAR, "
                 "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
                 "git_sha VARCHAR, "
                 "dirty_hashes TEXT, "
@@ -2672,6 +2682,8 @@ def _migrate_f631_terminal_identity() -> None:
             # duplicate-column error on an already-migrated DB is swallowed, so a
             # re-run at every deploy is a no-op (migration must be idempotent).
             _add_column_if_missing(conn, "terminal_identity", "worktree_path", "VARCHAR")
+            _add_column_if_missing(conn, "terminal_identity", "worktree_branch", "VARCHAR")
+            _add_column_if_missing(conn, "terminal_identity", "worktree_repo_root", "VARCHAR")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
         logger.debug(f"f631_terminal_identity migration skipped: {e}")
 
@@ -3820,6 +3832,8 @@ def _register_terminal_identity(
     session_name: Optional[str],
     provider_session_id: Optional[str],
     worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+    worktree_repo_root: Optional[str] = None,
 ) -> None:
     """F631 §3: write the durable identity row in the terminal's OWN transaction.
 
@@ -3859,6 +3873,8 @@ def _register_terminal_identity(
             provider_session_id=provider_session_id,
             base_name=terminal_id,
             worktree_path=worktree_path,
+            worktree_branch=worktree_branch,
+            worktree_repo_root=worktree_repo_root,
             lifecycle="live",
             created_at=_utcnow(),
         )
@@ -3871,33 +3887,30 @@ def _mark_terminal_identity_reaped(
     terminal_id: str,
     *,
     captured_provider_session_id: Optional[str] = None,
-) -> Optional[str]:
-    """F631 D2/D4: flip the identity row to ``reaped`` and return the resume key.
+) -> Optional[Dict[str, Any]]:
+    """F631 D2/D4: flip the identity row to ``reaped`` and return its resume facts.
 
     Runs in the SAME transaction as the ``terminals`` hard delete. The identity
     row is never deleted (D1) — that is the whole point of the table — so a
     reaped lane keeps a durable, resolvable handle.
 
-    Returns the resume key (D4: the ``provider_session_id``), or None when the
-    lane has no captured provider session or has no identity row at all (a
-    pre-registry terminal).
+    Returns a dict of resume facts (addendum r1 #4), or None when there is no
+    identity row (a pre-registry terminal):
+      * ``resume_key`` — the HISTORICAL terminal id (always resolvable through
+        terminal_identity); the handle a resume takes.
+      * ``provider_session_id`` — the captured provider session id, or None.
+      * ``provider`` / ``cwd`` — from the identity row.
+      * ``artifact_locator`` — the worktree path (the resumable artifact's
+        location), or None when unknown.
 
-    RESUME HOT-FIX (deliverable 3a): ``captured_provider_session_id`` — a
-    session id the caller resolved at reap time (for kiro, from the on-disk
-    session store) — is written into the identity row ONLY when its stored
-    ``provider_session_id`` is still NULL. This is what makes a warm kiro
-    builder, whose id was never captured at spawn, resumable after reap. A row
-    that already has an id is never overwritten (the captured value is a
-    best-effort fill, not an authority).
+    ``captured_provider_session_id`` (deliverable 3a) fills a NULL
+    ``provider_session_id`` at reap time (kiro store capture); a row that
+    already has an id is never overwritten.
 
-    **Deliberately unguarded** (r2), for the mirror of the reason given on
-    ``_register_terminal_identity``: a swallowed retirement failure hard-deletes
-    the ``terminals`` row while leaving the durable identity ``live`` with no
-    ``reaped_at``, and hands the caller ``resume_key=None`` — a reaped lane that
-    still reads as live, and a missing handle that reads as "this lane never had
-    one". A failure to retire an EXISTING row must abort the delete. The
-    pre-registry no-row case stays supported, and it is control flow (the
-    ``one_or_none()`` early return), not a tolerated exception.
+    **Deliberately unguarded** (r2): a swallowed retirement failure leaves the
+    durable identity ``live`` after the terminals row is hard-deleted — a reaped
+    lane that still reads as live. A failure to retire an EXISTING row must abort
+    the delete. The pre-registry no-row case is control flow (early return).
     """
     row = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
     if row is None:
@@ -3907,7 +3920,13 @@ def _mark_terminal_identity_reaped(
     row.lifecycle = "reaped"
     row.reaped_at = _utcnow()
     db.flush()
-    return cast(Optional[str], row.provider_session_id)
+    return {
+        "resume_key": terminal_id,
+        "provider_session_id": cast(Optional[str], row.provider_session_id),
+        "provider": cast(Optional[str], row.provider),
+        "cwd": cast(Optional[str], row.cwd),
+        "artifact_locator": cast(Optional[str], row.worktree_path),
+    }
 
 
 def get_terminal_identity(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -4040,6 +4059,12 @@ def create_terminal(
             # reaped kiro session is keyed by.
             worktree_path=(
                 worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+            ),
+            worktree_branch=(
+                worktree_info.get("expected_branch") if isinstance(worktree_info, dict) else None
+            ),
+            worktree_repo_root=(
+                worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
             ),
         )
         if dispatch_barrier is not None:
@@ -4198,6 +4223,12 @@ def create_terminal_with_warm_intent(
             provider_session_id=None,
             worktree_path=(
                 worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+            ),
+            worktree_branch=(
+                worktree_info.get("expected_branch") if isinstance(worktree_info, dict) else None
+            ),
+            worktree_repo_root=(
+                worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
             ),
         )
         if dispatch_barrier is not None:
@@ -5842,18 +5873,18 @@ def delete_terminal_and_warm_intent(
     preserve_warm_intent: bool = False,
     reparent_target_id: str | None = None,
     captured_provider_session_id: str | None = None,
-    resume_hint: str | None = None,
+    resumable: bool = False,
+    resume_reason: str | None = None,
 ) -> Dict[str, Any]:
     """Settle terminal-owned state and delete the row in one transaction.
 
-    F631 D4: the result additionally carries ``resume_key`` — the reaped lane's
-    ``provider_session_id``, or None when it has none.
-
-    RESUME HOT-FIX (deliverable 3): ``captured_provider_session_id`` is a
-    session id the caller resolved at reap time (kiro store lookup); it fills a
-    NULL identity ``provider_session_id`` so the reaped lane becomes resumable.
-    When the resume key is still None, the returned ``resume_hint`` explains why
-    (so the operator sees a reason, not a bare null).
+    F631 D4 / addendum r1 #4: the result carries a resume block for EVERY
+    provider — ``resume_key`` (the historical terminal id, always resolvable),
+    ``provider_session_id`` (nullable), ``resumable`` (bool), ``reason``,
+    ``cwd``, ``artifact_locator`` (nullable). ``captured_provider_session_id``
+    is a reap-time kiro store capture that fills a NULL id. ``resumable`` /
+    ``resume_reason`` are computed by the caller (provider capability + capture
+    outcome).
     """
     with SessionLocal.begin() as db:
         terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
@@ -5992,7 +6023,7 @@ def delete_terminal_and_warm_intent(
         # the SAME transaction as the hard delete below. The identity row is
         # NOT deleted — the terminals row keeps its hard delete (D1), and the
         # identity outlives it.
-        resume_key = _mark_terminal_identity_reaped(
+        reap_facts = _mark_terminal_identity_reaped(
             db,
             terminal_id,
             captured_provider_session_id=captured_provider_session_id,
@@ -6006,10 +6037,15 @@ def delete_terminal_and_warm_intent(
     return {
         "terminal_deleted": terminal_deleted,
         "intent_deleted": intent_deleted,
-        "resume_key": resume_key,
-        # RESUME HOT-FIX (deliverable 3b): a reason string when no resume key
-        # could be resolved, so the operator sees WHY rather than a bare null.
-        "resume_hint": (resume_hint if resume_key is None else None),
+        # F631 D4 / addendum r1 #4: a resume block for EVERY provider that has
+        # an identity row. A pre-registry terminal (no identity row) has no
+        # resolvable handle, so resume_key is None and resumable is False.
+        "resume_key": (reap_facts["resume_key"] if reap_facts else None),
+        "provider_session_id": (reap_facts["provider_session_id"] if reap_facts else None),
+        "resumable": bool(resumable) if reap_facts else False,
+        "reason": (resume_reason if reap_facts else "no_identity_row_pre_registry_terminal"),
+        "cwd": (reap_facts["cwd"] if reap_facts else None),
+        "artifact_locator": (reap_facts["artifact_locator"] if reap_facts else None),
     }
 
 

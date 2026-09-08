@@ -26,7 +26,6 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,25 +40,38 @@ RESUME_MISSING_TOKENS = frozenset(
 
 
 class ResumeRefused(Exception):
-    """The single typed refusal on the resume path (brief deliverable 4).
+    """The single typed refusal on the resume path (deliverable 4, addendum r1 #7).
 
-    Carries the closed-vocabulary ``missing`` token and a ``how`` string: the
-    exact command or fact that fixes it. Serialized by the assign handler as
-    ``{"error": "resume_refused", "missing": <token>, "how": <str>}`` — the ONE
-    shape that replaces base_not_registered / base_name_unknown /
+    Serialized by the assign handler as the exact envelope::
+
+        {"error": "resume_refused",
+         "missing": <identity|session_id|artifact|cwd|provider_capability|profile>,
+         "how": "<real command or fact>",
+         "reason": "<snake_case detail>",
+         "retryable": <bool>}
+
+    This ONE shape replaces base_not_registered / base_name_unknown /
     anchor_not_forkable / provider_lacks_fork_capability / resume_profile_mismatch
     on the resume path. The fork path keeps those strings unchanged.
     """
 
-    def __init__(self, missing: str, how: str):
+    def __init__(self, missing: str, how: str, *, reason: str, retryable: bool = False):
         if missing not in RESUME_MISSING_TOKENS:
             raise ValueError(f"unknown resume-missing token: {missing!r}")
         self.missing = missing
         self.how = how
-        super().__init__(f"resume_refused:{missing}")
+        self.reason = reason
+        self.retryable = retryable
+        super().__init__(f"resume_refused:{missing}:{reason}")
 
-    def as_dict(self) -> dict[str, str]:
-        return {"error": "resume_refused", "missing": self.missing, "how": self.how}
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "error": "resume_refused",
+            "missing": self.missing,
+            "how": self.how,
+            "reason": self.reason,
+            "retryable": self.retryable,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -68,12 +80,14 @@ class ResumeRefused(Exception):
 def provider_supports_resume(provider: str) -> bool:
     """Whether ``provider`` can RESUME a prior session (distinct from FORK).
 
-    Capability query, not a class flag on the fork axis: the default is the
-    provider's ``supports_resume`` attribute, which itself defaults to
-    ``supports_fork_context`` (base.py) so codex/grok keep resuming as today.
-    kiro overrides ``supports_resume = True`` while ``supports_fork_context``
-    stays False — it can re-attach an existing session via ``--resume-id`` but
-    cannot fork one. An unknown provider is not resumable.
+    Addendum r1 #6 / r2 #2: this checks ONLY the explicit ``supports_resume``
+    class flag — it does NOT fall back to ``supports_fork_context``. In this
+    slice ``supports_resume`` is True only for providers with a real, exercised
+    resume input path: codex (resume-mode fork_context) and kiro
+    (``--resume-id sess_<uuid>``). grok/claude/pi declare False here (claude
+    needs resume_session_id threaded through the MCP wrapper; pi needs
+    ``--session <path>`` — both are F829 proper). An unknown provider, or one
+    that never opts in, is not resumable.
     """
     from cli_agent_orchestrator.providers.manager import get_provider_class
 
@@ -81,11 +95,7 @@ def provider_supports_resume(provider: str) -> bool:
         cls = get_provider_class(provider)
     except ValueError:
         return False
-    supports = getattr(cls, "supports_resume", None)
-    if supports is None:
-        # Provider predates the capability; fall back to the fork axis.
-        return bool(getattr(cls, "supports_fork_context", False))
-    return bool(supports)
+    return bool(getattr(cls, "supports_resume", False))
 
 
 # --------------------------------------------------------------------------
@@ -112,48 +122,47 @@ def _cwd_hash(cwd: str) -> str:
     return hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:16]
 
 
-def _parse_kiro_ts(value: Any) -> Optional[float]:
-    """Parse a kiro ISO8601 timestamp (``…Z``) to a POSIX epoch, else None."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        text = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
-
-
 def capture_kiro_session_id_from_store(
     cwd: str,
-    launch_epoch: float,
+    terminal_id: str,
     *,
+    recorded_locator: Optional[str] = None,
     sessions_root: Optional[Path] = None,
-) -> Optional[str]:
-    """Resolve a reaped kiro terminal's session id from the on-disk store.
+) -> tuple[Optional[str], Optional[str], int]:
+    """Positively attribute a reaped kiro terminal's session id from the store.
 
-    Unlike ``fork_context_service.capture_kiro_uuid`` (which shells out to the
-    kiro CLI's list-sessions surface), this reads ONLY the filesystem — the
-    account may be dead at reap time (the exact incident in the evidence pack),
-    so nothing here may depend on the live provider process.
+    Reads ONLY the filesystem (the account may be dead at reap time). Returns
+    ``(session_id, reason, candidate_count)``:
+    * ``session_id`` — the ``sess_<uuid>`` id, or None when it cannot be
+      POSITIVELY attributed.
+    * ``reason`` — None on success, else a snake_case detail
+      (``capture_unknown``) surfaced to the operator.
+    * ``candidate_count`` — how many cwd-matching sessions were seen (for the
+      hint).
 
-    Rule (brief §3a): under ``~/.kiro/sessions/<sha256(cwd)[:16]>/`` find each
-    ``sess_*/session.json`` whose recorded workspace path equals ``cwd``, keep
-    only those CREATED AFTER ``launch_epoch`` (so an unrelated older session in
-    a reused cwd is never captured), and return the id ONLY when EXACTLY ONE
-    such candidate exists (newest by mtime is used to break nothing — the
-    exactly-one rule is the safety gate). Any ambiguity → None (the caller then
-    records ``resume_hint`` rather than a wrong id).
-
-    The workspace path lives in ``rootPaths``/``workspacePaths`` (NOT a ``cwd``
-    key — verified against the live store); the resume id is the ``id`` field
-    verbatim (``sess_<uuid>``), which is exactly the ``--resume-id`` value.
+    Addendum r1 #2 — POSITIVE ATTRIBUTION ONLY. The former "newest by mtime,
+    single candidate after launch epoch" rule is STRUCK. A session id binds
+    only when:
+      (1) ``recorded_locator`` is set (a locator CAO already recorded) — used
+          verbatim; OR
+      (2) EXACTLY ONE session under ``~/.kiro/sessions/<sha256(cwd)[:16]>/``
+          whose ``session.json`` names ``cwd`` (rootPaths/workspacePaths) AND
+          whose ``messages.jsonl`` contains THIS terminal's own unique seed
+          marker — the ``[Assigned by terminal <terminal_id>…]`` assign-trailer
+          text, which is unique per terminal.
+    Never binds on cwd+mtime alone. Zero or >1 attributed matches → (None,
+    "capture_unknown", count).
     """
+    if recorded_locator:
+        return recorded_locator, None, 1
     root = sessions_root if sessions_root is not None else _kiro_sessions_root()
     hash_dir = root / _cwd_hash(cwd)
     if not hash_dir.is_dir():
-        return None
+        return None, "capture_unknown", 0
     target = os.path.realpath(cwd)
-    candidates: list[tuple[float, str]] = []
+    marker = f"[Assigned by terminal {terminal_id}"
+    cwd_matches = 0
+    attributed: list[str] = []
     for sess_dir in hash_dir.iterdir():
         if not sess_dir.is_dir() or not sess_dir.name.startswith("sess_"):
             continue
@@ -164,28 +173,31 @@ def capture_kiro_session_id_from_store(
             continue
         if not _session_matches_cwd(meta, target):
             continue
-        created = _parse_kiro_ts(meta.get("createdAt"))
-        if created is None:
-            # Fall back to the file's own mtime when kiro omitted the field.
-            try:
-                created = meta_path.stat().st_mtime
-            except OSError:
-                continue
-        if created < launch_epoch:
-            continue
+        cwd_matches += 1
         session_id = meta.get("id")
         if not isinstance(session_id, str) or not session_id:
             continue
-        try:
-            mtime = meta_path.stat().st_mtime
-        except OSError:
-            mtime = created
-        candidates.append((mtime, session_id))
-    if len(candidates) != 1:
-        # Zero (no session persisted for this cwd yet) or ambiguous (more than
-        # one post-launch session) — both refuse to guess.
-        return None
-    return candidates[0][1]
+        if _transcript_contains_marker(sess_dir / "messages.jsonl", marker):
+            attributed.append(session_id)
+    if len(attributed) == 1:
+        return attributed[0], None, cwd_matches
+    # Zero attributed, or ambiguous (>1) — refuse to guess.
+    return None, "capture_unknown", cwd_matches
+
+
+def _transcript_contains_marker(transcript: Path, marker: str) -> bool:
+    """True iff ``marker`` appears anywhere in the kiro messages.jsonl.
+
+    The marker is the per-terminal ``[Assigned by terminal <id>`` assign-trailer
+    text, which is unique per terminal, so a hit is positive attribution.
+    Read as bytes and substring-matched to avoid per-line JSON parsing of a
+    multi-MB transcript.
+    """
+    try:
+        data = transcript.read_bytes()
+    except OSError:
+        return False
+    return marker.encode("utf-8") in data
 
 
 def _session_matches_cwd(meta: dict[str, Any], target_realpath: str) -> bool:
@@ -207,10 +219,10 @@ def _session_matches_cwd(meta: dict[str, Any], target_realpath: str) -> bool:
 
 
 def kiro_capture_hint(cwd: str, *, sessions_root: Optional[Path] = None) -> str:
-    """Human-facing reason a kiro reap could not resolve a resume_key.
+    """Human-facing reason a kiro reap could not positively attribute a session.
 
-    Distinguishes "no session dir for this cwd" from "ambiguous / none matched"
-    so the operator knows whether the worker ever persisted a turn.
+    Distinguishes "no session dir for this cwd" from "no / ambiguous attributed
+    match" so the operator knows whether the worker ever persisted a turn.
     """
     root = sessions_root if sessions_root is not None else _kiro_sessions_root()
     hash_dir = root / _cwd_hash(cwd)
@@ -220,8 +232,9 @@ def kiro_capture_hint(cwd: str, *, sessions_root: Optional[Path] = None) -> str:
             f"(expected {hash_dir}); the worker persisted no conversation turn"
         )
     return (
-        f"kiro session id unresolved for cwd {cwd}: zero or ambiguous "
-        f"post-launch sessions under {hash_dir}"
+        f"kiro session id could not be positively attributed for cwd {cwd}: no "
+        f"(or ambiguous) session under {hash_dir} carried this terminal's own "
+        f"assign-trailer marker"
     )
 
 
@@ -231,26 +244,26 @@ def kiro_capture_hint(cwd: str, *, sessions_root: Optional[Path] = None) -> str:
 def resolve_resume_target(value: str) -> dict[str, Any]:
     """Resolve ``assign(resume_from=<value>)`` to the facts a resume needs.
 
-    NO fork-base (``provider_sessions``) row is required and NO base name is
-    involved (evidence §1.6-8, §5). Resolution order (brief deliverable 1):
+    NO fork-base (``provider_sessions``) row is consulted (addendum r2 #1) and NO
+    base name is involved. Resolution order:
 
     (a) a live OR reaped terminal id → its ``terminal_identity`` row (F631; it
         survives reap) → provider, cwd, agent_profile, provider_session_id,
-        worktree_path, session_name.
-    (b) a bare uuid → search ``terminal_identity.provider_session_id``, then
-        fall back to the fork-base ``provider_sessions.session_uuid`` registry.
+        worktree_path, git_sha, session_name.
+    (b) a bare uuid → ``terminal_identity.provider_session_id`` ONLY (for kiro,
+        the ``sess_``-prefixed form is what is stored). The fork-base catalog is
+        never consulted by resume.
 
     Returns a row-like dict with the keys the assign resume path consumes:
-    ``name`` (the durable handle — the old terminal id or uuid),
-    ``session_uuid`` (the resume key), ``provider``, ``cwd``,
-    ``agent_profile``, ``worktree_path``, ``source_terminal_id``.
+    ``name`` (the durable handle — the historical terminal id), ``session_uuid``
+    (the resume key), ``provider``, ``cwd``, ``agent_profile``,
+    ``worktree_path``, ``git_sha``, ``source_terminal_id``.
 
     Raises ``ResumeRefused`` — never a fork-path string:
     * unknown value → missing="identity"
     * identity found but no captured session id → missing="session_id"
     """
     from cli_agent_orchestrator.clients.database import (
-        get_provider_session_by_uuid,
         get_terminal_identity,
         get_terminal_identity_by_provider_session_id,
     )
@@ -260,31 +273,20 @@ def resolve_resume_target(value: str) -> dict[str, Any]:
     if identity is not None:
         return _row_from_identity(identity, handle=value)
 
-    # (b) bare uuid: first the identity registry (survives reap), then the
-    # fork-base registry (a codex resume_key that was hand-registered, §5).
+    # (b) bare uuid: the identity registry ONLY (survives reap). r2 #1 drops the
+    # former provider_sessions fallback — resume never reads the fork-base catalog.
     identity = get_terminal_identity_by_provider_session_id(value)
     if identity is not None:
         return _row_from_identity(identity, handle=identity.get("terminal_id") or value)
 
-    base_row = get_provider_session_by_uuid(value)
-    if base_row is not None:
-        return {
-            "name": base_row.get("name") or value,
-            "session_uuid": base_row.get("session_uuid") or value,
-            "provider": base_row.get("provider"),
-            "cwd": base_row.get("cwd"),
-            "agent_profile": base_row.get("agent_profile"),
-            "worktree_path": None,
-            "source_terminal_id": base_row.get("source_terminal_id"),
-        }
-
     raise ResumeRefused(
         missing="identity",
         how=(
-            f"no live or reaped terminal, and no provider session, matches "
-            f"{value!r}; pass a terminal id you remember (dead or alive) or a "
-            f"provider session uuid returned as a reap resume_key"
+            f"no live or reaped terminal, and no captured provider session, "
+            f"matches {value!r}; pass a terminal id you remember (dead or alive) "
+            f"or a provider session uuid a reap returned as provider_session_id"
         ),
+        reason="no_identity_match",
     )
 
 
@@ -294,7 +296,7 @@ def _row_from_identity(identity: dict[str, Any], *, handle: str) -> dict[str, An
     Refuses with missing="session_id" when the row has no captured provider
     session id — resume cannot re-attach a conversation whose id was never
     recorded (for kiro this is what the reap-time capture, deliverable 3, fills
-    in; if it is still NULL the worker never persisted a turn).
+    in; if it is still NULL the worker never persisted a resumable turn).
     """
     session_uuid = identity.get("provider_session_id")
     terminal_id = identity.get("terminal_id") or handle
@@ -303,9 +305,10 @@ def _row_from_identity(identity: dict[str, Any], *, handle: str) -> dict[str, An
             missing="session_id",
             how=(
                 f"terminal {terminal_id!r} has no captured provider session id; "
-                f"it was reaped before persisting a resumable session (for kiro, "
-                f"before any conversation turn was written to disk)"
+                f"it was reaped before a resumable session was recorded (for kiro, "
+                f"before any conversation turn was attributably written to disk)"
             ),
+            reason="provider_session_id_null",
         )
     return {
         "name": terminal_id,
@@ -314,6 +317,9 @@ def _row_from_identity(identity: dict[str, Any], *, handle: str) -> dict[str, An
         "cwd": identity.get("cwd"),
         "agent_profile": identity.get("agent_profile"),
         "worktree_path": identity.get("worktree_path"),
+        "worktree_branch": identity.get("worktree_branch"),
+        "worktree_repo_root": identity.get("worktree_repo_root"),
+        "git_sha": identity.get("git_sha"),
         "source_terminal_id": terminal_id,
     }
 
@@ -321,13 +327,22 @@ def _row_from_identity(identity: dict[str, Any], *, handle: str) -> dict[str, An
 # --------------------------------------------------------------------------
 # assign(resume_from=…) orchestration (brief deliverable 1 + 2 + 4)
 # --------------------------------------------------------------------------
-def _ensure_resume_cwd(row_cwd: Optional[str], worktree_path: Optional[str], handle: str) -> str:
-    """Resolve (and, if necessary, re-create) the cwd a resume must run in.
+def _ensure_resume_cwd(
+    row_cwd: Optional[str],
+    worktree_path: Optional[str],
+    worktree_branch: Optional[str],
+    worktree_repo_root: Optional[str],
+    git_sha: Optional[str],
+    handle: str,
+) -> str:
+    """Resolve (and, if necessary, reconstruct) the cwd a resume must run in.
 
     cwd defaults to the identity row's cwd. When that directory is gone
-    (evidence §1.5 — reap deleted a kiro worktree keyed by cwd hash), re-create
-    it as a git worktree on the branch recorded for it (``cao/<old-terminal-id>``
-    convention) when that branch exists; otherwise refuse with missing="cwd".
+    (evidence §1.5 — reap-time abandon or GC removed a kiro worktree keyed by
+    cwd hash), reconstruct it ONLY from a fully recorded worktree provenance
+    (addendum r1 #7): the recorded worktree path + branch + commit (+ the repo
+    it belongs to), with the branch tip verified to exist. A ``cao/<id>``
+    branch-name GUESS is NOT sufficient on its own.
 
     Returns the live cwd on success. Raises ``ResumeRefused(missing="cwd")``.
     """
@@ -335,74 +350,96 @@ def _ensure_resume_cwd(row_cwd: Optional[str], worktree_path: Optional[str], han
     if not cwd:
         raise ResumeRefused(
             missing="cwd",
-            how=(
-                f"the reaped identity for {handle!r} recorded no working "
-                f"directory; pass working_directory= explicitly"
-            ),
+            how=f"pass working_directory= for {handle!r} (no cwd was recorded)",
+            reason="cwd_unrecorded",
         )
     if os.path.isdir(cwd):
         return cwd
-    # The directory is gone. Try to re-create it as a worktree on the branch
-    # the reaped terminal owned (cao/<old-terminal-id>), so a kiro session keyed
-    # by this exact path resolves again.
-    recreated = _recreate_worktree(cwd, handle)
-    if recreated is not None:
-        return recreated
+    # Directory gone — reconstruct ONLY from full recorded provenance.
+    if worktree_path and worktree_branch and git_sha:
+        recreated = _reconstruct_worktree(
+            worktree_path, worktree_branch, git_sha, worktree_repo_root
+        )
+        if recreated is not None:
+            return recreated
+        raise ResumeRefused(
+            missing="cwd",
+            how=(
+                f"recorded worktree {worktree_path!r} for {handle!r} is gone and "
+                f"branch {worktree_branch!r}@{git_sha[:8]} could not be checked "
+                f"out there; re-create that checkout at that exact path (kiro "
+                f"keys the session by it) or pass working_directory="
+            ),
+            reason="worktree_reconstruct_failed",
+        )
     raise ResumeRefused(
         missing="cwd",
         how=(
-            f"working directory {cwd!r} for {handle!r} no longer exists and no "
-            f"branch cao/{handle} was found to re-create it; re-create the "
-            f"checkout at that exact path (kiro keys the session by it) or pass "
-            f"working_directory="
+            f"working directory {cwd!r} for {handle!r} no longer exists and its "
+            f"worktree provenance (path+branch+commit) was not fully recorded, "
+            f"so it cannot be safely reconstructed; pass working_directory="
         ),
+        reason="cwd_missing_no_provenance",
     )
 
 
-def _recreate_worktree(cwd: str, handle: str) -> Optional[str]:
-    """Best-effort: re-create the worktree at ``cwd`` on branch ``cao/<handle>``.
+def _reconstruct_worktree(
+    worktree_path: str, branch: str, commit: str, repo_root: Optional[str]
+) -> Optional[str]:
+    """Re-create the worktree at ``worktree_path`` on ``branch`` @ ``commit``.
 
-    Returns the path on success, else None (no repo, no such branch, or the
-    add failed). The path is preserved exactly because kiro's session store is
-    keyed by ``sha256(cwd)[:16]`` — a different path is a different session.
+    Anchors the ``git worktree add`` on the RECORDED ``repo_root`` (an off-repo
+    checkout's own parent chain is not inside the repo, so an ancestor-walk
+    cannot find it); falls back to the ancestor-walk only when repo_root was not
+    recorded. Verifies the branch tip exists AND the recorded commit is
+    reachable from it before adding — a bare branch-name guess is refused by the
+    caller, and a branch whose tip cannot be verified returns None. The path is
+    preserved exactly because kiro's session store is keyed by
+    ``sha256(cwd)[:16]``. Returns the path on success, else None.
     """
     import subprocess
 
-    branch = f"cao/{handle}"
-    # Find a repo to anchor the worktree add: the parent chain of cwd, or the
-    # repo the branch lives in as seen from any existing checkout is not known
-    # here, so anchor on the nearest existing ancestor directory that is a repo.
-    anchor = _nearest_repo_ancestor(cwd)
+    anchor = repo_root if (repo_root and os.path.isdir(repo_root)) else None
+    if anchor is None:
+        anchor = _nearest_repo_ancestor(worktree_path)
     if anchor is None:
         return None
-    # Does the branch exist?
-    show = subprocess.run(
+    tip = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
         cwd=anchor,
         capture_output=True,
         text=True,
     )
-    if show.returncode != 0:
+    if tip.returncode != 0 or not tip.stdout.strip():
+        return None
+    reachable = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, branch],
+        cwd=anchor,
+        capture_output=True,
+        text=True,
+    )
+    if reachable.returncode != 0 and tip.stdout.strip() != commit:
         return None
     try:
-        os.makedirs(os.path.dirname(cwd), exist_ok=True)
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
     except OSError:
         return None
     add = subprocess.run(
-        ["git", "worktree", "add", cwd, branch],
+        ["git", "worktree", "add", worktree_path, branch],
         cwd=anchor,
         capture_output=True,
         text=True,
     )
     if add.returncode != 0:
         logger.warning(
-            "resume: could not re-create worktree %s on %s: %s",
-            cwd,
+            "resume: could not reconstruct worktree %s on %s@%s: %s",
+            worktree_path,
             branch,
+            commit[:8],
             add.stderr.strip(),
         )
         return None
-    return cwd
+    return worktree_path
 
 
 def _nearest_repo_ancestor(path: str) -> Optional[str]:
@@ -431,7 +468,7 @@ def prepare_resume(
     resume_from: str,
     requested_agent_profile: Optional[str],
     requested_working_directory: Optional[str],
-    inherit_pins: bool,
+    inherit_pins: bool = True,
 ) -> dict[str, Any]:
     """Resolve everything an ``assign(resume_from=…)`` needs, or raise ResumeRefused.
 
@@ -439,12 +476,19 @@ def prepare_resume(
       * ``fork_context`` — a ForkContext(mode="resume") to hand to the create path
       * ``provider`` — the resolved provider
       * ``agent_profile`` — requested override, else the identity's
-      * ``working_directory`` — the live (possibly re-created) cwd
-      * ``forked_from_info`` — {name, cwd, resumed_from} surfaced to the operator
+      * ``working_directory`` — the live (possibly reconstructed) cwd
+      * ``forked_from_info`` — {name, cwd, resumed_from, provider}
       * ``authority_files`` — inherited frozen pins when inherit_pins, else None
+      * ``pins_inherited`` — count of inherited pins (for the success line)
 
     Every precondition failure raises ``ResumeRefused`` (deliverable 4): the ONE
     typed answer, never a fork-path string.
+
+    ``inherit_pins`` defaults True (addendum r1 #5): the new terminal re-declares
+    the reaped pin set (same shas), which the create path re-verifies before
+    continuation. ``inherit_pins=False`` when the reaped terminal HAD frozen pins
+    requires the caller to pass equivalent explicit ``authority_files`` (checked
+    in the assign handler); otherwise this refuses with missing="profile".
     """
     from cli_agent_orchestrator.clients.database import get_frozen_pins
     from cli_agent_orchestrator.models.terminal import ForkContext
@@ -454,32 +498,31 @@ def prepare_resume(
     if not provider:
         raise ResumeRefused(
             missing="identity",
-            how=(
-                f"the identity for {resume_from!r} recorded no provider; it is "
-                f"too old to resume — re-dispatch cold"
-            ),
+            how=f"re-dispatch {resume_from!r} cold — its identity recorded no provider",
+            reason="provider_unrecorded",
         )
-    # Capability: kiro resumes (supports_resume True) though it cannot fork.
+    # Capability: kiro/codex resume; grok/claude/pi refuse here (r1 #6 / r2 #2).
     if not provider_supports_resume(provider):
         raise ResumeRefused(
             missing="provider_capability",
-            how=(
-                f"provider {provider!r} cannot resume a session; re-dispatch the "
-                f"worker cold with its task"
-            ),
+            how="not resumable in this build; F829 build 2",
+            reason=f"provider_{provider}_not_resumable",
         )
     agent_profile = requested_agent_profile or row.get("agent_profile")
     if not agent_profile:
         raise ResumeRefused(
             missing="profile",
-            how=(
-                f"no agent_profile recorded for {resume_from!r} and none passed; "
-                f"pass agent_profile= for the resumed worker"
-            ),
+            how=f"pass agent_profile= for the resumed worker (none recorded for {resume_from!r})",
+            reason="agent_profile_unrecorded",
         )
     handle = row.get("source_terminal_id") or row.get("name") or resume_from
     working_directory = requested_working_directory or _ensure_resume_cwd(
-        row.get("cwd"), row.get("worktree_path"), str(handle)
+        row.get("cwd"),
+        row.get("worktree_path"),
+        row.get("worktree_branch"),
+        row.get("worktree_repo_root"),
+        row.get("git_sha"),
+        str(handle),
     )
     fork_context = ForkContext(
         mode="resume",
@@ -491,10 +534,14 @@ def prepare_resume(
             f"{handle}). Continue the task where you left off."
         ),
     )
+    known_pins = (
+        get_frozen_pins(str(row["source_terminal_id"])) if row.get("source_terminal_id") else []
+    )
     authority_files: Optional[list[dict[str, str]]] = None
-    if inherit_pins and row.get("source_terminal_id"):
-        pins = get_frozen_pins(str(row["source_terminal_id"]))
-        authority_files = pins or None
+    pins_inherited = 0
+    if inherit_pins:
+        authority_files = known_pins or None
+        pins_inherited = len(known_pins)
     return {
         "fork_context": fork_context,
         "provider": provider,
@@ -507,4 +554,6 @@ def prepare_resume(
             "provider": provider,
         },
         "authority_files": authority_files,
+        "pins_inherited": pins_inherited,
+        "known_pins": known_pins,
     }

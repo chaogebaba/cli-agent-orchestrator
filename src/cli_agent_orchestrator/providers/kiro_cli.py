@@ -216,11 +216,10 @@ E_KIRO_SESSION_LOCKED = "E-KIRO-SESSION-LOCKED"
 class KiroCliProvider(BaseProvider):
     condition_provider_key = "kiro_cli"  # F611 #467
     supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
-    # RESUME HOT-FIX (deliverable 2): kiro can RESUME a prior session via
-    # --resume-id (the F560/F566 path below) even though it cannot FORK one
-    # (supports_fork_context stays False). This capability is what makes a
-    # warm kiro builder resumable through assign(resume_from=…). Fork stays
-    # refused for kiro.
+    # RESUME HOT-FIX (deliverable 2, r1 #6 / r2 #2): kiro can RESUME a prior
+    # session via --resume-id (the F560/F566 path below) even though it cannot
+    # FORK one (supports_fork_context stays False). The resume path checks ONLY
+    # this explicit supports_resume flag. Fork stays refused for kiro.
     supports_resume = True
     # ...but NOT for the stale-PROCESSING self-heal: on a rendered frame the composer
     # placeholder sits below the working line and the credits line — the opposite of

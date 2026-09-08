@@ -299,8 +299,11 @@ def test_a_failed_identity_retirement_aborts_the_whole_reap(db_env):
     identity_state = (row["lifecycle"], row["reaped_at"])
     assert identity_state == ("live", None), f"F631-N2-STATE: identity is {identity_state}"
     # …and the real key was never silently discarded — a second, clean reap
-    # still returns it.
-    assert delete_terminal_and_warm_intent("lane0001")["resume_key"] == "uuid-lane0001"
+    # still returns it (r1 #4: the captured id is now provider_session_id;
+    # resume_key is the historical terminal id).
+    _reap = delete_terminal_and_warm_intent("lane0001")
+    assert _reap["provider_session_id"] == "uuid-lane0001"
+    assert _reap["resume_key"] == "lane0001"
 
 
 def test_a_failed_identity_write_propagates_rather_than_returning(db_env):
@@ -340,13 +343,18 @@ def test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception(db_env):
         db.commit()
 
     result = delete_terminal_and_warm_intent("lane0009")
-    # RESUME HOT-FIX: the reap result additionally carries resume_hint (None
-    # here — a pre-registry lane has no identity row, so no reason to explain).
+    # RESUME HOT-FIX (r1 #4): the reap result carries a resume block for every
+    # provider. A pre-registry lane (no identity row) has no resolvable handle,
+    # so resume_key is None and resumable is False.
     assert result == {
         "terminal_deleted": True,
         "intent_deleted": False,
         "resume_key": None,
-        "resume_hint": None,
+        "provider_session_id": None,
+        "resumable": False,
+        "reason": "no_identity_row_pre_registry_terminal",
+        "cwd": None,
+        "artifact_locator": None,
     }
 
 
@@ -399,19 +407,23 @@ def test_ac2_reap_does_not_disturb_a_sibling_lane(db_env):
 
 
 def test_reap_returns_the_resume_key(db_env):
-    """§1: the delete result used to carry no resume key at all."""
+    """§1 / r1 #4: the reap block carries the captured id (provider_session_id)
+    and the historical terminal id (resume_key)."""
     _make_lane()
 
     result = delete_terminal_and_warm_intent("lane0001")
-    assert result["resume_key"] == "uuid-lane0001"
+    assert result["provider_session_id"] == "uuid-lane0001"
+    assert result["resume_key"] == "lane0001"
 
 
 def test_reap_returns_none_when_the_lane_has_no_provider_session(db_env):
-    """A lane whose provider never minted an id reaps to a None key, not a lie."""
+    """A lane whose provider never minted an id reaps to a None
+    provider_session_id, not a lie. resume_key is still the terminal id (r1 #4)."""
     create_terminal("lane0004", SESSION, "worker-lane0004", "kiro_cli")
 
     result = delete_terminal_and_warm_intent("lane0004")
-    assert result["resume_key"] is None
+    assert result["provider_session_id"] is None
+    assert result["resume_key"] == "lane0004"
     assert get_terminal_identity("lane0004")["lifecycle"] == "reaped"
 
 

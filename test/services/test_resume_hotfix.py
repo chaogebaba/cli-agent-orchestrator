@@ -108,8 +108,9 @@ def test_resolve_bare_uuid_via_identity_registry(db_env):
     assert row["session_uuid"] == "uuid-bare-1"
 
 
-def test_resolve_bare_uuid_via_provider_sessions_fallback(db_env):
-    """A codex resume_key hand-registered as a fork base still resolves (§5)."""
+def test_resolve_bare_uuid_provider_sessions_NOT_consulted(db_env):
+    """r2 #1: resume never reads the fork-base catalog. A uuid that exists ONLY
+    as a provider_sessions row (no identity) → resume_refused.identity."""
     register_provider_session(
         name="base-x",
         provider="codex",
@@ -118,10 +119,9 @@ def test_resolve_bare_uuid_via_provider_sessions_fallback(db_env):
         agent_profile="codex_dev",
         kind="base",
     )
-    row = resolve_resume_target("11111111-1111-1111-1111-111111111111")
-    assert row["session_uuid"] == "11111111-1111-1111-1111-111111111111"
-    assert row["provider"] == "codex"
-    assert row["cwd"] == "/home/chao/repo"
+    with pytest.raises(ResumeRefused) as exc:
+        resolve_resume_target("11111111-1111-1111-1111-111111111111")
+    assert exc.value.missing == "identity"
 
 
 def test_resolve_unknown_refuses_with_identity(db_env):
@@ -165,10 +165,16 @@ def test_kiro_supports_resume_but_not_fork():
     assert provider_supports_resume("kiro_cli") is True
 
 
-def test_codex_grok_resume_default_from_fork_axis():
-    # supports_resume undeclared (None) → falls back to supports_fork_context.
+def test_capability_only_codex_and_kiro(db_env):
+    # r1 #6 / r2 #2: supports_resume True ONLY for codex + kiro this slice;
+    # grok/claude/pi False (grok has supports_fork_context=True but resume=False).
     assert provider_supports_resume("codex") is True
-    assert provider_supports_resume("grok_cli") is True
+    assert provider_supports_resume("kiro_cli") is True
+    assert provider_supports_resume("grok_cli") is False
+    from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+
+    assert GrokCliProvider.supports_fork_context is True  # fork axis unchanged
+    assert GrokCliProvider.supports_resume is False
 
 
 def test_unknown_provider_not_resumable():
@@ -195,7 +201,9 @@ def test_kiro_resume_id_is_verbatim_sess_prefix():
 # ── Deliverable 3: reap-time kiro capture from the on-disk store ────────────
 
 
-def _write_kiro_session(root: Path, cwd: str, sess_id: str, created_at: str):
+def _write_kiro_session(
+    root: Path, cwd: str, sess_id: str, *, marker: str = "", created_at="2026-09-08T04:00:00.000Z"
+):
     hash_dir = root / resume_service._cwd_hash(cwd)
     sess_dir = hash_dir / sess_id
     sess_dir.mkdir(parents=True, exist_ok=True)
@@ -211,56 +219,76 @@ def _write_kiro_session(root: Path, cwd: str, sess_id: str, created_at: str):
         ),
         encoding="utf-8",
     )
+    # messages.jsonl carries the per-terminal assign-trailer marker used for
+    # positive attribution (r1 #2).
+    (sess_dir / "messages.jsonl").write_text(
+        json.dumps({"role": "user", "content": f"task…\n{marker}"}) + "\n" if marker else "{}\n",
+        encoding="utf-8",
+    )
     return sess_dir
 
 
-def test_capture_kiro_from_store_single_candidate(tmp_path):
+def test_capture_kiro_positive_attribution_single(tmp_path):
+    """r1 #2: binds on the terminal's own assign-trailer marker, one match."""
     cwd = str(tmp_path / "wt")
     Path(cwd).mkdir()
     root = tmp_path / "sessions"
     _write_kiro_session(
-        root, cwd, "sess_aaaaaaaa-0000-0000-0000-000000000001", "2026-09-08T04:00:00.000Z"
+        root,
+        cwd,
+        "sess_aaaaaaaa-0000-0000-0000-000000000001",
+        marker="[Assigned by terminal abcd1234. When done…]",
     )
-    got = capture_kiro_session_id_from_store(cwd, launch_epoch=0.0, sessions_root=root)
+    got, reason, count = capture_kiro_session_id_from_store(cwd, "abcd1234", sessions_root=root)
     assert got == "sess_aaaaaaaa-0000-0000-0000-000000000001"
+    assert reason is None and count == 1
 
 
-def test_capture_kiro_ignores_pre_launch_session(tmp_path):
-    """A session created BEFORE the terminal launched must not be captured."""
+def test_capture_kiro_recorded_locator_wins(tmp_path):
+    got, reason, count = capture_kiro_session_id_from_store(
+        str(tmp_path), "abcd1234", recorded_locator="sess_recorded-1", sessions_root=tmp_path / "s"
+    )
+    assert got == "sess_recorded-1" and reason is None
+
+
+def test_capture_kiro_no_marker_match_refuses(tmp_path):
+    """A cwd-matching session WITHOUT this terminal's marker is NOT captured
+    (never cwd-alone)."""
     cwd = str(tmp_path / "wt")
     Path(cwd).mkdir()
     root = tmp_path / "sessions"
     _write_kiro_session(
-        root, cwd, "sess_old-0000-0000-0000-000000000000", "2020-01-01T00:00:00.000Z"
+        root,
+        cwd,
+        "sess_other-0000-0000-0000-000000000001",
+        marker="[Assigned by terminal SOMEONELSE. …]",
     )
-    import datetime as _dt
-
-    launch = _dt.datetime(2026, 9, 8, 4, 0, tzinfo=_dt.timezone.utc).timestamp()
-    got = capture_kiro_session_id_from_store(cwd, launch_epoch=launch, sessions_root=root)
-    assert got is None
+    got, reason, count = capture_kiro_session_id_from_store(cwd, "abcd1234", sessions_root=root)
+    assert got is None and reason == "capture_unknown" and count == 1
 
 
-def test_capture_kiro_refuses_ambiguous(tmp_path):
-    """Two post-launch sessions for the same cwd → refuse to guess (None)."""
+def test_capture_kiro_ambiguous_two_markers_refuses(tmp_path):
+    """Two sessions both carrying this terminal's marker → refuse to guess."""
     cwd = str(tmp_path / "wt")
     Path(cwd).mkdir()
     root = tmp_path / "sessions"
-    _write_kiro_session(root, cwd, "sess_a-0000-0000-0000-000000000001", "2026-09-08T04:00:00.000Z")
-    _write_kiro_session(root, cwd, "sess_b-0000-0000-0000-000000000002", "2026-09-08T04:05:00.000Z")
-    got = capture_kiro_session_id_from_store(cwd, launch_epoch=0.0, sessions_root=root)
-    assert got is None
+    m = "[Assigned by terminal abcd1234. …]"
+    _write_kiro_session(root, cwd, "sess_a-0000-0000-0000-000000000001", marker=m)
+    _write_kiro_session(root, cwd, "sess_b-0000-0000-0000-000000000002", marker=m)
+    got, reason, count = capture_kiro_session_id_from_store(cwd, "abcd1234", sessions_root=root)
+    assert got is None and reason == "capture_unknown" and count == 2
 
 
 def test_capture_kiro_no_store_returns_none(tmp_path):
-    got = capture_kiro_session_id_from_store(
-        str(tmp_path / "missing"), launch_epoch=0.0, sessions_root=tmp_path / "sessions"
+    got, reason, count = capture_kiro_session_id_from_store(
+        str(tmp_path / "missing"), "abcd1234", sessions_root=tmp_path / "sessions"
     )
-    assert got is None
+    assert got is None and reason == "capture_unknown" and count == 0
 
 
-def test_reap_fills_kiro_session_id_and_returns_resume_key(db_env):
-    """A kiro reap with a captured id writes it into the identity row and
-    returns it as resume_key."""
+def test_reap_fills_kiro_session_id_and_returns_full_block(db_env):
+    """A kiro reap with a captured id writes it into the identity row; the reap
+    block reports resume_key=<historical terminal id> + provider_session_id."""
     create_terminal(
         "kiro0002",
         SESSION,
@@ -273,15 +301,20 @@ def test_reap_fills_kiro_session_id_and_returns_resume_key(db_env):
     result = delete_terminal_and_warm_intent(
         "kiro0002",
         captured_provider_session_id="sess_captured-0000-0000-0000-000000000009",
+        resumable=True,
+        resume_reason="resumable",
     )
-    assert result["resume_key"] == "sess_captured-0000-0000-0000-000000000009"
+    assert result["resume_key"] == "kiro0002"  # historical terminal id
+    assert result["provider_session_id"] == "sess_captured-0000-0000-0000-000000000009"
+    assert result["resumable"] is True
+    assert result["reason"] == "resumable"
     assert (
         get_terminal_identity("kiro0002")["provider_session_id"]
         == "sess_captured-0000-0000-0000-000000000009"
     )
 
 
-def test_reap_resume_hint_when_no_key(db_env):
+def test_reap_block_when_no_capture(db_env):
     create_terminal(
         "kiro0003",
         SESSION,
@@ -291,20 +324,33 @@ def test_reap_resume_hint_when_no_key(db_env):
         working_directory="/home/chao/repo",
         provider_session_id=None,
     )
-    result = delete_terminal_and_warm_intent("kiro0003", resume_hint="no session persisted")
-    assert result["resume_key"] is None
-    assert result["resume_hint"] == "no session persisted"
+    result = delete_terminal_and_warm_intent(
+        "kiro0003", resumable=False, resume_reason="capture_unknown_candidates_0"
+    )
+    assert result["resume_key"] == "kiro0003"
+    assert result["provider_session_id"] is None
+    assert result["resumable"] is False
+    assert result["reason"] == "capture_unknown_candidates_0"
+
+
+def test_reap_returns_resume_key_as_terminal_id_for_codex(db_env):
+    _make_lane("codex0004", provider="codex", uuid_value="uuid-existing")
+    result = delete_terminal_and_warm_intent("codex0004", resumable=True, resume_reason="resumable")
+    # r1 #4: resume_key is the historical terminal id; the uuid is provider_session_id.
+    assert result["resume_key"] == "codex0004"
+    assert result["provider_session_id"] == "uuid-existing"
+    assert result["resumable"] is True
 
 
 def test_reap_does_not_overwrite_existing_session_id(db_env):
-    _make_lane("codex0004", provider="codex", uuid_value="uuid-existing")
+    _make_lane("codex0006", provider="codex", uuid_value="uuid-keep")
     result = delete_terminal_and_warm_intent(
-        "codex0004", captured_provider_session_id="should-not-apply"
+        "codex0006", captured_provider_session_id="should-not-apply"
     )
-    assert result["resume_key"] == "uuid-existing"
+    assert result["provider_session_id"] == "uuid-keep"
 
 
-def test_worktree_path_recorded_at_create(db_env):
+def test_worktree_path_and_branch_recorded_at_create(db_env):
     create_terminal(
         "wtree0005",
         SESSION,
@@ -319,10 +365,12 @@ def test_worktree_path_recorded_at_create(db_env):
             "terminal_id": "wtree0005",
         },
     )
-    assert get_terminal_identity("wtree0005")["worktree_path"] == "/data/x/.cao/worktrees/wtree0005"
+    idn = get_terminal_identity("wtree0005")
+    assert idn["worktree_path"] == "/data/x/.cao/worktrees/wtree0005"
+    assert idn["worktree_branch"] == "cao/wtree0005"
 
 
-# ── Deliverable 3c: worktree kept when branch has unmerged commits ──────────
+# ── Addendum r1 #3: worktree retained on normal reap; removed only on abandon ─
 
 
 def _git(args, cwd):
@@ -339,47 +387,49 @@ def _init_repo(path: Path):
     _git(["commit", "-qm", "base"], path)
 
 
-def test_worktree_kept_when_branch_has_unmerged_commits(tmp_path, monkeypatch):
-    from cli_agent_orchestrator.services import worktree_service
-
-    monkeypatch.setenv("CAO_WORKTREE_ROOT", str(tmp_path / "wts"))
-    repo = tmp_path / "repo"
-    _init_repo(repo)
-    wt = worktree_service.create_worktree(str(repo), "term9001")
-    # Commit real work on the worktree branch (unmerged w.r.t. repo HEAD).
-    (Path(wt) / "work.txt").write_text("progress\n")
-    _git(["add", "."], wt)
-    _git(["commit", "-qm", "worker progress"], wt)
-
-    worktree_service.remove_worktree(str(repo), "term9001", worktree_path=wt)
-    # Directory kept because the branch carries unmerged commits.
-    assert Path(wt).is_dir()
-    assert worktree_service._branch_has_unmerged_commits(str(repo), "cao/term9001")
-
-
-def test_worktree_removed_when_branch_clean(tmp_path, monkeypatch):
+def test_remove_worktree_on_abandon_discards_checkout(tmp_path, monkeypatch):
+    """remove_worktree is the ABANDON path (force delete): it discards the
+    checkout; the branch is safe-deleted so committed work survives as a branch."""
     from cli_agent_orchestrator.services import worktree_service
 
     monkeypatch.setenv("CAO_WORKTREE_ROOT", str(tmp_path / "wts"))
     repo = tmp_path / "repo"
     _init_repo(repo)
     wt = worktree_service.create_worktree(str(repo), "term9002")
-    # No commits on the branch → safe to remove (today's behaviour).
     worktree_service.remove_worktree(str(repo), "term9002", worktree_path=wt)
     assert not Path(wt).is_dir()
 
 
-# ── Deliverable 4: the ONE typed refusal shape ──────────────────────────────
+def test_branch_has_unmerged_commits_helper(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services import worktree_service
+
+    monkeypatch.setenv("CAO_WORKTREE_ROOT", str(tmp_path / "wts"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = worktree_service.create_worktree(str(repo), "term9001")
+    (Path(wt) / "work.txt").write_text("progress\n")
+    _git(["add", "."], wt)
+    _git(["commit", "-qm", "worker progress"], wt)
+    assert worktree_service._branch_has_unmerged_commits(str(repo), "cao/term9001")
+
+
+# ── Deliverable 4: the ONE typed refusal shape (r1 #7) ──────────────────────
 
 
 def test_resume_refused_shape():
-    r = ResumeRefused(missing="cwd", how="do X")
-    assert r.as_dict() == {"error": "resume_refused", "missing": "cwd", "how": "do X"}
+    r = ResumeRefused(missing="cwd", how="do X", reason="cwd_missing_no_provenance")
+    assert r.as_dict() == {
+        "error": "resume_refused",
+        "missing": "cwd",
+        "how": "do X",
+        "reason": "cwd_missing_no_provenance",
+        "retryable": False,
+    }
 
 
 def test_resume_refused_rejects_unknown_token():
     with pytest.raises(ValueError):
-        ResumeRefused(missing="not-a-token", how="x")
+        ResumeRefused(missing="not-a-token", how="x", reason="r")
 
 
 # ── inherit_pins ────────────────────────────────────────────────────────────
@@ -426,3 +476,113 @@ def test_prepare_resume_inherit_pins(db_env, tmp_path):
     assert out["authority_files"] == [{"file_path": "/a/b.md", "sha256": "b" * 64}]
     assert out["fork_context"].mode == "resume"
     assert out["provider"] == "codex"
+
+
+def test_prepare_resume_inherit_pins_defaults_true(db_env, tmp_path):
+    """r1 #5: inherit_pins defaults True — the reaped pin set is carried."""
+    cwd = str(tmp_path)
+    _make_lane("pinlane03", provider="codex", uuid_value="uuid-pin3", cwd=cwd)
+    _seed_frozen_pin("pinlane03", "/a/b.md", "d" * 64)
+    out = resume_service.prepare_resume(
+        resume_from="pinlane03",
+        requested_agent_profile=None,
+        requested_working_directory=cwd,
+        # inherit_pins omitted → default True
+    )
+    assert out["pins_inherited"] == 1
+    assert out["authority_files"] == [{"file_path": "/a/b.md", "sha256": "d" * 64}]
+
+
+def test_prepare_resume_inherit_pins_false_reports_known_pins(db_env, tmp_path):
+    """r1 #5: inherit_pins=False surfaces known_pins so the handler can refuse
+    when no replacement authority_files are supplied."""
+    cwd = str(tmp_path)
+    _make_lane("pinlane04", provider="codex", uuid_value="uuid-pin4", cwd=cwd)
+    _seed_frozen_pin("pinlane04", "/a/b.md", "e" * 64)
+    out = resume_service.prepare_resume(
+        resume_from="pinlane04",
+        requested_agent_profile=None,
+        requested_working_directory=cwd,
+        inherit_pins=False,
+    )
+    assert out["authority_files"] is None
+    assert out["known_pins"] == [{"file_path": "/a/b.md", "sha256": "e" * 64}]
+
+
+def test_prepare_resume_grok_refuses_provider_capability(db_env, tmp_path):
+    """r2 #2: grok is not resumable this slice → provider_capability refusal."""
+    cwd = str(tmp_path)
+    _make_lane("grok0007", provider="grok_cli", uuid_value="uuid-grok", cwd=cwd)
+    with pytest.raises(ResumeRefused) as exc:
+        resume_service.prepare_resume(
+            resume_from="grok0007",
+            requested_agent_profile=None,
+            requested_working_directory=cwd,
+            inherit_pins=True,
+        )
+    assert exc.value.missing == "provider_capability"
+    assert "F829 build 2" in exc.value.how
+
+
+def test_prepare_resume_cwd_missing_no_provenance_refuses(db_env):
+    """r1 #7: a gone cwd with no recorded worktree provenance → missing=cwd."""
+    _make_lane("codex0008", provider="codex", uuid_value="uuid-8", cwd="/gone/nowhere-xyz")
+    with pytest.raises(ResumeRefused) as exc:
+        resume_service.prepare_resume(
+            resume_from="codex0008",
+            requested_agent_profile=None,
+            requested_working_directory=None,
+            inherit_pins=True,
+        )
+    assert exc.value.missing == "cwd"
+    assert exc.value.reason == "cwd_missing_no_provenance"
+
+
+def test_prepare_resume_cwd_reconstructs_from_provenance(db_env, tmp_path, monkeypatch):
+    """r1 #7: a gone cwd IS reconstructed from recorded path+branch+commit."""
+    from cli_agent_orchestrator.services import worktree_service
+
+    monkeypatch.setenv("CAO_WORKTREE_ROOT", str(tmp_path / "wts"))
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    wt = worktree_service.create_worktree(str(repo), "recon01")
+    # Commit work so the branch survives the abandon (git branch -d refuses).
+    (Path(wt) / "progress.txt").write_text("work\n")
+    _git(["add", "."], wt)
+    _git(["commit", "-qm", "progress"], wt)
+    commit = _git(["rev-parse", "HEAD"], wt).stdout.strip()
+    # Register an identity with the worktree provenance, then remove the checkout.
+    create_terminal(
+        "recon01",
+        SESSION,
+        "worker-recon01",
+        "codex",
+        agent_profile="codex_dev",
+        working_directory=wt,
+        provider_session_id="uuid-recon",
+        worktree_info={
+            "repo_root": str(repo),
+            "worktree_path": wt,
+            "expected_branch": "cao/recon01",
+            "terminal_id": "recon01",
+        },
+    )
+    # Record the commit on the identity row (git_sha).
+    from cli_agent_orchestrator.clients.database import SessionLocal, TerminalIdentityModel
+
+    with SessionLocal() as db:
+        row = db.query(TerminalIdentityModel).filter_by(terminal_id="recon01").one()
+        row.git_sha = commit
+        db.commit()
+    # Remove the checkout (simulate abandon/GC) but keep the branch.
+    worktree_service.remove_worktree(str(repo), "recon01", worktree_path=wt)
+    assert not Path(wt).is_dir()
+
+    out = resume_service.prepare_resume(
+        resume_from="recon01",
+        requested_agent_profile=None,
+        requested_working_directory=None,
+        inherit_pins=True,
+    )
+    assert out["working_directory"] == wt
+    assert Path(wt).is_dir()  # reconstructed at the exact path

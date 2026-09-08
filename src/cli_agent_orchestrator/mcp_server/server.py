@@ -2431,7 +2431,7 @@ def _assign_impl(
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
     resume_from: Optional[str] = None,
-    inherit_pins: bool = False,
+    inherit_pins: bool = True,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -2460,21 +2460,47 @@ def _assign_impl(
     _stale = _dispatch_guard(message, "assign")
     if _stale:
         return {"success": False, "terminal_id": None, "message": _stale}
-    # RESUME HOT-FIX (deliverable 1): resolve an assign(resume_from=…) target up
-    # front, BEFORE the position/provider resolution and routing guards. The
-    # reaped identity supplies the provider and (when the caller omitted it) the
-    # agent_profile, so a resume does NOT go through position/routing resolution
-    # at all — it re-attaches a concrete prior worker, not a fresh routed spawn.
-    # Every precondition failure is the ONE typed resume_refused dict
-    # (deliverable 4), returned before any terminal is created.
+    # RESUME HOT-FIX (deliverable 1 + addendum r1 #1): resolve a resume target up
+    # front, BEFORE position/provider resolution and routing guards. A resume
+    # re-attaches a concrete prior worker (provider + profile from its reaped
+    # identity), so it does NOT go through position/routing resolution.
+    #
+    # Resume intent is EITHER the new resume_from param OR the legacy
+    # fork_from + resume=True form — the LEGACY FORM DELEGATES INTO THE SAME
+    # resume service (r1 #1); its old execution path is gone. resume=True alone
+    # (no handle) is refused; resume_from together with fork_from/resume=True is
+    # an input conflict. Plain fork_from (no resume) keeps fork semantics.
     _resume_prepared: Optional[Dict[str, Any]] = None
+    _resume_handle: Optional[str] = None
+    if resume_from and (fork_from or resume):
+        return {
+            "success": False,
+            "terminal_id": None,
+            "error": "resume_refused",
+            "missing": "identity",
+            "reason": "resume_input_conflict",
+            "retryable": False,
+            "how": "pass resume_from OR (legacy) fork_from+resume=True, not both",
+            "message": "resume_refused: resume_from conflicts with fork_from/resume",
+        }
     if resume_from:
-        if fork_from:
-            return {
-                "success": False,
-                "terminal_id": None,
-                "message": "resume_from and fork_from are mutually exclusive",
-            }
+        _resume_handle = resume_from
+    elif resume and fork_from:
+        # Legacy syntax → delegate into the resume service (a base name may
+        # itself translate to an identity inside resolve_resume_target).
+        _resume_handle = fork_from
+    elif resume and not fork_from:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "error": "resume_refused",
+            "missing": "identity",
+            "reason": "resume_true_without_handle",
+            "retryable": False,
+            "how": "pass resume_from=<terminal id|uuid> (or legacy fork_from=<base>+resume=True)",
+            "message": "resume_refused: resume=True requires a resume handle",
+        }
+    if _resume_handle:
         from cli_agent_orchestrator.services.resume_service import (
             ResumeRefused,
             prepare_resume,
@@ -2482,7 +2508,7 @@ def _assign_impl(
 
         try:
             _resume_prepared = prepare_resume(
-                resume_from=resume_from,
+                resume_from=_resume_handle,
                 requested_agent_profile=agent_profile or None,
                 requested_working_directory=working_directory,
                 inherit_pins=inherit_pins,
@@ -2494,8 +2520,25 @@ def _assign_impl(
                 **refusal.as_dict(),
                 "message": f"resume_refused (missing {refusal.missing}): {refusal.how}",
             }
+        # r1 #5: inherit_pins=False when the reaped terminal HAD frozen pins
+        # requires the caller to re-declare equivalent authority_files; else the
+        # continuation would run unpinned. Refuse with missing="profile".
+        if not inherit_pins and _resume_prepared.get("known_pins") and not authority_files:
+            return {
+                "success": False,
+                "terminal_id": None,
+                "error": "resume_refused",
+                "missing": "profile",
+                "reason": "pins_dropped_without_replacement",
+                "retryable": False,
+                "how": (
+                    "the reaped terminal had frozen authority pins; pass "
+                    "inherit_pins=True or equivalent authority_files= to re-pin"
+                ),
+                "message": "resume_refused (missing profile): frozen pins would be dropped",
+            }
         # Adopt the resolved profile so downstream logging/labels are correct;
-        # the position/routing machinery is skipped entirely below.
+        # position/routing machinery is skipped entirely below.
         agent_profile = _resume_prepared["agent_profile"]
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
@@ -2604,10 +2647,10 @@ def _assign_impl(
         refresh_base_name = None
         assignment_preamble = None
         forked_from_info = None
-        if resume and not fork_from and not resume_from:
-            raise ValueError("resume_requires_fork_from")
-        # RESUME HOT-FIX (deliverable 1): consume the resume target resolved up
-        # front. Mutually exclusive with fork_from (already rejected above).
+        # RESUME HOT-FIX (r1 #1): resume intent is fully resolved up front into
+        # _resume_prepared (new resume_from OR legacy fork_from+resume). The old
+        # resume_requires_fork_from raise is gone — resume=True without a handle
+        # already returned a typed refusal above.
         if _resume_prepared:
             fork_context = _resume_prepared["fork_context"]
             provider = _resume_prepared["provider"]
@@ -2898,6 +2941,17 @@ def _assign_impl(
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
                 for af in authority_files
             ]
+        # RESUME HOT-FIX (addendum r1 #8): surface the resume result line.
+        if _resume_prepared:
+            _old = _resume_prepared["forked_from_info"]["resumed_from"]
+            result["resumed_from"] = _old
+            result["worktree"] = working_directory
+            result["pins_inherited"] = _resume_prepared.get("pins_inherited", 0)
+            result["resume_line"] = (
+                f"resumed from {_old} as {terminal_id} "
+                f"(worktree {working_directory}, pins_inherited "
+                f"{_resume_prepared.get('pins_inherited', 0)})"
+            )
         # F497 D12 — surface the general-cell substitution to the operator.
         if _fallback_profile:
             result["fallback_profile"] = _fallback_profile
@@ -3065,11 +3119,13 @@ async def assign(
         ),
     ),
     inherit_pins: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "With resume_from: copy the reaped terminal's frozen authority-pin "
-            "set (same shas) onto the resumed worker. Default false — the caller "
-            "re-declares pins via authority_files as today."
+            "With resume_from (or legacy fork_from+resume=True): copy the reaped "
+            "terminal's frozen authority-pin set (same shas) onto the resumed "
+            "worker, which re-verifies them before continuing. Default TRUE. Set "
+            "False only if you re-declare equivalent pins via authority_files — "
+            "otherwise a resume of a terminal that HAD pins is refused."
         ),
     ),
     barrier: Optional[str] = Field(default=None, description="Callback barrier label"),
