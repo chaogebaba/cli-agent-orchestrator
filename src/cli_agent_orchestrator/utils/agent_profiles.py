@@ -690,102 +690,159 @@ class ProviderResolutionError(ValueError):
         self.code = code
 
 
-def _stub_declared_provider(agent_profile_name: str) -> "tuple[bool, Optional[str]]":
-    """Read a profile's RAW stub frontmatter and report its declared provider.
+# F838 (#695) r2 — tri-state stub-intent classification. The r1 helper was
+# binary (declares? yes/no) with a ``_safe`` wrapper that swallowed EVERY read
+# error into ``(False, None)`` — the codex EMPIRICAL-GATE-NO Blocker 1: a raw
+# stub that is unreadable/unparseable/vanished became "no declared intent" and
+# so fell back to the caller's provider. The correct classification is
+# tri-state, and UNKNOWN must FAIL CLOSED for the resolution path.
+_STUB_DECLARED = "declared"  # read OK, frontmatter carries provider/extends/position
+_STUB_PLAIN = "plain"  # read OK, genuine legacy plain profile (no such intent)
+_STUB_ABSENT = "absent"  # FileNotFoundError — name truly absent, nothing to contradict
+_STUB_UNKNOWN = "unknown"  # read/parse error, or ambiguous — evidence unavailable
 
-    Returns ``(declares_intent, provider)`` where ``declares_intent`` is True
-    when the raw frontmatter carries ANY of ``provider:``/``extends:``/
-    ``position:`` — i.e. the stub asserts a specific provider/composition and a
-    silent fallback to the caller's provider would contradict the store (F838
-    #695). ``provider`` is the raw ``provider:`` value (or None).
 
-    A profile with none of those keys is a genuine legacy plain profile
-    (``declares_intent`` False), for which the caller-provider fallback is
-    correct and pinned by existing tests. FileNotFoundError propagates to the
-    caller (a truly absent name is not this function's concern).
+def _classify_stub_intent(
+    agent_profile_name: str,
+) -> "tuple[str, Optional[str], Optional[str]]":
+    """Read a profile's RAW stub ONCE and classify its declared intent (tri-state+).
 
-    Reads through ``read_agent_profile_source`` so the search order matches the
-    load path. With the F838 atomic-write fix in install.sh a reader never sees
-    a truncated stub, so this raw read is either the full valid stub or the full
-    previous version — never a partial that drops ``provider:``.
+    Returns ``(intent, declared_provider, raw_text)`` where ``intent`` is one of
+    :data:`_STUB_DECLARED`, :data:`_STUB_PLAIN`, :data:`_STUB_ABSENT`,
+    :data:`_STUB_UNKNOWN`:
+
+    * ``DECLARED`` — the frontmatter parsed cleanly and carries ANY of
+      ``provider:``/``extends:``/``position:``; ``declared_provider`` is the raw
+      ``provider:`` value (or None if only ``extends:``/``position:`` present).
+    * ``PLAIN`` — the frontmatter parsed cleanly and carries NONE of those keys:
+      a genuine legacy plain profile, for which the caller-provider fallback is
+      correct (pinned by ``test_returns_fallback_when_no_provider_key`` et al.).
+    * ``ABSENT`` — ``read_agent_profile_source`` raised ``FileNotFoundError``:
+      the name is truly absent, nothing in the store to contradict.
+    * ``UNKNOWN`` — the raw read raised anything else (permission/IO/decoding),
+      or the frontmatter failed to parse. We have NO evidence of intent, so this
+      path MUST fail closed (F838 #695 r2) — never treated as ``PLAIN``.
+
+    ``raw_text`` is the single raw read (or None when not ABSENT-but-readable),
+    so the caller resolves the profile from these SAME bytes rather than issuing
+    a second, racy disk read (codex Blocker: "resolve from one immutable read").
     """
-    raw = read_agent_profile_source(agent_profile_name)
-    metadata = frontmatter.loads(raw).metadata
+    try:
+        raw = read_agent_profile_source(agent_profile_name)
+    except FileNotFoundError:
+        return _STUB_ABSENT, None, None
+    except Exception:
+        # Exists (or its readability is indeterminate) but we cannot read it —
+        # evidence unavailable. UNKNOWN, fail closed for the resolution path.
+        return _STUB_UNKNOWN, None, None
+    try:
+        metadata = frontmatter.loads(raw).metadata
+    except Exception:
+        # The bytes are present but not parseable frontmatter — indeterminate.
+        return _STUB_UNKNOWN, None, raw
     declares = any(k in metadata for k in ("provider", *PROFILE_COMPOSITION_KEYS))
     provider = metadata.get("provider")
     provider = provider if isinstance(provider, str) and provider else None
-    return declares, provider
+    return (_STUB_DECLARED if declares else _STUB_PLAIN), provider, raw
 
 
 def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
-    """Resolve the provider to use for an agent profile.
+    """Resolve the provider to use for an agent profile (F838 #695 FAIL-CLOSED).
 
-    Loads the agent profile from the CAO agent store and checks for a
-    ``provider`` key.  If present and valid, returns the profile's provider.
-    Otherwise returns the fallback provider (typically inherited from the
-    calling terminal).
+    The provider is resolved from a SINGLE immutable raw read of the profile's
+    stub (F838 #695 r2 — codex EMPIRICAL-GATE-NO Blocker 1): the stub is read
+    once, its declared intent is classified from those bytes, and the profile is
+    composed/parsed from those SAME bytes. No second, racy disk read decides the
+    fallback question.
 
-    F838 (#695) FAIL-CLOSED: a profile whose RAW stub frontmatter DECLARES a
-    provider/composition (``provider:``/``extends:``/``position:``) but that
-    resolves to no valid provider is a DEFECT, not a "no opinion, inherit the
-    caller" signal. Such a case now raises :class:`ProviderResolutionError`
-    (``E-PROVIDER-UNRESOLVED``) instead of silently substituting the caller's
-    provider (the bug: a ``pi_cli`` alias stub spawned as the supervisor's
-    ``claude_code``/Opus). The caller-provider fallback survives ONLY for a
-    genuine legacy plain profile that declares NO such intent (pinned by
-    ``test_returns_fallback_when_no_provider_key`` et al.) and for a truly
-    absent name.
+    Fail-closed contract for a name whose stub DECLARES a provider/composition
+    (``provider:``/``extends:``/``position:``): if it does not resolve to a
+    valid provider — because it composed/parsed to no provider, an invalid
+    provider, or the composition/parse RAISED — this raises
+    :class:`ProviderResolutionError` (``E-PROVIDER-UNRESOLVED``) rather than
+    silently substituting the caller's provider (the #695 bug: a ``pi_cli``
+    alias stub spawned as the supervisor's ``claude_code``/Opus).
+
+    An UNKNOWN stub — the raw read errored, or the frontmatter would not parse —
+    also fails closed: an unreadable/unparseable store entry for a legacy alias
+    is a REFUSAL, not caller-provider inheritance (codex: "an unreadable,
+    unparseable, changed, or disappeared store entry must be a refusal"). The
+    ``ProviderResolutionError`` carries the sentinel provider name ``<unknown>``.
+
+    The caller-provider fallback survives for EXACTLY two cases, both requiring a
+    SUCCESSFUL read:
+      * ``PLAIN`` — the stub read cleanly and declares NO provider/composition
+        intent (a genuine legacy plain profile).
+      * ``ABSENT`` — the name is truly absent (``FileNotFoundError``); nothing in
+        the store to contradict (provider.initialize surfaces the real error).
 
     Args:
         agent_profile_name: Name of the agent profile to look up.
-        fallback_provider: Provider to use when the profile declares no
-            provider/composition intent at all (legacy plain profile).
+        fallback_provider: Provider to use ONLY for a PLAIN or ABSENT stub.
 
     Returns:
         Resolved provider type string.
 
     Raises:
         ProviderResolutionError: the stub declares a provider/composition but
-            it does not resolve to a valid provider (fail closed, no spawn).
+            does not resolve to a valid provider, OR the stub is UNKNOWN
+            (unreadable/unparseable) — fail closed, no spawn.
     """
-    try:
-        profile = load_agent_profile(agent_profile_name)
-    except FileNotFoundError:
+    intent, declared_provider, raw_text = _classify_stub_intent(agent_profile_name)
+
+    if intent == _STUB_ABSENT:
         # Name truly absent — nothing to contradict; fall back.
         return fallback_provider
-    except RuntimeError:
-        # Loaded but failed to compose/parse. If the raw stub declares a
-        # provider/composition intent, this is the F838 defect — fail closed
-        # rather than silently inheriting the caller's provider.
-        declares, _ = _stub_declared_provider_safe(agent_profile_name)
-        if declares:
+
+    if intent == _STUB_UNKNOWN:
+        # Unreadable/unparseable store entry — evidence unavailable. A legacy
+        # alias that cannot be read must be REFUSED, never inherit the caller.
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"could not be read/parsed from the store (provider undeterminable); "
+            f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+        )
+
+    # intent is PLAIN or DECLARED — the stub read cleanly. Resolve the profile
+    # from the SAME raw bytes we classified, so nothing re-reads the mutable
+    # store between the intent decision and the resolution.
+    try:
+        profile = resolve_agent_profile(resolve_env_vars(raw_text or ""), agent_profile_name)
+    except (FileNotFoundError, ValueError, RuntimeError):
+        # Composition/parse failed AFTER a clean stub read. For a PLAIN profile
+        # this cannot normally happen (plain parse), but treat any failure on a
+        # DECLARED stub as the #695 defect — fail closed.
+        if intent == _STUB_DECLARED:
             raise ProviderResolutionError(
                 E_PROVIDER_UNRESOLVED,
                 f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
                 f"declares a provider/composition but failed to load/compose; "
                 f"refusing to fall back to '{fallback_provider}' (F838 #695)",
             )
-        return fallback_provider
+        # PLAIN stub that nonetheless failed to parse — indeterminate, refuse.
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"read but failed to parse (provider undeterminable); "
+            f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+        )
 
-    if profile.provider:
-        if profile.provider in PROVIDERS:
-            return profile.provider
-        else:
-            logger.warning(
-                "Agent profile '%s' has invalid provider '%s'. "
-                "Valid providers: %s. Falling back to '%s'.",
-                agent_profile_name,
-                profile.provider,
-                PROVIDERS,
-                fallback_provider,
-            )
+    if profile.provider and profile.provider in PROVIDERS:
+        return profile.provider
 
-    # No valid provider on the loaded profile. F838: if the raw stub DECLARED a
-    # provider/composition intent, a silent fallback would contradict the store
-    # — fail closed. Only a genuine legacy plain profile (no such intent) keeps
-    # the caller-provider fallback.
-    declares, _ = _stub_declared_provider_safe(agent_profile_name)
-    if declares:
+    if profile.provider and profile.provider not in PROVIDERS:
+        logger.warning(
+            "Agent profile '%s' has invalid provider '%s'. Valid providers: %s.",
+            agent_profile_name,
+            profile.provider,
+            PROVIDERS,
+        )
+
+    # Loaded cleanly but carries no valid provider. F838: a DECLARED stub that
+    # resolves to no valid provider is a defect — fail closed. Only a genuine
+    # PLAIN profile (no declared intent) keeps the caller-provider fallback.
+    if intent == _STUB_DECLARED:
         raise ProviderResolutionError(
             E_PROVIDER_UNRESOLVED,
             f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
@@ -797,16 +854,26 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
 
 
 def _stub_declared_provider_safe(agent_profile_name: str) -> "tuple[bool, Optional[str]]":
-    """``_stub_declared_provider`` that never raises (returns (False, None) on error).
+    """F838 #695 assign-guard helper: is the stub's declared intent known, and
+    what provider does it name?
 
-    Used inside ``resolve_provider``'s fail-closed decision: if we cannot even
-    re-read the raw stub, we do not have evidence it declared intent, so we do
-    not manufacture a refusal from a read error — we fall back to the legacy
-    path (the load-time RuntimeError, if any, already carries the real cause)."""
-    try:
-        return _stub_declared_provider(agent_profile_name)
-    except Exception:
-        return False, None
+    Returns ``(declares_intent, declared_provider)``. Unlike the r1 version this
+    is NOT best-effort: a ``DECLARED`` stub returns ``(True, provider)`` and a
+    genuinely ``PLAIN`` stub returns ``(False, None)`` — but an ``UNKNOWN`` stub
+    (unreadable/unparseable) ALSO returns ``(True, None)`` so the assign guard
+    routes it through ``resolve_provider`` (which fails closed on UNKNOWN) rather
+    than silently treating an unreadable alias as "no intent → legacy
+    passthrough" (codex Blocker 1). Only a clean PLAIN/ABSENT read yields
+    ``(False, …)`` — the sole paths allowed to fall back."""
+    intent, declared_provider, _ = _classify_stub_intent(agent_profile_name)
+    if intent == _STUB_DECLARED:
+        return True, declared_provider
+    if intent == _STUB_UNKNOWN:
+        # Unreadable/unparseable: NOT a "no intent" signal. Route through the
+        # fail-closed resolver rather than the legacy passthrough.
+        return True, None
+    # PLAIN or ABSENT — a clean read with no declared intent.
+    return False, declared_provider
 
 
 # --- F497 D7 — assign(provider=) position-name resolution ------------------

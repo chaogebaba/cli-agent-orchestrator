@@ -2593,19 +2593,26 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
+            # F838 (#695) r2 — the guard-checked provider for a legacy alias,
+            # carried INTO _create_terminal so creation never re-resolves from
+            # the mutable store between validation and use (codex Blocker 2).
+            _f838_checked_provider = None
 
-            # F838 (#695) — fail-closed provider guard for a LEGACY ALIAS STUB.
+            # F838 (#695) r2 — fail-closed provider guard for a LEGACY ALIAS STUB.
             # resolve_assignment_target passes a legacy name through with
             # _resolved_provider=None, deferring provider derivation to
             # _create_terminal's resolve_provider(fallback=caller_provider). That
             # fallback silently spawned a pi_cli alias stub as the supervisor's
             # claude_code/Opus when composition resolved to no provider. VALIDATE
             # here from the stub's own frontmatter: on any unresolved/mismatch,
-            # REFUSE with a typed result and NO spawn. We deliberately do NOT pin
-            # _resolved_provider (which would activate the position D8/D9 writer
-            # paths meant for position names) — _create_terminal still derives it
-            # via the now-fail-closed resolve_provider, so a legacy alias spawns
-            # exactly as before EXCEPT a substitution is refused, not silent.
+            # REFUSE with a typed result and NO spawn. r2 (codex Blocker 2):
+            # instead of leaving the derivation to a SECOND, racy store read in
+            # _create_terminal, we CARRY the guard-checked provider into creation
+            # via _f838_checked_provider so the value validated here is the value
+            # used — creation never re-resolves from the mutable store. We still
+            # do NOT pin _resolved_provider (which would activate the position
+            # D8/D9 writer paths meant for position names); the checked value
+            # flows through _create_terminal's F613 ``provider=`` seam instead.
             if _resolved_provider is None:
                 from cli_agent_orchestrator.utils.agent_profiles import (
                     E_PROVIDER_UNRESOLVED,
@@ -2652,9 +2659,11 @@ def _assign_impl(
                                 f"'{_checked}' (F838 #695 provider-substitution guard)"
                             ),
                         }
-                    # Validated only; _create_terminal re-derives via the
-                    # fail-closed resolve_provider. _resolved_provider stays None
-                    # (legacy passthrough) so no position machinery is triggered.
+                    # r2: carry the guard-checked provider into _create_terminal
+                    # so creation uses exactly this value (no re-resolution from
+                    # the mutable store between guard and create). _resolved_provider
+                    # stays None (legacy passthrough) so no position machinery fires.
+                    _f838_checked_provider = _checked
         if not _resume_prepared and _routing_driven and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (
@@ -2951,7 +2960,7 @@ def _assign_impl(
             lifecycle=lifecycle,
             use_worktree=use_worktree,
             authority_files=authority_files,
-            provider=_resolved_provider,
+            provider=_resolved_provider or _f838_checked_provider,
             **create_kwargs,
         )
 

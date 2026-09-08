@@ -122,74 +122,128 @@ class TestLoadAgentProfile:
 
 
 class TestResolveProvider:
-    """Tests for resolve_provider function."""
+    """Tests for resolve_provider function.
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_returns_profile_provider_when_valid(self, mock_load):
-        """Profile with a valid provider key should override the fallback."""
-        mock_load.return_value = AgentProfile(
-            name="developer", description="Dev agent", provider="claude_code"
+    F838 (#695) r2: resolve_provider now derives BOTH declared intent AND the
+    provider from a SINGLE raw read of the stub (``read_agent_profile_source``)
+    plus one composition (``resolve_agent_profile``) of those same bytes — it no
+    longer calls ``load_agent_profile``. A stub that DECLARES a provider but
+    resolves to an invalid/empty/absent provider now FAILS CLOSED
+    (ProviderResolutionError) instead of the old silent caller-provider
+    fallback; only a genuine PLAIN profile (no declared intent) or a truly
+    absent name falls back.
+    """
+
+    _READ = "cli_agent_orchestrator.utils.agent_profiles.read_agent_profile_source"
+    _COMPOSE = "cli_agent_orchestrator.utils.agent_profiles.resolve_agent_profile"
+    # A raw stub that DECLARES a provider key (so intent classification -> DECLARED).
+    _DECLARING = "---\nprovider: {p}\n---\nbody\n"
+    # A raw stub that declares NO provider/composition intent (genuine plain).
+    _PLAIN = "---\ndescription: plain legacy profile\n---\nbody\n"
+
+    def test_returns_profile_provider_when_valid(self):
+        """A stub declaring a valid provider resolves to it (overrides fallback)."""
+        with (
+            patch(self._READ, return_value=self._DECLARING.format(p="claude_code")),
+            patch(
+                self._COMPOSE,
+                return_value=AgentProfile(
+                    name="developer", description="Dev agent", provider="claude_code"
+                ),
+            ),
+        ):
+            assert resolve_provider("developer", fallback_provider="kiro_cli") == "claude_code"
+
+    def test_returns_fallback_when_no_provider_key(self):
+        """A genuine PLAIN profile (no provider/composition intent) falls back."""
+        with (
+            patch(self._READ, return_value=self._PLAIN),
+            patch(
+                self._COMPOSE,
+                return_value=AgentProfile(name="reviewer", description="Reviewer agent"),
+            ),
+        ):
+            assert resolve_provider("reviewer", fallback_provider="kiro_cli") == "kiro_cli"
+
+    def test_declaring_stub_with_invalid_provider_refuses(self, caplog):
+        """F838 r2: a stub that DECLARES a provider whose value is invalid now
+        REFUSES (fail closed) and logs the invalid provider — the old path
+        silently fell back to the caller's provider."""
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            E_PROVIDER_UNRESOLVED,
+            ProviderResolutionError,
         )
 
-        result = resolve_provider("developer", fallback_provider="kiro_cli")
-
-        assert result == "claude_code"
-        mock_load.assert_called_once_with("developer")
-
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_returns_fallback_when_no_provider_key(self, mock_load):
-        """Profile without a provider key should fall back to the caller's provider."""
-        mock_load.return_value = AgentProfile(name="reviewer", description="Reviewer agent")
-
-        result = resolve_provider("reviewer", fallback_provider="kiro_cli")
-
-        assert result == "kiro_cli"
-
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_returns_fallback_when_provider_is_invalid(self, mock_load, caplog):
-        """Profile with an invalid provider value should fall back and log a warning."""
-        mock_load.return_value = AgentProfile(
-            name="developer", description="Dev agent", provider="claud_code"
-        )
-
-        with caplog.at_level(logging.WARNING):
-            result = resolve_provider("developer", fallback_provider="kiro_cli")
-
-        assert result == "kiro_cli"
+        with (
+            patch(self._READ, return_value=self._DECLARING.format(p="claud_code")),
+            patch(
+                self._COMPOSE,
+                return_value=AgentProfile(
+                    name="developer", description="Dev agent", provider="claud_code"
+                ),
+            ),
+        ):
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(ProviderResolutionError) as ei:
+                    resolve_provider("developer", fallback_provider="kiro_cli")
+        assert ei.value.code == E_PROVIDER_UNRESOLVED
         assert "invalid provider" in caplog.text.lower()
         assert "claud_code" in caplog.text
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_returns_fallback_when_profile_not_found(self, mock_load):
-        """Missing profile should fall back without raising."""
-        mock_load.side_effect = RuntimeError("Failed to load agent profile 'ghost'")
+    def test_returns_fallback_when_profile_not_found(self):
+        """A truly absent name (FileNotFoundError from the raw read) falls back
+        without raising — nothing in the store to contradict."""
+        with patch(self._READ, side_effect=FileNotFoundError("Agent profile not found: ghost")):
+            assert resolve_provider("ghost", fallback_provider="kiro_cli") == "kiro_cli"
 
-        result = resolve_provider("ghost", fallback_provider="kiro_cli")
+    def test_unreadable_stub_refuses(self):
+        """F838 r2: a raw-read error (not FileNotFound) is an UNKNOWN store entry
+        and MUST refuse rather than fall back."""
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            E_PROVIDER_UNRESOLVED,
+            ProviderResolutionError,
+        )
 
-        assert result == "kiro_cli"
+        with patch(self._READ, side_effect=OSError("permission denied")):
+            with pytest.raises(ProviderResolutionError) as ei:
+                resolve_provider("developer", fallback_provider="kiro_cli")
+        assert ei.value.code == E_PROVIDER_UNRESOLVED
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_all_valid_provider_types_accepted(self, mock_load):
-        """Each ProviderType enum value should be accepted as a valid provider."""
+    def test_all_valid_provider_types_accepted(self):
+        """Each ProviderType enum value is accepted as a valid declared provider."""
         from cli_agent_orchestrator.constants import PROVIDERS
 
         for provider_value in PROVIDERS:
-            mock_load.return_value = AgentProfile(
-                name="agent", description="test", provider=provider_value
-            )
-            result = resolve_provider("agent", fallback_provider="kiro_cli")
-            assert result == provider_value
+            with (
+                patch(self._READ, return_value=self._DECLARING.format(p=provider_value)),
+                patch(
+                    self._COMPOSE,
+                    return_value=AgentProfile(
+                        name="agent", description="test", provider=provider_value
+                    ),
+                ),
+            ):
+                assert resolve_provider("agent", fallback_provider="kiro_cli") == provider_value
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
-    def test_returns_fallback_when_provider_is_empty_string(self, mock_load):
-        """Empty string provider should be treated as absent and fall back."""
-        mock_load.return_value = AgentProfile(
-            name="developer", description="Dev agent", provider=""
+    def test_declaring_stub_with_empty_provider_refuses(self):
+        """F838 r2: a stub that carries a ``provider:`` key with an empty value
+        DECLARES intent but resolves to no provider — REFUSE, do not fall back
+        (this is the #695 shape: parsed provider=None must not inherit caller)."""
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            E_PROVIDER_UNRESOLVED,
+            ProviderResolutionError,
         )
 
-        result = resolve_provider("developer", fallback_provider="kiro_cli")
-
-        assert result == "kiro_cli"
+        with (
+            patch(self._READ, return_value="---\nprovider:\n---\nbody\n"),
+            patch(
+                self._COMPOSE,
+                return_value=AgentProfile(name="developer", description="Dev agent", provider=""),
+            ),
+        ):
+            with pytest.raises(ProviderResolutionError) as ei:
+                resolve_provider("developer", fallback_provider="kiro_cli")
+        assert ei.value.code == E_PROVIDER_UNRESOLVED
 
 
 class TestListAgentProfiles:
