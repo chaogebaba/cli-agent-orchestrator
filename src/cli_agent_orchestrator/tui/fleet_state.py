@@ -42,6 +42,7 @@ _TERMINAL_KEYS: frozenset[str] = frozenset(
         "children_count",
         "init_state",
         "init_health",
+        "terminal_error",
         "since_last_input",
         "lifecycle",
         "resolved_model",
@@ -151,6 +152,10 @@ class TerminalState:
     children_count: int = 0
     init_state: str | None = None
     init_health: str | None = None
+    # F789 (#646): typed reason the row is in ERROR at init, or None when
+    # healthy. Additive; the renderer shows it so a dead-at-init worker never
+    # displays a stale `working`.
+    terminal_error: str | None = None
     since_last_input: float | None = None
     lifecycle: str = "ephemeral"
     resolved_model: str | None = None
@@ -187,6 +192,7 @@ class TerminalState:
             children_count=_as_int(raw.get("children_count")),
             init_state=_as_opt_str(raw.get("init_state")),
             init_health=_as_opt_str(raw.get("init_health")),
+            terminal_error=_as_opt_str(raw.get("terminal_error")),
             since_last_input=_as_opt_float(raw.get("since_last_input")),
             lifecycle=_as_str(raw.get("lifecycle")) or "ephemeral",
             resolved_model=_as_opt_str(raw.get("resolved_model")),

@@ -90,6 +90,41 @@ def _compute_init_health(row: dict[str, Any], now: datetime) -> str | None:
     return None
 
 
+# F789 (#646): the failed-init states that mean the worker is DEAD (or will never
+# confirm), mapped to a stable, typed terminal_error CODE for the fleet row. This
+# is the durable projection signal — the free-text bridge notice carries the
+# richer `code=… reason=…`, but the row itself must say *why* so the TUI never
+# renders a dead worker as `working`. Kept intentionally small and derived from
+# columns that already exist (no schema migration): the init_state CHECK set.
+_INIT_FAILED_TERMINAL_ERROR: dict[str, str] = {
+    "init_failed_notified": "init_failed",
+    "init_failed_caller_gone": "init_failed_caller_gone",
+}
+
+
+def _terminal_error_code(row: dict[str, Any], init_health: str | None) -> str | None:
+    """Derive the projected terminal_error code, or None when the row is healthy.
+
+    F789 (#646): a worker that died at deferred init must surface a typed code on
+    its fleet row, and (via the caller) must not project as `working`. Sources,
+    in order:
+      * an explicit ``init_state`` in the failed set → its mapped code;
+      * any other ``init_health == "failed"`` (e.g. an ``init_pending`` row whose
+        deadline has passed — the deferred-init TimeoutError window that #646
+        reported) → the generic ``deferred_init_failed`` code.
+    Returns None for ready/launching/legacy rows.
+    """
+    init_state = row.get("init_state")
+    if isinstance(init_state, str) and init_state in _INIT_FAILED_TERMINAL_ERROR:
+        return _INIT_FAILED_TERMINAL_ERROR[init_state]
+    if init_health == "failed":
+        # Health failed without a recorded terminal init_state — the overdue
+        # init_pending window (worker dead, failure not yet claimed). #646's
+        # exact signature: still `init_pending`, deadline elapsed.
+        return "deferred_init_failed"
+    return None
+
+
 def _depths(rows: list[dict[str, Any]]) -> dict[str, int]:
     by_id = {row["id"]: row for row in rows}
     memo: dict[str, int] = {}
@@ -380,10 +415,18 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             )
         # F124 S1: compute init_health; failed health overrides status to ERROR.
         init_health = _compute_init_health(row, now)
-        if init_health == "failed":
+        # F789 (#646): derive the typed terminal_error code for the row. When it
+        # is set the worker is dead/never-confirmed at init, so the projected
+        # status MUST NOT be `working` (PROCESSING) or any live class — force
+        # ERROR. This closes the gap where a deferred-init death (the reported
+        # `code=deferred_init_internal` TimeoutError) left the row rendering
+        # `● working` with a growing elapsed timer. The code is surfaced on the
+        # row below so the TUI can show *why*.
+        terminal_error = _terminal_error_code(row, init_health)
+        if init_health == "failed" or terminal_error is not None:
             status = TerminalStatus.ERROR
             _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
-                row["id"], "init_health_failed", ""
+                row["id"], "init_health_failed", terminal_error or ""
             )
         # F568 D12c: `delegating` is a projection over the FINAL status (computed
         # here, AFTER all three ERROR overrides above) and the children ledger.
@@ -457,6 +500,12 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "children_count": children_count,
                 "init_state": row.get("init_state"),
                 "init_health": init_health,
+                # F789 (#646): typed reason a worker's row is in ERROR at init
+                # (init_failed / init_failed_caller_gone / deferred_init_failed),
+                # or None when healthy. Additive sibling key — never a status
+                # enum value. Rendered by the fleet TUI so a dead-at-init worker
+                # shows the code, not a stale `working`.
+                "terminal_error": terminal_error,
                 "since_last_input": since_last_input,
                 "lifecycle": row.get("lifecycle", "ephemeral"),
                 "resolved_model": row.get("resolved_model"),
