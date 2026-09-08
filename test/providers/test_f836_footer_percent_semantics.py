@@ -71,18 +71,26 @@ def test_footer_percent_semantics(name, provider, kind, subtype) -> None:
 
 def test_kiro_glyph_alone_is_never_exhausted() -> None:
     """The pie glyph WITHOUT a number (or with a low number) is never a
-    condition — exhaustion is decided by the USED% value, not the glyph."""
+    condition — exhaustion is decided by the USED% value, not the glyph. The
+    status bar sits above the real kiro composer placeholder (F836 r3 anchor)."""
+    _composer = "\n ask a question or describe a task ↵\n"
     for glyph in ("◔", "◑", "◕", "●"):
-        pane = f"kiro_cli_dev · Auto · {glyph}      /path · (branch)\n›  ask\n"
+        pane = f"kiro_cli_dev · Auto · {glyph}      /path · (branch){_composer}"
         assert classify_condition(pane, "kiro_cli") is None, f"glyph {glyph} alone fired"
-        low = f"kiro_cli_dev · Auto · {glyph} 12%      /path · (branch)\n›  ask\n"
+        low = f"kiro_cli_dev · Auto · {glyph} 12%      /path · (branch){_composer}"
         assert classify_condition(low, "kiro_cli") is None, f"glyph {glyph} 12% fired"
 
 
 def test_kiro_threshold_boundary() -> None:
-    """kiro fires at exactly the USED threshold, not one below it."""
-    below = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD - 1}%   /p · (b)\n›  ask\n"
-    at = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD}%   /p · (b)\n›  ask\n"
+    """kiro fires at exactly the USED threshold, not one below it.
+
+    F836 r3: the status bar is anchored to the live kiro composer placeholder
+    ("ask a question or describe a task"), which sits BELOW the status bar in the
+    real TUI — so the boundary panes carry the real composer row, not a bare "›".
+    """
+    _composer = " ask a question or describe a task ↵\n"
+    below = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD - 1}%   /p · (b)\n{_composer}"
+    at = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD}%   /p · (b)\n{_composer}"
     assert classify_condition(below, "kiro_cli") is None
     cond = classify_condition(at, "kiro_cli")
     assert cond is not None and cond.kind is ConditionKind.CONTEXT_EXHAUSTED
@@ -178,3 +186,126 @@ def test_r2_kiro_glyph_without_chrome_is_not_a_footer() -> None:
     kiro status bar — do not fire."""
     pane = "  ● 92% of the way there\n"
     assert classify_condition(pane, "kiro_cli") is None
+
+
+# ── F836 r3 (#693) — footer located by POSITION relative to the live composer,
+# never by content shape. The r2 gate reported four fresh false positives that a
+# glyph-denylist + co-signature let through; each is quoted/fenced/bulleted
+# status-bar text that lives ABOVE the composer (or on a pane with no composer at
+# all) and MUST NOT fire. (EMPIRICAL-GATE-NO blocker fix.) ────────────────────
+
+# The four r2-verdict adversarial probes (verbatim substance). Each MUST be quiet:
+# a fenced/indented/bulleted quote of a status bar is transcript territory, above
+# the live composer (or on a composer-less pane), so the position rule excludes it
+# by construction — no new glyph rule.
+_R3_VERDICT_NEGATIVE = [
+    # A fenced Kiro status quote inside a ``` code fence, ABOVE the live composer.
+    (
+        "fenced-kiro-quote",
+        "kiro_cli",
+        "• Here is what my bar showed:\n"
+        "```text\n"
+        "kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "```\n"
+        "\n"
+        " ask a question or describe a task ↵\n",
+    ),
+    # A fenced Codex status quote inside a ``` code fence, ABOVE the live composer.
+    (
+        "fenced-codex-quote",
+        "codex",
+        "• Here is what my bar showed:\n"
+        "```text\n"
+        "~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+        "```\n"
+        "\n"
+        "› Ask Codex to do anything\n",
+    ),
+    # An indented Codex transcript continuation line under a bullet — the pane has
+    # NO live composer marker, so there is no live status bar to read.
+    (
+        "indented-codex-transcript",
+        "codex",
+        "• You pasted this status:\n"
+        "    ~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n",
+    ),
+    # A Markdown bullet quoting a Kiro status — no live composer marker on the pane.
+    (
+        "markdown-kiro-bullet",
+        "kiro_cli",
+        "• Sure, I see it.\n- copied · status · ● 92%\n",
+    ),
+]
+
+
+@pytest.mark.parametrize("label,provider,pane", _R3_VERDICT_NEGATIVE)
+def test_r3_verdict_probes_do_not_fire(label, provider, pane) -> None:
+    assert classify_condition(pane, provider) is None, f"{label}: quoted status wrongly fired"
+
+
+def test_r3_genuine_footer_below_composer_fires_codex() -> None:
+    """A genuine codex status bar at 8% left, BELOW the live composer, fires with
+    high confidence (the required positive)."""
+    pane = (
+        "• done.\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+    )
+    c = classify_condition(pane, "codex")
+    assert c is not None and c.kind is ConditionKind.CONTEXT_EXHAUSTED
+    assert c.subtype == "footer_percent_status" and c.confidence.value == "high"
+
+
+def test_r3_genuine_footer_fires_kiro() -> None:
+    """A genuine kiro status bar at 92% used, ABOVE the live composer, fires with
+    high confidence."""
+    pane = (
+        "  Parked idle.\n\n"
+        "kiro_cli_dev · Auto · ● 92%                    /data/x · (cao/x)\n\n"
+        " ask a question or describe a task ↵\n"
+    )
+    k = classify_condition(pane, "kiro_cli")
+    assert k is not None and k.kind is ConditionKind.CONTEXT_EXHAUSTED
+    assert k.subtype == "footer_percent_status" and k.confidence.value == "high"
+
+
+def test_r3_quoted_footer_above_and_live_footer_fires_once_codex() -> None:
+    """A pane that BOTH quotes a footer above the composer AND has a genuine live
+    footer below it fires exactly once, reading the LIVE row — the quote is inert.
+
+    The quoted row reads 3% left (would be exhausted if read); the live row reads
+    a healthy 77% left. The verdict must reflect the LIVE row: NOT exhausted."""
+    pane = (
+        "• Earlier my bar said:\n"
+        "```text\n"
+        "~/x · main · gpt-5.6-sol high · Context 3% left · 5h 9% left\n"
+        "```\n\n"
+        "› Ask Codex to do anything\n\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 77% left · 5h 47% left\n"
+    )
+    # The live row (77% left) is healthy → no condition; the quoted 3% is ignored.
+    assert classify_condition(pane, "codex") is None
+
+
+def test_r3_quoted_footer_above_and_live_footer_fires_once_kiro() -> None:
+    """kiro twin of the above: a quoted 92%-used bar above the composer plus a
+    genuine healthy 30%-used live bar → reads the LIVE row only → not exhausted."""
+    pane = (
+        "• Earlier my bar said:\n"
+        "```text\n"
+        "kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "```\n\n"
+        "kiro_cli_dev · Auto · ◑ 30%                    /data/x · (cao/x)\n\n"
+        " ask a question or describe a task ↵\n"
+    )
+    assert classify_condition(pane, "kiro_cli") is None
+
+
+def test_r3_no_composer_pane_does_not_fire() -> None:
+    """A pane with NO composer marker (mid-init, alt-screen, a bare transcript
+    paste) has no live status bar to anchor on → footer classification is quiet,
+    for both providers, even when a footer-shaped row is present."""
+    codex_no_composer = "  ~/x · main · gpt-5.6-sol high · Context 4% left · 5h 9% left\n"
+    assert classify_condition(codex_no_composer, "codex") is None
+    kiro_no_composer = "kiro_cli_dev · Auto · ● 95%                    /data/x · (cao/x)\n"
+    assert classify_condition(kiro_no_composer, "kiro_cli") is None
