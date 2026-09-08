@@ -453,6 +453,44 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         rec("ASSIGN_RESUME_FROM", f"resume_from={resume_handle!r} -> " + str({k: res.get(k) for k in
             ("success", "terminal_id", "resumed_from", "worktree", "pins_inherited",
              "resume_line", "error", "reason", "missing")}))
+        if not res.get("success"):
+            # DECISIVE DIAGNOSTIC: dump the post-hibernate DB rows so we see
+            # exactly which link is NULL (terminal_identity row present? its
+            # identity_key + provider_session_id? root id?).
+            conn = _db(cao_server)
+            try:
+                ti = conn.execute(
+                    "SELECT terminal_id, identity_key, provider_session_id, lifecycle "
+                    "FROM terminal_identity WHERE terminal_id = ?", (worker_id,),
+                ).fetchone()
+                by_uuid = conn.execute(
+                    "SELECT terminal_id, lifecycle FROM terminal_identity "
+                    "WHERE provider_session_id = ?", (captured_sid,),
+                ).fetchall()
+                root = conn.execute(
+                    "SELECT identity_key, provider_session_id, lifecycle FROM "
+                    "conversation_identity WHERE identity_key = ?", (identity_key,),
+                ).fetchone()
+                all_ti = conn.execute(
+                    "SELECT terminal_id, identity_key, provider_session_id, lifecycle "
+                    "FROM terminal_identity",
+                ).fetchall()
+            finally:
+                conn.close()
+            rec("DB_DIAG", f"worker_id={worker_id} captured_sid={captured_sid}\n"
+                f"terminal_identity[worker]={ti}\nby_uuid={by_uuid}\nroot={root}\n"
+                f"ALL terminal_identity={all_ti}")
+            print("\n===F829 DB_DIAG===", flush=True)
+            print(f"worker_id={worker_id} captured_sid={captured_sid}", flush=True)
+            print(f"terminal_identity[worker]={ti}", flush=True)
+            print(f"by_uuid={by_uuid}", flush=True)
+            print(f"root={root}", flush=True)
+            print(f"ALL terminal_identity={all_ti}", flush=True)
+            print("===END DB_DIAG===\n", flush=True)
+            _capture_diag(cao_server, f"resume-refused-{provider}")
+            _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+            (_DIAG_DIR / f"{provider}-resume-refused-diag.txt").write_text(
+                "\n".join(transcript), encoding="utf-8")
         assert res.get("success") is True, f"public resume seam failed: {res}"
         resumed_id = res["terminal_id"]
         assert res.get("resumed_from") in (worker_id, identity_key, captured_sid)
