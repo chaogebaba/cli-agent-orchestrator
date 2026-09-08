@@ -714,6 +714,8 @@ def test_ac4_crash_detach_narrow(real_sqlite_env):
 
     # narrow transition results
     assert out["terminal_deleted"] and out["lifecycle"] == "detached"
+    # A1 D8i: both authority settlement counts are returned (2 undelivered rows).
+    assert out["ledger_settled"] == 2 and out["inbox_settled"] == 2
     assert d.get_conversation_identity("k_cd")["lifecycle"] == "detached"
     assert "crash_detached" in [e["event"] for e in d.get_conversation_events("k_cd")]
 

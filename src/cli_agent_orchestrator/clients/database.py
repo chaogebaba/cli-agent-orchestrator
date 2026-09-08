@@ -7283,18 +7283,18 @@ def crash_detach_terminal(terminal_id: str) -> Dict[str, Any]:
         ti = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
         if ti is not None and ti.identity_key:
             identity_key = cast(str, ti.identity_key)
-        # (i) departed-receiver detector — same call the reap path makes.
-        try:
-            mark_receiver_gone(db, receiver_id=terminal_id)
-        except Exception:
-            logger.debug("crash_detach mark_receiver_gone failed", exc_info=True)
-        # (i-b) F829 E2 (D8): settle this dead receiver's UNDELIVERED inbox rows
-        # in the SAME transaction, so no inbox row is left pending/delivering
-        # against a removed receiver. NOT swallowed — a failed settlement rolls
-        # back the whole transaction rather than deleting the receiver with an
-        # unsettled inbox row. Scoped to crash-detach only (the reap path's
-        # inbox settlement is owned by the WPM4b delivery-attempt pipeline).
-        _settle_inbox_receiver_gone(db, receiver_id=terminal_id)
+        # (i) F829 A1 (D8i): settle BOTH delivery authorities for the dead
+        # receiver in this ONE transaction — the ledger (mark_receiver_gone:
+        # pending/emitted → undeliverable(receiver_gone)) AND the inbox
+        # (_settle_inbox_receiver_gone: pending/delivering →
+        # delivery_failed(receiver_gone)). NEITHER is swallowed: a failed
+        # settlement aborts the whole transaction so the receiver is NOT deleted
+        # with an unsettled authority (A1 D8i replaces the old swallow at :5879).
+        # Both counts are captured and returned. Inbox settlement is scoped to
+        # crash-detach only (the reap path's inbox settlement is owned by the
+        # WPM4b delivery-attempt pipeline).
+        ledger_settled = mark_receiver_gone(db, receiver_id=terminal_id)
+        inbox_settled = _settle_inbox_receiver_gone(db, receiver_id=terminal_id)
         # (ii) nullify mailbox authority for this terminal.
         db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
             {MailboxModel.current_terminal_id: None},
@@ -7320,6 +7320,8 @@ def crash_detach_terminal(terminal_id: str) -> Dict[str, Any]:
         "intent_dropped": intent_dropped,
         "identity_key": identity_key,
         "lifecycle": lifecycle_out,
+        "ledger_settled": ledger_settled,
+        "inbox_settled": inbox_settled,
     }
 
 
