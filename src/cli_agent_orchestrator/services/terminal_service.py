@@ -6391,6 +6391,18 @@ def send_input(
         # Inject profile contracts only for orchestrated deliveries. Direct
         # human pane input and answer_user_prompt keep their literal text.
         original_message = message
+        # F758 #615: provider hook may offload an over-long task body to a brief
+        # file and paste a short pointer instead (codex, to dodge the chip-less
+        # inline-paste submit failure). getattr-guarded → no-op for every other
+        # provider and for provider doubles that predate the hook; the hook is
+        # itself fail-open (returns the original message on any error).
+        _prepare_body = getattr(provider, "prepare_delivery_body", None)
+        if callable(_prepare_body) and orchestration_value in {
+            OrchestrationType.ASSIGN.value,
+            OrchestrationType.SEND_MESSAGE.value,
+            OrchestrationType.HANDOFF.value,
+        }:
+            message = _prepare_body(message)
         message = _append_message_contract(message, metadata, orchestration_value)
 
         # Inject memory context into the very first user message after init.
