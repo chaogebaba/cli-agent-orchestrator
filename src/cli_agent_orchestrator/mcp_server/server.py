@@ -2539,6 +2539,7 @@ def _assign_impl(
                 requested_agent_profile=agent_profile or None,
                 requested_working_directory=working_directory,
                 inherit_pins=inherit_pins,
+                caller_principal=_f829_resolve_caller_principal(),
             )
         except ResumeRefused as refusal:
             return {
@@ -2567,6 +2568,35 @@ def _assign_impl(
         # Adopt the resolved profile so downstream logging/labels are correct;
         # position/routing machinery is skipped entirely below.
         agent_profile = _resume_prepared["agent_profile"]
+        # F829 A1 (D3 step 4): for an identity-root resume, TAKE THE CAS CLAIM
+        # now — before any spawn effect. A lost CAS (another claimant or a moved
+        # generation) refuses with session_resume_in_progress and spawns nothing.
+        # The claim is held until the resumed worker reports its id, where
+        # attach_captured_uuid runs verify+publish and clears it (D3 steps 6-7);
+        # a dead attempt is reconciled by the claim TTL (D8).
+        if _resume_prepared.get("via_identity"):
+            from cli_agent_orchestrator.services.conversation_transition import (
+                claim_resume_admission,
+            )
+
+            _admission = _resume_prepared["admission"]
+            _claimant = _current_terminal_id() or "unknown"
+            _claimed = claim_resume_admission(_admission, claimant=_claimant)
+            if not _claimed.ok:
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": _claimed.error or "session_resume_in_progress",
+                    "retryable": True,
+                    "identity_key": _admission.identity_key,
+                    "how": (
+                        "another resume of this conversation is in progress; "
+                        "retry once it settles or is reconciled by the claim TTL"
+                    ),
+                    "message": "resume_refused (missing identity): session_resume_in_progress",
+                }
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
     # rewrites a position name into a profile.

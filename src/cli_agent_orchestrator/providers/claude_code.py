@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.models.terminal import ForkContext
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -705,9 +706,12 @@ class ClaudeCodeProvider(BaseProvider):
         persona_plan: Optional["PersonaPlan"] = None,
         model: Optional[str] = None,
         resume_session_id: Optional[str] = None,
+        fork_context: Optional["ForkContext"] = None,
     ):
         """Initialize provider state."""
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(
+            terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context
+        )
         self._initialized = False
         self._agent_profile = agent_profile
         self._persona_plan = persona_plan
@@ -717,6 +721,14 @@ class ClaudeCodeProvider(BaseProvider):
         # session id (--resume <sid>) instead of starting a fresh
         # conversation. Used to re-open a supervisor conversation inside a
         # new CAO session (durable-orchestra recovery).
+        # F829 A1 (D3): a resume-mode fork_context carries resume_session_id when
+        # the MCP resume path threads it via fork_context rather than the
+        # explicit arg — the explicit arg still wins when both are present.
+        if resume_session_id is None and fork_context is not None:
+            if getattr(fork_context, "mode", None) == "resume":
+                resume_session_id = getattr(fork_context, "resume_session_id", None) or getattr(
+                    fork_context, "session_uuid", None
+                )
         self._resume_session_id = resume_session_id
         # Explicit per-call override for profile.model (see launch()'s own
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
