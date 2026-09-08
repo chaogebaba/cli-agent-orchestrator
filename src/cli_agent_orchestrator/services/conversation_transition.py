@@ -268,6 +268,15 @@ def claim_resume_admission(admission: "ResumeAdmission", claimant: str) -> "Resu
         "resume_claimed",
         detail={"claimant": claimant, "generation": admission.generation + 1},
     )
+    # F829 AC5: record the RECOVERING supervisor separately as resumed_by — it is
+    # NOT the durable owner (owner_principal on the root is preserved untouched),
+    # so a bare callback still routes to the ORIGINAL caller, never to whoever
+    # requested the recovery.
+    record_conversation_event(
+        admission.identity_key,
+        "resumed_by",
+        detail={"resumed_by": claimant},
+    )
     return admission
 
 

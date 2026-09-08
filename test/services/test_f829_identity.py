@@ -478,3 +478,89 @@ def test_ac5_owner_principal_callback_routing(real_sqlite_env):
             MailboxModel(id="mb_down", session_name="s", role="worker", current_terminal_id=None)
         )
     assert get_current_mailbox_terminal("mb_down") is None
+
+
+def test_ac5_resume_bare_callback_routes_to_original_caller(real_sqlite_env):
+    """AC5 (the closed gap): a worker resumed FROM supervisor B, replying with a
+    no-receiver send_message, resolves to supervisor A's mailbox — the root's
+    owner_principal — never supervisor B (the recovering terminal).
+    """
+    from cli_agent_orchestrator.clients.database import (
+        TerminalModel,
+        resolve_bare_callback_receiver,
+    )
+
+    _mkroot("k_res5", "codex", "mb_A", "hibernated", "t_worker_old", uuid="u_ac5")
+    d.publish_current_terminal("k_res5", terminal_id="t_worker_new", provider_session_id="u_ac5")
+    with d.SessionLocal.begin() as db:
+        # the resumed worker's fresh terminal row records supervisor B as caller
+        db.add(
+            TerminalModel(
+                id="t_worker_new",
+                tmux_session="s",
+                tmux_window="w",
+                provider="codex",
+                lifecycle="ephemeral",
+                init_state="ready",
+                caller_mailbox_id="mb_B",
+            )
+        )
+        db.add(
+            TerminalIdentityModel(
+                terminal_id="t_worker_new",
+                provider="codex",
+                base_name="t_worker_new",
+                lifecycle="live",
+                identity_key="k_res5",
+                provider_session_id="u_ac5",
+            )
+        )
+    # THE ASSERTION: bare callback resolves to the ROOT owner (mb_A), not mb_B.
+    assert resolve_bare_callback_receiver("t_worker_new") == "mb_A"
+
+
+def test_ac5_fallback_to_terminal_caller_when_no_owner(real_sqlite_env):
+    """A terminal with NO root, or a NULL-owner/legacy root, falls back to the
+    terminal-row caller (pre-F829 behaviour preserved for those)."""
+    from cli_agent_orchestrator.clients.database import (
+        TerminalModel,
+        resolve_bare_callback_receiver,
+    )
+
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalModel(
+                id="t_noroot",
+                tmux_session="s",
+                tmux_window="w",
+                provider="codex",
+                lifecycle="ephemeral",
+                init_state="ready",
+                caller_mailbox_id="mb_direct",
+            )
+        )
+    assert resolve_bare_callback_receiver("t_noroot") == "mb_direct"
+
+    _mkroot("k_null5", "codex", None, "hibernated", "t_null5", uuid="u_null5")
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalModel(
+                id="t_null5_term",
+                tmux_session="s",
+                tmux_window="w",
+                provider="codex",
+                lifecycle="ephemeral",
+                init_state="ready",
+                caller_mailbox_id="mb_legacy",
+            )
+        )
+        db.add(
+            TerminalIdentityModel(
+                terminal_id="t_null5_term",
+                provider="codex",
+                base_name="t_null5_term",
+                lifecycle="live",
+                identity_key="k_null5",
+            )
+        )
+    assert resolve_bare_callback_receiver("t_null5_term") == "mb_legacy"

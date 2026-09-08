@@ -3546,9 +3546,25 @@ def _send_message_impl(
                     ),
                 }
             terminal_payload = response.json()
-            receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
-                "caller_id"
-            )
+            # F829 D3/AC5: prefer the conversation-root owner_principal for a
+            # bare callback so a RESUMED worker replies to the ORIGINAL caller,
+            # not the recovering supervisor recorded on its fresh terminal row.
+            # The server resolves root-owner-first, then caller_mailbox_id /
+            # caller_id; caller_unavailable semantics are unchanged downstream.
+            try:
+                _ct = cao_http.get(
+                    f"/terminals/{own_terminal_id}/callback-target",
+                    timeout=_mcp_timeout(),
+                    headers=_api_headers(),
+                )
+                if _ct.ok:
+                    receiver_id = _ct.json().get("receiver_id")
+            except Exception:
+                receiver_id = None
+            if not receiver_id:
+                receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
+                    "caller_id"
+                )
             if not receiver_id:
                 return {
                     "success": False,

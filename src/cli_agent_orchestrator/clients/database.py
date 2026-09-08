@@ -4502,6 +4502,45 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
 
+def resolve_bare_callback_receiver(sender_terminal_id: str) -> Optional[str]:
+    """F829 D3/AC5: resolve a no-receiver ``send_message`` target for a sender.
+
+    A resumed worker's terminal ROW records the recovering supervisor as its
+    caller, but its conversation ROOT preserves the ORIGINAL caller as
+    ``owner_principal``. A bare callback must reach the original caller's CURRENT
+    binding, never the recovering terminal. So:
+
+    * if the sender's ``terminal_identity`` resolves to a conversation root whose
+      ``owner_principal`` is set, return that ``owner_principal`` (a mailbox id) —
+      the delivery layer then resolves mailbox → current terminal, and its
+      ``caller_unavailable`` semantics are unchanged when that mailbox has no
+      live terminal;
+    * otherwise (no root, or a NULL-owner / legacy_unknown_owner root) fall back
+      to the terminal row's ``caller_mailbox_id`` then ``caller_id``.
+
+    Returns the resolved receiver id (mailbox or terminal id), or None when the
+    sender has no recorded caller at all.
+    """
+    with SessionLocal() as db:
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=sender_terminal_id).one_or_none()
+        if ti is not None and ti.identity_key:
+            root = (
+                db.query(ConversationIdentityModel)
+                .filter_by(identity_key=ti.identity_key)
+                .one_or_none()
+            )
+            if root is not None and root.owner_principal:
+                return cast(str, root.owner_principal)
+        term = db.query(TerminalModel).filter_by(id=sender_terminal_id).one_or_none()
+        if term is None:
+            return None
+        if term.caller_mailbox_id:
+            return cast(str, term.caller_mailbox_id)
+        if term.caller_id:
+            return cast(str, term.caller_id)
+        return None
+
+
 def record_conversation_event(
     identity_key: str,
     event: str,

@@ -4704,6 +4704,25 @@ async def resolve_terminal_by_window(session: str, window: str) -> Terminal:
         )
 
 
+@app.get("/terminals/{terminal_id}/callback-target")
+async def get_terminal_callback_target(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> dict[str, Any]:
+    """F829 D3/AC5: the no-receiver send_message target for this sender.
+
+    Returns ``{"receiver_id": <mailbox-or-terminal-id or null>}`` — the sender's
+    conversation-root ``owner_principal`` when it is bound to an F829 root with
+    an owner, else the terminal-row caller_mailbox_id/caller_id. The MCP
+    send_message no-receiver branch prefers this so a RESUMED worker's bare
+    callback routes to the ORIGINAL caller, not the recovering supervisor.
+    """
+    from cli_agent_orchestrator.clients.database import resolve_bare_callback_receiver
+
+    receiver = await asyncio.to_thread(resolve_bare_callback_receiver, terminal_id)
+    return {"receiver_id": receiver}
+
+
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(
     terminal_id: TerminalId,
