@@ -383,6 +383,115 @@ class TestStatusDetection:
             read.assert_not_called()
 
 
+# ─── F844 (#701): an error verdict must not be sticky ───────────────────────────
+
+
+class TestErrorNotSticky:
+    """F844 (#701): pi status is re-derived from the live pane every poll and an
+    ``error`` verdict is NOT sticky. A ClinePass 429 banner (see #700) scrolls
+    into the rolling buffer and stays there; once the pane is nudged and resumes
+    real work the status must re-derive to PROCESSING (working spinner) or IDLE
+    (composer), never latch ERROR on the stale banner.
+
+    ``_resolve_native_status`` is patched to None so these exercise the TUI-chrome
+    path (the tmux path, where native status is always None).
+    """
+
+    # The verbatim ClinePass 429 banner from the live panes (issue #700/#701).
+    _BANNER = (
+        'Error: 429: {"code":"INFERENCE_CAP_ERROR","message":"Error 429: You have '
+        "reached your 5-hour Clinepass limit. The limit resets in 1h 29m, please "
+        'try again later."}'
+    )
+    _RETRY_FAILED = "Error: Retry failed after 3 attempts: 429: {...same...}"
+    _RULE = "─" * 120
+    _FOOTER = "↑26k ↓172 R3.9k CH97.6% $0.002 0.4%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+
+    def _provider(self, dispatched=True, processing_seen=False) -> PiCliProvider:
+        provider = PiCliProvider("t1234567", "sess", "win0")
+        provider._initialized = True
+        provider._task_dispatched = dispatched
+        provider._tui_processing_seen = processing_seen
+        return provider
+
+    def _capped_at_composer(self) -> str:
+        """The pane right after the 429 storm: banner in transcript, pi idle at
+        its composer chrome (no working spinner)."""
+        return "\n".join(
+            [
+                " Run the lite gate on the diff.",
+                "",
+                self._BANNER,
+                self._BANNER,
+                self._RETRY_FAILED,
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                "/data/scratch/probe",
+                self._FOOTER,
+            ]
+        )
+
+    def _capped_then_working(self) -> str:
+        """After a tmux nudge the pane resumes real work: the stale 429 banner is
+        still in scrollback, but a live ``Working`` spinner now runs."""
+        return self._capped_at_composer() + "\n── ⠧ Working ──────────────────\n"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_capped_banner_at_composer_is_idle_not_error(self, _native) -> None:
+        """B-1: a 429 banner in scrollback with pi idle at its composer reads
+        IDLE (the banner is a #700 CAPPED condition, not a terminal ERROR).
+        Before the fix the _STARTUP_ERROR scan latched ERROR here."""
+        provider = self._provider(dispatched=False, processing_seen=False)
+        assert provider.get_status(self._capped_at_composer()) == TerminalStatus.IDLE
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_nudged_working_pane_re_derives_processing_not_error(self, _native) -> None:
+        """B-2: after the nudge the working spinner is present → PROCESSING, even
+        though the 429 banner is still in the rolling buffer. The error verdict
+        did not stick."""
+        provider = self._provider(dispatched=True)
+        assert provider.get_status(self._capped_then_working()) == TerminalStatus.PROCESSING
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_error_then_processing_then_idle_sequence(self, _native) -> None:
+        """The full #701 sequence on ONE provider instance:
+        [genuine startup error → nudge → working] yields ERROR→PROCESSING, and
+        [→ composer] yields IDLE. Status re-derives from the live pane each poll.
+        """
+        provider = self._provider(dispatched=True, processing_seen=False)
+        # 1) Genuine startup failure: no TUI chrome, no spinner → ERROR.
+        startup_error = (
+            "/data/scratch/probe$\n"
+            "Error: failed to initialize model catalog: connection refused\n"
+            "pi: error: could not start session\n"
+        )
+        assert provider.get_status(startup_error) == TerminalStatus.ERROR
+        # 2) Nudged and working: the live spinner re-derives PROCESSING (not
+        #    sticky ERROR), and latches _tui_processing_seen for the COMPLETED
+        #    transition below.
+        assert provider.get_status(self._capped_then_working()) == TerminalStatus.PROCESSING
+        assert provider._tui_processing_seen is True
+        # 3) Back at the composer with the banner still in scrollback: IDLE-class
+        #    (COMPLETED here because a task was dispatched and a processing frame
+        #    was seen) — never ERROR.
+        assert provider.get_status(self._capped_at_composer()) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_genuine_startup_error_still_reads_error(self, _native) -> None:
+        """Guard: the fix must not weaken genuine startup-failure detection — a
+        pane with NO idle chrome and NO spinner but a launch-error banner is
+        still ERROR."""
+        provider = self._provider(dispatched=False)
+        startup_error = (
+            "/data/scratch/probe$\n"
+            "Error: failed to initialize model catalog: connection refused\n"
+            "pi: error: could not start session\n"
+        )
+        assert provider.get_status(startup_error) == TerminalStatus.ERROR
+
+
 # ─── Response extraction ────────────────────────────────────────────────────────
 
 

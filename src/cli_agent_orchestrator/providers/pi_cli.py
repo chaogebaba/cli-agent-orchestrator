@@ -149,6 +149,13 @@ class PiCliProvider(BaseProvider):
     # same detector _resolve_buffer already runs on a live pane read).
     supports_direct_status_probe: bool = True
 
+    # F843 (#700): opt into the F611 condition classifier so pi's ClinePass 429
+    # INFERENCE_CAP_ERROR banner is detected as a CAPPED condition and the ONE
+    # [CONDITION] notice reaches the supervisor seat (the same delivery seam
+    # codex's usage_limit_hard uses). SEPARATE from get_status/fusion — a
+    # condition is never a TerminalStatus member (D1).
+    condition_provider_key = "pi_cli"
+
     def __init__(
         self,
         terminal_id: str,
@@ -486,6 +493,19 @@ class PiCliProvider(BaseProvider):
                 otherwise                                 → IDLE
           - startup/authorization error banner    → ERROR
           - no recognizable chrome yet            → UNKNOWN (pre-init/transient)
+
+        F844 (#701): status is RE-DERIVED from the live pane every poll and an
+        ``error`` verdict is NOT sticky. A RUNTIME error banner (notably the
+        ClinePass 429 ``Error: 429: {…}`` / ``Error: Retry failed after 3
+        attempts`` lines — see #700, which classifies it as a CAPPED *condition*,
+        not a status) scrolls into the rolling buffer and stays there while the
+        pane keeps working. So the live liveness of the pane — a ``Working``
+        spinner (PROCESSING) or the idle composer chrome (IDLE/COMPLETED) — is
+        decided BEFORE the error-banner scan, and the ERROR verdict is reserved
+        for a genuine launch failure: pi never reached a usable frame (no idle
+        chrome AND no working spinner). Once pi has drawn its TUI, an ``Error:``
+        line is transcript, never a terminal ERROR — so a nudged worker that
+        resumes real work re-derives PROCESSING/IDLE instead of latching error.
         """
         native = self._resolve_native_status(buffer)
         if native is not None:
@@ -498,17 +518,24 @@ class PiCliProvider(BaseProvider):
         if not clean.strip():
             return TerminalStatus.UNKNOWN
 
+        # Live liveness first (F844 #701): a working spinner or the idle composer
+        # chrome re-derives the true state every poll, so a runtime error banner
+        # left in scrollback (the 429 cap, #700) can never latch a sticky ERROR
+        # over a pane that is in fact working or waiting at its composer.
         if _WORKING.search(clean):
             self._tui_processing_seen = True
             return TerminalStatus.PROCESSING
-
-        if _STARTUP_ERROR.search(clean):
-            return TerminalStatus.ERROR
 
         if self._has_idle_chrome(clean):
             if self._task_dispatched and self._tui_processing_seen:
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
+
+        # No live TUI chrome AND no spinner: pi never reached (or has lost) a
+        # usable frame — a genuine startup/authorization failure. Only here does
+        # the error banner mean a terminal ERROR.
+        if _STARTUP_ERROR.search(clean):
+            return TerminalStatus.ERROR
 
         return TerminalStatus.UNKNOWN
 
