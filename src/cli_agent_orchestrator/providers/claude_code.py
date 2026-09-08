@@ -634,6 +634,15 @@ class ClaudeCodeProvider(BaseProvider):
     # F829 A1 (D10): claude RECOVERS resume/capture/artifact (D9). It cannot FORK
     # here (supports_fork_context stays default). resume via --resume <sid>
     # threaded as resume_session_id; artifact = ~/.claude/projects/<proj>/<uuid>.jsonl.
+    # F829 build-2 B2: opt into the resume capability the launch path already
+    # implements (--resume <sid> at line ~888; resume_session_id threaded from a
+    # resume-mode fork_context). provider_supports_resume() reads THIS flag to
+    # decide reap-time resumability and to admit assign(resume_from) for a
+    # hibernated claude worker. RELEASE-time advertising is still separately
+    # gated by D10 advertised_resumable() (declaration ∧ PASSING evidence), so
+    # this flag alone does not advertise claude resumable before measurement.
+    supports_resume = True
+
     declared_capabilities = {
         "fork": False,
         "resume": True,

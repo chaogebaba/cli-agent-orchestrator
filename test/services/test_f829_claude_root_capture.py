@@ -108,7 +108,7 @@ def test_sessionstart_binding_attaches_session_id_to_root(real_sqlite_env, tmp_p
 
 
 def test_reap_resolver_sources_claude_id_from_root_when_identity_row_null(
-    real_sqlite_env, tmp_path, monkeypatch
+    real_sqlite_env, tmp_path
 ):
     """F829 B2: after the SessionStart bind attaches the id to the ROOT, the
     reap/hibernate resolver (_resolve_reap_resume_key) fills the reaped claude
@@ -117,14 +117,14 @@ def test_reap_resolver_sources_claude_id_from_root_when_identity_row_null(
     makes a claude worker survive an account switch."""
     import cli_agent_orchestrator.clients.database as db_mod
     from cli_agent_orchestrator.services import terminal_service as ts
-    from cli_agent_orchestrator.services import resume_service as rs
+    from cli_agent_orchestrator.services.resume_service import provider_supports_resume
 
     home = tmp_path / "home"
     sid = "claude-sess-reap"
     _seed_root_and_incarnation(db_mod, identity_key="conv_rrr10001",
                                terminal_id="rrr10001", cwd="/work")
-    # claude declares resume support.
-    monkeypatch.setattr(rs, "provider_supports_resume", lambda p: p == "claude_code")
+    # claude genuinely supports resume now (supports_resume class flag, B2).
+    assert provider_supports_resume("claude_code") is True
     # terminal_identity id is NULL; bind attaches the id to the ROOT.
     _bind("rrr10001", sid, str(_projects_transcript(home, sid)), home)
     assert _root_sid(db_mod, "conv_rrr10001") == sid
