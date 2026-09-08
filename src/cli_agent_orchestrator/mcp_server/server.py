@@ -2593,6 +2593,68 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
+
+            # F838 (#695) — fail-closed provider guard for a LEGACY ALIAS STUB.
+            # resolve_assignment_target passes a legacy name through with
+            # _resolved_provider=None, deferring provider derivation to
+            # _create_terminal's resolve_provider(fallback=caller_provider). That
+            # fallback silently spawned a pi_cli alias stub as the supervisor's
+            # claude_code/Opus when composition resolved to no provider. VALIDATE
+            # here from the stub's own frontmatter: on any unresolved/mismatch,
+            # REFUSE with a typed result and NO spawn. We deliberately do NOT pin
+            # _resolved_provider (which would activate the position D8/D9 writer
+            # paths meant for position names) — _create_terminal still derives it
+            # via the now-fail-closed resolve_provider, so a legacy alias spawns
+            # exactly as before EXCEPT a substitution is refused, not silent.
+            if _resolved_provider is None:
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    E_PROVIDER_UNRESOLVED,
+                    ProviderResolutionError,
+                    _stub_declared_provider_safe,
+                )
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    resolve_provider as _f838_resolve_provider,
+                )
+
+                _declares, _declared_provider = _stub_declared_provider_safe(agent_profile)
+                if _declares:
+                    _caller_provider = None
+                    _cur = _current_terminal_id()
+                    if _cur:
+                        try:
+                            _cur_resp = cao_http.get(f"/terminals/{_cur}", timeout=_mcp_timeout())
+                            if _cur_resp.status_code == 200:
+                                _caller_provider = _cur_resp.json().get("provider")
+                        except Exception:
+                            _caller_provider = None
+                    try:
+                        _checked = _f838_resolve_provider(
+                            agent_profile, fallback_provider=_caller_provider or DEFAULT_PROVIDER
+                        )
+                    except ProviderResolutionError as exc:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": f"Assignment refused (no spawn): {exc}",
+                        }
+                    # Defence-in-depth: the resolved provider must equal the
+                    # stub's declared provider (when the stub named one) — never
+                    # a silent substitution, even one that happens to be valid.
+                    if _declared_provider and _checked != _declared_provider:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' declares provider "
+                                f"'{_declared_provider}' but resolution produced "
+                                f"'{_checked}' (F838 #695 provider-substitution guard)"
+                            ),
+                        }
+                    # Validated only; _create_terminal re-derives via the
+                    # fail-closed resolve_provider. _resolved_provider stays None
+                    # (legacy passthrough) so no position machinery is triggered.
         if not _resume_prepared and _routing_driven and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (

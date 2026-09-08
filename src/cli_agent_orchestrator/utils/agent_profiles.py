@@ -679,6 +679,44 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
 
+class ProviderResolutionError(ValueError):
+    """F838 (#695): provider resolution for a composition/alias stub failed
+    fail-closed (carries a stable ``.code``). Raised instead of silently
+    substituting the caller's provider when the stub declares a
+    provider/composition but resolves to no valid provider."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _stub_declared_provider(agent_profile_name: str) -> "tuple[bool, Optional[str]]":
+    """Read a profile's RAW stub frontmatter and report its declared provider.
+
+    Returns ``(declares_intent, provider)`` where ``declares_intent`` is True
+    when the raw frontmatter carries ANY of ``provider:``/``extends:``/
+    ``position:`` — i.e. the stub asserts a specific provider/composition and a
+    silent fallback to the caller's provider would contradict the store (F838
+    #695). ``provider`` is the raw ``provider:`` value (or None).
+
+    A profile with none of those keys is a genuine legacy plain profile
+    (``declares_intent`` False), for which the caller-provider fallback is
+    correct and pinned by existing tests. FileNotFoundError propagates to the
+    caller (a truly absent name is not this function's concern).
+
+    Reads through ``read_agent_profile_source`` so the search order matches the
+    load path. With the F838 atomic-write fix in install.sh a reader never sees
+    a truncated stub, so this raw read is either the full valid stub or the full
+    previous version — never a partial that drops ``provider:``.
+    """
+    raw = read_agent_profile_source(agent_profile_name)
+    metadata = frontmatter.loads(raw).metadata
+    declares = any(k in metadata for k in ("provider", *PROFILE_COMPOSITION_KEYS))
+    provider = metadata.get("provider")
+    provider = provider if isinstance(provider, str) and provider else None
+    return declares, provider
+
+
 def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     """Resolve the provider to use for an agent profile.
 
@@ -687,19 +725,46 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     Otherwise returns the fallback provider (typically inherited from the
     calling terminal).
 
+    F838 (#695) FAIL-CLOSED: a profile whose RAW stub frontmatter DECLARES a
+    provider/composition (``provider:``/``extends:``/``position:``) but that
+    resolves to no valid provider is a DEFECT, not a "no opinion, inherit the
+    caller" signal. Such a case now raises :class:`ProviderResolutionError`
+    (``E-PROVIDER-UNRESOLVED``) instead of silently substituting the caller's
+    provider (the bug: a ``pi_cli`` alias stub spawned as the supervisor's
+    ``claude_code``/Opus). The caller-provider fallback survives ONLY for a
+    genuine legacy plain profile that declares NO such intent (pinned by
+    ``test_returns_fallback_when_no_provider_key`` et al.) and for a truly
+    absent name.
+
     Args:
         agent_profile_name: Name of the agent profile to look up.
-        fallback_provider: Provider to use when the profile does not specify
-            one or specifies an invalid value.
+        fallback_provider: Provider to use when the profile declares no
+            provider/composition intent at all (legacy plain profile).
 
     Returns:
         Resolved provider type string.
+
+    Raises:
+        ProviderResolutionError: the stub declares a provider/composition but
+            it does not resolve to a valid provider (fail closed, no spawn).
     """
     try:
         profile = load_agent_profile(agent_profile_name)
-    except (FileNotFoundError, RuntimeError):
-        # Profile not found or failed to load — provider.initialize()
-        # will surface a clear error later.  Fall back for now.
+    except FileNotFoundError:
+        # Name truly absent — nothing to contradict; fall back.
+        return fallback_provider
+    except RuntimeError:
+        # Loaded but failed to compose/parse. If the raw stub declares a
+        # provider/composition intent, this is the F838 defect — fail closed
+        # rather than silently inheriting the caller's provider.
+        declares, _ = _stub_declared_provider_safe(agent_profile_name)
+        if declares:
+            raise ProviderResolutionError(
+                E_PROVIDER_UNRESOLVED,
+                f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+                f"declares a provider/composition but failed to load/compose; "
+                f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+            )
         return fallback_provider
 
     if profile.provider:
@@ -715,7 +780,33 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
                 fallback_provider,
             )
 
+    # No valid provider on the loaded profile. F838: if the raw stub DECLARED a
+    # provider/composition intent, a silent fallback would contradict the store
+    # — fail closed. Only a genuine legacy plain profile (no such intent) keeps
+    # the caller-provider fallback.
+    declares, _ = _stub_declared_provider_safe(agent_profile_name)
+    if declares:
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"declares a provider/composition but resolved to no valid provider "
+            f"(got {profile.provider!r}); refusing to fall back to "
+            f"'{fallback_provider}' (F838 #695)",
+        )
     return fallback_provider
+
+
+def _stub_declared_provider_safe(agent_profile_name: str) -> "tuple[bool, Optional[str]]":
+    """``_stub_declared_provider`` that never raises (returns (False, None) on error).
+
+    Used inside ``resolve_provider``'s fail-closed decision: if we cannot even
+    re-read the raw stub, we do not have evidence it declared intent, so we do
+    not manufacture a refusal from a read error — we fall back to the legacy
+    path (the load-time RuntimeError, if any, already carries the real cause)."""
+    try:
+        return _stub_declared_provider(agent_profile_name)
+    except Exception:
+        return False, None
 
 
 # --- F497 D7 — assign(provider=) position-name resolution ------------------
@@ -733,6 +824,10 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
 E_POSITION_NEEDS_PROVIDER = "E-POSITION-NEEDS-PROVIDER"
 E_PROVIDER_NOT_ALLOWED = "E-PROVIDER-NOT-ALLOWED"
 E_UNKNOWN_POSITION = "E-UNKNOWN-POSITION"
+# F838 (#695): a profile whose stub DECLARES a provider/composition but resolves
+# to no valid provider — the fail-closed replacement for the silent
+# caller-provider fallback that spawned a pi_cli alias stub as claude_code/Opus.
+E_PROVIDER_UNRESOLVED = "E-PROVIDER-UNRESOLVED"
 # F786 D3 — a dispatch naming a RETIRED legacy profile is refused BEFORE the
 # legacy passthrough; the mapping and this code live in ``routing_guard`` so the
 # root PreToolUse hook twin shares them (D7).
