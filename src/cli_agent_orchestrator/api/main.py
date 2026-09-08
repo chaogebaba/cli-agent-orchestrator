@@ -354,6 +354,7 @@ async def conversation_reconcile_daemon() -> None:
         try:
             await asyncio.to_thread(conversation_reconcile.reconcile_stale_claims)
             await asyncio.to_thread(conversation_reconcile.reconcile_live_roots)
+            await asyncio.to_thread(conversation_reconcile.sweep_kiro_capture)
         except asyncio.CancelledError:
             raise
         except Exception:

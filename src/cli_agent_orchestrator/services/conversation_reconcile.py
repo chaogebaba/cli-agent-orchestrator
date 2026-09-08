@@ -113,3 +113,56 @@ def reconcile_live_roots() -> dict:
             left_live,
         )
     return {"checked": checked, "detached": detached, "left_live": left_live}
+
+
+def sweep_kiro_capture() -> dict:
+    """F829 D7 driver: eager-capture poll for live kiro roots without a uuid.
+
+    Runs one bounded poll per live kiro conversation whose provider_session_id is
+    still NULL (the eager-capture window). The poller itself is idempotent and
+    bounded (20 ticks / 120 s), lands ``capture_unknown`` at timeout, and
+    short-circuits once captured — so a coarse periodic cadence here is safe.
+    """
+    from cli_agent_orchestrator.clients.database import ConversationIdentityModel as _CI
+    from cli_agent_orchestrator.clients.database import (
+        SessionLocal,
+        get_terminal_metadata,
+        list_live_conversation_roots,
+    )
+    from cli_agent_orchestrator.services import kiro_capture
+
+    polled = 0
+    captured = 0
+    try:
+        with SessionLocal() as db:
+            roots = (
+                db.query(_CI)
+                .filter(
+                    _CI.provider == "kiro_cli",
+                    _CI.lifecycle == "live",
+                    _CI.provider_session_id.is_(None),
+                )
+                .all()
+            )
+            targets = [(r.current_terminal_id, r.provider_namespace) for r in roots]
+    except Exception:
+        logger.debug("sweep_kiro_capture: could not list kiro roots", exc_info=True)
+        return {"polled": 0, "captured": 0}
+
+    for terminal_id, _ns in targets:
+        if not terminal_id:
+            continue
+        meta = get_terminal_metadata(terminal_id)
+        cwd = (meta or {}).get("working_directory")
+        if not cwd:
+            continue
+        polled += 1
+        try:
+            # KAS is the v3 engine; the capture surface auto-detects, and
+            # kas=True targets the v3 store the D9 probe confirmed.
+            res = kiro_capture.poll_kiro_capture(terminal_id, kas=True, cwd=cwd)
+            if res.get("status") == "captured":
+                captured += 1
+        except Exception:
+            logger.debug("sweep_kiro_capture poll failed for %s", terminal_id, exc_info=True)
+    return {"polled": polled, "captured": captured}
