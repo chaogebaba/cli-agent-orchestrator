@@ -172,6 +172,20 @@ def require_kiro(require_cao_server: CaoServer):
 
 
 @pytest.fixture()
+def require_pi():
+    """Skip test if the pi CLI is not available.
+
+    The pi_cli provider resolves its binary (``pi``) and config from
+    ``Path.home()``; the managed e2e server symlinks ``.bun`` (where the bun-
+    installed ``pi`` lives) and other provider dot-dirs into the redirected
+    HOME (see ``_PROVIDER_HOME_SYMLINKS``), so an authenticated ``pi`` on the
+    host is reachable without copying any credential material.
+    """
+    if not _cli_available("pi"):
+        pytest.skip("pi CLI not installed")
+
+
+@pytest.fixture()
 def require_kimi():
     """Skip test if kimi CLI is not available."""
     if not _cli_available("kimi"):
