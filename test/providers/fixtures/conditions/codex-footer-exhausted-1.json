@@ -1,0 +1,10 @@
+{
+  "provider": "codex",
+  "condition": "CONTEXT_EXHAUSTED",
+  "subtype": "footer_percent_status",
+  "reset_hint_raw": "",
+  "source_path": "github.com/chaogebaba/cli-subagents issue #693 (F836) — synthesized codex footer at the <= 10% LEFT hard-stop",
+  "source_line_range": "footer line",
+  "captured_at": "2026-09-08 (F836 fix)",
+  "note": "codex footer 'Context 7% left · 5h 47% left' — 7% LEFT is <= the 10 threshold, a genuine CONTEXT_EXHAUSTED. Positive counterpart to codex-footer-healthy-1."
+}

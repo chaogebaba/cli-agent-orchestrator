@@ -1,0 +1,10 @@
+{
+  "provider": "codex",
+  "condition": null,
+  "subtype": "footer_percent_status_healthy",
+  "reset_hint_raw": "",
+  "source_path": "github.com/chaogebaba/cli-subagents issue #693 (F836) — codex worker 0ec52ecf footer, flagged right after a normal verdict",
+  "source_line_range": "footer line",
+  "captured_at": "2026-09-08 (issue report)",
+  "note": "codex footer 'Context 97% left · 5h 47% left' — 97% LEFT is HEALTHY, must NOT classify CONTEXT_EXHAUSTED (left% > 10 threshold). The trailing '5h 47% left' is the rate window, not context."
+}
