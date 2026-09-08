@@ -44,6 +44,17 @@ cao_http = CAOHttpClient(lambda: requests)
 #: Context budget for the emitted digest — mirrors the .sh MAX_CONTEXT.
 _MAX_CONTEXT = 16000
 
+#: F810 #667 (r3, B4): the SessionStart edge stays SERVER-TRIGGER-ONLY (the base
+#: D22 behaviour: POST ``/inbox/drain`` and nothing else). The claim/ack digest
+#: leg — ``GET /messages?…claim=hook`` + ``POST /messages/ack`` — is only run on
+#: the *turn* edges (PostToolUse / Stop), which the provider overlay composes for
+#: a server-authoritatively identified SUPERVISOR seat alone (the overlay gates
+#: those legs on ``AgentProfile.role``, read server-side, never a client flag).
+#: A worker's overlay carries drain ONLY on SessionStart, so this gate means a
+#: worker never issues a ``claim=hook`` read and never acks — which is the B4
+#: fix and what the worker SessionStart witness asserts.
+_SESSION_START_EVENT = "SessionStart"
+
 
 def _is_busy_suppressible(body: str) -> bool:
     """True for a decision-free BUSY-class ``[CONDITION]`` ping (F639 #494).
@@ -200,6 +211,17 @@ def main() -> int:
         # (2) F810 digest surface: claim PENDING rows, print the exact envelope
         # into the seat context, and ack up to the max id. This is the leg that
         # makes a foreign-repo seat actually SEE its callbacks.
+        #
+        # F810 #667 r3 (B4): SKIP this leg on the SessionStart edge. SessionStart
+        # drain is server-trigger-only (leg 1 above) exactly as base D22 was — no
+        # ``claim=hook`` read, no ack. The digest is surfaced instead on the turn
+        # edges (PostToolUse matcher ``.*`` / Stop), which the provider overlay
+        # composes for a SUPERVISOR seat only. A worker's overlay carries drain
+        # ONLY on SessionStart, so a worker never claims or acks here — the B4 fix
+        # asserted by the worker SessionStart witness.
+        event_name = str(event.get("hook_event_name") or event.get("hookEventName") or "")
+        if event_name == _SESSION_START_EVENT:
+            return 0
         try:
             listing = cao_http.get(
                 "/messages",

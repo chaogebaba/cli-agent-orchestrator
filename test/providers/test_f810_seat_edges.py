@@ -23,7 +23,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.providers.claude_code import (
     ClaudeCodeProvider,
@@ -33,6 +39,56 @@ from cli_agent_orchestrator.providers.claude_code import (
 _REGISTER_MOD = "cli_agent_orchestrator.hooks.register_inbox"
 _DRAIN_MOD = "cli_agent_orchestrator.hooks.supervisor_drain"
 _REWAKE_MOD = "cli_agent_orchestrator.hooks.rewake"
+
+#: The parent (root) repository that carries the legacy repo-local `.claude`
+#: hooks the overlay is replacing. Read-only reference. Resolved from the env
+#: (CLAUDE_PROJECT_DIR, as Claude Code sets it) or the known laptop checkout;
+#: the composition test does not REQUIRE it to exist (it uses the captured
+#: command shapes below), but asserts the `.sh` files when the repo is present.
+_PARENT_REPO = Path(
+    os.environ.get("CLAUDE_PROJECT_DIR", "/home/chao/VScode_projects/cli-subagents")
+)
+
+#: The ACTUAL parent-repo hook command strings, captured verbatim from
+#: /home/chao/VScode_projects/cli-subagents/.claude/settings.json (PostToolUse
+#: matcher ".*" drain leg; Stop rewake --arm leg). These are the shapes Claude
+#: Code composes ALONGSIDE the overlay until deliverable 3 removes them. They are
+#: DIFFERENT command strings from the overlay's `python -m …` shapes, so the D2
+#: command-string dedupe cannot merge them — the two co-execute (the 0.7 ms
+#: race). Embedded as literals so the concurrency test is box-independent.
+_PARENT_DRAIN_CMD = "$CLAUDE_PROJECT_DIR/.claude/hooks/supervisor-inbox-drain.sh"
+_PARENT_REWAKE_CMD = (
+    '"$CLAUDE_PROJECT_DIR/.claude/hooks/supervisor-only.sh" '
+    "$CLAUDE_PROJECT_DIR/.claude/hooks/f213-callback-rewake.sh --arm --source=stop"
+)
+
+
+@pytest.fixture
+def mailbox_db(monkeypatch, tmp_path):
+    """File-backed SQLite wired into the mailbox/database seam for the
+    drain-claim concurrency test. A FILE db (not :memory:/StaticPool) so each
+    thread's own ``SessionLocal()`` gets its OWN connection — the production
+    shape, and the only one under which ``claim_emission``'s SAVEPOINT + the
+    UNIQUE(message_id, carrier) constraint arbitrate two concurrent claims
+    correctly. Two terminals (sup, wrk) seeded like
+    test/services/test_f642_list_claim_flag.py."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.clients.database import Base, create_terminal
+    from cli_agent_orchestrator.services import mailbox_service
+
+    db_file = tmp_path / "f810-concurrency.sqlite"
+    engine = create_engine(
+        f"sqlite:///{db_file}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", sessions)
+    monkeypatch.setattr(mailbox_service, "SessionLocal", sessions, raising=False)
+    database.clear_terminal_metadata_cache()
+    create_terminal("sup", "cao-t", "w-sup", "claude_code")
+    create_terminal("wrk", "cao-t", "w-wrk", "claude_code")
+    return sessions
 
 
 def _settings(role: str | None = "supervisor") -> dict:
@@ -132,7 +188,13 @@ def _f810_commands(settings: dict) -> list[str]:
 def test_worker_profile_gets_no_f810_edges():
     """A real (non-supervisor) worker profile: register/rewake absent entirely,
     and drain present ONLY on the base D22 SessionStart edge — never on the F810
-    PostToolUse/Stop legs."""
+    PostToolUse/Stop legs.
+
+    F810 #667 r3 (B4): the drain command DOES appear on a worker's SessionStart
+    (that edge is the unchanged base D22 drain), but on that edge the drain
+    module is SERVER-TRIGGER-ONLY — no ``claim=hook`` read, no ack. The
+    behavioural proof is ``test_worker_sessionstart_drain_is_server_trigger_only``
+    below; this test proves only the STRUCTURE (which edges carry which command)."""
     h = _settings(role="developer")["hooks"]
 
     def cmds(event: str) -> list[str]:
@@ -171,25 +233,149 @@ def test_supervisor_only_edges_present_for_supervisor():
     assert any(_REWAKE_MOD in c for c in cmds)
 
 
-def test_effective_project_plus_settings_composition_no_double_run():
-    """Effective composition: Claude Code merges the repo-local project
-    settings with the CLI ``--settings`` overlay. The overlay's command-string
-    dedupe keeps EACH overlay ``python -m`` edge once; a project-local copy that
-    uses the SAME command string cannot co-execute. (The repo-local `.sh` copies
-    have DIFFERENT command strings — their removal is a parent-repo follow-up,
-    not something the overlay can dedupe; see the build report.)"""
+def test_parent_sh_and_overlay_have_distinct_command_strings():
+    """Precondition for the concurrency tests below: the parent-repo `.sh` hook
+    commands and the overlay `python -m` commands are DIFFERENT strings, so the
+    D2 command-string dedupe CANNOT merge them. Until the parent repo drops its
+    copies (deliverable 3), Claude Code composes BOTH and starts them
+    concurrently — exactly the 0.7 ms race the verdict flagged. Uses the ACTUAL
+    parent command shapes (captured verbatim from the parent settings.json) and
+    the overlay shapes; when the live parent repo is present it ALSO cross-checks
+    that the captured shapes still match the on-disk settings.json (read-only)."""
     overlay = _settings(role="supervisor")["hooks"]
-    # Simulate Claude Code's project+CLI merge for the drain command: a project
-    # block carrying the IDENTICAL overlay command string, concatenated per event.
-    drain_cmd = next(c for c in _f810_commands({"hooks": overlay}) if _DRAIN_MOD in c)
+    overlay_drain = next(c for c in _f810_commands({"hooks": overlay}) if _DRAIN_MOD in c)
+    overlay_rewake = next(
+        hk["command"]
+        for b in overlay["Stop"]
+        for hk in b["hooks"]
+        if _REWAKE_MOD in hk["command"] and "--source=stop" in hk["command"]
+    )
+
+    # DIFFERENT command strings → the D2 dedupe leaves BOTH → they co-execute.
+    assert _PARENT_DRAIN_CMD != overlay_drain
+    assert _PARENT_REWAKE_CMD != overlay_rewake
     merged = {
-        event: list(blocks) + [{"hooks": [{"command": drain_cmd, "timeout": 5}]}]
-        for event, blocks in overlay.items()
+        "PostToolUse": [{"hooks": [{"command": _PARENT_DRAIN_CMD}, {"command": overlay_drain}]}],
+        "Stop": [{"hooks": [{"command": _PARENT_REWAKE_CMD}, {"command": overlay_rewake}]}],
     }
     _dedupe_overlay_hooks_by_command(merged)
-    for event, blocks in merged.items():
-        cmds = [hk["command"] for b in blocks for hk in b["hooks"]]
-        assert cmds.count(drain_cmd) <= 1, (event, cmds)
+    ptu = [hk["command"] for b in merged["PostToolUse"] for hk in b["hooks"]]
+    stop = [hk["command"] for b in merged["Stop"] for hk in b["hooks"]]
+    assert _PARENT_DRAIN_CMD in ptu and overlay_drain in ptu  # neither deduped
+    assert _PARENT_REWAKE_CMD in stop and overlay_rewake in stop
+
+    # Optional live cross-check: if the parent repo is present, the captured
+    # shapes must still equal the on-disk settings.json commands (read-only).
+    parent_settings = _PARENT_REPO / ".claude" / "settings.json"
+    if parent_settings.is_file():
+        parent = json.loads(parent_settings.read_text(encoding="utf-8"))["hooks"]
+
+        def pcmds(event: str) -> list[str]:
+            return [hk["command"] for b in parent.get(event, []) for hk in b.get("hooks", [])]
+
+        assert _PARENT_DRAIN_CMD in pcmds("PostToolUse")
+        assert _PARENT_REWAKE_CMD in pcmds("Stop")
+        assert (_PARENT_REPO / ".claude" / "hooks" / "supervisor-inbox-drain.sh").is_file()
+        assert (_PARENT_REPO / ".claude" / "hooks" / "f213-callback-rewake.sh").is_file()
+
+
+def test_concurrent_parent_and_overlay_drain_single_claim(mailbox_db):
+    """DRAIN single-claim under the 0.7 ms race. The parent `.sh` drain runs
+    ``cao messages list --to me --status pending --claim hook`` and the overlay
+    ``supervisor_drain`` runs ``GET /messages?…claim=hook`` — DIFFERENT commands,
+    but BOTH resolve to the SAME server read-as-claim
+    (``list_messages(receiver, claim='hook')`` → ``hook_claim_ids``). Fired
+    concurrently against ONE pending id, the server's UNIQUE(message_id, carrier)
+    claim lets exactly ONE win; the other returns the id NOT at all. This is the
+    server-side dedupe that HOLDS for the claim (the alternative the verdict
+    named)."""
+    import threading
+
+    from cli_agent_orchestrator.clients.database import create_inbox_message
+    from cli_agent_orchestrator.services.mailbox_service import list_messages
+
+    msg = create_inbox_message("sup", "wrk", "one real callback")
+
+    results: list[list[int]] = []
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+
+    def drain_once() -> None:
+        barrier.wait()  # release both within microseconds of each other
+        won = [int(i["id"]) for i in list_messages("wrk", claim="hook")["items"]]
+        with lock:
+            results.append(won)
+
+    threads = [threading.Thread(target=drain_once) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    # Exactly one carrier won the id; the other won nothing. One drain claim.
+    winners = [r for r in results if msg.id in r]
+    assert len(results) == 2
+    assert len(winners) == 1, results
+    assert sum(r.count(msg.id) for r in results) == 1
+
+
+def test_concurrent_parent_and_overlay_rewake_single_wake(monkeypatch, tmp_path):
+    """REWAKE single-wake under the 0.7 ms race. The parent `.sh` watcher and the
+    overlay ``rewake.py`` watcher contend on the SAME ``watcher.lock`` (the
+    overlay now acquires the parent's lock path — the "equivalent of the parent's
+    watcher.lock" the verdict required, because a wake is NOT server-side
+    dedupable). Fired concurrently against ONE pending id, exactly ONE watcher
+    wins the flock and wakes (exit 2, one ``rewakeSummary``); the other exits 0
+    without polling. Two DIFFERENT overlay arms stand in for parent+overlay: both
+    resolve the same shared lock via ``F213_STATE_DIR``."""
+    import io
+    import threading
+
+    from cli_agent_orchestrator.hooks import rewake
+
+    shared_state_dir = tmp_path / "f213-rewake" / "abcd1234"
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+    monkeypatch.setenv("F213_STATE_DIR", str(shared_state_dir))
+    monkeypatch.setattr(rewake, "CAO_HOME_DIR", str(tmp_path))
+    monkeypatch.setenv("F213_STABILITY_POLLS", "1")
+    monkeypatch.setenv("F213_POLL_INTERVAL_S", "0")
+    monkeypatch.setenv("F213_DEADLINE_S", "1")
+
+    resp = MagicMock()
+    resp.json.return_value = {
+        "items": [{"id": 42, "sender_id": "wrk1", "message": "hi", "status": "pending"}]
+    }
+    resp.raise_for_status = MagicMock()
+
+    rcs: list[int] = []
+    barrier = threading.Barrier(2)
+    reslock = threading.Lock()
+
+    def arm_once() -> None:
+        barrier.wait()
+        rc = rewake.main(["--arm", "--source=stop"])
+        with reslock:
+            rcs.append(rc)
+
+    # Patch ONCE at the outer scope (not per-thread): patch.object mutates shared
+    # module state, so per-thread context managers would clobber each other's
+    # mock mid-poll. Installed for the whole concurrent window here.
+    with (
+        patch.object(rewake, "get_local_bearer", return_value=None),
+        patch.object(rewake.cao_http, "get", return_value=resp),
+        patch("sys.stdin", io.StringIO("{}")),
+    ):
+        threads = [threading.Thread(target=arm_once) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    # Exactly one watcher woke (exit 2); the other stepped aside (exit 0) because
+    # it lost the shared watcher.lock. rc==2 is the ONLY wake signal (D5/AC16), so
+    # a single 2 in the pair is a single wake — the verdict's "one rewake result".
+    assert sorted(rcs) == [0, 2], rcs
 
 
 # ── dedupe helper (D2) ──────────────────────────────────────────────────────────

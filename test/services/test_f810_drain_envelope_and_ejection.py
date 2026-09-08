@@ -240,15 +240,66 @@ def _run_drain_capture_envelope(hook_event_name: str, monkeypatch, capsys):
     return json.loads(out)
 
 
-def test_drain_envelope_hook_event_name_session_start(monkeypatch, capsys):
-    env = _run_drain_capture_envelope("SessionStart", monkeypatch, capsys)
-    assert env["hookSpecificOutput"]["hookEventName"] == "SessionStart"
-    assert "real callback" in env["hookSpecificOutput"]["additionalContext"]
-
-
 def test_drain_envelope_hook_event_name_post_tool_use(monkeypatch, capsys):
     env = _run_drain_capture_envelope("PostToolUse", monkeypatch, capsys)
     assert env["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+
+# ── B4 (r3): SessionStart drain is SERVER-TRIGGER-ONLY (no claim, no ack) ───────
+
+
+def test_worker_sessionstart_drain_is_server_trigger_only(monkeypatch):
+    """F810 #667 r3 (B4): on the SessionStart edge the drain fires ONLY the
+    server-side deliver_pending trigger (leg 1: POST /inbox/drain) and does NOT
+    run the claim/ack digest leg — NO ``GET /messages?…claim=hook`` and NO
+    ``POST /messages/ack``. This is the worker SessionStart witness: a worker's
+    overlay carries drain only on SessionStart, so this proves a worker never
+    claims or acks its callback rows via the drain hook.
+
+    Verified by call-shape: the ONLY POST is the drain trigger (never the ack
+    endpoint), and there is NO GET at all (the claim list is never issued)."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.delenv("CLAUDE_AGENT_ID", raising=False)
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+    rc, post, get = _run_drain(json.dumps({"hook_event_name": "SessionStart"}), monkeypatch)
+    assert rc == 0
+    # The claim list GET is never issued on SessionStart.
+    get.assert_not_called()
+    # The only POST is the deliver_pending trigger — never the ack endpoint.
+    posted_paths = [c.args[0] if c.args else c.kwargs.get("path") for c in post.call_args_list]
+    assert posted_paths == ["/terminals/abcd1234/inbox/drain"]
+    assert not any(p == "/messages/ack" for p in posted_paths)
+
+
+def test_sessionstart_drain_emits_no_digest_even_with_pending(monkeypatch, capsys):
+    """Even when rows are pending, a SessionStart drain prints NO digest envelope
+    (the digest surfaces on the turn edges PostToolUse/Stop instead). Proves the
+    SessionStart leg cannot claim: the claim GET is never reached, so no digest."""
+    from cli_agent_orchestrator.hooks import supervisor_drain
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.delenv("CLAUDE_AGENT_ID", raising=False)
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+
+    drain_resp = MagicMock()
+    drain_resp.raise_for_status = MagicMock()
+    list_resp = MagicMock()
+    list_resp.raise_for_status = MagicMock()
+    list_resp.json.return_value = {
+        "items": [{"id": 11, "sender_id": "wrk", "message": "real callback"}]
+    }
+    get = MagicMock(return_value=list_resp)
+    with (
+        patch("sys.stdin", io.StringIO(json.dumps({"hook_event_name": "SessionStart"}))),
+        patch.object(supervisor_drain, "get_local_bearer", return_value=None),
+        patch.object(supervisor_drain.cao_http, "get", get),
+        patch.object(supervisor_drain.cao_http, "post", return_value=drain_resp),
+    ):
+        rc = supervisor_drain.main()
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out == ""  # no digest envelope on SessionStart
+    get.assert_not_called()  # claim list never issued
 
 
 def test_drain_envelope_hook_event_name_stop(monkeypatch, capsys):

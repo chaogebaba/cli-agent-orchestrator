@@ -42,6 +42,11 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.http import CAOHttpClient, resolve_endpoint
 
+try:  # POSIX-only; the seat harness (Claude Code) is POSIX. Absent → no lock.
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
 cao_http = CAOHttpClient(lambda: requests)
 
 # Default tuning knobs (env-overridable at CALL time inside main(); reading them
@@ -84,6 +89,64 @@ def _parse_args(argv: list[str]) -> tuple[str, str]:
 
 def _state_path(terminal_id: str) -> Path:
     return Path(CAO_HOME_DIR) / f"f810-rewake-state.{terminal_id}.json"
+
+
+def _watcher_lock_path(terminal_id: str) -> Path:
+    """The cross-process singleton lock the watcher contends on (F810 #667 r3).
+
+    Deliberately the SAME path the parent-repo ``f213-callback-rewake.sh`` uses
+    for its ``watcher.lock`` — ``$F213_STATE_DIR`` (test override) or
+    ``$CAO_HOME_DIR/f213-rewake/<terminal_id>/watcher.lock``. Sharing ONE lock
+    file across the parent ``.sh`` watcher and this overlay ``python -m`` watcher
+    is what makes them a single watcher: when both arm concurrently (the verdict's
+    0.7 ms race), only the flock winner polls-and-wakes; the loser exits 0. This
+    is the "equivalent of the parent's watcher.lock" the r3 amendment requires —
+    a wake is NOT server-side-dedupable (a read-only poll emits no claim), so the
+    OS file lock is the mechanism that holds under concurrency. Until the parent
+    repo drops its ``.sh`` copies (deliverable 3), this shared lock is the live
+    single-wake guarantee.
+    """
+    state_dir_env = os.environ.get("F213_STATE_DIR")
+    state_dir = (
+        Path(state_dir_env) if state_dir_env else Path(CAO_HOME_DIR) / "f213-rewake" / terminal_id
+    )
+    return state_dir / "watcher.lock"
+
+
+def _acquire_watcher_lock(terminal_id: str) -> Any:
+    """Try to become the singleton watcher; return the held lock fd or None.
+
+    Non-blocking ``flock(LOCK_EX|LOCK_NB)`` on the shared ``watcher.lock``. The
+    returned file object MUST be kept alive for the watcher's lifetime (closing
+    it releases the lock); the caller holds it in a local until it returns. A
+    ``None`` return means another watcher (parent ``.sh`` or a sibling overlay
+    arm) already owns the singleton — the caller exits 0 without polling, so the
+    seat is woken at most once for a given pending id.
+
+    Fail-open: if ``fcntl`` is unavailable or the lock dir cannot be created, we
+    return a sentinel (truthy) so the watcher still runs — a missing lock only
+    risks a redundant bounded watcher, never a lost wake.
+    """
+    if fcntl is None:
+        return True  # no flock available → run unguarded (fail-open)
+    lock_path = _watcher_lock_path(terminal_id)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Never truncate: open O_RDWR|O_CREAT so a parent .sh ``: >>"$LOCK_FILE"``
+        # and this open share the same inode/lock.
+        fd = open(lock_path, "a+")
+    except OSError:
+        return True  # cannot open the lock file → fail-open, run unguarded
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Another watcher owns the singleton.
+        try:
+            fd.close()
+        except OSError:
+            pass
+        return None
+    return fd
 
 
 def _read_state(terminal_id: str) -> tuple[int, float, int]:
@@ -203,6 +266,14 @@ def main(argv: list[str] | None = None) -> int:
     if mode != "arm":
         return 0
 
+    # F810 #667 r3 (single-wake): become the singleton watcher or step aside.
+    # This contends on the SAME ``watcher.lock`` the parent ``.sh`` uses, so a
+    # concurrent parent+overlay arm produces exactly ONE polling watcher (and
+    # thus at most one wake per pending id). The loser exits 0 without polling.
+    _lock = _acquire_watcher_lock(terminal_id)
+    if _lock is None:
+        return 0
+
     try:
         base_url = (
             os.environ.get("CAO_ENDPOINT")
@@ -262,6 +333,15 @@ def main(argv: list[str] | None = None) -> int:
             return _wake(terminal_id, max_id, preview, wake_streak, now)
     except Exception:
         return 0
+    finally:
+        # Release the singleton watcher lock (closing the fd drops the flock).
+        # Held for the whole watcher lifetime above; released on every exit path
+        # (wake, timeout, error) so the next arm can re-acquire it.
+        if _lock is not None and _lock is not True:
+            try:
+                _lock.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
