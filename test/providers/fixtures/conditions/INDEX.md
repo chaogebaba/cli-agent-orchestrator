@@ -38,6 +38,8 @@ TRANSIENT_OVERLOAD.
 | kiro-cli-footer-exhausted-1 | kiro_cli | CONTEXT_EXHAUSTED | footer_percent_status | — | issue #693 (F836) synth ≥90% used | — |
 | codex-footer-healthy-1 | codex | (none) | footer_percent_status_healthy | — | issue #693 (F836) term 0ec52ecf | — |
 | codex-footer-exhausted-1 | codex | CONTEXT_EXHAUSTED | footer_percent_status | — | issue #693 (F836) synth ≤10% left | — |
+| codex-resumed-replayed-cap-1 | codex | (none) | replayed_history | — | issue #689 (F832) term 2e342754/8d5617b6 | — |
+| codex-resumed-live-cap-1 | codex | CAPPED | usage_limit_hard | try again at Sep 8th, 2026 1:27 AM | issue #689 (F832) counterpart | — |
 | codex-dialog-blocked-1 | codex | DIALOG_BLOCKED | trust_dir_dialog | — | 15a6fa21.scrollback:16-33 | 8332f9d8116e |
 | grok-cli-dialog-blocked-1 | grok_cli | DIALOG_BLOCKED | trust_dir_dialog | Enter/y trust · n/Esc quit | fcbb00dc.scrollback:51-60 | f3479955a120 |
 | claude-code-dialog-blocked-1 | claude_code | DIALOG_BLOCKED | login_wizard | — | e3441b17.scrollback:31-37 | 822be4c2ff78 |
