@@ -343,16 +343,27 @@ def _codex_footer_percent_row(rows: List[str]) -> Optional[str]:
     "Context 8% left" lives there) and are never eligible; a footer-shaped row
     that is not the row adjacent to the composer (e.g. a fenced quote separated by
     a code fence) is not the live bar. No composer prompt → no live footer → None.
+
+    Live-bar co-signature (F836 r4, S1): the live TUI redraws bar + blank +
+    composer — every real captured codex pane separates the status bar from the
+    composer by at least one blank row. A footer-shaped row FLUSH against the
+    composer (no blank between) is a pasted/quoted status line, not the live bar,
+    so it does not fire.
     """
     composer = _last_index(rows, _CODEX_COMPOSER_PROMPT)
     if composer < 0:
         return None
+    saw_blank = False
     for row in rows[composer + 1 :]:
         if row.strip() == "":
+            saw_blank = True
             continue
-        # First non-blank row below the composer: the live status bar iff it
-        # carries the context figure; otherwise there is no live footer.
-        return row.strip() if _CODEX_CONTEXT_FOOTER.search(row) else None
+        # First non-blank row below the composer: the live status bar iff a blank
+        # separator precedes it AND it carries the context figure; otherwise
+        # there is no live footer (a flush footer-shaped row is transcript).
+        if saw_blank and _CODEX_CONTEXT_FOOTER.search(row):
+            return row.strip()
+        return None
     return None
 
 
@@ -367,16 +378,27 @@ def _kiro_footer_percent_row(rows: List[str]) -> Optional[str]:
     from the composer by a code fence or prose) is not the row adjacent to the
     composer and is never eligible; rows at/below the composer are trailing chrome
     ("/copy to clipboard"). No composer prompt → no live footer → None.
+
+    Live-bar co-signature (F836 r4, S1): the live TUI redraws bar + blank +
+    composer — every real captured kiro pane separates the status bar from the
+    composer by at least one blank row. A footer-shaped row FLUSH against the
+    composer (no blank between) is a pasted/quoted status line, not the live bar,
+    so it does not fire.
     """
     composer = _last_index(rows, _KIRO_COMPOSER_PROMPT)
     if composer < 0:
         return None
+    saw_blank = False
     for row in reversed(rows[:composer]):
         if row.strip() == "":
+            saw_blank = True
             continue
-        # First non-blank row above the composer: the live status bar iff it
-        # carries the pie-glyph percent; otherwise there is no live footer.
-        return row.strip() if _KIRO_CONTEXT_FOOTER.search(row) else None
+        # First non-blank row above the composer: the live status bar iff a blank
+        # separator precedes it AND it carries the pie-glyph percent; otherwise
+        # there is no live footer (a flush footer-shaped row is transcript).
+        if saw_blank and _KIRO_CONTEXT_FOOTER.search(row):
+            return row.strip()
+        return None
     return None
 
 

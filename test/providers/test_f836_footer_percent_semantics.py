@@ -87,8 +87,11 @@ def test_kiro_threshold_boundary() -> None:
     F836 r3: the status bar is anchored to the live kiro composer placeholder
     ("ask a question or describe a task"), which sits BELOW the status bar in the
     real TUI — so the boundary panes carry the real composer row, not a bare "›".
+    F836 r4: the live TUI redraws bar + blank + composer (every real capture
+    separates the bar from the composer by a blank row); the boundary panes carry
+    that blank separator so they exercise the live-bar path.
     """
-    _composer = " ask a question or describe a task ↵\n"
+    _composer = "\n ask a question or describe a task ↵\n"
     below = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD - 1}%   /p · (b)\n{_composer}"
     at = f"kiro_cli_dev · Auto · ● {KIRO_CONTEXT_USED_THRESHOLD}%   /p · (b)\n{_composer}"
     assert classify_condition(below, "kiro_cli") is None
@@ -97,9 +100,13 @@ def test_kiro_threshold_boundary() -> None:
 
 
 def test_codex_threshold_boundary() -> None:
-    """codex fires at exactly the LEFT threshold, not one above it."""
-    above = f"› Ask Codex to do anything\n  m · Context {CODEX_CONTEXT_LEFT_THRESHOLD + 1}% left · 5h 0% left\n"
-    at = f"› Ask Codex to do anything\n  m · Context {CODEX_CONTEXT_LEFT_THRESHOLD}% left · 5h 0% left\n"
+    """codex fires at exactly the LEFT threshold, not one above it.
+
+    F836 r4: the live TUI redraws bar + blank + composer; the boundary panes
+    carry the blank separator so they exercise the live-bar path.
+    """
+    above = f"› Ask Codex to do anything\n\n  m · Context {CODEX_CONTEXT_LEFT_THRESHOLD + 1}% left · 5h 0% left\n"
+    at = f"› Ask Codex to do anything\n\n  m · Context {CODEX_CONTEXT_LEFT_THRESHOLD}% left · 5h 0% left\n"
     assert classify_condition(above, "codex") is None
     cond = classify_condition(at, "codex")
     assert cond is not None and cond.kind is ConditionKind.CONTEXT_EXHAUSTED
@@ -309,3 +316,69 @@ def test_r3_no_composer_pane_does_not_fire() -> None:
     assert classify_condition(codex_no_composer, "codex") is None
     kiro_no_composer = "kiro_cli_dev · Auto · ● 95%                    /data/x · (cao/x)\n"
     assert classify_condition(kiro_no_composer, "kiro_cli") is None
+
+
+# ── F836 r4 (#693) — the r3 residual (S1): a verbatim status bar typed/pasted as
+# the line DIRECTLY adjacent to the live composer (no blank separator) is a
+# transcript paste, not the live bar. INVARIANT: the live TUI redraws
+# bar + blank + composer — every real captured pane in the corpus carries that
+# blank separator; a FLUSH footer-shaped row is transcript and must not fire.
+# (See _codex_footer_percent_row / _kiro_footer_percent_row.) ──────────────────
+
+# The composer literals in their exact live-pane forms (match the r3 attachment).
+_KC = " ask a question or describe a task ↵"
+_CC = "› Ask Codex to do anything"
+
+
+def test_r4_kiro_adjacent_quote_flush_does_not_fire() -> None:
+    """S1 residual (kiro): a quoted ``● 92%`` bar on the row DIRECTLY above the
+    composer, nothing between, is a pasted status line — NOT the live bar — and
+    must be quiet. (On r3 HEAD this fired a false high-confidence exhaustion.)"""
+    pane = (
+        "You asked about the pane. The last capture was:\n"
+        "kiro_cli_dev · Auto · ● 92%    /repo · (cao/x)\n" + _KC + "\n"
+    )
+    assert classify_condition(pane, "kiro_cli") is None
+
+
+def test_r4_codex_adjacent_below_flush_does_not_fire() -> None:
+    """S1 residual (codex twin): a footer-shaped row DIRECTLY below the composer,
+    nothing between, is only reachable in a pasted pane (a live codex composer is
+    bottom-most) — so a FLUSH footer below the composer must be quiet."""
+    pane = _CC + "\n~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+    assert classify_condition(pane, "codex") is None
+
+
+def test_r4_kiro_quote_separated_by_prose_is_quiet() -> None:
+    """Control (unchanged from r3): one prose row between the quote and the
+    composer -> correctly quiet (separated quotes were already inert)."""
+    pane = (
+        "The last capture was: kiro_cli_dev · Auto · ● 92%\n"
+        "Let me know if you want me to recover that seat.\n" + _KC + "\n"
+    )
+    assert classify_condition(pane, "kiro_cli") is None
+
+
+def test_r4_codex_reads_last_composer_not_first() -> None:
+    """S2 (M1 gap): two codex composers; the newest has a healthy footer below,
+    the older an exhausted footer below. Reading the LAST composer -> quiet.
+    Pins last-composer selection (mutant M1 'pick first composer' must die)."""
+    pane = (
+        _CC + "\n\n"
+        "~/x · main · gpt-5.6-sol high · Context 3% left · 5h 9% left\n"
+        "  ... later ...\n" + _CC + "\n\n"
+        "~/x · main · gpt-5.6-sol high · Context 77% left · 5h 47% left\n"
+    )
+    assert classify_condition(pane, "codex") is None
+
+
+def test_r4_codex_reads_adjacent_row_not_any_row_in_region() -> None:
+    """S3 (M6 gap): prose row directly below the composer, exhausted footer two
+    rows down. Reading the ADJACENT row only -> quiet. Pins adjacent-only, not
+    any-row (mutant M6 'accept any footer-shaped row below the composer' dies)."""
+    pane = (
+        _CC + "\n\n"
+        "  some assistant prose here\n"
+        "~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+    )
+    assert classify_condition(pane, "codex") is None
