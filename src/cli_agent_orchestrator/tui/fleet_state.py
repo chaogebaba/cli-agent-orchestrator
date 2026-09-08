@@ -46,6 +46,8 @@ _TERMINAL_KEYS: frozenset[str] = frozenset(
         "lifecycle",
         "resolved_model",
         "reasoning_effort",
+        "model_obs",
+        "effort_obs",
         "reparented_from",
         "config_stale",
         "wedge_suspect",
@@ -112,6 +114,18 @@ def _as_opt_float(value: Any) -> float | None:
     return None
 
 
+def _as_obs_map(value: Any) -> Mapping[str, Any] | None:
+    """Coerce a model_obs/effort_obs wire value to an immutable mapping or None.
+
+    An old server omits the key (``None``); anything that is not a mapping is
+    also ``None`` (old-server fallback → the renderer shows the configured
+    ``[C]``/``[?]`` value, D6).
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType(dict(value))
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalState:
     """One row of ``terminals[]``.
@@ -141,6 +155,12 @@ class TerminalState:
     lifecycle: str = "ephemeral"
     resolved_model: str | None = None
     reasoning_effort: str | None = None
+    # F826 (#683) D6: additive observed model/effort. Each is the wire dict
+    # {value, marker, kind, event_time, source, validity, configured} or None
+    # (old server / not observable). Kept as a plain mapping — the renderer
+    # (tui/model_effort_cell.py) reads it; no cross-fetch derivation here.
+    model_obs: Mapping[str, Any] | None = None
+    effort_obs: Mapping[str, Any] | None = None
     reparented_from: str | None = None
     config_stale: bool = False
     wedge_suspect: bool = False
@@ -171,6 +191,8 @@ class TerminalState:
             lifecycle=_as_str(raw.get("lifecycle")) or "ephemeral",
             resolved_model=_as_opt_str(raw.get("resolved_model")),
             reasoning_effort=_as_opt_str(raw.get("reasoning_effort")),
+            model_obs=_as_obs_map(raw.get("model_obs")),
+            effort_obs=_as_obs_map(raw.get("effort_obs")),
             reparented_from=_as_opt_str(raw.get("reparented_from")),
             config_stale=bool(raw.get("config_stale")),
             wedge_suspect=bool(raw.get("wedge_suspect")),

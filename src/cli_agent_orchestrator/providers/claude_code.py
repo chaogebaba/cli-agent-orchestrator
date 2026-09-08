@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.screen_classification import (
     screen_classification_result,
 )
 from cli_agent_orchestrator.services.settings_service import (
+    claude_statusline_enabled,
     get_provider_defaults,
     get_provider_profile_defaults,
     get_server_settings,
@@ -1234,6 +1235,37 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
             }
         }
+        # F826 (#683) D3: the Claude statusLine emitter. A new top-level
+        # `statusLine` key beside `hooks`. Claude invokes the command on session
+        # start/resume, new assistant message, /compact, permission/command/
+        # rate-limit change AND every refreshInterval (1500 ms) — the timer is
+        # what makes an idle `/model` or effort change visible (AC1). The emitter
+        # reads the statusline JSON on stdin, writes the observe sidecar
+        # atomically, then prints one CONSTANT line `<model> · <effort>` — that
+        # line is the status line every CAO-spawned Claude pane shows.
+        #
+        # SHOULD-1: the observe.claude_statusline toggle is read HERE, at
+        # overlay-generation time, from CAO_HOME_DIR/settings.json — never at
+        # emitter runtime. When off, no statusLine key is set at all (the pane
+        # keeps Claude's default). Flipping it takes effect on relaunch (D7).
+        # The emitter itself does zero settings I/O and imports only stdlib+json.
+        try:
+            statusline_on = claude_statusline_enabled()
+        except Exception:
+            statusline_on = True
+        if statusline_on:
+            statusline_command = shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "cli_agent_orchestrator.hooks.status_emit",
+                ]
+            )
+            settings["statusLine"] = {
+                "type": "command",
+                "command": statusline_command,
+                "refreshInterval": 1500,
+            }
         # When persona composition is active, the real ~/.claude/settings.json
         # is hidden behind the bwrap overlay.  Merge auth-critical env vars
         # (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, proxy config) from the

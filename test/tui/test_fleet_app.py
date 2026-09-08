@@ -438,7 +438,7 @@ async def test_c_reveals_the_new_columns_and_toggles_back(tmp_path: Path) -> Non
         supervisor = next(i for i, t in enumerate(rows) if t.id == "term-0021")
         assert plain(app.table, supervisor, ALL_VIEW.index("DELEG")) == "delegating (2)"
         assert plain(app.table, supervisor, ALL_VIEW.index("LIFE")) == "persistent"
-        assert plain(app.table, supervisor, ALL_VIEW.index("MODEL")) == "claude-opus-5"
+        assert plain(app.table, supervisor, ALL_VIEW.index("MODEL")) == "claude-opus-5 [C]"
 
         await pilot.press("c")
         await pilot.pause()
@@ -514,14 +514,16 @@ async def test_provider_model_effort_columns_render(tmp_path: Path) -> None:
         assert plain(table, 1, provider) == "codex"
         assert plain(table, 2, provider) == "grok"
 
-        assert plain(table, 0, model) == "claude-opus-5"
-        assert plain(table, 1, model) == "gpt-5.1-codex"
-        assert plain(table, 2, model) == "grok-4.6"
+        # F826 (#683): with no observation in the payload (old-server / not yet
+        # observed), the MODEL/EFFORT cells render the CONFIGURED value `[C]`.
+        assert plain(table, 0, model) == "claude-opus-5 [C]"
+        assert plain(table, 1, model) == "gpt-5.1-codex [C]"
+        assert plain(table, 2, model) == "grok-4.6 [C]"
 
-        assert plain(table, 0, effort) == "high"
-        assert plain(table, 1, effort) == "medium"
-        # A bound provider with no effort key at any level renders "-".
-        assert plain(table, 2, effort) == "-"
+        assert plain(table, 0, effort) == "high [C]"
+        assert plain(table, 1, effort) == "medium [C]"
+        # A bound provider with no effort key at any level renders "- [?]".
+        assert plain(table, 2, effort) == "- [?]"
 
 
 def _capped_codex_payload() -> Dict[str, Any]:
@@ -1370,8 +1372,8 @@ def test_row_values_is_the_single_source_of_the_row_text() -> None:
         "term-0001",
         "chao_supervisor",
         "claude",  # PROVIDER (F777): claude_code shortened
-        "claude-opus-5",  # MODEL (F777)
-        "high",  # EFFORT (F777)
+        "claude-opus-5 [C]",  # MODEL: configured [C] (F826, no observation in payload)
+        "high [C]",  # EFFORT: configured [C] (F826)
         "(supervisor seat)",
         "◌ idle",
         ELAPSED_UNKNOWN,  # no clock passed: one frame cannot time a transition
@@ -1394,11 +1396,13 @@ LAYOUT_ORDER = [
     "table-rule",
     "fleet",
     "empty",
+    "detail",
     "events-title",
     "events",
     "debug",
     "flash",
     "hints",
+    "legend",
     "peek",
 ]
 
