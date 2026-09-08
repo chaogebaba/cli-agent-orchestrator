@@ -432,6 +432,10 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         )
 
         # 4. RESUME through the PUBLIC SEAM: server._assign_impl(resume_from=...).
+        # The public resume resolver accepts a terminal id (live OR reaped — the
+        # terminal_identity row survives reap) or a provider session uuid; it does
+        # NOT resolve the internal conv_<id> identity_key. The real operator flow
+        # names the hibernated worker's terminal id, so pass worker_id.
         os.environ["CAO_ENDPOINT"] = api
         os.environ["CAO_TERMINAL_ID"] = supervisor_id
         from cli_agent_orchestrator.mcp_server import server as _srv
@@ -439,7 +443,7 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         assign_kwargs = dict(agent_profile=profile, message=(
             f"What exact token did I ask you to remember earlier? "
             f"Reply with ONLY that token."
-        ), resume_from=identity_key)
+        ), resume_from=worker_id)
         if model:
             assign_kwargs["model"] = model
         res = _srv._assign_impl(**assign_kwargs)
@@ -448,7 +452,7 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
              "resume_line", "error", "reason", "missing")}))
         assert res.get("success") is True, f"public resume seam failed: {res}"
         resumed_id = res["terminal_id"]
-        assert res.get("resumed_from") == identity_key or res.get("resumed_from") == worker_id
+        assert res.get("resumed_from") in (worker_id, identity_key)
 
         # resumed worker must reach ready, then recall the token.
         assert _wait_ready(resumed_id) in _READY, "resumed worker not ready"
