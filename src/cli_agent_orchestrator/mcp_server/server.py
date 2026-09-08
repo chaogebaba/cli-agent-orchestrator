@@ -174,6 +174,33 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
+def _f829_resolve_caller_principal() -> Optional[str]:
+    """F829 D3: the caller's DURABLE principal for resume authorization.
+
+    The owner_principal stored on a conversation root is the seat's durable
+    mailbox id (the migration set it from ``terminals.caller_mailbox_id``), NOT a
+    disposable terminal id. Resolve THIS caller's mailbox the same way: read the
+    current terminal's metadata over HTTP and return its ``caller_mailbox_id``.
+    Falls back to the terminal id when no mailbox is recorded (a top-level
+    supervisor), and to None when there is no terminal at all. Best-effort: a
+    lookup failure returns None (authorize then treats it as not-owner, which is
+    the safe default — a resume is refused rather than wrongly granted).
+    """
+    terminal_id = _current_terminal_id()
+    if not terminal_id:
+        return None
+    try:
+        resp = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        resp.raise_for_status()
+        meta = resp.json()
+        principal = meta.get("caller_mailbox_id")
+        if isinstance(principal, str) and principal:
+            return principal
+        return terminal_id
+    except Exception:
+        return None
+
+
 def _refresh_terminal_token_from_pane() -> Optional[str]:
     """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
 
