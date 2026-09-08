@@ -106,13 +106,31 @@ def _wait_ready(tid: str, timeout: float = _READY_TIMEOUT) -> str:
 
 def _create_session_terminal(api: str, provider: str, profile: str, session: str,
                              model: str | None) -> tuple[str, str]:
+    # Real-provider terminal init (tmux + MCP handshake + first system-prompt
+    # turn) can take well over two minutes on a loaded box; the live e2e tier
+    # budgets 300s per test (conftest _LIVE_TEST_TIMEOUT). Use a generous client
+    # timeout and one retry on a 500 (rate-limit-induced init timeout), mirroring
+    # test/e2e/conftest.create_terminal.
     params = {"provider": provider, "agent_profile": profile, "session_name": session}
     if model:
         params["model"] = model
-    resp = requests.post(f"{api}/sessions", params=params, timeout=120)
-    assert resp.status_code in (200, 201), f"create failed: {resp.status_code} {resp.text}"
-    data = resp.json()
-    return data["id"], data["session_name"]
+    last = None
+    for attempt in range(2):
+        if attempt:
+            params["session_name"] = f"{session}-r{uuid.uuid4().hex[:5]}"
+            time.sleep(10)
+        try:
+            resp = requests.post(f"{api}/sessions", params=params, timeout=240)
+        except requests.exceptions.ReadTimeout as exc:
+            last = f"ReadTimeout: {exc}"
+            continue
+        last = f"{resp.status_code} {resp.text}"
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return data["id"], data["session_name"]
+        if resp.status_code != 500:
+            break
+    raise AssertionError(f"create failed: {last}")
 
 
 def _send(api: str, tid: str, message: str) -> None:
