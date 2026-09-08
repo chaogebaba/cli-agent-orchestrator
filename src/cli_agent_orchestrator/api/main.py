@@ -334,6 +334,32 @@ async def deferred_init_watchdog(registry: PluginRegistry) -> None:
         await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
 
 
+async def conversation_reconcile_daemon() -> None:
+    """F829 D8: periodic per-tick liveness reconciliation of `live` conversation
+    roots (beyond the one-shot startup sweep).
+
+    Re-runs ``reconcile_live_roots`` on the slow reconcile cadence so a worker
+    that dies WHILE the server is up (a tombstone written after boot) has its
+    conversation root crash-detached without waiting for the next restart. Cheap
+    and idempotent: only ``live`` roots are examined, and a root is examined at
+    most once — crash-detach moves it to ``detached`` and out of the set. Stale
+    resume claims are swept on the same cadence. Never lets a sweep failure kill
+    the daemon.
+    """
+    from cli_agent_orchestrator.services import conversation_reconcile
+
+    logger.info("F829 conversation reconcile daemon started")
+    while True:
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
+        try:
+            await asyncio.to_thread(conversation_reconcile.reconcile_stale_claims)
+            await asyncio.to_thread(conversation_reconcile.reconcile_live_roots)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("F829 conversation reconcile sweep failed")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -1923,6 +1949,8 @@ async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
+    # F829 D8: periodic reconciliation of live conversation roots + stale claims.
+    conversation_reconcile_task = asyncio.create_task(conversation_reconcile_daemon())
 
     # F747 (#604): periodic idle-seat wake reconcile. The client-side rewake
     # watcher is re-armed only by Stop/PostToolUse, which an idle seat cannot
@@ -2004,6 +2032,7 @@ async def lifespan(app: FastAPI):
     watchdog_task.cancel()
     callback_barrier_task.cancel()
     deferred_init_watchdog_task.cancel()
+    conversation_reconcile_task.cancel()  # F829 D8
     # F295 AC4: Stop grok config watcher
     if grok_config_watcher_task is not None:
         grok_config_watcher_task.cancel()
@@ -2033,6 +2062,7 @@ async def lifespan(app: FastAPI):
             watchdog_task,
             callback_barrier_task,
             deferred_init_watchdog_task,
+            conversation_reconcile_task,  # F829 D8
             *([daemon_task] if daemon_task is not None else []),
             return_exceptions=True,
         )

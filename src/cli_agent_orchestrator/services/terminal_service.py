@@ -7327,6 +7327,46 @@ def delete_terminal(
     require_delete_allowed(terminal_id, force=force)
     session_name = root["tmux_session"]
 
+    # F829 D2(a): PLANNED HIBERNATE gate — evaluated BEFORE the teardown intent is
+    # opened so a refusal returns without opening/leaking an intent. On the
+    # default (non-force) path, a conversation with NO validated recoverable
+    # artifact (D6) must NOT be destroyed silently: refuse non-destructively with
+    # a typed result naming provider + reason (additive return fields; existing
+    # readers of terminal_deleted are unaffected), so the caller can choose an
+    # explicit force reap. force=True (explicit reap) always proceeds (D2(b)).
+    from cli_agent_orchestrator.services import conversation_transition as _f829_ct
+
+    _f829_hib_decision = None
+    if not force:
+        try:
+            _f829_hib_decision = _f829_ct.evaluate_planned_hibernate(terminal_id)
+        except Exception:
+            logger.debug("f829 hibernate evaluation failed; proceeding as reap", exc_info=True)
+            _f829_hib_decision = None
+        if _f829_hib_decision is not None and not _f829_hib_decision.allowed:
+            if _f829_hib_decision.identity_key is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import record_conversation_event
+
+                    record_conversation_event(
+                        _f829_hib_decision.identity_key,
+                        "hibernate_refused",
+                        terminal_id=terminal_id,
+                        detail={
+                            "provider": _f829_hib_decision.provider,
+                            "reason": _f829_hib_decision.reason,
+                        },
+                    )
+                except Exception:
+                    logger.debug("f829 hibernate_refused event failed", exc_info=True)
+            return {
+                "terminal_deleted": False,
+                "hibernate_refused": True,
+                "provider": _f829_hib_decision.provider,
+                "reason": _f829_hib_decision.reason,
+                "identity_key": _f829_hib_decision.identity_key,
+            }
+
     # D16: Open teardown intent BEFORE any tmux call. Committed immediately.
     from cli_agent_orchestrator.clients.database import SessionLocal
     from cli_agent_orchestrator.services.config_service import ConfigService
@@ -7376,7 +7416,7 @@ def delete_terminal(
 
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     try:
-        return _delete_terminal_inner(
+        _f829_result = _delete_terminal_inner(
             terminal_id=terminal_id,
             session_name=session_name,
             root=root,
@@ -7385,6 +7425,18 @@ def delete_terminal(
             orphan=orphan,
             caller_id=caller_id,
         )
+        # F829 D2 writer: land the conversation-root lifecycle AFTER a successful
+        # reap. Planned hibernate → hibernated (artifact validated above);
+        # explicit reap (force) → abandoned. Best-effort: a lifecycle-write
+        # failure must not turn a completed reap into an error.
+        try:
+            if force:
+                _f829_ct.commit_reap(terminal_id)
+            elif _f829_hib_decision is not None:
+                _f829_ct.commit_hibernate(_f829_hib_decision)
+        except Exception:
+            logger.debug("f829 conversation transition write failed", exc_info=True)
+        return _f829_result
     finally:
         # D16: Close intent in finally — runs on success, failure, exception alike
         if _f218_intent_id is not None:
