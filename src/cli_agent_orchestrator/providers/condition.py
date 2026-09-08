@@ -319,8 +319,48 @@ _KIRO_CONTEXT_TIP = re.compile(r"Running low on context\? Type /compact", re.IGN
 # The live composer-prompt markers. These are the placeholder rows the provider
 # TUI draws where the seat waits for input; each is a stable literal in the real
 # capture corpus.
+#
+# F836 r5 (#693): a plain substring search over the raw pane is NOT proof that a
+# row is the live composer (codex EMPIRICAL-GATE-NO): a fenced/indented FULL
+# snapshot quote (composer + blank + footer) and a prose row that merely CONTAINS
+# the composer phrase both carry the phrase, and the r3/r4 position rule promoted
+# them to live chrome. The substring markers below are kept ONLY to answer "does
+# this pane mention the composer phrase at all" (cheap short-circuit); a row is
+# accepted as the LIVE composer only by the anchored WHOLE-ROW matchers
+# (_CODEX_COMPOSER_ROW / _KIRO_COMPOSER_ROW) plus the bottom-of-viewport bound.
 _CODEX_COMPOSER_PROMPT = re.compile(r"Ask Codex to do anything", re.IGNORECASE)
 _KIRO_COMPOSER_PROMPT = re.compile(r"ask a question or describe a task", re.IGNORECASE)
+
+# F836 r5 (#693): EXACT full-row composer anchors. The live composer is a WHOLE
+# row the TUI draws, not a phrase embedded in prose or quoted inside a fence. The
+# measured real-capture shapes are (after escape-strip):
+#   codex: '› Ask Codex to do anything'
+#   kiro : ' ask a question or describe a task ↵'
+#          '›  ask a question or describe a task ↵'
+#          ' Ask a question or describe a task ↵  ctrl+g: agent monitor'
+# so the anchor allows ONLY: an optional leading '›' composer glyph, at most ONE
+# leading space (a genuine composer is flush-left or glyph-led — an indented
+# PASTE uses >=2 leading spaces), the exact phrase, and optional trailing chrome
+# (the '↵' hint and any '… ctrl+g/…/copy' affordance). A row that begins with a
+# fence (```), quote ('>' not the '›' glyph), bullet ('•'/'-'/'*'), or >=2 spaces
+# of indent is transcript and can NEVER be the live composer, whatever it quotes.
+_CODEX_COMPOSER_ROW = re.compile(r"^\u203a Ask Codex to do anything\s*$", re.IGNORECASE)
+_KIRO_COMPOSER_ROW = re.compile(
+    r"^(?:\u203a\s*| ?)ask a question or describe a task(?:\s.*)?$", re.IGNORECASE
+)
+# Rows that can never be the live composer even if they contain the phrase: a
+# leading fence / block-quote / bullet / list marker marks transcript territory.
+_TRANSCRIPT_ROW_LEAD = re.compile(r"^\s*(?:```|~~~|>|-|\*|\u2022|\d+[.)]|#)")
+
+# F836 r5 (#693): the live composer + footer are chrome at the BOTTOM of the
+# viewport. Measured across all 22 real fixtures with a composer+adjacent footer,
+# the composer is within the last 2 NON-BLANK rows of the pane (max 1 non-blank
+# row below it: codex draws its footer below the composer; kiro draws a trailing
+# '/copy to clipboard' affordance). K bounds how many non-blank rows may sit BELOW
+# the composer and still count as live chrome; K=2 (allow <=2 non-blank rows
+# below) is the observed max (1) plus a one-row margin. A composer occurrence with
+# more transcript below it is scrollback, whatever the row says.
+_COMPOSER_MAX_NONBLANK_BELOW = 2
 
 
 def _last_index(rows: List[str], pattern: "re.Pattern[str]") -> int:
@@ -330,6 +370,54 @@ def _last_index(rows: List[str], pattern: "re.Pattern[str]") -> int:
         if pattern.search(row):
             found = i
     return found
+
+
+def _nonblank_below(rows: List[str], idx: int) -> int:
+    """Count of non-blank rows strictly BELOW ``idx`` (bottom-of-viewport bound)."""
+    return sum(1 for r in rows[idx + 1 :] if r.strip() != "")
+
+
+def _live_composer_index(rows: List[str], row_anchor: "re.Pattern[str]") -> int:
+    """Index of the LIVE composer row, or -1 when there is no live composer.
+
+    F836 r5 (#693): a row is the live composer only when it (1) matches the exact
+    WHOLE-ROW composer anchor (never a substring inside prose, never a
+    fenced/quoted/bulleted/indented row — those are rejected by the anchor's
+    leading-character bound and by ``_TRANSCRIPT_ROW_LEAD``) AND (2) sits at the
+    BOTTOM of the viewport (at most ``_COMPOSER_MAX_NONBLANK_BELOW`` non-blank
+    rows below it). We scan from the bottom up and return the FIRST (lowest) row
+    that satisfies both — a higher occurrence is transcript. Returns -1 when no
+    row qualifies, so a quoted full snapshot (whose composer is buried above real
+    chrome, or is a fenced/prose row) yields no live composer and cannot fire.
+    """
+    for i in range(len(rows) - 1, -1, -1):
+        row = rows[i]
+        # Match the anchor against the RAW row (not stripped): the leading-glyph /
+        # leading-whitespace bound in the anchor is load-bearing. A genuine
+        # composer is flush-left or '›'-glyph-led with at most one leading space;
+        # an INDENTED paste (>=2 leading spaces) of the composer phrase is
+        # transcript and must not anchor (F836 r5 indented-snapshot case).
+        if not row_anchor.match(row):
+            continue
+        # A fenced/quoted/bulleted/indented lead is transcript, never the composer
+        # — even if the remainder matches the phrase (defence in depth over the
+        # anchor's own leading-char bound).
+        if _TRANSCRIPT_ROW_LEAD.match(row):
+            continue
+        if _nonblank_below(rows, i) > _COMPOSER_MAX_NONBLANK_BELOW:
+            # A clean-anchored composer that is NOT bottom-of-viewport is anomalous
+            # (no real capture puts >1 non-blank row below the composer). Treat it
+            # as not-live rather than a hard stop.
+            continue
+        # Any non-blank row BELOW the composer that is transcript chrome (a closing
+        # ``` fence, a quote/bullet lead) means this "composer" is the inner line
+        # of a quoted FULL snapshot, not live bottom chrome. Real trailing chrome
+        # ('/copy to clipboard') is not a transcript lead, so this rejects the
+        # fenced-snapshot case without touching genuine panes.
+        if any(r.strip() != "" and _TRANSCRIPT_ROW_LEAD.match(r) for r in rows[i + 1 :]):
+            continue
+        return i
+    return -1
 
 
 def _codex_footer_percent_row(rows: List[str]) -> Optional[str]:
@@ -344,24 +432,28 @@ def _codex_footer_percent_row(rows: List[str]) -> Optional[str]:
     that is not the row adjacent to the composer (e.g. a fenced quote separated by
     a code fence) is not the live bar. No composer prompt → no live footer → None.
 
-    Live-bar co-signature (F836 r4, S1): the live TUI redraws bar + blank +
-    composer — every real captured codex pane separates the status bar from the
-    composer by at least one blank row. A footer-shaped row FLUSH against the
-    composer (no blank between) is a pasted/quoted status line, not the live bar,
-    so it does not fire.
+    Bottom-of-viewport invariant (F836 r5, #693): the codex status bar is the
+    LAST non-blank row of the live pane — the composer sits directly above it and
+    nothing live is drawn below it. A footer-shaped row with ANY non-blank row
+    below it (e.g. a closing ``` fence, more transcript) is a quoted snapshot, not
+    the live bar, and does not fire. This is what rejects a fenced FULL snapshot
+    whose inner composer row happens to anchor cleanly (codex EMPIRICAL-GATE-NO).
     """
-    composer = _last_index(rows, _CODEX_COMPOSER_PROMPT)
+    composer = _live_composer_index(rows, _CODEX_COMPOSER_ROW)
     if composer < 0:
         return None
     saw_blank = False
-    for row in rows[composer + 1 :]:
+    for offset, row in enumerate(rows[composer + 1 :]):
+        idx = composer + 1 + offset
         if row.strip() == "":
             saw_blank = True
             continue
         # First non-blank row below the composer: the live status bar iff a blank
-        # separator precedes it AND it carries the context figure; otherwise
-        # there is no live footer (a flush footer-shaped row is transcript).
-        if saw_blank and _CODEX_CONTEXT_FOOTER.search(row):
+        # separator precedes it, it carries the context figure, AND it is the
+        # BOTTOM chrome row of the pane (no non-blank row below it). Otherwise
+        # there is no live footer (a flush or non-bottom footer-shaped row is
+        # transcript / a quoted snapshot).
+        if saw_blank and _CODEX_CONTEXT_FOOTER.search(row) and _nonblank_below(rows, idx) == 0:
             return row.strip()
         return None
     return None
@@ -385,7 +477,7 @@ def _kiro_footer_percent_row(rows: List[str]) -> Optional[str]:
     composer (no blank between) is a pasted/quoted status line, not the live bar,
     so it does not fire.
     """
-    composer = _last_index(rows, _KIRO_COMPOSER_PROMPT)
+    composer = _live_composer_index(rows, _KIRO_COMPOSER_ROW)
     if composer < 0:
         return None
     saw_blank = False

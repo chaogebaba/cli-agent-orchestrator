@@ -382,3 +382,211 @@ def test_r4_codex_reads_adjacent_row_not_any_row_in_region() -> None:
         "~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
     )
     assert classify_condition(pane, "codex") is None
+
+
+# ── F836 r5 (#693) — close the codex EMPIRICAL-GATE-NO on r3+r4. The r3/r4
+# position rule located the live composer by an UNANCHORED substring search
+# (_last_index over the raw pane) plus a blank-gap adjacency check. A quoted FULL
+# snapshot (composer + blank + footer) — fenced, indented, or split across prose
+# rows — reproduces that exact structure, so the selector promoted quoted
+# transcript to live chrome and fired a high-confidence hard stop (5 fresh
+# adversarial panes in the codex verdict). The r5 fix is structural, no content
+# denylist:
+#   1. EXACT full-row composer anchors (_CODEX_COMPOSER_ROW / _KIRO_COMPOSER_ROW):
+#      the composer must match the provider's composer line as a WHOLE row
+#      (optional '›' glyph, bounded leading whitespace, exact phrase, optional
+#      trailing chrome) — never a substring in prose, never a fenced/indented row.
+#   2. Bottom-of-viewport invariant: the live composer sits within the last
+#      non-blank rows of the pane (measured max 1 non-blank row below across all
+#      22 real captures; bound K=2), and for codex the footer is the LAST
+#      non-blank row of the pane. A composer occurrence with transcript chrome
+#      (a closing ``` fence, more rows) below it is scrollback.
+# Cursor/styling metadata is NOT available to the classifier this round (the pane
+# arrives as a plain `tmux capture-pane -p -e` string with no cursor row — see the
+# report's "second live signal" finding), so the bottom-of-viewport structural
+# invariant IS the second independent signal. ─────────────────────────────────
+
+# The FIVE codex-verdict adversarial panes (verbatim substance). Each MUST be
+# quiet: a fenced/indented/prose quote of a FULL snapshot is transcript, and its
+# "composer" fails the whole-row anchor and/or the bottom-of-viewport bound.
+_R5_VERDICT_NEGATIVE = [
+    (
+        "fenced-full-codex-snapshot",
+        "codex",
+        "• Here is my full terminal:\n"
+        "```text\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+        "```\n",
+    ),
+    (
+        "fenced-full-kiro-snapshot",
+        "kiro_cli",
+        "• Here is my full terminal:\n"
+        "```text\n"
+        "kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "\n"
+        " ask a question or describe a task ↵\n"
+        "```\n",
+    ),
+    (
+        "indented-full-kiro-snapshot",
+        "kiro_cli",
+        "• Here is my full terminal:\n"
+        "    kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "\n"
+        "     ask a question or describe a task ↵\n",
+    ),
+    (
+        "prose-codex-composer-phrase-plus-quoted-bar",
+        "codex",
+        "• I typed into the row that says Ask Codex to do anything\n"
+        "\n"
+        "  and the bar read ~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n",
+    ),
+    (
+        "prose-kiro-composer-phrase-below-quoted-bar",
+        "kiro_cli",
+        "• the bar read kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "\n"
+        "• then I clicked the ask a question or describe a task row\n",
+    ),
+]
+
+
+@pytest.mark.parametrize("label,provider,pane", _R5_VERDICT_NEGATIVE)
+def test_r5_full_snapshot_quotes_do_not_fire(label, provider, pane) -> None:
+    """The codex EMPIRICAL-GATE-NO blocker: a quoted FULL snapshot (composer +
+    blank + footer) must NOT be read as live chrome. On r3/r4 HEAD each of these
+    fired CONTEXT_EXHAUSTED.footer_percent_status/high."""
+    assert classify_condition(pane, provider) is None, f"{label}: quoted snapshot fired"
+
+
+# The REALISTIC variant of each negative: the same quoted snapshot ABOVE, plus a
+# genuine live composer + exhausted footer at the bottom of the pane. The live
+# rows MUST fire exactly once, high confidence, from the live chrome — the quote
+# above stays inert. (Anchoring must not cost genuine below/above reachability.)
+def test_r5_codex_quote_then_live_exhausted_fires_once() -> None:
+    pane = (
+        "• Earlier my bar said:\n"
+        "```text\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 3% left · 5h 9% left\n"
+        "```\n"
+        "\n"
+        "• back to work.\n"
+        "\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 6% left · 5h 47% left\n"
+    )
+    c = classify_condition(pane, "codex")
+    assert c is not None and c.kind is ConditionKind.CONTEXT_EXHAUSTED
+    assert c.subtype == "footer_percent_status" and c.confidence.value == "high"
+
+
+def test_r5_kiro_quote_then_live_exhausted_fires_once() -> None:
+    pane = (
+        "• Earlier my bar said:\n"
+        "```text\n"
+        "kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "\n"
+        " ask a question or describe a task ↵\n"
+        "```\n"
+        "\n"
+        "• back to work.\n"
+        "\n"
+        "kiro_cli_dev · Auto · ● 93%                    /data/x · (cao/x)\n"
+        "\n"
+        " ask a question or describe a task ↵\n"
+    )
+    k = classify_condition(pane, "kiro_cli")
+    assert k is not None and k.kind is ConditionKind.CONTEXT_EXHAUSTED
+    assert k.subtype == "footer_percent_status" and k.confidence.value == "high"
+
+
+# ── SHOULD (codex verdict): a mid-redraw capture that transiently omits the
+# blank separator / footer must NOT produce a false CONTEXT_EXHAUSTED — a missed
+# frame is recovered on the next poll. ────────────────────────────────────────
+def test_r5_codex_midredraw_no_footer_is_not_exhausted() -> None:
+    """A capture taken mid-redraw: the composer is drawn but the footer row has
+    not been redrawn yet (no non-blank row below the composer). No live footer to
+    read → NOT CONTEXT_EXHAUSTED (a missed frame is recovered on the next poll)."""
+    pane = "  done.\n\n› Ask Codex to do anything\n\n"
+    c = classify_condition(pane, "codex")
+    assert c is None or c.kind is not ConditionKind.CONTEXT_EXHAUSTED
+
+
+def test_r5_kiro_midredraw_no_footer_is_not_exhausted() -> None:
+    """kiro twin: the composer is present but the status bar above it has not been
+    redrawn (only prose above) → no live footer → not exhausted."""
+    pane = "  still thinking about the change.\n\n ask a question or describe a task ↵\n"
+    assert classify_condition(pane, "kiro_cli") is None
+
+
+# ── r5 structural unit assertions (pin the anchors + bottom-of-viewport bound
+# directly, independent of the full classify path). ───────────────────────────
+def test_r5_composer_anchor_rejects_fenced_and_indented_rows() -> None:
+    from cli_agent_orchestrator.providers.condition import (
+        _CODEX_COMPOSER_ROW,
+        _KIRO_COMPOSER_ROW,
+    )
+
+    # Genuine composer rows match.
+    assert _CODEX_COMPOSER_ROW.match("› Ask Codex to do anything")
+    assert _KIRO_COMPOSER_ROW.match(" ask a question or describe a task ↵")
+    assert _KIRO_COMPOSER_ROW.match("›  ask a question or describe a task ↵")
+    # A bullet/prose row that merely CONTAINS the phrase does not.
+    assert not _CODEX_COMPOSER_ROW.match("• row that says Ask Codex to do anything")
+    assert not _KIRO_COMPOSER_ROW.match("• clicked the ask a question or describe a task row")
+    # An indented (>=2 leading spaces) paste of the kiro phrase does not anchor.
+    assert not _KIRO_COMPOSER_ROW.match("     ask a question or describe a task ↵")
+
+
+def test_r5_live_composer_index_enforces_bottom_of_viewport() -> None:
+    from cli_agent_orchestrator.providers.condition import (
+        _CODEX_COMPOSER_ROW,
+        _live_composer_index,
+    )
+
+    # Composer at the bottom (0-1 non-blank rows below) is live.
+    rows = ["• x", "", "› Ask Codex to do anything", ""]
+    assert _live_composer_index(rows, _CODEX_COMPOSER_ROW) == 2
+    # Composer with a closing ``` fence + footer below it is a quoted snapshot.
+    rows2 = ["```text", "› Ask Codex to do anything", "", "  Context 8% left · 5h 9% left", "```"]
+    assert _live_composer_index(rows2, _CODEX_COMPOSER_ROW) == -1
+
+
+def test_r5_composer_with_transcript_below_beyond_k_is_not_live() -> None:
+    """Isolates the bottom-of-viewport K bound (mutant: drop the K bound). A
+    clean-anchored kiro composer with a footer-shaped row above it (blank gap) but
+    THREE plain non-lead transcript rows BELOW it is not bottom chrome: real
+    captures never put >1 non-blank row below the composer, and the kiro
+    footer-above path has no footer-is-bottom guard to fall back on. Must be
+    quiet. Without the K bound this fires a false CONTEXT_EXHAUSTED off the 92%."""
+    pane = (
+        "kiro_cli_dev · Auto · ● 92%    /path · (branch)\n"
+        "\n"
+        " ask a question or describe a task ↵\n"
+        "  trailing one\n"
+        "  trailing two\n"
+        "  trailing three\n"
+    )
+    assert classify_condition(pane, "kiro_cli") is None
+
+
+def test_r5_codex_footer_not_bottom_row_is_not_live() -> None:
+    """Isolates the codex footer-is-bottom-chrome direction rule (mutant: drop the
+    ``_nonblank_below(footer) == 0`` guard). The footer sits adjacent below the
+    composer with the blank gap, but a plain (non-lead) transcript row follows it,
+    so the footer is NOT the last non-blank row of the pane → a quoted snapshot,
+    not the live bar. Must be quiet; without the guard it fires."""
+    pane = (
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  ~/x · main · gpt-5.6-sol high · Context 8% left · 5h 47% left\n"
+        "  trailing plain line\n"
+    )
+    assert classify_condition(pane, "codex") is None
