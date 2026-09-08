@@ -391,3 +391,125 @@ def _stored_artifact(identity_key: str) -> Optional[str]:
 
     root = get_conversation_identity(identity_key)
     return root.get("artifact_locator") if root else None
+
+
+# ---------------------------------------------------------------------------
+# F829 D4: capture attach (positive attribution + not-owned-by-another) — and
+# the convergence point where a RESUME completes verify+publish.
+# ---------------------------------------------------------------------------
+
+
+def attach_captured_uuid(
+    terminal_id: str,
+    *,
+    provider_session_id: str,
+    provider: Optional[str] = None,
+    provider_namespace: Optional[str] = None,
+    artifact_locator: Optional[str] = None,
+) -> dict:
+    """F829 D4: bind a captured provider uuid to this terminal's conversation root.
+
+    Two cases converge here (this is the point where the reported id first
+    exists):
+
+    * RESUME completion (D3 steps 6-7): if the root holds an active resume claim,
+      run verify_and_publish_resume — the reported id must match (or the claude
+      divergence branch applies), then publish current_terminal_id + clear claim.
+    * FRESH capture (D4): otherwise bind the uuid iff it is not already bound to
+      ANOTHER identity (bind_provider_session_id enforces bound-uniqueness).
+      A conflict records a ``uuid_capture_rejected`` event naming both identities
+      and leaves the root unbound (never a newest-file / cwd-match attach).
+
+    Best-effort and non-raising: a terminal with no F829 root (pre-F829) returns
+    ``{"status": "no_root"}`` and the caller proceeds unchanged.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        bind_provider_session_id,
+        get_conversation_identity,
+        record_conversation_event,
+        set_conversation_lifecycle,
+    )
+
+    root = _root_for_terminal(terminal_id)
+    if root is None:
+        return {"status": "no_root"}
+    key = root["identity_key"]
+
+    # RESUME completion path: an active claim means this capture is the resumed
+    # worker reporting its id; verify + publish rather than a fresh bind.
+    if root.get("resume_claim"):
+        admission = ResumeAdmission(
+            ok=True,
+            identity_key=key,
+            generation=int(root.get("generation", 0)),
+            provider=provider or root.get("provider"),
+            provider_session_id=root.get("provider_session_id"),
+            provider_namespace=provider_namespace or root.get("provider_namespace"),
+        )
+        vr = verify_and_publish_resume(
+            admission,
+            terminal_id=terminal_id,
+            reported_session_id=provider_session_id,
+            reported_artifact_locator=artifact_locator,
+            provider=provider or root.get("provider"),
+        )
+        return {"status": "resume_published" if vr.ok else "resume_failed", "error": vr.error}
+
+    # FRESH capture path: bind iff not owned by another identity.
+    ok = bind_provider_session_id(
+        key,
+        provider_session_id=provider_session_id,
+        provider_namespace=provider_namespace,
+        artifact_locator=artifact_locator,
+    )
+    if not ok:
+        # Find the conflicting identity for the rejection event.
+        conflicting = None
+        from cli_agent_orchestrator.clients.database import ConversationIdentityModel as _CI
+        from cli_agent_orchestrator.clients.database import (
+            SessionLocal,
+        )
+
+        try:
+            with SessionLocal() as db:
+                ns = (
+                    provider_namespace
+                    if provider_namespace is not None
+                    else root.get("provider_namespace")
+                )
+                row = (
+                    db.query(_CI)
+                    .filter(
+                        _CI.provider == root["provider"],
+                        _CI.provider_namespace == ns,
+                        _CI.provider_session_id == provider_session_id,
+                        _CI.identity_key != key,
+                    )
+                    .first()
+                )
+                conflicting = row.identity_key if row is not None else None
+        except Exception:
+            conflicting = None
+        record_conversation_event(
+            key,
+            "uuid_capture_rejected",
+            terminal_id=terminal_id,
+            detail={
+                "provider_session_id": provider_session_id,
+                "conflicting_identity": conflicting,
+                "reason": "already_bound_to_another_identity",
+            },
+        )
+        return {"status": "capture_rejected", "conflicting_identity": conflicting}
+
+    record_conversation_event(
+        key,
+        "uuid_captured",
+        terminal_id=terminal_id,
+        detail={"provider_session_id": provider_session_id},
+    )
+    # A capture_unknown root that just captured its id becomes recoverable.
+    updated = get_conversation_identity(key)
+    if updated and updated.get("lifecycle") == "capture_unknown":
+        set_conversation_lifecycle(key, "live")
+    return {"status": "captured"}

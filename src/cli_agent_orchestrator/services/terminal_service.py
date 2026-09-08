@@ -686,6 +686,20 @@ def _commit_provider_runtime_identity(
         )
     if not persisted:
         raise RuntimeError("terminal_identity_persist_failed")
+    # F829 D4/D3: attach the captured uuid to the conversation root — completing
+    # a RESUME (verify+publish) when a claim is held, else a FRESH capture with
+    # not-owned-by-another attribution. Best-effort: a failure here must not fail
+    # the terminal's runtime-identity commit.
+    try:
+        from cli_agent_orchestrator.services.conversation_transition import attach_captured_uuid
+
+        attach_captured_uuid(
+            terminal_id,
+            provider_session_id=prepared.session_uuid,
+            artifact_locator=getattr(prepared, "artifact_locator", None),
+        )
+    except Exception:
+        logger.debug("f829 attach_captured_uuid failed", exc_info=True)
 
 
 def _wait_for_session_artifact_sync(
