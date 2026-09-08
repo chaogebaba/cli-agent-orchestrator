@@ -188,6 +188,28 @@ def test_ac2_concurrent_claim_exactly_one_wins(real_sqlite_env):
     assert d.claim_resume("k1", 0, "b") is False  # session_resume_in_progress
 
 
+def test_ac7_cas_null_guard_holds_at_matching_generation(real_sqlite_env):
+    """AC7 CAS-guard mutant kill: a SECOND claim at the CURRENT generation, while a
+    claim is already held, must still lose — proving the ``resume_claim IS NULL``
+    guard is load-bearing independently of the generation check.
+    """
+    d.mint_conversation_identity(
+        identity_key="k_cas",
+        provider="codex",
+        provider_namespace="ns",
+        agent_profile="dev",
+        model=None,
+        reasoning_effort=None,
+        owner_principal="mb",
+        origin_callback_ref=None,
+        current_terminal_id="t1",
+    )
+    assert d.claim_resume("k_cas", 0, "a") is True  # generation now 1, claim held
+    # Address the CURRENT generation (1): the generation guard is satisfied, so
+    # only the ``resume_claim IS NULL`` guard can reject this — it must.
+    assert d.claim_resume("k_cas", 1, "b") is False
+
+
 def test_ac7_bound_uniqueness(real_sqlite_env):
     """AC7 drop-UNIQUE mutant target: a duplicate (provider,ns,uuid) bind is rejected."""
     for key in ("k1", "k2"):
