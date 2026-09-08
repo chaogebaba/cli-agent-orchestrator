@@ -541,6 +541,51 @@ class FifoManager:
         if thread is not None:
             thread.join(timeout=2.0)
 
+    def stop_all_readers(self, *, join_timeout: float = 2.0) -> list[str]:
+        """Deterministically tear down every tracked reader + the watchdog.
+
+        Issue #624 (F767): a test (or a service) that created FIFO readers via
+        ``create_reader`` but never called ``stop_reader`` leaks the reader
+        threads. They are daemon threads, so they do not block interpreter
+        exit — but at process shutdown, while they are still spinning in
+        ``select``/``os.read``, the interpreter tears their module globals down
+        underneath them and each raises, printing an "Exception ignored in
+        thread" traceback to stderr. Across a full suite that leaks many
+        readers this compounds into tens of MB of stderr noise that swamps the
+        pytest reporting stream.
+
+        This is the one call a teardown (conftest fixture) or an orderly
+        shutdown path can make to guarantee no reader thread survives it:
+        it snapshots the tracked terminal ids under the lock, stops each via
+        the normal ``stop_reader`` path (flag + bounded join + unlink), then
+        stops the watchdog. Returns the ids of any readers whose thread did not
+        exit within ``join_timeout`` (empty list on a clean teardown), so a
+        caller can assert on the leak rather than discover it at shutdown.
+        """
+        with self._lock:
+            terminal_ids = list(self._threads.keys())
+
+        still_alive: list[str] = []
+        for terminal_id in terminal_ids:
+            # stop_reader takes the lock itself and is idempotent; call it
+            # outside our lock so the bounded join cannot deadlock the watchdog.
+            self.stop_reader(terminal_id)
+
+        # Stop the shared watchdog last (create_reader may have started it).
+        self.stop_watchdog()
+        # Allow re-arming a fresh watchdog for the next test / next server.
+        self._watchdog_stop.clear()
+        with self._lock:
+            self._watchdog_thread = None
+
+        # Report any reader thread that refused to die within the bound.
+        for terminal_id in terminal_ids:
+            with self._lock:
+                thread = self._threads.get(terminal_id)
+            if thread is not None and thread.is_alive():
+                still_alive.append(terminal_id)
+        return still_alive
+
     def _bound_probe_failure(
         self, terminal_id: str, dispatch_epoch: int | None = None
     ) -> None:

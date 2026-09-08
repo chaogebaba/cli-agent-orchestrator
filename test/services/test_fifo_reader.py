@@ -1237,3 +1237,100 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+
+class TestStopAllReadersF767:
+    """Issue #624 (F767): deterministic teardown of every leaked reader.
+
+    A test that called create_reader but never stop_reader left daemon reader
+    threads spinning; at interpreter shutdown they raise as their module
+    globals are torn down and print 'Exception ignored in thread' tracebacks to
+    stderr (~42 MB across a full suite). stop_all_readers() is the one call a
+    teardown makes to guarantee no reader thread survives it.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path
+        )
+        return FifoManager()
+
+    def test_stops_every_tracked_reader(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        tids = [f"term-{i}" for i in range(5)]
+        for tid in tids:
+            manager.create_reader(tid)
+        threads = []
+        with manager._lock:
+            for tid in tids:
+                t = manager._threads.get(tid)
+                assert t is not None and t.is_alive()
+                threads.append(t)
+
+        leaked = manager.stop_all_readers()
+
+        assert leaked == []
+        for t in threads:
+            t.join(timeout=3.0)
+            assert not t.is_alive()
+        # Registry fully drained.
+        with manager._lock:
+            assert manager._threads == {}
+            assert manager._readers == {}
+        # No reader FIFOs left on disk.
+        assert not list(tmp_path.glob("term-*.fifo"))
+
+    def test_is_noop_when_no_readers(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        # Must not raise and must report no leak.
+        assert manager.stop_all_readers() == []
+
+    def test_module_singleton_has_stop_all(self):
+        """The conftest teardown calls fifo_manager.stop_all_readers()."""
+        assert hasattr(fr.fifo_manager, "stop_all_readers")
+        assert callable(fr.fifo_manager.stop_all_readers)
+
+
+def test_leaked_readers_emit_no_stderr_at_shutdown(tmp_path):
+    """End-to-end: a process that leaks readers then drains them exits clean.
+
+    Reproduces the #624 shutdown class in a child interpreter: create several
+    readers, then call stop_all_readers() (the teardown the conftest fixture
+    performs) and exit. Assert the child's stderr carries NO thread-shutdown
+    traceback. This is the regression the 42 MB stderr run would fail.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs require a POSIX platform")
+
+    fifo_dir = tmp_path / "fifos"
+    fifo_dir.mkdir()
+    script = textwrap.dedent(
+        f"""
+        import time
+        from pathlib import Path
+        import cli_agent_orchestrator.services.fifo_reader as fr
+        fr.FIFO_DIR = Path({str(fifo_dir)!r})
+        mgr = fr.fifo_manager
+        for i in range(6):
+            mgr.create_reader(f"leak-{{i}}")
+        time.sleep(0.2)
+        # The teardown the conftest fixture performs:
+        leaked = mgr.stop_all_readers()
+        assert leaked == [], leaked
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    # The exact shutdown-noise signatures the issue reported.
+    assert "Exception ignored in thread" not in proc.stderr, proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stderr
