@@ -24,7 +24,7 @@ server lifespan.
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def reconcile_stale_claims() -> List[str]:
         return []
 
 
-def reconcile_live_roots() -> dict:
+def reconcile_live_roots() -> Dict[str, Any]:
     """N1 startup sweep: crash-detach every ``live`` root whose terminal is
     CONFIRMED dead; leave the rest ``live``.
 
@@ -115,7 +115,7 @@ def reconcile_live_roots() -> dict:
     return {"checked": checked, "detached": detached, "left_live": left_live}
 
 
-def sweep_kiro_capture() -> dict:
+def sweep_kiro_capture() -> Dict[str, Any]:
     """F829 D7 driver: eager-capture poll for live kiro roots without a uuid.
 
     Runs one bounded poll per live kiro conversation whose provider_session_id is
@@ -144,7 +144,11 @@ def sweep_kiro_capture() -> dict:
                 )
                 .all()
             )
-            targets = [(r.current_terminal_id, r.provider_namespace) for r in roots]
+            targets = [
+                (str(r.current_terminal_id), r.provider_namespace)
+                for r in roots
+                if r.current_terminal_id is not None
+            ]
     except Exception:
         logger.debug("sweep_kiro_capture: could not list kiro roots", exc_info=True)
         return {"polled": 0, "captured": 0}

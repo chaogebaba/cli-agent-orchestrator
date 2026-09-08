@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def poll_kiro_capture(
     kas: bool,
     cwd: str,
     now: Optional[float] = None,
-) -> dict:
+) -> Dict[str, Any]:
     """One eager-capture tick for a kiro terminal.
 
     Returns a small status dict: ``{"status": one_of(
@@ -142,7 +142,7 @@ def poll_kiro_capture(
     return {"status": "pending", "ticks": state.ticks}
 
 
-def reattempt_capture(terminal_id: str, *, kas: bool, cwd: str) -> dict:
+def reattempt_capture(terminal_id: str, *, kas: bool, cwd: str) -> Dict[str, Any]:
     """Re-attempt capture after a stop (first completed turn, hibernate/detach
     request, or an explicitly attributed artifact). Clears the stopped state and
     runs one poll.
@@ -157,7 +157,7 @@ def reattempt_capture(terminal_id: str, *, kas: bool, cwd: str) -> dict:
 
 def attach_identity_artifact(
     identity_key: str, artifact_locator: str, *, owner_principal: str
-) -> dict:
+) -> Dict[str, Any]:
     """F829 D7: `cao identity attach <identity_key> <artifact>` (owner-only).
 
     Turns a capture_unknown identity into a recoverable one by explicit,

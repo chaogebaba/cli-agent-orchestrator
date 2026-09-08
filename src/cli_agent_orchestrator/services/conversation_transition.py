@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class HibernateDecision:
     artifact_locator: Optional[str] = None
 
 
-def _root_for_terminal(terminal_id: str):
+def _root_for_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Resolve the conversation root row for a terminal, or None."""
     from cli_agent_orchestrator.clients.database import (
         get_conversation_identity,
@@ -179,7 +179,7 @@ def commit_reap(terminal_id: str) -> Optional[str]:
         terminal_id=terminal_id,
         detail={"provider": root["provider"], "reason": "explicit_reap"},
     )
-    return key
+    return cast(str, key)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +202,9 @@ class ResumeAdmission:
     provider_namespace: Optional[str] = None
 
 
-def authorize_and_classify_resume(root: dict, caller_principal: Optional[str]) -> "ResumeAdmission":
+def authorize_and_classify_resume(
+    root: Dict[str, Any], caller_principal: Optional[str]
+) -> "ResumeAdmission":
     """D3 steps 2-3 (authorize + classify), NO claim yet.
 
     * AUTHORIZE against ``owner_principal``:
@@ -390,7 +392,7 @@ def _stored_artifact(identity_key: str) -> Optional[str]:
     from cli_agent_orchestrator.clients.database import get_conversation_identity
 
     root = get_conversation_identity(identity_key)
-    return root.get("artifact_locator") if root else None
+    return cast(Optional[str], root.get("artifact_locator")) if root else None
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +408,7 @@ def attach_captured_uuid(
     provider: Optional[str] = None,
     provider_namespace: Optional[str] = None,
     artifact_locator: Optional[str] = None,
-) -> dict:
+) -> Dict[str, Any]:
     """F829 D4: bind a captured provider uuid to this terminal's conversation root.
 
     Two cases converge here (this is the point where the reported id first

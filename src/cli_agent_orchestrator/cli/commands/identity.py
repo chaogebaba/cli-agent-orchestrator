@@ -16,11 +16,12 @@ they run co-located with cao-server. Listing never mutates lifecycle (D6).
 from __future__ import annotations
 
 import json as _json
+from typing import Any
 
 import click
 
 
-def _fmt_row(root: dict) -> str:
+def _fmt_row(root: dict[str, Any]) -> str:
     uuid = root.get("provider_session_id")
     uuid8 = (uuid[:8] + "…") if uuid else "-"
     return (
