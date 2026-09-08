@@ -450,15 +450,16 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         _dbm.engine = _sub_engine
         _dbm.SessionLocal = _sm(autocommit=False, autoflush=False, bind=_sub_engine)
 
-        # The resuming seat must be the root's recorded OWNER (the real operator
-        # flow: the same seat that spawned the worker resumes it after an account
-        # switch). The worker root's owner_principal was set at spawn; resolve it
-        # from the (now subprocess-wired) DB and make the resume caller present as
-        # that owner — otherwise resume correctly refuses resume_not_owner.
-        _owner = None
+        # The resuming seat must be the root's recorded OWNER. A worker spawned
+        # via a bare POST /sessions has a NULL-owner root (a real assign would set
+        # the supervisor's mailbox); a NULL-owner root is not open season, so
+        # establish ownership first via the public claim (cao identity claim),
+        # then resume as that owner — the real operator sequence.
+        _owner_principal = f"mb_{provider}_owner"
+        _claim = _dbm.claim_identity_owner(identity_key, _owner_principal)
+        rec("CLAIM", f"claim_identity_owner -> {_claim}")
         _rootrow = _dbm.get_conversation_identity(identity_key)
-        if _rootrow:
-            _owner = _rootrow.get("owner_principal")
+        _owner = _rootrow.get("owner_principal") if _rootrow else _owner_principal
 
         os.environ["CAO_ENDPOINT"] = api
         os.environ["CAO_TERMINAL_ID"] = supervisor_id
