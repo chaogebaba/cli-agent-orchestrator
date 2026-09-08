@@ -109,10 +109,26 @@ PI_RUNTIME_ROOT = CAO_HOME_DIR / "pi"
 # dashes as a fallback).  Pi draws two of these around the footer when idle.
 _EDITOR_RULE = re.compile(r"^\s*[─━—-]{20,}\s*$")
 
-# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────".
-# The braille spinner glyph varies frame to frame, so we anchor on "Working"
-# flanked by rule characters rather than on the spinner itself.
-_WORKING = re.compile(r"[─━—-]{2,}\s*\S?\s*Working\b", re.IGNORECASE)
+# The braille spinner frames Pi cycles through on its active "Working" rule
+# row.  The ten canonical frames (#703 F847) are ``⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏``; we anchor on
+# the full braille-patterns Unicode block (U+2800–U+28FF) so every frame — and
+# the wider ``⠿``-style glyphs Pi has been observed to draw (#700/#701 corpus) —
+# counts, while ordinary ASCII prose that merely says "Working" does not.
+_BRAILLE_SPINNER = r"\u2800-\u28ff"
+
+# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────" or
+# (mid-redraw) "⠴ Working ────".  A braille spinner glyph adjacent to
+# ``Working`` with a box rule on EITHER side is Pi's live working chrome.  The
+# spinner glyph varies frame to frame, so all frames are accepted; the rule may
+# lead OR trail so a redraw that draws the trailing rule first still matches
+# (#703 F847: a long-running tool's ``Elapsed``/``(timeout Ns)`` block above the
+# spinner row must not suppress this — the row is matched wherever it appears in
+# the buffer).  A rule-flanked ``Working`` with a non-braille marker is still
+# honored via the second alternative (legacy #700/#701 shape).
+_WORKING = re.compile(
+    r"(?:[─━—-]{2,}\s*)?[" + _BRAILLE_SPINNER + r"]\s*Working\b" r"|[─━—-]{2,}\s*\S?\s*Working\b",
+    re.IGNORECASE,
+)
 
 # The footer context/budget readout, e.g. "0.3%/1.0M (auto)" or "?/1.0M".
 # Presence of this plus two rules is Pi's idle/completed chrome.
@@ -521,7 +537,11 @@ class PiCliProvider(BaseProvider):
         # Live liveness first (F844 #701): a working spinner or the idle composer
         # chrome re-derives the true state every poll, so a runtime error banner
         # left in scrollback (the 429 cap, #700) can never latch a sticky ERROR
-        # over a pane that is in fact working or waiting at its composer.
+        # over a pane that is in fact working or waiting at its composer. The
+        # ``⠴ Working`` spinner row (F847 #703) is matched wherever it sits in the
+        # buffer and BEFORE the idle/composer chrome, so a long-running tool's
+        # ``Elapsed``/``(timeout Ns)`` block printed above the spinner cannot flip
+        # a working pane to a false IDLE (the delivery-eligible state).
         if _WORKING.search(clean):
             self._tui_processing_seen = True
             return TerminalStatus.PROCESSING

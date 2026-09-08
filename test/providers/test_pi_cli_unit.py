@@ -383,6 +383,112 @@ class TestStatusDetection:
             read.assert_not_called()
 
 
+# ─── F847 (#703): false-idle — ⠴ Working spinner + long-running tool ────────────
+
+
+class TestFalseIdleWorkingSpinner:
+    """F847 (#703): the fleet server reported ``idle`` while the pane showed a
+    live ``── ⠴ Working ──`` braille spinner row with a long-running shell tool
+    printing its own ``Elapsed``/``(timeout Ns)`` block ABOVE the spinner. idle
+    is the delivery-eligible state, so a false idle would type a callback into a
+    busy composer and let reap/hibernate kill a working lane.
+
+    The spinner row must win as PROCESSING regardless of the tool-output block
+    above it, and BEFORE any idle/composer-chrome check. ``_resolve_native_status``
+    is patched to None so these exercise the tmux TUI-chrome path.
+    """
+
+    # The byte-exact incident capture, filed in the certification corpus.
+    _CORPUS = FIXTURES / "status_truth" / "pi_cli" / "working-1.txt"
+
+    def _provider(self, dispatched=True, processing_seen=False) -> PiCliProvider:
+        provider = PiCliProvider("t1234567", "sess", "win0")
+        provider._initialized = True
+        provider._task_dispatched = dispatched
+        provider._tui_processing_seen = processing_seen
+        return provider
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_corpus_capture_is_processing_raw(self, _native) -> None:
+        """The raw (ANSI-laden) incident capture classifies PROCESSING, not idle."""
+        raw = self._CORPUS.read_text(encoding="utf-8")
+        assert self._provider(dispatched=True, processing_seen=True).get_status(raw) == (
+            TerminalStatus.PROCESSING
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_corpus_capture_is_processing_ansi_stripped(self, _native) -> None:
+        """Same capture ANSI-stripped (the buffer get_status actually parses)
+        still classifies PROCESSING — the ⠴ Working row is matched wherever it
+        sits and beats the idle/composer chrome."""
+        clean = strip_terminal_escapes(self._CORPUS.read_text(encoding="utf-8"))
+        assert self._provider(dispatched=True).get_status(clean) == TerminalStatus.PROCESSING
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_long_running_tool_block_above_spinner_does_not_flip_idle(self, _native) -> None:
+        """Synthetic long-running-tool frame: an ``Elapsed``/``(timeout Ns)``
+        tool-output block, then the spinner row, then the composer rules + footer.
+        The idle chrome below the spinner must NOT flip the verdict to idle."""
+        _RULE = "─" * 120
+        _FOOTER = (
+            "↑48k ↓8.4k R731k CH98.8% $0.017 3.0%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+        )
+        buffer = "\n".join(
+            [
+                " $ pytest -q test/providers/ (timeout 1200s)",
+                " (timeout 1200s)",
+                " Elapsed 102.2s",
+                "",
+                f"── ⠴ Working {_RULE}",
+                " ",
+                _RULE,
+                "/data/cao-scratch/worktrees/cli-agent-orchestrator/pane (cao/pane)",
+                _FOOTER,
+                "🔌 MCP: 1 server enabled",
+            ]
+        )
+        assert self._provider(dispatched=True).get_status(buffer) == TerminalStatus.PROCESSING
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_all_braille_spinner_frames_are_processing(self, _native) -> None:
+        """Every canonical spinner frame (#703 glyph set) on a rule row → PROCESSING."""
+        for glyph in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
+            buffer = f"── {glyph} Working " + "─" * 100 + "\n"
+            assert self._provider(dispatched=True).get_status(buffer) == (
+                TerminalStatus.PROCESSING
+            ), f"frame {glyph!r} not detected as working"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_spinner_first_rule_after_is_processing(self, _native) -> None:
+        """A mid-redraw frame where the spinner LEADS and the rule TRAILS
+        (``⠴ Working ────``) must still classify PROCESSING — the fix that closes
+        #703 (the old rule-must-lead regex missed this shape)."""
+        buffer = "⠴ Working " + "─" * 100 + "\n"
+        assert self._provider(dispatched=True).get_status(buffer) == TerminalStatus.PROCESSING
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_prose_working_without_spinner_or_rule_is_not_processing(self, _native) -> None:
+        """Ordinary transcript prose that merely says 'Working' — no braille
+        glyph and no rule — must NOT be misread as a spinner (idle chrome below
+        it wins)."""
+        _RULE = "─" * 120
+        _FOOTER = "↑1k ↓1k R1k CH1% $0.001 0.1%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+        buffer = "\n".join(
+            [
+                " Working through the queue now, almost done.",
+                "",
+                _RULE,
+                " ",
+                _RULE,
+                _FOOTER,
+            ]
+        )
+        # Not PROCESSING: no spinner row. Dispatched + a prior processing frame →
+        # COMPLETED (idle chrome), proving the prose did not latch working.
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+
 # ─── F844 (#701): an error verdict must not be sticky ───────────────────────────
 
 
