@@ -243,8 +243,127 @@ def lint_positions(
 
 
 # --------------------------------------------------------------------------
-# F497 AC17 (D13) — persona byte-budget lint
+# F837 #694 — stale certification-row lint (WARN level)
 # --------------------------------------------------------------------------
+#
+# A ``certification:`` row records a (provider, position_sha, overlay_sha,
+# outcome) tuple. When a position body or a provider overlay is edited without
+# re-certifying, the row's recorded sha pair no longer matches the CURRENT pair
+# the resolver computes — the row is silently STALE: ``cell_certified`` returns
+# UNCERTIFIED and every POSITION-name assign for that cell is refused, but
+# nothing flags the drift until an assign fails (F837).
+#
+# This lint surfaces the drift as a WARN-level finding ``E-CERT-STALE``. It is
+# NOT fail-closed: it returns a list of findings and never raises on staleness,
+# so it can be reused by ``install.sh`` to print a sweep without failing the
+# install. A cell with NO row is UNCERTIFIED, not stale — only a PRESENT row
+# whose sha pair no longer matches is flagged (a missing row is out of scope
+# here; the resolver reports it at assign time). Rows are supervisor-owned; this
+# lint never edits them.
+
+E_CERT_STALE = "E-CERT-STALE"
+
+
+@dataclass(frozen=True)
+class CertFinding:
+    """One stale-certification finding (warn level)."""
+
+    code: str
+    position: str
+    provider: str
+    outcome: str
+    row_position_sha: str
+    row_overlay_sha: str
+    current_position_sha: str
+    current_overlay_sha: str
+
+    def message(self) -> str:
+        return (
+            f"{self.code}: cell ({self.position}, {self.provider}) row "
+            f"(outcome={self.outcome}) is stale — recorded "
+            f"position_sha={self.row_position_sha} overlay_sha={self.row_overlay_sha} "
+            f"but current position_sha={self.current_position_sha} "
+            f"overlay_sha={self.current_overlay_sha}; re-certify or mark the row STALE"
+        )
+
+
+def _current_sha_pair(
+    position: str, provider: str, positions_dir: Path
+) -> "tuple[str, str]":
+    """Compute the CURRENT (position_sha, overlay_sha) for a cell from the store.
+
+    Mirrors ``routing.cell_certified``'s pair computation exactly so the lint and
+    the resolver agree on what "current" means (single source of truth for the
+    hashing lives in ``profile_composition``).
+    """
+    from cli_agent_orchestrator.utils.profile_composition import (
+        overlay_sha,
+        position_sha,
+    )
+
+    parsed = frontmatter.loads((positions_dir / f"{position}.md").read_text(encoding="utf-8"))
+    pos_sha = position_sha(parsed.content, dict(parsed.metadata))
+    overlays_dir = positions_dir.parent / "overlays"
+    frags: List[str] = []
+    base = overlays_dir / f"{provider}.md"
+    if base.exists():
+        frags.append(base.read_text(encoding="utf-8"))
+    per_pos = overlays_dir / f"{provider}.{position}.md"
+    if per_pos.exists():
+        frags.append(per_pos.read_text(encoding="utf-8"))
+    return pos_sha, overlay_sha(frags)
+
+
+def lint_certifications(positions_dir: Path) -> List[CertFinding]:
+    """WARN-level sweep for stale ``certification:`` rows across every position.
+
+    Returns a list of ``CertFinding`` (possibly empty). Never raises on a stale
+    row — staleness is a warning, not a hard failure, so ``install.sh`` can print
+    it without failing the deploy. A ``certification:`` row whose recorded
+    (position_sha, overlay_sha) no longer equals the CURRENT pair for that row's
+    provider is flagged ``E-CERT-STALE``. A cell with no row is not flagged
+    (UNCERTIFIED is the resolver's assign-time verdict, not a stale row).
+    """
+    findings: List[CertFinding] = []
+    for pos_path in sorted(positions_dir.glob("*.md")):
+        position = pos_path.stem
+        parsed = frontmatter.loads(pos_path.read_text(encoding="utf-8"))
+        rows = parsed.metadata.get("certification") or []
+        if not isinstance(rows, list):
+            continue
+        # Cache the current pair per provider (position_sha is provider-independent
+        # but overlay_sha is not; compute once per provider we actually see).
+        current_by_provider: Dict[str, "tuple[str, str]"] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            provider = row.get("provider")
+            if not isinstance(provider, str) or not provider:
+                continue
+            if provider not in current_by_provider:
+                current_by_provider[provider] = _current_sha_pair(
+                    position, provider, positions_dir
+                )
+            cur_pos_sha, cur_ov_sha = current_by_provider[provider]
+            row_pos_sha = str(row.get("position_sha", ""))
+            row_ov_sha = str(row.get("overlay_sha", ""))
+            if row_pos_sha != cur_pos_sha or row_ov_sha != cur_ov_sha:
+                findings.append(
+                    CertFinding(
+                        code=E_CERT_STALE,
+                        position=position,
+                        provider=provider,
+                        outcome=str(row.get("outcome", "UNCERTIFIED")),
+                        row_position_sha=row_pos_sha,
+                        row_overlay_sha=row_ov_sha,
+                        current_position_sha=cur_pos_sha,
+                        current_overlay_sha=cur_ov_sha,
+                    )
+                )
+    return findings
+
+
+
 #
 # ``clause_lint`` reads ``[budget]`` from ``positions/_clauses.toml`` and fails
 # CLOSED when any position body, overlay fragment, or composed body exceeds its
