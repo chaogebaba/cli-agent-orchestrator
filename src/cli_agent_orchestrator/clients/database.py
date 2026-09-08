@@ -473,6 +473,60 @@ class ConversationEventModel(Base):
     )
 
 
+class RecoveryManifestModel(Base):
+    """F829 A1 (D1): the 1:1 recovery manifest owned by one conversation root.
+
+    Exactly one row per ``conversation_identity`` root (PK == ``identity_key``,
+    FK to the root). The ROOT stays authoritative for provider / uuid /
+    namespace / artifact / profile / model / effort / owner / lifecycle; the
+    manifest NEVER duplicates lifecycle or ownership. It records the *recovery
+    surface* a resume must reconstruct: the exact workspace, its verified git
+    provenance, the retained store references, the launch provenance that lets
+    D4 attribute a capture, the frozen pin-set revision, and the latest
+    instruction checkpoint token the D3 blind-checkpoint attestation compares
+    against. Transition writers update the root AND this row atomically
+    (same transaction).
+    """
+
+    __tablename__ = "recovery_manifest"
+
+    identity_key = Column(
+        String, ForeignKey("conversation_identity.identity_key"), primary_key=True
+    )
+    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
+    # Exact workspace directory the incarnation ran in (authoritative on resume).
+    cwd = Column(String, nullable=True)
+    # Verified git provenance: the repo root the worktree belongs to, the
+    # worktree checkout path, its branch, and the exact commit — all recorded
+    # so a gone checkout is reconstructed from verified facts, never a name guess.
+    repo_root = Column(String, nullable=True)
+    worktree_path = Column(String, nullable=True)
+    worktree_branch = Column(String, nullable=True)
+    worktree_commit = Column(String, nullable=True)
+    # Reference to the preserved dirty/untracked snapshot, written ONLY when the
+    # worktree path itself cannot be retained (D3/D6: in-place retention is the
+    # default; this points under the CAO state dir when a snapshot was taken).
+    dirty_snapshot_ref = Column(String, nullable=True)
+    # Retained persona/session-store references (kiro session dir, codex home,
+    # claude project dir, pi session dir) so a GC never releases them while live.
+    retained_store_refs = Column(Text, nullable=True)  # JSON
+    # Launch provenance (D4 attribution): the attempt id, the random capture
+    # nonce injected as first-prompt metadata, the launch epoch, and the store
+    # namespace the artifact must live in.
+    launch_attempt_id = Column(String, nullable=True)
+    capture_nonce = Column(String, nullable=True)
+    launch_epoch = Column(DateTime(timezone=True), nullable=True)
+    launch_namespace = Column(String, nullable=True)
+    # Operator-facing task label (for diag/listing), the frozen pin-set revision
+    # inherited on resume, and the latest instruction checkpoint token the
+    # D3 blind-checkpoint attestation compares against (never leaked in a prompt).
+    task_label = Column(String, nullable=True)
+    frozen_pin_revision = Column(Integer, nullable=True)
+    checkpoint_token = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
 class WarmIntentModel(Base):
     __tablename__ = "warm_intents"
     intent_id = Column(String, primary_key=True)
@@ -3007,6 +3061,32 @@ def _migrate_f829_conversation_identity() -> None:
                 "ON conversation_event(identity_key)"
             )
 
+            # recovery_manifest: the 1:1 A1 recovery surface per root (D1).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS recovery_manifest ("
+                "identity_key VARCHAR NOT NULL, "
+                "schema_version INTEGER NOT NULL DEFAULT 1, "
+                "cwd VARCHAR, "
+                "repo_root VARCHAR, "
+                "worktree_path VARCHAR, "
+                "worktree_branch VARCHAR, "
+                "worktree_commit VARCHAR, "
+                "dirty_snapshot_ref VARCHAR, "
+                "retained_store_refs TEXT, "
+                "launch_attempt_id VARCHAR, "
+                "capture_nonce VARCHAR, "
+                "launch_epoch DATETIME, "
+                "launch_namespace VARCHAR, "
+                "task_label VARCHAR, "
+                "frozen_pin_revision INTEGER, "
+                "checkpoint_token VARCHAR, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (identity_key), "
+                "FOREIGN KEY (identity_key) REFERENCES conversation_identity(identity_key)"
+                ")"
+            )
+
             # -------- Phase (B): the ONE rebuild of terminal_identity ----------
             ti_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_identity'"
@@ -3015,6 +3095,13 @@ def _migrate_f829_conversation_identity() -> None:
                 cols = {row[1] for row in conn.execute("PRAGMA table_info(terminal_identity)")}
                 if "identity_key" not in cols:
                     conn.execute("DROP TABLE IF EXISTS terminal_identity__f829_new")
+                    # Shadow table carries the FULL current column set — the
+                    # F631 base columns AND the hot-fix worktree columns
+                    # (worktree_path/branch/repo_root, added by
+                    # _migrate_f631_terminal_identity which runs BEFORE this) —
+                    # plus the new identity_key. Dropping any of them here would
+                    # silently strip a column the ORM dereferences (rebase-safety
+                    # against the hot-fix schema).
                     conn.execute(
                         "CREATE TABLE terminal_identity__f829_new ("
                         "terminal_id VARCHAR NOT NULL, "
@@ -3025,6 +3112,9 @@ def _migrate_f829_conversation_identity() -> None:
                         "provider_session_id VARCHAR, "
                         "base_name VARCHAR NOT NULL, "
                         "retained_persona_home VARCHAR, "
+                        "worktree_path VARCHAR, "
+                        "worktree_branch VARCHAR, "
+                        "worktree_repo_root VARCHAR, "
                         "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
                         "git_sha VARCHAR, "
                         "dirty_hashes TEXT, "
@@ -3036,14 +3126,26 @@ def _migrate_f829_conversation_identity() -> None:
                         "CHECK (lifecycle IN ('live','reaped'))"
                         ")"
                     )
+
+                    # Copy every base column; carry each worktree column only
+                    # when the SOURCE table has it (a legacy/test table may
+                    # predate the hot-fix add), else NULL — so the rebuild works
+                    # on both the hot-fix-migrated prod table and a bare legacy
+                    # table.
+                    def _src(colname: str) -> str:
+                        return colname if colname in cols else "NULL"
+
                     conn.execute(
                         "INSERT INTO terminal_identity__f829_new ("
                         "terminal_id, provider, agent_profile, cwd, session_name, "
                         "provider_session_id, base_name, retained_persona_home, "
+                        "worktree_path, worktree_branch, worktree_repo_root, "
                         "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
                         "identity_key) "
                         "SELECT terminal_id, provider, agent_profile, cwd, session_name, "
                         "provider_session_id, base_name, retained_persona_home, "
+                        f"{_src('worktree_path')}, {_src('worktree_branch')}, "
+                        f"{_src('worktree_repo_root')}, "
                         "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
                         "NULL FROM terminal_identity"
                     )
@@ -3066,6 +3168,8 @@ def _migrate_f829_conversation_identity() -> None:
 
             # -------- Phase (C): the legacy collapse rule ---------------------
             _f829_collapse_legacy_rows(conn, uuidlib)
+            # -------- Phase (D): recovery_manifest backfill (A1) --------------
+            _f829_backfill_recovery_manifests(conn)
             conn.commit()
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
         logger.debug(f"f829_conversation_identity migration skipped: {e}")
@@ -3218,6 +3322,42 @@ def _f829_collapse_legacy_rows(conn: Any, uuidlib: Any) -> None:
         conn.execute(
             "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
             (key, terminal_id),
+        )
+
+
+def _f829_backfill_recovery_manifests(conn: Any) -> None:
+    """F829 A1 (D1): backfill one ``recovery_manifest`` row per root that lacks
+    one, in the SAME schema-versioned migration pass, idempotently.
+
+    Provenance is drawn from the root's CURRENT incarnation's ``terminal_identity``
+    row (cwd + worktree path/branch/repo_root + git_sha as the recorded commit) —
+    the manifest never duplicates lifecycle/ownership, only the recovery surface.
+    ``INSERT OR IGNORE`` on the PK makes a second run a no-op (a manifest already
+    present is never overwritten by the backfill), so this is safe on a
+    half-migrated db. Rows the backfill cannot enrich are still created (all
+    NULL provenance) so every root ends with its 1:1 manifest.
+    """
+    now = _utcnow().isoformat(sep=" ")
+    roots = conn.execute(
+        "SELECT identity_key, current_terminal_id FROM conversation_identity"
+    ).fetchall()
+    for identity_key, current_terminal_id in roots:
+        prov = (None, None, None, None, None)
+        if current_terminal_id is not None:
+            ti = conn.execute(
+                "SELECT cwd, worktree_path, worktree_branch, worktree_repo_root, git_sha "
+                "FROM terminal_identity WHERE terminal_id=?",
+                (current_terminal_id,),
+            ).fetchone()
+            if ti is not None:
+                prov = (ti[0], ti[1], ti[2], ti[3], ti[4])
+        cwd, wt_path, wt_branch, repo_root, commit = prov
+        conn.execute(
+            "INSERT OR IGNORE INTO recovery_manifest ("
+            "identity_key, schema_version, cwd, repo_root, worktree_path, "
+            "worktree_branch, worktree_commit, created_at, updated_at) "
+            "VALUES (?,1,?,?,?,?,?,?,?)",
+            (identity_key, cwd, repo_root, wt_path, wt_branch, commit, now, now),
         )
 
 
@@ -4514,6 +4654,8 @@ def get_frozen_pins(task_key: str) -> List[Dict[str, str]]:
         if file_path not in latest:
             latest[file_path] = str(row.sha256)
     return [{"file_path": fp, "sha256": sha} for fp, sha in latest.items()]
+
+
 # ===========================================================================
 # F829 D1/D3/D5/D8: conversation_identity accessors
 # ===========================================================================
@@ -4650,6 +4792,99 @@ def mint_conversation_identity(
     else:
         with SessionLocal.begin() as own:
             _write(own)
+
+
+def upsert_recovery_manifest(
+    identity_key: str,
+    *,
+    cwd: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+    worktree_commit: Optional[str] = None,
+    dirty_snapshot_ref: Optional[str] = None,
+    retained_store_refs: Optional[Dict[str, Any]] = None,
+    launch_attempt_id: Optional[str] = None,
+    capture_nonce: Optional[str] = None,
+    launch_epoch: Optional[datetime] = None,
+    launch_namespace: Optional[str] = None,
+    task_label: Optional[str] = None,
+    frozen_pin_revision: Optional[int] = None,
+    checkpoint_token: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D1): create or update the 1:1 recovery manifest for a root.
+
+    Upsert semantics: a first call creates the row; later calls update ONLY the
+    fields explicitly supplied (a None argument leaves the stored value intact),
+    so an incremental capture/checkpoint update never blanks earlier provenance.
+    When ``db`` is supplied the write lands in the caller's transaction so the
+    root and its manifest commit together (D1: transition writes are atomic).
+    """
+    import json as _json
+
+    fields: Dict[str, Any] = {
+        "cwd": cwd,
+        "repo_root": repo_root,
+        "worktree_path": worktree_path,
+        "worktree_branch": worktree_branch,
+        "worktree_commit": worktree_commit,
+        "dirty_snapshot_ref": dirty_snapshot_ref,
+        "retained_store_refs": (
+            _json.dumps(retained_store_refs) if retained_store_refs is not None else None
+        ),
+        "launch_attempt_id": launch_attempt_id,
+        "capture_nonce": capture_nonce,
+        "launch_epoch": launch_epoch,
+        "launch_namespace": launch_namespace,
+        "task_label": task_label,
+        "frozen_pin_revision": frozen_pin_revision,
+        "checkpoint_token": checkpoint_token,
+    }
+    supplied = {k: v for k, v in fields.items() if v is not None}
+
+    def _write(session: Session) -> None:
+        row = (
+            session.query(RecoveryManifestModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if row is None:
+            row = RecoveryManifestModel(identity_key=identity_key, schema_version=1)
+            for k, v in supplied.items():
+                setattr(row, k, v)
+            session.add(row)
+        else:
+            for k, v in supplied.items():
+                setattr(row, k, v)
+            row.updated_at = _utcnow()
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def get_recovery_manifest(identity_key: str) -> Optional[Dict[str, Any]]:
+    """F829 A1 (D1): read the recovery manifest row for a root, or None.
+
+    ``retained_store_refs`` is decoded from its JSON column into a dict; every
+    other column is returned as stored.
+    """
+    import json as _json
+
+    with SessionLocal() as db:
+        row = db.query(RecoveryManifestModel).filter_by(identity_key=identity_key).one_or_none()
+        if row is None:
+            return None
+        out = _row_to_dict(row)
+        raw = out.get("retained_store_refs")
+        if isinstance(raw, str) and raw:
+            try:
+                out["retained_store_refs"] = _json.loads(raw)
+            except ValueError:
+                pass
+        return out
 
 
 def get_conversation_identity(identity_key: str) -> Optional[Dict[str, Any]]:

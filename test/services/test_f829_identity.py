@@ -287,6 +287,87 @@ def test_ac7_migration_half_state_attaches_live_row(real_sqlite_env):
     assert d.claim_resume("k1", 0, "b") is False  # session_resume_in_progress
 
 
+# --------------------------------------------------------------------------
+# D1 [A1] — recovery_manifest (1:1 root-owned)
+# --------------------------------------------------------------------------
+
+
+def test_a1_recovery_manifest_upsert_and_partial_update(real_sqlite_env):
+    """A1/D1: upsert creates the row, later calls update ONLY supplied fields
+    (a None argument never blanks a stored value), and get decodes JSON."""
+    _mkroot("k_man", "codex", "mb", "live", "t_man", uuid="um1")
+    d.upsert_recovery_manifest(
+        "k_man",
+        cwd="/w/repo",
+        repo_root="/w/repo",
+        worktree_path="/w/repo/wt",
+        worktree_branch="cao/x",
+        worktree_commit="abc123",
+        retained_store_refs={"codex_home": "/h/.codex"},
+        launch_attempt_id="att-1",
+        capture_nonce="nonce-1",
+        task_label="do the thing",
+        frozen_pin_revision=1,
+        checkpoint_token="mid:42",
+    )
+    m = d.get_recovery_manifest("k_man")
+    assert m is not None
+    assert m["cwd"] == "/w/repo" and m["worktree_branch"] == "cao/x"
+    assert m["retained_store_refs"] == {"codex_home": "/h/.codex"}
+    assert m["capture_nonce"] == "nonce-1" and m["checkpoint_token"] == "mid:42"
+    # Partial update: only checkpoint_token supplied — everything else intact.
+    d.upsert_recovery_manifest("k_man", checkpoint_token="mid:43")
+    m2 = d.get_recovery_manifest("k_man")
+    assert m2["checkpoint_token"] == "mid:43"
+    assert m2["cwd"] == "/w/repo"  # untouched
+    assert m2["capture_nonce"] == "nonce-1"  # untouched
+    assert m2["retained_store_refs"] == {"codex_home": "/h/.codex"}  # untouched
+
+
+def test_a1_migration_backfills_one_manifest_per_root_idempotent(real_sqlite_env):
+    """A1/D1: the migration backfills exactly one recovery_manifest per root,
+    drawing cwd/worktree provenance from the current incarnation, idempotently."""
+    db_file = str(real_sqlite_env["db_file"])
+    _seed_legacy(db_file)
+    # Simulate the hot-fix's prior _migrate_f631_terminal_identity having added
+    # the worktree columns (it runs BEFORE _migrate_f829 in the real chain), then
+    # record provenance on the live incarnation so the backfill can read it.
+    conn = sqlite3.connect(db_file)
+    for col in ("worktree_path", "worktree_branch", "worktree_repo_root"):
+        conn.execute(f"ALTER TABLE terminal_identity ADD COLUMN {col} VARCHAR")
+    conn.execute(
+        "UPDATE terminal_identity SET cwd='/w/live1', worktree_path='/w/live1/wt', "
+        "worktree_branch='cao/live1', worktree_repo_root='/w/live1', git_sha='deadbee' "
+        "WHERE terminal_id='live1'"
+    )
+    conn.commit()
+    conn.close()
+    import cli_agent_orchestrator.constants as k
+
+    with mock.patch.object(k, "DATABASE_FILE", db_file):
+        d._migrate_f829_conversation_identity()
+        conn = sqlite3.connect(db_file)
+        roots = conn.execute("SELECT COUNT(*) FROM conversation_identity").fetchone()[0]
+        mans = conn.execute("SELECT COUNT(*) FROM recovery_manifest").fetchone()[0]
+        assert mans == roots and roots > 0
+        # live1's manifest picked up its incarnation provenance.
+        lk = conn.execute(
+            "SELECT identity_key FROM terminal_identity WHERE terminal_id='live1'"
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT cwd, worktree_path, worktree_branch, repo_root, worktree_commit "
+            "FROM recovery_manifest WHERE identity_key=?",
+            (lk,),
+        ).fetchone()
+        assert row == ("/w/live1", "/w/live1/wt", "cao/live1", "/w/live1", "deadbee")
+        conn.close()
+        # Idempotent: a second run neither adds rows nor overwrites the manifest.
+        d._migrate_f829_conversation_identity()
+        conn = sqlite3.connect(db_file)
+        assert conn.execute("SELECT COUNT(*) FROM recovery_manifest").fetchone()[0] == roots
+        conn.close()
+
+
 def test_ac7_cas_null_guard_holds_at_matching_generation(real_sqlite_env):
     """AC7 CAS-guard mutant kill: a SECOND claim at the CURRENT generation, while a
     claim is already held, must still lose — proving the ``resume_claim IS NULL``
