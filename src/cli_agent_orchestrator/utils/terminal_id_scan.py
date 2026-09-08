@@ -5,13 +5,32 @@ PRE-RELAUNCH seat id in its summary and tell every worker to call back an id
 whose terminal row no longer exists (incident 2026-09-04: seven lanes told to
 report to ``terminal 5561a7d1`` while the live seat was ``34a7b2c1``). The MCP
 ``assign``/``handoff``/``send_message`` tools run :func:`guard` over the
-outgoing message (and over every ``/data/cao-scratch/briefs/*.md`` it points
-at) and refuse with :data:`ERROR_CODE` rather than posting work with an
-unroutable callback address.
+outgoing MESSAGE TEXT ONLY and refuse with :data:`ERROR_CODE` rather than
+posting work with an unroutable callback address.
+
+Scope of the scan (issues #688, #619 — narrow carve-out):
+  * The message body is scanned; the CONTENTS of any file the body points at
+    are NEVER opened or scanned. A file's author id is provenance, not an
+    address — citing a reaped-lane's ledger/report/scrollback by path is a
+    legitimate evidence reference, not a callback target.
+  * An 8-hex id that is part of a PATH TOKEN (a whitespace-delimited token
+    containing ``/`` — a file path, ``logs/terminal/<id>.scrollback``, a
+    ``/data/cao-scratch/<id>/...`` scratch dir, OR an API route such as
+    ``GET /terminals/<id>``) is EXEMPT. Paths are evidence, not addresses.
+  * An id inside a QUOTED EVIDENCE LINE (a line beginning with ``>``) or inside
+    a fenced code block (``` ``` ``` fences) is EXEMPT for the same reason.
+
+What still refuses: an id in an ADDRESSING position — the ``receiver_id``/
+``terminal_id`` kwarg form, and addressing prose (``callback/send_message/
+reply/report/respond/hand off to <id>``, bare ``CAO terminal <id>`` /
+``seat <id>`` prose). The F754 protection for the actual ``receiver_id``
+argument is unchanged.
 
 Rule set, in full: the caller's own id is fine; a LIVE foreign id is fine
-(cross-worker references are legitimate); anything else is refused. A message
-with no id in it is never refused, and an unavailable live set never refuses.
+(cross-worker references are legitimate); an exempt id (path token / quoted
+evidence) is fine; anything else in an addressing position is refused. A
+message with no id in it is never refused, and an unavailable live set never
+refuses.
 
 Deliberately dependency-free (stdlib only) so the root repo's PreToolUse hook
 can carry a byte-identical twin without importing the fork.
@@ -50,7 +69,8 @@ CITATION_RULES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "callback",
-        r"(?i:\b(?:call\s?back|callback|reply|report|respond|hand\s?off)\b)\s+(?i:\bto\b)\s+"
+        r"(?i:\b(?:call\s?back|callback|reply|report|respond|hand\s?off|send[\s_]?message)\b)"
+        r"\s+(?i:\bto\b)\s+"
         r"(?:(?i:the\s+)?(?i:\b(?:terminal|seat)\b)\s+)?['\"`]?" + _HEX8,
     ),
     ("seat", r"(?i:\bseats?\b)[\s:=]{0,3}['\"`]?" + _HEX8),
@@ -59,14 +79,6 @@ CITATION_RULES: Tuple[Tuple[str, str], ...] = (
 _COMPILED_RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
     (name, re.compile(pattern)) for name, pattern in CITATION_RULES
 )
-
-# Brief files the message may point at (issue #611 part 2). Only this directory
-# and only .md — the guard reads what it is told to read and nothing else.
-BRIEF_DIR = "/data/cao-scratch/briefs/"
-BRIEF_PATH_RE = re.compile(r"/data/cao-scratch/briefs/[A-Za-z0-9._+-]+\.md")
-
-# A brief larger than this is not read (a runaway file must not stall dispatch).
-MAX_BRIEF_BYTES = 262144
 
 ERROR_CODE = "E-STALE-TERMINAL-ID"
 
@@ -94,12 +106,76 @@ class Finding(NamedTuple):
     verdict: str
 
 
+def _fenced_spans(text: str) -> List[Tuple[int, int]]:
+    """Character spans covered by fenced code blocks (``` fences).
+
+    An id inside a fenced block is quoted evidence (a log paste, a captured
+    command), not an address. Fences are matched in pairs; an unclosed final
+    fence covers to end-of-text. Language info-strings after the opening fence
+    are ignored. Only triple-backtick fences are honored (the common shape in
+    briefs and reports); indented code blocks are not treated specially.
+    """
+    spans: List[Tuple[int, int]] = []
+    fence_open: Optional[int] = None
+    for match in re.finditer(r"^[ \t]*```[^\n]*$", text, re.MULTILINE):
+        if fence_open is None:
+            fence_open = match.start()
+        else:
+            spans.append((fence_open, match.end()))
+            fence_open = None
+    if fence_open is not None:
+        spans.append((fence_open, len(text)))
+    return spans
+
+
+def _in_any_span(pos: int, spans: Sequence[Tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _is_quoted_line(text: str, line_start: int) -> bool:
+    """True when the line beginning at ``line_start`` is a Markdown quote line.
+
+    A quoted evidence line begins with optional whitespace then ``>`` (e.g. a
+    pasted refusal or scrollback excerpt). Ids on such lines are evidence, not
+    addresses.
+    """
+    i = line_start
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    return i < len(text) and text[i] == ">"
+
+
+def _in_path_token(text: str, pos: int) -> bool:
+    """True when the char at ``pos`` sits inside a whitespace-delimited token
+    that contains a ``/`` — i.e. a file path or an API route.
+
+    ``GET /terminals/<id>``, ``logs/terminal/<id>.scrollback`` and
+    ``/data/cao-scratch/<id>/x`` all have the id inside a ``/``-bearing token,
+    so the id is provenance/evidence, never an address. The token is the run of
+    non-whitespace, non-quote characters around ``pos``.
+    """
+    boundary = set(" \t\n\r\f\v'\"`")
+    left = pos
+    while left > 0 and text[left - 1] not in boundary:
+        left -= 1
+    right = pos
+    while right < len(text) and text[right] not in boundary:
+        right += 1
+    return "/" in text[left:right]
+
+
 def find_citations(text: str, source: str = "message") -> List[Citation]:
     """Return every terminal-id citation in ``text``, in document order.
 
     Deduplicated on (terminal_id, line): the same id named twice on one line is
     one citation, the same id on two lines is two (both are worth naming in a
     refusal, because both are edits the caller has to make).
+
+    EXEMPTIONS (issues #688, #619 — narrow carve-out): an id is skipped, never
+    reported, when it sits inside a PATH TOKEN (a ``/``-bearing token — file
+    paths and API routes like ``GET /terminals/<id>``), inside a fenced code
+    block, or on a Markdown quote line (``>``). Those are evidence/provenance
+    references, not addresses; only addressing forms remain citations.
     """
     if not text:
         return []
@@ -117,12 +193,21 @@ def find_citations(text: str, source: str = "message") -> List[Citation]:
                 high = mid - 1
         return low + 1
 
+    fenced = _fenced_spans(text)
+
     seen: Set[Tuple[str, int]] = set()
     found: List[Tuple[int, Citation]] = []
     for rule_name, pattern in _COMPILED_RULES:
         for match in pattern.finditer(text):
             terminal_id = match.group("id")
+            id_pos = match.start("id")
+            # Evidence/provenance, never an address: skip path-token ids, ids in
+            # fenced blocks, and ids on quoted (`>`) lines.
+            if _in_path_token(text, id_pos) or _in_any_span(id_pos, fenced):
+                continue
             line_no = _line_of(match.start())
+            if _is_quoted_line(text, line_starts[line_no - 1]):
+                continue
             key = (terminal_id, line_no)
             if key in seen:
                 continue
@@ -138,39 +223,6 @@ def find_citations(text: str, source: str = "message") -> List[Citation]:
             )
     found.sort(key=lambda item: item[0])
     return [citation for _, citation in found]
-
-
-def find_brief_paths(text: str) -> List[str]:
-    """Return the brief-file paths the message points at, in first-seen order."""
-    if not text:
-        return []
-    ordered: List[str] = []
-    seen: Set[str] = set()
-    for match in BRIEF_PATH_RE.finditer(text):
-        path = match.group(0)
-        if path not in seen:
-            seen.add(path)
-            ordered.append(path)
-    return ordered
-
-
-def _default_reader(path: str) -> Optional[str]:
-    """Read a brief, or return None when it cannot be read.
-
-    A brief that is missing, unreadable, or oversized is SKIPPED, not refused:
-    the guard's job is stale ids, and a nonexistent brief is a different bug.
-    """
-    if not path.startswith(BRIEF_DIR) or not path.endswith(".md"):
-        return None
-    try:
-        import os
-
-        if os.path.getsize(path) > MAX_BRIEF_BYTES:
-            return None
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            return handle.read()
-    except OSError:
-        return None
 
 
 def classify(
@@ -196,20 +248,21 @@ def collect_citations(
     message: str,
     reader: Optional[Callable[[str], Optional[str]]] = None,
 ) -> List[Citation]:
-    """Every citation in a dispatch message AND in every brief it points at.
+    """Every citation in a dispatch MESSAGE. File contents are never scanned.
 
     Split out from :func:`scan` so a caller can learn WHICH ids are cited
     before deciding how to resolve liveness — a server that predates
     ``GET /terminals`` is probed one cited id at a time, and that needs the
-    candidate set first. Briefs are read once, here.
+    candidate set first.
+
+    Issues #688/#619: the brief-file CONTENT scan is GONE. A file the message
+    points at is provenance, not an address — its author id must not make the
+    dispatch unsendable (a frozen-pinned ledger names its reaped author and
+    cannot be edited). ``reader`` is accepted and IGNORED for call-site
+    compatibility; nothing on disk is opened.
     """
-    read = reader if reader is not None else _default_reader
-    citations = list(find_citations(message, "message"))
-    for path in find_brief_paths(message):
-        body = read(path)
-        if body:
-            citations.extend(find_citations(body, path))
-    return citations
+    del reader  # no file is opened anymore (issues #688/#619)
+    return list(find_citations(message, "message"))
 
 
 def candidate_ids(citations: Sequence[Citation]) -> Set[str]:

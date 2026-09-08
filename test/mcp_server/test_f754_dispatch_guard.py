@@ -5,14 +5,23 @@ carried the pre-relaunch seat id ``5561a7d1`` while the live seat was
 ``34a7b2c1``. Seven lanes were dispatched telling workers to call back the dead
 id; the codex lanes would have failed their callback silently.
 
-The rule set under test, in full:
-  own id -> ok, live foreign id -> ok, anything else -> refuse,
-  no id at all -> never refuse, live set unavailable -> never refuse.
+The rule set under test, in full (narrow carve-out, issues #688 + #619):
+  own id -> ok, live foreign id -> ok, live set unavailable -> never refuse,
+  no id at all -> never refuse.
+  REFUSED (a stale id in an ADDRESSING position): the ``receiver_id``/
+  ``terminal_id`` kwarg form, and addressing prose — ``callback/send_message/
+  reply/report/respond/hand off to <id>``, bare ``CAO terminal <id>`` and
+  ``seat <id>`` prose.
+  ALLOWED (evidence/provenance, never an address): an id inside a PATH TOKEN
+  (a ``/``-bearing token — file paths, ``logs/terminal/<id>.scrollback``,
+  ``/data/cao-scratch/<id>/...``, AND API routes like ``GET /terminals/<id>``);
+  an id on a quoted evidence line (``>``) or inside a fenced code block.
+  The CONTENTS of any file the message points at are NEVER opened or scanned —
+  a file's author id is provenance, not a callback target.
 """
 
 import asyncio
 import os
-import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -99,18 +108,40 @@ class TestRuleSet:
             (f'receiver_id="{DEAD}"', "id-kwarg"),
             (f"CAO_TERMINAL_ID={DEAD}", "id-kwarg"),
             (f"callback to {DEAD}", "callback"),
+            (f"send_message to {DEAD}", "callback"),
+            (f"send message to {DEAD}", "callback"),
             # "terminal" is a stronger, earlier rule than "callback" — when both
             # match the same id on the same line the first rule keeps it.
             (f"report to the terminal {DEAD}", "terminal"),
             (f"report to {DEAD}", "callback"),
             (f"seat {DEAD}", "seat"),
-            (f"GET /terminals/{DEAD}", "terminal"),
         ],
     )
     def test_citation_forms(self, text, rule):
+        """Addressing forms — a stale id here refuses (issues #688/#619 keep-list)."""
         found = tis.find_citations(text)
         assert [c.terminal_id for c in found] == [DEAD], text
         assert found[0].rule == rule, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Path tokens (a `/`-bearing token) are evidence, not addresses —
+            # #688/#619 narrow carve-out. This INCLUDES the API-route form that
+            # the pre-carve-out guard wrongly read as a `terminal` citation.
+            f"GET /terminals/{DEAD}",
+            f"~/.aws/cli-agent-orchestrator/logs/terminal/{DEAD}.scrollback",
+            f"see /data/cao-scratch/{DEAD}/report.md for the ledger",
+            f"read /data/cao-scratch/briefs/ledger-{DEAD}.md and follow it",
+            # Quoted evidence line (`>`) and fenced block — pasted refusals/logs.
+            f"> stage-A ledger (empirical_reviewer_lite, terminal {DEAD})",
+            f"```\nE-STALE: cites {DEAD}\n  [terminal] ...terminal {DEAD}\n```",
+        ],
+    )
+    def test_evidence_forms_are_not_citations(self, text):
+        """Path tokens, quoted (`>`) lines, and fenced blocks are provenance,
+        never an address — no citation, no refusal (issues #688/#619)."""
+        assert tis.find_citations(text) == [], text
 
     def test_citation_records_line_number(self):
         text = f"line one\nline two\ncall back to terminal {DEAD}\n"
@@ -120,67 +151,43 @@ class TestRuleSet:
 
 
 # ---------------------------------------------------------------------------
-# Brief files (#611 part 2)
+# Pointed-at files are NEVER opened (issues #688, #619)
 # ---------------------------------------------------------------------------
+# The brief-file CONTENT scan (old #611 part 2) is GONE. A file the message
+# points at is provenance, not an address: a frozen-pinned ledger names its
+# reaped author and CANNOT be edited to remove that id, so scanning its
+# contents made the standard `LEDGER PINNED <path>` handshake unsendable by
+# design (#688), and a scrollback/log path cited AS EVIDENCE was refused (#619).
+# The guard now scans the message text only.
 
 
-class TestBriefFiles:
-    def test_finds_brief_paths(self):
-        msg = "Read /data/cao-scratch/briefs/lane-f754.md first, then start."
-        assert tis.find_brief_paths(msg) == ["/data/cao-scratch/briefs/lane-f754.md"]
-
-    def test_dead_id_inside_a_brief_is_refused_naming_file_and_line(self):
-        brief = "/data/cao-scratch/briefs/lane-f754.md"
-        body = f"# Lane\n\nWhen done, report to terminal {DEAD}.\n"
-        refusal = tis.guard(
-            f"Read {brief} and follow it exactly.",
-            OWN,
-            LIVE,
-            reader=lambda p: body if p == brief else None,
-            action="assign",
+class TestPointedAtFilesAreNotScanned:
+    def test_brief_whose_contents_name_a_reaped_id_is_accepted(self, tmp_path):
+        """A real on-disk brief citing a DEAD id in its body must NOT refuse:
+        the message points at the file by path, and file contents are never
+        opened. This is the #688 `LEDGER PINNED <path>` handshake."""
+        brief = tmp_path / "ledger-f810-r2.md"
+        brief.write_text(
+            f"# F810 r2 — evidence ledger (empirical_reviewer_lite, terminal {DEAD})\n"
         )
-        assert refusal is not None
-        assert f"{brief}:3 cites {DEAD}" in refusal
-
-    def test_live_id_inside_a_brief_passes(self):
-        brief = "/data/cao-scratch/briefs/lane-f754.md"
-        body = f"Report to terminal {LIVE_FOREIGN}.\n"
-        assert (
-            tis.guard(f"Read {brief}.", OWN, LIVE, reader=lambda p: body if p == brief else None)
-            is None
-        )
-
-    def test_missing_brief_is_skipped_not_refused(self):
-        msg = "Read /data/cao-scratch/briefs/does-not-exist.md."
+        msg = f"LEDGER PINNED {brief} — proceed to stage B."
         assert tis.guard(msg, OWN, LIVE) is None
+        # And the reader argument, if a caller still passes one, is ignored: no
+        # file is opened even when a reader would have surfaced the dead id.
+        opened = []
 
-    def test_default_reader_refuses_paths_outside_the_brief_dir(self, tmp_path):
-        outside = tmp_path / "notes.md"
-        outside.write_text("anything")
-        assert tis._default_reader(str(outside)) is None
+        def _spy_reader(path):
+            opened.append(path)
+            return f"report to terminal {DEAD}"
 
-    def test_default_reader_reads_a_real_brief(self, tmp_path, monkeypatch):
-        """End-to-end through the real file reader, with the brief dir relocated."""
-        brief_dir = tmp_path / "briefs"
-        brief_dir.mkdir()
-        brief = brief_dir / "lane-f754.md"
-        brief.write_text(f"Report to terminal {DEAD}.\n")
-        monkeypatch.setattr(tis, "BRIEF_DIR", str(brief_dir) + "/")
-        monkeypatch.setattr(
-            tis, "BRIEF_PATH_RE", re.compile(re.escape(str(brief_dir)) + r"/[A-Za-z0-9._+-]+\.md")
-        )
-        refusal = tis.guard(f"Read {brief} first.", OWN, LIVE)
-        assert refusal is not None
-        assert f"{brief}:1 cites {DEAD}" in refusal
+        assert tis.guard(msg, OWN, LIVE, reader=_spy_reader) is None
+        assert opened == []
 
-    def test_oversized_brief_is_skipped(self, tmp_path, monkeypatch):
-        brief_dir = tmp_path / "briefs"
-        brief_dir.mkdir()
-        brief = brief_dir / "big.md"
-        brief.write_text("x" * 64)
-        monkeypatch.setattr(tis, "BRIEF_DIR", str(brief_dir) + "/")
-        monkeypatch.setattr(tis, "MAX_BRIEF_BYTES", 8)
-        assert tis._default_reader(str(brief)) is None
+    def test_a_brief_path_in_the_message_is_not_itself_a_citation(self):
+        """The path token carrying an id is evidence, not an address (#619)."""
+        msg = f"Read /data/cao-scratch/briefs/ledger-{DEAD}.md and follow it."
+        assert tis.find_citations(msg) == []
+        assert tis.guard(msg, OWN, LIVE) is None
 
 
 # ---------------------------------------------------------------------------
