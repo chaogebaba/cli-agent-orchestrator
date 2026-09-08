@@ -2226,7 +2226,9 @@ class TestSendInput:
         # And it must not have been coerced to a MagicMock repr.
         assert isinstance(pasted, str)
 
-
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
