@@ -19,6 +19,36 @@ def terminal():
     """Manage CAO terminals."""
 
 
+@terminal.command("hibernated")
+@click.option("--mine", "mine", default=None, help="Filter to this owner principal (mailbox id).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def hibernated(mine, as_json):
+    """F829 D5: list conversation identities in a recoverable/parked state.
+
+    Alias of ``cao identity list`` under the terminals verb (blueprint D5:
+    ``cao terminals hibernated``). Listing never mutates lifecycle.
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.clients.database import list_hibernated_identities
+
+    rows = list_hibernated_identities(owner_principal=mine)
+    if as_json:
+        click.echo(_json.dumps(rows, default=str, indent=2))
+        return
+    if not rows:
+        click.echo("No hibernated/detached/capture_unknown identities.")
+        return
+    for root in rows:
+        uuid = root.get("provider_session_id")
+        uuid8 = (uuid[:8] + "…") if uuid else "-"
+        click.echo(
+            f"{root['identity_key']}  {root['provider']:<11}  "
+            f"{root.get('provider_namespace') or '-':<16}  {root['lifecycle']:<15}  "
+            f"uuid={uuid8}  cur={root.get('current_terminal_id') or 'none'}"
+        )
+
+
 @terminal.command("restore")
 @click.argument("terminal_id")
 def restore(terminal_id: str):

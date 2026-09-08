@@ -4776,6 +4776,34 @@ def bind_provider_session_id(
         return True
 
 
+def claim_identity_owner(identity_key: str, new_owner_principal: str) -> Dict[str, Any]:
+    """F829 D5: `cao identity claim` — an owner claims a NULL-owner / legacy root.
+
+    A root minted with owner_principal=NULL (a top-level spawn, supervisor ask 1)
+    or a legacy_unknown_owner root is resumable only after an explicit claim that
+    sets its owner. Refuses to overwrite an existing non-NULL owner (returns
+    ``{"status": "already_owned"}``); a legacy_unknown_owner origin is upgraded to
+    ``spawn`` on claim. Returns ``{"status": "claimed"|"already_owned"|"no_root"}``.
+    """
+    with SessionLocal.begin() as db:
+        root = (
+            db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if root is None:
+            return {"status": "no_root"}
+        if root.owner_principal is not None and root.origin != "legacy_unknown_owner":
+            return {"status": "already_owned", "owner_principal": root.owner_principal}
+        root.owner_principal = new_owner_principal
+        if root.origin == "legacy_unknown_owner":
+            root.origin = "spawn"
+        root.updated_at = _utcnow()
+        db.flush()
+    record_conversation_event(
+        identity_key, "identity_claimed", detail={"owner_principal": new_owner_principal}
+    )
+    return {"status": "claimed", "owner_principal": new_owner_principal}
+
+
 def list_hibernated_identities(owner_principal: Optional[str] = None) -> List[Dict[str, Any]]:
     """F829 D5: roots in a recoverable/parked state, optionally filtered to an owner.
 
