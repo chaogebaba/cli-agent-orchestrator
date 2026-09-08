@@ -106,9 +106,14 @@ def _status(api: str, tid: str) -> str:
         r = requests.get(f"{api}/terminals/{tid}", timeout=30)
         if r.status_code != 200:
             return "unknown"
-        return r.json().get("status", "unknown")
-    except Exception:
-        return "unknown"
+        body = r.json()
+        # Some create responses nest the terminal; accept top-level or ["status"].
+        st = body.get("status")
+        if st is None and isinstance(body.get("terminal"), dict):
+            st = body["terminal"].get("status")
+        return st or "no_status_field"
+    except Exception as exc:
+        return f"err:{type(exc).__name__}"
 
 
 def _wait_ready_api(api: str, tid: str, timeout: float = _READY_TIMEOUT) -> str:
@@ -554,6 +559,8 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
 
         # resumed worker must reach ready, then recall the token.
         _rst = _wait_ready_api(api, resumed_id, timeout=300.0)
+        rec("RESUMED_STATUS", f"resumed_id={resumed_id} observed_status={_rst!r}")
+        print(f"\n===F829 RESUMED_STATUS=== resumed_id={resumed_id} status={_rst!r}\n", flush=True)
         if _rst not in _READY:
             _capture_diag(cao_server, f"resumed-not-ready-{provider}")
             # also copy the subprocess server.log so we see if the resumed
