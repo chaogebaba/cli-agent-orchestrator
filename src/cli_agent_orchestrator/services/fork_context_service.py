@@ -373,6 +373,18 @@ def resolve_base(value: str) -> dict[str, Any]:
     row = get_ready_provider_session(value)
     if row:
         return _require_forkable(row)
+    # F829 D3 step 1: resolve any identifier (identity_key | provider uuid | any
+    # historical terminal id) to its canonical conversation root, BEFORE the
+    # base_session_unset and uuid-shaped base_not_registered raises below. A
+    # resolved root is adapted to the forkable row shape the resume consumer
+    # dereferences; the FULL root is carried under ``_f829_root`` so the MCP
+    # assign path can run authorize -> classify -> claim -> verify -> publish
+    # (D3) against it. A NULL provider_session_id (kiro capture_unknown, a fresh
+    # legacy root) is addressable by identity_key here even though there is no
+    # uuid to fork by yet.
+    f829_row = _f829_resolve_conversation_base(value)
+    if f829_row is not None:
+        return f829_row
     terminal = get_terminal_metadata(value)
     if terminal:
         uuid = terminal.get("provider_session_id")
@@ -401,6 +413,63 @@ def _require_forkable(row: dict[str, Any]) -> dict[str, Any]:
     if row.get("kind", "base") == "anchor":
         raise ForkContextError(f"anchor_not_forkable:{row['name']}")
     return row
+
+
+# F829 D3: the resumable conversation lifecycles and the classify tokens, kept
+# beside the resolver so the MCP assign path and the tests share one source.
+F829_RESUMABLE_LIFECYCLES = ("hibernated", "detached")
+F829_CLASSIFY_TOKENS = {
+    "abandoned": "session_abandoned",
+    "live": "session_live_owned",
+    "expired": "session_expired",
+    "capture_unknown": "session_artifact_missing",
+}
+
+
+def _f829_resolve_conversation_base(value: str) -> dict[str, Any] | None:
+    """F829 D3 step 1: adapt a resolved conversation root to the forkable row shape.
+
+    Returns None when ``value`` resolves to no conversation root, so
+    ``resolve_base`` falls through to its existing provider_sessions / terminal
+    / uuid branches unchanged. Raises ``ForkContextError('session_ambiguous')``
+    when a bare uuid matches roots in more than one namespace (D5).
+
+    The adapted row uses the exact keys the resume consumer dereferences:
+    ``name`` (the identity_key — roots are addressed by it), ``session_uuid``
+    (provider_session_id, may be None), ``source_terminal_id``
+    (current_terminal_id), plus provider/agent_profile/cwd/model/
+    reasoning_effort/artifact_locator/git_sha/dirty_hashes with NULL meaning "no
+    staleness claim". The FULL root travels under ``_f829_root`` and a
+    ``_f829_resume`` marker flags this as a conversation resume so downstream D3
+    steps run authorize -> classify -> claim -> verify -> publish.
+    """
+    from cli_agent_orchestrator.clients.database import resolve_conversation_identity
+
+    try:
+        root = resolve_conversation_identity(value)
+    except ValueError as exc:
+        if str(exc) == "session_ambiguous":
+            raise ForkContextError("session_ambiguous") from exc
+        raise
+    if root is None:
+        return None
+    return {
+        "name": root["identity_key"],
+        "session_uuid": root.get("provider_session_id"),
+        "source_terminal_id": root.get("current_terminal_id"),
+        "provider": root["provider"],
+        "agent_profile": root.get("agent_profile"),
+        "cwd": None,  # roots carry no cwd; NULL = no staleness claim
+        "model": root.get("model"),
+        "reasoning_effort": root.get("reasoning_effort"),
+        "artifact_locator": root.get("artifact_locator"),
+        "provider_namespace": root.get("provider_namespace"),
+        "git_sha": None,
+        "dirty_hashes": None,
+        "kind": "base",
+        "_f829_root": root,
+        "_f829_resume": True,
+    }
 
 
 def first_pane(session: str, window: str) -> tuple[str, int]:

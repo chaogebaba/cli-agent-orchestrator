@@ -159,3 +159,214 @@ def commit_reap(terminal_id: str) -> Optional[str]:
         detail={"provider": root["provider"], "reason": "explicit_reap"},
     )
     return key
+
+
+# ---------------------------------------------------------------------------
+# F829 D3: resume authorize -> classify -> claim (the pre-spawn gate)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResumeAdmission:
+    """Outcome of the D3 pre-spawn gate (authorize + classify + claim)."""
+
+    ok: bool
+    identity_key: str
+    error: Optional[str] = None  # snake_case token when refused
+    generation: Optional[int] = None  # the generation the claim was taken at
+    provider: Optional[str] = None
+    provider_session_id: Optional[str] = None
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    provider_namespace: Optional[str] = None
+
+
+def authorize_and_classify_resume(root: dict, caller_principal: Optional[str]) -> "ResumeAdmission":
+    """D3 steps 2-3 (authorize + classify), NO claim yet.
+
+    * AUTHORIZE against ``owner_principal``:
+      - owner set and != caller → ``resume_not_owner``.
+      - owner NULL (a top-level spawn root, or a legacy_unknown_owner root) →
+        ``resume_not_owner`` too: it is claimable only by an explicit
+        ``cao identity claim`` (supervisor ask 1), never silently by a
+        requester.
+    * CLASSIFY the lifecycle:
+      - resumable set {hibernated, detached} → ok.
+      - abandoned → session_abandoned; live → session_live_owned; expired →
+        session_expired; capture_unknown → session_artifact_missing.
+    """
+    from cli_agent_orchestrator.services.fork_context_service import (
+        F829_CLASSIFY_TOKENS,
+        F829_RESUMABLE_LIFECYCLES,
+    )
+
+    key = root["identity_key"]
+    owner = root.get("owner_principal")
+    # AUTHORIZE. A NULL owner is NOT open season — it requires an explicit claim.
+    if owner is None or (caller_principal is not None and owner != caller_principal):
+        return ResumeAdmission(ok=False, identity_key=key, error="resume_not_owner")
+
+    # CLASSIFY.
+    lifecycle = root.get("lifecycle")
+    if lifecycle not in F829_RESUMABLE_LIFECYCLES:
+        token = F829_CLASSIFY_TOKENS.get(lifecycle or "", "session_artifact_missing")
+        return ResumeAdmission(ok=False, identity_key=key, error=token)
+
+    return ResumeAdmission(
+        ok=True,
+        identity_key=key,
+        generation=int(root.get("generation", 0)),
+        provider=root.get("provider"),
+        provider_session_id=root.get("provider_session_id"),
+        model=root.get("model"),
+        reasoning_effort=root.get("reasoning_effort"),
+        provider_namespace=root.get("provider_namespace"),
+    )
+
+
+def claim_resume_admission(admission: "ResumeAdmission", claimant: str) -> "ResumeAdmission":
+    """D3 step 4: take the CAS claim for an already-authorized+classified resume.
+
+    Returns the admission unchanged on success; on a lost CAS (another claimant
+    or a moved generation) returns a refused admission with
+    ``session_resume_in_progress``. The caller must NOT spawn on a refusal.
+    """
+    from cli_agent_orchestrator.clients.database import claim_resume, record_conversation_event
+
+    if not admission.ok or admission.generation is None:
+        return admission
+    won = claim_resume(admission.identity_key, admission.generation, claimant)
+    if not won:
+        return ResumeAdmission(
+            ok=False, identity_key=admission.identity_key, error="session_resume_in_progress"
+        )
+    record_conversation_event(
+        admission.identity_key,
+        "resume_claimed",
+        detail={"claimant": claimant, "generation": admission.generation + 1},
+    )
+    return admission
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    ok: bool
+    identity_key: str
+    error: Optional[str] = None
+    published_session_id: Optional[str] = None
+
+
+def _same_file(path_a: Optional[str], path_b: Optional[str]) -> bool:
+    """inode/realpath equality for the claude divergence branch."""
+    if not path_a or not path_b:
+        return False
+    import os
+
+    try:
+        return os.path.realpath(path_a) == os.path.realpath(path_b) or os.path.samefile(
+            path_a, path_b
+        )
+    except OSError:
+        return False
+
+
+def verify_and_publish_resume(
+    admission: "ResumeAdmission",
+    *,
+    terminal_id: str,
+    reported_session_id: Optional[str],
+    reported_artifact_locator: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> "VerifyResult":
+    """D3 steps 6-7: verify resumed identity + readiness, then publish.
+
+    The provider-reported / hook-resolved session id MUST equal the root's
+    ``provider_session_id`` — EXCEPT claude_code, where a documented divergence
+    exists: if the hook-resolved id differs, the resume is accepted only when the
+    hook-resolved transcript path is the SAME FILE as the stored artifact_locator
+    (inode/realpath equality), and the root's ``provider_session_id`` is then
+    rebound to the hook-resolved id inside the publish (UNIQUE re-checked; a
+    conflict → ``session_identity_conflict``, claim cleared, NO publish).
+
+    Publishing moves ``current_terminal_id`` and clears the claim — only AFTER
+    verification (never before; AC7 mutant). Any failure clears the claim, keeps
+    the identity retryable, and never publishes.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        bind_provider_session_id,
+        clear_resume_claim,
+        publish_current_terminal,
+        record_conversation_event,
+    )
+
+    key = admission.identity_key
+    prov = provider or admission.provider
+    expected = admission.provider_session_id
+
+    def _fail(token: str) -> "VerifyResult":
+        clear_resume_claim(key, event="resume_failed")
+        record_conversation_event(
+            key, "resume_failed", terminal_id=terminal_id, detail={"error": token}
+        )
+        return VerifyResult(ok=False, identity_key=key, error=token)
+
+    # Identity match. A None expected means the root had no captured uuid yet;
+    # accept the reported id as the binding (capture-on-resume for a
+    # capture_unknown root that became addressable by identity_key).
+    publish_uuid = expected
+    if expected is not None and reported_session_id != expected:
+        if prov == "claude_code":
+            # Divergence branch: accept iff the hook-resolved transcript path is
+            # the SAME FILE as the stored artifact locator (inode/realpath).
+            stored = _stored_artifact(key)
+            if _same_file(reported_artifact_locator, stored):
+                if not bind_provider_session_id(
+                    key,
+                    provider_session_id=reported_session_id or expected,
+                    artifact_locator=reported_artifact_locator,
+                ):
+                    record_conversation_event(
+                        key,
+                        "resume_failed",
+                        terminal_id=terminal_id,
+                        detail={"error": "session_identity_conflict"},
+                    )
+                    clear_resume_claim(key)
+                    return VerifyResult(
+                        ok=False, identity_key=key, error="session_identity_conflict"
+                    )
+                publish_uuid = reported_session_id
+                record_conversation_event(
+                    key,
+                    "claude_divergence_rebound",
+                    terminal_id=terminal_id,
+                    detail={"from": expected, "to": reported_session_id},
+                )
+            else:
+                return _fail("session_identity_mismatch")
+        else:
+            return _fail("session_identity_mismatch")
+    elif expected is None and reported_session_id:
+        publish_uuid = reported_session_id
+
+    publish_current_terminal(
+        key,
+        terminal_id=terminal_id,
+        provider_session_id=publish_uuid,
+        artifact_locator=reported_artifact_locator,
+        lifecycle="live",
+    )
+    record_conversation_event(
+        key,
+        "resume_published",
+        terminal_id=terminal_id,
+        detail={"provider_session_id": publish_uuid},
+    )
+    return VerifyResult(ok=True, identity_key=key, published_session_id=publish_uuid)
+
+
+def _stored_artifact(identity_key: str) -> Optional[str]:
+    from cli_agent_orchestrator.clients.database import get_conversation_identity
+
+    root = get_conversation_identity(identity_key)
+    return root.get("artifact_locator") if root else None
