@@ -452,39 +452,43 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             f"hibernate result: {hib}"
         )
 
-        # 4. RESUME through the PUBLIC SEAM: server._assign_impl(resume_from=...).
-        # _assign_impl makes HTTP calls to the subprocess for terminal CREATION,
-        # but resolves the resume handle IN-PROCESS via prepare_resume ->
-        # get_terminal_identity_by_provider_session_id, reading THIS process's
-        # SessionLocal. Point it at the subprocess's sqlite file so the resolver
-        # sees the rows the subprocess wrote at hibernate (the reaped
-        # terminal_identity row carrying the captured id). Without this the
-        # resolver reads an unconfigured DB and spuriously refuses missing=identity
-        # even though the row exists (verified via a direct sqlite read).
+        # 4. RESUME through the PUBLIC SEAM, production-faithful.
+        # In PRODUCTION the MCP-server process and cao-server SHARE ONE HOME/DB:
+        # _assign_impl resolves the resume IN-PROCESS (prepare_resume / claim /
+        # ownership) against that shared DB, and MATERIALIZES the resumed
+        # terminal through the production HTTP create (POST /sessions/{s}/terminals
+        # with the resume fork_context — server.py:883-900), so cao-server owns
+        # the tmux/provider spawn. Reproduce that faithfully: point THIS process's
+        # HOME + CAO_HOME_DIR at the subprocess's HOME and reload the database
+        # module so SessionLocal binds to the SUBPROCESS'S ACTUAL db file (one DB,
+        # one truth — no ad-hoc second connection), and CAO_ENDPOINT at the
+        # subprocess so the HTTP create lands there.
+        import importlib
         import cli_agent_orchestrator.clients.database as _dbm
-        from sqlalchemy import create_engine as _ce
-        from sqlalchemy.orm import sessionmaker as _sm
 
-        _sub_engine = _ce(f"sqlite:///{cao_server.db_path}",
-                          connect_args={"check_same_thread": False})
-        _saved_engine, _saved_sl = _dbm.engine, _dbm.SessionLocal
-        _dbm.engine = _sub_engine
-        _dbm.SessionLocal = _sm(autocommit=False, autoflush=False, bind=_sub_engine)
+        _saved = {k: os.environ.get(k) for k in ("HOME", "CAO_HOME_DIR", "CAO_ENDPOINT",
+                                                  "CAO_TERMINAL_ID")}
+        os.environ["HOME"] = str(cao_server.home_dir)
+        os.environ.pop("CAO_HOME_DIR", None)  # constants derives from HOME when unset
+        os.environ["CAO_ENDPOINT"] = api
+        os.environ["CAO_TERMINAL_ID"] = supervisor_id
+        # Rebind SessionLocal/engine to the subprocess DB the module's own way.
+        import cli_agent_orchestrator.constants as _const
+        importlib.reload(_const)
+        importlib.reload(_dbm)
 
         # The resuming seat must be the root's recorded OWNER. A worker spawned
-        # via a bare POST /sessions has a NULL-owner root (a real assign would set
-        # the supervisor's mailbox); a NULL-owner root is not open season, so
-        # establish ownership first via the public claim (cao identity claim),
-        # then resume as that owner — the real operator sequence.
+        # via a bare POST /sessions has a NULL-owner root; establish ownership
+        # first via the public claim (cao identity claim), then resume as that
+        # owner — the real operator sequence.
         _owner_principal = f"mb_{provider}_owner"
         _claim = _dbm.claim_identity_owner(identity_key, _owner_principal)
         rec("CLAIM", f"claim_identity_owner -> {_claim}")
         _rootrow = _dbm.get_conversation_identity(identity_key)
         _owner = _rootrow.get("owner_principal") if _rootrow else _owner_principal
 
-        os.environ["CAO_ENDPOINT"] = api
-        os.environ["CAO_TERMINAL_ID"] = supervisor_id
         from cli_agent_orchestrator.mcp_server import server as _srv
+        importlib.reload(_srv)
 
         from unittest.mock import patch as _patch
         resume_handle = captured_sid or worker_id
@@ -498,7 +502,11 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             with _patch.object(_srv, "_f829_resolve_caller_principal", return_value=_owner):
                 res = _srv._assign_impl(**assign_kwargs)
         finally:
-            _dbm.engine, _dbm.SessionLocal = _saved_engine, _saved_sl
+            for k, v in _saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         rec("ASSIGN_RESUME_FROM", f"resume_from={resume_handle!r} -> " + str({k: res.get(k) for k in
             ("success", "terminal_id", "resumed_from", "worktree", "pins_inherited",
              "resume_line", "error", "reason", "missing")}))
@@ -548,8 +556,13 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         _rst = _wait_ready_api(api, resumed_id, timeout=300.0)
         if _rst not in _READY:
             _capture_diag(cao_server, f"resumed-not-ready-{provider}")
+            # also copy the subprocess server.log so we see if the resumed
+            # claude --resume worker errored in provider init (vs never created).
+            import contextlib as _c2, shutil as _sh2
+            with _c2.suppress(Exception):
+                _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+                _sh2.copy2(cao_server.log_path, _DIAG_DIR / f"{provider}-resumed-server.log")
             rec("RESUMED_NOT_READY", f"resumed_id={resumed_id} status={_rst}")
-            _DIAG_DIR.mkdir(parents=True, exist_ok=True)
             (_DIAG_DIR / f"{provider}-resumed-notready-diag.txt").write_text(
                 "\n".join(transcript), encoding="utf-8")
         assert _rst in _READY, f"resumed worker not ready (status={_rst})"
