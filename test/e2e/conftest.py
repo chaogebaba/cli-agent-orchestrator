@@ -110,6 +110,25 @@ def _cli_available(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+# F829 build-2 live arms (arm-scoped, gated by F829_EXTRA_HOME_SYMLINKS): the
+# shared cao_server fixture symlinks only ~/.bun and ~/.kiro into the redirected
+# scratch HOME, so claude/codex/pi have their BINARY but not their CONFIG/AUTH
+# there — claude then re-runs its interactive first-run theme wizard in the CAO
+# pane and init times out. When the flag is set (only by the F829 arm box-run),
+# extend _PROVIDER_HOME_SYMLINKS with the provider config/auth dot-entries so the
+# arms can reach real auth + a completed-onboarding ~/.claude.json. Box-local,
+# read-only symlinks, disposable box (no F549-class concern there). NOT applied
+# to the general e2e suite (production fixture untouched).
+if os.environ.get("F829_EXTRA_HOME_SYMLINKS"):
+    from test.fixtures import cao_server as _f829_cao_server
+
+    _F829_EXTRA = (".claude", ".claude.json", ".codex", ".pi", ".config/cao")
+    _existing = set(_f829_cao_server._PROVIDER_HOME_SYMLINKS)
+    _f829_cao_server._PROVIDER_HOME_SYMLINKS = _f829_cao_server._PROVIDER_HOME_SYMLINKS + tuple(
+        e for e in _F829_EXTRA if e not in _existing
+    )
+
+
 @pytest.fixture()
 def require_codex():
     """Skip test if codex CLI is not available."""
