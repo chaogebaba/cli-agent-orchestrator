@@ -4834,8 +4834,13 @@ def reconcile_stale_resume_claims(claim_ttl_s: float) -> List[str]:
         )
         for root in rows:
             claimed_at = root.resume_claim_at
-            if claimed_at is not None and claimed_at > cutoff:
-                continue
+            if claimed_at is not None:
+                # SQLite hands back naive datetimes; normalise to UTC-aware
+                # before comparing against the aware cutoff.
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                if claimed_at > cutoff:
+                    continue
             root.resume_claim = None
             root.resume_claim_at = None
             root.updated_at = _utcnow()

@@ -1805,6 +1805,27 @@ async def lifespan(app: FastAPI):
             reconcile_result["skipped_session_live"],
         )
 
+    # F829 D8 (N1): reconcile every `live` conversation root and clear stale
+    # resume claims. A root whose current terminal is CONFIRMED dead (tombstone)
+    # is crash-detached; an unconfirmed/alive root is left `live` for the next
+    # boot. Must run after the dead-session reconcile above so a terminal whose
+    # whole session vanished is already gone before the tombstone check. Never
+    # raises into lifespan.
+    try:
+        from cli_agent_orchestrator.services import conversation_reconcile as _f829_reconcile
+
+        _f829_claims = _f829_reconcile.reconcile_stale_claims()
+        _f829_roots = _f829_reconcile.reconcile_live_roots()
+    except Exception:
+        logger.exception("F829 startup conversation reconciliation failed; deferring to next boot")
+    else:
+        logger.info(
+            "startup_f829_reconcile live_roots_checked=%d detached=%d claims_cleared=%d",
+            _f829_roots["checked"],
+            _f829_roots["detached"],
+            len(_f829_claims),
+        )
+
     # D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
     try:
         rearm_result = terminal_service.rearm_fifo_readers_at_startup()
