@@ -4963,6 +4963,35 @@ async def bind_transcript(
         # NEW epoch, so the tailer has to learn about the epoch to announce
         # ``session.resumed`` while keeping the cursor that stops it replaying.
         _wt_claude_truth.attach_transcript_source(terminal_id, candidate_real, body.session_id)
+        # F829 (build-2 B2): attach the hook-reported claude session id to this
+        # terminal's conversation_identity ROOT so a claude worker becomes
+        # resumable across an account switch (planned hibernate needs a captured
+        # provider_session_id on the root — D6). claude does not opt into the
+        # capture_session_uuid seam that codex uses, and unlike kiro it has no
+        # nonce poll; the SessionStart hook is where claude's id first exists, so
+        # this is the attach point. attach_captured_uuid is best-effort and
+        # non-raising: it is idempotent on a re-reported same id, runs the
+        # resume verify+publish branch when a resume claim is held (claude's
+        # same-file divergence rule applies there), and REFUSES a foreign id
+        # already bound to a different identity (uuid_capture_rejected) rather
+        # than stealing it. A terminal with no F829 root (pre-F829) is a no-op.
+        try:
+            from cli_agent_orchestrator.services.conversation_transition import (
+                attach_captured_uuid,
+            )
+
+            attach_captured_uuid(
+                terminal_id,
+                provider_session_id=body.session_id,
+                provider="claude_code",
+                artifact_locator=candidate_real,
+            )
+        except Exception:
+            logger.debug(
+                "f829 claude root-attach from transcript-binding failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
         return {"success": True, "binding": row}
     except ValueError as exc:
         raise HTTPException(
