@@ -7360,11 +7360,21 @@ def delete_terminal(
                 except Exception:
                     logger.debug("f829 hibernate_refused event failed", exc_info=True)
             return {
-                "terminal_deleted": False,
-                "hibernate_refused": True,
-                "provider": _f829_hib_decision.provider,
-                "reason": _f829_hib_decision.reason,
-                "identity_key": _f829_hib_decision.identity_key,
+                "reaped": [],
+                "skipped": [
+                    {
+                        "id": terminal_id,
+                        "refused": True,
+                        "kind": "hibernate_refused",
+                        "provider": _f829_hib_decision.provider,
+                        "reason": _f829_hib_decision.reason,
+                        "detail": _f829_hib_decision.detail,
+                        "identity_key": _f829_hib_decision.identity_key,
+                        "hint": "delete_terminal(force=True) reaps and marks unrecoverable",
+                    }
+                ],
+                "uncertain": [],
+                "unattempted": [],
             }
 
     # D16: Open teardown intent BEFORE any tmux call. Committed immediately.

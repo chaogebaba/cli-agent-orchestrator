@@ -43,6 +43,7 @@ class HibernateDecision:
     lifecycle: Optional[str]  # 'hibernated' when allowed, else None
     provider: Optional[str] = None
     reason: Optional[str] = None  # snake_case token when refused
+    detail: Optional[str] = None  # the resolver's human detail, carried to the caller
     identity_key: Optional[str] = None
     artifact_locator: Optional[str] = None
 
@@ -69,11 +70,17 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
     let the operator choose an explicit ``force`` reap instead.
 
     Reason tokens (snake_case, D3 vocabulary):
+    - ``capture_unknown``               — the root never captured an id (kiro/codex
+                                          pre-capture); refuses under the same shape.
     - ``session_artifact_missing``      — nothing recoverable was captured / gone.
     - ``session_artifact_unavailable``  — store inaccessible (retryable).
     - ``session_artifact_invalid``      — a file exists but does not validate.
     A terminal with no conversation root (pre-F829) is allowed to proceed
     (nothing F829 owns to protect) with ``lifecycle=None``.
+
+    Cheap by construction (supervisor guard 1): a single filesystem artifact
+    resolve, NO provider round-trip, so a bulk reap of many terminals is not
+    slowed.
     """
     from cli_agent_orchestrator.services.session_artifact import (
         ArtifactState,
@@ -85,6 +92,19 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
         # No F829 identity → no hibernate contract to enforce; let the ordinary
         # reap proceed and set no conversation lifecycle.
         return HibernateDecision(allowed=True, lifecycle=None)
+
+    # A capture_unknown root (kiro/codex pre-capture) has no recoverable identity
+    # yet — refuse under the same shape with the capture_unknown reason, without
+    # even resolving an artifact (there is no id to resolve).
+    if root.get("lifecycle") == "capture_unknown":
+        return HibernateDecision(
+            allowed=False,
+            lifecycle=None,
+            provider=root["provider"],
+            reason="capture_unknown",
+            detail="conversation has no captured session id yet",
+            identity_key=root["identity_key"],
+        )
 
     status = resolve_artifact(
         root["provider"],
@@ -110,6 +130,7 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
         lifecycle=None,
         provider=root["provider"],
         reason=reason,
+        detail=status.detail,
         identity_key=root["identity_key"],
     )
 
