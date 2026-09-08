@@ -85,6 +85,27 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
     record = terminals._deferred_tasks_by_terminal[terminal_id]
     call = record.current_call
     assert call is not None
+    real_winner_lock = call.ready_winner_lock
+    loop_thread = threading.get_ident()
+    loop_acquire_modes: list[bool] = []
+
+    class ObservedWinnerLock:
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if threading.get_ident() == loop_thread:
+                loop_acquire_modes.append(blocking)
+            return real_winner_lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            real_winner_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self.release()
+
+    call.ready_winner_lock = ObservedWinnerLock()
 
     def hold_winner() -> None:
         with call.ready_winner_lock:
@@ -125,6 +146,7 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
         # (event-based), not a wall-clock or tick-count threshold. A short
         # deterministic bound guards against a hang, not against scheduler jitter.
         await asyncio.wait_for(loop_ran_during_quiesce.wait(), timeout=5.0)
+        assert loop_acquire_modes == [False]
         # ready-winner assertion — UNCHANGED (the claim under attack): quiesce
         # observed the held winner and yielded the result to the reconciler.
         assert call.result_owner == "reconciler"
