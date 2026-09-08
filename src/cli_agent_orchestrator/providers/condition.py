@@ -284,6 +284,54 @@ _CODEX_CONTEXT_FOOTER = re.compile(r"Context\s+(\d+)%\s+left", re.IGNORECASE)
 _KIRO_CONTEXT_FOOTER = re.compile(r"[◔◑◕●]\s*(\d+)%", re.IGNORECASE)
 _KIRO_CONTEXT_TIP = re.compile(r"Running low on context\? Type /compact", re.IGNORECASE)
 
+# F836 r2 (#693): the footer-percent scan runs on RAW pane rows so the status bar
+# (which sits BELOW the ``›`` composer, where banner_rows suppresses it) stays
+# reachable — but a RAW row can also be a user prompt or transcript text that
+# merely QUOTES footer-like glyphs/percentages. The r1 matchers were unanchored
+# and fired a high-confidence false CONTEXT_EXHAUSTED on such rows (gate BLOCKER).
+# A row now qualifies as a provider FOOTER only when it (a) is not a prompt /
+# assistant / transcript row, and (b) carries the provider's status-bar
+# CO-SIGNATURE on the SAME row:
+#   * codex status bar: "… · Context NN% left · <H>h <MM>% left" — the context
+#     figure ALWAYS co-occurs with the 5h rate-window on the same row; a quoted
+#     "Context 8% left" in a prompt has no rate-window suffix.
+#   * kiro status bar: "<agent> · <mode> · <glyph> NN%   <path> · (<branch>)" —
+#     the glyph/percent is preceded by the agent·mode chrome (>=2 " · "
+#     separators before the glyph); a quoted "… ● 92%" in a prompt is not.
+# A leading prompt/assistant glyph disqualifies the row outright (belt & braces).
+_FOOTER_ROW_DISQUALIFIER = re.compile(r"^\s*(?:›|»|❯|•|●|◇|◆|⏺|\$|#|>)")
+# codex rate-window co-signature ("5h 47% left" / "1h 3% left"): "<H>h <MM>% left".
+_CODEX_RATE_WINDOW = re.compile(r"\b\d+h\s+\d+%\s+left\b", re.IGNORECASE)
+
+
+def _codex_footer_row(row: str) -> bool:
+    """True when ``row`` is the codex STATUS-BAR row (not quoted user/transcript).
+
+    Requires the codex context figure AND the co-occurring 5h rate-window on the
+    SAME row, and rejects a row that opens with a prompt/assistant glyph. A user
+    prompt quoting "Context 8% left" carries no rate-window and fails here."""
+    if _FOOTER_ROW_DISQUALIFIER.search(row):
+        return False
+    return bool(_CODEX_CONTEXT_FOOTER.search(row) and _CODEX_RATE_WINDOW.search(row))
+
+
+def _kiro_footer_row(row: str) -> bool:
+    """True when ``row`` is the kiro STATUS-BAR row (not quoted user/transcript).
+
+    Requires the pie-glyph percent to be preceded on the row by the agent·mode
+    chrome (>=2 " · " separators before the glyph) and rejects a row that opens
+    with a prompt/assistant glyph. A user prompt quoting "… ● 92%" opens with
+    "›" (disqualified) and/or lacks the leading chrome."""
+    if _FOOTER_ROW_DISQUALIFIER.search(row):
+        return False
+    m = _KIRO_CONTEXT_FOOTER.search(row)
+    if not m:
+        return False
+    # Agent·mode chrome before the glyph: at least two " · " separators precede
+    # the matched glyph position (e.g. "kiro_cli_dev · Auto · ◑ 30%").
+    return row[: m.start()].count(" · ") >= 2
+
+
 # DIALOG_BLOCKED anchors.
 _CODEX_TRUST = re.compile(
     r"subdirectory of a Git project\. Trusting will apply to the repository root",
@@ -482,12 +530,19 @@ def _classify_context(
     # The footer status bar is the LAST pane row and, in the live codex/kiro TUI,
     # sits BELOW the composer prompt — so banner_rows() (which suppresses the
     # user-region continuation after a "›" prompt) drops it. The footer-percent
-    # scan therefore runs on the RAW pane rows (the status bar is a structural
-    # readout, never user-quoted text); the softer kiro TIP still scans brows.
+    # scan therefore runs on the RAW pane rows to keep the below-composer status
+    # bar reachable; but a raw row can ALSO be a prompt/transcript that quotes
+    # footer-like text, so each row is gated by _codex_footer_row/_kiro_footer_row
+    # (status-bar shape + co-signature, never a prompt) — F836 r2 gate BLOCKER
+    # fix. The softer kiro TIP still scans brows.
     rows = raw_rows if raw_rows is not None else brows
     if provider == "codex":
-        # codex: NN is context REMAINING → exhausted at NN <= threshold.
+        # codex: NN is context REMAINING → exhausted at NN <= threshold. Only a
+        # genuine status-bar row (context figure + 5h rate-window, not a prompt)
+        # is considered — a quoted "Context 8% left" in a prompt is ignored.
         for row in rows:
+            if not _codex_footer_row(row):
+                continue
             m = _CODEX_CONTEXT_FOOTER.search(row)
             if m and int(m.group(1)) <= CODEX_CONTEXT_LEFT_THRESHOLD:
                 return Condition(
@@ -501,8 +556,12 @@ def _classify_context(
     if provider == "kiro_cli":
         # kiro: NN is context USED (pie glyph ◔◑◕● precedes it) → exhausted at
         # NN >= threshold. A glyph alone, or a healthy low USED% (e.g. ◑ 30%), is
-        # NOT exhaustion (F836 false positive).
+        # NOT exhaustion (F836 false positive). Only a genuine status-bar row
+        # (agent·mode chrome before the glyph, not a prompt) is considered — a
+        # quoted "… ● 92%" in a prompt is ignored.
         for row in rows:
+            if not _kiro_footer_row(row):
+                continue
             m = _KIRO_CONTEXT_FOOTER.search(row)
             if m and int(m.group(1)) >= KIRO_CONTEXT_USED_THRESHOLD:
                 return Condition(
@@ -724,11 +783,11 @@ def classify_condition(
 
     # CAPPED (precedence 4): dispatched explicitly so codex can scope the scan to
     # the CURRENT incarnation. F832 (#689): on a RESUMED codex terminal the prior
-    # transcript (including an old "usage limit" line) is replayed ABOVE the fresh
-    # composer prompt; scanning the whole buffer fired a false CAPPED. For codex
-    # we scope the banner rows to those after the resume boot marker / newest
-    # composer prompt (computed on the RAW pane, since banner_rows strips the
-    # ``›`` prompt used as the boundary anchor). Other providers scan unchanged.
+    # transcript (including an old "usage limit" line) is replayed ABOVE the
+    # "Resuming session" boot marker; scanning the whole buffer fired a false
+    # CAPPED. For codex we scope the banner rows to those AFTER the last resume
+    # boot marker (_codex_live_rows); a never-resumed pane has no marker and is
+    # scanned whole. Other providers scan unchanged.
     raw_rows = [strip_terminal_escapes(r) for r in pane.splitlines()]
     if provider == "codex":
         live_rows = _codex_live_rows(raw_rows)
