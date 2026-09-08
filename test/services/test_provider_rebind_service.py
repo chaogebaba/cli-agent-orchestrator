@@ -1387,7 +1387,19 @@ def test_public_delete_passes_current_lease_token_to_single_teardown_body(monkey
         ),
     )
     result = terminal_service.delete_terminal("delete-a")
-    assert result["reaped"] == [{"id": "delete-a", "status": "reaped"}]
+    # RESUME HOT-FIX r1 #4: reaped entries carry the resume block (None/False
+    # here — the mocked teardown returns no resume fields).
+    assert result["reaped"] == [
+        {
+            "id": "delete-a",
+            "status": "reaped",
+            "provider_session_id": None,
+            "resumable": False,
+            "reason": None,
+            "cwd": None,
+            "artifact_locator": None,
+        }
+    ]
     assert seen[0][0] == "delete-a"
     assert seen[0][1] is not None
     assert seen[0][1].terminal_id == "delete-a"

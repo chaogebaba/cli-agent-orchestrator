@@ -7489,6 +7489,60 @@ def _close_cascade_teardown_intents(intent_ids: list[str], marked: list[str]) ->
         unmark_teardown(node_id)
 
 
+def _resolve_reap_resume_key(
+    terminal_id: str, metadata: Optional[dict], *, force: bool = False
+) -> tuple[Optional[str], bool, str]:
+    """RESUME HOT-FIX (addendum r1 #4): compute the reap resume facts.
+
+    Returns ``(captured_provider_session_id, resumable, reason)``:
+      * ``captured_provider_session_id`` — a session id to fill a NULL identity
+        row (kiro store capture), or None.
+      * ``resumable`` — whether ``assign(resume_from=<terminal_id>)`` will
+        succeed: the provider supports resume AND a provider_session_id is (or
+        becomes) known. ``force=True`` (abandon) always yields False.
+      * ``reason`` — a snake_case detail for the operator.
+
+    kiro is the only provider needing reap-time capture (its id is unknown until
+    harvested); the capture reads ONLY the on-disk store and binds by POSITIVE
+    ATTRIBUTION (the terminal's own assign-trailer marker), never cwd+mtime.
+    Never raises — a failure degrades to ``(None, False, <reason>)``.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_identity
+        from cli_agent_orchestrator.services.resume_service import provider_supports_resume
+
+        identity = get_terminal_identity(terminal_id)
+        if identity is None:
+            return None, False, "no_identity_row"
+        provider = (identity.get("provider") or "") if identity else ""
+        cwd = identity.get("cwd") or (metadata.get("working_directory") if metadata else None)
+        supports = provider_supports_resume(provider) if provider else False
+        if force:
+            # Abandon: the caller is discarding the checkout; not resumable.
+            return None, False, "abandoned_force_delete"
+        existing_id = identity.get("provider_session_id")
+        if existing_id:
+            reason = "resumable" if supports else f"provider_{provider}_not_resumable"
+            return None, bool(supports), reason
+        if provider != "kiro_cli":
+            # Non-kiro with a NULL id: nothing to capture; not resumable.
+            return None, False, "provider_session_id_never_captured"
+        if not cwd:
+            return None, False, "kiro_cwd_unknown"
+        from cli_agent_orchestrator.services.resume_service import (
+            capture_kiro_session_id_from_store,
+        )
+
+        captured, cap_reason, count = capture_kiro_session_id_from_store(cwd, terminal_id)
+        if captured:
+            reason = "resumable" if supports else f"provider_{provider}_not_resumable"
+            return captured, bool(supports), reason
+        return None, False, f"capture_unknown_candidates_{count}"
+    except Exception as exc:  # never block a reap over capture
+        logger.warning("reap resume-key resolution failed for %s: %s", terminal_id, exc)
+        return None, False, "capture_error"
+
+
 def _delete_terminal_inner(
     terminal_id: str,
     session_name: str,
@@ -7580,7 +7634,7 @@ def _delete_terminal_inner(
             [node_id for node_id in order if node_id != terminal_id],
             caller_id=caller_id,
         )
-        reaped: list[dict[str, str]] = []
+        reaped: list[dict[str, Any]] = []
         for index, node_id in enumerate(order):
             token = acquire_rebind_lease(node_id)
             if token is None:
@@ -7616,10 +7670,16 @@ def _delete_terminal_inner(
             # F631 D4: the cascade result used to carry no resume key at all
             # (§1) — the 19:19Z incident's operator had nothing to resume by.
             # Each reaped node now reports the handle its identity row holds.
-            entry: dict[str, str] = {"id": node_id, "status": disposition}
+            entry: dict[str, Any] = {"id": node_id, "status": disposition}
+            # RESUME HOT-FIX (addendum r1 #4): resume block per reaped node.
             node_resume_key = result.get("resume_key")
             if node_resume_key:
                 entry["resume_key"] = node_resume_key
+            entry["provider_session_id"] = result.get("provider_session_id")
+            entry["resumable"] = result.get("resumable", False)
+            entry["reason"] = result.get("reason")
+            entry["cwd"] = result.get("cwd")
+            entry["artifact_locator"] = result.get("artifact_locator")
             reaped.append(entry)
             parent_writer = getattr(get_backend(), "set_window_parent", None)
             if callable(parent_writer):
@@ -7971,7 +8031,14 @@ def _delete_terminal_under_lease(
         # "A" out of it, and force-remove A's still-running worktree.
         # Mismatched parses now fall through as a no-op leak (Phase 3
         # territory) instead of destroying another terminal's checkout.
-        if metadata is not None:
+        #
+        # RESUME HOT-FIX (addendum r1 #3): a normal reap RETAINS the worktree
+        # (directory + branch + dirty/untracked content) so a later
+        # assign(resume_from=…) can re-attach to the exact cwd a kiro session is
+        # keyed by. The checkout is torn down ONLY on an explicit abandon
+        # (force=True) or a future GC (not in this slice). So this whole
+        # removal block runs only under force.
+        if force and metadata is not None:
             # F620 (#476): prefer CAO's stored worktree_info (authoritative
             # repo_root + terminal_id) over parsing the pane cwd. Since the
             # worktree checkout can now live off-repo (e.g. under
@@ -8158,6 +8225,16 @@ def _delete_terminal_under_lease(
                 }
                 if reparent_target_id is not None:
                     deletion_kwargs["reparent_target_id"] = reparent_target_id
+                # RESUME HOT-FIX (addendum r1 #4): compute the reap resume facts
+                # (kiro store capture by positive attribution + provider
+                # capability). force=True abandons → not resumable.
+                _cap_id, _resumable, _reason = _resolve_reap_resume_key(
+                    terminal_id, metadata, force=force
+                )
+                if _cap_id is not None:
+                    deletion_kwargs["captured_provider_session_id"] = _cap_id
+                deletion_kwargs["resumable"] = _resumable
+                deletion_kwargs["resume_reason"] = _reason
                 deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
         finally:
             delivery_lock.release()
@@ -8182,11 +8259,16 @@ def _delete_terminal_under_lease(
             "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
             "rollback_kill_uncertain": False,
             "persona_retention_error": persona_retention_error,
-            # F631 D4: the reaped lane's resume key, surfaced so the operator
-            # who reaps a lane is handed the handle it can be resumed by.
-            # `.get` because the F138 non-durable-force branch above fabricates
-            # a "not deleted" result that never reached the DB writer.
+            # F631 D4 / addendum r1 #4: the reaped lane's resume block, surfaced
+            # for EVERY provider. resume_key is the historical terminal id (the
+            # handle a resume takes); provider_session_id may be null; resumable
+            # + reason say whether assign(resume_from=) will work and why.
             "resume_key": deletion.get("resume_key"),
+            "provider_session_id": deletion.get("provider_session_id"),
+            "resumable": deletion.get("resumable", False),
+            "reason": deletion.get("reason"),
+            "cwd": deletion.get("cwd"),
+            "artifact_locator": deletion.get("artifact_locator"),
         }
 
     except Exception as e:

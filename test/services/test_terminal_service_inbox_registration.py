@@ -252,6 +252,7 @@ class TestCreateTerminalHerdrRegistration:
                 m.db_create_terminal.side_effect = RuntimeError("boom")
             elif site == "context":
                 from cli_agent_orchestrator.models.agent_profile import AgentProfile as _AP
+
                 m.load_agent_profile.return_value = _AP(
                     name="developer",
                     description="test",
@@ -304,7 +305,15 @@ class TestCreateTerminalHerdrRegistration:
             # F138: cleanup path adds a second get_terminal_metadata call for snapshot
             assert get_metadata.call_count == 2
             get_metadata.assert_called_with(TERMINAL_ID)
-            delete_row.assert_called_once_with(TERMINAL_ID, preserve_warm_intent=False)
+            # RESUME HOT-FIX (verdict r1 B3): the reap now also passes the resume
+            # facts. This is a fresh, never-registered rollback (no identity row),
+            # so the resolver yields resumable=False, reason="no_identity_row".
+            delete_row.assert_called_once_with(
+                TERMINAL_ID,
+                preserve_warm_intent=False,
+                resumable=False,
+                resume_reason="no_identity_row",
+            )
         else:
             delete_row.assert_not_called()
 

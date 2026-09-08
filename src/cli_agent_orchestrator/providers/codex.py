@@ -2114,6 +2114,9 @@ class ProviderError(Exception):
 class CodexProvider(BaseProvider):
     condition_provider_key = "codex"  # F611 #467
     supports_fork_context = True
+    # RESUME HOT-FIX (r1 #6 / r2 #2): codex resumes via a resume-mode
+    # fork_context (the proven path); opt into the resume capability explicitly.
+    supports_resume = True
     supports_seed_resume_identity = True
     supports_reauth_rebind = True
 

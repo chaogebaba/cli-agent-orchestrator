@@ -299,8 +299,11 @@ def test_a_failed_identity_retirement_aborts_the_whole_reap(db_env):
     identity_state = (row["lifecycle"], row["reaped_at"])
     assert identity_state == ("live", None), f"F631-N2-STATE: identity is {identity_state}"
     # …and the real key was never silently discarded — a second, clean reap
-    # still returns it.
-    assert delete_terminal_and_warm_intent("lane0001")["resume_key"] == "uuid-lane0001"
+    # still returns it (r1 #4: the captured id is now provider_session_id;
+    # resume_key is the historical terminal id).
+    _reap = delete_terminal_and_warm_intent("lane0001")
+    assert _reap["provider_session_id"] == "uuid-lane0001"
+    assert _reap["resume_key"] == "lane0001"
 
 
 def test_a_failed_identity_write_propagates_rather_than_returning(db_env):
@@ -340,7 +343,19 @@ def test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception(db_env):
         db.commit()
 
     result = delete_terminal_and_warm_intent("lane0009")
-    assert result == {"terminal_deleted": True, "intent_deleted": False, "resume_key": None}
+    # RESUME HOT-FIX (r1 #4): the reap result carries a resume block for every
+    # provider. A pre-registry lane (no identity row) has no resolvable handle,
+    # so resume_key is None and resumable is False.
+    assert result == {
+        "terminal_deleted": True,
+        "intent_deleted": False,
+        "resume_key": None,
+        "provider_session_id": None,
+        "resumable": False,
+        "reason": "no_identity_row_pre_registry_terminal",
+        "cwd": None,
+        "artifact_locator": None,
+    }
 
 
 def test_nothing_fabricates_a_provider_session_id(db_env):
@@ -392,19 +407,23 @@ def test_ac2_reap_does_not_disturb_a_sibling_lane(db_env):
 
 
 def test_reap_returns_the_resume_key(db_env):
-    """§1: the delete result used to carry no resume key at all."""
+    """§1 / r1 #4: the reap block carries the captured id (provider_session_id)
+    and the historical terminal id (resume_key)."""
     _make_lane()
 
     result = delete_terminal_and_warm_intent("lane0001")
-    assert result["resume_key"] == "uuid-lane0001"
+    assert result["provider_session_id"] == "uuid-lane0001"
+    assert result["resume_key"] == "lane0001"
 
 
 def test_reap_returns_none_when_the_lane_has_no_provider_session(db_env):
-    """A lane whose provider never minted an id reaps to a None key, not a lie."""
+    """A lane whose provider never minted an id reaps to a None
+    provider_session_id, not a lie. resume_key is still the terminal id (r1 #4)."""
     create_terminal("lane0004", SESSION, "worker-lane0004", "kiro_cli")
 
     result = delete_terminal_and_warm_intent("lane0004")
-    assert result["resume_key"] is None
+    assert result["provider_session_id"] is None
+    assert result["resume_key"] == "lane0004"
     assert get_terminal_identity("lane0004")["lifecycle"] == "reaped"
 
 
@@ -567,3 +586,63 @@ def test_ac15_migrated_table_matches_the_model(tmp_path, monkeypatch):
             )
         indexes = {r[1] for r in conn.execute("PRAGMA index_list(terminal_identity)")}
         assert "ix_terminal_identity_provider_session_id" in indexes
+
+
+# ── RESUME HOT-FIX (verdict r1 B2): required-column migration safety ─────────
+
+
+def test_b2_half_migration_adds_required_columns_idempotently(tmp_path, monkeypatch):
+    """A pre-existing terminal_identity missing the worktree columns is migrated
+    to include all three, twice-run is a no-op, and an existing row survives."""
+    db_path = tmp_path / "half.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE terminal_identity ("
+            "terminal_id VARCHAR NOT NULL PRIMARY KEY, provider VARCHAR NOT NULL, "
+            "provider_session_id VARCHAR, "
+            "base_name VARCHAR NOT NULL, lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+            "worktree_branch VARCHAR)"  # one of the three already present
+        )
+        conn.execute(
+            "INSERT INTO terminal_identity (terminal_id, provider, base_name, lifecycle) "
+            "VALUES ('keep', 'codex', 'keep', 'live')"
+        )
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_f631_terminal_identity()
+    _migrate_f631_terminal_identity()  # idempotent second run
+    with sqlite3.connect(str(db_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(terminal_identity)")}
+        assert {"worktree_path", "worktree_branch", "worktree_repo_root"} <= cols
+        assert conn.execute("SELECT count(*) FROM terminal_identity").fetchone()[0] == 1
+
+
+def test_b2_failed_required_column_write_raises_not_fails_open(tmp_path, monkeypatch):
+    """Negative witness (verdict r1 B2): if the additive ALTER genuinely fails
+    and a required column stays absent, the migrator RAISES so init_db aborts —
+    it MUST NOT return with the schema still incompatible."""
+    db_path = tmp_path / "ro-half.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE terminal_identity ("
+            "terminal_id VARCHAR NOT NULL PRIMARY KEY, provider VARCHAR NOT NULL, "
+            "provider_session_id VARCHAR, "
+            "base_name VARCHAR NOT NULL, lifecycle VARCHAR DEFAULT 'live' NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+            "ON terminal_identity(provider_session_id)"
+        )
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    # Make the DB file AND its directory read-only so ALTER TABLE cannot write.
+    db_path.chmod(0o444)
+    tmp_path.chmod(0o555)
+    try:
+        with pytest.raises(Exception):
+            _migrate_f631_terminal_identity()
+    finally:
+        tmp_path.chmod(0o755)
+        db_path.chmod(0o644)
+    # The required columns are STILL absent — the raise is what protects startup.
+    with sqlite3.connect(str(db_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(terminal_identity)")}
+    assert not ({"worktree_path", "worktree_repo_root"} & cols)

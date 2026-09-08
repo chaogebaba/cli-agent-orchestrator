@@ -288,6 +288,12 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
     loss. Only the (uncommitted/untracked) working-tree contents of the
     worktree itself are ever force-discarded.
 
+    RESUME HOT-FIX (addendum r1 #3): a normal reap no longer calls this at all —
+    the worktree is RETAINED so a resume can re-attach. This runs ONLY on an
+    explicit abandon (``delete_terminal(force=True)``), where discarding the
+    checkout is the intent. The branch is still only SAFE-deleted (``-d``), so
+    unmerged commits survive as a branch for a later merge/GC.
+
     Never raises -- called from terminal-teardown paths (``delete_terminal``,
     and the failure-cleanup path in ``create_terminal``) that must not fail
     the terminal's own deletion/rollback over a worktree cleanup issue.
@@ -302,6 +308,9 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
     """
     path = worktree_path if worktree_path else worktree_path_for(repo_root, terminal_id)
     branch = branch_for(terminal_id)
+    # Called only on an explicit abandon (force delete) now — discard the
+    # checkout contents; the branch is still SAFE-deleted so committed work
+    # survives as a branch (addendum r1 #3).
     result = _run_git(["worktree", "remove", "--force", path], cwd=repo_root)
     if result.returncode != 0:
         logger.warning(
@@ -317,6 +326,25 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
             branch,
             result.stderr.strip(),
         )
+
+
+def _branch_has_unmerged_commits(repo_root: str, branch: str) -> bool:
+    """True iff ``branch`` exists AND carries commits not reachable from HEAD.
+
+    Retained as a helper (used by tests and any future GC) though the normal
+    reap no longer force-removes worktrees (addendum r1 #3). Never raises — an
+    infra failure is reported as "no unmerged commits".
+    """
+    verify = _run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+    if verify.returncode != 0:
+        return False
+    result = _run_git(["rev-list", "--count", f"HEAD..{branch}"], cwd=repo_root)
+    if result.returncode != 0:
+        return False
+    try:
+        return int(result.stdout.strip() or "0") > 0
+    except ValueError:
+        return False
 
 
 def list_worktrees(repo_root: str) -> list[dict[str, str | bool]]:
