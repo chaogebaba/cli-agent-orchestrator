@@ -375,3 +375,149 @@ def test_ac17_no_budget_section_fails(tmp_path):
     (pos_dir / "dev.md").write_text(_pos_file(_body_of(50)), encoding="utf-8")
     with pytest.raises(ClauseLintError, match="no \\[budget\\] section"):
         lint_budgets(pos_dir)
+
+
+
+# --- F837 #694: stale certification-row lint (warn level) ------------------
+
+from cli_agent_orchestrator.utils.clause_lint import (  # noqa: E402
+    E_CERT_STALE,
+    lint_certifications,
+)
+
+
+def _cert_positions_dir(tmp_path):
+    """A minimal tmp positions store (with an overlays sibling) for cert tests."""
+    pos = tmp_path / "positions"
+    pos.mkdir()
+    (tmp_path / "overlays").mkdir()
+    (pos / "_clauses.toml").write_text(
+        '[clauses.callback-contract]\nmarker = "<!-- clause:callback-contract -->"\n'
+        '[required]\ndev = ["callback-contract"]\n',
+        encoding="utf-8",
+    )
+    return pos
+
+
+def _current_pair(pos_dir, position, provider):
+    """Compute the current (position_sha, overlay_sha) the resolver would see."""
+    import frontmatter
+
+    from cli_agent_orchestrator.utils.profile_composition import (
+        overlay_sha,
+        position_sha,
+    )
+
+    parsed = frontmatter.loads((pos_dir / f"{position}.md").read_text(encoding="utf-8"))
+    ps = position_sha(parsed.content, dict(parsed.metadata))
+    ov_dir = pos_dir.parent / "overlays"
+    frags = []
+    for name in (f"{provider}.md", f"{provider}.{position}.md"):
+        f = ov_dir / name
+        if f.exists():
+            frags.append(f.read_text(encoding="utf-8"))
+    return ps, overlay_sha(frags)
+
+
+def _pos_with_cert(body_note, rows_yaml):
+    """A dev.md position body carrying the required clause + a certification block."""
+    fm = "---\nrole: developer\n"
+    if rows_yaml is not None:
+        fm += rows_yaml
+    fm += "---\n"
+    return f"{fm}\n# Dev {body_note}\n\n<!-- clause:callback-contract -->\nbody\n"
+
+
+def test_f837_fresh_row_is_not_stale(tmp_path):
+    # A row whose (position_sha, overlay_sha) matches the current pair → no finding.
+    pos = _cert_positions_dir(tmp_path)
+    # First write the body with NO cert block so we can compute its current pair;
+    # the cert block is excluded from position_sha, so adding it does not shift ps.
+    (pos / "dev.md").write_text(_pos_with_cert("v1", None), encoding="utf-8")
+    ps, ov = _current_pair(pos, "dev", "kiro_cli")
+    rows = (
+        "certification:\n"
+        "  - provider: kiro_cli\n"
+        f"    position_sha: {ps}\n"
+        f"    overlay_sha: {ov}\n"
+        "    outcome: PASS\n"
+    )
+    (pos / "dev.md").write_text(_pos_with_cert("v1", rows), encoding="utf-8")
+    findings = lint_certifications(pos)
+    assert findings == [], [f.message() for f in findings]
+
+
+def test_f837_stale_row_is_flagged(tmp_path):
+    # A row whose recorded position_sha no longer matches the current body → STALE.
+    pos = _cert_positions_dir(tmp_path)
+    rows = (
+        "certification:\n"
+        "  - provider: kiro_cli\n"
+        "    position_sha: deadbeefdeadbeef\n"  # deliberately wrong (stale)
+        "    overlay_sha: cafebabecafebabe\n"
+        "    outcome: PASS\n"
+    )
+    (pos / "dev.md").write_text(_pos_with_cert("v1", rows), encoding="utf-8")
+    findings = lint_certifications(pos)
+    assert len(findings) == 1, [f.message() for f in findings]
+    f = findings[0]
+    assert f.code == E_CERT_STALE
+    assert f.position == "dev" and f.provider == "kiro_cli"
+    assert f.row_position_sha == "deadbeefdeadbeef"
+    # The finding names the current pair (what re-cert must record).
+    ps, ov = _current_pair(pos, "dev", "kiro_cli")
+    assert f.current_position_sha == ps and f.current_overlay_sha == ov
+    assert "E-CERT-STALE" in f.message()
+
+
+def test_f837_missing_row_is_uncertified_not_stale(tmp_path):
+    # A cell with NO certification row is UNCERTIFIED (resolver's assign-time
+    # verdict), NOT a stale-row lint finding — lint_certifications ignores it.
+    pos = _cert_positions_dir(tmp_path)
+    (pos / "dev.md").write_text(_pos_with_cert("v1", None), encoding="utf-8")
+    findings = lint_certifications(pos)
+    assert findings == [], [f.message() for f in findings]
+
+
+def test_f837_stale_after_body_edit(tmp_path):
+    # End-to-end: a FRESH row goes stale when the position body is edited without
+    # re-cert — exactly the F837 drift (the #430 HEADER CONTRACT fold shape).
+    pos = _cert_positions_dir(tmp_path)
+    (pos / "dev.md").write_text(_pos_with_cert("v1", None), encoding="utf-8")
+    ps, ov = _current_pair(pos, "dev", "kiro_cli")
+    rows = (
+        "certification:\n"
+        "  - provider: kiro_cli\n"
+        f"    position_sha: {ps}\n"
+        f"    overlay_sha: {ov}\n"
+        "    outcome: PASS\n"
+    )
+    # Fresh row + edited BODY (v2) in one write → row now describes the old body.
+    (pos / "dev.md").write_text(_pos_with_cert("v2 EDITED BODY", rows), encoding="utf-8")
+    findings = lint_certifications(pos)
+    assert len(findings) == 1 and findings[0].code == E_CERT_STALE
+    assert findings[0].row_position_sha == ps  # recorded old sha
+    assert findings[0].current_position_sha != ps  # body moved
+
+
+def test_f837_overlay_edit_makes_row_stale(tmp_path):
+    # A row can go stale via the OVERLAY leg alone (position body unchanged).
+    pos = _cert_positions_dir(tmp_path)
+    ov_dir = pos.parent / "overlays"
+    (ov_dir / "kiro_cli.md").write_text("---\n---\noverlay v1\n", encoding="utf-8")
+    (pos / "dev.md").write_text(_pos_with_cert("v1", None), encoding="utf-8")
+    ps, ov = _current_pair(pos, "dev", "kiro_cli")
+    rows = (
+        "certification:\n"
+        "  - provider: kiro_cli\n"
+        f"    position_sha: {ps}\n"
+        f"    overlay_sha: {ov}\n"
+        "    outcome: PASS\n"
+    )
+    (pos / "dev.md").write_text(_pos_with_cert("v1", rows), encoding="utf-8")
+    assert lint_certifications(pos) == []  # fresh
+    # Edit the overlay → overlay_sha moves → row stale.
+    (ov_dir / "kiro_cli.md").write_text("---\n---\noverlay v2 CHANGED\n", encoding="utf-8")
+    findings = lint_certifications(pos)
+    assert len(findings) == 1 and findings[0].code == E_CERT_STALE
+    assert findings[0].row_overlay_sha == ov and findings[0].current_overlay_sha != ov
