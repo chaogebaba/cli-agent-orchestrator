@@ -450,10 +450,21 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         _dbm.engine = _sub_engine
         _dbm.SessionLocal = _sm(autocommit=False, autoflush=False, bind=_sub_engine)
 
+        # The resuming seat must be the root's recorded OWNER (the real operator
+        # flow: the same seat that spawned the worker resumes it after an account
+        # switch). The worker root's owner_principal was set at spawn; resolve it
+        # from the (now subprocess-wired) DB and make the resume caller present as
+        # that owner — otherwise resume correctly refuses resume_not_owner.
+        _owner = None
+        _rootrow = _dbm.get_conversation_identity(identity_key)
+        if _rootrow:
+            _owner = _rootrow.get("owner_principal")
+
         os.environ["CAO_ENDPOINT"] = api
         os.environ["CAO_TERMINAL_ID"] = supervisor_id
         from cli_agent_orchestrator.mcp_server import server as _srv
 
+        from unittest.mock import patch as _patch
         resume_handle = captured_sid or worker_id
         assign_kwargs = dict(agent_profile=profile, message=(
             f"What exact token did I ask you to remember earlier? "
@@ -462,7 +473,8 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         if model:
             assign_kwargs["model"] = model
         try:
-            res = _srv._assign_impl(**assign_kwargs)
+            with _patch.object(_srv, "_f829_resolve_caller_principal", return_value=_owner):
+                res = _srv._assign_impl(**assign_kwargs)
         finally:
             _dbm.engine, _dbm.SessionLocal = _saved_engine, _saved_sl
         rec("ASSIGN_RESUME_FROM", f"resume_from={resume_handle!r} -> " + str({k: res.get(k) for k in
