@@ -2834,7 +2834,62 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
-        # F439 (#294) round 5 / BLOCKER 1: the row is now durably published and
+        # F829 A1 (D3 step 4 / verdict B4): mint the FRESH conversation root +
+        # recovery_manifest at production spawn — additive, fresh-spawn ONLY (a
+        # resume re-points an existing root via publish_current_terminal, so
+        # skip when resuming/forking). The per-attempt capture_nonce is minted
+        # here, stored on the manifest, and injected into the worker's first
+        # turn below so a kiro session is positively attributable to THIS
+        # attempt. Best-effort: a mint failure must never fail a spawn.
+        _is_resume_spawn = bool(resume_uuid) or (
+            fork_context is not None and getattr(fork_context, "mode", None) == "resume"
+        )
+        _spawn_capture_nonce: Optional[str] = None
+        if not _is_resume_spawn:
+            try:
+                from cli_agent_orchestrator.clients.database import (
+                    mint_capture_nonce,
+                    mint_spawn_identity,
+                )
+
+                _spawn_capture_nonce = mint_capture_nonce()
+                _pub_meta = get_terminal_metadata(terminal_id) or {}
+                _owner_mb = _pub_meta.get("caller_mailbox_id") or caller_id
+                _wt = _worktree_info_dict if isinstance(_worktree_info_dict, dict) else {}
+                mint_spawn_identity(
+                    identity_key=f"conv_{terminal_id}",
+                    provider=provider,
+                    provider_namespace=None,
+                    agent_profile=agent_profile,
+                    model=model,
+                    reasoning_effort=None,
+                    owner_principal=_owner_mb,
+                    origin_callback_ref=None,
+                    current_terminal_id=terminal_id,
+                    cwd=resolved_working_directory,
+                    worktree_path=_wt.get("worktree_path"),
+                    worktree_branch=_wt.get("expected_branch"),
+                    repo_root=_wt.get("repo_root"),
+                    capture_nonce=_spawn_capture_nonce,
+                    launch_attempt_id=terminal_id,
+                )
+            except Exception:
+                logger.debug("f829 spawn-identity mint skipped for %s", terminal_id, exc_info=True)
+                _spawn_capture_nonce = None
+        # verdict B4: inject the per-attempt nonce into the kiro worker's FIRST
+        # turn (seed/own marker), so the eager + reap selectors positively
+        # attribute the kiro session it writes to THIS attempt. An invisible
+        # trailer line on the first message is enough — it lands verbatim in
+        # kiro's messages.jsonl. Only for a fresh kiro spawn with a message.
+        if (
+            _spawn_capture_nonce
+            and provider == "kiro_cli"
+            and initial_message
+            and not _is_resume_spawn
+        ):
+            initial_message = (
+                f"{initial_message}\n\n<!-- cao-capture-nonce: {_spawn_capture_nonce} -->"
+            )
         # visible in the listing. Retire this create's reservation HERE — before
         # the slow provider-init phase below — in one locked step that also drops
         # this terminal id from ``_cap_publishing_ids``. The row was already
@@ -7609,7 +7664,21 @@ def _resolve_reap_resume_key(
             capture_kiro_session_id_from_store,
         )
 
-        captured, cap_reason, count = capture_kiro_session_id_from_store(cwd, terminal_id)
+        # verdict B4: prefer this launch attempt's capture_nonce (per-attempt
+        # positive attribution) over the copyable per-terminal assign-trailer.
+        # Load it from the root's recovery_manifest via the identity_key.
+        _nonce = None
+        _ikey = identity.get("identity_key")
+        if _ikey:
+            from cli_agent_orchestrator.clients.database import get_recovery_manifest
+
+            _manifest = get_recovery_manifest(_ikey)
+            if _manifest:
+                _nonce = _manifest.get("capture_nonce")
+
+        captured, cap_reason, count = capture_kiro_session_id_from_store(
+            cwd, terminal_id, capture_nonce=_nonce
+        )
         if captured:
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return captured, bool(supports), reason

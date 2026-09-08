@@ -470,3 +470,64 @@ def test_ac1_identity_mismatch_does_not_publish(real_sqlite_env):
     assert root["resume_claim"] is None
     events = [e["event"] for e in d.get_conversation_events(key)]
     assert "resume_failed" in events and "resume_published" not in events
+
+
+def test_b4_mint_spawn_identity_writes_root_manifest_and_nonce(real_sqlite_env):
+    """B4/D3-step-4: a fresh spawn mint creates the conversation root + recovery
+    manifest carrying the per-attempt capture_nonce, links the terminal_identity
+    incarnation, and is idempotent on identity_key."""
+    nonce = d.mint_capture_nonce()
+    assert nonce.startswith("cao-nonce-")
+    # the incarnation row must exist first (create path writes it before mint).
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalIdentityModel(
+                terminal_id="spawn001",
+                provider="kiro_cli",
+                base_name="spawn001",
+                lifecycle="live",
+                cwd="/tmp",
+            )
+        )
+    d.mint_spawn_identity(
+        identity_key="conv_spawn001",
+        provider="kiro_cli",
+        provider_namespace=None,
+        agent_profile="kiro_dev",
+        model="m1",
+        reasoning_effort=None,
+        owner_principal="mb_boss",
+        origin_callback_ref=None,
+        current_terminal_id="spawn001",
+        cwd="/tmp",
+        capture_nonce=nonce,
+        launch_attempt_id="spawn001",
+    )
+    root = d.get_conversation_identity("conv_spawn001")
+    assert root is not None
+    assert root["origin"] == "spawn" and root["lifecycle"] == "live"
+    assert root["owner_principal"] == "mb_boss"
+    assert root["current_terminal_id"] == "spawn001"
+    manifest = d.get_recovery_manifest("conv_spawn001")
+    assert manifest is not None and manifest["capture_nonce"] == nonce
+    assert manifest["cwd"] == "/tmp"
+    # the incarnation is now linked to the root.
+    ti = d.get_terminal_identity("spawn001")
+    assert ti["identity_key"] == "conv_spawn001"
+    # idempotent: a second mint with the same key leaves the row untouched.
+    d.mint_spawn_identity(
+        identity_key="conv_spawn001",
+        provider="kiro_cli",
+        provider_namespace=None,
+        agent_profile="other",
+        model="m2",
+        reasoning_effort=None,
+        owner_principal="mb_other",
+        origin_callback_ref=None,
+        current_terminal_id="spawn001",
+        cwd="/other",
+        capture_nonce="cao-nonce-second",
+    )
+    root2 = d.get_conversation_identity("conv_spawn001")
+    assert root2["owner_principal"] == "mb_boss"  # unchanged
+    assert d.get_recovery_manifest("conv_spawn001")["capture_nonce"] == nonce  # unchanged

@@ -4878,6 +4878,95 @@ def mint_conversation_identity(
             _write(own)
 
 
+def mint_capture_nonce() -> str:
+    """F829 D4/B4: a per-launch-attempt capture nonce.
+
+    A short random token minted at spawn, stored on the root's
+    ``recovery_manifest``, and injected into the worker's first turn so a kiro
+    session written under a shared cwd can be POSITIVELY attributed to THIS
+    attempt (never "newest updatedAt", never a copyable per-terminal string).
+    """
+    import secrets
+
+    return f"cao-nonce-{secrets.token_hex(16)}"
+
+
+def mint_spawn_identity(
+    *,
+    identity_key: str,
+    provider: str,
+    provider_namespace: Optional[str],
+    agent_profile: Optional[str],
+    model: Optional[str],
+    reasoning_effort: Optional[str],
+    owner_principal: Optional[str],
+    origin_callback_ref: Optional[str],
+    current_terminal_id: str,
+    cwd: Optional[str],
+    worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    worktree_commit: Optional[str] = None,
+    capture_nonce: Optional[str] = None,
+    launch_attempt_id: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D3 step 4): mint a FRESH conversation root + its recovery manifest
+    at production spawn, in ONE transaction.
+
+    Additive: called only for a genuinely fresh spawn (never a resume, whose new
+    incarnation re-points an EXISTING root via publish_current_terminal). Mints
+    the ``conversation_identity`` root (origin=spawn, live) AND the 1:1
+    ``recovery_manifest`` carrying the cwd, worktree provenance, the per-attempt
+    ``capture_nonce`` and ``launch_attempt_id``. When ``db`` is supplied the
+    mint lands in the terminal's own transaction so root + manifest + terminals
+    row commit together. Idempotent on identity_key (a pre-existing root is left
+    untouched)."""
+
+    def _write(session: Session) -> None:
+        exists = (
+            session.query(ConversationIdentityModel.identity_key)
+            .filter_by(identity_key=identity_key)
+            .first()
+        )
+        if exists is not None:
+            return
+        mint_conversation_identity(
+            identity_key=identity_key,
+            provider=provider,
+            provider_namespace=provider_namespace,
+            agent_profile=agent_profile,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            owner_principal=owner_principal,
+            origin_callback_ref=origin_callback_ref,
+            current_terminal_id=current_terminal_id,
+            db=session,
+        )
+        upsert_recovery_manifest(
+            identity_key,
+            cwd=cwd,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            worktree_branch=worktree_branch,
+            worktree_commit=worktree_commit,
+            capture_nonce=capture_nonce,
+            launch_attempt_id=launch_attempt_id,
+            db=session,
+        )
+        # Link this spawn's terminal_identity incarnation to the new root.
+        session.query(TerminalIdentityModel).filter_by(terminal_id=current_terminal_id).update(
+            {TerminalIdentityModel.identity_key: identity_key},
+            synchronize_session=False,
+        )
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
 def upsert_recovery_manifest(
     identity_key: str,
     *,

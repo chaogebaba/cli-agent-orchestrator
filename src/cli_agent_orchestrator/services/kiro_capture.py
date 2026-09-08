@@ -8,8 +8,11 @@ messages.jsonl materialise early in the first turn, not at spawn, not only at
 completion).
 
 So capture is EAGER and BOUNDED, starting at the FIRST TURN's start:
-* poll on the status tick; each attempt tries ``capture_kiro_uuid`` (the CLI's
-  own ``--list-sessions --format json`` surface).
+* poll on the status tick; each attempt reads the kiro on-disk store via
+  ``capture_kiro_session_id_from_store`` and POSITIVELY attributes the session
+  carrying THIS launch attempt's ``capture_nonce`` (verdict B4) — never "newest
+  updatedAt". With no nonce recorded it falls back to the per-terminal
+  assign-trailer marker (still positive, still never mtime).
 * the bound is ``CAPTURE_MAX_TICKS`` (20) ticks OR ``CAPTURE_MAX_SECONDS`` (120)
   wall-clock from the first attempt, whichever first.
 * on capture: attribute + bind via ``attach_captured_uuid`` (D4).
@@ -99,18 +102,25 @@ def poll_kiro_capture(
     if state.started_at is None:
         state.started_at = tnow
 
-    # Try the capture (the CLI's list-sessions surface). session_capture_none
-    # means the first turn hasn't persisted a row yet — a normal "pending".
-    from cli_agent_orchestrator.services.fork_context_service import (
-        ForkContextError,
-        capture_kiro_uuid,
+    # verdict B4: per-attempt POSITIVE attribution. Select ONLY the session
+    # carrying THIS launch attempt's capture_nonce (minted at spawn, injected
+    # into the first turn, recorded on the root's recovery_manifest) — never
+    # "newest updatedAt". Load the nonce; with no nonce recorded we fall back to
+    # the per-terminal assign-trailer marker inside the store resolver (legacy),
+    # still positive, still never mtime.
+    from cli_agent_orchestrator.clients.database import get_recovery_manifest
+    from cli_agent_orchestrator.services.resume_service import (
+        capture_kiro_session_id_from_store,
     )
+
+    _manifest = get_recovery_manifest(key)
+    _nonce = _manifest.get("capture_nonce") if _manifest else None
 
     captured: Optional[str] = None
     try:
-        captured = capture_kiro_uuid(kas, state.started_at, cwd)
-    except ForkContextError:
-        captured = None
+        captured, _reason, _count = capture_kiro_session_id_from_store(
+            cwd, terminal_id, capture_nonce=_nonce
+        )
     except Exception:
         logger.debug("kiro capture attempt errored for %s", key, exc_info=True)
         captured = None

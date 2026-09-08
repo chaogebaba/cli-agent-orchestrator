@@ -188,6 +188,7 @@ def capture_kiro_session_id_from_store(
     cwd: str,
     terminal_id: str,
     *,
+    capture_nonce: Optional[str] = None,
     recorded_locator: Optional[str] = None,
     sessions_root: Optional[Path] = None,
 ) -> tuple[Optional[str], Optional[str], int]:
@@ -202,19 +203,20 @@ def capture_kiro_session_id_from_store(
     * ``candidate_count`` — how many cwd-matching sessions were seen (for the
       hint).
 
-    Addendum r1 #2 — POSITIVE ATTRIBUTION ONLY. The former "newest by mtime,
-    single candidate after launch epoch" rule is STRUCK. A session id binds
-    only when:
+    Addendum r1 #2 / verdict B4 — PER-ATTEMPT POSITIVE ATTRIBUTION ONLY. The
+    former "newest by mtime" rule is STRUCK. A session id binds only when:
       (1) ``recorded_locator`` is set (a locator CAO already recorded) — used
           verbatim; OR
       (2) EXACTLY ONE session under ``~/.kiro/sessions/<sha256(cwd)[:16]>/``
           whose ``session.json`` names ``cwd`` (rootPaths/workspacePaths) AND
-          whose ``messages.jsonl`` contains THIS terminal's own unique seed
-          marker — the ``[Assigned by terminal <terminal_id>…]`` assign-trailer
-          text, which is unique per terminal.
-    Never binds on cwd+mtime alone. Zero or >1 attributed matches → (None,
-    "capture_unknown", count).
-    """
+          whose ``messages.jsonl`` carries THIS launch attempt's marker.
+
+    The attempt marker is the per-launch ``capture_nonce`` when one was minted
+    and injected (verdict B4: a per-attempt nonce, not a copyable per-terminal
+    string). When no nonce was recorded (legacy rows / a spawn before this
+    slice) it falls back to the per-terminal ``[Assigned by terminal <id>``
+    assign-trailer marker. Never binds on cwd+mtime alone. Zero or >1 attributed
+    matches → (None, "capture_unknown", count)."""
     if recorded_locator:
         return recorded_locator, None, 1
     root = sessions_root if sessions_root is not None else _kiro_sessions_root()
@@ -222,7 +224,9 @@ def capture_kiro_session_id_from_store(
     if not hash_dir.is_dir():
         return None, "capture_unknown", 0
     target = os.path.realpath(cwd)
-    marker = f"[Assigned by terminal {terminal_id}"
+    # Prefer the per-attempt nonce marker (positive, non-copyable); fall back to
+    # the per-terminal assign-trailer only when no nonce was minted.
+    marker = capture_nonce if capture_nonce else f"[Assigned by terminal {terminal_id}"
     cwd_matches = 0
     attributed: list[str] = []
     for sess_dir in hash_dir.iterdir():
