@@ -454,6 +454,17 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     ".minimax",
     # antigravity_cli (gemini): Path.home() / ".gemini"
     ".gemini",
+    # claude_code: Claude Code reads auth (oauthAccount) AND first-run state
+    # (hasCompletedOnboarding, theme) from ~/.claude.json, plus session/config
+    # under ~/.claude/. Without these in the redirected HOME, claude re-runs its
+    # interactive first-run onboarding (theme picker) inside the CAO tmux pane
+    # and never reaches ready — CAO init then times out at 180s (F829 build-2
+    # finding: the ~/.bun symlink gave claude its BINARY but not its CONFIG, so
+    # every claude_code e2e terminal hung at the theme wizard). Linking the real
+    # config in fixes auth AND onboarding at once. (.claude.json is a FILE; the
+    # loop below symlinks files and dirs alike.)
+    ".claude",
+    ".claude.json",
 )
 
 
