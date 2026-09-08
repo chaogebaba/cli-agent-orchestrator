@@ -3,13 +3,13 @@
 Publisher: terminal.{id}.output
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import logging
 import os
 import select
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -22,12 +22,12 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_STALL_CHECKS,
 )
 from cli_agent_orchestrator.services.event_bus import bus
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class EnrollmentAuthority:
     """Immutable authority tuple pinned at FIFO enrollment time (D19)."""
+
     terminal_id: str
     terminal_generation: int | None
     incarnation_id: str | None  # None = explicit process-less marker
@@ -108,7 +108,7 @@ def _f138_is_durable_detail(detail: str) -> bool:
         return True
     # Parse "incarnation_state=<value>" exactly (no substring match).
     if detail.startswith("incarnation_state="):
-        state_value = detail[len("incarnation_state="):]
+        state_value = detail[len("incarnation_state=") :]
         return state_value in _F138_DURABLE_STATES
     return False
 
@@ -342,7 +342,9 @@ class FifoManager:
         self._f138_attention_sent.pop(terminal_id, None)
         self._probe_failures.pop(terminal_id, None)
 
-    def stop_reader(self, terminal_id: str) -> None:
+    def stop_reader(
+        self, terminal_id: str, *, join_timeout: float = 2.0
+    ) -> threading.Thread | None:
         """Stop the reader thread (if running) and delete the FIFO file.
 
         The unlink is best-effort and runs even when no in-memory reader is
@@ -350,6 +352,15 @@ class FifoManager:
         terminals after a server restart, where ``_readers`` is empty but stale
         ``*.fifo`` files may still be on disk. Without it those files would
         accumulate unbounded.
+
+        ``join_timeout`` bounds the join on the reader thread (default 2.0s,
+        the historical value). A caller that needs to know whether the reader
+        actually exited within that bound gets the truth from the return value:
+        the still-alive :class:`threading.Thread` is returned when the reader
+        refused to die within ``join_timeout``, else ``None``. This is the only
+        reliable survivor signal — the thread is popped from ``_threads`` here
+        under the lock, so a later ``_threads.get(terminal_id)`` can never see
+        it again (issue #624 §Gate blocker 2).
         """
         with self._lock:
             stop_flag = self._readers.pop(terminal_id, None)
@@ -369,6 +380,7 @@ class FifoManager:
         # actually torn down at process shutdown (api/main.py's lifespan).
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
+        still_alive: threading.Thread | None = None
         if stop_flag and thread:
             # The reader never blocks in open()/read() (non-blocking fd +
             # select with a timeout), so setting the flag is sufficient — it is
@@ -377,15 +389,17 @@ class FifoManager:
             # could strand the thread forever in a blocking FIFO open on an
             # unlinked inode (issue #382).
             stop_flag.set()
-            thread.join(timeout=2.0)
+            thread.join(timeout=join_timeout)
             if thread.is_alive():
                 # Never silent: a leaked reader thread was how #382's wedge
                 # built up. With the non-blocking loop this should not happen.
                 logger.warning(
                     "FIFO reader thread for terminal %s did not exit "
-                    "within 2s; leaking a daemon thread",
+                    "within %.4gs; leaking a daemon thread",
                     terminal_id,
+                    join_timeout,
                 )
+                still_alive = thread
             else:
                 logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
@@ -396,6 +410,12 @@ class FifoManager:
             fifo_path.unlink()
         except OSError:
             pass
+
+        # Truthful survivor signal for stop_all_readers: the thread reference is
+        # already gone from _threads (popped above under the lock), so this
+        # return value is the ONLY way a caller learns the reader outlived the
+        # join. None on a clean stop (or when nothing was tracked).
+        return still_alive
 
     def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to the event bus.
@@ -534,12 +554,23 @@ class FifoManager:
             )
             self._watchdog_thread.start()
 
-    def stop_watchdog(self) -> None:
-        """Stop the watchdog thread (shutdown / tests)."""
+    def stop_watchdog(self, *, join_timeout: float = 2.0) -> bool:
+        """Stop the watchdog thread (shutdown / tests).
+
+        Returns ``True`` when there is no live watchdog thread afterwards
+        (nothing was running, or it exited within ``join_timeout``), ``False``
+        when a watchdog thread was still alive after the join. Callers that
+        reset watchdog state (``stop_all_readers``) MUST NOT drop the handle on
+        a ``False`` return: a watchdog that timed out here can still be spinning,
+        and forgetting its reference would leak it and let a stale probe resume
+        unobserved (issue #624 §Bounded shutdown judgment).
+        """
         self._watchdog_stop.set()
         thread = self._watchdog_thread
-        if thread is not None:
-            thread.join(timeout=2.0)
+        if thread is None:
+            return True
+        thread.join(timeout=join_timeout)
+        return not thread.is_alive()
 
     def stop_all_readers(self, *, join_timeout: float = 2.0) -> list[str]:
         """Deterministically tear down every tracked reader + the watchdog.
@@ -561,6 +592,14 @@ class FifoManager:
         stops the watchdog. Returns the ids of any readers whose thread did not
         exit within ``join_timeout`` (empty list on a clean teardown), so a
         caller can assert on the leak rather than discover it at shutdown.
+
+        ``join_timeout`` is the per-reader join bound and is forwarded to each
+        ``stop_reader`` call (issue #624 §Gate blocker 2 — the parameter used to
+        be silently dropped). The survivor list is built from what ``stop_reader``
+        itself reports (the still-alive thread it returns), NOT from a later
+        ``_threads`` lookup: ``stop_reader`` pops the thread out of ``_threads``
+        before joining, so a post-hoc lookup can never see a survivor and would
+        always (falsely) report a clean teardown.
         """
         with self._lock:
             terminal_ids = list(self._threads.keys())
@@ -569,26 +608,34 @@ class FifoManager:
         for terminal_id in terminal_ids:
             # stop_reader takes the lock itself and is idempotent; call it
             # outside our lock so the bounded join cannot deadlock the watchdog.
-            self.stop_reader(terminal_id)
+            # Forward the bound and trust its return value for the survivor
+            # verdict — it is the only reference left to the reader thread.
+            survivor = self.stop_reader(terminal_id, join_timeout=join_timeout)
+            if survivor is not None and survivor.is_alive():
+                still_alive.append(terminal_id)
 
         # Stop the shared watchdog last (create_reader may have started it).
-        self.stop_watchdog()
-        # Allow re-arming a fresh watchdog for the next test / next server.
-        self._watchdog_stop.clear()
-        with self._lock:
-            self._watchdog_thread = None
-
-        # Report any reader thread that refused to die within the bound.
-        for terminal_id in terminal_ids:
+        watchdog_stopped = self.stop_watchdog(join_timeout=join_timeout)
+        if watchdog_stopped:
+            # Allow re-arming a fresh watchdog for the next test / next server.
+            self._watchdog_stop.clear()
             with self._lock:
-                thread = self._threads.get(terminal_id)
-            if thread is not None and thread.is_alive():
-                still_alive.append(terminal_id)
+                self._watchdog_thread = None
+        else:
+            # The watchdog did not exit within the bound. Do NOT clear the stop
+            # flag or drop the handle: clearing the flag would let the still-live
+            # thread resume its loop, and dropping the reference would leak it
+            # unobservably. Keep _watchdog_stop set and retain the handle so a
+            # later stop_watchdog() can join the same thread (issue #624).
+            logger.warning(
+                "FIFO pipe watchdog did not exit within %.4gs; retaining its "
+                "handle and leaving the stop flag set",
+                join_timeout,
+            )
+
         return still_alive
 
-    def _bound_probe_failure(
-        self, terminal_id: str, dispatch_epoch: int | None = None
-    ) -> None:
+    def _bound_probe_failure(self, terminal_id: str, dispatch_epoch: int | None = None) -> None:
         """#598: Bound the probe-throws-because-gone liveness storm.
 
         The session/window/whole tmux server is gone, so probe() raises
@@ -650,7 +697,8 @@ class FifoManager:
             except Exception:
                 logger.warning(
                     "f218_confirmed_gone_pipeline_outer_failed: terminal=%s",
-                    terminal_id, exc_info=True,
+                    terminal_id,
+                    exc_info=True,
                 )
 
             # D20: Report BEFORE unenroll — uses pinned authority.
@@ -699,14 +747,19 @@ class FifoManager:
 
                 backend = TmuxBackend()
                 scope_probe = backend.session_scope_probe(
-                    session_name, window_name=window_name,
-                    samples=samples, timeout_s=timeout_s,
+                    session_name,
+                    window_name=window_name,
+                    samples=samples,
+                    timeout_s=timeout_s,
                 )
 
                 logger.info(
                     "f218_scope_probe terminal=%s session=%s hint=%s scope=%s samples=%d "
                     "session_present=%s siblings=%s elapsed=n/a",
-                    terminal_id, session_name, scope_hint, scope_probe.scope,
+                    terminal_id,
+                    session_name,
+                    scope_hint,
+                    scope_probe.scope,
                     scope_probe.samples,
                     scope_probe.session_present,
                     len(scope_probe.sibling_windows) if scope_probe.sibling_windows else 0,
@@ -715,14 +768,21 @@ class FifoManager:
                 # Step 3: Write tombstone T-1 (D3) — last moment /proc exists
                 from cli_agent_orchestrator.services.pane_tombstone_service import record
                 from cli_agent_orchestrator.services.session_degradation_service import (
-                    resolve_session_incarnation,
                     mark_degraded,
                     raise_alarm,
+                    resolve_session_incarnation,
                 )
 
                 forensics_enabled = bool(ConfigService.get("forensics.tombstone_enabled", True))
-                incarnation_id = authority.incarnation_id or f"processless:{terminal_id}:{authority.terminal_generation}"
-                token_hash = self._f138_get_token_hash(authority.incarnation_id) if authority.incarnation_id else None
+                incarnation_id = (
+                    authority.incarnation_id
+                    or f"processless:{terminal_id}:{authority.terminal_generation}"
+                )
+                token_hash = (
+                    self._f138_get_token_hash(authority.incarnation_id)
+                    if authority.incarnation_id
+                    else None
+                )
 
                 # Resolve session incarnation (D15: total, never None)
                 try:
@@ -779,7 +839,8 @@ class FifoManager:
             # D11: pipeline failures never block reconciliation
             logger.warning(
                 "f218_confirmed_gone_pipeline_failed: terminal=%s",
-                terminal_id, exc_info=True,
+                terminal_id,
+                exc_info=True,
             )
 
     def _f138_report_confirmed_gone(self, terminal_id: str, source: str) -> bool:
@@ -887,11 +948,7 @@ class FifoManager:
             )
 
             with SessionLocal() as db:
-                inc = (
-                    db.query(ProcessIncarnationModel)
-                    .filter_by(id=incarnation_id)
-                    .one_or_none()
-                )
+                inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
                 if inc and hasattr(inc, "token_hash"):
                     return inc.token_hash or "unknown"
         except Exception:
@@ -1027,9 +1084,8 @@ class FifoManager:
                         return  # Stale — discard
             # D15: Classify ValueError shapes from get_history().
             msg = str(ve)
-            if (
-                (msg.startswith("Session '") and msg.endswith("' not found"))
-                or ("not found in session '" in msg and msg.startswith("Window '"))
+            if (msg.startswith("Session '") and msg.endswith("' not found")) or (
+                "not found in session '" in msg and msg.startswith("Window '")
             ):
                 # Definitive absence — session/window genuinely gone.
                 # D1: Derive hint from the string shape (stored, never acted on).

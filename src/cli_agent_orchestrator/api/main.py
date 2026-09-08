@@ -2041,10 +2041,21 @@ async def lifespan(app: FastAPI):
         pass
 
     await terminal_service.shutdown_deferred_tasks()
-    # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
-    # threading.Thread (not asyncio), so join it directly rather than via
-    # asyncio.gather with the tasks above.
-    fifo_manager.stop_watchdog()
+    # Deterministically tear down every FIFO reader AND the pipe-pane liveness
+    # watchdog thread (issue #388 for the watchdog, issue #624 F767 for the
+    # readers). stop_all_readers() subsumes the old watchdog-only stop: it stops
+    # every tracked reader on the bounded stop_reader path first, then the
+    # watchdog. Without this, orderly shutdown left the reader threads spinning
+    # in select()/os.read() while the interpreter tore their module globals
+    # down, printing "Exception ignored in thread" tracebacks to stderr. These
+    # are plain threading.Threads (not asyncio), so this joins them directly
+    # rather than via asyncio.gather with the tasks above.
+    leaked_readers = fifo_manager.stop_all_readers()
+    if leaked_readers:
+        logger.warning(
+            "FIFO reader thread(s) did not exit during shutdown: %s",
+            ", ".join(leaked_readers),
+        )
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:

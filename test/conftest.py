@@ -600,7 +600,6 @@ def isolated_memory_db(tmp_path, monkeypatch):
         engine.dispose()
 
 
-
 # ---------------------------------------------------------------------------
 # F767 (#624): FIFO reader thread leak — deterministic teardown + leak guard
 # ---------------------------------------------------------------------------
@@ -629,6 +628,21 @@ def _drain_leaked_fifo_readers() -> Iterator[None]:
     module is only present once a test has touched the terminal/FIFO stack, so
     a trivial test that never imports it pays nothing and its process state is
     unchanged (same discipline as _isolate_terminal_service_registries above).
+
+    Teardown surfaces failures rather than swallowing them (issue #624 §Gate
+    blocker 3): a blanket ``except Exception: pass`` erased exactly the cleanup
+    failures this fixture exists to catch. Instead:
+
+    - if ``stop_all_readers`` RAISES, the exception propagates and pytest
+      reports the test in error (nothing is masked);
+    - if ``stop_all_readers`` returns a non-empty survivor list (readers that
+      refused to die within the join bound), the fixture fails the test with the
+      survivor ids, so a genuine teardown leak is loud instead of silent.
+
+    Running in teardown (after ``yield``), a failure here is reported against
+    the just-finished test without erasing that test's own body result — a
+    passing body still surfaces the leak, a failing body still surfaces its own
+    assertion.
     """
     yield
     module = sys.modules.get("cli_agent_orchestrator.services.fifo_reader")
@@ -637,10 +651,13 @@ def _drain_leaked_fifo_readers() -> Iterator[None]:
     fifo_manager = getattr(module, "fifo_manager", None)
     if fifo_manager is None:
         return
-    try:
-        fifo_manager.stop_all_readers()
-    except Exception:  # noqa: BLE001 — teardown must never fail a test
-        pass
+    survivors = fifo_manager.stop_all_readers()
+    if survivors:
+        pytest.fail(
+            "FIFO reader thread(s) survived teardown drain: "
+            f"{', '.join(survivors)}. stop_all_readers() could not join them "
+            "within the bound — a reader was leaked (issue #624)."
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
