@@ -76,6 +76,14 @@ _MODEL = {
 _READY = ("idle", "completed")
 _READY_TIMEOUT = 120.0
 _TURN_TIMEOUT = 180.0
+_CREATE_TIMEOUT = 600.0  # supervisor: 600s create budget for real-provider init on a box
+_CREATE_WATCHDOG_S = 90.0  # capture tmux/pane/server.log if a create exceeds this while blocked
+
+# Persistent diagnostics dir on the box scratch (survives fixture teardown so a
+# stall in claude_code init is inspectable — supervisor directive).
+_DIAG_DIR = Path(
+    os.environ.get("F829_DIAG_DIR", str(Path.home() / "box-scratch" / "f829-b2-fix" / "logs"))
+)
 
 # codex quota-banner fragments — if seen, record and STOP (never touch auth).
 _QUOTA_BANNERS = (
@@ -104,13 +112,58 @@ def _wait_ready(tid: str, timeout: float = _READY_TIMEOUT) -> str:
     return s
 
 
+def _capture_diag(cao_server, tag: str) -> str:
+    """Snapshot tmux windows + each pane tail + the live server.log so a stall
+    in provider init (tmux spawn vs MCP handshake vs first turn) is inspectable
+    AFTER the fixture tears the scratch HOME down. Best-effort; never raises."""
+    import contextlib as _c
+    import shutil as _sh
+
+    _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = f"{tag}-{time.strftime('%H%M%S')}"
+    lines: list[str] = [f"# diag {stamp}"]
+    # tmux windows across sessions (test sessions carry the cao-test- prefix).
+    with _c.suppress(Exception):
+        lw = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F",
+             "#{session_name}:#{window_name} panes=#{window_panes} active=#{window_active}"],
+            capture_output=True, text=True, timeout=20,
+        )
+        lines.append("## tmux list-windows -a\n" + (lw.stdout or "") + (lw.stderr or ""))
+        # pane tails for cao-test- windows
+        for wl in (lw.stdout or "").splitlines():
+            tgt = wl.split(" ")[0]
+            if "cao-test-" not in tgt:
+                continue
+            with _c.suppress(Exception):
+                cap = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", tgt, "-S", "-120"],
+                    capture_output=True, text=True, timeout=20,
+                )
+                lines.append(f"## pane {tgt}\n{cap.stdout or ''}")
+    # copy the live server.log (before teardown deletes the scratch HOME)
+    with _c.suppress(Exception):
+        if cao_server is not None and Path(cao_server.log_path).exists():
+            dest = _DIAG_DIR / f"server-{stamp}.log"
+            _sh.copy2(cao_server.log_path, dest)
+            lines.append(f"## server.log copied -> {dest}")
+            tail = Path(cao_server.log_path).read_text(errors="replace").splitlines()[-60:]
+            lines.append("## server.log tail\n" + "\n".join(tail))
+    out = "\n\n".join(lines)
+    with _c.suppress(Exception):
+        (_DIAG_DIR / f"diag-{stamp}.txt").write_text(out, encoding="utf-8")
+    return out
+
+
 def _create_session_terminal(api: str, provider: str, profile: str, session: str,
-                             model: str | None) -> tuple[str, str]:
-    # Real-provider terminal init (tmux + MCP handshake + first system-prompt
-    # turn) can take well over two minutes on a loaded box; the live e2e tier
-    # budgets 300s per test (conftest _LIVE_TEST_TIMEOUT). Use a generous client
-    # timeout and one retry on a 500 (rate-limit-induced init timeout), mirroring
-    # test/e2e/conftest.create_terminal.
+                             model: str | None, cao_server=None) -> tuple[str, str]:
+    # Real-provider terminal init (tmux spawn + MCP handshake + first system-
+    # prompt turn) can take many minutes on a box; supervisor set a 600s create
+    # budget + ONE retry. A watchdog thread captures tmux/pane/server.log if a
+    # create call stays blocked past _CREATE_WATCHDOG_S, so a hang is diagnosable
+    # (tmux spawn vs handshake vs first turn) even though POST /sessions blocks.
+    import threading
+
     params = {"provider": provider, "agent_profile": profile, "session_name": session}
     if model:
         params["model"] = model
@@ -119,11 +172,24 @@ def _create_session_terminal(api: str, provider: str, profile: str, session: str
         if attempt:
             params["session_name"] = f"{session}-r{uuid.uuid4().hex[:5]}"
             time.sleep(10)
+        done = threading.Event()
+
+        def _wd(a=attempt):
+            if done.wait(_CREATE_WATCHDOG_S):
+                return
+            _capture_diag(cao_server, f"create-stall-{provider}-a{a}")
+
+        wd = threading.Thread(target=_wd, daemon=True)
+        wd.start()
         try:
-            resp = requests.post(f"{api}/sessions", params=params, timeout=240)
+            resp = requests.post(f"{api}/sessions", params=params, timeout=_CREATE_TIMEOUT)
         except requests.exceptions.ReadTimeout as exc:
-            last = f"ReadTimeout: {exc}"
+            last = f"ReadTimeout after {_CREATE_TIMEOUT}s: {exc}"
+            _capture_diag(cao_server, f"create-timeout-{provider}-a{attempt}")
+            done.set()
             continue
+        finally:
+            done.set()
         last = f"{resp.status_code} {resp.text}"
         if resp.status_code in (200, 201):
             data = resp.json()
@@ -280,13 +346,13 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
     try:
         # supervisor (stays idle; the recorded caller for the resume seam)
         supervisor_id, actual_session = _create_session_terminal(
-            api, provider, profile, session, model
+            api, provider, profile, session, model, cao_server=cao_server
         )
         assert _wait_ready(supervisor_id) in _READY, "supervisor not ready"
 
         # 1. FRESH SPAWN through production create/publish (spawn-mint fires).
         worker_id, _ = _create_session_terminal(
-            api, provider, profile, f"{session}-w", model
+            api, provider, profile, f"{session}-w", model, cao_server=cao_server
         )
         st = _wait_ready(worker_id)
         assert st in _READY, f"worker not ready (status={st})"
@@ -383,6 +449,10 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
                 "shape": shape, "transcript_path": str(tpath),
                 "kiro_foreign": foreign}
     finally:
+        # If we did not reach a clean green/quota return, snapshot diagnostics
+        # (server.log + tmux + panes) before teardown wipes the scratch HOME.
+        with __import__("contextlib").suppress(Exception):
+            _capture_diag(cao_server, f"arm-final-{provider}")
         os.environ.pop("CAO_ENDPOINT", None)
         os.environ.pop("CAO_TERMINAL_ID", None)
         # best-effort cleanup: force-reap anything still around + drop session
@@ -395,11 +465,21 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
                 requests.delete(f"{api}/sessions/{actual_session}", timeout=30)
 
 
-# --- provider arms (kiro → claude → pi → codex last) ------------------------
+# --- provider arms (amended order: claude → codex → pi → kiro) --------------
 
 
+@pytest.mark.timeout(1800)  # supervisor: 30-min outer cap for real-provider arms
+def test_claude_public_resume_arm(require_claude, cao_server: CaoServer, tmp_path):
+    """Claude sonnet through the public assign(resume_from) seam (runs first)."""
+    out = _run_public_resume_arm(cao_server, "claude_code", artifacts_dir=tmp_path)
+    assert out["status"] == "green", out
+
+
+@pytest.mark.timeout(1800)
 def test_kiro_public_resume_arm(require_kiro, cao_server: CaoServer, tmp_path):
-    """Kiro long-lived, TWO same-cwd candidates → resume binds the OWN nonce id."""
+    """Kiro long-lived, TWO same-cwd candidates → resume binds the OWN nonce id.
+    BLOCKED-on-account unless a kiro account is ported to the box (the two-
+    candidate selection is already covered by the unit suite)."""
     out = _run_public_resume_arm(
         cao_server, "kiro_cli", kiro_two_candidate=True, artifacts_dir=tmp_path
     )
@@ -407,18 +487,14 @@ def test_kiro_public_resume_arm(require_kiro, cao_server: CaoServer, tmp_path):
     assert out["shape"]["capture_nonce"], "kiro nonce must be present on the root manifest"
 
 
-def test_claude_public_resume_arm(require_claude, cao_server: CaoServer, tmp_path):
-    """Claude sonnet through the public assign(resume_from) seam."""
-    out = _run_public_resume_arm(cao_server, "claude_code", artifacts_dir=tmp_path)
-    assert out["status"] == "green", out
-
-
+@pytest.mark.timeout(1800)
 def test_pi_public_resume_arm(require_pi, cao_server: CaoServer, tmp_path):
     """Pi glm-5.3-flash through the public assign(resume_from) seam."""
     out = _run_public_resume_arm(cao_server, "pi_cli", artifacts_dir=tmp_path)
     assert out["status"] == "green", out
 
 
+@pytest.mark.timeout(1800)
 def test_codex_public_resume_arm(require_codex, cao_server: CaoServer, tmp_path):
     """Codex gpt-5.6-luna — ONE attempt. On a quota banner, record and stop
     (never touch auth); the arm is not a failure in that case."""
