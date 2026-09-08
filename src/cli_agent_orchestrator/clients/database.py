@@ -4899,7 +4899,8 @@ def mint_spawn_identity(
     agent_profile: Optional[str],
     model: Optional[str],
     reasoning_effort: Optional[str],
-    owner_principal: Optional[str],
+    owner_principal: Optional[str] = None,
+    owner_caller_id: Optional[str] = None,
     origin_callback_ref: Optional[str],
     current_terminal_id: str,
     cwd: Optional[str],
@@ -4921,7 +4922,11 @@ def mint_spawn_identity(
     ``capture_nonce`` and ``launch_attempt_id``. When ``db`` is supplied the
     mint lands in the terminal's own transaction so root + manifest + terminals
     row commit together. Idempotent on identity_key (a pre-existing root is left
-    untouched)."""
+    untouched).
+
+    The durable owner is ``owner_principal`` when given, else the mailbox that
+    owns ``owner_caller_id`` (resolved WITHIN this write's session so no extra
+    metadata read happens on the create path)."""
 
     def _write(session: Session) -> None:
         exists = (
@@ -4931,6 +4936,9 @@ def mint_spawn_identity(
         )
         if exists is not None:
             return
+        _owner = owner_principal
+        if _owner is None and owner_caller_id is not None:
+            _owner = _mailbox_id_for_terminal(session, owner_caller_id) or owner_caller_id
         mint_conversation_identity(
             identity_key=identity_key,
             provider=provider,
@@ -4938,7 +4946,7 @@ def mint_spawn_identity(
             agent_profile=agent_profile,
             model=model,
             reasoning_effort=reasoning_effort,
-            owner_principal=owner_principal,
+            owner_principal=_owner,
             origin_callback_ref=origin_callback_ref,
             current_terminal_id=current_terminal_id,
             db=session,

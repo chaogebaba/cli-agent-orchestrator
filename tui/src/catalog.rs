@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 114;
+const COMMAND_COUNT: usize = 115;
 
 /// What the TUI does with a command.
 ///
@@ -250,6 +250,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::IdentityDiag,
     CommandId::IdentityAttach,
     CommandId::IdentityClaim,
+    CommandId::ProvidersCapabilities,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
@@ -592,6 +593,8 @@ pub enum CommandId {
     IdentityAttach,
     /// `cao identity claim`
     IdentityClaim,
+    /// `cao providers capabilities`
+    ProvidersCapabilities,
     /// `cao terminal hibernated`
     TerminalHibernated,
 }
@@ -1297,6 +1300,17 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "identity_key", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: F829 owner-authorised op, not a launcher action
+        },
+
+        CommandId::ProvidersCapabilities => Command {
+            id: CommandId::ProvidersCapabilities,
+            parent: Some("providers"),
+            leaf_name: "capabilities",
+            summary: "Show declared \u{2227} measured provider capabilities (advertised = declaration \u{2227} passing).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "provider", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: F829 D10 read-only diagnostic, not a launcher action
         },
 
         CommandId::WorkflowApprove => Command {
@@ -2082,6 +2096,7 @@ mod tests {
                     CommandId::IdentityDiag => CommandId::IdentityDiag,
                     CommandId::IdentityAttach => CommandId::IdentityAttach,
                     CommandId::IdentityClaim => CommandId::IdentityClaim,
+                    CommandId::ProvidersCapabilities => CommandId::ProvidersCapabilities,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,

@@ -2853,8 +2853,6 @@ async def create_terminal(
                 )
 
                 _spawn_capture_nonce = mint_capture_nonce()
-                _pub_meta = get_terminal_metadata(terminal_id) or {}
-                _owner_mb = _pub_meta.get("caller_mailbox_id") or caller_id
                 _wt = _worktree_info_dict if isinstance(_worktree_info_dict, dict) else {}
                 mint_spawn_identity(
                     identity_key=f"conv_{terminal_id}",
@@ -2863,7 +2861,7 @@ async def create_terminal(
                     agent_profile=agent_profile,
                     model=model,
                     reasoning_effort=None,
-                    owner_principal=_owner_mb,
+                    owner_caller_id=caller_id,
                     origin_callback_ref=None,
                     current_terminal_id=terminal_id,
                     cwd=resolved_working_directory,
