@@ -3147,7 +3147,7 @@ def _f829_collapse_legacy_rows(conn: Any, uuidlib: Any) -> None:
     uuid_rows = [r for r in remaining if r[3] is not None]
     # Group by (provider, namespace, uuid), ordered by created_at so the newest
     # becomes the current incarnation.
-    groups: dict[tuple[str, str, str], list[tuple]] = {}
+    groups: dict[tuple[str, str, str], list[tuple[Any, ...]]] = {}
     for r in uuid_rows:
         provider = r[1]
         namespace = _f829_default_namespace(provider)
@@ -4703,7 +4703,7 @@ def publish_current_terminal(
     branch); the caller is responsible for the UNIQUE recheck.
     """
     with SessionLocal.begin() as db:
-        values: Dict[str, Any] = {
+        values: Dict[Any, Any] = {
             ConversationIdentityModel.current_terminal_id: terminal_id,
             ConversationIdentityModel.lifecycle: lifecycle,
             ConversationIdentityModel.resume_claim: None,
