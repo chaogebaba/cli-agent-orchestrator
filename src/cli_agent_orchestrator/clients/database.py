@@ -325,13 +325,151 @@ class TerminalIdentityModel(Base):
     dirty_hashes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     reaped_at = Column(DateTime(timezone=True), nullable=True)
+    # F829 D1: FK to the canonical conversation_identity root. Every incarnation
+    # of one conversation shares an identity_key; the root owns lifecycle,
+    # ownership and the current-terminal pointer. NULL only transiently before
+    # the root is minted (and on a pre-F829 row until the migration back-fills
+    # it). Indexed because resolve_base follows a historical terminal id to its
+    # root through this column.
+    identity_key = Column(String, nullable=True, index=True)
     __table_args__ = (
         # D2: a two-value lifecycle on a NEW table, so this CHECK collides with
         # nothing — contrast terminals.lifecycle, which means ephemeral|sticky.
+        # F829 D1: terminal_identity KEEPS its per-incarnation live|reaped
+        # meaning. The six-value conversation lifecycle lives on the NEW
+        # conversation_identity root, not here. The F829 migration rebuilds this
+        # table only to add the identity_key column+index atomically (never
+        # ADD COLUMN then rebuild); the rebuilt CHECK stays byte-identical to
+        # this one.
         CheckConstraint(
             "lifecycle IN ('live','reaped')",
             name="ck_terminal_identity_lifecycle",
         ),
+    )
+
+
+class ConversationIdentityModel(Base):
+    """F829 D1: the canonical conversation identity — the root that owns
+    resumability.
+
+    One row per *conversation*, minted at spawn BEFORE any provider session id
+    exists (``identity_key`` is an internal handle, not a provider uuid).
+    ``terminal_identity`` rows are its per-terminal INCARNATIONS (children via
+    ``terminal_identity.identity_key``); the never-deleted incarnation history
+    stays where F631 put it, and no consumer of terminal-id lookups changes.
+
+    Only the root carries conversation lifecycle, durable ownership
+    (``owner_principal`` — the seat's mailbox/principal, NOT a disposable
+    terminal id), the assignment/callback correlation (``origin_callback_ref``),
+    the current-incarnation pointer (``current_terminal_id``) and the single
+    resume claim. Two historical terminal rows sharing a provider uuid are
+    legitimate history; making each independently own resumability was the
+    F829 defect, and a single owning root removes it by construction.
+
+    DB invariants (D1):
+    - UNIQUE ``(provider, provider_namespace, provider_session_id)`` where the
+      uuid is not NULL — one conversation per bound provider identity.
+    - the resume claim is a ROOT column, so "one active claim per conversation"
+      holds by construction (no separate claim table to race).
+    - the CAS that serializes resume before spawn is
+      ``UPDATE conversation_identity SET resume_claim=?, generation=generation+1
+      WHERE identity_key=? AND resume_claim IS NULL AND generation=?`` — zero
+      rows affected ⇒ ``session_resume_in_progress`` (see ``claim_resume``).
+    """
+
+    __tablename__ = "conversation_identity"
+
+    # Internal durable handle, minted at spawn before any provider uuid. This is
+    # what a child terminal_identity row points at, and what `cao diag
+    # <identity_key>` / `fork_from=<identity_key>` address when there is no uuid.
+    identity_key = Column(String, primary_key=True)
+    provider = Column(String, nullable=False)
+    # The store the recoverable artifact lives in: CODEX_HOME / kiro session
+    # store / pi session dir / claude project dir. Part of the UNIQUE bound
+    # identity because isolated homes make the same uuid mean different
+    # conversations across stores (D6/D9).
+    provider_namespace = Column(String, nullable=True)
+    # NULL until the provider session id is captured (D4/D7). Bound-uniqueness is
+    # enforced only where this is not NULL (partial index below).
+    provider_session_id = Column(String, nullable=True)
+    artifact_locator = Column(String, nullable=True)
+    agent_profile = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    reasoning_effort = Column(String, nullable=True)
+    # Durable caller identity — the seat's mailbox/principal id, NOT its
+    # disposable terminal id. Survives every transition (D2). May be NULL for a
+    # top-level conversation with no caller, or a legacy_unknown_owner root.
+    owner_principal = Column(String, nullable=True)
+    # Assignment/callback correlation, so a resumed worker's no-receiver callback
+    # can be routed back to the original seat's CURRENT binding (D3/AC5).
+    origin_callback_ref = Column(String, nullable=True)
+    current_terminal_id = Column(String, nullable=True)
+    generation = Column(Integer, nullable=False, default=0, server_default="0")
+    # Six-value conversation lifecycle (distinct from terminal_identity's
+    # per-incarnation live|reaped).
+    lifecycle = Column(String, nullable=False, default="live", server_default="live")
+    # NULL or a JSON blob {"claimant","generation","started_at"}. A root column,
+    # so one-active-claim holds by construction (D1).
+    resume_claim = Column(Text, nullable=True)
+    resume_claim_at = Column(DateTime(timezone=True), nullable=True)
+    # How this root came to exist: a fresh spawn, a resume, or the one-time
+    # legacy migration collapse of pre-F829 rows with no known owner.
+    origin = Column(String, nullable=False, default="spawn", server_default="spawn")
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    __table_args__ = (
+        # Bound-identity uniqueness: one conversation per (provider, namespace,
+        # uuid) once the uuid is known. Partial (uuid IS NOT NULL) so the many
+        # not-yet-captured roots (kiro before first turn, every NULL-uuid legacy
+        # root) do not collide on NULL. This index is AC7's "drop the UNIQUE
+        # bound-identity index → duplicate bind test fails" mutant target.
+        Index(
+            "uq_conversation_identity_bound",
+            "provider",
+            "provider_namespace",
+            "provider_session_id",
+            unique=True,
+            sqlite_where=(provider_session_id.isnot(None)),
+        ),
+        Index("ix_conversation_identity_owner", "owner_principal"),
+        Index("ix_conversation_identity_lifecycle", "lifecycle"),
+        Index("ix_conversation_identity_current_terminal", "current_terminal_id"),
+        CheckConstraint(
+            "lifecycle IN ("
+            "'live','hibernated','capture_unknown','detached','expired','abandoned'"
+            ")",
+            name="ck_conversation_identity_lifecycle",
+        ),
+        CheckConstraint(
+            "origin IN ('spawn','resume','legacy_unknown_owner')",
+            name="ck_conversation_identity_origin",
+        ),
+    )
+
+
+class ConversationEventModel(Base):
+    """F829 D5: append-only event timeline for one conversation identity.
+
+    ``cao diag <uuid|identity_key|terminal_id>`` follows any id to the root and
+    prints these in order (spawn, capture, capture rejections, detach, resume
+    attempts with outcome tokens, claims). D4's ``uuid_capture_rejected`` and
+    D8's ``warm_intent_dropped`` land here too. Never mutated after insert.
+    """
+
+    __tablename__ = "conversation_event"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    identity_key = Column(String, nullable=False, index=True)
+    # snake_case event token, e.g. spawn / uuid_captured / uuid_capture_rejected
+    # / crash_detached / warm_intent_dropped / resume_claimed / resume_published
+    # / resume_failed / claim_reconciled.
+    event = Column(String, nullable=False)
+    terminal_id = Column(String, nullable=True)
+    # free-form JSON detail (conflicting identity, reason, outcome token…).
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    __table_args__ = (
+        Index("ix_conversation_event_identity_created", "identity_key", "created_at", "id"),
     )
 
 
@@ -1822,6 +1960,13 @@ def init_db() -> None:
     # promises. Disjoint from every table above, so registry order is immaterial
     # here too; appended LAST.
     _migrate_f631_terminal_identity()
+    # F829 canonical conversation identity. Creates conversation_identity, does
+    # the ONE rebuild of terminal_identity that adds its identity_key FK column
+    # (never ADD COLUMN then rebuild), and runs the legacy collapse rule that
+    # back-fills roots + FK. Depends on terminal_identity existing (F631 above)
+    # and reads terminals, so it MUST come after _migrate_f631_terminal_identity;
+    # appended LAST.
+    _migrate_f829_conversation_identity()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -2708,6 +2853,351 @@ def _migrate_f631_terminal_identity() -> None:
                 f"f631_terminal_identity migration failed: required columns still "
                 f"absent after migration: {missing}"
             )
+
+
+# F829 D1: the six-value conversation lifecycle and the origin enum, kept beside
+# the migration so the collapse rule and the model can share one source of truth.
+CONVERSATION_LIFECYCLES = (
+    "live",
+    "hibernated",
+    "capture_unknown",
+    "detached",
+    "expired",
+    "abandoned",
+)
+CONVERSATION_ORIGINS = ("spawn", "resume", "legacy_unknown_owner")
+
+
+def _f829_default_namespace(provider: str) -> str:
+    """The back-filled ``provider_namespace`` for a legacy row that has none.
+
+    D1's collapse rule keys "one root per distinct (provider, back-filled default
+    namespace per provider, uuid)". Legacy ``terminal_identity`` rows never
+    recorded a namespace, so the migration supplies a per-provider default that
+    matches where the running resolver (D6) looks by default. The value only has
+    to be *stable and per-provider* for the collapse grouping to be correct; the
+    live resolver re-derives the real store at resume time.
+    """
+    return f"default:{provider}"
+
+
+def _migrate_f829_conversation_identity() -> None:
+    """F829 D1: canonical ``conversation_identity`` root + ``terminal_identity``
+    ``identity_key`` FK + the one-time legacy collapse.
+
+    Three phases, all idempotent, in ONE migration (never ADD COLUMN then
+    rebuild):
+
+    (A) CREATE ``conversation_identity`` IF NOT EXISTS — column-for-column
+        identical to ``ConversationIdentityModel`` (``test_f829_*`` asserts they
+        agree, mirroring F631's AC).
+
+    (B) The ONE rebuild: if ``terminal_identity`` lacks ``identity_key``, rebuild
+        it (create shadow with the column, copy every existing column, drop,
+        rename) and recreate its index. SQLite cannot ADD a column AND keep the
+        table's rootpage, and the blueprint forbids ADD-COLUMN-then-rebuild, so
+        this is a single rebuild. Skipped entirely once the column exists, so a
+        second run is a no-op (idempotent).
+
+    (C) The legacy collapse rule (measured: ~434 rows = 8 live + 426 reaped, 224
+        NULL-uuid, 1 duplicate codex pair):
+        - FIRST branch: a ``terminal_identity`` row in lifecycle ``live`` WITH a
+          surviving ``terminals`` row becomes a ``live`` root
+          (``current_terminal_id`` = that terminal, ``owner_principal`` = the
+          terminal's ``caller_mailbox_id`` else NULL, ``origin=spawn``). The
+          migration runs at server start while worker tmux sessions survive a
+          restart, so this is the NORMAL case, not an edge. A ``live`` row whose
+          ``terminals`` row is gone falls through to the reaped handling.
+        - Then, over the remaining (reaped, or live-without-terminal) rows that
+          carry a uuid: a row whose (provider, default-namespace, uuid) already
+          matched a ``live`` root ATTACHES to that root as an older incarnation
+          (never a second root — S1). Otherwise ONE root per distinct (provider,
+          default-namespace, uuid), every matching row attached ordered by
+          created_at, ``current_terminal_id`` = the newest, lifecycle
+          ``hibernated`` if its artifact validates else ``capture_unknown`` (the
+          migration cannot validate artifacts, so it lands ``capture_unknown``
+          and the live resolver upgrades it on demand — never worse than the
+          truth).
+        - every NULL-uuid row gets its OWN root in ``capture_unknown``.
+        - all legacy roots carry ``origin=legacy_unknown_owner`` and
+          ``owner_principal=NULL`` (never assigned to a requester; resume →
+          ``resume_not_owner`` until an owner claims via ``cao identity claim``)
+          — EXCEPT the live-branch roots, which have a real owner.
+        - every ``terminal_identity`` row ends with its ``identity_key`` set.
+
+    Idempotent under a half-migrated db: rows that already have an
+    ``identity_key`` are skipped by phase (C)'s ``WHERE identity_key IS NULL``,
+    and phase (A)/(B) are guarded on existence. Best-effort, logged at debug,
+    never propagated — matching every migrator above.
+    """
+    import sqlite3
+    import uuid as uuidlib
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    lifecycles = "','".join(CONVERSATION_LIFECYCLES)
+    origins = "','".join(CONVERSATION_ORIGINS)
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            # -------- Phase (A): conversation_identity ------------------------
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_identity ("
+                "identity_key VARCHAR NOT NULL, "
+                "provider VARCHAR NOT NULL, "
+                "provider_namespace VARCHAR, "
+                "provider_session_id VARCHAR, "
+                "artifact_locator VARCHAR, "
+                "agent_profile VARCHAR, "
+                "model VARCHAR, "
+                "reasoning_effort VARCHAR, "
+                "owner_principal VARCHAR, "
+                "origin_callback_ref VARCHAR, "
+                "current_terminal_id VARCHAR, "
+                "generation INTEGER DEFAULT 0 NOT NULL, "
+                "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+                "resume_claim TEXT, "
+                "resume_claim_at DATETIME, "
+                "origin VARCHAR DEFAULT 'spawn' NOT NULL, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (identity_key), "
+                "CONSTRAINT ck_conversation_identity_lifecycle "
+                f"CHECK (lifecycle IN ('{lifecycles}')), "
+                "CONSTRAINT ck_conversation_identity_origin "
+                f"CHECK (origin IN ('{origins}'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversation_identity_bound "
+                "ON conversation_identity(provider, provider_namespace, provider_session_id) "
+                "WHERE provider_session_id IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_owner "
+                "ON conversation_identity(owner_principal)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_lifecycle "
+                "ON conversation_identity(lifecycle)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_current_terminal "
+                "ON conversation_identity(current_terminal_id)"
+            )
+
+            # conversation_event: the D5 diag timeline (append-only).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_event ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "identity_key VARCHAR NOT NULL, "
+                "event VARCHAR NOT NULL, "
+                "terminal_id VARCHAR, "
+                "detail TEXT, "
+                "created_at DATETIME"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_event_identity_created "
+                "ON conversation_event(identity_key, created_at, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_event_identity_key "
+                "ON conversation_event(identity_key)"
+            )
+
+            # -------- Phase (B): the ONE rebuild of terminal_identity ----------
+            ti_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_identity'"
+            ).fetchone()
+            if ti_exists is not None:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(terminal_identity)")}
+                if "identity_key" not in cols:
+                    conn.execute("DROP TABLE IF EXISTS terminal_identity__f829_new")
+                    conn.execute(
+                        "CREATE TABLE terminal_identity__f829_new ("
+                        "terminal_id VARCHAR NOT NULL, "
+                        "provider VARCHAR NOT NULL, "
+                        "agent_profile VARCHAR, "
+                        "cwd VARCHAR, "
+                        "session_name VARCHAR, "
+                        "provider_session_id VARCHAR, "
+                        "base_name VARCHAR NOT NULL, "
+                        "retained_persona_home VARCHAR, "
+                        "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+                        "git_sha VARCHAR, "
+                        "dirty_hashes TEXT, "
+                        "created_at DATETIME, "
+                        "reaped_at DATETIME, "
+                        "identity_key VARCHAR, "
+                        "PRIMARY KEY (terminal_id), "
+                        "CONSTRAINT ck_terminal_identity_lifecycle "
+                        "CHECK (lifecycle IN ('live','reaped'))"
+                        ")"
+                    )
+                    conn.execute(
+                        "INSERT INTO terminal_identity__f829_new ("
+                        "terminal_id, provider, agent_profile, cwd, session_name, "
+                        "provider_session_id, base_name, retained_persona_home, "
+                        "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
+                        "identity_key) "
+                        "SELECT terminal_id, provider, agent_profile, cwd, session_name, "
+                        "provider_session_id, base_name, retained_persona_home, "
+                        "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
+                        "NULL FROM terminal_identity"
+                    )
+                    conn.execute("DROP TABLE terminal_identity")
+                    conn.execute(
+                        "ALTER TABLE terminal_identity__f829_new RENAME TO terminal_identity"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+                        "ON terminal_identity(provider_session_id)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS ix_terminal_identity_identity_key "
+                        "ON terminal_identity(identity_key)"
+                    )
+            else:
+                # Fresh DB: create_all already built terminal_identity WITH the
+                # identity_key column from the model; nothing to rebuild.
+                pass
+
+            # -------- Phase (C): the legacy collapse rule ---------------------
+            _f829_collapse_legacy_rows(conn, uuidlib)
+            conn.commit()
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"f829_conversation_identity migration skipped: {e}")
+
+
+def _f829_collapse_legacy_rows(conn: Any, uuidlib: Any) -> None:
+    """The collapse rule proper (phase C of ``_migrate_f829_conversation_identity``).
+
+    Operates ONLY on ``terminal_identity`` rows whose ``identity_key IS NULL``
+    (so it is idempotent and never re-collapses an already-rooted row). Splits
+    the source rows into: LIVE-with-terminal (first branch), uuid-bearing
+    (grouped into roots), and NULL-uuid (one root each). Every touched row ends
+    with its ``identity_key`` set and a matching root created.
+    """
+    now = _utcnow().isoformat(sep=" ")
+
+    def _new_key() -> str:
+        return f"conv_{uuidlib.uuid4().hex}"
+
+    # Only unrooted rows participate (idempotency).
+    rows = conn.execute(
+        "SELECT terminal_id, provider, agent_profile, provider_session_id, "
+        "created_at FROM terminal_identity WHERE identity_key IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+
+    # A terminals row still present means the incarnation survived a restart.
+    live_terminal_ids = {
+        r[0]
+        for r in conn.execute(
+            "SELECT ti.terminal_id FROM terminal_identity ti "
+            "WHERE ti.lifecycle='live' AND EXISTS "
+            "(SELECT 1 FROM terminals t WHERE t.id=ti.terminal_id)"
+        ).fetchall()
+    }
+
+    def _caller_mailbox(terminal_id: str) -> Any:
+        row = conn.execute(
+            "SELECT caller_mailbox_id FROM terminals WHERE id=?", (terminal_id,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    # Bound (provider, namespace, uuid) -> identity_key, seeded from any root
+    # already present (half-migrated db) so the second pass ATTACHES rather than
+    # colliding on the UNIQUE index (S1).
+    bound_root: dict[tuple[str, str, str], str] = {}
+    for ik, prov, ns, uid in conn.execute(
+        "SELECT identity_key, provider, provider_namespace, provider_session_id "
+        "FROM conversation_identity WHERE provider_session_id IS NOT NULL"
+    ).fetchall():
+        bound_root[(prov, ns, uid)] = ik
+
+    # ---- FIRST branch: live rows with a surviving terminals row --------------
+    live_rows = [r for r in rows if r[0] in live_terminal_ids]
+    handled: set[str] = set()
+    for terminal_id, provider, profile, uid, _created in live_rows:
+        namespace = _f829_default_namespace(provider)
+        key = _new_key()
+        owner = _caller_mailbox(terminal_id)
+        conn.execute(
+            "INSERT INTO conversation_identity ("
+            "identity_key, provider, provider_namespace, provider_session_id, "
+            "agent_profile, owner_principal, current_terminal_id, generation, "
+            "lifecycle, origin, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,0,'live','spawn',?,?)",
+            (key, provider, namespace, uid, profile, owner, terminal_id, now, now),
+        )
+        conn.execute(
+            "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+            (key, terminal_id),
+        )
+        handled.add(terminal_id)
+        if uid is not None:
+            bound_root[(provider, namespace, uid)] = key
+
+    # ---- Second pass: remaining uuid-bearing rows collapse into roots --------
+    remaining = [r for r in rows if r[0] not in handled]
+    uuid_rows = [r for r in remaining if r[3] is not None]
+    # Group by (provider, namespace, uuid), ordered by created_at so the newest
+    # becomes the current incarnation.
+    groups: dict[tuple[str, str, str], list[tuple]] = {}
+    for r in uuid_rows:
+        provider = r[1]
+        namespace = _f829_default_namespace(provider)
+        groups.setdefault((provider, namespace, r[3]), []).append(r)
+    for (provider, namespace, uid), members in groups.items():
+        members.sort(key=lambda m: (m[4] or "", m[0]))
+        existing = bound_root.get((provider, namespace, uid))
+        if existing is not None:
+            # ATTACH to the live (or already-created) root — never a 2nd root.
+            key = existing
+            for terminal_id, *_ in members:
+                conn.execute(
+                    "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+                    (key, terminal_id),
+                )
+            continue
+        key = _new_key()
+        newest = members[-1]
+        conn.execute(
+            "INSERT INTO conversation_identity ("
+            "identity_key, provider, provider_namespace, provider_session_id, "
+            "agent_profile, owner_principal, current_terminal_id, generation, "
+            "lifecycle, origin, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,NULL,?,0,'capture_unknown','legacy_unknown_owner',?,?)",
+            (key, provider, namespace, uid, newest[2], newest[0], now, now),
+        )
+        bound_root[(provider, namespace, uid)] = key
+        for terminal_id, *_ in members:
+            conn.execute(
+                "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+                (key, terminal_id),
+            )
+
+    # ---- NULL-uuid rows: one root each, capture_unknown ----------------------
+    null_rows = [r for r in remaining if r[3] is None]
+    for terminal_id, provider, profile, _uid, _created in null_rows:
+        namespace = _f829_default_namespace(provider)
+        key = _new_key()
+        conn.execute(
+            "INSERT INTO conversation_identity ("
+            "identity_key, provider, provider_namespace, provider_session_id, "
+            "agent_profile, owner_principal, current_terminal_id, generation, "
+            "lifecycle, origin, created_at, updated_at) "
+            "VALUES (?,?,?,NULL,?,NULL,?,0,'capture_unknown','legacy_unknown_owner',?,?)",
+            (key, provider, namespace, profile, terminal_id, now, now),
+        )
+        conn.execute(
+            "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+            (key, terminal_id),
+        )
 
 
 def _restrict_db_file_permissions() -> None:
@@ -4003,6 +4493,368 @@ def get_frozen_pins(task_key: str) -> List[Dict[str, str]]:
         if file_path not in latest:
             latest[file_path] = str(row.sha256)
     return [{"file_path": fp, "sha256": sha} for fp, sha in latest.items()]
+# ===========================================================================
+# F829 D1/D3/D5/D8: conversation_identity accessors
+# ===========================================================================
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def record_conversation_event(
+    identity_key: str,
+    event: str,
+    *,
+    terminal_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 D5: append one row to the conversation timeline.
+
+    Accepts an open ``db`` so an event lands in the SAME transaction as the
+    lifecycle write it describes (D4 rejections, D8 detach). With no ``db`` it
+    opens its own short transaction. Best-effort: an event-log failure must not
+    fail the operation it annotates.
+    """
+    import json as _json
+
+    payload = _json.dumps(detail) if detail is not None else None
+
+    def _write(session: Session) -> None:
+        session.add(
+            ConversationEventModel(
+                identity_key=identity_key,
+                event=event,
+                terminal_id=terminal_id,
+                detail=payload,
+                created_at=_utcnow(),
+            )
+        )
+        session.flush()
+
+    try:
+        if db is not None:
+            _write(db)
+        else:
+            with SessionLocal.begin() as own:
+                _write(own)
+    except Exception:  # noqa: BLE001 — the annotation must never fail the write
+        logger.debug("record_conversation_event failed", exc_info=True)
+
+
+def mint_conversation_identity(
+    *,
+    identity_key: str,
+    provider: str,
+    provider_namespace: Optional[str],
+    agent_profile: Optional[str],
+    model: Optional[str],
+    reasoning_effort: Optional[str],
+    owner_principal: Optional[str],
+    origin_callback_ref: Optional[str],
+    current_terminal_id: Optional[str],
+    db: Optional[Session] = None,
+) -> None:
+    """F829 D1: create a fresh conversation root at spawn (origin=spawn, live).
+
+    Minted BEFORE any provider uuid exists (``provider_session_id`` NULL). If a
+    ``db`` is supplied the root is written in the terminal's own transaction so
+    root + terminal_identity + terminals commit together.
+    """
+
+    def _write(session: Session) -> None:
+        session.add(
+            ConversationIdentityModel(
+                identity_key=identity_key,
+                provider=provider,
+                provider_namespace=provider_namespace,
+                provider_session_id=None,
+                agent_profile=agent_profile,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                owner_principal=owner_principal,
+                origin_callback_ref=origin_callback_ref,
+                current_terminal_id=current_terminal_id,
+                generation=0,
+                lifecycle="live",
+                origin="spawn",
+                created_at=_utcnow(),
+                updated_at=_utcnow(),
+            )
+        )
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def get_conversation_identity(identity_key: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        return _row_to_dict(row) if row is not None else None
+
+
+def resolve_conversation_identity(value: str) -> Optional[Dict[str, Any]]:
+    """F829 D3 step 1: resolve any identifier to its canonical root.
+
+    Accepts an ``identity_key``, a provider ``provider_session_id`` (uuid), or
+    any historical ``terminal_id`` (followed through ``terminal_identity``).
+    Returns the root row dict, or None if nothing resolves. Raises
+    ``ValueError('session_ambiguous')`` when a bare uuid matches roots in more
+    than one namespace (disambiguate by identity_key, D5).
+    """
+    with SessionLocal() as db:
+        # 1) identity_key exact
+        root = db.query(ConversationIdentityModel).filter_by(identity_key=value).one_or_none()
+        if root is not None:
+            return _row_to_dict(root)
+        # 2) historical terminal id -> its root
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=value).one_or_none()
+        if ti is not None and ti.identity_key:
+            root = (
+                db.query(ConversationIdentityModel)
+                .filter_by(identity_key=ti.identity_key)
+                .one_or_none()
+            )
+            if root is not None:
+                return _row_to_dict(root)
+        # 3) bare provider_session_id (uuid). May match >1 namespace.
+        matches = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.provider_session_id == value)
+            .all()
+        )
+        if len(matches) == 1:
+            return _row_to_dict(matches[0])
+        if len(matches) > 1:
+            raise ValueError("session_ambiguous")
+        return None
+
+
+def claim_resume(identity_key: str, expected_generation: int, claimant: str) -> bool:
+    """F829 D1 CAS: atomically take the single resume claim.
+
+    ``UPDATE conversation_identity SET resume_claim=?, generation=generation+1
+    WHERE identity_key=? AND resume_claim IS NULL AND generation=?`` — returns
+    True iff exactly one row changed. Zero rows ⇒ another claimant holds it or
+    the generation moved ⇒ caller raises ``session_resume_in_progress``.
+    """
+    import json as _json
+
+    claim = _json.dumps(
+        {
+            "claimant": claimant,
+            "generation": expected_generation + 1,
+            "started_at": _utcnow().isoformat(),
+        }
+    )
+    with SessionLocal.begin() as db:
+        affected = (
+            db.query(ConversationIdentityModel)
+            .filter(
+                ConversationIdentityModel.identity_key == identity_key,
+                ConversationIdentityModel.resume_claim.is_(None),
+                ConversationIdentityModel.generation == expected_generation,
+            )
+            .update(
+                {
+                    ConversationIdentityModel.resume_claim: claim,
+                    ConversationIdentityModel.resume_claim_at: _utcnow(),
+                    ConversationIdentityModel.generation: expected_generation + 1,
+                },
+                synchronize_session=False,
+            )
+        )
+        return bool(affected == 1)
+
+
+def clear_resume_claim(identity_key: str, *, event: Optional[str] = None) -> None:
+    """F829 D3: release the claim (on failure at spawn/verify, or after publish)."""
+    with SessionLocal.begin() as db:
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            {
+                ConversationIdentityModel.resume_claim: None,
+                ConversationIdentityModel.resume_claim_at: None,
+                ConversationIdentityModel.updated_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
+    if event is not None:
+        record_conversation_event(identity_key, event)
+
+
+def publish_current_terminal(
+    identity_key: str,
+    *,
+    terminal_id: str,
+    provider_session_id: Optional[str] = None,
+    provider_namespace: Optional[str] = None,
+    artifact_locator: Optional[str] = None,
+    lifecycle: str = "live",
+) -> None:
+    """F829 D3 step 7: move the current-incarnation pointer and clear the claim.
+
+    Called only AFTER identity + readiness are verified (never before — AC7
+    mutant). Optionally rebinds the provider_session_id (claude divergence
+    branch); the caller is responsible for the UNIQUE recheck.
+    """
+    with SessionLocal.begin() as db:
+        values: Dict[str, Any] = {
+            ConversationIdentityModel.current_terminal_id: terminal_id,
+            ConversationIdentityModel.lifecycle: lifecycle,
+            ConversationIdentityModel.resume_claim: None,
+            ConversationIdentityModel.resume_claim_at: None,
+            ConversationIdentityModel.origin: "resume",
+            ConversationIdentityModel.updated_at: _utcnow(),
+        }
+        if provider_session_id is not None:
+            values[ConversationIdentityModel.provider_session_id] = provider_session_id
+        if provider_namespace is not None:
+            values[ConversationIdentityModel.provider_namespace] = provider_namespace
+        if artifact_locator is not None:
+            values[ConversationIdentityModel.artifact_locator] = artifact_locator
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            values, synchronize_session=False
+        )
+
+
+def set_conversation_lifecycle(identity_key: str, lifecycle: str) -> None:
+    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach)."""
+    with SessionLocal.begin() as db:
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            {
+                ConversationIdentityModel.lifecycle: lifecycle,
+                ConversationIdentityModel.updated_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
+
+
+def bind_provider_session_id(
+    identity_key: str,
+    *,
+    provider_session_id: str,
+    provider_namespace: Optional[str] = None,
+    artifact_locator: Optional[str] = None,
+) -> bool:
+    """F829 D4/D7: bind a captured uuid to a root, honouring bound-uniqueness.
+
+    Returns False (no raise) when the (provider, namespace, uuid) triple is
+    already bound to a DIFFERENT identity — the caller records
+    ``uuid_capture_rejected`` and leaves the root unbound. True on success.
+    """
+    with SessionLocal.begin() as db:
+        root = (
+            db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if root is None:
+            return False
+        ns = provider_namespace if provider_namespace is not None else root.provider_namespace
+        conflict = (
+            db.query(ConversationIdentityModel)
+            .filter(
+                ConversationIdentityModel.provider == root.provider,
+                ConversationIdentityModel.provider_namespace == ns,
+                ConversationIdentityModel.provider_session_id == provider_session_id,
+                ConversationIdentityModel.identity_key != identity_key,
+            )
+            .first()
+        )
+        if conflict is not None:
+            return False
+        root.provider_session_id = provider_session_id
+        if provider_namespace is not None:
+            root.provider_namespace = provider_namespace
+        if artifact_locator is not None:
+            root.artifact_locator = artifact_locator
+        root.updated_at = _utcnow()
+        db.flush()
+        return True
+
+
+def list_hibernated_identities(owner_principal: Optional[str] = None) -> List[Dict[str, Any]]:
+    """F829 D5: roots in a recoverable/parked state, optionally filtered to an owner.
+
+    Listing NEVER mutates lifecycle (D6). Recoverable set for the listing is
+    {hibernated, detached, capture_unknown} — the states a `cao terminals
+    resume`/`identity attach` can still act on.
+    """
+    parked = ("hibernated", "detached", "capture_unknown")
+    with SessionLocal() as db:
+        q = db.query(ConversationIdentityModel).filter(
+            ConversationIdentityModel.lifecycle.in_(parked)
+        )
+        if owner_principal is not None:
+            q = q.filter(ConversationIdentityModel.owner_principal == owner_principal)
+        rows = q.order_by(ConversationIdentityModel.updated_at.desc()).all()
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_conversation_incarnations(identity_key: str) -> List[Dict[str, Any]]:
+    """F829 D5: every terminal_identity incarnation of a root, oldest first."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalIdentityModel)
+            .filter_by(identity_key=identity_key)
+            .order_by(TerminalIdentityModel.created_at, TerminalIdentityModel.terminal_id)
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_conversation_events(identity_key: str) -> List[Dict[str, Any]]:
+    """F829 D5: the ordered event timeline for `cao diag`."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(ConversationEventModel)
+            .filter_by(identity_key=identity_key)
+            .order_by(ConversationEventModel.created_at, ConversationEventModel.id)
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
+
+
+def reconcile_stale_resume_claims(claim_ttl_s: float) -> List[str]:
+    """F829 D8: clear resume claims older than ``claim_ttl_s`` before a new resume.
+
+    Returns the identity_keys whose claim was reconciled (an event is recorded
+    per key). A claim with no ``resume_claim_at`` is treated as reconcilable.
+    """
+    cutoff = _utcnow() - timedelta(seconds=claim_ttl_s)
+    reconciled: List[str] = []
+    with SessionLocal.begin() as db:
+        rows = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.resume_claim.isnot(None))
+            .all()
+        )
+        for root in rows:
+            claimed_at = root.resume_claim_at
+            if claimed_at is not None and claimed_at > cutoff:
+                continue
+            root.resume_claim = None
+            root.resume_claim_at = None
+            root.updated_at = _utcnow()
+            reconciled.append(root.identity_key)
+        db.flush()
+    for key in reconciled:
+        record_conversation_event(key, "claim_reconciled")
+    return reconciled
+
+
+def list_live_conversation_roots() -> List[Dict[str, Any]]:
+    """F829 D8 (N1): every root in lifecycle ``live`` — startup reconciliation input."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.lifecycle == "live")
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
 
 
 def create_terminal(
@@ -6068,6 +6920,71 @@ def delete_terminal_and_warm_intent(
         "reason": (resume_reason if reap_facts else "no_identity_row_pre_registry_terminal"),
         "cwd": (reap_facts["cwd"] if reap_facts else None),
         "artifact_locator": (reap_facts["artifact_locator"] if reap_facts else None),
+    }
+
+
+def crash_detach_terminal(terminal_id: str) -> Dict[str, Any]:
+    """F829 D8: the ONE idempotent crash-detach transition — NOT the reap cascade.
+
+    Factored narrowly out of ``delete_terminal_and_warm_intent`` (whose full
+    cascade cancels barriers as ``owner_gone``, flips membership GONE and
+    reparents children). This does EXACTLY four things, in one transaction:
+
+    (i)   ``mark_receiver_gone`` on the dead terminal's inbox rows, so nothing
+          stays PENDING/EMITTED against a removed receiver (matches the reap
+          path's :5879 call) — this neither cancels barriers nor reparents;
+    (ii)  mailbox ``current_terminal_id`` → NULL for this terminal (FAM-1);
+    (iii) delete the warm intent row (UNIQUE on worker_terminal_id), recording
+          ``warm_intent_dropped`` on the identity when one existed;
+    (iv)  remove the ``terminals`` row so F439 cap consumption ends.
+
+    It then flips the conversation root to ``detached`` (a distinct writer from
+    planned hibernate / explicit reap). It does NOT cancel barriers, does NOT
+    flip membership GONE, does NOT touch frozen pins — those are the #299
+    suspension/reactivation dependency, named in D8. Idempotent: a second call
+    for an already-removed terminal is a no-op that still returns cleanly.
+
+    Returns ``{terminal_deleted, intent_dropped, identity_key, lifecycle}``.
+    """
+    identity_key: Optional[str] = None
+    intent_dropped = False
+    terminal_deleted = False
+    with SessionLocal.begin() as db:
+        # Resolve the conversation root for this terminal (for the lifecycle
+        # flip + events), before the terminals row is removed.
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
+        if ti is not None and ti.identity_key:
+            identity_key = cast(str, ti.identity_key)
+        # (i) departed-receiver detector — same call the reap path makes.
+        try:
+            mark_receiver_gone(db, receiver_id=terminal_id)
+        except Exception:
+            logger.debug("crash_detach mark_receiver_gone failed", exc_info=True)
+        # (ii) nullify mailbox authority for this terminal.
+        db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
+            {MailboxModel.current_terminal_id: None},
+            synchronize_session=False,
+        )
+        # (iii) drop the warm intent (if any).
+        intent_dropped = (
+            db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
+        )
+        # (iv) remove the terminals row → cap consumption ends.
+        terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
+    invalidate_terminal_metadata_cache(terminal_id)
+    # Root lifecycle → detached (its own writer). Events recorded outside the
+    # narrow transaction so a logging failure cannot roll back the detach.
+    lifecycle_out = "detached"
+    if identity_key is not None:
+        set_conversation_lifecycle(identity_key, "detached")
+        if intent_dropped:
+            record_conversation_event(identity_key, "warm_intent_dropped", terminal_id=terminal_id)
+        record_conversation_event(identity_key, "crash_detached", terminal_id=terminal_id)
+    return {
+        "terminal_deleted": terminal_deleted,
+        "intent_dropped": intent_dropped,
+        "identity_key": identity_key,
+        "lifecycle": lifecycle_out,
     }
 
 
