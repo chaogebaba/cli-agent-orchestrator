@@ -5148,6 +5148,50 @@ async def supervisor_drain_ack_endpoint(
     return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
 
 
+@app.post("/terminals/{terminal_id}/native-unpublished")
+async def native_unpublished_endpoint(
+    terminal_id: TerminalId,
+    body: InboxDrainRequest,
+    request: Request,
+    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F810 #667 BLOCKER 6: the register hook's journal-visible unpublished edge.
+
+    D1 requires a throttled, journal-visible WARN emitted VIA THE SERVER when the
+    register hook can derive no team (the seat is not natively reachable right
+    now). Hook stderr alone is not the fleet/server trace path D1 asks for, so
+    the register hook best-effort POSTs here after its own per-terminal 10-minute
+    throttle; this edge appends one ``f810.native_unpublished`` row to the shared
+    ``inbox_message_trace_event`` journal (``message_id=0`` — a non-per-message
+    condition, the same sentinel ``f219.session_notice`` uses). Best-effort and
+    idempotent-enough: the hook throttles, so at most one row lands per window.
+    404 on an unknown terminal; the caller is bound to the route terminal exactly
+    like the drain edges (F707).
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_native_unpublished: terminal_id does not match route",
+        )
+    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-NATIVE-UNPUB-CALLER")
+    try:
+        from cli_agent_orchestrator.clients.database import record_message_trace_event
+
+        await asyncio.to_thread(
+            record_message_trace_event,
+            0,
+            "f810.native_unpublished",
+            phase="register",
+            reason="socket_unpublished",
+            payload={"terminal_id": terminal_id, "detail": body.ts or ""},
+        )
+    except Exception:
+        logger.debug("f810 native-unpublished trace best-effort failed", exc_info=True)
+    return {"success": True, "terminal_id": terminal_id, "op": "native-unpublished"}
+
+
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")
 async def get_latest_compact_transcript_binding_endpoint(
     terminal_id: TerminalId,

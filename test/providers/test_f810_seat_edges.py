@@ -4,7 +4,11 @@ Covers the four named unit tests from the build brief:
 
 * overlay content for a claude_code supervisor contains the four F810 hook
   registrations with the resolved binary path, dedupes against a pre-existing
-  identical command, and leaves non-supervisor profiles untouched;
+  identical command, and (BLOCKER 4) is appended ONLY for a supervisor seat —
+  ``test_worker_profile_gets_no_f810_edges`` /
+  ``test_worker_overlay_is_byte_equivalent_to_no_role`` are the real negative
+  tests, and ``test_effective_project_plus_settings_composition_no_double_run``
+  is the effective project-plus-``--settings`` composition test;
 * register_inbox / supervisor_drain / rewake exit 0 on: no CAO_TERMINAL_ID,
   empty stdin, server down (mock), malformed JSON;
 * the drain envelope text equals the root hook's format for one pending row and
@@ -31,9 +35,20 @@ _DRAIN_MOD = "cli_agent_orchestrator.hooks.supervisor_drain"
 _REWAKE_MOD = "cli_agent_orchestrator.hooks.rewake"
 
 
-def _settings() -> dict:
+def _settings(role: str | None = "supervisor") -> dict:
+    """Render the terminal-settings overlay for a seat of the given profile role.
+
+    F810 BLOCKER 4: the seat-delivery edges are supervisor-only, gated on the
+    server-authoritative ``AgentProfile.role``. Tests patch ``_load_profile`` so
+    the overlay is exercised for a real ``role`` rather than the ``None`` default
+    (which is a worker/unknown seat and gets NO F810 edges).
+    """
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
     provider = ClaudeCodeProvider("hookterm", "session", "window", None)
-    path = provider._write_terminal_settings()
+    prof = AgentProfile(name="p", description="d", role=role) if role is not None else None
+    with patch.object(ClaudeCodeProvider, "_load_profile", return_value=prof):
+        path = provider._write_terminal_settings()
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     finally:
@@ -98,6 +113,83 @@ def test_overlay_no_intra_event_duplicate_commands():
 
 def test_no_auth_token_leaks_in_overlay():
     assert "CAO_AUTH_LOCAL_TOKEN" not in json.dumps(_settings())
+
+
+# ── BLOCKER 4: supervisor-only overlay + worker byte-equivalence ────────────────
+
+
+def _f810_commands(settings: dict) -> list[str]:
+    hooks = settings["hooks"]
+    return [
+        hk["command"]
+        for blocks in hooks.values()
+        for b in blocks
+        for hk in b["hooks"]
+        if any(m in hk["command"] for m in (_REGISTER_MOD, _DRAIN_MOD, _REWAKE_MOD))
+    ]
+
+
+def test_worker_profile_gets_no_f810_edges():
+    """A real (non-supervisor) worker profile: register/rewake absent entirely,
+    and drain present ONLY on the base D22 SessionStart edge — never on the F810
+    PostToolUse/Stop legs."""
+    h = _settings(role="developer")["hooks"]
+
+    def cmds(event: str) -> list[str]:
+        return [hk["command"] for b in h.get(event, []) for hk in b["hooks"]]
+
+    # No register / rewake anywhere for a worker.
+    assert not any(_REGISTER_MOD in c for e in h for c in cmds(e))
+    assert not any(_REWAKE_MOD in c for e in h for c in cmds(e))
+    # Drain only on SessionStart (base D22), NOT the F810 PostToolUse/Stop legs.
+    assert any(_DRAIN_MOD in c for c in cmds("SessionStart"))
+    assert not any(_DRAIN_MOD in c for c in cmds("PostToolUse"))
+    assert not any(_DRAIN_MOD in c for c in cmds("Stop"))
+
+
+def test_worker_overlay_is_byte_equivalent_to_no_role():
+    """`role=None` (unknown seat) and an explicit worker role produce the same
+    overlay — the F810 gate keys on supervisor-ness, nothing else."""
+    assert json.dumps(_settings(role=None), sort_keys=True) == json.dumps(
+        _settings(role="developer"), sort_keys=True
+    )
+
+
+def test_worker_stop_block_matches_base_shape():
+    """A worker's Stop carries only marker+ack+turn (base shape) — no F810 drain
+    or rewake leg."""
+    h = _settings(role="reviewer")["hooks"]
+    stop_cmds = [hk["command"] for b in h["Stop"] for hk in b["hooks"]]
+    assert not any(_DRAIN_MOD in c or _REWAKE_MOD in c for c in stop_cmds)
+
+
+def test_supervisor_only_edges_present_for_supervisor():
+    """The positive control: a supervisor DOES get all four F810 edges."""
+    cmds = _f810_commands(_settings(role="supervisor"))
+    assert any(_REGISTER_MOD in c for c in cmds)
+    assert any(_DRAIN_MOD in c for c in cmds)
+    assert any(_REWAKE_MOD in c for c in cmds)
+
+
+def test_effective_project_plus_settings_composition_no_double_run():
+    """Effective composition: Claude Code merges the repo-local project
+    settings with the CLI ``--settings`` overlay. The overlay's command-string
+    dedupe keeps EACH overlay ``python -m`` edge once; a project-local copy that
+    uses the SAME command string cannot co-execute. (The repo-local `.sh` copies
+    have DIFFERENT command strings — their removal is a parent-repo follow-up,
+    not something the overlay can dedupe; see the build report.)"""
+    overlay = _settings(role="supervisor")["hooks"]
+    # Simulate Claude Code's project+CLI merge for the drain command: a project
+    # block carrying the IDENTICAL overlay command string, concatenated per event.
+    drain_cmd = next(c for c in _f810_commands({"hooks": overlay}) if _DRAIN_MOD in c)
+    merged = {
+        event: list(blocks) + [{"hooks": [{"command": drain_cmd, "timeout": 5}]}]
+        for event, blocks in overlay.items()
+    }
+    _dedupe_overlay_hooks_by_command(merged)
+    for event, blocks in merged.items():
+        cmds = [hk["command"] for b in blocks for hk in b["hooks"]]
+        assert cmds.count(drain_cmd) <= 1, (event, cmds)
 
 
 # ── dedupe helper (D2) ──────────────────────────────────────────────────────────
@@ -182,7 +274,10 @@ def test_register_zero_teams_warns_once_per_window(monkeypatch, tmp_path, capsys
     # No team dirs derivable → WARN, throttled by the sentinel under CAO_HOME_DIR.
     monkeypatch.setattr(register_inbox, "CAO_HOME_DIR", tmp_path)
     monkeypatch.setattr(register_inbox, "_derive_team_names", lambda sid, home: [])
-    with patch.object(register_inbox.cao_http, "patch") as p:
+    with (
+        patch.object(register_inbox.cao_http, "post") as _post,
+        patch.object(register_inbox.cao_http, "patch") as p,
+    ):
         assert _run_register({"session_id": "s"}, monkeypatch) == 0
         first = capsys.readouterr().err
         # second immediate fire is throttled (no new WARN)
@@ -191,6 +286,45 @@ def test_register_zero_teams_warns_once_per_window(monkeypatch, tmp_path, capsys
     p.assert_not_called()
     assert "f810.native_unpublished" in first
     assert second == ""
+
+
+def test_register_zero_teams_posts_server_trace_once_then_retries_after_window(
+    monkeypatch, tmp_path
+):
+    """BLOCKER 6: the zero-team WARN is journal-visible VIA THE SERVER — exactly
+    one POST to /native-unpublished inside the 10-min window, and a second POST
+    after the window expires (sentinel mtime pushed back)."""
+    from cli_agent_orchestrator.hooks import register_inbox
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.delenv("CAO_TERMINAL_TOKEN", raising=False)
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+    monkeypatch.setattr(register_inbox, "CAO_HOME_DIR", tmp_path)
+    monkeypatch.setattr(register_inbox, "_derive_team_names", lambda sid, home: [])
+    post = MagicMock()
+    with (
+        patch.object(register_inbox, "get_local_bearer", return_value=None),
+        patch.object(register_inbox.cao_http, "post", post),
+        patch.object(register_inbox.cao_http, "patch") as patch_call,
+    ):
+        # First fire → one server POST.
+        assert _run_register({"session_id": "s"}, monkeypatch) == 0
+        # Second immediate fire → throttled, NO additional POST.
+        assert _run_register({"session_id": "s"}, monkeypatch) == 0
+        assert post.call_count == 1
+        assert post.call_args[0][0] == "/terminals/abcd1234/native-unpublished"
+        assert post.call_args.kwargs["json"]["terminal_id"] == "abcd1234"
+
+        # Expire the window: push the sentinel mtime back beyond the interval.
+        sentinel = tmp_path / "f810-native-unpublished.abcd1234"
+        import os as _os
+
+        old = register_inbox.time.time() - (register_inbox._NATIVE_UNPUBLISHED_WARN_INTERVAL_S + 10)
+        _os.utime(sentinel, (old, old))
+        # Third fire after expiry → a second server POST (retry).
+        assert _run_register({"session_id": "s"}, monkeypatch) == 0
+        assert post.call_count == 2
+    patch_call.assert_not_called()
 
 
 def test_register_idempotent_skips_patch_when_already_registered(monkeypatch, tmp_path):

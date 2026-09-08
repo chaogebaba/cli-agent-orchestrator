@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+import io
+import json
+from unittest.mock import MagicMock, patch
+
 from cli_agent_orchestrator.hooks.supervisor_drain import _build_digest, _is_busy_suppressible
 from cli_agent_orchestrator.services.transport_ejection import TransportEjectionService
 
@@ -146,3 +150,113 @@ def test_sink_failure_leaves_flag_unset_for_retry():
         is True
     )
     assert len(calls) == 1
+
+
+# ── BLOCKER 3: in-process-subagent safety gate on the drain ─────────────────────
+
+
+def _run_drain(stdin: str, monkeypatch):
+    """Run supervisor_drain.main() with mocked transport; return (rc, post, get)."""
+    from cli_agent_orchestrator.hooks import supervisor_drain
+
+    post = MagicMock()
+    get = MagicMock()
+    with (
+        patch("sys.stdin", io.StringIO(stdin)),
+        patch.object(supervisor_drain, "get_local_bearer", return_value=None),
+        patch.object(supervisor_drain.cao_http, "post", post),
+        patch.object(supervisor_drain.cao_http, "get", get),
+    ):
+        rc = supervisor_drain.main()
+    return rc, post, get
+
+
+def test_drain_subagent_gate_agent_id_in_stdin_no_transport(monkeypatch):
+    """A child event carrying `agent_id` in stdin claims NOTHING: no POST (drain
+    trigger + ack), no GET (claim list)."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.delenv("CLAUDE_AGENT_ID", raising=False)
+    rc, post, get = _run_drain(json.dumps({"agent_id": "child-1"}), monkeypatch)
+    assert rc == 0
+    post.assert_not_called()
+    get.assert_not_called()
+
+
+def test_drain_subagent_gate_env_discriminator_no_transport(monkeypatch):
+    """The CLAUDE_AGENT_ID env discriminator alone also fully gates the drain."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setenv("CLAUDE_AGENT_ID", "child-1")
+    rc, post, get = _run_drain(json.dumps({"hook_event_name": "Stop"}), monkeypatch)
+    assert rc == 0
+    post.assert_not_called()
+    get.assert_not_called()
+
+
+def test_drain_no_terminal_id_is_full_noop(monkeypatch):
+    """Non-CAO / worker context (no CAO_TERMINAL_ID): zero side effects."""
+    monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    rc, post, get = _run_drain(json.dumps({"hook_event_name": "PostToolUse"}), monkeypatch)
+    assert rc == 0
+    post.assert_not_called()
+    get.assert_not_called()
+
+
+# ── BLOCKER 5: emitted hookEventName names the event that fired ─────────────────
+
+
+def _run_drain_capture_envelope(hook_event_name: str, monkeypatch, capsys):
+    """Drive main() with one pending row and the given hook_event_name; return the
+    parsed stdout envelope."""
+    from cli_agent_orchestrator.hooks import supervisor_drain
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.delenv("CLAUDE_AGENT_ID", raising=False)
+    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
+
+    drain_resp = MagicMock()
+    drain_resp.raise_for_status = MagicMock()
+    list_resp = MagicMock()
+    list_resp.raise_for_status = MagicMock()
+    list_resp.json.return_value = {
+        "items": [{"id": 11, "sender_id": "wrk", "message": "real callback"}]
+    }
+
+    def fake_get(path, **kw):
+        return list_resp
+
+    def fake_post(path, **kw):
+        return drain_resp
+
+    stdin = json.dumps({"hook_event_name": hook_event_name})
+    with (
+        patch("sys.stdin", io.StringIO(stdin)),
+        patch.object(supervisor_drain, "get_local_bearer", return_value=None),
+        patch.object(supervisor_drain.cao_http, "get", side_effect=fake_get),
+        patch.object(supervisor_drain.cao_http, "post", side_effect=fake_post),
+    ):
+        rc = supervisor_drain.main()
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    return json.loads(out)
+
+
+def test_drain_envelope_hook_event_name_session_start(monkeypatch, capsys):
+    env = _run_drain_capture_envelope("SessionStart", monkeypatch, capsys)
+    assert env["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "real callback" in env["hookSpecificOutput"]["additionalContext"]
+
+
+def test_drain_envelope_hook_event_name_post_tool_use(monkeypatch, capsys):
+    env = _run_drain_capture_envelope("PostToolUse", monkeypatch, capsys)
+    assert env["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+
+def test_drain_envelope_hook_event_name_stop(monkeypatch, capsys):
+    env = _run_drain_capture_envelope("Stop", monkeypatch, capsys)
+    assert env["hookSpecificOutput"]["hookEventName"] == "Stop"
+
+
+def test_drain_envelope_defaults_to_post_tool_use_when_event_absent(monkeypatch, capsys):
+    # No hook_event_name in stdin → falls back to PostToolUse (the safe default).
+    env = _run_drain_capture_envelope("", monkeypatch, capsys)
+    assert env["hookSpecificOutput"]["hookEventName"] == "PostToolUse"

@@ -83,13 +83,49 @@ def _derive_team_names(session_id: str, home: Path) -> list[str]:
     return team_names
 
 
+def _post_native_unpublished(terminal_id: str, detail: str) -> None:
+    """Best-effort POST one ``f810.native_unpublished`` trace event (BLOCKER 6).
+
+    D1 requires the throttled WARN to be journal-visible VIA THE SERVER, not only
+    on hook stderr. This posts through the SAME authenticated client path the
+    register PATCH uses (F707 terminal-token header), to the
+    ``/terminals/<id>/native-unpublished`` edge which appends one
+    ``inbox_message_trace_event`` row. Fail-open: any transport error is
+    swallowed (a hook must never block the seat).
+    """
+    try:
+        base_url = (
+            os.environ.get("CAO_ENDPOINT")
+            or os.environ.get("CAO_API_BASE_URL")
+            or resolve_endpoint()
+        ).rstrip("/")
+        headers: dict[str, str] = {}
+        token = get_local_bearer()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+        if terminal_token:
+            headers["X-CAO-Terminal-Token"] = terminal_token
+        cao_http.post(
+            f"/terminals/{terminal_id}/native-unpublished",
+            base_url=base_url,
+            json={"terminal_id": terminal_id, "ts": detail},
+            headers=headers,
+            timeout=5,
+        )
+    except Exception:
+        pass  # best-effort; stderr WARN below is the supplemental signal.
+
+
 def _warn_native_unpublished(terminal_id: str, session_id: str, detail: str) -> None:
     """Emit ONE journal-visible ``f810.native_unpublished`` WARN, rate-limited.
 
     Rate-limit is a per-terminal sentinel file whose mtime is checked against
-    :data:`_NATIVE_UNPUBLISHED_WARN_INTERVAL_S`. Fail-open: any filesystem error
-    still prints the WARN (a duplicate WARN is harmless; a swallowed one is the
-    silence F810 is trying to end).
+    :data:`_NATIVE_UNPUBLISHED_WARN_INTERVAL_S`. Inside the window we do nothing;
+    on the first fire after the window we (1) best-effort POST the server-side
+    journal-visible trace event (BLOCKER 6, the D1 requirement) and (2) print the
+    supplemental stderr WARN. Fail-open: any filesystem error still falls through
+    to emit (a duplicate is harmless; a swallowed one is the silence F810 ends).
     """
     sentinel = Path(CAO_HOME_DIR) / f"f810-native-unpublished.{terminal_id}"
     now = time.time()
@@ -101,6 +137,9 @@ def _warn_native_unpublished(terminal_id: str, session_id: str, detail: str) -> 
         pass
     except OSError:
         pass  # fall through: emit anyway
+    # (1) Server-side journal-visible trace event — the D1 primary signal.
+    _post_native_unpublished(terminal_id, detail)
+    # (2) Supplemental stderr WARN (f162's journal convention).
     print(
         f"WARNING: {_NATIVE_UNPUBLISHED_WARN_KIND} terminal={terminal_id} "
         f"session={session_id} {detail} — seat is not natively reachable; "

@@ -160,11 +160,16 @@ def main() -> int:
     terminal_id = os.environ["CAO_TERMINAL_ID"]
     try:
         # Drain event bodies are read but not required; the terminal id is the
-        # only authority the server needs.
+        # only authority the server needs. F810 BLOCKER 3: port the reference
+        # hook's fail-closed in-process-subagent gate BEFORE the first claim —
+        # an in-harness child must never claim the parent seat's callbacks.
+        raw = sys.stdin.read()
+        if os.environ.get("CLAUDE_AGENT_ID") or '"agent_id"' in raw:
+            return 0
         try:
-            json.load(sys.stdin)
+            event = json.loads(raw) if raw else {}
         except Exception:
-            pass
+            event = {}
         base_url = (
             os.environ.get("CAO_ENDPOINT")
             or os.environ.get("CAO_API_BASE_URL")
@@ -236,7 +241,7 @@ def main() -> int:
         if digest is not None:
             envelope = {
                 "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
+                    "hookEventName": str(event.get("hook_event_name") or "PostToolUse"),
                     "additionalContext": digest,
                 }
             }

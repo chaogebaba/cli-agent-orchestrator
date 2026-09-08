@@ -1196,8 +1196,23 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         turn_hooks = [{"type": "command", "command": turn_command, "timeout": 5}]
+        # F810 (#667) BLOCKER 4: the fork's seat-delivery edges (register / the
+        # PostToolUse+Stop drain legs / rewake) are appended ONLY for a
+        # server-authoritatively identified SUPERVISOR seat. The authority is the
+        # CAO agent profile's ``role`` field ("supervisor"), loaded from the
+        # server-side profile store via ``_load_profile`` — never a pane heuristic.
+        # For a worker (or any seat whose profile is absent/non-supervisor) these
+        # lists stay EMPTY and the F810 PostToolUse/Stop blocks are omitted, so the
+        # worker overlay is byte-equivalent to base (the base D22 ``drain_hooks``
+        # on SessionStart is unchanged and still applies to every seat).
+        is_supervisor = False
+        try:
+            _profile = self._load_profile()
+            is_supervisor = bool(_profile is not None and _profile.role == "supervisor")
+        except Exception:
+            is_supervisor = False
         # F810 (#667): the fork now OWNS the seat delivery edges. Three hooks
-        # ported from the old repo-local .claude/hooks/*.sh into the same
+        # ported from the old repository-local hook scripts into the same
         # `python -m cli_agent_orchestrator.hooks.<mod>` shape as the hooks above,
         # so a seat in ANY repo (or one that never spawned an in-harness Agent)
         # gets them from this overlay rather than from a repo-local settings.json.
@@ -1221,6 +1236,8 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         register_hooks = [{"type": "command", "command": register_command, "timeout": 10}]
+        if not is_supervisor:
+            register_hooks = []
         rewake_command_stop = shlex.join(
             [
                 "env",
@@ -1249,6 +1266,8 @@ class ClaudeCodeProvider(BaseProvider):
                 ),
             }
         ]
+        if not is_supervisor:
+            rewake_stop_hooks = []
         rewake_command_ptu = shlex.join(
             [
                 "env",
@@ -1275,6 +1294,8 @@ class ClaudeCodeProvider(BaseProvider):
                 ),
             }
         ]
+        if not is_supervisor:
+            rewake_ptu_hooks = []
         settings = {
             "hooks": {
                 "SessionStart": [
@@ -1336,18 +1357,26 @@ class ClaudeCodeProvider(BaseProvider):
                     # derivation reads), then drain + rewake on matcher .* (every
                     # tool call) so a foreign-repo seat surfaces its callbacks on
                     # its own turn rather than waiting for a SessionStart.
-                    {
-                        "matcher": "Agent|Task",
-                        "hooks": register_hooks,
-                    },
-                    {
-                        "matcher": ".*",
-                        "hooks": drain_hooks,
-                    },
-                    {
-                        "matcher": ".*",
-                        "hooks": rewake_ptu_hooks,
-                    },
+                    # BLOCKER 4: supervisor-only; omitted entirely for workers so
+                    # the worker PostToolUse block is byte-equivalent to base.
+                    *(
+                        [
+                            {
+                                "matcher": "Agent|Task",
+                                "hooks": register_hooks,
+                            },
+                            {
+                                "matcher": ".*",
+                                "hooks": drain_hooks,
+                            },
+                            {
+                                "matcher": ".*",
+                                "hooks": rewake_ptu_hooks,
+                            },
+                        ]
+                        if is_supervisor
+                        else []
+                    ),
                 ],
                 "PostToolUseFailure": [
                     {
@@ -1360,9 +1389,13 @@ class ClaudeCodeProvider(BaseProvider):
                         # F810 (#667): drain THEN rewake --arm on Stop (D2), after
                         # the existing marker/ack/turn edges. Drain surfaces any
                         # pending digest at the turn boundary; rewake arms the
-                        # async idle-gap watcher.
+                        # async idle-gap watcher. BLOCKER 4: the F810 drain+rewake
+                        # legs are supervisor-only; a worker's Stop stays byte-
+                        # equivalent to base (marker + ack + turn only).
                         "hooks": (
                             marker_hooks + ack_hooks + turn_hooks + drain_hooks + rewake_stop_hooks
+                            if is_supervisor
+                            else marker_hooks + ack_hooks + turn_hooks
                         ),
                     }
                 ],
