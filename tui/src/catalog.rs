@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 109;
+const COMMAND_COUNT: usize = 114;
 
 /// What the TUI does with a command.
 ///
@@ -245,6 +245,11 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SkillsList,
     CommandId::SkillsRemove,
     CommandId::TerminalRestore,
+    CommandId::TerminalHibernated,
+    CommandId::IdentityList,
+    CommandId::IdentityDiag,
+    CommandId::IdentityAttach,
+    CommandId::IdentityClaim,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
@@ -577,6 +582,18 @@ pub enum CommandId {
     VerifyScope,
     /// `cao verify suite-log`
     VerifySuiteLog,
+
+    // F829 `cao identity *` + `cao terminal hibernated`
+    /// `cao identity list`
+    IdentityList,
+    /// `cao identity diag`
+    IdentityDiag,
+    /// `cao identity attach`
+    IdentityAttach,
+    /// `cao identity claim`
+    IdentityClaim,
+    /// `cao terminal hibernated`
+    TerminalHibernated,
 }
 
 /// The one place a command's row is written.
@@ -1226,6 +1243,60 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "terminal_id", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
+        },
+
+        CommandId::TerminalHibernated => Command {
+            id: CommandId::TerminalHibernated,
+            parent: Some("terminal"),
+            leaf_name: "hibernated",
+            summary: "List conversation identities in a recoverable/parked state (F829).",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: F829 diagnostic listing, not yet reviewed for in-app use
+        },
+        CommandId::IdentityList => Command {
+            id: CommandId::IdentityList,
+            parent: Some("identity"),
+            leaf_name: "list",
+            summary: "List recoverable/parked conversation identities (F829).",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: F829 diagnostic listing, not yet reviewed for in-app use
+        },
+        CommandId::IdentityDiag => Command {
+            id: CommandId::IdentityDiag,
+            parent: Some("identity"),
+            leaf_name: "diag",
+            summary: "Follow a uuid/identity_key/terminal_id to its conversation root timeline.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "identifier", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: F829 diagnostic, not yet reviewed for in-app use
+        },
+        CommandId::IdentityAttach => Command {
+            id: CommandId::IdentityAttach,
+            parent: Some("identity"),
+            leaf_name: "attach",
+            summary: "Owner-only explicit artifact attribution for a capture_unknown identity.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "identity_key", required: true, kind: ParamKind::Text },
+                Param { name: "artifact", required: true, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+            // HIDE: F829 owner-authorised recovery op, not a launcher action
+        },
+        CommandId::IdentityClaim => Command {
+            id: CommandId::IdentityClaim,
+            parent: Some("identity"),
+            leaf_name: "claim",
+            summary: "Claim ownership of a NULL-owner/legacy conversation identity.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "identity_key", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: F829 owner-authorised op, not a launcher action
         },
 
         CommandId::WorkflowApprove => Command {
@@ -2006,6 +2077,11 @@ mod tests {
                     CommandId::SkillsList => CommandId::SkillsList,
                     CommandId::SkillsRemove => CommandId::SkillsRemove,
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::TerminalHibernated => CommandId::TerminalHibernated,
+                    CommandId::IdentityList => CommandId::IdentityList,
+                    CommandId::IdentityDiag => CommandId::IdentityDiag,
+                    CommandId::IdentityAttach => CommandId::IdentityAttach,
+                    CommandId::IdentityClaim => CommandId::IdentityClaim,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
@@ -2120,6 +2196,11 @@ mod tests {
                 CommandId::SkillsList,
                 CommandId::SkillsRemove,
                 CommandId::TerminalRestore,
+                CommandId::TerminalHibernated,
+                CommandId::IdentityList,
+                CommandId::IdentityDiag,
+                CommandId::IdentityAttach,
+                CommandId::IdentityClaim,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
