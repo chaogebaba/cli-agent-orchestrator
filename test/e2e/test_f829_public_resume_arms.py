@@ -101,6 +101,27 @@ def _api(cao_server: CaoServer) -> str:
     return cao_server.url
 
 
+def _status(api: str, tid: str) -> str:
+    try:
+        r = requests.get(f"{api}/terminals/{tid}", timeout=30)
+        if r.status_code != 200:
+            return "unknown"
+        return r.json().get("status", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _wait_ready_api(api: str, tid: str, timeout: float = _READY_TIMEOUT) -> str:
+    start = time.time()
+    s = "unknown"
+    while time.time() - start < timeout:
+        s = _status(api, tid)
+        if s in _READY or s == "error":
+            break
+        time.sleep(3)
+    return s
+
+
 def _wait_ready(tid: str, timeout: float = _READY_TIMEOUT) -> str:
     start = time.time()
     s = "unknown"
@@ -369,13 +390,13 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         supervisor_id, actual_session = _create_session_terminal(
             api, provider, profile, session, model, cao_server=cao_server
         )
-        assert _wait_ready(supervisor_id) in _READY, "supervisor not ready"
+        assert _wait_ready_api(api, supervisor_id) in _READY, "supervisor not ready"
 
         # 1. FRESH SPAWN through production create/publish (spawn-mint fires).
         worker_id, _ = _create_session_terminal(
             api, provider, profile, f"{session}-w", model, cao_server=cao_server
         )
-        st = _wait_ready(worker_id)
+        st = _wait_ready_api(api, worker_id)
         assert st in _READY, f"worker not ready (status={st})"
         identity_key = f"conv_{worker_id}"
 
@@ -524,7 +545,14 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         assert res.get("resumed_from") in (worker_id, identity_key, captured_sid)
 
         # resumed worker must reach ready, then recall the token.
-        assert _wait_ready(resumed_id) in _READY, "resumed worker not ready"
+        _rst = _wait_ready_api(api, resumed_id, timeout=300.0)
+        if _rst not in _READY:
+            _capture_diag(cao_server, f"resumed-not-ready-{provider}")
+            rec("RESUMED_NOT_READY", f"resumed_id={resumed_id} status={_rst}")
+            _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+            (_DIAG_DIR / f"{provider}-resumed-notready-diag.txt").write_text(
+                "\n".join(transcript), encoding="utf-8")
+        assert _rst in _READY, f"resumed worker not ready (status={_rst})"
         recall = _drive_turn(
             api, resumed_id,
             "What exact token did I ask you to remember earlier? Reply with ONLY that token.",
