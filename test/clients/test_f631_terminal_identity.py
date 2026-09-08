@@ -586,3 +586,63 @@ def test_ac15_migrated_table_matches_the_model(tmp_path, monkeypatch):
             )
         indexes = {r[1] for r in conn.execute("PRAGMA index_list(terminal_identity)")}
         assert "ix_terminal_identity_provider_session_id" in indexes
+
+
+# ── RESUME HOT-FIX (verdict r1 B2): required-column migration safety ─────────
+
+
+def test_b2_half_migration_adds_required_columns_idempotently(tmp_path, monkeypatch):
+    """A pre-existing terminal_identity missing the worktree columns is migrated
+    to include all three, twice-run is a no-op, and an existing row survives."""
+    db_path = tmp_path / "half.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE terminal_identity ("
+            "terminal_id VARCHAR NOT NULL PRIMARY KEY, provider VARCHAR NOT NULL, "
+            "provider_session_id VARCHAR, "
+            "base_name VARCHAR NOT NULL, lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+            "worktree_branch VARCHAR)"  # one of the three already present
+        )
+        conn.execute(
+            "INSERT INTO terminal_identity (terminal_id, provider, base_name, lifecycle) "
+            "VALUES ('keep', 'codex', 'keep', 'live')"
+        )
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_f631_terminal_identity()
+    _migrate_f631_terminal_identity()  # idempotent second run
+    with sqlite3.connect(str(db_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(terminal_identity)")}
+        assert {"worktree_path", "worktree_branch", "worktree_repo_root"} <= cols
+        assert conn.execute("SELECT count(*) FROM terminal_identity").fetchone()[0] == 1
+
+
+def test_b2_failed_required_column_write_raises_not_fails_open(tmp_path, monkeypatch):
+    """Negative witness (verdict r1 B2): if the additive ALTER genuinely fails
+    and a required column stays absent, the migrator RAISES so init_db aborts —
+    it MUST NOT return with the schema still incompatible."""
+    db_path = tmp_path / "ro-half.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE terminal_identity ("
+            "terminal_id VARCHAR NOT NULL PRIMARY KEY, provider VARCHAR NOT NULL, "
+            "provider_session_id VARCHAR, "
+            "base_name VARCHAR NOT NULL, lifecycle VARCHAR DEFAULT 'live' NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+            "ON terminal_identity(provider_session_id)"
+        )
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    # Make the DB file AND its directory read-only so ALTER TABLE cannot write.
+    db_path.chmod(0o444)
+    tmp_path.chmod(0o555)
+    try:
+        with pytest.raises(Exception):
+            _migrate_f631_terminal_identity()
+    finally:
+        tmp_path.chmod(0o755)
+        db_path.chmod(0o644)
+    # The required columns are STILL absent — the raise is what protects startup.
+    with sqlite3.connect(str(db_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(terminal_identity)")}
+    assert not ({"worktree_path", "worktree_repo_root"} & cols)

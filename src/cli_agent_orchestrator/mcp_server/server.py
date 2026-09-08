@@ -2721,8 +2721,6 @@ def _assign_impl(
                 supports_fork = False
             if not supports_fork:
                 raise ValueError("provider_lacks_fork_capability")
-            if resume and agent_profile != row["agent_profile"]:
-                raise ValueError("resume_profile_mismatch")
             from cli_agent_orchestrator.services.fork_context_service import (
                 validate_base_source,
             )
@@ -2734,22 +2732,6 @@ def _assign_impl(
                 cwd=row["cwd"],
                 source_terminal_id=row.get("source_terminal_id"),
             )
-            if resume:
-                try:
-                    owner = cao_http.get(
-                        f"/provider-sessions/{row['session_uuid']}/owner",
-                        timeout=_mcp_timeout(),
-                    )
-                    owner.raise_for_status()
-                    state = owner.json()["state"]
-                    if state not in {"live", "gone", "error"}:
-                        raise ValueError("invalid owner state")
-                except Exception as exc:
-                    raise ValueError("owner_probe_failed") from exc
-                if state == "live":
-                    raise ValueError("session_live_owned")
-                if state == "error":
-                    raise ValueError("owner_probe_failed")
             try:
                 working_directory, workdir_preamble = _resolve_fork_working_directory(
                     row, working_directory
@@ -2771,7 +2753,7 @@ def _assign_impl(
                     "staleness_count": stale.changed_count if stale else 0,
                 }
                 preamble = stale.preamble
-                if stale and not resume:
+                if stale:
                     refresh_base_name = row["name"]
                 if workdir_preamble:
                     preamble = f"{preamble}\n{workdir_preamble}"
@@ -2788,8 +2770,13 @@ def _assign_impl(
                     preamble = f"{preamble}\n{fence}"
                 else:
                     preamble = fence
+                # RESUME HOT-FIX (verdict r1 B1): this block is the FORK path
+                # ONLY. Resume is fully handled by the delegating entrance above
+                # (_skip_fork_resolution), so no resume gate/owner-probe/
+                # mode="resume" survives here — the legacy resume-via-fork path
+                # is deleted, not merely unreachable (addendum r1 #1 / A1 D3).
                 fork_context = ForkContext(
-                    mode="resume" if resume else "fork",
+                    mode="fork",
                     session_uuid=row["session_uuid"],
                     base_name=row["name"],
                     provider=provider,

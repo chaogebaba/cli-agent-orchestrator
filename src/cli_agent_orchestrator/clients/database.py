@@ -2609,6 +2609,13 @@ def _add_column_if_missing(conn: Any, table: str, column: str, coltype: str) -> 
     Reads ``PRAGMA table_info`` first so a re-run on an already-migrated DB is a
     no-op (the migration must be idempotent at every deploy). A raw sqlite3
     connection is used to match the F631 migrator's own style.
+
+    RESUME HOT-FIX (verdict r1 B2): an ``ALTER TABLE`` failure is NOT blindly
+    swallowed. After it raises, the table is re-read: the error is suppressed
+    ONLY when the requested column is now present (a genuine duplicate-column
+    race between concurrent boots — the desired end state). If the column is
+    still absent, the exception is re-raised so the caller can abort startup
+    rather than serve a schema the ORM cannot use.
     """
     import sqlite3 as _sqlite3
 
@@ -2618,9 +2625,12 @@ def _add_column_if_missing(conn: Any, table: str, column: str, coltype: str) -> 
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
     except _sqlite3.OperationalError:
-        # Duplicate-column race between concurrent boots — the column now
-        # exists, which is the desired end state.
-        pass
+        # Re-read: only a real duplicate-column race (column now present) is
+        # benign. A still-absent column means the ALTER genuinely failed (e.g. a
+        # read-only DB) — propagate so startup fails closed.
+        cols_after = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols_after:
+            raise
 
 
 def _migrate_f631_terminal_identity() -> None:
@@ -2641,51 +2651,63 @@ def _migrate_f631_terminal_identity() -> None:
     database via ``Base.metadata.create_all``; ``test_f631_terminal_identity``
     asserts the two agree.
 
-    Idempotent, zero-arg, self-connecting; failure logged at debug and never
-    propagated, matching every migrator above.
+    Idempotent, zero-arg, self-connecting. RESUME HOT-FIX (verdict r1 B2): the
+    additive worktree columns are REQUIRED by the ORM, so a failure to add them
+    is NOT swallowed — after the migration the table is re-read and, if any
+    required column is still absent, the function RAISES so ``init_db`` aborts
+    instead of serving an incompatible schema. The create-if-missing of the base
+    table remains tolerant of a benign concurrent-boot race only insofar as the
+    required-column postcondition still holds.
     """
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS terminal_identity ("
-                "terminal_id VARCHAR NOT NULL, "
-                "provider VARCHAR NOT NULL, "
-                "agent_profile VARCHAR, "
-                "cwd VARCHAR, "
-                "session_name VARCHAR, "
-                "provider_session_id VARCHAR, "
-                "base_name VARCHAR NOT NULL, "
-                "retained_persona_home VARCHAR, "
-                "worktree_path VARCHAR, "
-                "worktree_branch VARCHAR, "
-                "worktree_repo_root VARCHAR, "
-                "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
-                "git_sha VARCHAR, "
-                "dirty_hashes TEXT, "
-                "created_at DATETIME, "
-                "reaped_at DATETIME, "
-                "PRIMARY KEY (terminal_id), "
-                "CONSTRAINT ck_terminal_identity_lifecycle "
-                "CHECK (lifecycle IN ('live','reaped'))"
-                ")"
+    required_worktree_columns = ("worktree_path", "worktree_branch", "worktree_repo_root")
+    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS terminal_identity ("
+            "terminal_id VARCHAR NOT NULL, "
+            "provider VARCHAR NOT NULL, "
+            "agent_profile VARCHAR, "
+            "cwd VARCHAR, "
+            "session_name VARCHAR, "
+            "provider_session_id VARCHAR, "
+            "base_name VARCHAR NOT NULL, "
+            "retained_persona_home VARCHAR, "
+            "worktree_path VARCHAR, "
+            "worktree_branch VARCHAR, "
+            "worktree_repo_root VARCHAR, "
+            "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+            "git_sha VARCHAR, "
+            "dirty_hashes TEXT, "
+            "created_at DATETIME, "
+            "reaped_at DATETIME, "
+            "PRIMARY KEY (terminal_id), "
+            "CONSTRAINT ck_terminal_identity_lifecycle "
+            "CHECK (lifecycle IN ('live','reaped'))"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+            "ON terminal_identity(provider_session_id)"
+        )
+        # Additive worktree columns for a pre-existing ~1-year prod
+        # terminal_identity table. Idempotent; _add_column_if_missing re-raises
+        # (verdict r1 B2) when an ALTER genuinely fails and the column is still
+        # absent, rather than assuming a benign duplicate-column race.
+        for _col in required_worktree_columns:
+            _add_column_if_missing(conn, "terminal_identity", _col, "VARCHAR")
+        # Postcondition (verdict r1 B2): the ORM dereferences all three columns
+        # (TerminalIdentityModel), so a migration that left any of them absent
+        # must abort startup — never a silent "skipped".
+        present = {row[1] for row in conn.execute("PRAGMA table_info(terminal_identity)")}
+        missing = [c for c in required_worktree_columns if c not in present]
+        if missing:
+            raise RuntimeError(
+                f"f631_terminal_identity migration failed: required columns still "
+                f"absent after migration: {missing}"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
-                "ON terminal_identity(provider_session_id)"
-            )
-            # RESUME HOT-FIX (deliverable 3c): additive worktree_path column for a
-            # pre-existing ~1-year prod terminal_identity table. Idempotent — a
-            # duplicate-column error on an already-migrated DB is swallowed, so a
-            # re-run at every deploy is a no-op (migration must be idempotent).
-            _add_column_if_missing(conn, "terminal_identity", "worktree_path", "VARCHAR")
-            _add_column_if_missing(conn, "terminal_identity", "worktree_branch", "VARCHAR")
-            _add_column_if_missing(conn, "terminal_identity", "worktree_repo_root", "VARCHAR")
-    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
-        logger.debug(f"f631_terminal_identity migration skipped: {e}")
 
 
 def _restrict_db_file_permissions() -> None:
