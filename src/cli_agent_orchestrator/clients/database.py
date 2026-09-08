@@ -3124,23 +3124,44 @@ def _f829_collapse_legacy_rows(conn: Any, uuidlib: Any) -> None:
     handled: set[str] = set()
     for terminal_id, provider, profile, uid, _created in live_rows:
         namespace = _f829_default_namespace(provider)
-        key = _new_key()
         owner = _caller_mailbox(terminal_id)
-        conn.execute(
-            "INSERT INTO conversation_identity ("
-            "identity_key, provider, provider_namespace, provider_session_id, "
-            "agent_profile, owner_principal, current_terminal_id, generation, "
-            "lifecycle, origin, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,0,'live','spawn',?,?)",
-            (key, provider, namespace, uid, profile, owner, terminal_id, now, now),
-        )
+        # E3 (D1/AC7): on a HALF-migrated db a live incarnation may be unrooted
+        # while its (provider, namespace, uuid) root already exists (a prior
+        # partial run). Attach to that bound root instead of INSERTing a fresh
+        # one — a blind INSERT collides on uq_conversation_identity_bound and the
+        # swallowed exception would leave the row permanently unrooted. Idempotent
+        # across repeated runs: the second pass observes the same bound root and
+        # re-attaches to the identical key.
+        existing = bound_root.get((provider, namespace, uid)) if uid is not None else None
+        if existing is not None:
+            key = existing
+            # Promote the existing root to live and point it at this surviving
+            # terminal; fill owner only if it was NULL (D1: never overwrite a
+            # recorded owner). Keeps the second run byte-for-byte stable.
+            conn.execute(
+                "UPDATE conversation_identity "
+                "SET lifecycle='live', current_terminal_id=?, "
+                "owner_principal=COALESCE(owner_principal, ?), updated_at=? "
+                "WHERE identity_key=?",
+                (terminal_id, owner, now, key),
+            )
+        else:
+            key = _new_key()
+            conn.execute(
+                "INSERT INTO conversation_identity ("
+                "identity_key, provider, provider_namespace, provider_session_id, "
+                "agent_profile, owner_principal, current_terminal_id, generation, "
+                "lifecycle, origin, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,0,'live','spawn',?,?)",
+                (key, provider, namespace, uid, profile, owner, terminal_id, now, now),
+            )
+            if uid is not None:
+                bound_root[(provider, namespace, uid)] = key
         conn.execute(
             "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
             (key, terminal_id),
         )
         handled.add(terminal_id)
-        if uid is not None:
-            bound_root[(provider, namespace, uid)] = key
 
     # ---- Second pass: remaining uuid-bearing rows collapse into roots --------
     remaining = [r for r in rows if r[0] not in handled]
@@ -14377,12 +14398,29 @@ def mark_receiver_gone(
     *,
     receiver_id: str,
 ) -> int:
-    """D8/S1 (AC22): a receiver was reaped or reclaimed — transition its
-    undelivered ledger rows to ``undeliverable(receiver_gone)`` in the SAME
-    transaction as the delete, not on a later sweep. Acked/terminal rows are
-    untouched. Returns the count transitioned."""
+    """D8/S1 (AC22): a receiver was reaped or reclaimed — settle BOTH delivery
+    authorities in the SAME transaction as the delete, not on a later sweep.
+
+    F829 E2 (D8/AC4): the ledger is not the only authority for an undelivered
+    message — the ``inbox`` row carries its own ``status``. Settling only the
+    ledger left the paired inbox row ``pending`` against a removed receiver, so
+    a crash-detach could not honour D8's "no inbox row pending/emitted against a
+    removed receiver". Both are now transitioned atomically:
+
+    * every ``DeliveryLedgerModel`` row for ``receiver_id`` in
+      ``pending``/``emitted`` → ``undeliverable(receiver_gone)``;
+    * every ``InboxModel`` row for ``receiver_id`` whose status is
+      ``pending``/``delivering`` → ``delivery_failed`` with
+      ``failure_reason='receiver_gone'``.
+
+    Acked/terminal rows are untouched. Returns the ledger transition count; a
+    caller that also needs the inbox count should read it from the two-count
+    assertion — for paired rows the two counts agree. A failed settlement is NOT
+    swallowed here so the enclosing transaction cannot delete the receiver while
+    leaving either authority unsettled.
+    """
     now = _utcnow()
-    rows = (
+    ledger_rows = (
         db.query(DeliveryLedgerModel)
         .filter(
             DeliveryLedgerModel.receiver_id == receiver_id,
@@ -14390,15 +14428,28 @@ def mark_receiver_gone(
         )
         .all()
     )
-    count = 0
-    for row in rows:
+    ledger_count = 0
+    for row in ledger_rows:
         row.state = LedgerState.UNDELIVERABLE.value
         row.undeliverable_reason = UndeliverableReason.RECEIVER_GONE.value
         row.blocked_reason = None
         row.blocked_since = None
         row.updated_at = now
-        count += 1
-    return count
+        ledger_count += 1
+    # F829 E2: settle the paired inbox rows in the same transaction so no inbox
+    # row remains pending/delivering against a removed receiver.
+    inbox_rows = (
+        db.query(InboxModel)
+        .filter(
+            InboxModel.receiver_id == receiver_id,
+            InboxModel.status.in_([MessageStatus.PENDING.value, MessageStatus.DELIVERING.value]),
+        )
+        .all()
+    )
+    for row in inbox_rows:
+        row.status = MessageStatus.DELIVERY_FAILED.value
+        row.failure_reason = UndeliverableReason.RECEIVER_GONE.value
+    return ledger_count
 
 
 def enqueue_callback_replay_gated(

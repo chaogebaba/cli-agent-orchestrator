@@ -16,9 +16,16 @@ import pytest
 
 from cli_agent_orchestrator.clients import database as d
 from cli_agent_orchestrator.clients.database import (
+    AuthorityPinModel,
+    CallbackBarrierMemberModel,
+    CallbackBarrierModel,
     ConversationIdentityModel,
+    DeliveryLedgerModel,
+    InboxModel,
+    MailboxModel,
     TerminalIdentityModel,
     TerminalModel,
+    WarmIntentModel,
 )
 
 # --------------------------------------------------------------------------
@@ -171,7 +178,99 @@ def test_ac7_migration_idempotent(real_sqlite_env):
     assert n1 == n2
 
 
-def test_ac2_concurrent_claim_exactly_one_wins(real_sqlite_env):
+def test_ac7_migration_half_state_attaches_live_row(real_sqlite_env):
+    """AC7/E3: a HALF-migrated db where a surviving LIVE incarnation is unrooted
+    (``terminal_identity.identity_key IS NULL``) but its (provider, namespace,
+    uuid) root ALREADY exists must ATTACH the live row to that root — not INSERT
+    a second one (which collides on uq_conversation_identity_bound and, with the
+    collision swallowed, leaves the row permanently unrooted). Running the
+    migration twice over that exact half-state is byte-for-byte stable.
+    """
+    db_file = str(real_sqlite_env["db_file"])
+    _seed_legacy(db_file)
+    import cli_agent_orchestrator.constants as k
+
+    with mock.patch.object(k, "DATABASE_FILE", db_file):
+        # First full migration builds the schema + all roots (incl. live1's).
+        d._migrate_f829_conversation_identity()
+
+        conn = sqlite3.connect(db_file)
+        # Synthesize the half-state: keep live1's root + surviving terminals row,
+        # but UN-root the live terminal_identity row (as a crashed partial run
+        # would have left it — root inserted, FK back-fill not yet applied).
+        conn.execute("UPDATE terminal_identity SET identity_key=NULL WHERE terminal_id='live1'")
+        conn.commit()
+        # Sanity: exactly the half-state we intend to exercise.
+        assert (
+            conn.execute(
+                "SELECT identity_key FROM terminal_identity WHERE terminal_id='live1'"
+            ).fetchone()[0]
+            is None
+        )
+        root_key = conn.execute(
+            "SELECT identity_key FROM conversation_identity "
+            "WHERE provider='codex' AND provider_namespace='default:codex' "
+            "AND provider_session_id='uuid-live-1'"
+        ).fetchone()[0]
+        assert root_key is not None
+        conn.close()
+
+        # Run the migration TWICE over the half-state.
+        d._migrate_f829_conversation_identity()
+
+        conn = sqlite3.connect(db_file)
+        # Zero unrooted incarnations after the first re-run.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM terminal_identity WHERE identity_key IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        # Exactly ONE bound root for the triplet (no second root inserted).
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM conversation_identity "
+                "WHERE provider='codex' AND provider_namespace='default:codex' "
+                "AND provider_session_id='uuid-live-1'"
+            ).fetchone()[0]
+            == 1
+        )
+        # The live row attached to the pre-existing root, which is live +
+        # current=live1 and retained its owner.
+        after1 = conn.execute(
+            "SELECT identity_key,lifecycle,current_terminal_id,owner_principal "
+            "FROM conversation_identity WHERE provider_session_id='uuid-live-1'"
+        ).fetchone()
+        assert after1 == (root_key, "live", "live1", "mb_owner1")
+        assert (
+            conn.execute(
+                "SELECT identity_key FROM terminal_identity WHERE terminal_id='live1'"
+            ).fetchone()[0]
+            == root_key
+        )
+        snapshot1 = conn.execute(
+            "SELECT identity_key,provider,provider_namespace,provider_session_id,"
+            "lifecycle,current_terminal_id,owner_principal,generation "
+            "FROM conversation_identity ORDER BY identity_key"
+        ).fetchall()
+        conn.close()
+
+        # Second re-run over the (now fully-migrated) db: no change at all.
+        d._migrate_f829_conversation_identity()
+        conn = sqlite3.connect(db_file)
+        snapshot2 = conn.execute(
+            "SELECT identity_key,provider,provider_namespace,provider_session_id,"
+            "lifecycle,current_terminal_id,owner_principal,generation "
+            "FROM conversation_identity ORDER BY identity_key"
+        ).fetchall()
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM terminal_identity WHERE identity_key IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        conn.close()
+    assert snapshot1 == snapshot2
     """AC2 / AC7 CAS mutant: two concurrent claims at the same generation, one wins."""
     d.mint_conversation_identity(
         identity_key="k1",
@@ -208,6 +307,41 @@ def test_ac7_cas_null_guard_holds_at_matching_generation(real_sqlite_env):
     # Address the CURRENT generation (1): the generation guard is satisfied, so
     # only the ``resume_claim IS NULL`` guard can reject this — it must.
     assert d.claim_resume("k_cas", 1, "b") is False
+
+
+def test_ac7_cas_generation_guard_rejects_stale_generation(real_sqlite_env):
+    """AC7 CAS-guard mutant kill (E4): a claim addressing a STALE generation must
+    lose while ``resume_claim IS NULL`` — proving the
+    ``generation == expected_generation`` predicate is load-bearing INDEPENDENTLY
+    of the NULL guard.
+
+    Sequence: mint at generation 0, claim (generation → 1, claim held), then
+    clear the claim (claim → NULL, generation STAYS 1). A second claim at the
+    stale generation 0 now has the NULL guard satisfied — so ONLY the generation
+    predicate can reject it. Deleting that predicate lets the stale claim win,
+    which this test alone catches.
+    """
+    d.mint_conversation_identity(
+        identity_key="k_stale",
+        provider="codex",
+        provider_namespace="ns",
+        agent_profile="dev",
+        model=None,
+        reasoning_effort=None,
+        owner_principal="mb",
+        origin_callback_ref=None,
+        current_terminal_id="t1",
+    )
+    assert d.claim_resume("k_stale", 0, "first") is True  # generation now 1
+    d.clear_resume_claim("k_stale")  # claim back to NULL; generation stays 1
+    assert d.get_conversation_identity("k_stale")["generation"] == 1
+    assert d.get_conversation_identity("k_stale")["resume_claim"] is None
+    # NULL guard is satisfied (claim is None); the ONLY predicate that can reject
+    # a claim at the stale generation 0 is ``generation == expected_generation``.
+    assert d.claim_resume("k_stale", 0, "stale") is False
+    # unchanged: still generation 1, still no claim held
+    assert d.get_conversation_identity("k_stale")["generation"] == 1
+    assert d.get_conversation_identity("k_stale")["resume_claim"] is None
 
 
 def test_ac7_bound_uniqueness(real_sqlite_env):
@@ -366,8 +500,22 @@ def test_ac3_capture_not_owned_by_another(real_sqlite_env):
 
 
 def test_ac4_crash_detach_narrow(real_sqlite_env):
-    """AC4: crash_detach removes the terminals row + warm intent, lifecycle detached."""
+    """AC4/E2: crash_detach settles BOTH delivery authorities (inbox + ledger)
+    to ``receiver_gone``, nullifies the mailbox pointer, drops the warm intent
+    and the terminals row, flips the root to ``detached`` — and touches NOTHING
+    ELSE (no barrier cancel, no member GONE flip, no pin change).
+
+    Seeds every named non-cascade invariant so removing either settlement call
+    OR any preservation guard makes this test fail:
+      * a PENDING inbox row + its paired PENDING ledger row,
+      * a DELIVERING inbox row + its paired EMITTED ledger row,
+      * a mailbox bound to the dying terminal,
+      * a warm intent for the dying terminal,
+      * an OPEN barrier + an AWAITING member for the dying terminal,
+      * a frozen authority pin for the dying terminal.
+    """
     _mkroot("k_cd", "codex", "mb", "live", "t_cd", uuid="u6")
+    now = datetime.now(timezone.utc)
     with d.SessionLocal.begin() as db:
         db.add(
             TerminalModel(
@@ -379,10 +527,149 @@ def test_ac4_crash_detach_narrow(real_sqlite_env):
                 init_state="ready",
             )
         )
+        # (1) a PENDING inbox row + paired PENDING ledger row to t_cd.
+        m1 = InboxModel(
+            id=9001,
+            sender_id="s_send",
+            receiver_id="t_cd",
+            message="pending-msg",
+            status=d.MessageStatus.PENDING.value,
+        )
+        # (2) a DELIVERING inbox row + paired EMITTED ledger row to t_cd.
+        m2 = InboxModel(
+            id=9002,
+            sender_id="s_send",
+            receiver_id="t_cd",
+            message="delivering-msg",
+            status=d.MessageStatus.DELIVERING.value,
+        )
+        # A control row to an UNRELATED receiver — must stay pending, untouched.
+        m3 = InboxModel(
+            id=9003,
+            sender_id="s_send",
+            receiver_id="other_term",
+            message="other-msg",
+            status=d.MessageStatus.PENDING.value,
+        )
+        db.add_all([m1, m2, m3])
+        db.flush()
+        db.add(
+            DeliveryLedgerModel(
+                message_id=9001,
+                receiver_id="t_cd",
+                state=d.LedgerState.PENDING.value,
+            )
+        )
+        db.add(
+            DeliveryLedgerModel(
+                message_id=9002,
+                receiver_id="t_cd",
+                state=d.LedgerState.EMITTED.value,
+            )
+        )
+        db.add(
+            DeliveryLedgerModel(
+                message_id=9003,
+                receiver_id="other_term",
+                state=d.LedgerState.PENDING.value,
+            )
+        )
+        # (3) mailbox bound to t_cd.
+        db.add(
+            MailboxModel(
+                id="mb_cd",
+                session_name="s",
+                role="worker",
+                current_terminal_id="t_cd",
+            )
+        )
+        # (4) warm intent for t_cd.
+        db.add(
+            WarmIntentModel(
+                intent_id="wi_cd",
+                worker_terminal_id="t_cd",
+                session_name="s",
+                worker_profile="dev",
+                parent_base_name="base",
+                provider="codex",
+            )
+        )
+        # (5) OPEN barrier + AWAITING member for t_cd — must be preserved.
+        db.add(
+            CallbackBarrierModel(
+                id=7001,
+                owner_terminal_id="sup_term",
+                owner_generation=1,
+                label="bar_cd",
+                state="OPEN",
+                timeout_at=now + timedelta(seconds=600),
+            )
+        )
+        db.flush()
+        db.add(
+            CallbackBarrierMemberModel(
+                id=8001,
+                barrier_id=7001,
+                member_key="mk_cd",
+                position=0,
+                terminal_id="t_cd",
+                lifecycle_generation=1,
+                state="AWAITING",
+            )
+        )
+        # (6) frozen authority pin for t_cd — must be preserved byte-for-byte.
+        db.add(
+            AuthorityPinModel(
+                task_key="t_cd",
+                file_path="/some/authority.md",
+                sha256="deadbeef",
+                version=1,
+                registered_by="sup_term",
+                frozen=True,
+            )
+        )
+
     out = d.crash_detach_terminal("t_cd")
+
+    # narrow transition results
     assert out["terminal_deleted"] and out["lifecycle"] == "detached"
     assert d.get_conversation_identity("k_cd")["lifecycle"] == "detached"
     assert "crash_detached" in [e["event"] for e in d.get_conversation_events("k_cd")]
+
+    with d.SessionLocal() as db:
+        # BOTH authorities settled to receiver_gone for the two undelivered rows.
+        i1 = db.query(InboxModel).filter_by(id=9001).one()
+        i2 = db.query(InboxModel).filter_by(id=9002).one()
+        assert i1.status == d.MessageStatus.DELIVERY_FAILED.value
+        assert i1.failure_reason == d.UndeliverableReason.RECEIVER_GONE.value
+        assert i2.status == d.MessageStatus.DELIVERY_FAILED.value
+        assert i2.failure_reason == d.UndeliverableReason.RECEIVER_GONE.value
+        l1 = db.query(DeliveryLedgerModel).filter_by(message_id=9001).one()
+        l2 = db.query(DeliveryLedgerModel).filter_by(message_id=9002).one()
+        assert l1.state == d.LedgerState.UNDELIVERABLE.value
+        assert l1.undeliverable_reason == d.UndeliverableReason.RECEIVER_GONE.value
+        assert l2.state == d.LedgerState.UNDELIVERABLE.value
+        assert l2.undeliverable_reason == d.UndeliverableReason.RECEIVER_GONE.value
+
+        # unrelated receiver's rows untouched.
+        i3 = db.query(InboxModel).filter_by(id=9003).one()
+        l3 = db.query(DeliveryLedgerModel).filter_by(message_id=9003).one()
+        assert i3.status == d.MessageStatus.PENDING.value and i3.failure_reason is None
+        assert l3.state == d.LedgerState.PENDING.value and l3.undeliverable_reason is None
+
+        # mailbox pointer nulled; warm intent + terminals row gone.
+        assert db.query(MailboxModel).filter_by(id="mb_cd").one().current_terminal_id is None
+        assert db.query(WarmIntentModel).filter_by(worker_terminal_id="t_cd").count() == 0
+        assert db.query(TerminalModel).filter_by(id="t_cd").count() == 0
+
+        # NON-cascade invariants preserved: barrier still OPEN, member still
+        # AWAITING (not GONE), pin still present and frozen.
+        bar = db.query(CallbackBarrierModel).filter_by(id=7001).one()
+        assert bar.state == "OPEN"
+        mem = db.query(CallbackBarrierMemberModel).filter_by(id=8001).one()
+        assert mem.state == "AWAITING"
+        pin = db.query(AuthorityPinModel).filter_by(task_key="t_cd").one()
+        assert pin.frozen is True and pin.sha256 == "deadbeef"
 
 
 def test_ac4_claim_ttl_reconcile(real_sqlite_env):
@@ -421,6 +708,49 @@ def test_d8_reconcile_live_roots(real_sqlite_env):
     assert res["detached"] == 1 and res["left_live"] == 1
     assert d.get_conversation_identity("k_dead")["lifecycle"] == "detached"
     assert d.get_conversation_identity("k_alive")["lifecycle"] == "live"
+
+
+def test_d8_reconcile_pi_no_artifact_classified_before_detach(real_sqlite_env):
+    """E2 (D8, Pi half): a dead pi_cli root with no recoverable artifact is
+    classified ``session_artifact_missing`` (with the D8 diagnostic) BEFORE the
+    narrow crash-detach, so the required no-artifact outcome is recorded rather
+    than silently lost. Detach still proceeds (a dead terminal is detached
+    regardless of artifact state).
+    """
+    from cli_agent_orchestrator.services import conversation_reconcile as cr
+    from cli_agent_orchestrator.services.session_artifact import ArtifactState, ArtifactStatus
+
+    # pi root with provider_session_id NULL -> resolve_artifact is MISSING.
+    _mkroot("k_pi", "pi_cli", "mb", "live", "term_pi", uuid=None)
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalModel(
+                id="term_pi",
+                tmux_session="s",
+                tmux_window="term_pi",
+                provider="pi_cli",
+                lifecycle="ephemeral",
+                init_state="ready",
+            )
+        )
+    with (
+        mock.patch(
+            "cli_agent_orchestrator.services.delivery_service.is_target_confirmed_dead",
+            side_effect=lambda tid, db: tid == "term_pi",
+        ),
+        mock.patch(
+            "cli_agent_orchestrator.services.session_artifact.resolve_artifact",
+            return_value=ArtifactStatus(ArtifactState.MISSING, detail="pi mid-turn crash"),
+        ),
+    ):
+        res = cr.reconcile_live_roots()
+    assert res["detached"] == 1
+    assert d.get_conversation_identity("k_pi")["lifecycle"] == "detached"
+    events = [e["event"] for e in d.get_conversation_events("k_pi")]
+    # classification recorded BEFORE the crash_detached event.
+    assert "session_artifact_missing" in events
+    assert "crash_detached" in events
+    assert events.index("session_artifact_missing") < events.index("crash_detached")
 
 
 # --------------------------------------------------------------------------

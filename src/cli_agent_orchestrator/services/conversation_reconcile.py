@@ -61,6 +61,7 @@ def reconcile_live_roots() -> Dict[str, Any]:
         SessionLocal,
         crash_detach_terminal,
         list_live_conversation_roots,
+        record_conversation_event,
     )
     from cli_agent_orchestrator.services.delivery_service import is_target_confirmed_dead
 
@@ -96,6 +97,46 @@ def reconcile_live_roots() -> Dict[str, Any]:
         if not confirmed_dead:
             left_live += 1
             continue
+        # F829 E2 (D8, Pi half): before the narrow capacity-removal, classify a
+        # dead root's recoverable artifact for providers whose crash is only
+        # recoverable after a completed turn (pi_cli). A mid-turn Pi crash has
+        # no artifact — persist the `session_artifact_missing` classification and
+        # the D8 diagnostic on the root BEFORE detaching, so the required
+        # no-artifact outcome is recorded rather than silently lost. Detach then
+        # proceeds identically (no cold start): a dead terminal is detached
+        # regardless of artifact state.
+        provider = root.get("provider")
+        identity_key = root.get("identity_key")
+        if provider == "pi_cli" and identity_key:
+            try:
+                from cli_agent_orchestrator.services.session_artifact import (
+                    ArtifactState,
+                    resolve_artifact,
+                )
+
+                status = resolve_artifact(
+                    "pi_cli",
+                    provider_session_id=root.get("provider_session_id"),
+                    provider_namespace=root.get("provider_namespace"),
+                    artifact_locator=root.get("artifact_locator"),
+                )
+                if status.state is ArtifactState.MISSING:
+                    record_conversation_event(
+                        identity_key,
+                        "session_artifact_missing",
+                        terminal_id=terminal_id,
+                        detail={
+                            "provider": "pi_cli",
+                            "reason": "session_artifact_missing",
+                            "diagnostic": status.detail or "no recoverable artifact",
+                        },
+                    )
+            except Exception:
+                logger.debug(
+                    "reconcile_live_roots: pi artifact classification failed for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
         try:
             crash_detach_terminal(terminal_id)
             detached += 1
