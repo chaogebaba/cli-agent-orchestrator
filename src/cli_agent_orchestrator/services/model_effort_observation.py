@@ -176,16 +176,19 @@ class _CodexCursor:
     """Forward-scan cursor for one codex rollout PATH (ruling / B5).
 
     ``offset`` — byte position the scan has consumed up to. ``inode`` / ``size``
-    detect rotation/truncation. ``model`` / ``effort`` / ``event_time_ns`` /
-    ``kind`` hold the LAST turn_context / thread_settings_applied seen so far,
-    so a poll that appends only unrelated records keeps the prior evidence.
-    ``over_cap`` records that the first pass hit the 16 MB ceiling and only the
-    head+tail were scanned.
+    detect rotation/truncation; ``mtime_ns`` detects a same-SIZE in-place
+    rewrite (B2 r1): a rewrite that keeps the byte length changes mtime but not
+    size, so without this the cursor sits at EOF, reads nothing, and reprojects
+    stale values. ``model`` / ``effort`` / ``event_time_ns`` / ``kind`` hold the
+    LAST turn_context / thread_settings_applied seen so far, so a poll that
+    appends only unrelated records keeps the prior evidence. ``over_cap`` records
+    that the first pass hit the 16 MB ceiling and only the head+tail were scanned.
     """
 
     offset: int = 0
     inode: Optional[int] = None
     size: int = 0
+    mtime_ns: Optional[int] = None
     seeded: bool = False
     model: Optional[str] = None
     effort: Optional[str] = None
@@ -478,21 +481,48 @@ def observe_codex(
 
 
 def _codex_advance(path: Path, cursor: _CodexCursor) -> ProviderObservation:
-    """Advance ``cursor`` over new bytes and project. Caller holds ``_lock``."""
+    """Advance ``cursor`` over new bytes and project. Caller holds ``_lock``.
+
+    Three cases:
+
+    * **Rotation / truncation** (inode change or size below the consumed
+      offset): a different file at the same path — reset and rescan from 0.
+    * **Same-size in-place rewrite** (B2 r1): mtime advanced but size did NOT
+      grow past the consumed offset. The cursor is already at EOF, so an
+      append-only reader would read nothing and reproject stale values. Reset
+      and rescan the whole bound file.
+    * **First observation** (not seeded): stream consecutive windows (each read
+      capped at :data:`CODEX_INCREMENTAL_MAX_BYTES`) all the way to EOF (B1 r1),
+      up to the 16 MB first-pass ceiling; beyond the ceiling, head + tail only.
+    * **Ordinary incremental poll**: read only ``[offset, EOF)`` capped at 1 MB,
+      carrying any remainder forward to the next poll.
+    """
     try:
         st = path.stat()
     except OSError:
         return _codex_project(cursor)
 
     rotated = cursor.inode is not None and (cursor.inode != st.st_ino or st.st_size < cursor.offset)
-    if rotated:
+    # B2: a same-size (or grow-less) in-place rewrite advances mtime without
+    # moving EOF past what we already consumed. Detect it by mtime change with
+    # no append growth, and force a full rescan rather than reading zero bytes.
+    rewritten = (
+        not rotated
+        and cursor.seeded
+        and cursor.mtime_ns is not None
+        and st.st_mtime_ns != cursor.mtime_ns
+        and st.st_size <= cursor.offset
+    )
+    if rotated or rewritten:
         cursor.offset = 0
         cursor.model = cursor.effort = cursor.event_time_ns = None
+        cursor.over_cap = False
         cursor.seeded = False
     cursor.inode = st.st_ino
 
     if not cursor.seeded:
         cursor.seeded = True
+        cursor.offset = 0
         if st.st_size > CODEX_FIRST_PASS_MAX_BYTES:
             # Oversized: head + tail windows only (ruling).
             cursor.over_cap = True
@@ -501,17 +531,50 @@ def _codex_advance(path: Path, cursor: _CodexCursor) -> ProviderObservation:
             _codex_read_range(path, cursor, tail_start, st.st_size)
             cursor.offset = st.st_size
             cursor.size = st.st_size
+            cursor.mtime_ns = st.st_mtime_ns
             return _codex_project(cursor)
-        # First full pass, streaming, capped per read window.
-        cursor.offset = 0
+        # First full pass (B1): stream consecutive <=1 MB windows to EOF, not a
+        # single window. Each _codex_read_range consumes up to its last newline;
+        # the loop guards against a window that consumes nothing (a record
+        # straddling the cap boundary) by advancing past it to keep moving.
+        _codex_scan_forward_to_eof(path, cursor, st.st_size)
+        cursor.size = st.st_size
+        cursor.mtime_ns = st.st_mtime_ns
+        return _codex_project(cursor)
 
-    # Incremental (or first-pass) read of [offset, min(EOF, offset+cap)).
+    # Ordinary incremental poll: read only [offset, min(EOF, offset+cap)).
     if st.st_size > cursor.offset:
         end = min(st.st_size, cursor.offset + CODEX_INCREMENTAL_MAX_BYTES)
         consumed = _codex_read_range(path, cursor, cursor.offset, end)
         cursor.offset += consumed
     cursor.size = st.st_size
+    cursor.mtime_ns = st.st_mtime_ns
     return _codex_project(cursor)
+
+
+def _codex_scan_forward_to_eof(path: Path, cursor: _CodexCursor, eof: int) -> None:
+    """Stream consecutive <=1 MB windows from ``cursor.offset`` to ``eof`` (B1).
+
+    Completes the promised first-pass scan instead of stopping after one window.
+    Each window consumes up to its last newline; a window that consumes nothing
+    (a single record longer than the cap, already skipped inside
+    ``_codex_read_range`` when it returns the full cap) still advances the
+    offset, so the loop always terminates.
+    """
+    guard = 0
+    max_windows = (CODEX_FIRST_PASS_MAX_BYTES // CODEX_INCREMENTAL_MAX_BYTES) + 2
+    while cursor.offset < eof and guard < max_windows:
+        guard += 1
+        end = min(eof, cursor.offset + CODEX_INCREMENTAL_MAX_BYTES)
+        consumed = _codex_read_range(path, cursor, cursor.offset, end)
+        if consumed <= 0:
+            # No complete line in this window and it is not a full-cap oversized
+            # record (that path returns the cap): the tail of the window is a
+            # partial line. Nothing more to do on the first pass — stop; the
+            # ordinary incremental poll reads it whole once it is newline-
+            # terminated.
+            break
+        cursor.offset += consumed
 
 
 def _codex_read_range(path: Path, cursor: _CodexCursor, start: int, end: int) -> int:

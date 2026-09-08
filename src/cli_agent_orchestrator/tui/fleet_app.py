@@ -999,7 +999,11 @@ class FleetApp(App[None]):
         self.query_one("#debug", Static).display = self.debug_visible
         self.query_one("#empty", Static).display = False
         self.query_one("#hints", Static).update(hint_renderable())
-        self.query_one("#legend", Static).update(LEGEND)
+        # F826 (#683) B3 (r1): pass a literal Text renderable, not a plain str.
+        # Static.update passes a str through Rich markup, which consumes the D1/D6
+        # marker brackets ([L], [R], [S], [C], [?]) as console-markup tags and
+        # STRIPS them from the visible legend. Text() renders literally.
+        self.query_one("#legend", Static).update(Text(LEGEND))
         self.refresh_view()
         self.fetch_worker()
         # The clock ticks on its own: the fetch loop is too slow to watch a
@@ -1427,7 +1431,10 @@ class FleetApp(App[None]):
         effort_line = observation_detail(
             "effort", term.reasoning_effort, term.effort_obs, now_ns=now_ns
         )
-        widget.update(f"{model_line}    {effort_line}")
+        # F826 (#683) B3 (r1): literal Text — the detail carries the same D1/D6
+        # marker brackets ([L]/[R]/[S]/[C]/[?]), which Rich markup would strip
+        # from a plain str.
+        widget.update(Text(f"{model_line}    {effort_line}"))
 
     def resolve_pane(self, window_index: int) -> str | None:
         """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``)."""

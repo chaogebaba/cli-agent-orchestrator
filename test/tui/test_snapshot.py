@@ -124,3 +124,38 @@ async def test_the_golden_frame_carries_every_section_in_the_scripts_order(
     assert frame.index(head) < marks[1]
     # the selection gutter marks exactly one row
     assert sum(1 for line in frame if line.startswith("▶")) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_frame_renders_literal_d1_marker_brackets(tmp_path: Path) -> None:
+    """F826 (#683) B3 (r1): the D1/D6 marker brackets must render LITERALLY.
+
+    ``Static.update`` on a plain str runs the text through Rich console markup,
+    which consumes ``[L]``/``[R]``/``[S]``/``[C]``/``[?]`` as markup tags and
+    strips them — the exact regression the r1 gate caught. This asserts, over the
+    COMPOSITED frame (not a widget in isolation), that the legend, the selected-
+    row detail, and the MODEL/EFFORT cells all carry their literal brackets.
+    """
+    app, feed, _ = make_app(
+        [load_payload("healthy")],
+        tmp_path,
+        tmux=FakeTmux(activity={"0": 990, "2": 999, "3": 999}),
+        labels=LABELS,
+        events=EVENTS,
+    )
+    async with app.run_test(size=SCREEN_SIZE) as pilot:
+        await settle(pilot, feed)
+        await pilot.pause()
+        frame = normalise(screen_lines(app))
+    blob = "\n".join(frame)
+    # The legend keeps every literal marker bracket.
+    assert "[L]ive" in blob
+    assert "[R]ecorded" in blob
+    assert "[S]tale" in blob
+    assert "[C]onfigured" in blob
+    assert "[?]unknown" in blob
+    assert "!=conflict" in blob
+    # The MODEL/EFFORT cells and the selected-row detail keep their [C]/[?].
+    assert "claude-opus-5 [C]" in blob
+    assert "- [?]" in blob
+    assert "model: claude-opus-5 [C]" in blob

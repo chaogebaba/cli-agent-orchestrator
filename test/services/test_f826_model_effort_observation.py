@@ -180,6 +180,64 @@ def test_codex_no_signal_is_unknown(tmp_path):
     assert obs.model.marker is Marker.UNKNOWN
 
 
+def test_codex_first_pass_completes_full_16mb_scan_beyond_1mb(tmp_path):
+    """B1 (r1): the first pass must stream to EOF, not stop after one 1 MB window.
+
+    The only turn_context sits AFTER byte 1,048,576 (past the incremental cap)
+    and before 16 MB. The first call must resolve it; an unchanged second call
+    must return that resolved projection from cache.
+    """
+    cx = tmp_path / "rollout.jsonl"
+    filler = json.dumps(
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant"},
+            "pad": "x" * 60,
+        }
+    )
+    lines = []
+    size = 0
+    while size < 1_200_000:  # push the signal past the 1 MB (1,048,576) incremental cap
+        lines.append(filler)
+        size += len(filler) + 1
+    lines.append(_codex_turn_context("gpt-5.6-sol", "high"))
+    lines.append(filler)  # trailing filler so the signal is not itself at EOF
+    cx.write_text("\n".join(lines) + "\n")
+    assert cx.stat().st_size > meo.CODEX_INCREMENTAL_MAX_BYTES  # signal is past one window
+    assert cx.stat().st_size < meo.CODEX_FIRST_PASS_MAX_BYTES  # but within the 16 MB cap
+
+    first = meo.observe_codex(cx)
+    assert first.model.value == "gpt-5.6-sol"
+    assert first.model.marker is Marker.OBSERVED
+    second = meo.observe_codex(cx)  # unchanged -> cached completed first-pass projection
+    assert second.model.value == "gpt-5.6-sol"
+
+
+def test_codex_same_size_in_place_rewrite_is_rescanned(tmp_path):
+    """B2 (r1): a same-SIZE in-place rewrite (mtime advances, size unchanged) must
+    reset the cursor and rescan — parallel to the pi cache-key mutant test.
+
+    Without retaining/comparing mtime_ns on the cursor, the cursor sits at EOF,
+    reads zero bytes, and reprojects the stale value.
+    """
+    import os
+
+    cx = tmp_path / "rollout.jsonl"
+    rec_one = _codex_turn_context("model-one", "high")
+    cx.write_text(rec_one + "\n")
+    first = meo.observe_codex(cx)
+    assert first.model.value == "model-one"
+
+    # A same-LENGTH replacement so st_size does not change; only mtime advances.
+    rec_two = _codex_turn_context("model-two", "high")
+    assert len(rec_two) == len(rec_one)
+    cx.write_text(rec_two + "\n")
+    later = cx.stat().st_mtime_ns + 5_000_000_000
+    os.utime(cx, ns=(later, later))
+    second = meo.observe_codex(cx)
+    assert second.model.value == "model-two"  # not the stale "model-one"
+
+
 # --- pi (AC2) ---------------------------------------------------------------
 
 
