@@ -24,6 +24,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -319,66 +320,194 @@ def test_concurrent_parent_and_overlay_drain_single_claim(mailbox_db):
     assert sum(r.count(msg.id) for r in results) == 1
 
 
-def test_concurrent_parent_and_overlay_rewake_single_wake(monkeypatch, tmp_path):
-    """REWAKE single-wake under the 0.7 ms race. The parent `.sh` watcher and the
-    overlay ``rewake.py`` watcher contend on the SAME ``watcher.lock`` (the
-    overlay now acquires the parent's lock path — the "equivalent of the parent's
-    watcher.lock" the verdict required, because a wake is NOT server-side
-    dedupable). Fired concurrently against ONE pending id, exactly ONE watcher
-    wins the flock and wakes (exit 2, one ``rewakeSummary``); the other exits 0
-    without polling. Two DIFFERENT overlay arms stand in for parent+overlay: both
-    resolve the same shared lock via ``F213_STATE_DIR``."""
-    import io
+def _find_parent_rewake_hook():
+    """Locate the real parent-repo ``f213-callback-rewake.sh`` (read-only).
+
+    Order: explicit ``CAO_F810_PARENT_HOOK`` env → ``CLAUDE_PROJECT_DIR`` →
+    ``_PARENT_REPO``. Returns a Path or None (the caller skips when absent, e.g.
+    on a box that has no parent checkout)."""
+    candidates = []
+    env_hook = os.environ.get("CAO_F810_PARENT_HOOK")
+    if env_hook:
+        candidates.append(Path(env_hook))
+    proj = os.environ.get("CLAUDE_PROJECT_DIR")
+    if proj:
+        candidates.append(Path(proj) / ".claude" / "hooks" / "f213-callback-rewake.sh")
+    candidates.append(_PARENT_REPO / ".claude" / "hooks" / "f213-callback-rewake.sh")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def test_actual_parent_sh_and_overlay_single_wake_persistent_row(tmp_path):
+    """B4 (r4): the ACTUAL parent ``.sh`` + overlay ``python -m`` pair against ONE
+    PERSISTENTLY pending row must produce EXACTLY ONE wake — the r3 EMPIRICAL gate
+    reproduced a DOUBLE wake here (overlay wins the lock, wakes id 42, releases;
+    the parent Stop watcher retries the freed lock for up to 15s, consults its OWN
+    state.json, and wakes id 42 again). The r4 fix is a one-directional shared
+    wake cursor: the parent reads/writes the overlay's
+    ``$CAO_HOME_DIR/f810-rewake-state.<tid>.json`` so a post-release retry sees the
+    id as already woken.
+
+    This runs the REAL scripts as subprocesses (reviewer driver shape,
+    /data/cao-scratch/30eb5f40/actual_pair_repro.py): a stub HTTP server serves id
+    42 on EVERY poll (persistent), the overlay is started first and holds
+    ``watcher.lock`` between two stability polls, and the parent is started inside
+    that window so its production 15s lock-retry fires. Assert exactly one exit 2
+    and one ``rewakeSummary`` across BOTH processes.
+
+    Skips when the parent ``.sh`` is not present (e.g. a box without the parent
+    checkout); the box A/B run in the report exercises the real pair."""
+    import json as _json
+    import subprocess
     import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from cli_agent_orchestrator.hooks import rewake
+    parent_hook = _find_parent_rewake_hook()
+    if parent_hook is None:
+        pytest.skip("parent f213-callback-rewake.sh not present in this checkout")
 
-    shared_state_dir = tmp_path / "f213-rewake" / "abcd1234"
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    monkeypatch.setenv("CAO_API_BASE_URL", "http://127.0.0.1:9999")
-    monkeypatch.setenv("F213_STATE_DIR", str(shared_state_dir))
-    monkeypatch.setattr(rewake, "CAO_HOME_DIR", str(tmp_path))
-    monkeypatch.setenv("F213_STABILITY_POLLS", "1")
-    monkeypatch.setenv("F213_POLL_INTERVAL_S", "0")
-    monkeypatch.setenv("F213_DEADLINE_S", "1")
+    # Fork ``src`` for the overlay subprocess' PYTHONPATH — resolve from this file
+    # (test/providers/…  → repo root is parents[2]).
+    fork_src = Path(__file__).resolve().parents[2] / "src"
 
-    resp = MagicMock()
-    resp.json.return_value = {
-        "items": [{"id": 42, "sender_id": "wrk1", "message": "hi", "status": "pending"}]
-    }
-    resp.raise_for_status = MagicMock()
+    home = tmp_path / "home"
+    lockdir = tmp_path / "lock"
+    datadir = tmp_path / "data"
+    for d in (home, lockdir, datadir):
+        d.mkdir(parents=True)
 
-    rcs: list[int] = []
-    barrier = threading.Barrier(2)
-    reslock = threading.Lock()
+    reqs: list[tuple[float, str]] = []
+    reqs_lock = threading.Lock()
 
-    def arm_once() -> None:
-        barrier.wait()
-        rc = rewake.main(["--arm", "--source=stop"])
-        with reslock:
-            rcs.append(rc)
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            with reqs_lock:
+                reqs.append((time.monotonic(), self.path))
+            if self.path.startswith("/messages"):
+                body: dict = {
+                    "items": [
+                        {
+                            "id": 42,
+                            "sender_id": "wrk1",
+                            "message": "one persistent callback",
+                            "status": "pending",
+                        }
+                    ]
+                }
+            elif self.path.startswith("/terminals/"):
+                body = {"status": "ready"}
+            else:
+                body = {}
+            enc = _json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(enc)))
+            self.end_headers()
+            self.wfile.write(enc)
 
-    # Patch ONCE at the outer scope (not per-thread): patch.object mutates shared
-    # module state, so per-thread context managers would clobber each other's
-    # mock mid-poll. Installed for the whole concurrent window here.
-    with (
-        patch.object(rewake, "get_local_bearer", return_value=None),
-        patch.object(rewake.cao_http, "get", return_value=resp),
-        patch("sys.stdin", io.StringIO("{}")),
-    ):
-        threads = [threading.Thread(target=arm_once) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
+        def log_message(self, *a: object) -> None:  # noqa: A003
+            return
 
-    # Exactly one watcher woke (exit 2); the other stepped aside (exit 0) because
-    # it lost the shared watcher.lock. rc==2 is the ONLY wake signal (D5/AC16), so
-    # a single 2 in the pair is a single wake — the verdict's "one rewake result".
-    assert sorted(rcs) == [0, 2], rcs
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
 
+    common = os.environ.copy()
+    common.update(
+        {
+            "CAO_TERMINAL_ID": "abcd1234",
+            "CAO_ENDPOINT": endpoint,
+            "CAO_API_BASE_URL": endpoint,
+            "CAO_HOME_DIR": str(home),
+            "CAO_DATA_DIR": str(datadir),
+            "F213_STATE_DIR": str(lockdir),  # shared watcher.lock dir
+            "F213_COOLDOWN_S": "300",
+            "F213_MAX_STREAK": "3",
+            "F213_OWNER_CHECK_CADENCE": "999",
+            "CAO_PROCESS_INCARNATION": "inc1",
+            "CAO_OVERLAY_HOOKS_ACTIVE": "1",
+        }
+    )
+    common.pop("CLAUDE_AGENT_ID", None)
 
-# ── dedupe helper (D2) ──────────────────────────────────────────────────────────
+    overlay_env = common.copy()
+    overlay_env.update(
+        {
+            "PYTHONPATH": str(fork_src),
+            "F213_POLL_INTERVAL_S": "0.20",
+            "F213_STABILITY_POLLS": "2",
+            "F213_DEADLINE_S": "6",
+        }
+    )
+    parent_env = common.copy()
+    parent_env.update(
+        {
+            "F213_POLL_INTERVAL_S": "0.01",
+            "F213_STABILITY_POLLS": "2",
+            "F213_DEADLINE_S": "6",
+        }
+    )
+
+    overlay_cmd = [
+        sys.executable,
+        "-m",
+        "cli_agent_orchestrator.hooks.rewake",
+        "--arm",
+        "--source=stop",
+    ]
+    parent_cmd = [str(parent_hook), "--arm", "--source=stop"]
+
+    try:
+        overlay = subprocess.Popen(
+            overlay_cmd,
+            env=overlay_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Wait until the overlay has reached its first poll (it now holds the
+        # lock, between stability polls) before starting the parent.
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            with reqs_lock:
+                seen = any(p.startswith("/messages") for _, p in reqs)
+            if seen:
+                break
+            time.sleep(0.005)
+        else:
+            overlay.kill()
+            pytest.fail("overlay did not reach its first poll")
+
+        parent_started = time.monotonic()
+        parent = subprocess.Popen(
+            parent_cmd,
+            cwd=str(parent_hook.parent.parent.parent),
+            env=parent_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        overlay_out, _ = overlay.communicate(timeout=30)
+        parent_out, _ = parent.communicate(timeout=30)
+    finally:
+        server.shutdown()
+        th.join(timeout=2)
+
+    rcs = sorted([overlay.returncode, parent.returncode])
+    wake_summaries = [
+        out for out in (overlay_out.strip(), parent_out.strip()) if "rewakeSummary" in out
+    ]
+    # EXACTLY ONE wake across the real pair: one exit 2, one exit 0, one summary.
+    assert rcs == [0, 2], (rcs, overlay_out, parent_out)
+    assert len(wake_summaries) == 1, (overlay_out, parent_out)
+    # And the one wake names id 42.
+    assert '"id 42"' in wake_summaries[0] or "id 42" in wake_summaries[0]
 
 
 def test_dedupe_drops_second_identical_command_first_wins():

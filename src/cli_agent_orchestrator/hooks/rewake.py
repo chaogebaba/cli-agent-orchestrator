@@ -150,8 +150,14 @@ def _acquire_watcher_lock(terminal_id: str) -> Any:
 
 
 def _read_state(terminal_id: str) -> tuple[int, float, int]:
+    # F810 #667 r4: this file may be written by the transition-only parent
+    # ``.sh`` (the shared wake cursor), so read it TOLERANTLY: pull only the three
+    # known keys via ``.get`` (ignore any extra keys the .sh might add), and fall
+    # back to zeros on a missing/garbage/torn file. Never raises.
     try:
         d = json.loads(_state_path(terminal_id).read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return 0, 0.0, 0
         return (
             int(d.get("last_wake_max_id", 0)),
             float(d.get("last_wake_ts", 0)),
@@ -162,12 +168,26 @@ def _read_state(terminal_id: str) -> tuple[int, float, int]:
 
 
 def _save_state(terminal_id: str, mid: int, ts: float, streak: int) -> None:
+    """Persist the wake cursor, atomically (tmp + os.replace).
+
+    F810 #667 r4: this file (``$CAO_HOME_DIR/f810-rewake-state.<tid>.json``) is a
+    SHARED wake cursor during the fork-first redeploy window — the transition-only
+    parent ``.sh`` reads it before waking and writes it on its own wake (same
+    3-key shape). The atomic rename guarantees the ``.sh`` (or a sibling overlay
+    arm) never observes a half-written file; a torn read would let a re-wake slip
+    through. The ``.sh`` writes the same way, so a read on either side always sees
+    a complete record. ``_read_state`` tolerates extra/unknown keys and a missing
+    file, so a ``.sh``-authored file is always safe to consume here.
+    """
     try:
         Path(CAO_HOME_DIR).mkdir(parents=True, exist_ok=True, mode=0o700)
-        _state_path(terminal_id).write_text(
+        target = _state_path(terminal_id)
+        tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(
             json.dumps({"last_wake_max_id": mid, "last_wake_ts": ts, "wake_streak": streak}),
             encoding="utf-8",
         )
+        os.replace(tmp, target)
     except OSError:
         pass
 
