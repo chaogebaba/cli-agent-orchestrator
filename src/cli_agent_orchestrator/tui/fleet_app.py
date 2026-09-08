@@ -93,6 +93,7 @@ from typing import (
     Final,
     List,
     Mapping,
+    Optional,
     Sequence,
     Tuple,
 )
@@ -130,6 +131,11 @@ from cli_agent_orchestrator.tui.columns import (
 )
 from cli_agent_orchestrator.tui.fetcher import FETCH_INTERVAL, fetch_json, run_fetch_loop
 from cli_agent_orchestrator.tui.fleet_state import FleetState, StatusClock, TerminalState
+from cli_agent_orchestrator.tui.model_effort_cell import (
+    LEGEND,
+    observation_cell,
+    observation_detail,
+)
 from cli_agent_orchestrator.tui.status_cell import status_cell
 
 __all__ = [
@@ -673,8 +679,11 @@ def row_values(
         term.id,
         term.position or term.profile or "?",
         provider_short(term.provider),
-        term.resolved_model or CELL_UNKNOWN,
-        term.reasoning_effort or CELL_UNKNOWN,
+        # F826 (#683) D6: render the OBSERVED model/effort as `value [M]`,
+        # falling back to the configured value `[C]` (or `- [?]`) when there is
+        # no usable observation. The configured columns are never overwritten.
+        observation_cell(term.resolved_model, term.model_obs),
+        observation_cell(term.reasoning_effort, term.effort_obs),
         labels.get(term.id, default_label)[:40],
         status_cell(status_row(term)).plain,
         elapsed,
@@ -965,11 +974,13 @@ class FleetApp(App[None]):
             yield Static(id="table-rule")
             yield DataTable(id="fleet")
             yield Static(id="empty")
+            yield Static(id="detail")
             yield Static(id="events-title")
             yield Static(id="events")
             yield Static(id="debug")
             yield Static(id="flash")
             yield Static(id="hints")
+            yield Static(id="legend")
             yield Static(id="peek")
 
     def on_mount(self) -> None:
@@ -988,6 +999,11 @@ class FleetApp(App[None]):
         self.query_one("#debug", Static).display = self.debug_visible
         self.query_one("#empty", Static).display = False
         self.query_one("#hints", Static).update(hint_renderable())
+        # F826 (#683) B3 (r1): pass a literal Text renderable, not a plain str.
+        # Static.update passes a str through Rich markup, which consumes the D1/D6
+        # marker brackets ([L], [R], [S], [C], [?]) as console-markup tags and
+        # STRIPS them from the visible legend. Text() renders literally.
+        self.query_one("#legend", Static).update(Text(LEGEND))
         self.refresh_view()
         self.fetch_worker()
         # The clock ticks on its own: the fetch loop is too slow to watch a
@@ -1085,6 +1101,7 @@ class FleetApp(App[None]):
         self.refresh_badge()
         self.refresh_events()
         self.refresh_peek()
+        self.refresh_detail()
         self.refresh_debug()
         self.query_one("#flash", Static).update(self.flash)
 
@@ -1388,6 +1405,36 @@ class FleetApp(App[None]):
         if selected is None:
             return None
         return next((t for t in self.state.terminals if t.id == selected), None)
+
+    def refresh_detail(self) -> None:
+        """F826 (#683) D6: model/effort details for the selected row.
+
+        Shows the observation kind, source, age and configured value for the
+        row under the cursor (D1: "kind is shown in the details"). Empty when no
+        row is selected. Never raises — a detail line is not worth a crashed
+        frame.
+        """
+        try:
+            widget = self.query_one("#detail", Static)
+        except Exception:
+            return
+        term = self.selected_terminal()
+        if term is None:
+            widget.update("")
+            return
+        now_ns: Optional[int] = None
+        try:
+            now_ns = int(self._now() * 1e9)
+        except Exception:
+            now_ns = None
+        model_line = observation_detail("model", term.resolved_model, term.model_obs, now_ns=now_ns)
+        effort_line = observation_detail(
+            "effort", term.reasoning_effort, term.effort_obs, now_ns=now_ns
+        )
+        # F826 (#683) B3 (r1): literal Text — the detail carries the same D1/D6
+        # marker brackets ([L]/[R]/[S]/[C]/[?]), which Rich markup would strip
+        # from a plain str.
+        widget.update(Text(f"{model_line}    {effort_line}"))
 
     def resolve_pane(self, window_index: int) -> str | None:
         """The window's CAO pane id, or ``None`` (``fleet-tui.py:129-135``)."""

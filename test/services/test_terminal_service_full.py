@@ -2654,12 +2654,12 @@ class TestDeleteTerminalWorktree:
     """issue #100 Phase 1: worktree teardown lives on _delete_terminal_under_lease
     (fork cascade delete_terminal is a different surface)."""
 
-    def _run_under_lease(self, terminal_id: str, **extra_patches):
+    def _run_under_lease(self, terminal_id: str, *, force: bool = False, **extra_patches):
         from cli_agent_orchestrator.services.terminal_service import (
             _delete_terminal_under_lease,
         )
 
-        return _delete_terminal_under_lease(terminal_id, lease_token="lease")
+        return _delete_terminal_under_lease(terminal_id, lease_token="lease", force=force)
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease")
@@ -2669,7 +2669,7 @@ class TestDeleteTerminalWorktree:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_removes_the_worktree_when_the_live_cwd_matches_the_worktree_shape(
+    def test_retains_the_worktree_on_a_normal_reap(
         self,
         mock_get_metadata,
         mock_tmux,
@@ -2680,6 +2680,12 @@ class TestDeleteTerminalWorktree:
         mock_validate_lease,
         mock_db_delete,
     ):
+        """RESUME HOT-FIX (addendum r1 #3, verdict r1 B3): a normal reap RETAINS
+        the worktree so a later assign(resume_from=…) can re-attach to the exact
+        cwd a kiro session is keyed by. Removal is gated on force=True (abandon)
+        — see test_removes_the_worktree_on_force_abandon below. The runtime is
+        correct; this test's OLD expectation (remove on normal reap) was the
+        stale side."""
         from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
         from cli_agent_orchestrator.services.worktree_service import (
             parse_worktree_path as real_parse_worktree_path,
@@ -2705,7 +2711,62 @@ class TestDeleteTerminalWorktree:
         with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
             lock = MagicMock()
             mock_lock.return_value = lock
-            result = self._run_under_lease("test1234")
+            result = self._run_under_lease("test1234")  # force=False (normal reap)
+
+        assert (
+            result.get("terminal_deleted") is True
+            or result.get("rollback_kill_uncertain") is not True
+        )
+        # Retained, not removed, on a normal reap.
+        mock_worktree_service.remove_worktree.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
+    @patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_removes_the_worktree_on_force_abandon(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_worktree_service,
+        mock_validate_lease,
+        mock_db_delete,
+    ):
+        """RESUME HOT-FIX (addendum r1 #3, verdict r1 B3): force=True is the
+        ABANDON path — the checkout IS removed (git truth: repo_root from the
+        stored/parsed worktree shape)."""
+        from cli_agent_orchestrator.services.worktree_service import (
+            parse_worktree_path as real_parse_worktree_path,
+        )
+
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "provider": "kiro_cli",
+        }
+        mock_tmux.get_pane_working_directory.return_value = "/repo/.cao/worktrees/test1234"
+        mock_tmux.window_liveness.return_value = "gone"
+        mock_tmux.get_history.return_value = ""
+        mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
+        mock_db_delete.return_value = {
+            "terminal_deleted": True,
+            "intent_deleted": False,
+            "intent_error": None,
+            "intent_retain_reason": None,
+        }
+
+        with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
+            lock = MagicMock()
+            mock_lock.return_value = lock
+            result = self._run_under_lease("test1234", force=True)
 
         assert (
             result.get("terminal_deleted") is True

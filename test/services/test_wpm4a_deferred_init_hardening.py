@@ -274,12 +274,17 @@ def test_atomic_delete_preserves_keep_bases_intent(isolated_db):
         parent_base_name="base",
         fork_mode="fork",
     )
-    # F631 D4 widened this result with `resume_key` — the reaped lane's
-    # provider_session_id, None for a lane whose provider minted none.
+    # F631 D4 widened this result with `resume_key`; RESUME HOT-FIX r1 #4
+    # widened it into a full resume block for every provider.
     assert db.delete_terminal_and_warm_intent("worker", preserve_warm_intent=True) == {
         "terminal_deleted": True,
         "intent_deleted": False,
-        "resume_key": None,
+        "resume_key": "worker",
+        "provider_session_id": None,
+        "resumable": False,
+        "reason": None,
+        "cwd": None,
+        "artifact_locator": None,
     }
     with sessions() as session:
         assert session.query(db.TerminalModel).count() == 0
@@ -1262,7 +1267,20 @@ async def test_external_delete_waits_for_deferred_future_before_core(monkeypatch
     assert not core_called.is_set()
     release.set()
     result = await deleting
-    assert result["reaped"] == [{"id": "delete-worker", "status": "reaped"}]
+    # RESUME HOT-FIX r1 #4: reaped entries carry the resume block. This test's
+    # mocked _delete_terminal_under_lease returns no resume fields, so they are
+    # None/False (no resume_key key is added when it is falsy).
+    assert result["reaped"] == [
+        {
+            "id": "delete-worker",
+            "status": "reaped",
+            "provider_session_id": None,
+            "resumable": False,
+            "reason": None,
+            "cwd": None,
+            "artifact_locator": None,
+        }
+    ]
     assert core_called.is_set()
 
 

@@ -7,18 +7,27 @@ import requests
 from cli_agent_orchestrator.mcp_server.server import _assign_impl
 from cli_agent_orchestrator.services.fork_context_service import ForkContextError
 
-
-ROW = {"name": "base", "provider": "codex", "session_uuid": "11111111-1111-4111-8111-111111111111",
-       "cwd": "/repo", "agent_profile": "developer", "git_sha": "a" * 40,
-       "dirty_hashes": "{}"}
+ROW = {
+    "name": "base",
+    "provider": "codex",
+    "session_uuid": "11111111-1111-4111-8111-111111111111",
+    "cwd": "/repo",
+    "agent_profile": "developer",
+    "git_sha": "a" * 40,
+    "dirty_hashes": "{}",
+}
 
 
 @pytest.mark.parametrize("code", ["base_name_unknown", "base_not_registered", "base_session_unset"])
 def test_resolution_errors_do_not_spawn(monkeypatch, code):
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with patch("cli_agent_orchestrator.services.fork_context_service.resolve_base",
-               side_effect=ForkContextError(code)), patch(
-               "cli_agent_orchestrator.mcp_server.server._create_terminal") as create:
+    with (
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base",
+            side_effect=ForkContextError(code),
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
         result = _assign_impl("developer", "task", fork_from="base")
     assert code in result["message"]
     create.assert_not_called()
@@ -28,76 +37,92 @@ def test_resume_requires_base_does_not_spawn(monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     with patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create:
         result = _assign_impl("developer", "task", resume=True)
-    assert "resume_requires_fork_from" in result["message"]
+    # RESUME HOT-FIX r1 #1: resume=True with no handle is now the ONE typed
+    # refusal (was the fork-path string resume_requires_fork_from).
+    assert result["error"] == "resume_refused"
+    assert result["reason"] == "resume_true_without_handle"
     create.assert_not_called()
 
 
-@pytest.mark.parametrize("code", ["provider_mismatch", "provider_lacks_fork_capability",
-                                  "resume_profile_mismatch", "session_file_missing",
-                                  "session_live_owned", "owner_probe_failed"])
-def test_validation_errors_do_not_spawn(monkeypatch, code):
+@pytest.mark.parametrize(
+    "code", ["provider_mismatch", "provider_lacks_fork_capability", "session_file_missing"]
+)
+def test_fork_path_validation_errors_do_not_spawn(monkeypatch, code):
+    """The FORK path (resume=False) keeps its original error strings (r1 #4
+    scopes the typed refusal to the RESUME path only)."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     row = dict(ROW)
-    profile = "developer"
-    resume = code in {"resume_profile_mismatch", "session_live_owned", "owner_probe_failed"}
     resolved = "codex"
     if code == "provider_mismatch":
         resolved = "grok_cli"
     if code == "provider_lacks_fork_capability":
         row["provider"] = resolved = "kiro_cli"
-    if code == "resume_profile_mismatch":
-        profile = "reviewer"
-    owner_state = "live" if code == "session_live_owned" else "error"
-    response = MagicMock()
-    response.json.return_value = {"state": owner_state}
-    with patch("cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=row), \
-         patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value=resolved), \
-         patch("pathlib.Path.glob", return_value=[] if code == "session_file_missing" else
-               [SimpleNamespace(name=f"rollout-{row['session_uuid']}.jsonl")]), \
-         patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=response), \
-         patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create:
-        result = _assign_impl(profile, "task", fork_from="base", resume=resume)
+    with (
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=row
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value=resolved),
+        patch(
+            "pathlib.Path.glob",
+            return_value=(
+                []
+                if code == "session_file_missing"
+                else [SimpleNamespace(name=f"rollout-{row['session_uuid']}.jsonl")]
+            ),
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
+        result = _assign_impl("developer", "task", fork_from="base", resume=False)
     assert code in result["message"]
     create.assert_not_called()
 
 
-@pytest.mark.parametrize("failure", ["timeout", "http", "malformed", "missing", "unknown"])
-def test_owner_probe_protocol_failures_map_to_distinct_error(monkeypatch, failure):
+@pytest.mark.parametrize("code", ["identity", "session_id"])
+def test_legacy_fork_resume_delegates_to_resume_refusal(monkeypatch, code):
+    """r1 #1: legacy fork_from+resume=True delegates into the resume service,
+    so a base name that is not a resolvable identity yields resume_refused —
+    NOT the old owner-probe/resume_profile_mismatch fork-path strings."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    response = MagicMock()
-    if failure == "timeout":
-        get_effect = requests.Timeout("backend unreachable")
-    else:
-        get_effect = None
-        if failure == "http":
-            response.raise_for_status.side_effect = requests.HTTPError("503")
-        elif failure == "malformed":
-            response.json.side_effect = ValueError("bad json")
-        elif failure == "missing":
-            response.json.return_value = {}
-        else:
-            response.json.return_value = {"state": "maybe"}
-    with patch("cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=ROW), \
-         patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="codex"), \
-         patch("pathlib.Path.glob", return_value=[SimpleNamespace(name=f"rollout-{ROW['session_uuid']}.jsonl")]), \
-         patch("cli_agent_orchestrator.mcp_server.server.requests.get",
-               side_effect=get_effect, return_value=response), \
-         patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create:
+    from cli_agent_orchestrator.clients import database as _db
+
+    if code == "identity":
+        identity = None  # "base" resolves to nothing
+    else:  # session_id: an identity exists but has no captured provider session
+        identity = {
+            "terminal_id": "base",
+            "provider": "codex",
+            "agent_profile": "developer",
+            "cwd": "/repo",
+            "provider_session_id": None,
+            "worktree_path": None,
+            "worktree_branch": None,
+            "worktree_repo_root": None,
+            "git_sha": None,
+        }
+    with (
+        patch.object(_db, "get_terminal_identity", return_value=identity),
+        patch.object(_db, "get_terminal_identity_by_provider_session_id", return_value=None),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
         result = _assign_impl("developer", "task", fork_from="base", resume=True)
-    assert result["message"] == "Assignment failed: owner_probe_failed"
+    assert result["error"] == "resume_refused"
+    assert result["missing"] == code
     create.assert_not_called()
 
 
 def test_capability_attribute_owns_pre_spawn_check(monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with patch("cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=ROW), \
-         patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="codex"), \
-         patch("cli_agent_orchestrator.providers.codex.CodexProvider.supports_fork_context", False), \
-         patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create:
+    with (
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=ROW
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="codex"),
+        patch("cli_agent_orchestrator.providers.codex.CodexProvider.supports_fork_context", False),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
         result = _assign_impl("developer", "task", fork_from="base")
     assert "provider_lacks_fork_capability" in result["message"]
     create.assert_not_called()
-
 
 
 # --- F497 D10 / AC11 — routing-flip fork-base tolerance ---------------------
@@ -122,21 +147,26 @@ def test_ac11_defaulted_fork_provider_mismatch_degrades_and_spawns(monkeypatch):
         captured["initial_message"] = kwargs.get("initial_message")
         return ("worker99", "kiro_cli")
 
-    with patch(
-        "cli_agent_orchestrator.mcp_server.server._configured_default_fork_base",
-        return_value="base",
-    ), patch(
-        "cli_agent_orchestrator.services.fork_context_service.resolve_base",
-        return_value=row,
-    ), patch(
-        # binding flipped: the profile now resolves to a DIFFERENT provider than
-        # the base was registered under.
-        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
-        return_value="kiro_cli",
-    ), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal",
-        side_effect=_fake_create,
-    ) as create:
+    with (
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._configured_default_fork_base",
+            return_value="base",
+        ),
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base",
+            return_value=row,
+        ),
+        patch(
+            # binding flipped: the profile now resolves to a DIFFERENT provider than
+            # the base was registered under.
+            "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+            return_value="kiro_cli",
+        ),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal",
+            side_effect=_fake_create,
+        ) as create,
+    ):
         result = _assign_impl("developer", "task", working_directory="/repo")
 
     assert result["success"] is True
@@ -158,15 +188,19 @@ def test_ac11_explicit_fork_from_provider_mismatch_still_raises(monkeypatch):
     """
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     row = dict(ROW)
-    with patch(
-        "cli_agent_orchestrator.services.fork_context_service.resolve_base",
-        return_value=row,
-    ), patch(
-        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
-        return_value="grok_cli",
-    ), patch(
-        "cli_agent_orchestrator.mcp_server.server._create_terminal",
-    ) as create:
+    with (
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base",
+            return_value=row,
+        ),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+            return_value="grok_cli",
+        ),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal",
+        ) as create,
+    ):
         result = _assign_impl("developer", "task", fork_from="base")
     assert "provider_mismatch" in result["message"]
     create.assert_not_called()

@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.screen_classification import (
     screen_classification_result,
 )
 from cli_agent_orchestrator.services.settings_service import (
+    claude_statusline_enabled,
     get_provider_defaults,
     get_provider_profile_defaults,
     get_server_settings,
@@ -895,7 +896,7 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
         command_parts.extend(["--session-id", self.allocated_session_uuid])
-        settings_file = self._write_terminal_settings()
+        settings_file = self._write_terminal_settings(profile)
         command_parts.extend(["--settings", str(settings_file)])
 
         # Resume a prior Claude Code conversation. Applied for every profile
@@ -1087,8 +1088,16 @@ class ClaudeCodeProvider(BaseProvider):
         )
         return f"{unset_cmd}; {claude_cmd}"
 
-    def _write_terminal_settings(self) -> Path:
-        """Write the terminal-scoped additive SessionStart hook settings."""
+    def _write_terminal_settings(self, profile: Optional["AgentProfile"] = _UNSET) -> Path:
+        """Write the terminal-scoped additive SessionStart hook settings.
+
+        Args:
+            profile: Pre-loaded profile. When omitted, it is loaded from disk
+                here. ``initialize`` → ``_build_claude_command`` loads the profile
+                once and threads it in (F826 merge: ``initialize`` also reads the
+                profile, so a second disk read here would double the
+                ``load_agent_profile`` call the F810 supervisor gate makes).
+        """
         tmp_dir = cao_tmp_dir()
         command = shlex.join(
             [
@@ -1207,7 +1216,11 @@ class ClaudeCodeProvider(BaseProvider):
         # on SessionStart is unchanged and still applies to every seat).
         is_supervisor = False
         try:
-            _profile = self._load_profile()
+            # F826 merge: reuse the profile threaded in from initialize/
+            # _build_claude_command when present, so the F810 supervisor gate does
+            # not read the profile from disk a second time (initialize already
+            # loaded it once); fall back to a load for direct/legacy callers.
+            _profile = self._load_profile() if profile is _UNSET else profile
             is_supervisor = bool(_profile is not None and _profile.role == "supervisor")
         except Exception:
             is_supervisor = False
@@ -1416,6 +1429,37 @@ class ClaudeCodeProvider(BaseProvider):
         # per-hook fields (matcher grouping, timeout, asyncRewake) of that first
         # occurrence are preserved.
         _dedupe_overlay_hooks_by_command(settings["hooks"])
+        # F826 (#683) D3: the Claude statusLine emitter. A new top-level
+        # `statusLine` key beside `hooks`. Claude invokes the command on session
+        # start/resume, new assistant message, /compact, permission/command/
+        # rate-limit change AND every refreshInterval (1500 ms) — the timer is
+        # what makes an idle `/model` or effort change visible (AC1). The emitter
+        # reads the statusline JSON on stdin, writes the observe sidecar
+        # atomically, then prints one CONSTANT line `<model> · <effort>` — that
+        # line is the status line every CAO-spawned Claude pane shows.
+        #
+        # SHOULD-1: the observe.claude_statusline toggle is read HERE, at
+        # overlay-generation time, from CAO_HOME_DIR/settings.json — never at
+        # emitter runtime. When off, no statusLine key is set at all (the pane
+        # keeps Claude's default). Flipping it takes effect on relaunch (D7).
+        # The emitter itself does zero settings I/O and imports only stdlib+json.
+        try:
+            statusline_on = claude_statusline_enabled()
+        except Exception:
+            statusline_on = True
+        if statusline_on:
+            statusline_command = shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "cli_agent_orchestrator.hooks.status_emit",
+                ]
+            )
+            settings["statusLine"] = {
+                "type": "command",
+                "command": statusline_command,
+                "refreshInterval": 1500,
+            }
         # When persona composition is active, the real ~/.claude/settings.json
         # is hidden behind the bwrap overlay.  Merge auth-critical env vars
         # (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, proxy config) from the

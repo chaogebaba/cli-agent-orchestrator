@@ -137,6 +137,13 @@ class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False
     supports_seed_resume_identity: bool = False
+    # RESUME HOT-FIX (deliverable 2, addendum r1 #6 / r2 #2): whether the
+    # provider can RESUME a prior session (re-attach an existing conversation) —
+    # a DIFFERENT axis from FORK. Default False; the resume path checks ONLY
+    # this flag (never supports_fork_context). Opt in ONLY where a real resume
+    # input path is exercised in this slice: codex + kiro. grok/claude/pi stay
+    # False here (F829 proper wires the rest).
+    supports_resume: bool = False
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
 

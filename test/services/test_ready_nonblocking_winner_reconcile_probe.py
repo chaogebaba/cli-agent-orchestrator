@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -38,7 +37,8 @@ def isolated_db(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_nonblocking_winner_fallback_reconciles_late_ready(
-    isolated_db, caplog,
+    isolated_db,
+    caplog,
 ):
     terminal_id = "ready-nonblocking-reconcile"
     db.create_terminal(
@@ -64,7 +64,9 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
 
     event.listen(isolated_db.class_, "before_commit", before_commit)
     provider = SimpleNamespace(
-        initialize=AsyncMock(), supports_reauth_rebind=False, shell_baseline=None,
+        initialize=AsyncMock(),
+        supports_reauth_rebind=False,
+        shell_baseline=None,
     )
     terminals._schedule_deferred_init(
         provider,
@@ -83,6 +85,27 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
     record = terminals._deferred_tasks_by_terminal[terminal_id]
     call = record.current_call
     assert call is not None
+    real_winner_lock = call.ready_winner_lock
+    loop_thread = threading.get_ident()
+    loop_acquire_modes: list[bool] = []
+
+    class ObservedWinnerLock:
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if threading.get_ident() == loop_thread:
+                loop_acquire_modes.append(blocking)
+            return real_winner_lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            real_winner_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            self.release()
+
+    call.ready_winner_lock = ObservedWinnerLock()
 
     def hold_winner() -> None:
         with call.ready_winner_lock:
@@ -95,22 +118,37 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
     allow_commit.set()
     await asyncio.sleep(0.005)
 
-    ticks = 0
+    # Deterministic non-blocking proof (replaces a load-sensitive tick COUNT).
+    # A background task sets `loop_ran_during_quiesce` on its FIRST scheduling.
+    # If `quiesce_deferred_terminal` blocked the event-loop thread on the held
+    # `ready_winner_lock` (a regression), this task could never be scheduled
+    # before quiesce returns, so the event stays clear. It is set iff the loop
+    # kept running concurrently — the property under test — and its truth does
+    # not depend on how many times a `sleep(0.001)` happened to fire under load.
+    loop_ran_during_quiesce = asyncio.Event()
 
-    async def ticker() -> None:
-        nonlocal ticks
-        for _ in range(30):
-            ticks += 1
+    async def concurrent_progress() -> None:
+        # Yield once so this coroutine is scheduled only while another task is
+        # awaiting (i.e. while quiesce is parked on its own await), then record
+        # that the loop advanced.
+        await asyncio.sleep(0)
+        loop_ran_during_quiesce.set()
+        # Keep yielding cooperatively until the test tears us down, so a
+        # blocked loop is observable for the whole quiesce window, not one tick.
+        while True:
             await asyncio.sleep(0.001)
 
-    ticking = asyncio.create_task(ticker())
-    started = time.monotonic()
+    progress = asyncio.create_task(concurrent_progress())
     try:
         with pytest.raises(RuntimeError, match="quiesce_timeout_mutation_in_flight"):
             await terminals.quiesce_deferred_terminal(terminal_id, timeout_s=0.02)
-        elapsed = time.monotonic() - started
-        assert elapsed < 0.1
-        assert ticks >= 3
+        # The loop kept running concurrently with quiesce's await — deterministic
+        # (event-based), not a wall-clock or tick-count threshold. A short
+        # deterministic bound guards against a hang, not against scheduler jitter.
+        await asyncio.wait_for(loop_ran_during_quiesce.wait(), timeout=5.0)
+        assert loop_acquire_modes == [False]
+        # ready-winner assertion — UNCHANGED (the claim under attack): quiesce
+        # observed the held winner and yielded the result to the reconciler.
         assert call.result_owner == "reconciler"
 
         release_lock.set()
@@ -122,13 +160,11 @@ async def test_nonblocking_winner_fallback_reconciles_late_ready(
         assert call.future.done() and call.future.exception() is None
         assert call.future.result() is True
         assert db.get_terminal_metadata(terminal_id)["init_state"] == "ready"
-        assert (
-            f"reconcile_settlement_result terminal={terminal_id}" in caplog.text
-        )
+        assert f"reconcile_settlement_result terminal={terminal_id}" in caplog.text
     finally:
         release_lock.set()
         allow_commit.set()
         holder.join(1)
-        await asyncio.gather(ticking, return_exceptions=True)
+        progress.cancel()
+        await asyncio.gather(progress, return_exceptions=True)
         event.remove(isolated_db.class_, "before_commit", before_commit)
-
