@@ -34,6 +34,12 @@ TRANSIENT_OVERLOAD.
 | kiro-cli-context-exhausted-1 | kiro_cli | CONTEXT_EXHAUSTED | low_context_tip | /compact | a6da8e75.scrollback:13-20 | 6baa0d0a5b76 |
 | kiro-cli-context-exhausted-2 | kiro_cli | CONTEXT_EXHAUSTED | low_context_tip | /compact | d950d891.scrollback:13-20 | 6baa0d0a5b76 (identical banner text) |
 | codex-context-exhausted-1 | codex | CONTEXT_EXHAUSTED | footer_percent_status | — | 16073a9e.scrollback:1396-1403 | 08c21768f32b |
+| kiro-cli-footer-healthy-1 | kiro_cli | (none) | footer_percent_status_healthy | — | issue #693 (F836) term 6f29c67d | — |
+| kiro-cli-footer-exhausted-1 | kiro_cli | CONTEXT_EXHAUSTED | footer_percent_status | — | issue #693 (F836) synth ≥90% used | — |
+| codex-footer-healthy-1 | codex | (none) | footer_percent_status_healthy | — | issue #693 (F836) term 0ec52ecf | — |
+| codex-footer-exhausted-1 | codex | CONTEXT_EXHAUSTED | footer_percent_status | — | issue #693 (F836) synth ≤10% left | — |
+| codex-resumed-replayed-cap-1 | codex | (none) | replayed_history | — | issue #689 (F832) term 2e342754/8d5617b6 | — |
+| codex-resumed-live-cap-1 | codex | CAPPED | usage_limit_hard | try again at Sep 8th, 2026 1:27 AM | issue #689 (F832) counterpart | — |
 | codex-dialog-blocked-1 | codex | DIALOG_BLOCKED | trust_dir_dialog | — | 15a6fa21.scrollback:16-33 | 8332f9d8116e |
 | grok-cli-dialog-blocked-1 | grok_cli | DIALOG_BLOCKED | trust_dir_dialog | Enter/y trust · n/Esc quit | fcbb00dc.scrollback:51-60 | f3479955a120 |
 | claude-code-dialog-blocked-1 | claude_code | DIALOG_BLOCKED | login_wizard | — | e3441b17.scrollback:31-37 | 822be4c2ff78 |

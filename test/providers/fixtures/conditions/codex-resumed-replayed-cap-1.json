@@ -1,0 +1,10 @@
+{
+  "provider": "codex",
+  "condition": null,
+  "subtype": "replayed_history",
+  "reset_hint_raw": "",
+  "source_path": "github.com/chaogebaba/cli-subagents issue #689 (F832) — resumed adjudicators 2e342754 / 8d5617b6 after an account swap",
+  "source_line_range": "pane replay",
+  "captured_at": "2026-09-08T03:56Z (issue report)",
+  "note": "The OLD account's cap line is replayed ABOVE the 'Resuming session…' boot marker; the fresh login and '100% left' footer follow it. Must NOT classify CAPPED — the cap predates the current incarnation."
+}

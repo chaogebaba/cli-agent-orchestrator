@@ -1,0 +1,10 @@
+{
+  "provider": "codex",
+  "condition": "CAPPED",
+  "subtype": "usage_limit_hard",
+  "reset_hint_raw": "try again at Sep 8th, 2026 1:27 AM",
+  "source_path": "github.com/chaogebaba/cli-subagents issue #689 (F832) — resumed-then-genuinely-capped counterpart",
+  "source_line_range": "pane",
+  "captured_at": "2026-09-08 (F832 fix)",
+  "note": "A resumed codex pane where the cap banner appears BELOW the 'Resuming session…' marker (i.e. the CURRENT incarnation hit the cap). Must still classify CAPPED. Positive counterpart to codex-resumed-replayed-cap-1."
+}
