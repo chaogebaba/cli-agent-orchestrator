@@ -115,3 +115,95 @@ def admit_capability(
         unverified_key=operation,
         reason=f"{provider}_{operation}_capability_unverified",
     )
+
+
+def _load_evidence_state(
+    provider: str,
+    operation: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+) -> Optional[EvidenceState]:
+    """Load the persisted exact-key evidence state, or None when unmeasured.
+
+    Thin adapter over the DB reader (kept here so the resume path imports ONE
+    admission seam). A stored ``state`` string maps to ``EvidenceState``; an
+    unrecognised/absent row yields None so ``admit_capability`` treats it as
+    unmeasured (admit + ``capability_unverified``), never a refusal.
+    """
+    from cli_agent_orchestrator.clients.database import get_capability_evidence
+
+    row = get_capability_evidence(
+        provider,
+        operation,
+        cli_version=cli_version,
+        adapter_version=adapter_version,
+        mode=mode,
+        store_format_fingerprint=store_format_fingerprint,
+    )
+    if not row:
+        return None
+    raw = row.get("state")
+    try:
+        return EvidenceState(raw)
+    except ValueError:
+        return None
+
+
+def admit_resume_capability(
+    provider: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+) -> CapabilityVerdict:
+    """D10 PRODUCTION runtime admission for a ``resume`` on ``provider``.
+
+    The single seam the resume path (``_build_launch_spec``) calls. It:
+
+    1. REFUSES a provider that does not DECLARE ``resume`` (``provider_declares``
+       — its production caller). A non-declaring provider is never resume-capable
+       (blueprint D10), so this is ``admitted=False`` before any evidence read.
+    2. LOADS the persisted exact-key ``resume`` evidence and decides admission
+       with ``admit_capability``: a ``failed`` row refuses; a missing/stale/
+       ``unknown`` key admits carrying ``capability_unverified`` (runtime never
+       blocks on an unmeasured key — that is the release-time advertising gate).
+
+    Returns a ``CapabilityVerdict``; the caller maps ``admitted=False`` to
+    ``ResumeRefused(missing="provider_capability")`` (retryable).
+    """
+    if not provider_declares(provider, "resume"):
+        return CapabilityVerdict(
+            admitted=False,
+            operation="resume",
+            state=EvidenceState.UNKNOWN,
+            reason=f"{provider}_resume_not_declared",
+        )
+    state = _load_evidence_state(
+        provider,
+        "resume",
+        cli_version=cli_version,
+        adapter_version=adapter_version,
+        mode=mode,
+        store_format_fingerprint=store_format_fingerprint,
+    )
+    return admit_capability(provider, "resume", evidence_state=state)
+
+
+def advertised_resumable(provider: str) -> bool:
+    """D10 RELEASE-time advertising gate: declaration ∧ PASSING evidence.
+
+    True only when the adapter DECLARES ``resume`` AND the exact-key evidence
+    state is ``passed``. A declared-but-unmeasured (or failed) capability is NOT
+    advertised — this is the gate that keeps kiro from being advertised
+    resumable until per-attempt positive attribution is measured and passes
+    (B4). Distinct from ``admit_resume_capability`` (runtime), which admits an
+    unmeasured key; advertising is strictly stronger.
+    """
+    if not provider_declares(provider, "resume"):
+        return False
+    state = _load_evidence_state(provider, "resume")
+    return state is EvidenceState.PASSED

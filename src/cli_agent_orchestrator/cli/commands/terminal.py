@@ -22,7 +22,7 @@ def terminal():
 @terminal.command("hibernated")
 @click.option("--mine", "mine", default=None, help="Filter to this owner principal (mailbox id).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def hibernated(mine, as_json):
+def hibernated(mine: str | None, as_json: bool) -> None:
     """F829 D5: list conversation identities in a recoverable/parked state.
 
     Alias of ``cao identity list`` under the terminals verb (blueprint D5:

@@ -527,6 +527,45 @@ class RecoveryManifestModel(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
 
 
+class CapabilityEvidenceModel(Base):
+    """F829 A1 (D10): persisted exact-key measured-capability evidence.
+
+    One row per exact evidence key — ``(provider, cli_version, adapter_version,
+    mode, store_format_fingerprint, operation)`` — recording the MEASURED
+    ``state`` (passed|failed|unknown) with a timestamp and an optional evidence
+    path/hash. Runtime admission reads the exact-key row: a ``failed`` row
+    refuses a resume (``missing=provider_capability``); a missing/stale key is
+    admitted carrying ``capability_unverified`` (D10). The declared∧measured
+    ADVERTISING gate (release time) joins this MEASURED state with the adapter's
+    declaration. The key columns default to ``"*"`` (a wildcard sentinel) so a
+    probe that measured a capability without pinning every axis still lands an
+    exact-key lookup — never NULL, so the unique key is always well-formed.
+    """
+
+    __tablename__ = "capability_evidence"
+
+    provider = Column(String, primary_key=True)
+    cli_version = Column(String, primary_key=True, default="*", server_default="*")
+    adapter_version = Column(String, primary_key=True, default="*", server_default="*")
+    mode = Column(String, primary_key=True, default="*", server_default="*")
+    store_format_fingerprint = Column(String, primary_key=True, default="*", server_default="*")
+    operation = Column(String, primary_key=True)
+    # state ∈ {passed, failed, unknown}.
+    state = Column(String, nullable=False)
+    evidence_path = Column(String, nullable=True)
+    evidence_hash = Column(String, nullable=True)
+    measured_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('passed','failed','unknown')",
+            name="ck_capability_evidence_state",
+        ),
+    )
+
+
 class WarmIntentModel(Base):
     __tablename__ = "warm_intents"
     intent_id = Column(String, primary_key=True)
@@ -2021,6 +2060,10 @@ def init_db() -> None:
     # and reads terminals, so it MUST come after _migrate_f631_terminal_identity;
     # appended LAST.
     _migrate_f829_conversation_identity()
+    # F829 A1 (D10) measured-capability evidence. ONE brand-new table
+    # (capability_evidence), no rebuild of anything above — additive. Disjoint
+    # from every table above, so registry order is immaterial; appended LAST.
+    _migrate_f829_capability_evidence()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -3359,6 +3402,47 @@ def _f829_backfill_recovery_manifests(conn: Any) -> None:
             "VALUES (?,1,?,?,?,?,?,?,?)",
             (identity_key, cwd, repo_root, wt_path, wt_branch, commit, now, now),
         )
+
+
+def _migrate_f829_capability_evidence() -> None:
+    """F829 A1 (D10): create the ``capability_evidence`` table IF NOT EXISTS.
+
+    ONE brand-new additive table, column-for-column identical to
+    ``CapabilityEvidenceModel``. The exact evidence key is the composite PK
+    ``(provider, cli_version, adapter_version, mode, store_format_fingerprint,
+    operation)`` with the version/mode/fingerprint axes defaulting to the
+    ``"*"`` wildcard sentinel so a lookup is never keyed on NULL. Idempotent;
+    best-effort, logged at debug, never propagated — matching every migrator
+    above.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS capability_evidence ("
+                "provider VARCHAR NOT NULL, "
+                "cli_version VARCHAR NOT NULL DEFAULT '*', "
+                "adapter_version VARCHAR NOT NULL DEFAULT '*', "
+                "mode VARCHAR NOT NULL DEFAULT '*', "
+                "store_format_fingerprint VARCHAR NOT NULL DEFAULT '*', "
+                "operation VARCHAR NOT NULL, "
+                "state VARCHAR NOT NULL, "
+                "evidence_path VARCHAR, "
+                "evidence_hash VARCHAR, "
+                "measured_at DATETIME, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (provider, cli_version, adapter_version, mode, "
+                "store_format_fingerprint, operation), "
+                "CONSTRAINT ck_capability_evidence_state "
+                "CHECK (state IN ('passed','failed','unknown'))"
+                ")"
+            )
+    except Exception:
+        logger.debug("f829 capability_evidence migration skipped", exc_info=True)
 
 
 def _restrict_db_file_permissions() -> None:
@@ -4885,6 +4969,123 @@ def get_recovery_manifest(identity_key: str) -> Optional[Dict[str, Any]]:
             except ValueError:
                 pass
         return out
+
+
+def record_capability_evidence(
+    provider: str,
+    operation: str,
+    state: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+    evidence_path: Optional[str] = None,
+    evidence_hash: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D10): upsert one exact-key measured-capability evidence row.
+
+    Keyed by the D9 exact key ``(provider, cli_version, adapter_version, mode,
+    store_format_fingerprint, operation)``; the version/mode/fingerprint axes
+    default to the ``"*"`` wildcard sentinel (never NULL, so the composite PK is
+    always well-formed and re-lookups hit the same row). ``state`` must be one
+    of ``passed|failed|unknown``. A later measurement of the same key overwrites
+    the prior state and refreshes ``measured_at`` (the newest measurement is the
+    truth; D10 records each attempt as fresh evidence).
+    """
+    if operation not in ("fork", "resume", "capture", "artifact_locate"):
+        raise ValueError(f"unknown capability operation: {operation!r}")
+    if state not in ("passed", "failed", "unknown"):
+        raise ValueError(f"unknown evidence state: {state!r}")
+
+    def _write(session: Session) -> None:
+        row = (
+            session.query(CapabilityEvidenceModel)
+            .filter_by(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+            )
+            .one_or_none()
+        )
+        now = _utcnow()
+        if row is None:
+            row = CapabilityEvidenceModel(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+                state=state,
+                evidence_path=evidence_path,
+                evidence_hash=evidence_hash,
+                measured_at=now,
+            )
+            session.add(row)
+        else:
+            row.state = state
+            row.evidence_path = evidence_path
+            row.evidence_hash = evidence_hash
+            row.measured_at = now
+            row.updated_at = now
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def get_capability_evidence(
+    provider: str,
+    operation: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+) -> Optional[Dict[str, Any]]:
+    """F829 A1 (D10): read the exact-key evidence row, or None when unmeasured.
+
+    The exact key mirrors ``record_capability_evidence``. Returns the row dict
+    (including ``state``) when a row exists, else None (an unmeasured key). The
+    runtime admission caller maps a None / non-``failed`` state to
+    ``capability_unverified`` and only a ``failed`` state to a refusal (D10).
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(CapabilityEvidenceModel)
+            .filter_by(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+            )
+            .one_or_none()
+        )
+        return _row_to_dict(row) if row is not None else None
+
+
+def list_capability_evidence(provider: Optional[str] = None) -> List[Dict[str, Any]]:
+    """F829 A1 (D10): all measured evidence rows, optionally scoped to a provider.
+
+    Feeds the ``cao providers capabilities`` read-out, which joins these MEASURED
+    states with the adapter's DECLARATION to render the declared∧measured
+    advertising view.
+    """
+    with SessionLocal() as db:
+        q = db.query(CapabilityEvidenceModel)
+        if provider is not None:
+            q = q.filter_by(provider=provider)
+        return [_row_to_dict(r) for r in q.all()]
 
 
 def get_conversation_identity(identity_key: str) -> Optional[Dict[str, Any]]:

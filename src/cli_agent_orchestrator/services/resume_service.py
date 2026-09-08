@@ -568,7 +568,7 @@ def _build_launch_spec(
     (the recorded artifact locator, launched as ``--session <path>``).
     """
     from cli_agent_orchestrator.models.terminal import ForkContext
-    from cli_agent_orchestrator.services.capability_evidence import admit_capability
+    from cli_agent_orchestrator.services.capability_evidence import admit_resume_capability
 
     provider = root["provider"]
     identity_key = root["identity_key"]
@@ -578,12 +578,22 @@ def _build_launch_spec(
         manifest.get("worktree_path") if manifest else None
     )
 
-    # D10 runtime admission for the resume operation.
-    verdict = admit_capability(provider, "resume")
+    # D10 runtime admission for the resume operation. This is the PRODUCTION
+    # seam (blueprint D10): it enforces declaration (provider_declares) AND reads
+    # the persisted exact-key evidence — a FAILED row refuses here with
+    # missing=provider_capability; a missing/stale key admits and the spec
+    # carries capability_unverified; a provider that does not DECLARE resume is
+    # refused before any evidence read.
+    verdict = admit_resume_capability(provider)
     if not verdict.admitted:
         raise ResumeRefused(
             missing="provider_capability",
-            how=f"provider {provider!r} resume capability has a FAILED probe; re-probe with cao providers probe",
+            how=(
+                f"provider {provider!r} resume capability is not admitted "
+                f"({verdict.reason}); re-probe with `cao providers probe "
+                f"--provider {provider}` or resume a provider whose resume "
+                f"capability is declared and not failed"
+            ),
             reason=verdict.reason or f"provider_{provider}_resume_capability_failed",
             retryable=True,
             identity_key=identity_key,
