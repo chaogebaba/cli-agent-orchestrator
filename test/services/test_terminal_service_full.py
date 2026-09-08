@@ -2185,7 +2185,48 @@ class TestSendInput:
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_f758_offload_hook_is_noop_for_generic_provider_double(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_pm,
+        mock_load_profile,
+        mock_preserve,
+        mock_update,
+    ):
+        # F758 stage-B F1 regression: the offload hook must be a NO-OP for a
+        # generic (non-Codex) provider double. A bare MagicMock auto-manufactures
+        # a callable for `prepare_delivery_body`, so the old
+        # getattr(...)/callable(...) gate FIRED for mocks and replaced the pasted
+        # task with a MagicMock return value (3 head-only dispatch regressions).
+        # The isinstance(provider, CodexProvider) gate cannot be synthesized by
+        # MagicMock.__getattr__ — the pasted bytes must be the literal task.
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "agent_profile": "plain",
+        }
+        mock_load_profile.return_value = AgentProfile(name="plain", description="")
+        mock_provider = mock_pm.get_provider.return_value  # generic MagicMock
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
+
+        # A body far over CODEX_INLINE_PASTE_MAX: if the hook wrongly fired it
+        # would be replaced by a mock return / a pointer. It must paste verbatim.
+        big_task = "x" * 4000
+        send_input("test1234", big_task, orchestration_type=OrchestrationType.ASSIGN)
+
+        pasted = mock_backend.send_keys.call_args.args[2]
+        assert pasted == big_task, "offload hook must not fire for a non-Codex double"
+        # And it must not have been coerced to a MagicMock repr.
+        assert isinstance(pasted, str)
+
+
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

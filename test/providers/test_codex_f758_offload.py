@@ -121,6 +121,31 @@ def test_threshold_measures_body_not_footer(cao_home):
     assert not (cao_home / "briefs").exists()
 
 
+def test_body_exactly_at_cap_is_inline_no_brief(cao_home):
+    # F758 stage-B F2: a body of EXACTLY CODEX_INLINE_PASTE_MAX bytes is INLINE
+    # (the threshold is inclusive: `<=` → inline). Pins the inclusive cap so a
+    # `<=`→`<` mutant that would offload the boundary body is killed.
+    p = _provider("capexact")
+    body = "a" * CODEX_INLINE_PASTE_MAX
+    assert len(body.encode()) == CODEX_INLINE_PASTE_MAX
+    msg = body + _FOOTER
+    out = p.prepare_delivery_body(msg)
+    assert out == msg  # byte-identical inline delivery
+    assert not (cao_home / "briefs").exists()  # no brief written at the cap
+
+
+def test_body_one_over_cap_offloads(cao_home):
+    # F758 stage-B F2: cap+1 byte body DOES offload (paired boundary assertion).
+    p = _provider("capplus1")
+    body = "a" * (CODEX_INLINE_PASTE_MAX + 1)
+    assert len(body.encode()) == CODEX_INLINE_PASTE_MAX + 1
+    out = p.prepare_delivery_body(body + _FOOTER)
+    brief = next((cao_home / "briefs" / "capplus1").glob("*.md"))
+    assert brief.read_text(encoding="utf-8") == body  # full body persisted
+    assert out.startswith("Read and follow ")
+    assert out.endswith(_FOOTER)  # footer preserved
+
+
 def test_msg_id_is_deterministic_content_hash(cao_home):
     # Same body → same <msg-id> filename (deterministic content hash).
     p = _provider("det12345")
