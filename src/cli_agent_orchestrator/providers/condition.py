@@ -341,12 +341,26 @@ _KIRO_COMPOSER_PROMPT = re.compile(r"ask a question or describe a task", re.IGNO
 # so the anchor allows ONLY: an optional leading '›' composer glyph, at most ONE
 # leading space (a genuine composer is flush-left or glyph-led — an indented
 # PASTE uses >=2 leading spaces), the exact phrase, and optional trailing chrome
-# (the '↵' hint and any '… ctrl+g/…/copy' affordance). A row that begins with a
+# drawn from the DOCUMENTED grammar ONLY — the '↵' submit hint and/or a known
+# affordance token ('ctrl+g…' agent-monitor hint, '/copy…' clipboard affordance).
+# F836 r6 (#693): the trailing group was previously '(?:\s.*)?', which accepted
+# ARBITRARY prose after the phrase (codex r5 SHOULD: a Kiro footer + composer-
+# phrase prose row anchored as live). It is now constrained to the chrome grammar
+# above: a row whose trailing text is anything other than the '↵' hint or a
+# recognised affordance token is NOT the live composer. A row that begins with a
 # fence (```), quote ('>' not the '›' glyph), bullet ('•'/'-'/'*'), or >=2 spaces
 # of indent is transcript and can NEVER be the live composer, whatever it quotes.
 _CODEX_COMPOSER_ROW = re.compile(r"^\u203a Ask Codex to do anything\s*$", re.IGNORECASE)
+# Trailing chrome grammar (F836 r6): optional '↵' submit hint, then zero or more
+# whitespace-separated known affordance runs. Each affordance run must BEGIN with
+# a documented chrome token ('ctrl+g' or '/copy'); everything after that token on
+# the row is the affordance's own label ('ctrl+g: agent monitor', '/copy to
+# clipboard'). This admits the three measured real shapes and rejects a row that
+# merely appends arbitrary transcript prose after the phrase.
+_KIRO_COMPOSER_TRAILING_CHROME = r"(?:\s*\u21b5)?(?:\s+(?:ctrl\+g|/copy)\b[^\n]*)?"
 _KIRO_COMPOSER_ROW = re.compile(
-    r"^(?:\u203a\s*| ?)ask a question or describe a task(?:\s.*)?$", re.IGNORECASE
+    r"^(?:\u203a\s*| ?)ask a question or describe a task" + _KIRO_COMPOSER_TRAILING_CHROME + r"$",
+    re.IGNORECASE,
 )
 # Rows that can never be the live composer even if they contain the phrase: a
 # leading fence / block-quote / bullet / list marker marks transcript territory.
@@ -714,7 +728,20 @@ def _classify_context(
                     provider,
                     "footer_percent_status",
                     row,
-                    Confidence.HIGH,
+                    # F836 r6 (#693): footer_percent_status caps at MEDIUM, never
+                    # HIGH. The classifier's ONLY input is plaintext pane bytes
+                    # (base.py:348-376, fleet_app.py:577-592, condition.py:952),
+                    # so no arrangement of row anchors can be a second, live-only
+                    # signal — a pasted/truncated full snapshot that ends at the
+                    # viewport bottom preserves every structural predicate (codex
+                    # EMPIRICAL-GATE-NO r5). MEDIUM still surfaces on fleet/TUI/CLI
+                    # via ``should_deliver`` but the inbox (acting) leg is DECLINED
+                    # by ``drain_class_declines_inbox`` (delivery_ledger.py) — this
+                    # is the ADVISORY, never-hard-stop class, mirroring
+                    # ``low_context_tip``. A hard stop would need a genuinely
+                    # independent live signal (a cursor/provider-state fact through
+                    # the capture boundary), which plaintext cannot supply.
+                    Confidence.MEDIUM,
                 )
         return None
     if provider == "kiro_cli":
@@ -730,7 +757,10 @@ def _classify_context(
                     provider,
                     "footer_percent_status",
                     row,
-                    Confidence.HIGH,
+                    # F836 r6 (#693): caps at MEDIUM, never HIGH — see the codex
+                    # arm above. Plaintext-only footer matches are advisory
+                    # (fleet/TUI/CLI) and DECLINE the inbox leg; never a hard stop.
+                    Confidence.MEDIUM,
                 )
         # The welcome/low-context TIP is a softer, medium-confidence signal.
         ev = _first_evidence(brows, _KIRO_CONTEXT_TIP)
@@ -1195,8 +1225,10 @@ class ConditionDelivery:
         condition?
 
         Declined when EITHER the drain-class predicate matches (BUSY, a
-        command_exit PROC_EXITED, or a CONTEXT_EXHAUSTED ``low_context_tip`` — the
-        SAME class the supervisor-inbox-drain hook withholds, F718 #574 / F807)
+        command_exit PROC_EXITED, a CONTEXT_EXHAUSTED ``low_context_tip``, or a
+        CONTEXT_EXHAUSTED ``footer_percent_status`` — the plaintext-only footer
+        reading that F836 r6 (#693) made ADVISORY, never a hard stop — the SAME
+        class the supervisor-inbox-drain hook withholds, F718 #574 / F807 / F836)
         OR the F642 routing map (``KIND_SURFACES``) has no inbox surface for the
         kind. The second arm preserves base behaviour for the map's other
         inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD): F790 must only
