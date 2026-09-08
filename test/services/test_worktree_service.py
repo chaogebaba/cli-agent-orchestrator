@@ -216,10 +216,13 @@ class TestCreateAndRemoveWorktree:
 
     def test_remove_worktree_retains_a_branch_with_unmerged_commits(self, repo: Path) -> None:
         """A worker that committed real work to its branch before completing
-        must not have that history destroyed just because Phase 1 has no
-        merge-back story -- the worktree's working-tree contents are force
-        -discarded, but the branch itself is only safe-deleted (``git branch
-        -d``), which refuses when there are commits that would be lost."""
+        must not have that history destroyed.
+
+        RESUME HOT-FIX (deliverable 3c): the directory is now KEPT too (not only
+        the branch), because a reaped kiro session is keyed by the checkout cwd
+        and a resume must be able to re-attach to the still-present path.
+        Tonight's incident (evidence §1.2/§1.5): reap force-removed a kiro
+        worktree and resume had to guess/re-create the exact path by hand."""
         terminal_id = "term_committed01"
         path = create_worktree(str(repo), terminal_id)
         (Path(path) / "result.txt").write_text("important output\n")
@@ -233,7 +236,7 @@ class TestCreateAndRemoveWorktree:
 
         remove_worktree(str(repo), terminal_id)  # must not raise
 
-        assert not Path(path).exists()  # worktree checkout itself is gone
+        assert Path(path).exists()  # checkout KEPT — a resume may re-attach to it
         branch_result = subprocess.run(
             ["git", "branch", "--list", branch_for(terminal_id)],
             cwd=repo,

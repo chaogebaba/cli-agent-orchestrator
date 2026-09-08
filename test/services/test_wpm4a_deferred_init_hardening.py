@@ -276,10 +276,12 @@ def test_atomic_delete_preserves_keep_bases_intent(isolated_db):
     )
     # F631 D4 widened this result with `resume_key` — the reaped lane's
     # provider_session_id, None for a lane whose provider minted none.
+    # RESUME HOT-FIX widened it again with `resume_hint` (None here).
     assert db.delete_terminal_and_warm_intent("worker", preserve_warm_intent=True) == {
         "terminal_deleted": True,
         "intent_deleted": False,
         "resume_key": None,
+        "resume_hint": None,
     }
     with sessions() as session:
         assert session.query(db.TerminalModel).count() == 0

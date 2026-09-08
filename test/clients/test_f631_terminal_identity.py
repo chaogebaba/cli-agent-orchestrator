@@ -340,7 +340,14 @@ def test_a_pre_registry_lane_is_control_flow_not_a_tolerated_exception(db_env):
         db.commit()
 
     result = delete_terminal_and_warm_intent("lane0009")
-    assert result == {"terminal_deleted": True, "intent_deleted": False, "resume_key": None}
+    # RESUME HOT-FIX: the reap result additionally carries resume_hint (None
+    # here — a pre-registry lane has no identity row, so no reason to explain).
+    assert result == {
+        "terminal_deleted": True,
+        "intent_deleted": False,
+        "resume_key": None,
+        "resume_hint": None,
+    }
 
 
 def test_nothing_fabricates_a_provider_session_id(db_env):

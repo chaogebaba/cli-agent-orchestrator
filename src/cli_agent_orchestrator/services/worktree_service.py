@@ -288,6 +288,12 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
     loss. Only the (uncommitted/untracked) working-tree contents of the
     worktree itself are ever force-discarded.
 
+    RESUME HOT-FIX (deliverable 3c): when the branch has UNMERGED commits, the
+    checkout DIRECTORY is kept too (not force-removed), because a reaped kiro
+    session is keyed by the cwd and a resume must be able to re-attach to the
+    still-present path. A branch with no unmerged commits behaves exactly as
+    before (directory force-removed, branch safe-deleted).
+
     Never raises -- called from terminal-teardown paths (``delete_terminal``,
     and the failure-cleanup path in ``create_terminal``) that must not fail
     the terminal's own deletion/rollback over a worktree cleanup issue.
@@ -302,6 +308,21 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
     """
     path = worktree_path if worktree_path else worktree_path_for(repo_root, terminal_id)
     branch = branch_for(terminal_id)
+    # RESUME HOT-FIX (deliverable 3c): keep the CHECKOUT DIRECTORY, not only the
+    # branch, when the branch has unmerged commits. Tonight's incident (evidence
+    # §1.2/§1.5): reap force-removed a kiro worktree whose session store is keyed
+    # by the cwd hash, so resume had to guess and re-create the exact path by
+    # hand. A branch that fails the safe `git branch -d` below is exactly the
+    # "has work worth keeping" signal; when it does, we also skip the
+    # force-remove so a resume can re-attach to the still-present checkout.
+    if _branch_has_unmerged_commits(repo_root, branch):
+        logger.info(
+            "worktree cleanup: keeping checkout %s and branch %s (branch has "
+            "unmerged commits — a resume may re-attach to it)",
+            path,
+            branch,
+        )
+        return
     result = _run_git(["worktree", "remove", "--force", path], cwd=repo_root)
     if result.returncode != 0:
         logger.warning(
@@ -317,6 +338,29 @@ def remove_worktree(repo_root: str, terminal_id: str, worktree_path: Optional[st
             branch,
             result.stderr.strip(),
         )
+
+
+def _branch_has_unmerged_commits(repo_root: str, branch: str) -> bool:
+    """True iff ``branch`` exists AND carries commits not reachable from HEAD.
+
+    Mirrors the ``git branch -d`` safety predicate (which refuses to delete a
+    branch with unmerged commits) so the directory-keep decision matches the
+    branch-keep decision exactly. A nonexistent branch, or a branch fully merged
+    into HEAD, returns False (safe to remove). Never raises — an infra failure
+    (missing repo, hung git) is reported as "no unmerged commits" so cleanup
+    proceeds as it does today rather than leaking every worktree on a git hiccup.
+    """
+    verify = _run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo_root)
+    if verify.returncode != 0:
+        return False
+    # Commits on <branch> not reachable from HEAD. Empty output => fully merged.
+    result = _run_git(["rev-list", "--count", f"HEAD..{branch}"], cwd=repo_root)
+    if result.returncode != 0:
+        return False
+    try:
+        return int(result.stdout.strip() or "0") > 0
+    except ValueError:
+        return False
 
 
 def list_worktrees(repo_root: str) -> list[dict[str, str | bool]]:

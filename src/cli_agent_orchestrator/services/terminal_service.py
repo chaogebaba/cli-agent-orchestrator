@@ -7489,6 +7489,73 @@ def _close_cascade_teardown_intents(intent_ids: list[str], marked: list[str]) ->
         unmark_teardown(node_id)
 
 
+def _resolve_reap_resume_key(
+    terminal_id: str, metadata: Optional[dict]
+) -> tuple[Optional[str], Optional[str]]:
+    """RESUME HOT-FIX (deliverable 3a/3b): resolve a resume key at reap time.
+
+    Returns ``(captured_provider_session_id, resume_hint)``:
+      * ``captured_provider_session_id`` — a session id to fill a NULL identity
+        row, or None (already captured, or unresolvable).
+      * ``resume_hint`` — a reason string when no key could be resolved and the
+        row has none, else None.
+
+    Only kiro needs reap-time capture: codex/grok capture their id at spawn (so
+    the identity row already carries it), while kiro's id is unknown until
+    harvested. The capture reads ONLY the on-disk session store (the account may
+    be dead at reap), keyed by the terminal's cwd. Never raises — a failure here
+    must not block the reap; it degrades to ``(None, <hint>)``.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_identity
+
+        identity = get_terminal_identity(terminal_id)
+        if identity is None:
+            return None, None
+        if identity.get("provider_session_id"):
+            # Already resumable; nothing to capture, no hint needed.
+            return None, None
+        provider = (identity.get("provider") or "") if identity else ""
+        cwd = identity.get("cwd") or (metadata.get("working_directory") if metadata else None)
+        if provider != "kiro_cli":
+            # Non-kiro with a NULL id: nothing we can resolve here.
+            if not cwd:
+                return None, f"{provider or 'provider'} session id was never captured"
+            return None, f"{provider or 'provider'} session id was never captured"
+        if not cwd:
+            return None, "kiro cwd unknown; cannot locate the on-disk session store"
+        from cli_agent_orchestrator.services.resume_service import (
+            capture_kiro_session_id_from_store,
+            kiro_capture_hint,
+        )
+
+        launch_epoch = _identity_launch_epoch(identity)
+        captured = capture_kiro_session_id_from_store(cwd, launch_epoch)
+        if captured:
+            return captured, None
+        return None, kiro_capture_hint(cwd)
+    except Exception as exc:  # never block a reap over capture
+        logger.warning("reap resume-key capture failed for %s: %s", terminal_id, exc)
+        return None, None
+
+
+def _identity_launch_epoch(identity: dict) -> float:
+    """POSIX epoch of the identity row's ``created_at`` (the terminal's launch),
+    or 0.0 when unavailable (so every post-launch session still qualifies)."""
+    created = identity.get("created_at")
+    if created is None:
+        return 0.0
+    try:
+        # SQLAlchemy hands back a datetime; a naive value is treated as UTC.
+        from datetime import timezone as _tz
+
+        if getattr(created, "tzinfo", None) is None:
+            created = created.replace(tzinfo=_tz.utc)
+        return float(created.timestamp())
+    except (AttributeError, ValueError, OSError):
+        return 0.0
+
+
 def _delete_terminal_inner(
     terminal_id: str,
     session_name: str,
@@ -7620,6 +7687,11 @@ def _delete_terminal_inner(
             node_resume_key = result.get("resume_key")
             if node_resume_key:
                 entry["resume_key"] = node_resume_key
+            else:
+                # RESUME HOT-FIX (deliverable 3b): a reason when no key resolved.
+                node_hint = result.get("resume_hint")
+                if node_hint:
+                    entry["resume_hint"] = node_hint
             reaped.append(entry)
             parent_writer = getattr(get_backend(), "set_window_parent", None)
             if callable(parent_writer):
@@ -8158,6 +8230,18 @@ def _delete_terminal_under_lease(
                 }
                 if reparent_target_id is not None:
                     deletion_kwargs["reparent_target_id"] = reparent_target_id
+                # RESUME HOT-FIX (deliverable 3a/3b): before the reap flips the
+                # identity row, resolve a resume key for a provider whose id was
+                # never captured at spawn. kiro is the case that matters (its id
+                # is UNKNOWN until harvested); resolve it from the on-disk session
+                # store keyed by the terminal's cwd — NOT from the CLI, which may
+                # be a dead account at reap time. When it cannot be resolved, pass
+                # a hint so the reap result explains why instead of a bare null.
+                _cap_id, _cap_hint = _resolve_reap_resume_key(terminal_id, metadata)
+                if _cap_id is not None:
+                    deletion_kwargs["captured_provider_session_id"] = _cap_id
+                if _cap_hint is not None:
+                    deletion_kwargs["resume_hint"] = _cap_hint
                 deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
         finally:
             delivery_lock.release()
@@ -8187,6 +8271,8 @@ def _delete_terminal_under_lease(
             # `.get` because the F138 non-durable-force branch above fabricates
             # a "not deleted" result that never reached the DB writer.
             "resume_key": deletion.get("resume_key"),
+            # RESUME HOT-FIX (deliverable 3b): why no resume key, when null.
+            "resume_hint": deletion.get("resume_hint"),
         }
 
     except Exception as e:

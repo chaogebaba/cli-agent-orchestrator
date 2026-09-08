@@ -308,6 +308,10 @@ class TerminalIdentityModel(Base):
     # uq_provider_sessions_ready namespace.
     base_name = Column(String, nullable=False)
     retained_persona_home = Column(String, nullable=True)  # D11, later slice
+    # RESUME HOT-FIX (deliverable 3c): the isolated-worktree checkout path this
+    # terminal owned, so a resume can re-create the checkout at the SAME path a
+    # reaped kiro session is keyed by. NULL for a non-worktree terminal.
+    worktree_path = Column(String, nullable=True)
     lifecycle = Column(String, nullable=False, default="live", server_default="live")
     git_sha = Column(String, nullable=True)
     dirty_hashes = Column(Text, nullable=True)
@@ -2591,6 +2595,26 @@ def _migrate_f642_delivery_ledger() -> None:
         logger.debug(f"f642_delivery_ledger migration skipped: {e}")
 
 
+def _add_column_if_missing(conn: Any, table: str, column: str, coltype: str) -> None:
+    """Idempotently ``ALTER TABLE <table> ADD COLUMN <column> <coltype>``.
+
+    Reads ``PRAGMA table_info`` first so a re-run on an already-migrated DB is a
+    no-op (the migration must be idempotent at every deploy). A raw sqlite3
+    connection is used to match the F631 migrator's own style.
+    """
+    import sqlite3 as _sqlite3
+
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column in cols:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except _sqlite3.OperationalError:
+        # Duplicate-column race between concurrent boots — the column now
+        # exists, which is the desired end state.
+        pass
+
+
 def _migrate_f631_terminal_identity() -> None:
     """F631 D10: create ``terminal_identity`` if missing. Additive, no rebuild.
 
@@ -2628,6 +2652,7 @@ def _migrate_f631_terminal_identity() -> None:
                 "provider_session_id VARCHAR, "
                 "base_name VARCHAR NOT NULL, "
                 "retained_persona_home VARCHAR, "
+                "worktree_path VARCHAR, "
                 "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
                 "git_sha VARCHAR, "
                 "dirty_hashes TEXT, "
@@ -2642,6 +2667,11 @@ def _migrate_f631_terminal_identity() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
                 "ON terminal_identity(provider_session_id)"
             )
+            # RESUME HOT-FIX (deliverable 3c): additive worktree_path column for a
+            # pre-existing ~1-year prod terminal_identity table. Idempotent — a
+            # duplicate-column error on an already-migrated DB is swallowed, so a
+            # re-run at every deploy is a no-op (migration must be idempotent).
+            _add_column_if_missing(conn, "terminal_identity", "worktree_path", "VARCHAR")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
         logger.debug(f"f631_terminal_identity migration skipped: {e}")
 
@@ -3789,6 +3819,7 @@ def _register_terminal_identity(
     cwd: Optional[str],
     session_name: Optional[str],
     provider_session_id: Optional[str],
+    worktree_path: Optional[str] = None,
 ) -> None:
     """F631 §3: write the durable identity row in the terminal's OWN transaction.
 
@@ -3827,6 +3858,7 @@ def _register_terminal_identity(
             # that persists NULL at spawn (kiro_cli) records NULL.
             provider_session_id=provider_session_id,
             base_name=terminal_id,
+            worktree_path=worktree_path,
             lifecycle="live",
             created_at=_utcnow(),
         )
@@ -3834,7 +3866,12 @@ def _register_terminal_identity(
     db.flush()
 
 
-def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[str]:
+def _mark_terminal_identity_reaped(
+    db: Session,
+    terminal_id: str,
+    *,
+    captured_provider_session_id: Optional[str] = None,
+) -> Optional[str]:
     """F631 D2/D4: flip the identity row to ``reaped`` and return the resume key.
 
     Runs in the SAME transaction as the ``terminals`` hard delete. The identity
@@ -3844,6 +3881,14 @@ def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[st
     Returns the resume key (D4: the ``provider_session_id``), or None when the
     lane has no captured provider session or has no identity row at all (a
     pre-registry terminal).
+
+    RESUME HOT-FIX (deliverable 3a): ``captured_provider_session_id`` — a
+    session id the caller resolved at reap time (for kiro, from the on-disk
+    session store) — is written into the identity row ONLY when its stored
+    ``provider_session_id`` is still NULL. This is what makes a warm kiro
+    builder, whose id was never captured at spawn, resumable after reap. A row
+    that already has an id is never overwritten (the captured value is a
+    best-effort fill, not an authority).
 
     **Deliberately unguarded** (r2), for the mirror of the reason given on
     ``_register_terminal_identity``: a swallowed retirement failure hard-deletes
@@ -3857,6 +3902,8 @@ def _mark_terminal_identity_reaped(db: Session, terminal_id: str) -> Optional[st
     row = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
     if row is None:
         return None
+    if not row.provider_session_id and captured_provider_session_id:
+        row.provider_session_id = captured_provider_session_id
     row.lifecycle = "reaped"
     row.reaped_at = _utcnow()
     db.flush()
@@ -3870,6 +3917,51 @@ def get_terminal_identity(terminal_id: str) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
         return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def get_terminal_identity_by_provider_session_id(
+    session_uuid: str,
+) -> Optional[Dict[str, Any]]:
+    """RESUME HOT-FIX (deliverable 1b): resolve an identity row by its captured
+    ``provider_session_id`` (the resume key), for a bare-uuid ``resume_from``.
+
+    Returns the newest matching row (by ``created_at``) — a session uuid is
+    per-terminal so a collision is not expected, but ordering makes the lookup
+    deterministic if one ever occurs. None when no identity row carries it.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalIdentityModel)
+            .filter_by(provider_session_id=session_uuid)
+            .order_by(TerminalIdentityModel.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def get_frozen_pins(task_key: str) -> List[Dict[str, str]]:
+    """RESUME HOT-FIX (inherit_pins): the latest-version FROZEN authority pins
+    for ``task_key`` as ``[{file_path, sha256}]``.
+
+    One entry per file_path (the highest ``version`` row), so a rotated pin set
+    inherits its current shas, not its history. Empty list when the terminal
+    had no frozen pins.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(AuthorityPinModel)
+            .filter_by(task_key=task_key, frozen=True)
+            .order_by(AuthorityPinModel.file_path.asc(), AuthorityPinModel.version.desc())
+            .all()
+        )
+    latest: Dict[str, str] = {}
+    for row in rows:
+        file_path = str(row.file_path)
+        if file_path not in latest:
+            latest[file_path] = str(row.sha256)
+    return [{"file_path": fp, "sha256": sha} for fp, sha in latest.items()]
 
 
 def create_terminal(
@@ -3943,6 +4035,12 @@ def create_terminal(
             cwd=working_directory,
             session_name=tmux_session,
             provider_session_id=provider_session_id,
+            # RESUME HOT-FIX (deliverable 3c): persist the worktree checkout path
+            # so a later resume can re-create the checkout at the SAME path a
+            # reaped kiro session is keyed by.
+            worktree_path=(
+                worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+            ),
         )
         if dispatch_barrier is not None:
             if caller_id is None:
@@ -4098,6 +4196,9 @@ def create_terminal_with_warm_intent(
             cwd=working_directory,
             session_name=tmux_session,
             provider_session_id=None,
+            worktree_path=(
+                worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+            ),
         )
         if dispatch_barrier is not None:
             if caller_id is None:
@@ -5740,11 +5841,19 @@ def delete_terminal_and_warm_intent(
     *,
     preserve_warm_intent: bool = False,
     reparent_target_id: str | None = None,
+    captured_provider_session_id: str | None = None,
+    resume_hint: str | None = None,
 ) -> Dict[str, Any]:
     """Settle terminal-owned state and delete the row in one transaction.
 
     F631 D4: the result additionally carries ``resume_key`` — the reaped lane's
     ``provider_session_id``, or None when it has none.
+
+    RESUME HOT-FIX (deliverable 3): ``captured_provider_session_id`` is a
+    session id the caller resolved at reap time (kiro store lookup); it fills a
+    NULL identity ``provider_session_id`` so the reaped lane becomes resumable.
+    When the resume key is still None, the returned ``resume_hint`` explains why
+    (so the operator sees a reason, not a bare null).
     """
     with SessionLocal.begin() as db:
         terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
@@ -5883,7 +5992,11 @@ def delete_terminal_and_warm_intent(
         # the SAME transaction as the hard delete below. The identity row is
         # NOT deleted — the terminals row keeps its hard delete (D1), and the
         # identity outlives it.
-        resume_key = _mark_terminal_identity_reaped(db, terminal_id)
+        resume_key = _mark_terminal_identity_reaped(
+            db,
+            terminal_id,
+            captured_provider_session_id=captured_provider_session_id,
+        )
         terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
     # F351: evict from metadata cache after deletion
     invalidate_terminal_metadata_cache(terminal_id)
@@ -5894,6 +6007,9 @@ def delete_terminal_and_warm_intent(
         "terminal_deleted": terminal_deleted,
         "intent_deleted": intent_deleted,
         "resume_key": resume_key,
+        # RESUME HOT-FIX (deliverable 3b): a reason string when no resume key
+        # could be resolved, so the operator sees WHY rather than a bare null.
+        "resume_hint": (resume_hint if resume_key is None else None),
     }
 
 

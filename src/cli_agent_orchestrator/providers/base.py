@@ -137,6 +137,13 @@ class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False
     supports_seed_resume_identity: bool = False
+    # RESUME HOT-FIX (deliverable 2): whether the provider can RESUME a prior
+    # session (re-attach an existing conversation), a DIFFERENT axis from FORK.
+    # None means "not declared" → the capability query falls back to
+    # supports_fork_context, so codex/grok keep resuming as today. kiro sets
+    # this True while supports_fork_context stays False: it resumes via
+    # --resume-id but cannot fork.
+    supports_resume: bool | None = None
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
 
