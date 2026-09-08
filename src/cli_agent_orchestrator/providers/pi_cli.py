@@ -149,6 +149,17 @@ class PiCliProvider(BaseProvider):
     # same detector _resolve_buffer already runs on a live pane read).
     supports_direct_status_probe: bool = True
 
+    # F829 A1 (D10): pi is PARTIAL (D9) — it RECOVERS after a COMPLETED turn (the
+    # transcript is written atomically at turn end), so resume/artifact are
+    # declared; a mid-turn kill leaves NO artifact (that boundary is D8's
+    # session_artifact_missing, not a capability failure). It cannot FORK.
+    declared_capabilities = {
+        "fork": False,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
+
     def __init__(
         self,
         terminal_id: str,

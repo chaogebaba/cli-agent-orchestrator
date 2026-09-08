@@ -2119,6 +2119,13 @@ class CodexProvider(BaseProvider):
     supports_resume = True
     supports_seed_resume_identity = True
     supports_reauth_rebind = True
+    # F829 A1 (D10): codex RECOVERS on all D9 arms (fork+resume+capture+artifact).
+    declared_capabilities = {
+        "fork": True,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
 
     def capture_shell_baseline(self) -> str | None:
         """Capture through this module's backend seam before Codex starts."""

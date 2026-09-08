@@ -26,10 +26,51 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResumeLaunchSpec:
+    """F829 A1 (D3): the per-provider resume input the create path consumes.
+
+    Built from the conversation ROOT + its recovery MANIFEST (never from a
+    filename), it carries EXACTLY the resume input each adapter's initialization
+    needs, so MCP/HTTP/CLI can hand the same spec end to end:
+
+    * codex / kiro — a resume-mode ``ForkContext`` carrying the stored
+      ``provider_session_id`` (kiro's is the ``sess_<uuid>`` form, prefix
+      included). ``fork_context`` is populated.
+    * claude_code — ``resume_session_id`` (threaded to the claude constructor,
+      ``--resume <sid>``). ``resume_session_id`` is populated.
+    * pi — the recorded artifact path, launched as ``--session <artifact_locator>``
+      (NEVER a fresh ``--session-id``). ``session_artifact_path`` is populated.
+
+    ``identity_key`` and the resolved workspace/model/effort/namespace come from
+    the root; ``capability_unverified`` names an unmeasured D10 capability key
+    when the resume proceeds without passing evidence (D10). Exactly one of the
+    three provider-input fields is set for a given provider.
+    """
+
+    identity_key: str
+    provider: str
+    provider_session_id: str
+    provider_namespace: Optional[str] = None
+    artifact_locator: Optional[str] = None
+    working_directory: Optional[str] = None
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    # Per-provider resume input (exactly one set per provider):
+    fork_context: Any = None  # ForkContext(mode="resume") for codex/kiro
+    resume_session_id: Optional[str] = None  # claude_code --resume
+    session_artifact_path: Optional[str] = None  # pi --session <path>
+    # D10: set to the unmeasured capability key when resume proceeds on an
+    # unverified (missing/stale) capability row rather than a failed one.
+    capability_unverified: Optional[str] = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 # The closed set of missing-fact tokens the ONE resume refusal can name
@@ -55,23 +96,44 @@ class ResumeRefused(Exception):
     on the resume path. The fork path keeps those strings unchanged.
     """
 
-    def __init__(self, missing: str, how: str, *, reason: str, retryable: bool = False):
+    def __init__(
+        self,
+        missing: str,
+        how: str,
+        *,
+        reason: str,
+        retryable: bool = False,
+        identity_key: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ):
         if missing not in RESUME_MISSING_TOKENS:
             raise ValueError(f"unknown resume-missing token: {missing!r}")
         self.missing = missing
         self.how = how
         self.reason = reason
         self.retryable = retryable
+        # A1 D3: an AUTHORIZED refusal names the identity_key it concerns; an
+        # optional evidence_ref points at a diag/event record. Both are omitted
+        # from the envelope when None (unauthorized callers learn no identity).
+        self.identity_key = identity_key
+        self.evidence_ref = evidence_ref
         super().__init__(f"resume_refused:{missing}:{reason}")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "error": "resume_refused",
             "missing": self.missing,
             "how": self.how,
             "reason": self.reason,
             "retryable": self.retryable,
         }
+        # A1 D3: additive — present only when known, so the hot-fix envelope
+        # shape is unchanged for a pre-authorization refusal.
+        if self.identity_key is not None:
+            out["identity_key"] = self.identity_key
+        if self.evidence_ref is not None:
+            out["evidence_ref"] = self.evidence_ref
+        return out
 
 
 # --------------------------------------------------------------------------

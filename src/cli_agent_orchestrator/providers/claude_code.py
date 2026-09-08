@@ -630,6 +630,16 @@ class ClaudeCodeProvider(BaseProvider):
 
     condition_provider_key = "claude_code"  # F611 #467
 
+    # F829 A1 (D10): claude RECOVERS resume/capture/artifact (D9). It cannot FORK
+    # here (supports_fork_context stays default). resume via --resume <sid>
+    # threaded as resume_session_id; artifact = ~/.claude/projects/<proj>/<uuid>.jsonl.
+    declared_capabilities = {
+        "fork": False,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
+
     composer_stash_keys = ["C-s"]
     composer_clear_keys = ["C-u"]
     composer_stashed_chip_pattern = CLAUDE_STASHED_CHIP_PATTERN
