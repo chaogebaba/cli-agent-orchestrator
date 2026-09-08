@@ -7654,8 +7654,30 @@ def _resolve_reap_resume_key(
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return None, bool(supports), reason
         if provider != "kiro_cli":
-            # Non-kiro with a NULL id: nothing to capture; not resumable.
-            return None, False, "provider_session_id_never_captured"
+            # F829 (build-2 B2): a non-kiro provider whose terminal_identity id is
+            # still NULL may nonetheless have captured its id onto the F829
+            # conversation ROOT during the run (claude: the SessionStart hook via
+            # bind_transcript -> attach_captured_uuid; codex normally fills the
+            # identity row at init, but the root is the durable source either
+            # way). Fill the reaped identity row from the root so the worker is
+            # resume-resolvable (get_terminal_identity_by_provider_session_id /
+            # resume_from=<terminal_id>). No store read, no cwd+mtime guess — the
+            # root id is a positively-attributed capture. Only when the provider
+            # actually supports resume.
+            if supports:
+                _ikey = identity.get("identity_key")
+                if _ikey:
+                    from cli_agent_orchestrator.clients.database import (
+                        get_conversation_identity,
+                    )
+
+                    _root = get_conversation_identity(_ikey)
+                    _root_sid = _root.get("provider_session_id") if _root else None
+                    if _root_sid:
+                        return _root_sid, True, "resumable"
+                return None, False, "provider_session_id_never_captured"
+            # Non-kiro that does not support resume: nothing to do.
+            return None, False, f"provider_{provider}_not_resumable"
         if not cwd:
             return None, False, "kiro_cwd_unknown"
         from cli_agent_orchestrator.services.resume_service import (

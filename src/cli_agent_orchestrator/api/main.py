@@ -4980,6 +4980,15 @@ async def bind_transcript(
                 attach_captured_uuid,
             )
 
+            # Attach the hook-reported claude session id to the F829 conversation
+            # ROOT. The reap/hibernate resolver (_resolve_reap_resume_key) reads
+            # this root id to fill the reaped terminal_identity row and mark the
+            # worker resumable — so a claude worker survives an account switch by
+            # resume (D6). attach_captured_uuid is best-effort/non-raising:
+            # idempotent on a re-reported id, runs the resume verify+publish
+            # branch under a claim (claude same-file divergence), and REFUSES a
+            # foreign id already bound to a different identity (uuid_capture_
+            # rejected) rather than stealing it. Pre-F829 terminal = no-op.
             attach_captured_uuid(
                 terminal_id,
                 provider_session_id=body.session_id,

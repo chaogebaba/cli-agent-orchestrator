@@ -101,8 +101,43 @@ def test_sessionstart_binding_attaches_session_id_to_root(real_sqlite_env, tmp_p
     result = _bind("ccc10001", sid, str(tpath), home)
     assert result["success"] is True
 
-    # THE POINT: the root now carries the captured id.
+    # THE POINT: the root now carries the captured id (the durable source the
+    # reap/hibernate resolver reads to fill the reaped identity row and mark the
+    # worker resumable — proven by the reap-resolver test below).
     assert _root_sid(db_mod, "conv_ccc10001") == sid
+
+
+def test_reap_resolver_sources_claude_id_from_root_when_identity_row_null(
+    real_sqlite_env, tmp_path, monkeypatch
+):
+    """F829 B2: after the SessionStart bind attaches the id to the ROOT, the
+    reap/hibernate resolver (_resolve_reap_resume_key) fills the reaped claude
+    terminal_identity row FROM THE ROOT and marks the worker resumable — so
+    assign(resume_from=<terminal_id|uuid>) can re-attach. This is the seam that
+    makes a claude worker survive an account switch."""
+    import cli_agent_orchestrator.clients.database as db_mod
+    from cli_agent_orchestrator.services import terminal_service as ts
+    from cli_agent_orchestrator.services import resume_service as rs
+
+    home = tmp_path / "home"
+    sid = "claude-sess-reap"
+    _seed_root_and_incarnation(db_mod, identity_key="conv_rrr10001",
+                               terminal_id="rrr10001", cwd="/work")
+    # claude declares resume support.
+    monkeypatch.setattr(rs, "provider_supports_resume", lambda p: p == "claude_code")
+    # terminal_identity id is NULL; bind attaches the id to the ROOT.
+    _bind("rrr10001", sid, str(_projects_transcript(home, sid)), home)
+    assert _root_sid(db_mod, "conv_rrr10001") == sid
+    ti = db_mod.get_terminal_identity("rrr10001")
+    assert ti.get("provider_session_id") is None  # not on the row yet
+
+    # The reap resolver must source the id from the root and mark resumable.
+    cap_id, resumable, reason = ts._resolve_reap_resume_key(
+        "rrr10001", {"working_directory": "/work"}, force=False
+    )
+    assert cap_id == sid, (cap_id, reason)
+    assert resumable is True
+    assert reason == "resumable"
 
 
 def test_re_report_of_same_id_is_idempotent(real_sqlite_env, tmp_path):
