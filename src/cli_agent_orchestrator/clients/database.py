@@ -7053,6 +7053,13 @@ def crash_detach_terminal(terminal_id: str) -> Dict[str, Any]:
             mark_receiver_gone(db, receiver_id=terminal_id)
         except Exception:
             logger.debug("crash_detach mark_receiver_gone failed", exc_info=True)
+        # (i-b) F829 E2 (D8): settle this dead receiver's UNDELIVERED inbox rows
+        # in the SAME transaction, so no inbox row is left pending/delivering
+        # against a removed receiver. NOT swallowed — a failed settlement rolls
+        # back the whole transaction rather than deleting the receiver with an
+        # unsettled inbox row. Scoped to crash-detach only (the reap path's
+        # inbox settlement is owned by the WPM4b delivery-attempt pipeline).
+        _settle_inbox_receiver_gone(db, receiver_id=terminal_id)
         # (ii) nullify mailbox authority for this terminal.
         db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
             {MailboxModel.current_terminal_id: None},
@@ -14398,29 +14405,21 @@ def mark_receiver_gone(
     *,
     receiver_id: str,
 ) -> int:
-    """D8/S1 (AC22): a receiver was reaped or reclaimed — settle BOTH delivery
-    authorities in the SAME transaction as the delete, not on a later sweep.
+    """D8/S1 (AC22): a receiver was reaped or reclaimed — transition its
+    undelivered ledger rows to ``undeliverable(receiver_gone)`` in the SAME
+    transaction as the delete, not on a later sweep. Acked/terminal rows are
+    untouched. Returns the count transitioned.
 
-    F829 E2 (D8/AC4): the ledger is not the only authority for an undelivered
-    message — the ``inbox`` row carries its own ``status``. Settling only the
-    ledger left the paired inbox row ``pending`` against a removed receiver, so
-    a crash-detach could not honour D8's "no inbox row pending/emitted against a
-    removed receiver". Both are now transitioned atomically:
-
-    * every ``DeliveryLedgerModel`` row for ``receiver_id`` in
-      ``pending``/``emitted`` → ``undeliverable(receiver_gone)``;
-    * every ``InboxModel`` row for ``receiver_id`` whose status is
-      ``pending``/``delivering`` → ``delivery_failed`` with
-      ``failure_reason='receiver_gone'``.
-
-    Acked/terminal rows are untouched. Returns the ledger transition count; a
-    caller that also needs the inbox count should read it from the two-count
-    assertion — for paired rows the two counts agree. A failed settlement is NOT
-    swallowed here so the enclosing transaction cannot delete the receiver while
-    leaving either authority unsettled.
+    Ledger-ONLY by design: the ``inbox`` row's own settlement on the reap path
+    is owned by the WPM4b delivery-attempt pipeline
+    (``recover_wpm2_stale_attempt`` / orphan reconciliation), which requires the
+    row to still read ``delivering`` when it settles it. The D8 crash-detach path
+    settles the inbox row itself (see ``crash_detach_terminal`` via
+    ``_settle_inbox_receiver_gone``); this shared helper must not, or it would
+    race that pipeline out of its ``delivering`` precondition (F829 E2 scoping).
     """
     now = _utcnow()
-    ledger_rows = (
+    rows = (
         db.query(DeliveryLedgerModel)
         .filter(
             DeliveryLedgerModel.receiver_id == receiver_id,
@@ -14428,16 +14427,26 @@ def mark_receiver_gone(
         )
         .all()
     )
-    ledger_count = 0
-    for row in ledger_rows:
+    count = 0
+    for row in rows:
         row.state = LedgerState.UNDELIVERABLE.value
         row.undeliverable_reason = UndeliverableReason.RECEIVER_GONE.value
         row.blocked_reason = None
         row.blocked_since = None
         row.updated_at = now
-        ledger_count += 1
-    # F829 E2: settle the paired inbox rows in the same transaction so no inbox
-    # row remains pending/delivering against a removed receiver.
+        count += 1
+    return count
+
+
+def _settle_inbox_receiver_gone(db: Session, *, receiver_id: str) -> int:
+    """F829 E2 (D8): settle a dead receiver's UNDELIVERED inbox rows to
+    ``delivery_failed(receiver_gone)`` in the caller's transaction.
+
+    Scoped to the D8 crash-detach path (``crash_detach_terminal``), NOT the
+    shared reap helper ``mark_receiver_gone`` — on the reap path the WPM4b
+    delivery-attempt pipeline owns inbox settlement and needs the row to stay
+    ``delivering`` until it acts. Rows in ``pending``/``delivering`` are settled;
+    terminal rows are untouched. Returns the count settled."""
     inbox_rows = (
         db.query(InboxModel)
         .filter(
@@ -14446,10 +14455,12 @@ def mark_receiver_gone(
         )
         .all()
     )
+    count = 0
     for row in inbox_rows:
         row.status = MessageStatus.DELIVERY_FAILED.value
         row.failure_reason = UndeliverableReason.RECEIVER_GONE.value
-    return ledger_count
+        count += 1
+    return count
 
 
 def enqueue_callback_replay_gated(
