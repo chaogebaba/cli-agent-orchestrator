@@ -181,3 +181,56 @@ def test_d10_advertised_gate_needs_declaration_and_passing(real_sqlite_env):
     assert advertised_resumable("codex") is False
     # a provider that does not declare resume is never advertised.
     assert advertised_resumable("does_not_exist") is False
+
+
+def test_d10_unmeasured_resume_carries_unverified_and_writes_fresh_evidence(real_sqlite_env):
+    """D10 [A1-r8]: an UNMEASURED resume admits carrying capability_unverified,
+    and a SUCCESSFUL resume records the outcome as fresh PASSING evidence — so a
+    previously unmeasured key becomes measured (verdict-adjacent seam test)."""
+    from cli_agent_orchestrator.clients.database import (
+        TerminalIdentityModel,
+        get_conversation_events,
+    )
+    from cli_agent_orchestrator.services.conversation_transition import (
+        attach_captured_uuid,
+        authorize_and_classify_resume,
+        claim_resume_admission,
+    )
+
+    key, old_t, new_t, uuid = "unv1", "oldunv01", "newunv01", "cx-unv-uuid"
+    _mkresumable(key, "codex", owner="mb_u", uuid=uuid)
+    # No evidence row exists yet → unmeasured.
+    assert d.get_capability_evidence("codex", "resume") is None
+
+    # (1) unmeasured resume ADMITS carrying capability_unverified=resume.
+    prepared = prepare_resume(
+        resume_from=key,
+        requested_agent_profile=None,
+        requested_working_directory="/tmp",
+        caller_principal="mb_u",
+    )
+    assert prepared["launch_spec"].capability_unverified == "resume"
+
+    # (2) drive the resume to a successful publish through the production seam.
+    admission = authorize_and_classify_resume(d.get_conversation_identity(key), "mb_u")
+    claim_resume_admission(admission, claimant="sup_u")
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalIdentityModel(
+                terminal_id=new_t,
+                provider="codex",
+                base_name=new_t,
+                lifecycle="live",
+                identity_key=key,
+                cwd="/tmp",
+            )
+        )
+    out = attach_captured_uuid(new_t, provider_session_id=uuid, provider="codex")
+    assert out["status"] == "resume_published"
+
+    # (3) the outcome is now recorded as fresh PASSING evidence (measured).
+    row = d.get_capability_evidence("codex", "resume")
+    assert row is not None and row["state"] == "passed"
+    # a subsequent resume of a fresh root would now admit WITHOUT unverified.
+    events = [e["event"] for e in get_conversation_events(key)]
+    assert "resume_published" in events

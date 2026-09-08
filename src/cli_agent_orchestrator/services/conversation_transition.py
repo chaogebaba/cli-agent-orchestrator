@@ -394,6 +394,16 @@ def verify_and_publish_resume(
         terminal_id=terminal_id,
         detail={"provider_session_id": publish_uuid},
     )
+    # D10 [A1-r8]: a successful resume MEASURES the resume capability — record it
+    # as fresh PASSING evidence so a previously unmeasured (capability_unverified)
+    # key is now measured. Best-effort; never fail a publish over evidence.
+    if prov:
+        try:
+            from cli_agent_orchestrator.clients.database import record_capability_evidence
+
+            record_capability_evidence(str(prov), "resume", "passed")
+        except Exception:
+            logger.debug("resume evidence record (passed) failed for %s", key, exc_info=True)
     return VerifyResult(ok=True, identity_key=key, published_session_id=publish_uuid)
 
 
