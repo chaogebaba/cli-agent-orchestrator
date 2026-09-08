@@ -217,6 +217,27 @@ def _drive_turn(api: str, tid: str, message: str, timeout: float = _TURN_TIMEOUT
     return extract_output(tid)
 
 
+def _wait_capture(cao_server, identity_key: str, timeout: float = 90.0) -> str | None:
+    """Poll the scratch DB until the conversation root has a captured
+    provider_session_id (the claude SessionStart-hook binding / kiro nonce
+    capture is async and tick-driven; a fresh spawn is not hibernate-eligible
+    until it lands). Returns the id, or None on timeout."""
+    start = time.time()
+    while time.time() - start < timeout:
+        conn = _db(cao_server)
+        try:
+            row = conn.execute(
+                "SELECT provider_session_id FROM conversation_identity WHERE identity_key = ?",
+                (identity_key,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            return row[0]
+        time.sleep(3)
+    return None
+
+
 def _hibernate(api: str, tid: str) -> dict:
     """Planned hibernate = DELETE non-force. Returns the JSON result."""
     resp = requests.delete(f"{api}/terminals/{tid}", timeout=120)
@@ -381,6 +402,18 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             rec("KIRO_TWO_CANDIDATE", f"foreign same-cwd session (newer mtime): {foreign}")
 
         # 3. PLANNED HIBERNATE — DELETE non-force (the real operator flow).
+        # First wait for the provider session-id capture to land on the root
+        # (claude SessionStart-hook binding / kiro nonce capture is async): a
+        # fresh spawn is not hibernate-eligible until a recoverable artifact is
+        # captured (D6). Hibernating before that yields the correct
+        # hibernate_refused{session_artifact_missing}.
+        captured_sid = _wait_capture(cao_server, identity_key)
+        rec("CAPTURE", f"root provider_session_id captured = {captured_sid!r}")
+        assert captured_sid, (
+            "provider session-id was not captured onto the root within the wait "
+            "budget; planned hibernate needs a recoverable artifact (D6). "
+            f"provider={provider}"
+        )
         hib = _hibernate(api, worker_id)
         rec("HIBERNATE", str(hib))
         # root must be hibernated now
