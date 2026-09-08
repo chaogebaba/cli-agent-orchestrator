@@ -432,12 +432,24 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         )
 
         # 4. RESUME through the PUBLIC SEAM: server._assign_impl(resume_from=...).
-        # The public resume resolver accepts (a) a terminal id whose
-        # terminal_identity row survives, or (b) a provider session uuid resolved
-        # via terminal_identity.provider_session_id. After a planned hibernate the
-        # durable, always-resolvable handle is the CAPTURED provider session id
-        # (the root/terminal_identity carry it); use captured_sid. This is also
-        # what a reap returns as the resume_key.
+        # _assign_impl makes HTTP calls to the subprocess for terminal CREATION,
+        # but resolves the resume handle IN-PROCESS via prepare_resume ->
+        # get_terminal_identity_by_provider_session_id, reading THIS process's
+        # SessionLocal. Point it at the subprocess's sqlite file so the resolver
+        # sees the rows the subprocess wrote at hibernate (the reaped
+        # terminal_identity row carrying the captured id). Without this the
+        # resolver reads an unconfigured DB and spuriously refuses missing=identity
+        # even though the row exists (verified via a direct sqlite read).
+        import cli_agent_orchestrator.clients.database as _dbm
+        from sqlalchemy import create_engine as _ce
+        from sqlalchemy.orm import sessionmaker as _sm
+
+        _sub_engine = _ce(f"sqlite:///{cao_server.db_path}",
+                          connect_args={"check_same_thread": False})
+        _saved_engine, _saved_sl = _dbm.engine, _dbm.SessionLocal
+        _dbm.engine = _sub_engine
+        _dbm.SessionLocal = _sm(autocommit=False, autoflush=False, bind=_sub_engine)
+
         os.environ["CAO_ENDPOINT"] = api
         os.environ["CAO_TERMINAL_ID"] = supervisor_id
         from cli_agent_orchestrator.mcp_server import server as _srv
@@ -449,7 +461,10 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         ), resume_from=resume_handle)
         if model:
             assign_kwargs["model"] = model
-        res = _srv._assign_impl(**assign_kwargs)
+        try:
+            res = _srv._assign_impl(**assign_kwargs)
+        finally:
+            _dbm.engine, _dbm.SessionLocal = _saved_engine, _saved_sl
         rec("ASSIGN_RESUME_FROM", f"resume_from={resume_handle!r} -> " + str({k: res.get(k) for k in
             ("success", "terminal_id", "resumed_from", "worktree", "pins_inherited",
              "resume_line", "error", "reason", "missing")}))
