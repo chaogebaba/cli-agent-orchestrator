@@ -64,7 +64,17 @@ def canonical_session_env(
     working_directory: str | None,
     env_vars: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Return the session floor with one absolute, immutable artifact root."""
+    """Return the session floor with one absolute, immutable artifact root.
+
+    F198 (#38): the artifact root was previously computed and named in the
+    session env but never created and never checked for writability. When a
+    terminal was launched with a ``working_directory`` outside a repo (e.g.
+    ``$HOME``), the default resolved to a phantom ``$HOME/tmp/orch`` that never
+    existed; a worker's dumps then went to an unrecoverable tree. We now
+    materialize the resolved root (create parents) and confirm it is writable,
+    raising ``artifacts_dir_unwritable`` loud rather than handing out a path
+    that silently swallows every write.
+    """
     result = dict(env_vars or {})
     override = result.get(ARTIFACTS_DIR_ENV)
     if override is not None:
@@ -80,8 +90,30 @@ def canonical_session_env(
             artifact_root = orch_sub / "tmp" / "orch"
         else:
             artifact_root = base / "tmp" / "orch"
+    _ensure_artifact_root_writable(artifact_root)
     result[ARTIFACTS_DIR_ENV] = str(artifact_root)
     return result
+
+
+def _ensure_artifact_root_writable(artifact_root: Path) -> None:
+    """F198 (#38): make the artifact root a REAL, writable dir or fail loud.
+
+    Creates ``artifact_root`` (and parents) if absent and confirms a write can
+    actually land there. Raises ``ValueError('artifacts_dir_unwritable: ...')``
+    if the directory cannot be created or written — so a misconfigured session
+    fails at launch with a named reason instead of routing artifacts into a
+    phantom tree that is discovered empty only after the worker is reaped.
+    """
+    try:
+        artifact_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(
+            f"artifacts_dir_unwritable: cannot create {artifact_root}: {exc}"
+        ) from exc
+    if not os.access(artifact_root, os.W_OK | os.X_OK):
+        raise ValueError(
+            f"artifacts_dir_unwritable: {artifact_root} is not writable"
+        )
 
 
 def finalize_session(

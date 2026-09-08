@@ -65,6 +65,69 @@ def test_canonical_session_env_rejects_non_absolute_override(override):
         canonical_session_env("/repo", {"CAO_ARTIFACTS_DIR": override})
 
 
+# --- F198 (#38): artifact root must be a REAL, writable dir or fail loud ---
+
+def test_canonical_session_env_creates_default_root(tmp_path):
+    """F198: the default artifact root is created, not just named."""
+    result = canonical_session_env(str(tmp_path), None)
+    root = Path(result["CAO_ARTIFACTS_DIR"])
+    assert root == tmp_path.resolve() / "tmp" / "orch"
+    assert root.is_dir(), "default artifact root was named but not created (phantom tree)"
+
+
+def test_canonical_session_env_creates_orchestrator_layout_root(tmp_path):
+    """F198: the orchestrator-layout default root is created too."""
+    (tmp_path / "orchestrator").mkdir()
+    result = canonical_session_env(str(tmp_path), None)
+    root = Path(result["CAO_ARTIFACTS_DIR"])
+    assert root == tmp_path.resolve() / "orchestrator" / "tmp" / "orch"
+    assert root.is_dir()
+
+
+def test_canonical_session_env_creates_override_root(tmp_path):
+    """F198: an absolute override that does not yet exist is created."""
+    override = tmp_path / "custom" / "artifacts"
+    assert not override.exists()
+    result = canonical_session_env("/ignored", {"CAO_ARTIFACTS_DIR": str(override)})
+    assert Path(result["CAO_ARTIFACTS_DIR"]).is_dir()
+
+
+def test_canonical_session_env_root_is_writable(tmp_path):
+    """F198: a file can actually be written under the returned root."""
+    result = canonical_session_env(str(tmp_path), None)
+    root = Path(result["CAO_ARTIFACTS_DIR"])
+    probe = root / "f198-probe.txt"
+    probe.write_text("ok")
+    assert probe.read_text() == "ok"
+
+
+def test_canonical_session_env_non_repo_working_dir_is_real(tmp_path):
+    """F198 regression: a non-repo working_directory (the $HOME-like case that
+    produced the phantom /home/chao/tmp/orch) yields a real, existing dir."""
+    home_like = tmp_path / "homeuser"
+    home_like.mkdir()
+    result = canonical_session_env(str(home_like), None)
+    root = Path(result["CAO_ARTIFACTS_DIR"])
+    assert root == home_like.resolve() / "tmp" / "orch"
+    assert root.is_dir()
+
+
+def test_canonical_session_env_fails_loud_when_unwritable(tmp_path):
+    """F198: if the artifact root cannot be created, fail loud with a named reason."""
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    # Make the parent read-only so mkdir of a new child fails.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    override = locked / "cannot" / "make"
+    try:
+        with pytest.raises(ValueError, match="artifacts_dir_unwritable"):
+            canonical_session_env("/ignored", {"CAO_ARTIFACTS_DIR": str(override)})
+    finally:
+        locked.chmod(0o700)  # restore so tmp_path cleanup succeeds
+
+
 class TestCreateSession:
     """Tests for create_session function."""
 
