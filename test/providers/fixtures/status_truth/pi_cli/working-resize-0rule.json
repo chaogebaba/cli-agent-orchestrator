@@ -1,0 +1,8 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "live-capture",
+  "capture": "copied byte-identical from /data/cao-scratch/gate-700-703-r3/capture/frames/frame_00300_turn5resize.txt (sha256 839e3beebece08160e562eed5ec696689735349c92e115f02d0ab325929a4e42), a genuine transient pi 0.85.1 TUI frame captured mid terminal-resize.",
+  "geometry": "ZERO composer rules visible below the working row (a transient resize frame mid-redraw). This exercises the step-5 `no width evidence -> accept` branch of _live_working_spinner and the empty-`below` path of _has_complete_composer_below.",
+  "role": "PORTABLE anti-over-narrowing guard (Opus r6 EMPIRICAL-GATE-NO): asserts PROCESSING unconditionally in the repo, complementing the 3-rule frame — proves a live working frame with no width evidence stays PROCESSING. See test_committed_resize_frames_are_processing."
+}

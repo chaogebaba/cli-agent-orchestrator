@@ -810,14 +810,67 @@ class TestFalseIdleWorkingSpinner:
             provider.get_status(buffer) == TerminalStatus.PROCESSING
         ), "full-width CJK/emoji working row must be PROCESSING (EAW width handling)"
 
+    # ── #703 r7: PORTABLE anti-over-narrowing guard (Opus r6 EMPIRICAL-GATE-NO) ──
+    # The r6 full-width qualifier in _has_complete_composer_below is load-bearing,
+    # but its only killer was the gate-scratch archive sweep, which SKIPS on every
+    # machine without that corpus (it skipped on the box in the r6 A/B). These two
+    # frames are committed INTO the repo (byte-identical live captures, .json
+    # sidecars) so the guard runs UNCONDITIONALLY in CI:
+    #   working-resize-3rule.txt — the ONE archive frame where the any-width and
+    #     full-width readings differ: 3 box rules below the working row, only ONE
+    #     full-width (the other two are narrow resize artifacts). RED under the
+    #     drop-full-width mutant (any-count 3 >= 2 + footer disqualifies the live
+    #     row), GREEN with the qualifier (full-count 1 < 2).
+    #   working-resize-0rule.txt — a transient resize frame with zero composer
+    #     rules below the working row (the step-5 no-width-evidence accept path).
+    _COMMITTED_RESIZE_FIXTURES = ("working-resize-3rule", "working-resize-0rule")
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_committed_resize_frames_are_processing(self, _native) -> None:
+        """PORTABLE, UNCONDITIONAL guard for the full-width qualifier: two
+        committed live resize frames classify PROCESSING (raw + ANSI-stripped).
+        working-resize-3rule.txt is RED under the mutant that drops
+        ``_visible_width(r) == composer_width`` from _has_complete_composer_below,
+        so this test — not the optional gate-scratch sweep — is the CI killer of
+        that mutant."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        for name in self._COMMITTED_RESIZE_FIXTURES:
+            raw = (FIXTURES / "status_truth" / "pi_cli" / f"{name}.txt").read_text(encoding="utf-8")
+            clean = strip_terminal_escapes(raw)
+            assert provider.get_status(raw) == TerminalStatus.PROCESSING, f"{name}: raw"
+            assert provider.get_status(clean) == TerminalStatus.PROCESSING, f"{name}: stripped"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_footerless_two_rules_below_working_row_is_processing(self, _native) -> None:
+        """Pins the ``has_footer`` conjunct in ``_has_complete_composer_below``.
+        A genuine full-width working row (the composer top border) with TWO
+        full-width box rules below it but NO footer is still a live working pane →
+        PROCESSING. The ``has_footer`` conjunct is what keeps the disqualifier
+        scoped to a COMPLETE idle composer (rules AND footer): dropping it makes
+        ``full_rules >= 2`` alone disqualify this row, flipping it to UNKNOWN.
+        This arm therefore FAILS (PROCESSING → UNKNOWN) when the conjunct is
+        dropped, which is why the ``has_footer`` clause is kept rather than
+        removed (Opus r6 EMPIRICAL-GATE-NO item 2, decision: keep + pin)."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        lead = "── ⠋ Working "
+        candidate = lead + "─" * (120 - _visible_width(lead))
+        assert _visible_width(candidate) == 120
+        # Working row (top border) then two full-width rules, NO footer.
+        buffer = "\n".join([" prior turn output", candidate, "", self._RULE, " ", self._RULE])
+        assert provider.get_status(buffer) == TerminalStatus.PROCESSING, (
+            "a full-width working row above two footerless rules must stay PROCESSING "
+            "(dropping the has_footer conjunct would flip it to UNKNOWN)"
+        )
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_archive_live_frames_all_processing(self, _native) -> None:
-        """The inherited live pi 0.85.1 capture archive (the frames the r3-r5
-        gates were measured on) must classify PROCESSING for every frame that
-        carries a working row — raw AND ANSI-stripped — under the r6
-        composer-structure check. This is the anti-over-narrowing guard: the wrap
-        fix must not regress a single genuine live frame. Skips cleanly when the
-        archive is absent (it lives in gate scratch, not the repo)."""
+        """OPTIONAL, non-load-bearing arm: the full inherited live pi 0.85.1
+        capture archive (the frames the r3-r6 gates were measured on) classifies
+        PROCESSING for every working frame. The PORTABLE guard for the full-width
+        qualifier is ``test_committed_resize_frames_are_processing`` (committed
+        fixtures); THIS sweep only widens the sample when the gate-scratch corpus
+        happens to be present, and SKIPS otherwise. It is NOT counted as CI
+        coverage."""
         import glob as _glob
 
         roots = [
@@ -827,7 +880,10 @@ class TestFalseIdleWorkingSpinner:
         ]
         files = [f for pat in roots for f in sorted(_glob.glob(pat))]
         if not files:
-            pytest.skip("live-frame archive not present (gate scratch only)")
+            pytest.skip(
+                "OPTIONAL non-load-bearing sweep: gate-scratch archive absent; the "
+                "portable guard is test_committed_resize_frames_are_processing"
+            )
         provider = self._provider(dispatched=True, processing_seen=True)
         working = 0
         for f in files:
