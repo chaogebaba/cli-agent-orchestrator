@@ -209,6 +209,24 @@ def test_composed_literal_explicit_uncertified_refused(store):
     assert ei.value.code == "E-CELL-UNCERTIFIED"
 
 
+def test_unknown_request_class_fails_closed_as_explicit(store):
+    """F868 fail-closed backstop (r3 OWN mutant M-x1 killer): an UNKNOWN
+    ``request_class`` (not in ``_VALID_CLASSES``) must be treated as EXPLICIT —
+    the strictest arm — never as LEGACY (which would passthrough with NO cell
+    check). The r2 ledger's M-x1 tried to reach this in-guard fallback via
+    ``create_terminal``'s signature default ``"explicit"`` (a VALID class, so the
+    fallback never fired) and SURVIVED; the guard's own public API is where the
+    unknown-class fallback is reachable and killable.
+
+    An uncertified composed-literal cell that raises E-CELL-UNCERTIFIED under
+    EXPLICIT must raise the SAME code under an unknown class. The M-x1 mutant
+    (``request_class = CLASS_LEGACY`` in the fallback) would instead return a
+    ``is_position_cell=False`` passthrough and NOT raise — failing this test."""
+    with pytest.raises(CellGuardRefused) as ei:
+        guard_cell_admission("dev-kiro_cli", None, request_class="__unknown_class__")
+    assert ei.value.code == "E-CELL-UNCERTIFIED"
+
+
 def test_composed_literal_certified_admitted_own_cell(store):
     """A composed literal on a CERTIFIED cell → admitted, spawns its own cell."""
     _certify(store, "dev", "kiro_cli", "PASS")
