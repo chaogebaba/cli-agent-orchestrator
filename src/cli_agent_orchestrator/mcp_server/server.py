@@ -2615,16 +2615,31 @@ def _assign_impl(
             # flows through _create_terminal's F613 ``provider=`` seam instead.
             if _resolved_provider is None:
                 from cli_agent_orchestrator.utils.agent_profiles import (
+                    _STUB_DECLARED,
+                    _STUB_UNKNOWN,
                     E_PROVIDER_UNRESOLVED,
                     ProviderResolutionError,
-                    _stub_declared_provider_safe,
-                )
-                from cli_agent_orchestrator.utils.agent_profiles import (
-                    resolve_provider as _f838_resolve_provider,
+                    _classify_stub_intent,
+                    _resolve_provider_from_classification,
                 )
 
-                _declares, _declared_provider = _stub_declared_provider_safe(agent_profile)
-                if _declares:
+                # r3 (codex EMPIRICAL-GATE-NO Blocker B): read+classify the stub
+                # EXACTLY ONCE here, then resolve from THAT immutable
+                # classification. The r2 guard read twice — once via
+                # ``_stub_declared_provider_safe`` for intent and again inside
+                # ``resolve_provider`` — so an empty-provider stub that DISAPPEARED
+                # between the two reads was reclassified ABSENT on the second read
+                # and fell back to the caller's provider, which was then carried
+                # into creation. With a single read a mid-flight disappearance
+                # cannot change the verdict: the bytes classified are the bytes
+                # resolved.
+                _intent, _declared_provider, _raw = _classify_stub_intent(agent_profile)
+                # A stub DECLARES intent when it names provider/extends/position;
+                # an UNKNOWN stub (unreadable/unparseable/malformed/dangling) is
+                # ALSO routed through the fail-closed resolver rather than the
+                # legacy passthrough. Only a cleanly-read PLAIN/ABSENT name skips
+                # the guard (the sole fallback paths).
+                if _intent in (_STUB_DECLARED, _STUB_UNKNOWN):
                     _caller_provider = None
                     _cur = _current_terminal_id()
                     if _cur:
@@ -2635,8 +2650,12 @@ def _assign_impl(
                         except Exception:
                             _caller_provider = None
                     try:
-                        _checked = _f838_resolve_provider(
-                            agent_profile, fallback_provider=_caller_provider or DEFAULT_PROVIDER
+                        _checked = _resolve_provider_from_classification(
+                            agent_profile,
+                            _caller_provider or DEFAULT_PROVIDER,
+                            _intent,
+                            _declared_provider,
+                            _raw,
                         )
                     except ProviderResolutionError as exc:
                         return {
@@ -2659,7 +2678,25 @@ def _assign_impl(
                                 f"'{_checked}' (F838 #695 provider-substitution guard)"
                             ),
                         }
-                    # r2: carry the guard-checked provider into _create_terminal
+                    # r3: creation must REFUSE when the guard-verified value is
+                    # None/empty (the brief's explicit requirement for the
+                    # empty-provider disappearance). The resolver already returns
+                    # a non-empty valid provider or raises, but a belt-and-braces
+                    # check here means an empty value never silently reaches
+                    # _create_terminal (whose F613 seam would treat a blank
+                    # provider as "not supplied" and re-derive from disk).
+                    if not (isinstance(_checked, str) and _checked.strip()):
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' resolved to an empty provider "
+                                f"({_checked!r}); refusing to fall back (F838 #695)"
+                            ),
+                        }
+                    # r2/r3: carry the guard-checked provider into _create_terminal
                     # so creation uses exactly this value (no re-resolution from
                     # the mutable store between guard and create). _resolved_provider
                     # stays None (legacy passthrough) so no position machinery fires.

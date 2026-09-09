@@ -702,6 +702,124 @@ _STUB_ABSENT = "absent"  # FileNotFoundError — name truly absent, nothing to c
 _STUB_UNKNOWN = "unknown"  # read/parse error, or ambiguous — evidence unavailable
 
 
+def _dangling_store_entry(agent_name: str) -> bool:
+    """F838 (#695) r3 — does ``agent_name`` map to a DANGLING SYMLINK in any of
+    the configured stores?
+
+    ``read_agent_profile_source`` gates every candidate on ``Path.exists()``,
+    which FOLLOWS a symlink — so a link whose target is missing reads as
+    ``False`` and the whole lookup falls through to ``FileNotFoundError``, i.e.
+    it is indistinguishable from a truly-absent name. But a dangling link is a
+    store entry that IS present (as a link) and cannot be read: that is
+    uncertainty, not a clean absence, and the resolver must fail closed on it
+    (codex r2 P0-A). This mirrors the flat/nested candidate locations of
+    ``read_agent_profile_source`` and reports True when any candidate exists as a
+    symlink whose target does not resolve. ``Path.is_symlink()`` tests the link
+    itself (it does not follow it), so it is True for a dangling link where
+    ``exists()`` is False. Best-effort and never raises: a lookup helper that
+    itself blew up would just be a differently-shaped uncertainty, and the read
+    error path already covers that.
+    """
+
+    def _is_dangling(path: "Optional[Path]") -> bool:
+        try:
+            return path is not None and path.is_symlink() and not path.exists()
+        except OSError:
+            return False
+
+    try:
+        _validate_agent_name(agent_name)
+    except ValueError:
+        return False
+
+    try:
+        from cli_agent_orchestrator.services.settings_service import (
+            get_agent_dirs,
+            get_disabled_agent_dirs,
+            get_extra_agent_dirs,
+        )
+
+        disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
+        candidate_roots: List[Path] = []
+        if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
+            candidate_roots.append(LOCAL_AGENT_STORE_DIR)
+        for dir_path in get_agent_dirs().values():
+            if normalized_path(dir_path) not in disabled:
+                candidate_roots.append(Path(dir_path))
+        for extra_dir in get_extra_agent_dirs():
+            if normalized_path(extra_dir) not in disabled:
+                candidate_roots.append(Path(extra_dir))
+
+        for root in candidate_roots:
+            flat = _safe_join(root, f"{agent_name}.md")
+            nested = _safe_join(root, agent_name, "agent.md")
+            # _safe_join resolves the path (following the symlink target); test
+            # the UNRESOLVED join too, since is_symlink() on the resolved target
+            # would be False. The unresolved join is where the link lives.
+            raw_flat = root.joinpath(f"{agent_name}.md")
+            raw_nested = root.joinpath(agent_name, "agent.md")
+            if (
+                _is_dangling(raw_flat)
+                or _is_dangling(raw_nested)
+                or _is_dangling(flat)
+                or _is_dangling(nested)
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+# F838 (#695) r3 — the U+FEFF byte-order mark. A well-formed profile source
+# never begins with one; a BOM-prefixed stub defeats frontmatter detection
+# (the ``---`` opener is no longer at offset 0), so ``frontmatter.loads`` silently
+# returns EMPTY metadata and the r2 classifier mislabelled it ``PLAIN`` and fell
+# back. A leading BOM is treated as a MALFORMED (UNKNOWN) stub (codex r2 P0-A).
+_BOM = "\ufeff"
+
+
+def _raw_stub_is_malformed(raw: str) -> bool:
+    """F838 (#695) r3 — does this successfully-read raw stub look like it INTENDED
+    to carry frontmatter but is malformed, so ``frontmatter.loads`` silently
+    produced empty metadata?
+
+    Two adversaries the r2 classifier accepted as ``PLAIN`` (codex EMPIRICAL-GATE
+    P0 blocker A) are caught here:
+
+    * **BOM-prefixed** — the source begins with U+FEFF, which pushes the ``---``
+      opener off offset 0 so the YAML handler never detects frontmatter. A clean
+      profile never starts with a BOM.
+    * **Truncated / unterminated delimiter** — the source opens with ``---`` (the
+      handler DETECTS a frontmatter block) but has no valid closing delimiter, so
+      the handler's split RAISES and ``loads`` swallows it into empty metadata.
+
+    A genuine legacy plain profile (no frontmatter block at all, or a well-formed
+    but empty ``---\\n---`` block) is NOT malformed: the handler either does not
+    detect a block, or detects and splits it cleanly. Those keep ``PLAIN``.
+    """
+    if raw.startswith(_BOM):
+        return True
+    handler = frontmatter.YAMLHandler()
+    try:
+        detected = handler.detect(raw)
+    except Exception:
+        # The detector itself choked on the bytes — indeterminate, treat as
+        # malformed (fail closed) rather than silently plain.
+        return True
+    if not detected:
+        # No frontmatter block opener — a genuine plain profile (no declared
+        # intent). Not malformed.
+        return False
+    # A frontmatter opener IS present. It must split cleanly into (metadata,
+    # content); if the closing delimiter is missing/garbled the handler raises
+    # and ``frontmatter.loads`` would have hidden that as empty metadata.
+    try:
+        handler.split(raw)
+    except Exception:
+        return True
+    return False
+
+
 def _classify_stub_intent(
     agent_profile_name: str,
 ) -> "tuple[str, Optional[str], Optional[str]]":
@@ -717,24 +835,39 @@ def _classify_stub_intent(
     * ``PLAIN`` — the frontmatter parsed cleanly and carries NONE of those keys:
       a genuine legacy plain profile, for which the caller-provider fallback is
       correct (pinned by ``test_returns_fallback_when_no_provider_key`` et al.).
-    * ``ABSENT`` — ``read_agent_profile_source`` raised ``FileNotFoundError``:
-      the name is truly absent, nothing in the store to contradict.
-    * ``UNKNOWN`` — the raw read raised anything else (permission/IO/decoding),
-      or the frontmatter failed to parse. We have NO evidence of intent, so this
-      path MUST fail closed (F838 #695 r2) — never treated as ``PLAIN``.
+    * ``ABSENT`` — ``read_agent_profile_source`` raised ``FileNotFoundError`` AND
+      no store entry for the name is a dangling symlink: the name is truly
+      absent, nothing in the store to contradict.
+    * ``UNKNOWN`` — the raw read raised anything else (permission/IO/decoding);
+      the frontmatter failed to parse; the raw stub is MALFORMED (BOM-prefixed or
+      a truncated/unterminated delimiter that ``frontmatter.loads`` hides as
+      empty metadata — codex r2 P0-A); OR the name resolves to a DANGLING SYMLINK
+      (a store entry that exists as a link but whose target is missing — NOT a
+      clean absence, codex r2 P0-A). We have NO reliable evidence of intent, so
+      this path MUST fail closed (F838 #695) — never treated as ``PLAIN``/``ABSENT``.
 
-    ``raw_text`` is the single raw read (or None when not ABSENT-but-readable),
-    so the caller resolves the profile from these SAME bytes rather than issuing
-    a second, racy disk read (codex Blocker: "resolve from one immutable read").
+    ``raw_text`` is the single raw read (or None when not readable), so the
+    caller resolves the profile from these SAME bytes rather than issuing a
+    second, racy disk read (codex Blocker: "resolve from one immutable read").
     """
     try:
         raw = read_agent_profile_source(agent_profile_name)
     except FileNotFoundError:
+        # A plain ``.exists()`` miss can hide a DANGLING SYMLINK (a store entry
+        # that IS present as a link but whose target is gone). That is not a
+        # clean absence; fail closed rather than inheriting the caller provider.
+        if _dangling_store_entry(agent_profile_name):
+            return _STUB_UNKNOWN, None, None
         return _STUB_ABSENT, None, None
     except Exception:
         # Exists (or its readability is indeterminate) but we cannot read it —
         # evidence unavailable. UNKNOWN, fail closed for the resolution path.
         return _STUB_UNKNOWN, None, None
+    # The bytes were read. Reject MALFORMED frontmatter (BOM / truncated
+    # delimiter) that ``frontmatter.loads`` would silently reduce to empty
+    # metadata and thereby mislabel as a plain profile.
+    if _raw_stub_is_malformed(raw):
+        return _STUB_UNKNOWN, None, raw
     try:
         metadata = frontmatter.loads(raw).metadata
     except Exception:
@@ -789,14 +922,47 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
             (unreadable/unparseable) — fail closed, no spawn.
     """
     intent, declared_provider, raw_text = _classify_stub_intent(agent_profile_name)
+    return _resolve_provider_from_classification(
+        agent_profile_name,
+        fallback_provider,
+        intent,
+        declared_provider,
+        raw_text,
+    )
 
+
+def _resolve_provider_from_classification(
+    agent_profile_name: str,
+    fallback_provider: str,
+    intent: str,
+    declared_provider: "Optional[str]",
+    raw_text: "Optional[str]",
+) -> str:
+    """F838 (#695) r3 — resolve a provider from an ALREADY-CLASSIFIED stub.
+
+    This is the resolution half of :func:`resolve_provider`, split out so a
+    caller that has already read+classified the stub ONCE (the assign guard)
+    can resolve from that SAME immutable classification without issuing a second
+    ``_classify_stub_intent`` (and thus a second disk read). ``resolve_provider``
+    itself is now a one-read wrapper around this function, so its external
+    behaviour is byte-identical — but the guard no longer reads the store twice
+    (codex r2 P0 blocker B: the guard "still spans two mutable reads", so an
+    empty-provider file that DISAPPEARS between the intent read and the resolver
+    read was reclassified ``ABSENT`` and fell back). With a single read, a
+    mid-flight disappearance cannot change the verdict.
+
+    The fail-closed contract is identical to :func:`resolve_provider`: UNKNOWN
+    and a DECLARED-but-unresolvable stub REFUSE; only a cleanly-read PLAIN or a
+    truly ABSENT name may fall back.
+    """
     if intent == _STUB_ABSENT:
         # Name truly absent — nothing to contradict; fall back.
         return fallback_provider
 
     if intent == _STUB_UNKNOWN:
-        # Unreadable/unparseable store entry — evidence unavailable. A legacy
-        # alias that cannot be read must be REFUSED, never inherit the caller.
+        # Unreadable/unparseable/malformed/dangling store entry — evidence
+        # unavailable. A legacy alias that cannot be read must be REFUSED, never
+        # inherit the caller.
         raise ProviderResolutionError(
             E_PROVIDER_UNRESOLVED,
             f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "

@@ -4,81 +4,156 @@ A legacy alias stub (``pi_cli_empirical_reviewer_lite``) that declares a provide
 but resolves to no valid provider must NOT spawn as the caller's provider. The
 assign seam pre-resolves the provider strictly from the stub and, on failure or
 mismatch, returns a typed refusal WITHOUT calling ``_create_terminal``.
+
+r3 (codex EMPIRICAL-GATE-NO r2 Blocker B): the r2 guard spanned TWO mutable store
+reads — once for intent (``_stub_declared_provider_safe``) and again inside
+``resolve_provider`` — so an empty-provider stub that DISAPPEARED between them was
+reclassified ABSENT on the second read and fell back to the caller's provider,
+which was then carried into creation. The r3 guard reads+classifies EXACTLY ONCE
+(``_classify_stub_intent``) and resolves from that SAME immutable classification
+(``_resolve_provider_from_classification``). These tests exercise the guard
+through REAL on-disk store files (the reviewer's probe made permanent) rather
+than preprogramming the resolver to raise — the verdict's explicit requirement
+for the disappearance case.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import shutil
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch as _patch
 
+import pytest
+
+from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.mcp_server.server import _assign_impl
-from cli_agent_orchestrator.utils import agent_profiles
-from cli_agent_orchestrator.utils.agent_profiles import (
-    E_PROVIDER_UNRESOLVED,
-    ProviderResolutionError,
-)
+from cli_agent_orchestrator.utils import agent_profiles as ap
+from cli_agent_orchestrator.utils.agent_profiles import E_PROVIDER_UNRESOLVED
 
 _CREATE = "cli_agent_orchestrator.mcp_server.server._create_terminal"
-_STUBSAFE = "cli_agent_orchestrator.utils.agent_profiles._stub_declared_provider_safe"
-# The assign seam imports resolve_provider LOCALLY from agent_profiles, so patch
-# it there (patching server.resolve_provider would not bind the local import).
-_RESOLVE = "cli_agent_orchestrator.utils.agent_profiles.resolve_provider"
 
 
-def _no_positions():
-    return patch.object(agent_profiles, "_read_composition_store", side_effect=lambda *a, **k: None)
+def patch_object(target, attr, value):
+    return _patch.object(target, attr, value)
 
 
-def test_assign_refuses_when_declared_stub_resolves_unresolved(monkeypatch):
-    """Declaring stub + ProviderResolutionError from resolve_provider → the
-    assign result is a typed refusal and NO terminal is created."""
+def patch_dotted(path, **kw):
+    return _patch(path, **kw)
+
+
+class _CallerResponse:
+    """Minimal cao_http.get response for the current-terminal metadata lookup:
+    the caller is a ``claude_code`` supervisor — the provider a substitution
+    would leak into the spawn."""
+
+    status_code = 200
+
+    @staticmethod
+    def json() -> dict[str, object]:
+        return {
+            "provider": "claude_code",
+            "session_name": "scratch-session",
+            "allowed_tools": None,
+        }
+
+    @staticmethod
+    def raise_for_status() -> None:
+        return None
+
+
+@pytest.fixture()
+def store(tmp_path, monkeypatch):
+    """A real scratch agent-store dir wired into the profile lookup, with every
+    other configured agent dir disabled so ONLY the files we write can match.
+    ``_create_terminal`` and the caller-metadata HTTP GET are stubbed so the
+    guard runs against real files but no real spawn/HTTP happens."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with (
-        _no_positions(),
-        patch(_STUBSAFE, return_value=(True, "pi_cli")),
-        patch(
-            _RESOLVE,
-            side_effect=ProviderResolutionError(
-                E_PROVIDER_UNRESOLVED, "E-PROVIDER-UNRESOLVED: boom"
-            ),
-        ),
-        patch(_CREATE) as create,
-    ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
+    store_dir = tmp_path / "agent-store"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(patch_object(ap, "LOCAL_AGENT_STORE_DIR", store_dir))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={},
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(_patch.object(server.cao_http, "get", return_value=_CallerResponse()))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        )
+    )
+    try:
+        yield store_dir
+    finally:
+        stack.close()
+        if store_dir.exists():
+            shutil.rmtree(store_dir, ignore_errors=True)
 
+
+def _write(store_dir: Path, name: str, raw: str) -> Path:
+    path = store_dir / f"{name}.md"
+    path.write_text(raw, encoding="utf-8", newline="")
+    return path
+
+
+def test_assign_refuses_when_declared_stub_resolves_unresolved(store):
+    """A real declaring stub (``provider:`` empty) that resolves to no valid
+    provider → typed refusal, NO terminal created. Uses the REAL resolver."""
+    _write(store, "f838_alias", "---\nprovider:\n---\nbody\n")
+    with _patch(_CREATE) as create:
+        result = _assign_impl("f838_alias", "task", working_directory="/repo")
     assert result["success"] is False
     assert E_PROVIDER_UNRESOLVED in result["message"]
     assert "no spawn" in result["message"].lower()
     create.assert_not_called()
 
 
-def test_assign_refuses_on_provider_mismatch(monkeypatch):
-    """Declaring stub says pi_cli but resolution produced a DIFFERENT provider
-    (the silent-substitution shape) → typed refusal, no spawn — even though the
-    produced provider is itself valid."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    with (
-        _no_positions(),
-        patch(_STUBSAFE, return_value=(True, "pi_cli")),
-        patch(_RESOLVE, return_value="claude_code"),
-        patch(_CREATE) as create,
-    ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
+def test_assign_refuses_on_provider_mismatch(store):
+    """A real declaring stub names ``pi_cli`` but the composed profile resolves
+    to a DIFFERENT valid provider (the silent-substitution shape) → typed
+    refusal, no spawn. Force the mismatch by composing to claude_code while the
+    stub declared pi_cli."""
+    _write(store, "f838_alias", "---\nprovider: pi_cli\n---\nbody\n")
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
+    with (
+        _patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_agent_profile",
+            return_value=AgentProfile(name="f838_alias", description="d", provider="claude_code"),
+        ),
+        _patch(_CREATE) as create,
+    ):
+        result = _assign_impl("f838_alias", "task", working_directory="/repo")
     assert result["success"] is False
     assert E_PROVIDER_UNRESOLVED in result["message"]
     assert "claude_code" in result["message"] and "pi_cli" in result["message"]
     create.assert_not_called()
 
 
-def test_assign_validates_declared_provider_on_success(monkeypatch):
-    """Healthy declaring stub → seam VALIDATES via resolve_provider (matches the
-    declared provider) and lets the spawn proceed. r2 (codex Blocker 2): the
-    guard-checked provider is CARRIED into _create_terminal (via the F613
-    ``provider=`` seam) so creation uses the value validated here — not a second
-    re-resolution from the mutable store. _resolved_provider is still NOT pinned
-    (legacy passthrough), so no position D8/D9 machinery fires."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    captured = {}
+def test_assign_validates_declared_provider_on_success(store):
+    """Healthy declaring stub resolving to pi_cli → seam validates and the spawn
+    proceeds; the guard-checked provider (pi_cli) is CARRIED into
+    _create_terminal (never a second re-resolution)."""
+    _write(store, "f838_alias", "---\nprovider: pi_cli\n---\nbody\n")
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    captured: dict[str, object] = {}
 
     def fake_create(agent_profile, *a, **k):
         captured["provider"] = k.get("provider")
@@ -86,138 +161,140 @@ def test_assign_validates_declared_provider_on_success(monkeypatch):
         return ("worker1", "pi_cli")
 
     with (
-        _no_positions(),
-        patch(_STUBSAFE, return_value=(True, "pi_cli")),
-        patch(_RESOLVE, return_value="pi_cli"),
-        patch(_CREATE, side_effect=fake_create) as create,
+        _patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_agent_profile",
+            return_value=AgentProfile(name="f838_alias", description="d", provider="pi_cli"),
+        ),
+        _patch(_CREATE, side_effect=fake_create) as create,
     ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
-
+        result = _assign_impl("f838_alias", "task", working_directory="/repo")
     assert result["success"] is True
     create.assert_called_once()
-    assert captured["agent_profile"] == "pi_cli_empirical_reviewer_lite"
-    # r2: the guard-checked provider is carried into _create_terminal.
+    assert captured["agent_profile"] == "f838_alias"
     assert captured["provider"] == "pi_cli"
 
 
-def test_assign_carries_guard_checked_provider_across_store_replacement(monkeypatch):
-    """codex Blocker 2 probe VERBATIM: a healthy ``pi_cli`` validation followed
-    by store replacement between guard and create. The guard resolves pi_cli;
-    then the store is swapped so a SECOND resolution would yield claude_code. The
-    provider PASSED TO _create_terminal must equal the guard-checked value
+def test_assign_carries_guard_checked_provider_across_store_replacement(store):
+    """codex probe VERBATIM (real files): a healthy ``pi_cli`` validation, then
+    the store file is REPLACED so a SECOND resolution would yield claude_code.
+    The provider PASSED TO _create_terminal must equal the guard-checked value
     (pi_cli) and MUST NEVER become claude_code — proving creation does not
-    re-resolve from the mutated store."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    captured = {}
-    calls = {"n": 0}
+    re-resolve from the mutated store. Counts raw store reads to pin the
+    single-read invariant."""
+    path = _write(store, "f838_alias", "---\nprovider: pi_cli\n---\nbody\n")
+    original_read = ap.read_agent_profile_source
+    raw_reads = {"n": 0}
+    captured: dict[str, object] = {}
 
-    def resolve_then_mutate(name, fallback_provider):
-        # First call is the guard's validation → the healthy declared provider.
-        # Any LATER call (i.e. a re-resolution at create time) would see the
-        # mutated store and return the caller's provider. If the fix carries the
-        # guard value forward, this second call never happens.
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return "pi_cli"
-        return "claude_code"  # store replaced — the substitution shape
+    def read_then_replace(profile_name: str) -> str:
+        raw = original_read(profile_name)
+        raw_reads["n"] += 1
+        # After the guard's single classify read, mutate the on-disk stub so any
+        # LATER read at create time would see claude_code.
+        if raw_reads["n"] == 1:
+            path.write_text("---\nprovider: claude_code\n---\nbody\n", encoding="utf-8")
+        return raw
 
     def fake_create(agent_profile, *a, **k):
         captured["provider"] = k.get("provider")
+        captured["disk_now"] = path.read_text(encoding="utf-8").splitlines()[1]
         return ("worker1", "pi_cli")
 
     with (
-        _no_positions(),
-        patch(_STUBSAFE, return_value=(True, "pi_cli")),
-        patch(_RESOLVE, side_effect=resolve_then_mutate),
-        patch(_CREATE, side_effect=fake_create),
+        _patch.object(ap, "read_agent_profile_source", side_effect=read_then_replace),
+        _patch(_CREATE, side_effect=fake_create),
     ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
+        result = _assign_impl("f838_alias", "task", working_directory="/repo")
 
     assert result["success"] is True
-    # The decisive assertion: guard_checked pi_cli reaches create as pi_cli.
+    # The decisive assertion: guard_checked pi_cli reaches create as pi_cli even
+    # though the disk now says claude_code.
     assert captured["provider"] == "pi_cli"
     assert captured["provider"] != "claude_code"
-    # The guard resolved exactly once; create did NOT re-resolve from disk.
-    assert calls["n"] == 1
+    assert captured["disk_now"] == "provider: claude_code"
 
 
-def test_assign_refuses_when_stub_disappears_between_guard_and_create(monkeypatch):
-    """codex Blocker 2, disappearance case: the stub declared intent, but by the
-    time the guard resolves it the store entry is gone/unreadable, so
-    resolve_provider fails closed (E-PROVIDER-UNRESOLVED). The assign returns a
-    typed refusal and _create_terminal is NEVER called — no fallback spawn."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+def test_assign_refuses_when_empty_provider_disappears_between_guard_reads(store):
+    """codex r2 Blocker B, REAL resolver (verdict: "the disappearance test must
+    run the real resolver rather than preprogramming it to raise"): a
+    ``provider:``-empty stub is renamed away right after the guard's FIRST raw
+    read. In r2 the guard read a SECOND time inside resolve_provider, saw the
+    gone file as ABSENT, and fell back to the caller's claude_code — which
+    reached _create_terminal (success=True). In r3 the guard classifies ONCE and
+    resolves from those same bytes (DECLARED, empty provider → refuse), so a
+    mid-flight disappearance cannot flip the verdict: typed refusal, NO spawn."""
+    path = _write(store, "f838_race_empty", "---\nprovider:\n---\nbody\n")
+    moved = path.with_suffix(".moved")
+    original_read = ap.read_agent_profile_source
+    raw_reads = {"n": 0}
+
+    def read_then_remove(profile_name: str) -> str:
+        raw = original_read(profile_name)
+        raw_reads["n"] += 1
+        # Remove the file immediately after the FIRST successful read.
+        if raw_reads["n"] == 1 and path.exists():
+            path.rename(moved)
+        return raw
 
     with (
-        _no_positions(),
-        # Stub read at guard-classification time still shows declared intent...
-        patch(_STUBSAFE, return_value=(True, "pi_cli")),
-        # ...but resolution (single-read) now fails closed: entry vanished.
-        patch(
-            _RESOLVE,
-            side_effect=ProviderResolutionError(
-                E_PROVIDER_UNRESOLVED,
-                "E-PROVIDER-UNRESOLVED: agent profile 'pi_cli_empirical_reviewer_lite' "
-                "could not be read/parsed from the store (F838 #695)",
-            ),
-        ),
-        patch(_CREATE) as create,
+        _patch.object(ap, "read_agent_profile_source", side_effect=read_then_remove),
+        _patch(_CREATE) as create,
     ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
+        result = _assign_impl("f838_race_empty", "task", working_directory="/repo")
 
-    assert result["success"] is False
+    assert result["success"] is False, result
     assert E_PROVIDER_UNRESOLVED in result["message"]
     assert "no spawn" in result["message"].lower()
     create.assert_not_called()
+    # Single-read invariant: the guard read the raw store EXACTLY ONCE. If it had
+    # read twice, the second read would have hit the removed file (ABSENT) and
+    # fallen back — the r2 defect.
+    assert raw_reads["n"] == 1, f"guard must read once; read {raw_reads['n']} times"
 
 
-def test_assign_refuses_on_unreadable_stub_after_parsed_none(monkeypatch):
-    """codex Blocker 1 at the public seam: an UNKNOWN/unreadable stub is routed
-    through resolve_provider by _stub_declared_provider_safe returning
-    (True, None) — NOT treated as "no intent → passthrough". resolve_provider
-    then fails closed, so the assign refuses with no spawn."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-
-    with (
-        _no_positions(),
-        # UNKNOWN read: the r2 _stub_declared_provider_safe reports (True, None)
-        # so the guard does NOT fall through to the legacy passthrough.
-        patch(_STUBSAFE, return_value=(True, None)),
-        patch(
-            _RESOLVE,
-            side_effect=ProviderResolutionError(
-                E_PROVIDER_UNRESOLVED,
-                "E-PROVIDER-UNRESOLVED: provider undeterminable (F838 #695)",
-            ),
-        ),
-        patch(_CREATE) as create,
-    ):
-        result = _assign_impl("pi_cli_empirical_reviewer_lite", "task", working_directory="/repo")
-
+def test_assign_refuses_on_unreadable_dangling_symlink(store):
+    """codex r2 Blocker A at the public seam (real file): a DANGLING SYMLINK
+    store entry is UNKNOWN (present-but-unreadable), routed through the
+    fail-closed resolver → typed refusal, no spawn. In r2 this classified ABSENT
+    and fell back to claude_code."""
+    (store / "f838_dangling.md").symlink_to(store / "missing-target.md")
+    with _patch(_CREATE) as create:
+        result = _assign_impl("f838_dangling", "task", working_directory="/repo")
     assert result["success"] is False
     assert E_PROVIDER_UNRESOLVED in result["message"]
     create.assert_not_called()
 
 
-def test_assign_legacy_no_intent_unchanged(monkeypatch):
-    """A genuine legacy name that declares no provider/composition intent is not
-    pre-resolved by the F838 seam — passthrough to _create_terminal unchanged
-    (provider stays None; resolve_provider inside _create_terminal handles it)."""
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    captured = {}
+def test_assign_refuses_on_truncated_and_bom_stubs(store):
+    """codex r2 Blocker A at the public seam (real files): a TRUNCATED stub
+    (opener, no closing delimiter) and a BOM-prefixed stub both classify UNKNOWN
+    and refuse — in r2 both were PLAIN and fell back to claude_code."""
+    _write(store, "f838_partial", "---\nprovider: pi_cli\n")
+    _write(store, "f838_bom", "\ufeff---\nprovider: pi_cli\n---\nbody\n")
+    for name in ("f838_partial", "f838_bom"):
+        with _patch(_CREATE) as create:
+            result = _assign_impl(name, "task", working_directory="/repo")
+        assert result["success"] is False, name
+        assert E_PROVIDER_UNRESOLVED in result["message"], name
+        create.assert_not_called()
+
+
+def test_assign_legacy_plain_no_intent_unchanged(store):
+    """A genuine legacy plain profile (declares no provider/composition intent)
+    is NOT pre-resolved by the F838 seam — passthrough to _create_terminal
+    unchanged (provider stays None; _create_terminal's own resolve handles it)."""
+    _write(store, "f838_plain", "---\ndescription: plain legacy\n---\nbody\n")
+    captured: dict[str, object] = {}
 
     def fake_create(agent_profile, *a, **k):
         captured["provider"] = k.get("provider")
         captured["agent_profile"] = agent_profile
         return ("worker1", "kiro_cli")
 
-    with (
-        _no_positions(),
-        patch(_STUBSAFE, return_value=(False, None)),
-        patch(_CREATE, side_effect=fake_create) as create,
-    ):
-        result = _assign_impl("developer", "task", working_directory="/repo")
-
+    with _patch(_CREATE, side_effect=fake_create) as create:
+        result = _assign_impl("f838_plain", "task", working_directory="/repo")
     assert result["success"] is True
-    assert captured["agent_profile"] == "developer"
-    assert captured["provider"] is None  # not pre-resolved; legacy passthrough
+    create.assert_called_once()
+    assert captured["agent_profile"] == "f838_plain"
+    # Not pre-resolved by the guard; legacy passthrough leaves provider None.
+    assert captured["provider"] is None

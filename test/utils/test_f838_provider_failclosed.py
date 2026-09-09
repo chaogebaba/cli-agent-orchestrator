@@ -146,3 +146,151 @@ def test_unparseable_stub_refuses():
             with pytest.raises(ProviderResolutionError) as ei:
                 resolve_provider("pi_cli_empirical_reviewer_lite", "claude_code")
     assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r3 — REAL-FILE adversaries the codex r2 EMPIRICAL-GATE-NO named.
+#
+# The r2 classifier accepted three real on-disk shapes as permitted fallback
+# states rather than uncertainty (verdict-f838-r2 P0 blocker A):
+#   (a) a TRUNCATED stub (``---`` opener, no closing delimiter) — parsed to empty
+#       metadata and was mislabelled PLAIN.
+#   (b) a BOM-prefixed stub — the U+FEFF pushed the ``---`` off offset 0 so
+#       frontmatter was never detected; empty metadata; mislabelled PLAIN.
+#   (c) a DANGLING SYMLINK store entry — ``Path.exists()`` follows the link and
+#       reads False, so the lookup fell through to FileNotFoundError and was
+#       mislabelled ABSENT.
+# All three MUST classify UNKNOWN and REFUSE (E-PROVIDER-UNRESOLVED). These are
+# real files under a scratch store dir (not mocks), the reviewer's probe turned
+# into permanent regression tests.
+# ---------------------------------------------------------------------------
+
+from contextlib import ExitStack  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from cli_agent_orchestrator.utils import agent_profiles as _ap  # noqa: E402
+
+
+def _store_patches(store: Path) -> ExitStack:
+    """Point the profile lookup at a scratch store dir and disable every other
+    configured agent dir, so the only file that can match is the one we wrote."""
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", store))
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={},
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    return stack
+
+
+def _write(store: Path, name: str, raw: str) -> Path:
+    store.mkdir(parents=True, exist_ok=True)
+    path = store / f"{name}.md"
+    path.write_text(raw, encoding="utf-8", newline="")
+    return path
+
+
+def test_real_truncated_stub_classifies_unknown_and_refuses(tmp_path):
+    """(a) A stub with a ``---`` opener but NO closing delimiter — the r2
+    classifier called it PLAIN and fell back to claude_code."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_partial", "---\nprovider: pi_cli\n")
+    with _store_patches(store):
+        intent, declared, _ = _ap._classify_stub_intent("f838_partial")
+        assert intent == _ap._STUB_UNKNOWN
+        assert declared is None
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider("f838_partial", "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+    assert "claude_code" in str(ei.value)
+
+
+def test_real_bom_prefixed_stub_classifies_unknown_and_refuses(tmp_path):
+    """(b) A complete-frontmatter stub preceded by a U+FEFF BOM — the r2
+    classifier called it PLAIN and fell back."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_bom", "\ufeff---\nprovider: pi_cli\n---\nbody\n")
+    with _store_patches(store):
+        intent, declared, _ = _ap._classify_stub_intent("f838_bom")
+        assert intent == _ap._STUB_UNKNOWN
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider("f838_bom", "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+def test_real_dangling_symlink_classifies_unknown_and_refuses(tmp_path):
+    """(c) A store entry that is a symlink whose target is missing — the r2
+    classifier called it ABSENT (a clean absence) and fell back. A dangling link
+    is a present-but-unreadable entry: UNKNOWN, refuse."""
+    store = tmp_path / "agent-store"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "f838_dangling.md").symlink_to(store / "missing-target.md")
+    with _store_patches(store):
+        assert _ap._dangling_store_entry("f838_dangling") is True
+        intent, _, _ = _ap._classify_stub_intent("f838_dangling")
+        assert intent == _ap._STUB_UNKNOWN
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider("f838_dangling", "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+def test_real_wellformed_empty_frontmatter_stays_plain(tmp_path):
+    """Control: a WELL-FORMED but empty frontmatter block (``---\\n---``) is NOT
+    malformed — the delimiter opens and closes cleanly. It declares no
+    provider/composition, so it stays PLAIN and keeps the caller fallback. This
+    guards against the malformed-detector over-refusing genuine plain profiles."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_emptyfm", "---\n---\nbody\n")
+    with _store_patches(store):
+        intent, _, _ = _ap._classify_stub_intent("f838_emptyfm")
+        assert intent == _ap._STUB_PLAIN
+        assert resolve_provider("f838_emptyfm", "kiro_cli") == "kiro_cli"
+
+
+def test_real_no_frontmatter_plain_stays_plain(tmp_path):
+    """Control: a genuine legacy plain profile with NO frontmatter block at all
+    stays PLAIN (detect=False, not malformed) and keeps the caller fallback."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_noyaml", "# Just a heading\n\nplain body, no frontmatter\n")
+    with _store_patches(store):
+        intent, _, _ = _ap._classify_stub_intent("f838_noyaml")
+        assert intent == _ap._STUB_PLAIN
+        assert resolve_provider("f838_noyaml", "kiro_cli") == "kiro_cli"
+
+
+def test_real_crlf_frontmatter_stays_declared(tmp_path):
+    """Control: CRLF-delimited frontmatter is well-formed and DECLARED — it must
+    resolve its declared provider, not be mistaken for malformed."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_crlf", "---\r\nprovider: pi_cli\r\n---\r\nbody\r\n")
+    with _store_patches(store):
+        intent, declared, _ = _ap._classify_stub_intent("f838_crlf")
+        assert intent == _ap._STUB_DECLARED
+        assert declared == "pi_cli"
+
+
+def test_single_read_invariant_resolve_reads_store_once(tmp_path):
+    """Single-read invariant (verdict): ``resolve_provider`` must read the raw
+    store EXACTLY ONCE — it classifies and resolves from the same immutable
+    bytes, never a second racy disk read."""
+    store = tmp_path / "agent-store"
+    _write(store, "f838_once", "---\ndescription: plain\n---\nbody\n")
+    original_read = _ap.read_agent_profile_source
+    with _store_patches(store):
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            resolve_provider("f838_once", "kiro_cli")
+    assert reads.call_count == 1, f"expected 1 raw store read, got {reads.call_count}"
