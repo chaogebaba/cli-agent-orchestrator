@@ -179,6 +179,7 @@ def record_event(
     the property AC-10 depends on). Safe to call inside an existing session
     (pass ``db``) or standalone.
     """
+
     def _do(session: Any) -> bool:
         existing = (
             session.query(DeskEventModel)
@@ -237,9 +238,7 @@ def admit_query(
 
         # Replay: a known handle retrieves its record; never a second job.
         if request_id is not None:
-            existing = (
-                db.query(DeskQueryModel).filter_by(request_id=request_id).one_or_none()
-            )
+            existing = db.query(DeskQueryModel).filter_by(request_id=request_id).one_or_none()
             if existing is not None:
                 return AdmitResult(
                     kind="replayed",
@@ -321,9 +320,7 @@ def complete_query(
         # A cited answer is a useful completion; NOT_FOUND is completed but not
         # cited, and does not advance last_useful_completion.
         if outcome not in ("NOT_FOUND", "FAILED"):
-            record_event(
-                q.conversation_id, str(q.incarnation), EV_CITED_ANSWER, request_id, db=db
-            )
+            record_event(q.conversation_id, str(q.incarnation), EV_CITED_ANSWER, request_id, db=db)
             binding = (
                 db.query(DeskBindingModel)
                 .filter_by(conversation_id=q.conversation_id)
@@ -339,9 +336,7 @@ def complete_query(
 
 
 def _release_slot(db: Any, conversation_id: str) -> None:
-    binding = (
-        db.query(DeskBindingModel).filter_by(conversation_id=conversation_id).one_or_none()
-    )
+    binding = db.query(DeskBindingModel).filter_by(conversation_id=conversation_id).one_or_none()
     if binding is not None and int(binding.queue_depth) > 0:
         binding.queue_depth = int(binding.queue_depth) - 1
 
@@ -371,9 +366,7 @@ def wait_for(request_id: str) -> WaitResult:
                 outcome=q.outcome,
             )
         if q.state in ("FAILED", "EXPIRED"):
-            return WaitResult(
-                kind="failed", request_id=request_id, outcome=q.outcome or q.state
-            )
+            return WaitResult(kind="failed", request_id=request_id, outcome=q.outcome or q.state)
         return WaitResult(
             kind="pending",
             request_id=request_id,
@@ -422,9 +415,7 @@ def project_usage(conversation_id: str) -> DeskUsage:
     gaps stay visible beside the routed share.
     """
     with SessionLocal() as db:
-        events = (
-            db.query(DeskEventModel).filter_by(conversation_id=conversation_id).all()
-        )
+        events = db.query(DeskEventModel).filter_by(conversation_id=conversation_id).all()
         # Query-state counts come from the durable query rows (also deduplicated
         # by request_id primary key).
         pending = (

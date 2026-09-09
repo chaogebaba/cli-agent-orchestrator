@@ -7,12 +7,13 @@ Mutant: route the completion through the inbox path -> test_no_inbox_* RED
 
 from __future__ import annotations
 
+from test.app.desk.conftest import ready_boundary
+
 from sqlalchemy import text
 
 from cli_agent_orchestrator.clients.database import DeskQueryModel
 from cli_agent_orchestrator.services import desk_service as ds
 from cli_agent_orchestrator.services.desk_reconciler import reconcile_once
-from test.app.desk.conftest import ready_boundary
 
 
 def _inbox_count(rig) -> int:

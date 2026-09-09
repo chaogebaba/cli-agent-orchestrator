@@ -8,6 +8,8 @@ Mutant: hibernate on a merely declared artifact -> test_declared_only RED
 
 from __future__ import annotations
 
+from test.app.desk.conftest import ready_boundary
+
 import pytest
 
 from cli_agent_orchestrator.clients.database import DeskBindingModel
@@ -16,27 +18,27 @@ from cli_agent_orchestrator.services.desk_reconciler import (
     reconcile_once,
     stop_at_session_end,
 )
-from test.app.desk.conftest import ready_boundary
 
 
 def test_both_verified_allows_hibernation(desk_rig):
-    assert hibernation_allowed(
-        resume_artifact_verified=True, memory_roundtrip_verified=True
-    ) is True
+    assert (
+        hibernation_allowed(resume_artifact_verified=True, memory_roundtrip_verified=True) is True
+    )
 
 
 def test_declared_only_refuses(desk_rig):
     """A merely DECLARED artifact (verified=False) or a missing memory round
     trip must NOT enable hibernation."""
-    assert hibernation_allowed(
-        resume_artifact_verified=True, memory_roundtrip_verified=False
-    ) is False
-    assert hibernation_allowed(
-        resume_artifact_verified=False, memory_roundtrip_verified=True
-    ) is False
-    assert hibernation_allowed(
-        resume_artifact_verified=False, memory_roundtrip_verified=False
-    ) is False
+    assert (
+        hibernation_allowed(resume_artifact_verified=True, memory_roundtrip_verified=False) is False
+    )
+    assert (
+        hibernation_allowed(resume_artifact_verified=False, memory_roundtrip_verified=True) is False
+    )
+    assert (
+        hibernation_allowed(resume_artifact_verified=False, memory_roundtrip_verified=False)
+        is False
+    )
 
 
 def test_desk_stops_at_session_end(desk_rig):

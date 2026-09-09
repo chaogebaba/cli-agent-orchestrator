@@ -8,6 +8,8 @@ test_cert_failed_stays_degraded RED (state would be READY on a general lane).
 
 from __future__ import annotations
 
+from test.app.desk.conftest import degraded_boundary
+
 import pytest
 
 from cli_agent_orchestrator.clients.database import DeskBindingModel
@@ -17,7 +19,6 @@ from cli_agent_orchestrator.services.desk_reconciler import (
     CreateStatus,
     reconcile_once,
 )
-from test.app.desk.conftest import degraded_boundary
 
 
 @pytest.mark.parametrize(

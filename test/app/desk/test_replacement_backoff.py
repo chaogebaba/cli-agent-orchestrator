@@ -8,6 +8,8 @@ tick within the backoff window would attempt again).
 
 from __future__ import annotations
 
+from test.app.desk.conftest import degraded_boundary, ready_boundary
+
 from cli_agent_orchestrator.clients.database import DeskBindingModel
 from cli_agent_orchestrator.services.desk_reconciler import (
     REPLACEMENT_BACKOFF_SECONDS,
@@ -15,7 +17,6 @@ from cli_agent_orchestrator.services.desk_reconciler import (
     CreateStatus,
     reconcile_once,
 )
-from test.app.desk.conftest import degraded_boundary, ready_boundary
 
 
 class CountingBoundary:

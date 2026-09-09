@@ -119,9 +119,7 @@ def list_live_conversation_ids() -> List[str]:
 def _live_generation(conversation_id: str) -> Optional[int]:
     with engine.connect() as conn:
         row = conn.execute(
-            text(
-                "SELECT generation FROM conversation_identity WHERE identity_key = :k"
-            ),
+            text("SELECT generation FROM conversation_identity WHERE identity_key = :k"),
             {"k": conversation_id},
         ).fetchone()
     return int(row[0]) if row is not None else None
@@ -262,9 +260,7 @@ def within_ready_bound(binding_created_at: datetime, observed_at: datetime) -> b
     return (observed_at - binding_created_at) <= timedelta(seconds=READY_BOUND_SECONDS)
 
 
-def hibernation_allowed(
-    *, resume_artifact_verified: bool, memory_roundtrip_verified: bool
-) -> bool:
+def hibernation_allowed(*, resume_artifact_verified: bool, memory_roundtrip_verified: bool) -> bool:
     """Whether a desk may hibernate to save a slot (D6 / AC-14 / K3).
 
     Hibernation is NOT promised: it is enabled ONLY after that provider's resume

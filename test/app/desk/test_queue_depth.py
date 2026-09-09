@@ -7,10 +7,11 @@ Mutant: admit a fifth query past the depth -> test_fifth_* RED.
 
 from __future__ import annotations
 
+from test.app.desk.conftest import ready_boundary
+
 from cli_agent_orchestrator.clients.database import DeskBindingModel, DeskQueryModel
 from cli_agent_orchestrator.services import desk_service as ds
 from cli_agent_orchestrator.services.desk_reconciler import reconcile_once
-from test.app.desk.conftest import ready_boundary
 
 
 def _ready(rig, cid="conv1"):

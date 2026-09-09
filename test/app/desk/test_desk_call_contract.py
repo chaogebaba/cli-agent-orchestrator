@@ -9,11 +9,12 @@ Mutants (blueprint names two):
 
 from __future__ import annotations
 
+from test.app.desk.conftest import ready_boundary
+
 import pytest
 
 from cli_agent_orchestrator.services import desk_service as ds
 from cli_agent_orchestrator.services.desk_reconciler import reconcile_once
-from test.app.desk.conftest import ready_boundary
 
 
 def _make_ready_desk(rig, cid="conv1"):

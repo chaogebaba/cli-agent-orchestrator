@@ -47,10 +47,7 @@ class DeskRig:
     def set_lifecycle(self, identity_key: str, lifecycle: str) -> None:
         with self.engine.begin() as conn:
             conn.execute(
-                text(
-                    "UPDATE conversation_identity SET lifecycle = :lc "
-                    "WHERE identity_key = :k"
-                ),
+                text("UPDATE conversation_identity SET lifecycle = :lc " "WHERE identity_key = :k"),
                 {"lc": lifecycle, "k": identity_key},
             )
 
