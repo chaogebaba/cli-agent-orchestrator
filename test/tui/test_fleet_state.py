@@ -147,3 +147,18 @@ def test_window_index_accepts_the_stringified_shape_the_server_sends() -> None:
     assert TerminalState.from_dict({"id": "a", "window_index": "x"}).window_index is None
     assert TerminalState.from_dict({"id": "a", "window_index": True}).window_index is None
     assert TerminalState.from_dict({"id": "a"}).window_index is None
+
+
+
+def test_terminal_error_is_a_typed_first_class_key() -> None:
+    """F789 (#646): terminal_error round-trips as a typed field, not `extra`."""
+    from cli_agent_orchestrator.tui.fleet_state import TerminalState
+
+    row = TerminalState.from_dict({"id": "t1", "terminal_error": "deferred_init_failed"})
+    assert row.terminal_error == "deferred_init_failed"
+    assert "terminal_error" not in row.extra  # allow-listed, not spilled to extra
+
+    # Absent → None (additive, old-server tolerant).
+    assert TerminalState.from_dict({"id": "t1"}).terminal_error is None
+    # Non-string → coerced to None by _as_opt_str's contract path.
+    assert TerminalState.from_dict({"id": "t1", "terminal_error": None}).terminal_error is None

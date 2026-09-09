@@ -109,7 +109,7 @@ from cli_agent_orchestrator.providers.base import (
     RetryableArtifactValidation,
     TerminalArtifactValidation,
 )
-from cli_agent_orchestrator.providers.codex import CodexSubmitStuckError
+from cli_agent_orchestrator.providers.codex import CodexProvider, CodexSubmitStuckError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     probe_kiro_capabilities,
@@ -6494,6 +6494,21 @@ def send_input(
         # Inject profile contracts only for orchestrated deliveries. Direct
         # human pane input and answer_user_prompt keep their literal text.
         original_message = message
+        # F758 #615: the codex provider may offload an over-long task body to a
+        # brief file and paste a short pointer instead (to dodge the chip-less
+        # inline-paste submit failure on codex-cli 0.153.x). F758 stage-B F1: gate
+        # on the CONCRETE CLASS via isinstance, NOT getattr(...,"prepare_delivery_body")
+        # — an unspecced MagicMock provider double auto-manufactures a callable for
+        # any attribute, so a getattr/callable check FIRED for mocks and replaced the
+        # task string with a mock return (3 head-only dispatch regressions). isinstance
+        # cannot be synthesized by MagicMock.__getattr__, so non-codex providers and
+        # every mock double are a true no-op. The hook is itself fail-open.
+        if isinstance(provider, CodexProvider) and orchestration_value in {
+            OrchestrationType.ASSIGN.value,
+            OrchestrationType.SEND_MESSAGE.value,
+            OrchestrationType.HANDOFF.value,
+        }:
+            message = provider.prepare_delivery_body(message)
         message = _append_message_contract(message, metadata, orchestration_value)
 
         # Inject memory context into the very first user message after init.

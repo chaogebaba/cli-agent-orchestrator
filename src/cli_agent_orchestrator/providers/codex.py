@@ -61,6 +61,26 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
+# F758 #615 — inline-paste offload threshold. A codex TUI (codex-cli 0.153.x)
+# renders a long bracketed paste INLINE as plain text with no paste chip; the
+# F435 verify then cannot confirm/​recover the submit and deferred-init tears the
+# worker down (incident: two ~2.3 KB briefs). Mechanize the file-pointer
+# workaround: when the outgoing TASK BODY exceeds this many bytes, write the full
+# body to a brief file under CAO_HOME_DIR and paste a short pointer instead, so
+# the composer only ever holds a tiny, reliably-submitted message. Below the
+# threshold the delivery is byte-identical to today. Constant-only: there is no
+# providers.toml precedent key for a CAO-side delivery threshold (codex_config is
+# `-c` passthrough to the codex binary), so per the brief this is not TOML-
+# overridable.
+CODEX_INLINE_PASTE_MAX = 1500
+
+# The distinctive trailing callback footer the assign/handoff MCP tool appends to
+# a worker's first task (ENABLE_SENDER_ID_INJECTION). The offload splits it off
+# the task body so the pasted pointer keeps the callback line UNCHANGED — the
+# worker still learns how to report back. Matched on the LAST occurrence so a
+# body that quotes the phrase cannot steal the split.
+_CODEX_CALLBACK_FOOTER_ANCHOR = "\n\n[Assigned by terminal "
+
 # F587 D19: how many trailing output lines a seed-failure carries into its
 # exception AND the assign error payload. Every failure branch (rc≠0, timeout,
 # and a classifier refusal that hangs into the timeout) surfaces the same
@@ -4564,6 +4584,77 @@ class CodexProvider(BaseProvider):
         if len(norm) < CODEX_SUBMIT_TASK_SIGNATURE_MIN_CHARS:
             return None
         return norm[:CODEX_SUBMIT_TASK_SIGNATURE_CHARS]
+
+    def prepare_delivery_body(self, message: str) -> str:
+        """F758 #615: offload an over-long task body to a brief file + pointer.
+
+        Called by the send seam BEFORE the message-contract/​memory injection and
+        the paste. When the TASK BODY (the message minus its trailing callback
+        footer) exceeds ``CODEX_INLINE_PASTE_MAX`` bytes, write the full body to
+        ``$CAO_HOME_DIR/briefs/<terminal-id>/<msg-id>.md`` (dir 0700, file 0600)
+        and return a short pointer that names the absolute path + byte count,
+        with the callback footer preserved UNCHANGED. Below the threshold the
+        message is returned byte-identical (no file, no rewrite).
+
+        This never touches the F435/F643c verify/​recovery machinery — it only
+        shrinks what gets pasted, so the composer holds a tiny, reliably-
+        submitted message instead of a chip-less inline blob.
+
+        Pure except for the file write; raises nothing into the send path — on
+        any write error it returns the ORIGINAL message (fail-open to today's
+        behaviour, never worse than the status quo).
+        """
+        if not isinstance(message, str) or not message:
+            return message
+        # Split the trailing callback footer (if present) off the task body so
+        # the pointer keeps it verbatim. rfind → the LAST anchor wins.
+        anchor_idx = message.rfind(_CODEX_CALLBACK_FOOTER_ANCHOR)
+        if anchor_idx >= 0:
+            body = message[:anchor_idx]
+            footer = message[anchor_idx:]  # includes the leading "\n\n"
+        else:
+            body = message
+            footer = ""
+        body_bytes = len(body.encode("utf-8"))
+        if body_bytes <= CODEX_INLINE_PASTE_MAX:
+            return message  # below threshold → byte-identical to today
+        try:
+            import hashlib
+
+            briefs_dir = CAO_HOME_DIR / "briefs" / str(self.terminal_id)
+            briefs_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                briefs_dir.chmod(0o700)
+            except OSError:
+                pass
+            # <msg-id>: a short content hash of the body — deterministic, unique
+            # per distinct body, and available at this seam (no message id is
+            # threaded here).
+            msg_id = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+            brief_path = briefs_dir / f"{msg_id}.md"
+            brief_path.write_text(body, encoding="utf-8")
+            try:
+                brief_path.chmod(0o600)
+            except OSError:
+                pass
+        except Exception as exc:  # never fail the send on an offload error
+            logger.warning(
+                "F758 offload: could not write brief for terminal %s (%s: %s); "
+                "pasting the full body inline as before",
+                self.terminal_id,
+                type(exc).__name__,
+                exc,
+            )
+            return message
+        pointer = f"Read and follow {brief_path} ({body_bytes} bytes). Start now."
+        logger.info(
+            "F758 offload: terminal %s task body %d B > %d B → wrote %s, pasting pointer",
+            self.terminal_id,
+            body_bytes,
+            CODEX_INLINE_PASTE_MAX,
+            brief_path,
+        )
+        return f"{pointer}{footer}"
 
     def capture_submission_baseline(
         self,

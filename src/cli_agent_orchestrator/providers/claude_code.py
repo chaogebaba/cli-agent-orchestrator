@@ -141,6 +141,45 @@ _SETTINGS_WRITE_LOCK = threading.Lock()
 _UNSET: Any = object()
 
 
+def _dedupe_overlay_hooks_by_command(hooks_by_event: dict[str, Any]) -> None:
+    """F810 (#667) D2: drop duplicate hook command strings within each event.
+
+    Mutates ``hooks_by_event`` in place. For each event (SessionStart,
+    PostToolUse, Stop, …) the flattened per-hook entries are scanned in order and
+    any hook whose ``command`` string was already seen for that event is removed;
+    the first occurrence (and its matcher grouping / timeout / asyncRewake fields)
+    is kept. A hook block left with no hooks is dropped so the overlay carries no
+    empty groups. This makes the overlay safe to compose ALONGSIDE a repo-local
+    ``.claude/settings.json`` that registers the same ``python -m`` command: the
+    seat runs each such command once, never twice.
+    """
+    for event, blocks in list(hooks_by_event.items()):
+        if not isinstance(blocks, list):
+            continue
+        seen: set[str] = set()
+        kept_blocks = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                kept_blocks.append(block)
+                continue
+            inner = block.get("hooks")
+            if not isinstance(inner, list):
+                kept_blocks.append(block)
+                continue
+            kept_hooks = []
+            for hook in inner:
+                cmd = hook.get("command") if isinstance(hook, dict) else None
+                if isinstance(cmd, str):
+                    if cmd in seen:
+                        continue
+                    seen.add(cmd)
+                kept_hooks.append(hook)
+            if kept_hooks:
+                block["hooks"] = kept_hooks
+                kept_blocks.append(block)
+        hooks_by_event[event] = kept_blocks
+
+
 # Custom exception for provider errors
 class ProviderError(Exception):
     """Exception raised for provider-specific errors."""
@@ -888,7 +927,7 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
         command_parts.extend(["--session-id", self.allocated_session_uuid])
-        settings_file = self._write_terminal_settings()
+        settings_file = self._write_terminal_settings(profile)
         command_parts.extend(["--settings", str(settings_file)])
 
         # Resume a prior Claude Code conversation. Applied for every profile
@@ -1080,8 +1119,16 @@ class ClaudeCodeProvider(BaseProvider):
         )
         return f"{unset_cmd}; {claude_cmd}"
 
-    def _write_terminal_settings(self) -> Path:
-        """Write the terminal-scoped additive SessionStart hook settings."""
+    def _write_terminal_settings(self, profile: Optional["AgentProfile"] = _UNSET) -> Path:
+        """Write the terminal-scoped additive SessionStart hook settings.
+
+        Args:
+            profile: Pre-loaded profile. When omitted, it is loaded from disk
+                here. ``initialize`` → ``_build_claude_command`` loads the profile
+                once and threads it in (F826 merge: ``initialize`` also reads the
+                profile, so a second disk read here would double the
+                ``load_agent_profile`` call the F810 supervisor gate makes).
+        """
         tmp_dir = cao_tmp_dir()
         command = shlex.join(
             [
@@ -1189,12 +1236,116 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         turn_hooks = [{"type": "command", "command": turn_command, "timeout": 5}]
+        # F810 (#667) BLOCKER 4: the fork's seat-delivery edges (register / the
+        # PostToolUse+Stop drain legs / rewake) are appended ONLY for a
+        # server-authoritatively identified SUPERVISOR seat. The authority is the
+        # CAO agent profile's ``role`` field ("supervisor"), loaded from the
+        # server-side profile store via ``_load_profile`` — never a pane heuristic.
+        # For a worker (or any seat whose profile is absent/non-supervisor) these
+        # lists stay EMPTY and the F810 PostToolUse/Stop blocks are omitted, so the
+        # worker overlay is byte-equivalent to base (the base D22 ``drain_hooks``
+        # on SessionStart is unchanged and still applies to every seat).
+        is_supervisor = False
+        try:
+            # F826 merge: reuse the profile threaded in from initialize/
+            # _build_claude_command when present, so the F810 supervisor gate does
+            # not read the profile from disk a second time (initialize already
+            # loaded it once); fall back to a load for direct/legacy callers.
+            _profile = self._load_profile() if profile is _UNSET else profile
+            is_supervisor = bool(_profile is not None and _profile.role == "supervisor")
+        except Exception:
+            is_supervisor = False
+        # F810 (#667): the fork now OWNS the seat delivery edges. Three hooks
+        # ported from the old repository-local hook scripts into the same
+        # `python -m cli_agent_orchestrator.hooks.<mod>` shape as the hooks above,
+        # so a seat in ANY repo (or one that never spawned an in-harness Agent)
+        # gets them from this overlay rather than from a repo-local settings.json.
+        #   * register_inbox — publishes cc_team_inbox_path (the native socket) so
+        #     the F783 native ring can reach the seat. SessionStart + PostToolUse
+        #     (matcher Agent|Task, the subagent-spawn edge that creates the team
+        #     dir the derivation reads).
+        #   * supervisor_drain — now ALSO fires on PostToolUse (matcher .*) and
+        #     Stop, not SessionStart only: that is the edge a foreign seat was
+        #     missing, so its pending callbacks never entered context (F810 root
+        #     cause). It prints the digest envelope to stdout.
+        #   * rewake — the F213 --arm callback watcher on Stop, async so the
+        #     harness can hold it open to the idle gap; posttooluse arm re-arms it.
+        register_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.register_inbox",
+            ]
+        )
+        register_hooks = [{"type": "command", "command": register_command, "timeout": 10}]
+        if not is_supervisor:
+            register_hooks = []
+        rewake_command_stop = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.rewake",
+                "--arm",
+                "--source=stop",
+            ]
+        )
+        # Stop rewake mirrors the root settings.json: async, long timeout, the
+        # same operator-facing rewake summary/message.
+        rewake_stop_hooks = [
+            {
+                "type": "command",
+                "command": rewake_command_stop,
+                "asyncRewake": True,
+                "timeout": 3600,
+                "rewakeSummary": "CAO callback waiting",
+                "rewakeMessage": (
+                    "A CAO worker callback is pending and was not delivered by any "
+                    "other channel. The authoritative digest will be injected by "
+                    "the inbox-drain hook on your first tool call this turn — make "
+                    "one. Summary of what is waiting:"
+                ),
+            }
+        ]
+        if not is_supervisor:
+            rewake_stop_hooks = []
+        rewake_command_ptu = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.rewake",
+                "--arm",
+                "--source=posttooluse",
+            ]
+        )
+        rewake_ptu_hooks = [
+            {
+                "type": "command",
+                "command": rewake_command_ptu,
+                "asyncRewake": True,
+                "timeout": 10,
+                "rewakeSummary": "CAO callback waiting",
+                "rewakeMessage": (
+                    "A CAO worker callback is pending and was not delivered by any "
+                    "other channel. The authoritative digest will be injected by "
+                    "the inbox-drain hook on your first tool call this turn — make "
+                    "one. Summary of what is waiting:"
+                ),
+            }
+        ]
+        if not is_supervisor:
+            rewake_ptu_hooks = []
         settings = {
             "hooks": {
                 "SessionStart": [
                     {
                         "matcher": "startup|resume|clear|compact",
-                        "hooks": hooks + drain_hooks,
+                        "hooks": hooks + drain_hooks + register_hooks,
                     }
                 ],
                 # OPEN edges (D7):
@@ -1244,7 +1395,32 @@ class ClaudeCodeProvider(BaseProvider):
                     {
                         "matcher": "AskUserQuestion",
                         "hooks": marker_hooks,
-                    }
+                    },
+                    # F810 (#667): register on the subagent-spawn matcher
+                    # (Agent|Task — the edge that creates the team dir the socket
+                    # derivation reads), then drain + rewake on matcher .* (every
+                    # tool call) so a foreign-repo seat surfaces its callbacks on
+                    # its own turn rather than waiting for a SessionStart.
+                    # BLOCKER 4: supervisor-only; omitted entirely for workers so
+                    # the worker PostToolUse block is byte-equivalent to base.
+                    *(
+                        [
+                            {
+                                "matcher": "Agent|Task",
+                                "hooks": register_hooks,
+                            },
+                            {
+                                "matcher": ".*",
+                                "hooks": drain_hooks,
+                            },
+                            {
+                                "matcher": ".*",
+                                "hooks": rewake_ptu_hooks,
+                            },
+                        ]
+                        if is_supervisor
+                        else []
+                    ),
                 ],
                 "PostToolUseFailure": [
                     {
@@ -1254,7 +1430,17 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
                 "Stop": [
                     {
-                        "hooks": marker_hooks + ack_hooks + turn_hooks,
+                        # F810 (#667): drain THEN rewake --arm on Stop (D2), after
+                        # the existing marker/ack/turn edges. Drain surfaces any
+                        # pending digest at the turn boundary; rewake arms the
+                        # async idle-gap watcher. BLOCKER 4: the F810 drain+rewake
+                        # legs are supervisor-only; a worker's Stop stays byte-
+                        # equivalent to base (marker + ack + turn only).
+                        "hooks": (
+                            marker_hooks + ack_hooks + turn_hooks + drain_hooks + rewake_stop_hooks
+                            if is_supervisor
+                            else marker_hooks + ack_hooks + turn_hooks
+                        ),
                     }
                 ],
                 # F568 D12a release edge: the subagent's Stop (converted to
@@ -1266,6 +1452,14 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
             }
         }
+        # F810 (#667) D2 dedupe: a hook command string must appear at most once
+        # per event, so a seat that ALSO carries a repo-local .claude/settings.json
+        # (the cli-subagents root repo, until it drops its copies) cannot run the
+        # same drain/register/rewake twice. Dedupe is by exact command string
+        # within each event's flattened hook list, first occurrence wins; the
+        # per-hook fields (matcher grouping, timeout, asyncRewake) of that first
+        # occurrence are preserved.
+        _dedupe_overlay_hooks_by_command(settings["hooks"])
         # F826 (#683) D3: the Claude statusLine emitter. A new top-level
         # `statusLine` key beside `hooks`. Claude invokes the command on session
         # start/resume, new assistant message, /compact, permission/command/

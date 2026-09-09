@@ -256,13 +256,257 @@ _CLAUDE_AUTH = re.compile(r"Failed to authenticate: OAuth session expired", re.I
 
 _NET_INTERRUPTED = re.compile(r"Your connection was interrupted", re.IGNORECASE)
 
-# codex context footer (codex-context-exhausted-1). Reuse the codex footer shape:
-# "Context NN% left". The threshold guard (blueprint AC/hazard): must NOT fire on
-# a HEALTHY footer like "Context 77% left" — that is BUSY, not exhausted. Only a
-# footer at/below the CONTEXT_EXHAUSTED_THRESHOLD is a hard stop.
-CONTEXT_EXHAUSTED_THRESHOLD = 15
-_CONTEXT_FOOTER = re.compile(r"Context\s+(\d+)%\s+left", re.IGNORECASE)
+# F836 (#693): per-provider footer-percent SEMANTICS. The two providers that
+# print a context percentage in their status footer mean OPPOSITE things by the
+# number, so a single "is the number small/large?" rule mis-reads one of them:
+#
+#   * codex footer  "Context NN% left · 5h MM% left"  → NN is the context
+#     REMAINING. Exhausted only when little is LEFT: NN <= CODEX threshold.
+#   * kiro footer    "agent · model · ◑ NN%"          → NN is the context USED
+#     (a pie glyph ◔◑◕● precedes it). Exhausted only when a LOT is used:
+#     NN >= KIRO threshold. The glyph alone (◑ etc.) NEVER means exhausted — a
+#     healthy warm kiro seat sits at ◑ 30% used (the F836 false positive).
+#
+# Thresholds are the provider's REAL hard-stop point (brief F836): codex <= 10%
+# left, kiro >= 90% used. A footer between the extremes is BUSY/healthy, never a
+# condition.
+CODEX_CONTEXT_LEFT_THRESHOLD = 10  # codex: exhausted at <= 10% context LEFT
+KIRO_CONTEXT_USED_THRESHOLD = 90  # kiro:  exhausted at >= 90% context USED
+# codex footer shape "Context NN% left"; the FIRST "Context …% left" is the
+# context window (a trailing "· 5h MM% left" is the rate-limit window, not
+# context — anchoring on the "Context" keyword keeps them apart).
+_CODEX_CONTEXT_FOOTER = re.compile(r"Context\s+(\d+)%\s+left", re.IGNORECASE)
+# kiro footer shape "… · <pie glyph> NN%". Match the percent that FOLLOWS a pie
+# glyph (◔◑◕●) so a stray percentage elsewhere on the row is not read as context,
+# and so the number's provenance (a kiro context gauge) is explicit. The glyph is
+# required — a bare "NN%" is not a kiro context reading, and the glyph WITHOUT a
+# number is never exhaustion (never on a glyph alone, brief F836).
+_KIRO_CONTEXT_FOOTER = re.compile(r"[◔◑◕●]\s*(\d+)%", re.IGNORECASE)
 _KIRO_CONTEXT_TIP = re.compile(r"Running low on context\? Type /compact", re.IGNORECASE)
+
+# F836 r3 (#693): the footer percent is located by POSITION relative to the live
+# COMPOSER PROMPT, not by the content shape of a matched row. The r1/r2 matchers
+# scanned every raw row and decided "this is the footer" from a leading-glyph
+# denylist plus a same-row co-signature; that never established the row was the
+# LIVE provider status bar, so fenced / indented / bulleted quotes of a status
+# bar (which carry the same shape) still fired a false high-confidence
+# CONTEXT_EXHAUSTED (r2 gate BLOCKER). The structural invariant is instead:
+#
+#   * The live status bar sits DIRECTLY BESIDE the newest composer prompt — the
+#     row where the seat is waiting for input. Everything above the newest
+#     composer is transcript / user territory (a fenced quote, an indented paste,
+#     a Markdown bullet), and is NEVER eligible to be the footer, whatever it
+#     contains. This holds by construction: a quoted status bar is scrollback and
+#     therefore ABOVE the live composer.
+#   * The two providers place the bar on OPPOSITE sides of their composer, so the
+#     region is defined per provider (proven by the pinned corpus fixtures):
+#       - codex composer "› Ask Codex to do anything" → the status bar is redrawn
+#         one/two rows BELOW it (codex-footer-*, codex-context-exhausted-1).
+#       - kiro composer  " ask a question or describe a task ↵" → the status bar
+#         sits one/two rows ABOVE it (kiro-cli-footer-*, status_truth/kiro_cli).
+#   * The footer signature is required on the row DIRECTLY ADJACENT to the
+#     composer (the first non-blank row on the footer side), never on "any row"
+#     of the region — a footer-shaped row separated from the composer by a code
+#     fence or prose is scrollback, not the one live status bar.
+#   * A pane with NO composer marker (mid-init, alt-screen, a bare transcript
+#     paste) has no live status bar to read → footer classification does NOT
+#     fire. We never guess.
+#
+# No leading-glyph denylist and no same-row co-signature are used to decide
+# footer-ness any more: exclusion of quoted/fenced/bulleted rows is a consequence
+# of the position rule (they are above the composer), not of a content rule.
+
+# The live composer-prompt markers. These are the placeholder rows the provider
+# TUI draws where the seat waits for input; each is a stable literal in the real
+# capture corpus.
+#
+# F836 r5 (#693): a plain substring search over the raw pane is NOT proof that a
+# row is the live composer (codex EMPIRICAL-GATE-NO): a fenced/indented FULL
+# snapshot quote (composer + blank + footer) and a prose row that merely CONTAINS
+# the composer phrase both carry the phrase, and the r3/r4 position rule promoted
+# them to live chrome. The substring markers below are kept ONLY to answer "does
+# this pane mention the composer phrase at all" (cheap short-circuit); a row is
+# accepted as the LIVE composer only by the anchored WHOLE-ROW matchers
+# (_CODEX_COMPOSER_ROW / _KIRO_COMPOSER_ROW) plus the bottom-of-viewport bound.
+_CODEX_COMPOSER_PROMPT = re.compile(r"Ask Codex to do anything", re.IGNORECASE)
+_KIRO_COMPOSER_PROMPT = re.compile(r"ask a question or describe a task", re.IGNORECASE)
+
+# F836 r5 (#693): EXACT full-row composer anchors. The live composer is a WHOLE
+# row the TUI draws, not a phrase embedded in prose or quoted inside a fence. The
+# measured real-capture shapes are (after escape-strip):
+#   codex: '› Ask Codex to do anything'
+#   kiro : ' ask a question or describe a task ↵'
+#          '›  ask a question or describe a task ↵'
+#          ' Ask a question or describe a task ↵  ctrl+g: agent monitor'
+# so the anchor allows ONLY: an optional leading '›' composer glyph, at most ONE
+# leading space (a genuine composer is flush-left or glyph-led — an indented
+# PASTE uses >=2 leading spaces), the exact phrase, and optional trailing chrome
+# drawn from the DOCUMENTED grammar ONLY — the '↵' submit hint and/or a known
+# affordance token ('ctrl+g…' agent-monitor hint, '/copy…' clipboard affordance).
+# F836 r6 (#693): the trailing group was previously '(?:\s.*)?', which accepted
+# ARBITRARY prose after the phrase (codex r5 SHOULD: a Kiro footer + composer-
+# phrase prose row anchored as live). It is now constrained to the chrome grammar
+# above: a row whose trailing text is anything other than the '↵' hint or a
+# recognised affordance token is NOT the live composer. A row that begins with a
+# fence (```), quote ('>' not the '›' glyph), bullet ('•'/'-'/'*'), or >=2 spaces
+# of indent is transcript and can NEVER be the live composer, whatever it quotes.
+_CODEX_COMPOSER_ROW = re.compile(r"^\u203a Ask Codex to do anything\s*$", re.IGNORECASE)
+# Trailing chrome grammar (F836 r6): optional '↵' submit hint, then zero or more
+# whitespace-separated known affordance runs. Each affordance run must BEGIN with
+# a documented chrome token ('ctrl+g' or '/copy'); everything after that token on
+# the row is the affordance's own label ('ctrl+g: agent monitor', '/copy to
+# clipboard'). This admits the three measured real shapes and rejects a row that
+# merely appends arbitrary transcript prose after the phrase.
+_KIRO_COMPOSER_TRAILING_CHROME = r"(?:\s*\u21b5)?(?:\s+(?:ctrl\+g|/copy)\b[^\n]*)?"
+_KIRO_COMPOSER_ROW = re.compile(
+    r"^(?:\u203a\s*| ?)ask a question or describe a task" + _KIRO_COMPOSER_TRAILING_CHROME + r"$",
+    re.IGNORECASE,
+)
+# Rows that can never be the live composer even if they contain the phrase: a
+# leading fence / block-quote / bullet / list marker marks transcript territory.
+_TRANSCRIPT_ROW_LEAD = re.compile(r"^\s*(?:```|~~~|>|-|\*|\u2022|\d+[.)]|#)")
+
+# F836 r5 (#693): the live composer + footer are chrome at the BOTTOM of the
+# viewport. Measured across all 22 real fixtures with a composer+adjacent footer,
+# the composer is within the last 2 NON-BLANK rows of the pane (max 1 non-blank
+# row below it: codex draws its footer below the composer; kiro draws a trailing
+# '/copy to clipboard' affordance). K bounds how many non-blank rows may sit BELOW
+# the composer and still count as live chrome; K=2 (allow <=2 non-blank rows
+# below) is the observed max (1) plus a one-row margin. A composer occurrence with
+# more transcript below it is scrollback, whatever the row says.
+_COMPOSER_MAX_NONBLANK_BELOW = 2
+
+
+def _last_index(rows: List[str], pattern: "re.Pattern[str]") -> int:
+    """Index of the LAST row matching ``pattern``, or -1 when none match."""
+    found = -1
+    for i, row in enumerate(rows):
+        if pattern.search(row):
+            found = i
+    return found
+
+
+def _nonblank_below(rows: List[str], idx: int) -> int:
+    """Count of non-blank rows strictly BELOW ``idx`` (bottom-of-viewport bound)."""
+    return sum(1 for r in rows[idx + 1 :] if r.strip() != "")
+
+
+def _live_composer_index(rows: List[str], row_anchor: "re.Pattern[str]") -> int:
+    """Index of the LIVE composer row, or -1 when there is no live composer.
+
+    F836 r5 (#693): a row is the live composer only when it (1) matches the exact
+    WHOLE-ROW composer anchor (never a substring inside prose, never a
+    fenced/quoted/bulleted/indented row — those are rejected by the anchor's
+    leading-character bound and by ``_TRANSCRIPT_ROW_LEAD``) AND (2) sits at the
+    BOTTOM of the viewport (at most ``_COMPOSER_MAX_NONBLANK_BELOW`` non-blank
+    rows below it). We scan from the bottom up and return the FIRST (lowest) row
+    that satisfies both — a higher occurrence is transcript. Returns -1 when no
+    row qualifies, so a quoted full snapshot (whose composer is buried above real
+    chrome, or is a fenced/prose row) yields no live composer and cannot fire.
+    """
+    for i in range(len(rows) - 1, -1, -1):
+        row = rows[i]
+        # Match the anchor against the RAW row (not stripped): the leading-glyph /
+        # leading-whitespace bound in the anchor is load-bearing. A genuine
+        # composer is flush-left or '›'-glyph-led with at most one leading space;
+        # an INDENTED paste (>=2 leading spaces) of the composer phrase is
+        # transcript and must not anchor (F836 r5 indented-snapshot case).
+        if not row_anchor.match(row):
+            continue
+        # A fenced/quoted/bulleted/indented lead is transcript, never the composer
+        # — even if the remainder matches the phrase (defence in depth over the
+        # anchor's own leading-char bound).
+        if _TRANSCRIPT_ROW_LEAD.match(row):
+            continue
+        if _nonblank_below(rows, i) > _COMPOSER_MAX_NONBLANK_BELOW:
+            # A clean-anchored composer that is NOT bottom-of-viewport is anomalous
+            # (no real capture puts >1 non-blank row below the composer). Treat it
+            # as not-live rather than a hard stop.
+            continue
+        # Any non-blank row BELOW the composer that is transcript chrome (a closing
+        # ``` fence, a quote/bullet lead) means this "composer" is the inner line
+        # of a quoted FULL snapshot, not live bottom chrome. Real trailing chrome
+        # ('/copy to clipboard') is not a transcript lead, so this rejects the
+        # fenced-snapshot case without touching genuine panes.
+        if any(r.strip() != "" and _TRANSCRIPT_ROW_LEAD.match(r) for r in rows[i + 1 :]):
+            continue
+        return i
+    return -1
+
+
+def _codex_footer_percent_row(rows: List[str]) -> Optional[str]:
+    """The codex status-bar row BELOW the newest codex composer prompt, or None.
+
+    Position rule (F836 r3): the codex status bar is redrawn directly below the
+    live "› Ask Codex to do anything" composer, separated only by blank rows. The
+    live status bar is therefore the FIRST non-blank row after the last composer
+    prompt; it fires only when that adjacent row bears the codex context figure.
+    Rows at/above the composer are transcript/user territory (a quoted or fenced
+    "Context 8% left" lives there) and are never eligible; a footer-shaped row
+    that is not the row adjacent to the composer (e.g. a fenced quote separated by
+    a code fence) is not the live bar. No composer prompt → no live footer → None.
+
+    Bottom-of-viewport invariant (F836 r5, #693): the codex status bar is the
+    LAST non-blank row of the live pane — the composer sits directly above it and
+    nothing live is drawn below it. A footer-shaped row with ANY non-blank row
+    below it (e.g. a closing ``` fence, more transcript) is a quoted snapshot, not
+    the live bar, and does not fire. This is what rejects a fenced FULL snapshot
+    whose inner composer row happens to anchor cleanly (codex EMPIRICAL-GATE-NO).
+    """
+    composer = _live_composer_index(rows, _CODEX_COMPOSER_ROW)
+    if composer < 0:
+        return None
+    saw_blank = False
+    for offset, row in enumerate(rows[composer + 1 :]):
+        idx = composer + 1 + offset
+        if row.strip() == "":
+            saw_blank = True
+            continue
+        # First non-blank row below the composer: the live status bar iff a blank
+        # separator precedes it, it carries the context figure, AND it is the
+        # BOTTOM chrome row of the pane (no non-blank row below it). Otherwise
+        # there is no live footer (a flush or non-bottom footer-shaped row is
+        # transcript / a quoted snapshot).
+        if saw_blank and _CODEX_CONTEXT_FOOTER.search(row) and _nonblank_below(rows, idx) == 0:
+            return row.strip()
+        return None
+    return None
+
+
+def _kiro_footer_percent_row(rows: List[str]) -> Optional[str]:
+    """The kiro status-bar row ABOVE the newest kiro composer prompt, or None.
+
+    Position rule (F836 r3): the kiro status bar sits directly above the live
+    " ask a question or describe a task ↵" composer, separated only by blank
+    rows. The live status bar is therefore the FIRST non-blank row scanning
+    UPWARD from the last composer prompt; it fires only when that adjacent row
+    bears the pie-glyph percent. A fenced/quoted "… ● 92%" further up (separated
+    from the composer by a code fence or prose) is not the row adjacent to the
+    composer and is never eligible; rows at/below the composer are trailing chrome
+    ("/copy to clipboard"). No composer prompt → no live footer → None.
+
+    Live-bar co-signature (F836 r4, S1): the live TUI redraws bar + blank +
+    composer — every real captured kiro pane separates the status bar from the
+    composer by at least one blank row. A footer-shaped row FLUSH against the
+    composer (no blank between) is a pasted/quoted status line, not the live bar,
+    so it does not fire.
+    """
+    composer = _live_composer_index(rows, _KIRO_COMPOSER_ROW)
+    if composer < 0:
+        return None
+    saw_blank = False
+    for row in reversed(rows[:composer]):
+        if row.strip() == "":
+            saw_blank = True
+            continue
+        # First non-blank row above the composer: the live status bar iff a blank
+        # separator precedes it AND it carries the pie-glyph percent; otherwise
+        # there is no live footer (a flush footer-shaped row is transcript).
+        if saw_blank and _KIRO_CONTEXT_FOOTER.search(row):
+            return row.strip()
+        return None
+    return None
+
 
 # DIALOG_BLOCKED anchors.
 _CODEX_TRUST = re.compile(
@@ -321,6 +565,42 @@ _CLINE_PROC_EXITED = re.compile(r"\[Command exited with code \d+\]")
 # BUSY_TAIL_ROWS + the F752 quiescent downgrade handle the live-worker sticky case.
 _CLINE_SHELL_PROMPT = re.compile(r"^\s*❯")
 
+# F832 (#689): codex replays the PRIOR conversation transcript on `codex resume
+# <uuid>` (e.g. after an account swap). An OLD "You've hit your usage limit" line
+# from a since-superseded account is redrawn ABOVE the "Resuming session…" boot
+# marker, and the CAPPED classifier fires on it — a false CAPPED on a terminal
+# that is in fact logged in and working. The fix scopes the codex CAPPED scan to
+# pane text that belongs to the CURRENT incarnation: only rows AFTER the resume
+# boot marker. A cap line above that marker is replayed history and must NOT
+# match; a live cap line below it (the codex composer is always redrawn at the
+# bottom, so a genuine current cap sits below the marker) still does.
+#
+# The discriminator is the RESUME MARKER alone, NOT the composer prompt: codex
+# always redraws "› Ask Codex …" at the bottom of the pane, so in the normal
+# (non-resumed) layout a genuine current cap banner sits ABOVE the composer
+# prompt (see fixture codex-capped-2). Keying on the prompt would wrongly scope
+# out every real cap; keying on the resume marker only excludes true replay.
+_CODEX_RESUME_MARKER = re.compile(r"Resuming session", re.IGNORECASE)
+
+
+def _codex_live_rows(rows: List[str]) -> List[str]:
+    """F832 (#689): the rows belonging to the CURRENT codex incarnation.
+
+    Returns only the rows AFTER the last resume boot marker ("Resuming
+    session"). When no resume marker is present the whole buffer is returned
+    unchanged — a fresh, never-resumed pane has no replayed history to exclude.
+    Used to keep the codex CAPPED scan off a cap banner replayed from the prior
+    transcript, WITHOUT scoping out a genuine current cap in the normal layout
+    (where the cap banner sits above the always-bottom composer prompt).
+    """
+    boundary = -1
+    for i, row in enumerate(rows):
+        if _CODEX_RESUME_MARKER.search(row):
+            boundary = i
+    if boundary < 0:
+        return rows
+    return rows[boundary + 1 :]
+
 
 def _scoped_proc_exited_evidence(brows: List[str]) -> Optional[str]:
     """F775 (#632): the exit-code line ONLY when it is live evidence.
@@ -352,7 +632,15 @@ def _first_evidence(rows: List[str], pattern: "re.Pattern[str]") -> Optional[str
 
 
 def _classify_capped(provider: str, brows: List[str]) -> Optional[Condition]:
-    """CAPPED for the provider, banner-only (D2). Reset≠cap guard (§2.4)."""
+    """CAPPED for the provider, banner-only (D2). Reset≠cap guard (§2.4).
+
+    F832 (#689): for codex the caller passes banner rows already scoped to the
+    CURRENT incarnation (rows after the last resume boot marker — see
+    ``_codex_live_rows``, whose sole boundary is "Resuming session"), so a cap
+    line replayed from the prior transcript never matches. The composer prompt is
+    NOT a boundary here: codex always redraws the composer at the bottom, so a
+    genuine current cap banner sits above it in the normal (non-resumed) layout.
+    """
     cap_pat: Optional["re.Pattern[str]"] = {
         "codex": _CODEX_CAP_HARD,
         "kiro_cli": _KIRO_CAP,
@@ -415,20 +703,66 @@ def _classify_net(provider: str, brows: List[str]) -> Optional[Condition]:
     return None
 
 
-def _classify_context(provider: str, brows: List[str]) -> Optional[Condition]:
+def _classify_context(
+    provider: str, brows: List[str], raw_rows: Optional[List[str]] = None
+) -> Optional[Condition]:
+    # F836 r3 (#693): the footer status bar is located by POSITION relative to the
+    # live composer prompt, not by the content shape of a matched row (r2 gate
+    # BLOCKER: fenced/indented/bulleted quotes of a status bar carry the same
+    # shape and fired a false CONTEXT_EXHAUSTED). _codex_footer_percent_row /
+    # _kiro_footer_percent_row return the LIVE status-bar row (below the codex
+    # composer, above the kiro composer) or None when there is no composer to
+    # anchor on. Anything above the newest composer is transcript/user territory
+    # and never eligible. The scan runs on the RAW pane rows (the status bar and
+    # the composer both sit in the user-region continuation that banner_rows
+    # suppresses); the softer kiro low-context TIP still scans brows.
+    rows = raw_rows if raw_rows is not None else brows
     if provider == "codex":
-        for row in brows:
-            m = _CONTEXT_FOOTER.search(row)
-            if m and int(m.group(1)) <= CONTEXT_EXHAUSTED_THRESHOLD:
+        # codex: NN is context REMAINING → exhausted at NN <= threshold.
+        row = _codex_footer_percent_row(rows)
+        if row is not None:
+            m = _CODEX_CONTEXT_FOOTER.search(row)
+            if m and int(m.group(1)) <= CODEX_CONTEXT_LEFT_THRESHOLD:
                 return Condition(
                     ConditionKind.CONTEXT_EXHAUSTED,
                     provider,
                     "footer_percent_status",
-                    row.strip(),
-                    Confidence.HIGH,
+                    row,
+                    # F836 r6 (#693): footer_percent_status caps at MEDIUM, never
+                    # HIGH. The classifier's ONLY input is plaintext pane bytes
+                    # (base.py:348-376, fleet_app.py:577-592, condition.py:952),
+                    # so no arrangement of row anchors can be a second, live-only
+                    # signal — a pasted/truncated full snapshot that ends at the
+                    # viewport bottom preserves every structural predicate (codex
+                    # EMPIRICAL-GATE-NO r5). MEDIUM still surfaces on fleet/TUI/CLI
+                    # via ``should_deliver`` but the inbox (acting) leg is DECLINED
+                    # by ``drain_class_declines_inbox`` (delivery_ledger.py) — this
+                    # is the ADVISORY, never-hard-stop class, mirroring
+                    # ``low_context_tip``. A hard stop would need a genuinely
+                    # independent live signal (a cursor/provider-state fact through
+                    # the capture boundary), which plaintext cannot supply.
+                    Confidence.MEDIUM,
                 )
         return None
     if provider == "kiro_cli":
+        # kiro: NN is context USED (pie glyph ◔◑◕● precedes it) → exhausted at
+        # NN >= threshold. A glyph alone, or a healthy low USED% (e.g. ◑ 30%), is
+        # NOT exhaustion (F836 false positive).
+        row = _kiro_footer_percent_row(rows)
+        if row is not None:
+            m = _KIRO_CONTEXT_FOOTER.search(row)
+            if m and int(m.group(1)) >= KIRO_CONTEXT_USED_THRESHOLD:
+                return Condition(
+                    ConditionKind.CONTEXT_EXHAUSTED,
+                    provider,
+                    "footer_percent_status",
+                    row,
+                    # F836 r6 (#693): caps at MEDIUM, never HIGH — see the codex
+                    # arm above. Plaintext-only footer matches are advisory
+                    # (fleet/TUI/CLI) and DECLINE the inbox leg; never a hard stop.
+                    Confidence.MEDIUM,
+                )
+        # The welcome/low-context TIP is a softer, medium-confidence signal.
         ev = _first_evidence(brows, _KIRO_CONTEXT_TIP)
         if ev:
             return Condition(
@@ -573,11 +907,14 @@ def _classify_waiting_on_subagents(provider: str, brows: List[str]) -> Optional[
 
 
 # The per-kind classifiers, applied then ranked by §2.2 precedence.
+# NOTE: CAPPED and CONTEXT are NOT in this tuple — both are dispatched explicitly
+# in classify_condition. CAPPED so codex can scope the scan to the current
+# incarnation (F832 #689). CONTEXT so the footer-percent scan runs on the RAW
+# pane rows (F836 #693): the status footer sits BELOW the composer prompt, which
+# banner_rows suppresses as user-region continuation.
 _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] = (
-    _classify_capped,
     _classify_auth,
     _classify_net,
-    _classify_context,
     _classify_dialog,
     _classify_transient,
     _classify_busy,
@@ -634,6 +971,30 @@ def classify_condition(
                 Confidence.LOW,
             )
         )
+
+    # CAPPED (precedence 4): dispatched explicitly so codex can scope the scan to
+    # the CURRENT incarnation. F832 (#689): on a RESUMED codex terminal the prior
+    # transcript (including an old "usage limit" line) is replayed ABOVE the
+    # "Resuming session" boot marker; scanning the whole buffer fired a false
+    # CAPPED. For codex we scope the banner rows to those AFTER the last resume
+    # boot marker (_codex_live_rows); a never-resumed pane has no marker and is
+    # scanned whole. Other providers scan unchanged.
+    raw_rows = [strip_terminal_escapes(r) for r in pane.splitlines()]
+    if provider == "codex":
+        live_rows = _codex_live_rows(raw_rows)
+        capped_brows = banner_rows("\n".join(live_rows))
+    else:
+        capped_brows = brows
+    capped = _classify_capped(provider, capped_brows)
+    if capped is not None:
+        candidates.append(capped)
+
+    # CONTEXT (precedence 5): F836 (#693) — the footer-percent scan runs on the
+    # RAW pane rows (the status footer sits below the composer prompt, which
+    # banner_rows suppresses); the kiro low-context TIP still scans brows.
+    context = _classify_context(provider, brows, raw_rows)
+    if context is not None:
+        candidates.append(context)
 
     for classifier in _KIND_CLASSIFIERS:
         cond = classifier(provider, brows)
@@ -864,8 +1225,10 @@ class ConditionDelivery:
         condition?
 
         Declined when EITHER the drain-class predicate matches (BUSY, a
-        command_exit PROC_EXITED, or a CONTEXT_EXHAUSTED ``low_context_tip`` — the
-        SAME class the supervisor-inbox-drain hook withholds, F718 #574 / F807)
+        command_exit PROC_EXITED, a CONTEXT_EXHAUSTED ``low_context_tip``, or a
+        CONTEXT_EXHAUSTED ``footer_percent_status`` — the plaintext-only footer
+        reading that F836 r6 (#693) made ADVISORY, never a hard stop — the SAME
+        class the supervisor-inbox-drain hook withholds, F718 #574 / F807 / F836)
         OR the F642 routing map (``KIND_SURFACES``) has no inbox surface for the
         kind. The second arm preserves base behaviour for the map's other
         inbox=False kinds (NET_INTERRUPTED / TRANSIENT_OVERLOAD): F790 must only

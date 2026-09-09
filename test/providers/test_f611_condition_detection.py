@@ -383,8 +383,14 @@ def test_context_threshold_healthy_footer_is_not_exhausted() -> None:
     cond = classify_condition(_load("codex-context-exhausted-1"), "codex")
     # 77% left is healthy — the pane's working-marker wins (BUSY), not CONTEXT.
     assert cond is not None and cond.kind is not ConditionKind.CONTEXT_EXHAUSTED
-    # A genuinely-low footer alone (no busy marker) IS exhausted.
-    low = classify_condition("  ~/x · gpt-5.6 high · Context 8% left · 5h 0% left", "codex")
+    # A genuinely-low LIVE footer (below the composer, no busy marker) IS
+    # exhausted. F836 r3: the footer is anchored to the live composer prompt, so
+    # the low-footer pane must carry a composer for the status bar to be read as
+    # live — a bare footer-shaped row with no composer is scrollback and quiet.
+    low = classify_condition(
+        "› Ask Codex to do anything\n\n  ~/x · gpt-5.6 high · Context 8% left · 5h 0% left\n",
+        "codex",
+    )
     assert low is not None and low.kind is ConditionKind.CONTEXT_EXHAUSTED
 
 

@@ -404,7 +404,9 @@ def test_claude_launch_preserves_injected_config_home(
     from cli_agent_orchestrator.providers import claude_code
 
     provider = claude_code.ClaudeCodeProvider("tid", "session", "window", "missing")
-    monkeypatch.setattr(provider, "_write_terminal_settings", lambda: Path("/tmp/settings"))
+    monkeypatch.setattr(
+        provider, "_write_terminal_settings", lambda *_a, **_k: Path("/tmp/settings")
+    )
     command = provider._build_claude_command()
     assert "CLAUDE_CONFIG_DIR'" in command
 
@@ -441,7 +443,9 @@ def test_claude_command_wrap_keeps_unset_outside_and_uses_frozen_argv(
     )
     provider_plane.preflight_claude_native_home(plane)
     provider = claude_code.ClaudeCodeProvider("tid", "session", "window", "missing")
-    monkeypatch.setattr(provider, "_write_terminal_settings", lambda: Path("/tmp/settings"))
+    monkeypatch.setattr(
+        provider, "_write_terminal_settings", lambda *_a, **_k: Path("/tmp/settings")
+    )
     command = provider._build_claude_command()
     unset, wrapped = command.split("; ", 1)
     assert unset.startswith("unset $(env")

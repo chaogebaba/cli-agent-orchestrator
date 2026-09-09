@@ -1,0 +1,10 @@
+  Parked idle, standing by.
+
+▸ Credits: 6.46 • Time: 1m 2s
+
+───────────────────────────────────────────────────────────────────────────────
+ Trust All Tools active, confirmations are off · /quit to exit
+───────────────────────────────────────────────────────────────────────────────
+kiro_cli_dev · Auto · ◑ 30%                          /data/cao-scratch/worktrees/cli-subagents/6f29c67d · (cao/6f29c67d)
+
+›  ask a question or describe a task ↵

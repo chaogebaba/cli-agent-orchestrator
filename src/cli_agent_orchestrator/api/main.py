@@ -2105,10 +2105,21 @@ async def lifespan(app: FastAPI):
         pass
 
     await terminal_service.shutdown_deferred_tasks()
-    # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
-    # threading.Thread (not asyncio), so join it directly rather than via
-    # asyncio.gather with the tasks above.
-    fifo_manager.stop_watchdog()
+    # Deterministically tear down every FIFO reader AND the pipe-pane liveness
+    # watchdog thread (issue #388 for the watchdog, issue #624 F767 for the
+    # readers). stop_all_readers() subsumes the old watchdog-only stop: it stops
+    # every tracked reader on the bounded stop_reader path first, then the
+    # watchdog. Without this, orderly shutdown left the reader threads spinning
+    # in select()/os.read() while the interpreter tore their module globals
+    # down, printing "Exception ignored in thread" tracebacks to stderr. These
+    # are plain threading.Threads (not asyncio), so this joins them directly
+    # rather than via asyncio.gather with the tasks above.
+    leaked_readers = fifo_manager.stop_all_readers()
+    if leaked_readers:
+        logger.warning(
+            "FIFO reader thread(s) did not exit during shutdown: %s",
+            ", ".join(leaked_readers),
+        )
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:
@@ -5564,6 +5575,50 @@ async def supervisor_drain_ack_endpoint(
     _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-ACK-CALLER")
     logger.debug("d22 supervisor drain-ack terminal=%s", terminal_id)
     return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
+
+
+@app.post("/terminals/{terminal_id}/native-unpublished")
+async def native_unpublished_endpoint(
+    terminal_id: TerminalId,
+    body: InboxDrainRequest,
+    request: Request,
+    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F810 #667 BLOCKER 6: the register hook's journal-visible unpublished edge.
+
+    D1 requires a throttled, journal-visible WARN emitted VIA THE SERVER when the
+    register hook can derive no team (the seat is not natively reachable right
+    now). Hook stderr alone is not the fleet/server trace path D1 asks for, so
+    the register hook best-effort POSTs here after its own per-terminal 10-minute
+    throttle; this edge appends one ``f810.native_unpublished`` row to the shared
+    ``inbox_message_trace_event`` journal (``message_id=0`` — a non-per-message
+    condition, the same sentinel ``f219.session_notice`` uses). Best-effort and
+    idempotent-enough: the hook throttles, so at most one row lands per window.
+    404 on an unknown terminal; the caller is bound to the route terminal exactly
+    like the drain edges (F707).
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_native_unpublished: terminal_id does not match route",
+        )
+    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-NATIVE-UNPUB-CALLER")
+    try:
+        from cli_agent_orchestrator.clients.database import record_message_trace_event
+
+        await asyncio.to_thread(
+            record_message_trace_event,
+            0,
+            "f810.native_unpublished",
+            phase="register",
+            reason="socket_unpublished",
+            payload={"terminal_id": terminal_id, "detail": body.ts or ""},
+        )
+    except Exception:
+        logger.debug("f810 native-unpublished trace best-effort failed", exc_info=True)
+    return {"success": True, "terminal_id": terminal_id, "op": "native-unpublished"}
 
 
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")

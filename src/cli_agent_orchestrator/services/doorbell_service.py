@@ -296,6 +296,20 @@ def ring_supervisor_doorbell(
         transport_ejection_service.record_refusal(
             terminal_id, "fallback", "not_registered_fallback"
         )
+        # F810 (#667) D3: when native refused with `socket_unpublished` AND the
+        # fallback rung is not registered, the seat is unreachable on BOTH rings
+        # — the exact silent-ejection combination the evidence pack shows (182
+        # deferred attempts, no operator signal). Surface ONE typed
+        # `native_unreachable` fleet condition per ejection episode (idempotent
+        # inside the service), rather than deferring silently. Best-effort: an
+        # emit failure never changes the delivery decision below.
+        if native_refusal == "socket_unpublished":
+            try:
+                transport_ejection_service.emit_native_unreachable(
+                    terminal_id, "fallback"
+                )
+            except Exception:
+                pass
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled "
             "reason=not_registered_fallback row=%s",
