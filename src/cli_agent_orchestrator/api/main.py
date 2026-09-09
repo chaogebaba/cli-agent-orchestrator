@@ -54,6 +54,7 @@ from starlette.responses import Response
 
 from cli_agent_orchestrator import bootstrap
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
+from cli_agent_orchestrator.api.routes_desk import router as desk_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -2165,6 +2166,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(fork_router)
+app.include_router(desk_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and

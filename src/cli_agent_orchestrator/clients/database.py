@@ -566,6 +566,162 @@ class CapabilityEvidenceModel(Base):
     )
 
 
+class DeskBindingModel(Base):
+    """F875 D2/B3/B6: the standing secretary desk binding for one supervisor
+    conversation.
+
+    Keyed by ``conversation_id`` which IS ``conversation_identity.identity_key``
+    (fork) and ``incarnation`` which IS its ``generation`` — the binding
+    reinvents NO identity or lease machinery, so compaction/restart/resume are
+    the root's problem, not a second scheme's (B3). One live binding per
+    ``conversation_id`` is enforced by the primary key: the reconciler upserts
+    the single row and fences concurrent writers on ``reconcile_generation``
+    (AC-4). ``state`` ∈ STARTING|READY|BUSY|DEGRADED|STOPPED; a DEGRADED row
+    carries a typed ``degraded_cause`` (D6/AC-12). Shadow-mode (R1a): rows are
+    written by the reconciler but nothing is wired into the live seat create
+    path or the hooks yet.
+    """
+
+    __tablename__ = "desk_bindings"
+
+    # conversation_id IS conversation_identity.identity_key (B3). One binding per
+    # conversation → the identity_key is the primary key, so a second live
+    # designated desk for the same conversation is impossible by construction.
+    conversation_id = Column(String, primary_key=True)
+    # incarnation IS conversation_identity.generation at bind time (B3). Stored
+    # as text to match the DeskQuery record's incarnation field and the memo.
+    incarnation = Column(String, nullable=False)
+    # Canonical position; terminal labels are presentation, never identity (D6).
+    position = Column(String, nullable=False, default="secretary", server_default="secretary")
+    # The resolved pi_cli cell, certified at assignment through the ordinary
+    # certified boundary (D6). NULL only transiently before first reconcile.
+    provider_binding = Column(String, nullable=True)
+    # A reference to the desk terminal, not its identity (D6).
+    terminal_ref = Column(String, nullable=True)
+    state = Column(String, nullable=False, default="STARTING", server_default="STARTING")
+    # capped|cert_failed|fleet_full|server_down|init_timeout (D6). NULL unless
+    # state == DEGRADED.
+    degraded_cause = Column(String, nullable=True)
+    # When the current state was last established (D2).
+    observed_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    # When the seat/binding was first created — the anchor for the 90s bound (D2/AC-5).
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    # Provider retry-after, else a five-minute backoff (D6/AC-13). NULL when no
+    # replacement is pending.
+    retry_deadline = Column(DateTime(timezone=True), nullable=True)
+    # A cited answer, not a ping or a READY (D2).
+    last_useful_completion = Column(DateTime(timezone=True), nullable=True)
+    # Bounded at 4; beyond it desk() refuses inline with BUSY_QUEUE_FULL (D1/B4/AC-19).
+    queue_depth = Column(Integer, nullable=False, default=0, server_default="0")
+    # How many automatic replacement attempts have run in the CURRENT failure
+    # episode. Reset to 0 on the next READY. One automatic attempt per episode,
+    # then retry-after/backoff (D6/AC-13).
+    replacement_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    # Generation-fenced reconciliation lease (AC-4). A reconciler CASes this to
+    # take ownership of a reconcile pass; a stale holder cannot overwrite a row
+    # a newer reconcile advanced.
+    reconcile_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('STARTING','READY','BUSY','DEGRADED','STOPPED')",
+            name="ck_desk_binding_state",
+        ),
+        CheckConstraint(
+            "degraded_cause IS NULL OR degraded_cause IN "
+            "('capped','cert_failed','fleet_full','server_down','init_timeout')",
+            name="ck_desk_binding_degraded_cause",
+        ),
+        Index("ix_desk_bindings_state", "state"),
+    )
+
+
+class DeskQueryModel(Base):
+    """F875 D1/B4: one durable record per admitted lookup; the handle IS the
+    record's identity.
+
+    A replayed ``request_id`` retrieves this record and dispatches NO second job
+    (AC-2). The 20s ``wait_deadline`` is the inline wait; the 120s
+    ``job_deadline`` turns an unfinished job into a typed failure — never an open
+    pending state (AC-2). The answer is at most 8 lines and 2048 UTF-8 bytes
+    including citations; an over-budget answer becomes a compact status plus an
+    ``artifact_ref`` (AC-1). The completion is addressed to THIS record, so an
+    inline return and an inbox callback cannot both carry one answer (AC-3).
+    """
+
+    __tablename__ = "desk_queries"
+
+    # Server-generated; survives retry through the handle (D1).
+    request_id = Column(String, primary_key=True)
+    conversation_id = Column(String, nullable=False, index=True)
+    incarnation = Column(String, nullable=False)
+    # May name the decision itself; no redundant field (D1).
+    question = Column(Text, nullable=False)
+    scope = Column(String, nullable=True)
+    state = Column(String, nullable=False, default="ADMITTED", server_default="ADMITTED")
+    admitted_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    wait_deadline = Column(DateTime(timezone=True), nullable=False)  # admitted_at + 20s
+    job_deadline = Column(DateTime(timezone=True), nullable=False)  # admitted_at + 120s
+    # A JSON list of <= 8 lines and <= 2048 UTF-8 bytes, citations included.
+    answer_lines = Column(JSON, nullable=True)
+    # Where full evidence stays when the answer is over budget (D1/AC-1).
+    artifact_ref = Column(String, nullable=True)
+    # Includes NOT_FOUND as a completed retrieval with its own outcome (D5/AC-10).
+    outcome = Column(String, nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('ADMITTED','RUNNING','COMPLETED','FAILED','EXPIRED')",
+            name="ck_desk_query_state",
+        ),
+        Index("ix_desk_queries_conversation", "conversation_id", "state"),
+    )
+
+
+class DeskEventModel(Base):
+    """F875 D5: append-only, deduplicated lifecycle/query/tool events; the
+    DeskUsage projection is computed over these rows.
+
+    Totals are keyed by conversation, incarnation and request-or-tool-call id,
+    so a retry, a spawn, a send_message or a compaction cannot inflate them
+    (D5/AC-10). The uniqueness key ``(conversation_id, kind, dedup_key)`` is what
+    makes the projection deduplicated by construction: re-recording the same
+    event is a no-op. Never mutated after insert.
+    """
+
+    __tablename__ = "desk_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(String, nullable=False, index=True)
+    incarnation = Column(String, nullable=False)
+    # e.g. query_admitted | query_completed | query_failed | cited_answer |
+    # native_local_discovery | exempt_read | unclassified_retrieval |
+    # opaque_bash | explicit_override | edit_intent_without_edit |
+    # notice_emitted | state_enter | telemetry_gap.
+    kind = Column(String, nullable=False)
+    # The dedup identity for this event: a request_id, a tool-call id, or a
+    # synthesized key. Two rows with the same (conversation_id, kind, dedup_key)
+    # are the same event.
+    dedup_key = Column(String, nullable=False)
+    # Small JSON blob: reason strings, byte counts, state names, latency ms, etc.
+    payload = Column(JSON, nullable=True)
+    observed_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id", "kind", "dedup_key", name="uq_desk_event_dedup"
+        ),
+        Index("ix_desk_events_conversation_kind", "conversation_id", "kind"),
+    )
+
+
 class WarmIntentModel(Base):
     __tablename__ = "warm_intents"
     intent_id = Column(String, primary_key=True)
@@ -2068,6 +2224,12 @@ def init_db() -> None:
     # mailbox where evidence is unique; idempotent and provenance-audited. Runs
     # AFTER conversation_identity exists; appended LAST.
     _migrate_f829_a2_owner_backfill()
+    # F875 secretary desk service. Three brand-new tables (desk_bindings,
+    # desk_queries, desk_events), no rebuild of anything above — additive and
+    # disjoint from every table above, so registry order is immaterial; appended
+    # LAST. conversation_id references conversation_identity.identity_key (B3) by
+    # value, not a hard FK, so it stays additive.
+    _migrate_f875_desk_service()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -3447,6 +3609,110 @@ def _migrate_f829_capability_evidence() -> None:
             )
     except Exception:
         logger.debug("f829 capability_evidence migration skipped", exc_info=True)
+
+
+def _migrate_f875_desk_service() -> None:
+    """F875: create the three additive desk tables on existing DBs.
+
+    ``Base.metadata.create_all`` handles fresh DBs; this idempotent migrator
+    adds the tables to an existing DB with ``CREATE TABLE IF NOT EXISTS``. The
+    tables are additive and disjoint from every table above — no rebuild, no
+    shared columns — so this is safe to append LAST and to run repeatedly.
+    ``conversation_id`` references ``conversation_identity.identity_key`` by
+    value (B3), not a hard FK, keeping the migration purely additive.
+    """
+    with engine.begin() as connection:
+        tables = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table'")
+        ).fetchall()
+        existing_tables = {r[0] for r in tables}
+
+        if "desk_bindings" not in existing_tables:
+            connection.execute(
+                text(
+                    """
+                CREATE TABLE desk_bindings (
+                    conversation_id TEXT PRIMARY KEY,
+                    incarnation TEXT NOT NULL,
+                    position TEXT NOT NULL DEFAULT 'secretary',
+                    provider_binding TEXT,
+                    terminal_ref TEXT,
+                    state TEXT NOT NULL DEFAULT 'STARTING'
+                        CHECK(state IN ('STARTING','READY','BUSY','DEGRADED','STOPPED')),
+                    degraded_cause TEXT
+                        CHECK(degraded_cause IS NULL OR degraded_cause IN
+                            ('capped','cert_failed','fleet_full','server_down','init_timeout')),
+                    observed_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    retry_deadline TIMESTAMP,
+                    last_useful_completion TIMESTAMP,
+                    queue_depth INTEGER NOT NULL DEFAULT 0,
+                    replacement_attempts INTEGER NOT NULL DEFAULT 0,
+                    reconcile_generation INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+                )
+            )
+            connection.execute(
+                text("CREATE INDEX ix_desk_bindings_state ON desk_bindings (state)")
+            )
+
+        if "desk_queries" not in existing_tables:
+            connection.execute(
+                text(
+                    """
+                CREATE TABLE desk_queries (
+                    request_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    incarnation TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    scope TEXT,
+                    state TEXT NOT NULL DEFAULT 'ADMITTED'
+                        CHECK(state IN ('ADMITTED','RUNNING','COMPLETED','FAILED','EXPIRED')),
+                    admitted_at TIMESTAMP NOT NULL,
+                    wait_deadline TIMESTAMP NOT NULL,
+                    job_deadline TIMESTAMP NOT NULL,
+                    answer_lines JSON,
+                    artifact_ref TEXT,
+                    outcome TEXT,
+                    completed_at TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_desk_queries_conversation "
+                    "ON desk_queries (conversation_id, state)"
+                )
+            )
+
+        if "desk_events" not in existing_tables:
+            connection.execute(
+                text(
+                    """
+                CREATE TABLE desk_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    incarnation TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    dedup_key TEXT NOT NULL,
+                    payload JSON,
+                    observed_at TIMESTAMP NOT NULL,
+                    CONSTRAINT uq_desk_event_dedup
+                        UNIQUE (conversation_id, kind, dedup_key)
+                )
+                """
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_desk_events_conversation_kind "
+                    "ON desk_events (conversation_id, kind)"
+                )
+            )
 
 
 def _migrate_f829_a2_owner_backfill() -> None:

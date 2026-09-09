@@ -2117,6 +2117,84 @@ _model_field_desc = (
 )
 
 
+@mcp.tool(
+    description=(
+        "F875 read-only secretary desk: admit a cited lookup against this "
+        "conversation's standing desk and wait briefly for the answer. Passing a "
+        "prior request_id replays that handle and dispatches no second job. "
+        "Shadow-mode (R1a): not yet wired into the live seat; requires an explicit "
+        "conversation_id."
+    )
+)
+async def desk(
+    conversation_id: str = Field(description="The supervisor conversation identity_key"),
+    question: str = Field(default="", description="Read-only lookup; may name the decision itself"),
+    decision: Optional[str] = Field(default=None, description="Optional decision the lookup names"),
+    scope: Optional[str] = Field(default=None, description="Optional retrieval scope"),
+    request_id: Optional[str] = Field(
+        default=None, description="A prior handle to replay; dispatches no second job"
+    ),
+) -> Dict[str, Any]:
+    try:
+        payload: Dict[str, Any] = {"conversation_id": conversation_id, "question": question}
+        if decision is not None:
+            payload["decision"] = decision
+        if scope is not None:
+            payload["scope"] = scope
+        if request_id is not None:
+            payload["request_id"] = request_id
+        response = cao_http.post("/desk", json=payload, timeout=_mcp_timeout())
+        response.raise_for_status()
+        return {"success": True, **response.json()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@mcp.tool(
+    description=(
+        "F875 desk_status: the DeskUsage projection plus the current binding "
+        "state, its typed degraded cause and recovery deadline."
+    )
+)
+async def desk_status(
+    conversation_id: str = Field(description="The supervisor conversation identity_key"),
+) -> Dict[str, Any]:
+    try:
+        response = cao_http.get(f"/desk/status/{conversation_id}", timeout=_mcp_timeout())
+        response.raise_for_status()
+        return {"success": True, **response.json()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@mcp.tool(
+    description=(
+        "F875 desk_notice_slot: request one server-owned unsolicited-notice slot "
+        "for a conversation (four total, keyed by identity_key alone). Emit "
+        "nothing on a refused or unavailable grant."
+    )
+)
+async def desk_notice_slot(
+    conversation_id: str = Field(description="identity_key; the counter is keyed by this alone"),
+    slot_kind: str = Field(default="operational", description="operational | summary"),
+    incarnation: str = Field(default="*", description="Advisory only; never part of the key"),
+) -> Dict[str, Any]:
+    try:
+        response = cao_http.post(
+            "/desk/notice-slot",
+            json={
+                "conversation_id": conversation_id,
+                "slot_kind": slot_kind,
+                "incarnation": incarnation,
+            },
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {"success": True, **response.json()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 @mcp.tool()
 async def handoff(
     agent_profile: str = Field(
