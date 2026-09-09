@@ -1,0 +1,8 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "live-capture",
+  "capture": "copied byte-identical from /data/cao-scratch/gate-700-703-r3/capture3/frames/q_001.txt (sha256 f6078d1670212afda5d92e61d9ea784145183f4a97fa95c544021e9e947f14e5), a genuine pi 0.85.1 TUI frame captured by starting a turn against a local stalled endpoint (zero LLM calls) and typing the next message while it ran, so the composer holds hidden lines and CustomEditor.renderTopBorder takes its overflow branch (pi-coding-agent/dist/modes/interactive/components/custom-editor.js:37-40).",
+  "geometry": "composer width 100; the working row '── \u280b Working \u2500\u2500\u2500 \u2191 15 more \u2500\u2500\u2500' spans the full composer width (100 == the widest composer rule), so the overflow '\u2191 N more' label is drawn INSIDE the trailing rule run with the total width invariant.",
+  "notes": "Opus r4 EMPIRICAL-GATE-NO Blocker 2: the r4 derived working-overflow-queued row was 24 columns short of the pane (a row pi cannot draw). Replaced with this genuine live capture. Must classify PROCESSING raw + ANSI-stripped, and its working row must equal its composer width (test_pi_working_fixture_rows_are_composer_width)."
+}

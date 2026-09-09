@@ -1,0 +1,104 @@
+[48;2;40;50;40m [1m[38;2;212;212;212m$ grep -Ev '^(\*\*)?Report-SHA256(:\*\*|:)[[:space:]]' /data/cao-scratch/briefs/ledger-f810-r5.md | sha256sum | cut -d' ' -f1[0m[48;2;40;50;40m
+
+ [38;2;128;128;128m09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[39m
+
+ [38;2;128;128;128mTook 0.0s[39m
+
+
+
+ [1m[38;2;212;212;212medit[0m[48;2;40;50;40m [38;2;138;190;183m/data/cao-scratch/briefs/ledger-f810-r5.md[39m
+
+ [38;2;128;128;128m     ...[39m
+ [38;2;128;128;128m 554    laptop scratch `/data/cao-scratch/worker-scratch/f810-r5/` retains only run artifacts[39m
+ [38;2;128;128;128m 555    (cc.diff, diff-p1/p2.diff, witness_f.py, verbatim/, head.py/p1.py/p2.py extracts).[39m
+ [38;2;128;128;128m 556 10. Laptop `lint-imports` was not on PATH; run via `uvx --from import-linter lint-imports`[39m
+ [38;2;128;128;128m 557     (2.15) in detached worktrees of each arm, removed and pruned afterwards.[39m
+ [38;2;204;102;102m-558 Report-SHA256: [7mPENDING[0m[48;2;40;50;40m
+ [38;2;181;189;104m+558 Report-SHA256: [7m09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[0m[48;2;40;50;40m
+
+
+
+ [1m[38;2;212;212;212m$ bash /home/chao/VScode_projects/cli-subagents/scripts/report-attest.sh --check /data/cao-scratch/briefs/ledger-f810-r5.md; echo CHECK_RC=$?; tail -1
+[0m[48;2;40;50;40m [1m[38;2;212;212;212m/data/cao-scratch/briefs/ledger-f810-r5.md; head -1 /data/cao-scratch/briefs/ledger-f810-r5.md[0m[48;2;40;50;40m
+
+ [38;2;128;128;128mCRD=09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113 SELF=09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[39m
+ [38;2;128;128;128mCHECK_RC=0[39m
+ [38;2;128;128;128mReport-SHA256: 09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[39m
+ [38;2;128;128;128m# F810 #667 — stage A evidence ledger, ROUND 5 merge-resolution delta (empirical_reviewer_lite)[39m
+
+ [38;2;128;128;128mTook 0.0s[39m
+
+
+[49m [3m[38;2;128;128;128mThinking...[0m
+
+ Attestation verified. Sending the callback:
+
+[1m[38;2;212;212;212mmcp call send_message @ cao-mcp-server[0m
+[38;2;128;128;128m{
+  "receiver_id": "d1203cc7",
+  "text": "LEDGER READY\nledger-f810-r5.md\nReport-SHA256: 09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113"
+}[39m
+[38;2;128;128;128mMCP cao-mcp-server/send_message[39m
+[38;2;128;128;128mError: 2 validation errors for call[send_message][39m
+[38;2;128;128;128mmessage[39m
+[38;2;128;128;128m  Missing required argument [type=missing_argument, input_value={'receiver_id': 'd1203cc7...7bed78e97af95c84827113'}, input_type=dict][39m
+[38;2;128;128;128m    For further information visit https://errors.pydantic.dev/2.13/v/missing_argument[39m
+[38;2;128;128;128mtext[39m
+[38;2;128;128;128m  Unexpected keyword argument [type=unexpected_keyword_argument, input_value='LEDGER READY\nledger-f81...27bed78e97af95c84827113', input_type=str][39m
+[38;2;128;128;128m    For further information visit https://errors.pydantic.dev/2.13/v/unexpected_keyword_argument[39m
+
+[38;2;128;128;128mExpected parameters:[39m
+[38;2;128;128;128m  message (string) *required* - Message content to send[39m
+[38;2;128;128;128m  receiver_id - Target terminal ID. Omit to reply to the terminal that created this one via handoff/assign (the recorded caller). [default: null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - string[39m
+[38;2;128;128;128m      - null[39m
+[38;2;128;128;128m  refresh_ingest (boolean) - Allow an explicit refresh-ingest dispatch to a ready base terminal [default: false][39m
+[38;2;128;128;128m  barrier - Callback barrier label [default: null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - string[39m
+[38;2;128;128;128m      - null[39m
+[38;2;128;128;128m  barrier_timeout_seconds - Timeout honored when creating the barrier [default: null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - integer[39m
+[38;2;128;128;128m      - null[39m
+[38;2;128;128;128m  barrier_member_key - Stable member key for duplicate profiles or re-arm [default: null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - string[39m
+[38;2;128;128;128m      - null[39m
+[38;2;128;128;128m  park_warm (boolean) - Deliver without arming a receiver callback watchdog episode [default: false][39m
+[38;2;128;128;128m  expire_after_s - F578 D23: opt-in. Seconds after enqueue after which an UNDELIVERED row transitions to `expired` (audit-visible, never delivered). Omit for today's behaviour. [default:
+null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - integer[39m
+[38;2;128;128;128m      - null[39m
+[38;2;128;128;128m  supersede_key - F578 D23: opt-in. Enqueuing a row with this key marks earlier UNDELIVERED rows to the same receiver+key `superseded` (only the latest delivers). Omit for today's behaviour.
+[default: null][39m
+[38;2;128;128;128m    anyOf:[39m
+[38;2;128;128;128m      - string[39m
+[38;2;128;128;128m      - null[39m
+
+[38;2;212;212;212mmcp call send_message @ cao-mcp-server[39m [38;2;128;128;128m{ "message": "LEDGER READY\nledger-f810-r5.md\nReport-SHA256: 09f[39m… → [38;2;128;128;128m{"success":true,"message_id":5291,"sender_id":"0afb9acc","rec[39m…[38;2;128;128;128m … (Ctrl+O to expand)
+
+[39m Callback sent (message 5291). Done.
+
+ [1mLedger:[0m [38;2;138;190;183m/data/cao-scratch/briefs/ledger-f810-r5.md[39m — [38;2;138;190;183mReport-SHA256: 09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[39m (attest --check rc=0)
+
+ Key recorded findings (recorded, not judged — codex adjudicates):
+ [38;2;138;190;183m- [1m[39mWitnesses A/B:[0m [38;2;138;190;183mgit show --cc[39m touches only [38;2;138;190;183mproviders/claude_code.py[39m; exactly 12 head lines are in neither parent — all the profile-threading merge fix. Builder account matches the diff.
+ [38;2;138;190;183m- [1m[39mDry-merge[0m of b7711f96 onto origin/main b1e4d48c: [1mconflict-free[0m ([38;2;138;190;183m--no-commit --no-ff[39m, then aborted).
+ [38;2;138;190;183m- [1m[39mWitness C (targeted):[0m identical 2 failures on both arms; ONLY-IN-HEAD = ∅; the two F810 test files don't exist on base (branch-only); only 2 of the claimed "3 known base failures" were
+   observed.
+ [38;2;138;190;183m- [1m[39mWitness D (full suite, 2 independent same-box passes):[0m ONLY-IN-HEAD is [1mnot empty[0m — 2 deterministic merge-induced [38;2;138;190;183mTypeError[39ms ([38;2;138;190;183mtest_g7b_sandbox.py[39m monkeypatches [38;2;138;190;183m_write_terminal_settings[39m
+   with a 0-arg lambda; merged file calls it with [38;2;138;190;183mprofile[39m, claude_code.py:899), 3/3 reproducible, passing on base; all other only-in deltas shown flaky by 3× isolated reruns.
+ [38;2;138;190;183m- [1m[39mWitness F:[0m settings JSON carries both the deduped hooks map (spy-injected duplicate collapsed to 1) and statusLine; block lines 1431 / 1432–1462.
+ [38;2;138;190;183m- [1m[39mWitness G (B4 on merged tree):[0m [38;2;138;190;183m[2,0][39m, one summary, id 42 — confirmed; r3 negative control [38;2;138;190;183m[2,2][39m reproduces; parent→overlay cursor direction confirmed.
+ [38;2;138;190;183m- [1m[39mStatic:[0m mypy --strict 1343/1343, kind-level identical (head checks +2 files); lint-imports 5 kept / 0 broken both arms; black/isort clean. One OWN mutant (revert profile threading) killed
+   by [38;2;138;190;183mtest_initialize_with_agent_profile[39m.
+
+[38;2;178;148;187m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[7m[39m [0m
+[38;2;178;148;187m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;2;102;102;102m/data/cao-scratch/worktrees/cli-agent-orchestrator/0afb9acc (cao/0afb9acc)[39m
+[38;2;102;102;102m↑469k ↓44k R6.6M CH99.8% $0.145 10.8%/1.0M (auto)                                                                                                               cline-pass/glm-5.3-flash • high
+[38;2;138;190;183m🔌 MCP: 1 server enabled[39m
