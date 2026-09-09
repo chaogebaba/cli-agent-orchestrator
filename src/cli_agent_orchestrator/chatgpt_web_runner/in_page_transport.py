@@ -324,7 +324,32 @@ class Transport:
             )
             if readiness_reached(signals):
                 logger.debug("chatgpt_web attachment ready: %s", sorted(signals))
-                return identity
+                # D8/AC-9: capture a STABLE composer-side attachment reference for
+                # the identity tuple. Prefer a chip test id / dom id; fall back to
+                # the chip's own trimmed text. Non-empty is required (r2 gate B3).
+                import dataclasses as _dc
+
+                ref = await self.page.evaluate(
+                    "(stem) => {\n"
+                    "  const chips = [...document.querySelectorAll("
+                    "\"[data-testid*='attachment' i], [class*='attachment' i]\")]"
+                    ".filter(e => (e.textContent||'').includes(stem));\n"
+                    "  const el = chips[chips.length-1];\n"
+                    "  if (!el) return '';\n"
+                    "  return el.getAttribute('data-testid') || el.id || "
+                    "(el.textContent||'').trim().slice(0,80);\n"
+                    "}",
+                    filename.rsplit(".", 1)[0],
+                )
+                ref_str = str(ref or "").strip()
+                if not ref_str:
+                    # No stable composer reference observed -> fail closed (AC-9).
+                    raise RunnerError(
+                        RunnerErrorCode.ATTACHMENT_IDENTITY,
+                        "no composer-side attachment reference observed on the chip",
+                        delivery_state=DeliveryState.NOTHING_SENT,
+                    )
+                return _dc.replace(identity, composer_attachment_ref=ref_str)
             await self.page.wait_for_timeout(700)
         raise RunnerError(
             RunnerErrorCode.UPLOAD_UNCONFIRMED,

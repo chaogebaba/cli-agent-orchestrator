@@ -63,6 +63,9 @@ def run_review(
     verify_pin_before_publish: PinCheck,
     browser_turn: BrowserTurn,
     publish: PublishSink,
+    attachment_identity: "dict[str, Any] | None" = None,
+    validate_schema: bool = True,
+    manifest_text: "str | None" = None,
     now: Callable[[], float] = time.monotonic,
 ) -> RunnerOutcome:
     """Execute one review run under the D2 anchor sequence.
@@ -114,6 +117,8 @@ def run_review(
             model_slug=answer.model_slug,
             thinking_effort=answer.thinking_effort,
             run_id=request.run_id,
+            validate_schema=validate_schema,
+            manifest_text=manifest_text,
         )
     except RunnerError as exc:
         # A gate token in the answer (AC-4) or an empty body: no accepted report.
@@ -154,6 +159,7 @@ def run_review(
         answer=answer.text,
         report_path=report_path,
         report_body_sha256=report.body_sha256,
+        attachment_identity=attachment_identity,
     )
 
 

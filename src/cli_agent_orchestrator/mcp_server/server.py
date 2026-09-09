@@ -2785,17 +2785,21 @@ def _assign_impl(
         if _resume_prepared:
             _f862_provider = _resume_prepared.get("provider")
             _f862_position = _f862_strip_provider_suffix(agent_profile)
-        elif _resolved_provider:
-            # Routing-driven: the position is _routing_position; the existing
-            # block below handles it, but we still assert here so a future edit
-            # to that block cannot silently drop the chatgpt_web refusal.
+        elif _routing_driven:
+            # Routing-driven (provider omitted): the position is _routing_position
+            # and the provider came from the routing binding.
             _f862_provider = _resolved_provider
             _f862_position = _routing_position
         else:
-            # Explicit-provider path: provider was supplied and agent_profile
-            # still names the position (resolve_assignment_target passed it
-            # through with _resolved_provider None).
-            _f862_provider = _f838_checked_provider or provider
+            # Explicit-provider path: provider was supplied by the caller and
+            # agent_profile still names the position. resolve_assignment_target
+            # rewrote agent_profile to the composed <position>-<provider> name, so
+            # strip the suffix back to the position. The provider is the resolved
+            # value, else the F838-checked value, else the raw explicit arg — this
+            # LAST fallback is the r2-gate mutant target (AC-3): without it the
+            # explicit chatgpt_web dispatch resolves no provider and skips the
+            # guard entirely.
+            _f862_provider = _resolved_provider or _f838_checked_provider or provider
             _f862_position = _f862_strip_provider_suffix(agent_profile)
         from cli_agent_orchestrator.utils.agent_profiles import (
             _position_exists as _f862_position_exists,

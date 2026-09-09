@@ -334,7 +334,10 @@ def test_ac4_clean_findings_body_accepted() -> None:
 def test_ac1_report_carries_findings_status_and_body_digest() -> None:
     # AC-1: FINDINGS-READY report whose body digest matches its published trailer.
     report = publication.build_report(
-        body_markdown="Finding 1: blueprint D3 line 4 should read 'foo'.",
+        body_markdown=(
+            "Finding 1: Cite: D3 line 4. OLD: `old text here`. "
+            "REPLACE: `new text here`. Evidence: the anchored section."
+        ),
         artifact_path="/data/cao-scratch/briefs/x.md",
         artifact_sha256="a" * 64,
         bundle_sha256=BUNDLE_SHA,
@@ -346,6 +349,88 @@ def test_ac1_report_carries_findings_status_and_body_digest() -> None:
     assert report.body.rstrip().endswith(report.body_sha256)
     # The digest is stable: recomputing over the body (trailer elided) matches.
     assert publication.canonical_body_digest(report.body) == report.body_sha256
+
+
+# ==========================================================================
+# D10 schema (r3) — findings must quote anchored OLD + exact REPLACE + Evidence;
+# invalid bodies are FINDINGS-INVALID (report_invalid), never promoted.
+# ==========================================================================
+def _kw(**over: object) -> dict[str, object]:
+    base: dict[str, object] = dict(
+        artifact_path="/x.md",
+        artifact_sha256="a" * 64,
+        bundle_sha256=BUNDLE_SHA,
+        model_slug=REQUIRED_MODEL_SLUG,
+        thinking_effort=REQUIRED_THINKING_EFFORT,
+        run_id=RUN_ID,
+    )
+    base.update(over)
+    return base
+
+
+def test_d10_finding_without_old_quote_is_report_invalid() -> None:
+    body = "Finding 1: Cite: D3 line 4. REPLACE: `x`. Evidence: y."  # no OLD:
+    with pytest.raises(RunnerError) as ei:
+        publication.build_report(body_markdown=body, **_kw())  # type: ignore[arg-type]
+    assert ei.value.code is RunnerErrorCode.REPORT_INVALID
+
+
+def test_d10_finding_without_replacement_is_report_invalid() -> None:
+    body = "Finding 1: Cite: D3 line 4. OLD: `x`. Evidence: y."  # no REPLACE:
+    with pytest.raises(RunnerError) as ei:
+        publication.build_report(body_markdown=body, **_kw())  # type: ignore[arg-type]
+    assert ei.value.code is RunnerErrorCode.REPORT_INVALID
+
+
+def test_d10_finding_without_citation_is_report_invalid() -> None:
+    body = "Finding 1: OLD: `x`. REPLACE: `y`. Evidence: z."  # no citation token
+    with pytest.raises(RunnerError) as ei:
+        publication.build_report(body_markdown=body, **_kw())  # type: ignore[arg-type]
+    assert ei.value.code is RunnerErrorCode.REPORT_INVALID
+
+
+def test_d10_no_finding_block_is_report_invalid() -> None:
+    body = "Some prose with no numbered findings at all."
+    with pytest.raises(RunnerError) as ei:
+        publication.build_report(body_markdown=body, **_kw())  # type: ignore[arg-type]
+    assert ei.value.code is RunnerErrorCode.REPORT_INVALID
+
+
+def test_d10_valid_finding_is_promoted() -> None:
+    body = (
+        "Finding 1: Cite: D3 line 4. OLD: `permitted every private backend endpoint`. "
+        "REPLACE: `permits exactly two reads`. Evidence: recon note."
+    )
+    report = publication.build_report(body_markdown=body, **_kw())  # type: ignore[arg-type]
+    assert report.body.startswith("Status: FINDINGS-READY")
+
+
+def test_d10_manifest_positive_and_negative_citation() -> None:
+    # Positive: the OLD quote is a verbatim substring of the pinned bundle.
+    manifest = "line A\npermitted every private backend endpoint\nline C\n"
+    good = (
+        "Finding 1: Cite: D3. OLD: `permitted every private backend endpoint`. "
+        "REPLACE: `permits exactly two reads`. Evidence: recon."
+    )
+    publication.build_report(body_markdown=good, manifest_text=manifest, **_kw())  # type: ignore[arg-type]
+    # Negative: a dangling OLD quote absent from the bundle is report_invalid.
+    bad = (
+        "Finding 1: Cite: D3. OLD: `this text is not in the bundle at all`. "
+        "REPLACE: `y`. Evidence: recon."
+    )
+    with pytest.raises(RunnerError) as ei:
+        publication.build_report(body_markdown=bad, manifest_text=manifest, **_kw())  # type: ignore[arg-type]
+    assert ei.value.code is RunnerErrorCode.REPORT_INVALID
+
+
+def test_d10_plain_run_skips_schema_when_disabled() -> None:
+    # The plain smoke run has no findings; validate_schema=False lets it publish.
+    report = publication.build_report(
+        body_markdown="PONG-style plain answer, no findings.",
+        validate_schema=False,
+        **_kw(),  # type: ignore[arg-type]
+    )
+    assert report.body.startswith("Status: FINDINGS-READY")
 
 
 def test_ac4_build_report_rejects_verdict_body() -> None:
@@ -462,24 +547,58 @@ def test_ac9_readiness_needs_both_calibrated_signals() -> None:
     assert readiness_reached({"filename_chip", "spinner"}) is False
 
 
-def test_ac9_attachment_identity_mismatch_rejected() -> None:
-    manifest = build_attachment_identity(b"hello\nworld\n", "bundle.txt")
-    tampered = build_attachment_identity(b"hello\nWORLD\n", "bundle.txt")
+def _ident(data: bytes, name: str, ref: "str | None") -> AttachmentIdentity:
+    import dataclasses as _dc
+
+    base = build_attachment_identity(data, name)
+    return _dc.replace(base, composer_attachment_ref=ref)
+
+
+def test_ac9_attachment_byte_mismatch_rejected() -> None:
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-1")
+    tampered = _ident(b"hello\nWORLD\n", "bundle.txt", "chip-1")
     with pytest.raises(RunnerError) as ei:
         verify_attachment_on_turn(manifest, tampered, attachment_count=1)
     assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
 
 
 def test_ac9_more_than_one_attachment_rejected() -> None:
-    manifest = build_attachment_identity(b"hello\n", "bundle.txt")
+    manifest = _ident(b"hello\n", "bundle.txt", "chip-1")
     with pytest.raises(RunnerError) as ei:
         verify_attachment_on_turn(manifest, manifest, attachment_count=2)
     assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
 
 
-def test_ac9_matching_identity_single_attachment_ok() -> None:
-    manifest = build_attachment_identity(b"hello\nworld\n", "bundle.txt")
-    verify_attachment_on_turn(manifest, manifest, attachment_count=1)  # no raise
+def test_ac9_missing_composer_reference_rejected() -> None:
+    # r2 gate Blocker 3: an observed turn with no composer-side reference fails.
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-A")
+    observed = _ident(b"hello\nworld\n", "bundle.txt", None)
+    with pytest.raises(RunnerError) as ei:
+        verify_attachment_on_turn(manifest, observed, attachment_count=1)
+    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
+
+
+def test_ac9_mismatched_composer_reference_rejected() -> None:
+    # r2 gate Blocker 3 adversarial fixture: identical byte fields, ref-A vs ref-B.
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", "ref-A")
+    observed = _ident(b"hello\nworld\n", "bundle.txt", "ref-B")
+    with pytest.raises(RunnerError) as ei:
+        verify_attachment_on_turn(manifest, observed, attachment_count=1)
+    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
+
+
+def test_ac9_matching_identity_and_reference_ok() -> None:
+    # Full-tuple match INCLUDING a non-empty equal composer reference.
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-xyz")
+    observed = _ident(b"hello\nworld\n", "bundle.txt", "chip-xyz")
+    verify_attachment_on_turn(manifest, observed, attachment_count=1)  # no raise
+
+
+def test_ac9_matches_manifest_requires_nonempty_equal_ref() -> None:
+    a = _ident(b"x\n", "b.txt", "r1")
+    assert a.matches_manifest(a) is True
+    assert _ident(b"x\n", "b.txt", None).matches_manifest(a) is False
+    assert _ident(b"x\n", "b.txt", "r2").matches_manifest(a) is False
 
 
 # ==========================================================================

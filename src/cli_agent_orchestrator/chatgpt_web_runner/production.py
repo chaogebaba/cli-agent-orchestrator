@@ -1,0 +1,304 @@
+"""Production run wiring — binds ``run_review`` to REAL seams (D2, r3).
+
+This is the ONE production path a dispatched ``design_findings`` terminal runs.
+``ChatGptWebProvider`` launches the runner (``python -m
+cli_agent_orchestrator.chatgpt_web_runner``) in its tmux pane; the entrypoint
+(:mod:`__main__`) reads the task and calls :func:`run_production_review`, which
+wires every helper the r2 gate flagged as a dead caller onto this single path:
+
+- ``ProfileLock`` (D5) — acquired by the PROVIDER around the whole turn (owner
+  lease, owner-only stop); the runner is the lease owner's child.
+- ``run_review`` (D2 anchor sequence) — start ``verify_pin`` → browser turn →
+  ``build_report`` (D10 schema) → before-publication ``verify_pin`` → publish →
+  worker-scoped callback.
+- ``enforce_no_api_egress`` (D3) — installed as a request guard on the live page
+  BEFORE any navigation, so a dynamically constructed OpenAI-API host is denied
+  at request time (AC-11), not by a startup string scan.
+- ``verify_attachment_on_turn`` (D8/AC-9) — run on the submitted turn, comparing
+  the full attachment identity tuple INCLUDING the observed composer-side
+  reference.
+
+Identity: this module runs INSIDE the worker's own subprocess, so
+``authority_pin_service.verify_pin`` (env principal = the worker) and the
+inbox callback (``X-CAO-Terminal-Token`` = the worker's) act as the worker — the
+anchor sequence's "assigned worker owns identity, report and callback" (D2).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from cli_agent_orchestrator.chatgpt_web_runner.errors import (
+    DeliveryState,
+    RunnerError,
+    RunnerErrorCode,
+)
+from cli_agent_orchestrator.chatgpt_web_runner.orchestrator import ReviewRequest, run_review
+from cli_agent_orchestrator.chatgpt_web_runner.output import RunnerOutcome, Submitted
+from cli_agent_orchestrator.chatgpt_web_runner.poll_gate import AcceptedAnswer
+
+logger = logging.getLogger(__name__)
+
+
+def _verify_pin_real(file_path: str) -> bool:
+    """Real start/before-publication pin check as the WORKER (D2/AC-1/AC-2).
+
+    Uses ``authority_pin_service.verify_pin`` whose principal is this process's
+    ``CAO_TERMINAL_ID`` (the worker). VALID only when the pin is registered and
+    the bytes still match; DRIFT/SUPERSEDED/UNPINNED are all non-VALID → the
+    orchestrator refuses/cancels publication.
+    """
+    from cli_agent_orchestrator.services import authority_pin_service
+
+    try:
+        verdict = authority_pin_service.verify_pin(file_path)
+    except Exception as exc:  # pragma: no cover - service/DB hiccup
+        logger.warning("chatgpt_web verify_pin failed for %s: %s", file_path, type(exc).__name__)
+        return False
+    return bool(verdict.get("verdict") == "VALID")
+
+
+def _callback_as_worker(message: str) -> None:
+    """Deliver the worker-scoped callback to the recorded caller (D2).
+
+    Posts to ``POST /terminals/{caller}/inbox/messages`` as the worker
+    (``X-CAO-Terminal-Token`` from env), mirroring what the ``send_message`` MCP
+    tool does with ``receiver_id`` omitted. The caller id comes from
+    ``CAO_CALLBACK_TERMINAL_ID`` (recorded caller) — never guessed.
+    """
+    import requests
+
+    endpoint = os.environ.get("CAO_ENDPOINT", "http://127.0.0.1:8990")
+    token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+    sender = os.environ.get("CAO_TERMINAL_ID", "")
+    receiver = os.environ.get("CAO_CALLBACK_TERMINAL_ID") or os.environ.get("CAO_CALLER_ID", "")
+    if not receiver:
+        raise RunnerError(
+            RunnerErrorCode.SUBMIT_UNKNOWN,
+            "no recorded caller (CAO_CALLBACK_TERMINAL_ID unset) — cannot call back",
+            delivery_state=DeliveryState.DELIVERED,
+        )
+    headers = {"X-CAO-Terminal-Token": token} if token else {}
+    resp = requests.post(
+        f"{endpoint.rstrip('/')}/terminals/{receiver}/inbox/messages",
+        params={"sender_id": sender, "message": message},
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def run_production_review(
+    *,
+    task_text: str,
+    artifact_path: str,
+    bundle_path: Optional[str],
+    display_env: Optional[dict[str, str]] = None,
+    callback: Any = _callback_as_worker,
+    verify_pin: Any = _verify_pin_real,
+    browser_turn: Any = None,
+) -> RunnerOutcome:
+    """Drive one production review turn through the D2 anchor sequence.
+
+    ``callback`` and ``verify_pin`` are injectable for the assign integration
+    test (stubbed browser/pin/callback seams); production binds the real ones
+    above. Returns the :class:`RunnerOutcome`; the caller (``__main__``) prints
+    the status markers and exit code from it.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
+        build_attachment_identity,
+        enforce_bundle_bounds,
+        sha256_bytes,
+        sha256_text,
+    )
+
+    started = time.monotonic()
+    from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import new_run_id
+
+    run_id = new_run_id()
+
+    if bundle_path:
+        data = Path(bundle_path).read_bytes()
+        enforce_bundle_bounds(data)
+        bundle_sha = sha256_bytes(data)
+        manifest_identity = build_attachment_identity(data, Path(bundle_path).name)
+    else:
+        bundle_sha = sha256_text(task_text)
+        manifest_identity = None
+
+    request = ReviewRequest(
+        artifact_path=artifact_path,
+        artifact_sha256=bundle_sha,
+        bundle_sha256=bundle_sha,
+        run_id=run_id,
+    )
+
+    # Holder the browser turn fills with the OBSERVED attachment identity (incl.
+    # the composer-side reference) so the envelope carries it (D8/AC-9).
+    _observed_attachment: dict[str, Any] = {}
+
+    def _default_browser_turn() -> AcceptedAnswer:
+        return asyncio.run(
+            _drive_browser(
+                task_text=task_text,
+                bundle_path=bundle_path,
+                manifest_identity=manifest_identity,
+                run_id=run_id,
+                bundle_sha=bundle_sha,
+                observed_holder=_observed_attachment,
+            )
+        )
+
+    _turn = browser_turn if browser_turn is not None else _default_browser_turn
+
+    def _publish(body: str) -> str:
+        out_dir = Path(
+            os.environ.get("CAO_ARTIFACTS_DIR") or "/data/cao-scratch/worker-scratch/f862-build"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"chatgpt-web-findings-{run_id}.md"
+        out_path.write_text(body, encoding="utf-8")
+        return str(out_path)
+
+    outcome = run_review(
+        request,
+        verify_pin_start=lambda: verify_pin(artifact_path),
+        verify_pin_before_publish=lambda: verify_pin(artifact_path),
+        browser_turn=_turn,
+        publish=_publish,
+        attachment_identity=(_observed_attachment or None),
+        validate_schema=bool(bundle_path),
+        manifest_text=(
+            Path(bundle_path).read_text(encoding="utf-8", errors="ignore") if bundle_path else None
+        ),
+    )
+
+    # Worker-scoped callback AFTER publication (report-before-callback, D10/AC-1).
+    if outcome.ok and outcome.report_path:
+        callback(
+            f"F862 FINDINGS-READY {outcome.report_path} "
+            f"sha256={outcome.report_body_sha256} conv={outcome.conversation_url}"
+        )
+    else:
+        callback(
+            f"F862 FINDINGS-{'INVALID' if outcome.error_code and outcome.error_code.value == 'report_invalid' else 'FAILED'} "
+            f"code={outcome.error_code.value if outcome.error_code else 'none'} "
+            f"delivery={outcome.delivery_state.value}"
+        )
+    logger.info(
+        "chatgpt_web production review finished in %sms", int((time.monotonic() - started) * 1000)
+    )
+    return outcome
+
+
+async def _drive_browser(
+    *,
+    task_text: str,
+    bundle_path: Optional[str],
+    manifest_identity: Any,
+    run_id: str,
+    bundle_sha: str,
+    observed_holder: Optional[dict[str, Any]] = None,
+) -> AcceptedAnswer:
+    """The real browser turn: launch, egress-guard, (attach), submit, poll (D3/D6).
+
+    Wires ``enforce_no_api_egress`` (as a page request guard) and
+    ``verify_attachment_on_turn`` (post-submit identity, D8/AC-9) onto the path.
+    """
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import (
+        SEL_COMPOSER,
+        Transport,
+    )
+    from cli_agent_orchestrator.chatgpt_web_runner.runtime import (
+        CHATGPT_URL,
+        build_launch_options,
+        launch,
+        pin_fingerprint_seed,
+        resolve_profile_dir,
+    )
+    from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
+        enforce_no_api_egress,
+        verify_attachment_on_turn,
+    )
+
+    profile = resolve_profile_dir()
+    seed = pin_fingerprint_seed(profile)
+    context = await launch(build_launch_options(profile, seed))
+    page = context.pages[0] if context.pages else await context.new_page()
+
+    # D3/AC-11: deny OpenAI-API egress at REQUEST time (dynamic host). The guard
+    # runs on every request the page issues, aborting a forbidden host.
+    async def _egress_guard(route: Any) -> None:
+        try:
+            enforce_no_api_egress(route.request.url)
+        except RunnerError:
+            await route.abort()
+            return
+        await route.continue_()
+
+    try:
+        await page.route("**/*", _egress_guard)
+    except Exception:  # pragma: no cover - routing optional
+        pass
+
+    transport = Transport(page)
+    transport.arm_send_observer()
+    await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
+    await page.locator(SEL_COMPOSER).first.wait_for(state="visible", timeout=20000)
+
+    if bundle_path:
+        identity = await transport.attach_file(bundle_path)
+        if manifest_identity is not None:
+            # D8/AC-9: compare the FULL identity tuple including the observed
+            # composer-side reference on the submitted turn.
+            verify_attachment_on_turn(manifest_identity, identity, 1)
+        if observed_holder is not None:
+            observed_holder.update(
+                {
+                    "file_sha256": identity.file_sha256,
+                    "byte_length": identity.byte_length,
+                    "line_count": identity.line_count,
+                    "submitted_filename": identity.submitted_filename,
+                    "composer_attachment_ref": identity.composer_attachment_ref,
+                }
+            )
+
+    await transport.type_prompt(task_text)
+    submit = await transport.submit_and_confirm(timeout_s=40.0)
+    conv_id = submit.conversation_id
+    if submit.delivery_state is not DeliveryState.DELIVERED or not conv_id:
+        await context.close()
+        raise RunnerError(
+            RunnerErrorCode.SUBMIT_UNKNOWN,
+            f"delivery={submit.delivery_state.value}",
+            delivery_state=submit.delivery_state,
+        )
+
+    submitted_uid = ""
+    for _ in range(10):
+        probe = await transport.read_conversation(conv_id)
+        body = probe.get("body")
+        if probe.get("ok") and isinstance(body, dict):
+            from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import (
+                _newest_user_msg_id,
+            )
+
+            submitted_uid = _newest_user_msg_id(body)
+            if submitted_uid:
+                break
+        await page.wait_for_timeout(1500)
+
+    try:
+        answer = await transport.poll_to_gate(
+            conv_id, submitted_uid, run_id, bundle_sha, timeout_s=420.0
+        )
+    finally:
+        await context.close()
+    assert isinstance(answer, AcceptedAnswer)
+    return answer

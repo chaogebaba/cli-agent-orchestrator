@@ -6528,6 +6528,24 @@ def send_input(
 
         status_monitor.bind_dispatch_provider(terminal_id, provider)
         dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
+        # F862 (#718) r3: a provider that owns its dispatch drives the task
+        # out-of-band (chatgpt_web hands it to its pane runner) — the task is
+        # NEVER pasted into the shell as a command (r2 gate Blocker 1). This runs
+        # inside the dispatch transaction so a failure aborts coherently.
+        if provider is not None and getattr(provider, "handles_own_dispatch", False):
+            try:
+                provider.dispatch_task(message)
+            except BaseException:
+                status_monitor.abort_dispatch(dispatch_txn)
+                raise
+            else:
+                status_monitor.commit_dispatch(dispatch_txn)
+                provider.mark_input_received()
+            if preserved_draft is not None:
+                preserved_draft.restore(backend)
+            update_last_active(terminal_id)
+            logger.info(f"Dispatched task to provider-owned runner: {terminal_id}")
+            return True
         try:
             if provider:
                 provider.pre_paste_gate()

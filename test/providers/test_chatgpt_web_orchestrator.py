@@ -26,8 +26,15 @@ REQ = ReviewRequest(
     run_id="run0",
 )
 
+_VALID_FINDINGS_BODY = (
+    "Finding 1: Cite: D3 line 4. "
+    "OLD: `permitted every private backend endpoint`. "
+    "REPLACE: `permits exactly two reads`. "
+    "Evidence: blueprint section D3 conflicts with the recon note.\n"
+)
+
 ANSWER = AcceptedAnswer(
-    text="Finding 1: section D3 should say foo not bar.",
+    text=_VALID_FINDINGS_BODY,
     model_slug="gpt-5-6-thinking",
     thinking_effort="extended",
     conversation_id="11111111-2222-3333-4444-555555555555",
