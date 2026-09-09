@@ -1090,11 +1090,16 @@ class TestBackendHealthSocketLiveness:
         with patch.object(HerdrBackend, "_ensure_session_running"):
             return HerdrBackend(herdr_session="cao")
 
-    def test_socket_is_live_true_when_server_listening(self, tmp_path):
+    def test_socket_is_live_true_when_server_listening(self):
         """A real listening unix socket → _socket_is_live True."""
+        import os as _os
         import socket as _socket
+        import tempfile
 
-        sock_path = str(tmp_path / "herdr.sock")
+        # AF_UNIX paths are capped at ~108 bytes; the box's pytest tmp_path is far
+        # longer, so bind under a short system-tmp dir and clean it up here.
+        tmpdir = tempfile.mkdtemp(prefix="f882-", dir="/tmp")
+        sock_path = _os.path.join(tmpdir, "h.sock")
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(sock_path)
         server.listen(1)
@@ -1102,6 +1107,14 @@ class TestBackendHealthSocketLiveness:
             assert HerdrBackend._socket_is_live(sock_path) is True
         finally:
             server.close()
+            try:
+                _os.unlink(sock_path)
+            except OSError:
+                pass
+            try:
+                _os.rmdir(tmpdir)
+            except OSError:
+                pass
 
     def test_socket_is_live_false_when_absent(self, tmp_path):
         """A missing socket path → _socket_is_live False."""
