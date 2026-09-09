@@ -7698,25 +7698,38 @@ def _resolve_reap_resume_key(
         cwd = identity.get("cwd") or (metadata.get("working_directory") if metadata else None)
         supports = provider_supports_resume(provider) if provider else False
 
-        def _root_link_intact() -> bool:
-            # A2.4: never advertise resumable:true without root/link integrity —
-            # the terminal_identity row must be LINKED to a conversation root that
-            # actually exists. A dangling link (identity_key set but no root) or a
-            # missing link is honestly non-resumable.
+        def _root_resumable_reason() -> str:
+            # A2.4 (F865 B3): "resumable" iff the terminal_identity row is LINKED
+            # to a conversation root that exists AND that root carries a non-NULL
+            # owner_principal. A dangling/missing link or a NULL-owner
+            # (legacy_unknown_owner / top-level-spawn) root is honestly
+            # non-resumable — a NULL-owner root is refused at resume time with
+            # ``resume_not_owner`` (authorize_and_classify_resume), so advertising
+            # ``resumable:true`` for it is the dishonesty A2.4 is titled against;
+            # it becomes resumable only after an explicit ``cao identity claim``.
+            # Returns "resumable" | "identity_root_link_missing" |
+            # "identity_owner_unknown".
             _ikey = identity.get("identity_key") if identity else None
             if not _ikey:
-                return False
+                return "identity_root_link_missing"
             from cli_agent_orchestrator.clients.database import get_conversation_identity
 
-            return get_conversation_identity(_ikey) is not None
+            _root = get_conversation_identity(_ikey)
+            if _root is None:
+                return "identity_root_link_missing"
+            if _root.get("owner_principal") is None:
+                return "identity_owner_unknown"
+            return "resumable"
 
         if force:
             # Abandon: the caller is discarding the checkout; not resumable.
             return None, False, "abandoned_force_delete"
         existing_id = identity.get("provider_session_id")
         if existing_id:
-            if supports and not _root_link_intact():
-                return None, False, "identity_root_link_missing"
+            if supports:
+                _rr = _root_resumable_reason()
+                if _rr != "resumable":
+                    return None, False, _rr
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return None, bool(supports), reason
         if provider != "kiro_cli":
@@ -7740,6 +7753,11 @@ def _resolve_reap_resume_key(
                     _root = get_conversation_identity(_ikey)
                     _root_sid = _root.get("provider_session_id") if _root else None
                     if _root_sid:
+                        # F865 B3: a captured id on a NULL-owner root is still
+                        # NOT resumable — resume authorization refuses it. Fill
+                        # the row from the root but do not advertise resumable.
+                        if _root and _root.get("owner_principal") is None:
+                            return _root_sid, False, "identity_owner_unknown"
                         return _root_sid, True, "resumable"
                 return None, False, "provider_session_id_never_captured"
             # Non-kiro that does not support resume: nothing to do.
@@ -7766,8 +7784,10 @@ def _resolve_reap_resume_key(
             cwd, terminal_id, capture_nonce=_nonce
         )
         if captured:
-            if supports and not _root_link_intact():
-                return captured, False, "identity_root_link_missing"
+            if supports:
+                _rr = _root_resumable_reason()
+                if _rr != "resumable":
+                    return captured, False, _rr
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return captured, bool(supports), reason
         return None, False, f"capture_unknown_candidates_{count}"

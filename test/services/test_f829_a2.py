@@ -691,3 +691,319 @@ async def test_ac_a2_3_service_built_seed_admission_carries_namespace(
         f"_resolved_codex_home {expected_ns!r}"
     )
     assert adm.provider_namespace is not None
+
+
+# ==========================================================================
+# F865 R1 — folds of the 9 A2 acceptance-wall gaps (issue #721).
+#
+# CODE fixes (fail-before / pass-after):
+#   * B3 → test_f865_b3_null_owner_root_not_advertised_resumable
+#   * S3 → test_f865_s3_resumed_by_stamped_only_at_publish
+#          test_f865_s3_spawn_failure_after_claim_leaves_no_resumed_by
+# TEST-ONLY pins (behaviour already correct, previously unpinned):
+#   * B4 → test_f865_b4_release_plane_is_owner_cas_not_terminal_token
+#   * B6 → test_f865_b6_stored_namespace_is_authoritative_not_re_resolved
+#   * S4 → test_f865_s4_diag_distinguishes_all_five_states
+# ==========================================================================
+
+
+def _seed_reap_root_and_incarnation(db_mod, *, identity_key, terminal_id, owner, uuid=None):
+    """A codex conversation root + its live incarnation, as after a fresh spawn.
+
+    ``owner=None`` mints a NULL-owner (legacy_unknown_owner-shaped) root; resume
+    of such a root is refused ``resume_not_owner`` until an explicit claim.
+    """
+    db_mod.mint_conversation_identity(
+        identity_key=identity_key,
+        provider="codex",
+        provider_namespace="/home/u/.codex",
+        agent_profile="dev",
+        model="m",
+        reasoning_effort=None,
+        owner_principal=owner,
+        origin_callback_ref=None,
+        current_terminal_id=terminal_id,
+        provider_session_id=uuid,
+    )
+    with db_mod.SessionLocal.begin() as s:
+        s.add(
+            db_mod.TerminalIdentityModel(
+                terminal_id=terminal_id,
+                provider="codex",
+                agent_profile="dev",
+                cwd="/tmp",
+                session_name="cao-test",
+                provider_session_id=uuid,
+                base_name=terminal_id,
+                lifecycle="live",
+                identity_key=identity_key,
+            )
+        )
+
+
+# --------------------------------------------------------------------------
+# B3 (CODE): a NULL-owner root passes root/link integrity but resume refuses it
+# (resume_not_owner), so advertising resumable:true for it is DISHONEST. The
+# reap resolver must report resumable=False, reason=identity_owner_unknown.
+# MUTANT: drop-the-owner-check (revert to root-link-only) → this test fails.
+# --------------------------------------------------------------------------
+def test_f865_b3_null_owner_root_not_advertised_resumable(real_sqlite_env):
+    from cli_agent_orchestrator.services import terminal_service as ts
+    from cli_agent_orchestrator.services.resume_service import provider_supports_resume
+
+    assert provider_supports_resume("codex") is True
+    _seed_reap_root_and_incarnation(
+        d, identity_key="conv_b3_null", terminal_id="b3null01", owner=None, uuid="uuid-b3-null"
+    )
+    cap_id, resumable, reason = ts._resolve_reap_resume_key(
+        "b3null01", {"working_directory": "/tmp"}, force=False
+    )
+    # Dishonesty guard: a NULL-owner root is NOT resumable through assign(resume_from).
+    assert resumable is False, (cap_id, reason)
+    assert reason == "identity_owner_unknown", reason
+
+
+def test_f865_b3_owned_root_still_advertised_resumable(real_sqlite_env):
+    """Control: an OWNED root with a captured id remains honestly resumable
+    (the B3 fix narrows only the NULL-owner case, nothing else)."""
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    _seed_reap_root_and_incarnation(
+        d, identity_key="conv_b3_own", terminal_id="b3own001", owner="mb_owner", uuid="uuid-b3-own"
+    )
+    cap_id, resumable, reason = ts._resolve_reap_resume_key(
+        "b3own001", {"working_directory": "/tmp"}, force=False
+    )
+    assert resumable is True and reason == "resumable", (cap_id, reason)
+
+
+def test_f865_b3_claimed_null_owner_root_is_resumable_after_claim(real_sqlite_env):
+    """The recovery path B3 points at: `cao identity claim` sets the owner, after
+    which the SAME root is honestly advertised resumable."""
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    _seed_reap_root_and_incarnation(
+        d, identity_key="conv_b3_clm", terminal_id="b3clm001", owner=None, uuid="uuid-b3-clm"
+    )
+    # Before claim: not resumable.
+    _, resumable_before, _ = ts._resolve_reap_resume_key(
+        "b3clm001", {"working_directory": "/tmp"}, force=False
+    )
+    assert resumable_before is False
+    # Owner claims → now resumable.
+    assert d.claim_identity_owner("conv_b3_clm", "mb_late_owner")["status"] == "claimed"
+    _, resumable_after, reason_after = ts._resolve_reap_resume_key(
+        "b3clm001", {"working_directory": "/tmp"}, force=False
+    )
+    assert resumable_after is True and reason_after == "resumable"
+
+
+# --------------------------------------------------------------------------
+# S3 (CODE): resumed_by is stamped ONLY once the incarnation row exists (at
+# publish), never at claim. A spawn that fails after the claim leaves NO
+# resumed_by. MUTANT: stamp-resumed_by-at-claim → the "after claim only"
+# assertion below fails.
+# --------------------------------------------------------------------------
+def test_f865_s3_resumed_by_stamped_only_at_publish(real_sqlite_env):
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    _mk_owned_root("k_s3_pub", owner="mb_owner")
+    root = d.get_conversation_identity("k_s3_pub")
+    adm = ct.authorize_and_classify_resume(root, "mb_owner")
+    adm = ct.claim_resume_admission(adm, "mb_recoverer")
+    assert adm.ok
+    # AFTER CLAIM, BEFORE PUBLISH: no resumed_by yet (the incarnation row does
+    # not exist). This is the exact assertion the stamp-at-claim mutant fails.
+    events = [e["event"] for e in d.get_conversation_events("k_s3_pub")]
+    assert "resume_claimed" in events
+    assert "resumed_by" not in events, "resumed_by stamped before the incarnation existed"
+    # PUBLISH (the incarnation row now exists) → resumed_by is stamped, carrying
+    # the recovering principal (never overwriting owner_principal).
+    vr = ct.verify_and_publish_resume(
+        adm,
+        terminal_id="t_s3_new",
+        reported_session_id=root["provider_session_id"],
+        provider="codex",
+    )
+    assert vr.ok
+    evs = d.get_conversation_events("k_s3_pub")
+    names = [e["event"] for e in evs]
+    assert "resume_published" in names and "resumed_by" in names
+    # owner_principal is untouched: a bare callback still routes to the ORIGINAL
+    # caller, never the recoverer.
+    assert d.get_conversation_identity("k_s3_pub")["owner_principal"] == "mb_owner"
+
+
+def test_f865_s3_spawn_failure_after_claim_leaves_no_resumed_by(real_sqlite_env):
+    """A2.5 + S3: a post-claim spawn failure (verify mismatch) clears the claim
+    and leaves NEITHER resume_published NOR resumed_by."""
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    _mk_owned_root("k_s3_fail", owner="mb_owner")
+    root = d.get_conversation_identity("k_s3_fail")
+    adm = ct.claim_resume_admission(ct.authorize_and_classify_resume(root, "mb_owner"), "mb_rec")
+    assert adm.ok
+    # The resumed worker reports the WRONG id → verify fails, claim cleared.
+    vr = ct.verify_and_publish_resume(
+        adm, terminal_id="t_s3_fail", reported_session_id="WRONG-ID", provider="codex"
+    )
+    assert vr.ok is False
+    names = [e["event"] for e in d.get_conversation_events("k_s3_fail")]
+    assert "resume_failed" in names
+    assert "resume_published" not in names
+    assert "resumed_by" not in names, "a failed spawn left a stale resumed_by"
+    assert d.get_conversation_identity("k_s3_fail")["resume_claim"] is None
+
+
+def test_f865_s3_resumed_by_recovered_from_event_at_capture_convergence(real_sqlite_env):
+    """The real flow rebuilds the admission from the root at the D4 capture
+    convergence (attach_captured_uuid), so claimed_by is not on that admission.
+    resumed_by must still be stamped, recovered from the durable resume_claimed
+    event's claimant."""
+    from cli_agent_orchestrator.services.conversation_transition import (
+        attach_captured_uuid,
+        authorize_and_classify_resume,
+        claim_resume_admission,
+    )
+
+    _mk_owned_root("k_s3_cap", owner="mb_owner")
+    root = d.get_conversation_identity("k_s3_cap")
+    claim_resume_admission(authorize_and_classify_resume(root, "mb_owner"), "mb_recoverer")
+    # SPAWN: register the NEW incarnation linked to the SAME root, exactly as the
+    # production create path does before capture.
+    from cli_agent_orchestrator.clients.database import TerminalIdentityModel
+
+    with d.SessionLocal.begin() as db:
+        db.add(
+            TerminalIdentityModel(
+                terminal_id="t_s3_cap_new",
+                provider="codex",
+                base_name="t_s3_cap_new",
+                lifecycle="live",
+                identity_key="k_s3_cap",
+                cwd="/tmp",
+            )
+        )
+    # The reported id matches the root's uuid → publish via the capture seam.
+    out = attach_captured_uuid(
+        "t_s3_cap_new", provider_session_id=root["provider_session_id"], provider="codex"
+    )
+    assert out["status"] == "resume_published", out
+    evs = d.get_conversation_events("k_s3_cap")
+    resumed = [e for e in evs if e["event"] == "resumed_by"]
+    assert resumed, "resumed_by not stamped at the capture convergence"
+
+
+# --------------------------------------------------------------------------
+# B4 (TEST-ONLY): the `cao identity release` auth plane is the OPERATOR /
+# owner-CAS plane (--owner compare-and-set against the recorded owner), NOT
+# A2.1's terminal-token binding. The review's proposed terminal-token fix would
+# break the leaked-claim recovery this verb exists for: a leaked claim is
+# exactly when the owning terminal is GONE and cannot present a token. This test
+# pins that release works with NO terminal token / no live owning terminal.
+# --------------------------------------------------------------------------
+def test_f865_b4_release_plane_is_owner_cas_not_terminal_token(real_sqlite_env):
+    _mk_owned_root("k_b4", owner="mb_owner")
+    gen = d.get_conversation_identity("k_b4")["generation"]
+    d.claim_resume("k_b4", gen, "leaked-claimant")
+    assert d.get_conversation_identity("k_b4")["resume_claim"] is not None
+    # No X-CAO-Terminal-Token, no live owning terminal — the owner principal
+    # alone (compare-and-set) releases. This is the operator plane the blueprint
+    # should name; the terminal-token plane would be UNSATISFIABLE here.
+    out = d.release_resume_claim_owned("k_b4", "mb_owner")
+    assert out.get("released") is True
+    assert d.get_conversation_identity("k_b4")["resume_claim"] is None
+    # And a non-owner principal is refused even with everything else identical.
+    d.claim_resume("k_b4", d.get_conversation_identity("k_b4")["generation"], "again")
+    assert d.release_resume_claim_owned("k_b4", "mb_not_owner")["reason"] == "not_owner"
+
+
+# --------------------------------------------------------------------------
+# B6 (TEST-ONLY): the namespace RECORDED at mint is authoritative — every later
+# check compares the STORED value, never a fresh resolution. This pins the three
+# properties the r3/r4 folds bought (non-NULL, canonical single-producer,
+# compare-against-stored) that AC-A2.3 did not assert.
+# --------------------------------------------------------------------------
+def test_f865_b6_stored_namespace_is_authoritative_not_re_resolved(real_sqlite_env):
+    with real_sqlite_env["TestSession"]() as db:
+        _seed_mailbox(db, "mb_b6", "supb6001")
+        db.commit()
+    d.create_terminal(
+        "cdxb6001",
+        "sess",
+        "win",
+        "codex",
+        agent_profile="dev",
+        working_directory="/tmp",
+        caller_id="supb6001",
+        provider_session_id="seed-uuid-b6",
+        root_admission=RootAdmission(
+            mode="mint",
+            identity_key="conv_b6",
+            provider="codex",
+            provider_namespace="/home/u/.codex",
+            provider_session_id="seed-uuid-b6",
+            owner_caller_id="supb6001",
+        ),
+    )
+    root = d.get_conversation_identity("conv_b6")
+    # (1) non-NULL — never leaves D1's UNIQUE triple inert.
+    assert root["provider_namespace"] is not None
+    stored_ns = root["provider_namespace"]
+    # (3) compare-against-STORED: authorize/classify reads the stored namespace
+    # onto the admission verbatim (a fresh resolution is never substituted).
+    from cli_agent_orchestrator.services.conversation_transition import (
+        authorize_and_classify_resume,
+    )
+
+    d.set_conversation_lifecycle("conv_b6", "hibernated")
+    adm = authorize_and_classify_resume(d.get_conversation_identity("conv_b6"), "mb_b6")
+    assert adm.ok and adm.provider_namespace == stored_ns
+
+
+# --------------------------------------------------------------------------
+# S4 (TEST-ONLY): `cao identity diag` distinguishes all FIVE A2.4 states, never
+# a manufactured root/owner. AC-A2.4 lists only three; this pins all five.
+# --------------------------------------------------------------------------
+def test_f865_s4_diag_distinguishes_all_five_states(real_sqlite_env):
+    import json
+
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.identity import identity_diag
+    from cli_agent_orchestrator.clients.database import get_conversation_identity as _gci
+
+    runner = CliRunner()
+
+    def _diag(identifier):
+        res = runner.invoke(identity_diag, [identifier, "--json"])
+        assert res.exit_code == 0, res.output
+        return json.loads(res.output)
+
+    # 1. unknown_handle — nothing at all.
+    assert _diag("nohandle0")["state"] == "unknown_handle"
+
+    # 2. incarnation_present_root_absent — a registered incarnation, no root link.
+    with real_sqlite_env["TestSession"]() as db:
+        _seed_incarnation(db, "s4inc001", identity_key=None)
+        db.commit()
+    assert _diag("s4inc001")["state"] == "incarnation_present_root_absent"
+
+    # 3. dangling_root_link — incarnation links to a root that does not exist.
+    with real_sqlite_env["TestSession"]() as db:
+        _seed_incarnation(db, "s4dng001", identity_key="conv_missing_root")
+        db.commit()
+    assert _diag("s4dng001")["state"] == "dangling_root_link"
+
+    # 4. root_present_owner_unknown — a NULL-owner root (claimable).
+    _seed_reap_root_and_incarnation(
+        d, identity_key="conv_s4_null", terminal_id="s4nul001", owner=None, uuid="u-s4-null"
+    )
+    assert _diag("conv_s4_null")["state"] == "root_present_owner_unknown"
+
+    # 5. binding_or_artifact_missing — owned root with no captured uuid.
+    _seed_reap_root_and_incarnation(
+        d, identity_key="conv_s4_bind", terminal_id="s4bnd001", owner="mb_o", uuid=None
+    )
+    assert _gci("conv_s4_bind")["provider_session_id"] is None
+    assert _diag("conv_s4_bind")["state"] == "binding_or_artifact_missing"
