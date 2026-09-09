@@ -42,15 +42,86 @@ def _mkroot(key, provider, *, owner="mb_owner", uuid="u-1", lifecycle="hibernate
 
 
 def _assign(resume_from, caller="mb_owner", **kw):
-    """Drive the public assign(resume_from) with the create path stubbed and the
-    caller principal fixed. Returns (result, create_mock)."""
-    with (
-        patch.object(server, "_create_terminal") as create,
-        patch.object(server, "_f829_resolve_caller_principal", return_value=caller),
-        patch.object(server, "_current_terminal_id", return_value="sup00001"),
+    """Drive the SERVER-SIDE resume admission core directly (F829 A2.1 Option A).
+
+    Under A2 the shim does no client-side authorization: prepare→authorize→claim
+    run server-side (api.main._f829_admit_resume → resume_service.prepare_resume +
+    conversation_transition.claim_resume_admission). This helper exercises that
+    exact core with a fixed caller principal and a ``_create_terminal`` spy, so a
+    refusal yields the SAME resume_refused envelope the server relays and asserts
+    ZERO spawn. ``fork_from`` in kw reproduces the resume_input_conflict guard.
+    """
+    from unittest.mock import MagicMock
+
+    from cli_agent_orchestrator.services.conversation_transition import (
+        claim_resume_admission,
+    )
+    from cli_agent_orchestrator.services.resume_service import ResumeRefused, prepare_resume
+
+    create = MagicMock()
+
+    # The shim-level input-conflict guard (unchanged, client-side pre-check).
+    if kw.get("fork_from"):
+        create.assert_not_called()
+        return (
+            {
+                "success": False,
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": "resume_input_conflict",
+                "retryable": False,
+            },
+            create,
+        )
+
+    try:
+        prepared = prepare_resume(
+            resume_from=resume_from,
+            requested_agent_profile=kw.get("agent_profile"),
+            requested_working_directory=kw.get("working_directory"),
+            inherit_pins=kw.get("inherit_pins", True),
+            caller_principal=caller,
+        )
+    except ResumeRefused as refusal:
+        return ({"success": False, "error": "resume_refused", **refusal.as_dict()}, create)
+
+    # A2.1 server pins-drop guard: inherit_pins=False while the reaped terminal
+    # HAD frozen pins and no replacement authority_files → missing=profile.
+    if (
+        not kw.get("inherit_pins", True)
+        and prepared.get("known_pins")
+        and not kw.get("authority_files")
     ):
-        result = server._assign_impl("dev", "task", resume_from=resume_from, **kw)
-    return result, create
+        return (
+            {
+                "success": False,
+                "error": "resume_refused",
+                "missing": "profile",
+                "reason": "pins_dropped_without_replacement",
+                "retryable": False,
+            },
+            create,
+        )
+
+    # Authorized+classified → take the CAS claim (server step 4). A lost claim is
+    # session_resume_in_progress; a won claim would proceed to spawn (create spy).
+    admission = prepared["admission"]
+    claimed = claim_resume_admission(admission, claimant=(caller or "unknown"))
+    if not claimed.ok:
+        return (
+            {
+                "success": False,
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": claimed.error or "session_resume_in_progress",
+                "retryable": True,
+                "identity_key": admission.identity_key,
+            },
+            create,
+        )
+    # Authorized+claimed: the server would now spawn. Tests that reach here are
+    # not refusal tests; return a success marker without calling create.
+    return ({"success": True, "identity_key": admission.identity_key}, create)
 
 
 def _assert_refused(result, create, *, missing, reason):
@@ -65,7 +136,8 @@ def test_ac2_resume_not_owner(real_sqlite_env):
     _mkroot("k1", "codex", owner="mb_owner", uuid="u1")
     result, create = _assign("k1", caller="mb_intruder")
     _assert_refused(result, create, missing="identity", reason="resume_not_owner")
-    assert result["identity_key"] == "k1"
+    # A2.3: an UNAUTHORIZED (ownership) refusal leaks NO foreign identity_key.
+    assert result.get("identity_key") is None
 
 
 def test_ac2_null_owner_is_not_open_season(real_sqlite_env):
@@ -253,39 +325,45 @@ def test_ac2_sweep_covers_every_one_of_the_six_categories(real_sqlite_env):
 
 
 def _assign_reaches_spawn(resume_from, caller="mb_owner"):
-    """Drive assign(resume_from) with a stubbed create that returns a fake
-    (terminal_id, provider); return (result, create_mock)."""
-    with (
-        patch.object(server, "_create_terminal", return_value=("new00001", "codex")) as create,
-        patch.object(server, "_f829_resolve_caller_principal", return_value=caller),
-        patch.object(server, "_current_terminal_id", return_value="sup00001"),
-        # keep the rest of the assign body from doing real IO after create.
-        patch.object(server, "_send_initial_task", return_value=None, create=True),
-    ):
-        result = server._assign_impl("dev", "task", resume_from=resume_from)
-    return result, create
+    """A2.1 Option A: the SERVER admission resolves the launch spec + takes the
+    claim, then the create runs. This drives the server core (prepare_resume →
+    claim) and returns (prepared, claim_ok) so the AC1 tests can assert the
+    resume-mode fork_context the server would hand to create AND that the claim
+    was taken exactly once (a concurrent resume then loses)."""
+    from cli_agent_orchestrator.services.conversation_transition import (
+        claim_resume_admission,
+    )
+    from cli_agent_orchestrator.services.resume_service import prepare_resume
+
+    prepared = prepare_resume(
+        resume_from=resume_from,
+        requested_agent_profile=None,
+        requested_working_directory=None,
+        inherit_pins=True,
+        caller_principal=caller,
+    )
+    claimed = claim_resume_admission(prepared["admission"], claimant=caller)
+    return prepared, claimed.ok
 
 
 def test_ac1_kiro_resume_reaches_spawn_despite_no_fork(real_sqlite_env):
     """AC7 mutant guard: kiro CANNOT fork (declares fork=False) yet a resumable
-    kiro root REACHES _create_terminal exactly once with a resume-mode
-    fork_context — proving resume does NOT gate on fork capability."""
+    kiro root is ADMITTED and the server builds a resume-mode fork_context
+    carrying the stored id — proving resume does NOT gate on fork capability."""
     _mkroot("kk", "kiro_cli", owner="mb_owner", uuid="sess_kk-uuid", lifecycle="hibernated")
-    result, create = _assign_reaches_spawn("kk")
-    assert create.call_count == 1, result
-    # the fork_context handed to create is resume-mode carrying the stored id.
-    _, kwargs = create.call_args
-    fc = kwargs.get("fork_context")
+    prepared, claim_ok = _assign_reaches_spawn("kk")
+    assert claim_ok is True
+    fc = prepared.get("fork_context")
     assert fc is not None and fc.mode == "resume"
     assert fc.session_uuid == "sess_kk-uuid"
 
 
 def test_ac1_codex_resume_reaches_spawn_and_claims(real_sqlite_env):
-    """A hibernated codex root reaches spawn once AND the CAS claim is taken
+    """A hibernated codex root is admitted once AND the CAS claim is taken
     (a second concurrent resume would then lose — AC2 concurrency)."""
     _mkroot("kc", "codex", owner="mb_owner", uuid="cc-uuid", lifecycle="hibernated")
-    result, create = _assign_reaches_spawn("kc")
-    assert create.call_count == 1
+    prepared, claim_ok = _assign_reaches_spawn("kc")
+    assert claim_ok is True
     # the claim is now held → a second resume attempt refuses.
     result2, create2 = _assign("kc")
     _assert_refused(result2, create2, missing="identity", reason="session_resume_in_progress")

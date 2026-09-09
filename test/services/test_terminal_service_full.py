@@ -347,6 +347,7 @@ class TestCreateTerminal:
             metadata=None,
             worktree_info=None,
             working_directory=os.path.realpath(os.getcwd()),
+            root_admission=ANY,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 

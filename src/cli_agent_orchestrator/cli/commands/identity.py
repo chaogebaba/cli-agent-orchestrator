@@ -59,10 +59,30 @@ def identity_list(mine: str | None, as_json: bool) -> None:
 @click.argument("identifier")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def identity_diag(identifier: str, as_json: bool) -> None:
-    """Follow a uuid | identity_key | terminal_id to its root and print the timeline."""
+    """Follow a uuid | identity_key | terminal_id to its root and print the timeline.
+
+    F829 A2.4 — five distinguished states, NEVER a manufactured root/owner/success
+    timeline:
+
+    1. ``unknown_handle``            — nothing (no incarnation row, no root).
+    2. ``incarnation_present_root_absent`` — a ``terminal_identity`` row exists but
+       carries no ``identity_key`` (F631 registered, F829 root never minted).
+    3. ``dangling_root_link``        — the incarnation's ``identity_key`` points at a
+       root that does not exist.
+    4. ``root_present_owner_unknown``— the root exists with ``owner_principal`` NULL
+       (a NULL-owner/legacy root; claimable via ``cao identity claim``).
+    5. ``binding_or_artifact_missing``— the root exists and is owned but has no
+       captured ``provider_session_id`` (or its artifact is unresolved).
+
+    For a MISSING root (states 1-3) the output carries ``identity_key: null``,
+    the provider + history lifecycle from the incarnation row when present, the
+    root/link status, ``resumable: false``, the reason, and only sanitized
+    creation evidence — never a fabricated root.
+    """
     from cli_agent_orchestrator.clients.database import (
         get_conversation_events,
         get_conversation_incarnations,
+        get_terminal_identity,
         resolve_conversation_identity,
     )
 
@@ -70,21 +90,75 @@ def identity_diag(identifier: str, as_json: bool) -> None:
         root = resolve_conversation_identity(identifier)
     except ValueError as exc:
         raise click.ClickException(str(exc))  # session_ambiguous
+
     if root is None:
-        raise click.ClickException(f"No conversation identity resolves '{identifier}'.")
+        # No resolvable root. Distinguish the missing-root taxonomy from the
+        # terminal_identity history (A2.4) instead of a flat "not found".
+        incarnation = get_terminal_identity(identifier)
+        if incarnation is None:
+            state = "unknown_handle"
+            link_status = "no_incarnation_row"
+        elif not incarnation.get("identity_key"):
+            state = "incarnation_present_root_absent"
+            link_status = "identity_key_null"
+        else:
+            state = "dangling_root_link"
+            link_status = f"identity_key={incarnation.get('identity_key')} -> (root missing)"
+        missing = {
+            "identity_key": None,
+            "state": state,
+            "resumable": False,
+            "reason": "identity_missing",
+            "provider": incarnation.get("provider") if incarnation else None,
+            "history_lifecycle": incarnation.get("lifecycle") if incarnation else None,
+            "link_status": link_status,
+            "creation_evidence": (
+                {
+                    "terminal_id": incarnation.get("terminal_id"),
+                    "created_at": incarnation.get("created_at"),
+                    "cwd": incarnation.get("cwd"),
+                    "session_name": incarnation.get("session_name"),
+                }
+                if incarnation
+                else None
+            ),
+        }
+        if as_json:
+            click.echo(_json.dumps(missing, default=str, indent=2))
+            return
+        click.echo(f"identity_key: null  state={state}  resumable=false  reason=identity_missing")
+        click.echo(f"  provider={missing['provider'] or '-'}  link={link_status}")
+        click.echo(f"  history_lifecycle={missing['history_lifecycle'] or '-'}")
+        if missing["creation_evidence"]:
+            click.echo(f"  creation_evidence={missing['creation_evidence']}")
+        return
+
     key = root["identity_key"]
+    # States 4/5: the root exists — annotate owner/binding for the operator.
+    if root.get("owner_principal") is None:
+        root_state = "root_present_owner_unknown"
+    elif not root.get("provider_session_id"):
+        root_state = "binding_or_artifact_missing"
+    else:
+        root_state = "root_present"
     incarnations = get_conversation_incarnations(key)
     events = get_conversation_events(key)
     if as_json:
         click.echo(
             _json.dumps(
-                {"root": root, "incarnations": incarnations, "events": events},
+                {
+                    "root": root,
+                    "state": root_state,
+                    "incarnations": incarnations,
+                    "events": events,
+                },
                 default=str,
                 indent=2,
             )
         )
         return
     click.echo(_fmt_row(root))
+    click.echo(f"  state={root_state}  owner={root.get('owner_principal') or 'none'}")
     click.echo(f"  incarnations ({len(incarnations)}):")
     for inc in incarnations:
         click.echo(
@@ -133,3 +207,29 @@ def identity_claim(identity_key: str, owner_principal: str) -> None:
         )
     else:
         raise click.ClickException(f"claim failed: {status}")
+
+
+@identity.command("release")
+@click.argument("identity_key")
+@click.option("--owner", "owner_principal", required=True, help="The owning principal (mailbox).")
+def identity_release(identity_key: str, owner_principal: str) -> None:
+    """F829 A2.5: owner-guarded release of a LEAKED resume claim (operator recovery).
+
+    Clears a stuck ``resume_claim`` (a resume attempt that died before the claim
+    was reconciled by its TTL) ONLY when ``--owner`` matches the root's recorded
+    owner. A recoverer cannot release a claim on a conversation it does not own.
+    """
+    from cli_agent_orchestrator.clients.database import release_resume_claim_owned
+
+    res = release_resume_claim_owned(identity_key, owner_principal)
+    if res.get("released"):
+        click.echo(f"released: {identity_key} (claim cleared)")
+        return
+    reason = res.get("reason")
+    if reason == "not_owner":
+        raise click.ClickException("not the owner of this identity")
+    if reason == "unknown_identity":
+        raise click.ClickException(f"no conversation identity '{identity_key}'")
+    if reason == "no_active_claim":
+        raise click.ClickException("no active resume claim to release")
+    raise click.ClickException(f"release failed: {reason}")
