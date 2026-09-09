@@ -55,6 +55,36 @@ CLASS_RESUME = "resume"
 CLASS_LEGACY = "legacy"
 _VALID_CLASSES = (CLASS_ROUTING, CLASS_EXPLICIT, CLASS_RESUME, CLASS_LEGACY)
 
+# F868 #724 r4 (codex Stage B r2 = EMPIRICAL-GATE-NO) — the request class is a
+# SERVER-SIDE property of the request shape (position vs legacy vs composed
+# literal, plus resume/override), NOT a value a public caller may assert. Before
+# r4 the HTTP create surfaces trusted a ``cell_request_class`` query parameter:
+# a caller could send a POSITION name with ``cell_request_class=legacy`` and the
+# guard returned its legacy passthrough BEFORE position parsing, so the position
+# reached ``create_terminal`` with no ``resolve_routing_binding`` and no
+# certification check (same on a resume create). r4 derives the class here and
+# REFUSES any caller-supplied class that disagrees with the derived one — a
+# forged class can never enter the ``legacy`` (or any weaker) passthrough.
+E_CELL_CLASS_FORGED = "E-CELL-CLASS-FORGED"
+
+
+class CellClassForged(Exception):
+    """A caller-supplied ``cell_request_class`` disagreed with the class the
+    server derives from the request shape (F868 #724 r4).
+
+    Raised at the HTTP boundary BEFORE any terminal is created or any resume
+    claim is taken, so a forged class produces a typed refusal and zero spawn.
+    Carries the stable ``.code`` (``E-CELL-CLASS-FORGED``), the ``.derived`` and
+    ``.supplied`` classes, and an operator-facing ``.message``.
+    """
+
+    def __init__(self, derived: str, supplied: str, message: str):
+        super().__init__(message)
+        self.code = E_CELL_CLASS_FORGED
+        self.derived = derived
+        self.supplied = supplied
+        self.message = message
+
 
 class CellGuardRefused(Exception):
     """A (position, provider) cell was refused admission at the choke point.
@@ -300,3 +330,54 @@ def classify_request(
         return CLASS_EXPLICIT
 
     return CLASS_LEGACY
+
+
+def reconcile_request_class(
+    agent_profile: str,
+    *,
+    provider_supplied: bool,
+    is_resume: bool = False,
+    resume_override: bool = False,
+    supplied_class: Optional[str] = None,
+) -> str:
+    """Derive the D5 request class SERVER-SIDE and refuse a forged override
+    (F868 #724 r4).
+
+    Computes the authoritative class from the request SHAPE via
+    :func:`classify_request`, then:
+
+    * if ``supplied_class`` is ``None`` (no caller value) → return the derived
+      class. This is the normal HTTP path — the class is a pure function of the
+      request the boundary already parsed.
+    * if ``supplied_class`` EQUALS the derived class → return it (the trusted
+      MCP ``_create_terminal`` client already classified identically; its value
+      is accepted because it agrees).
+    * otherwise → raise :class:`CellClassForged`. A public caller cannot label a
+      POSITION request ``legacy`` (or any class weaker than the shape implies)
+      to slip past the certification choke point.
+
+    An unknown ``supplied_class`` (outside :data:`_VALID_CLASSES`) is treated as
+    a disagreement unless it happens to equal the derived class, so garbage
+    values are refused rather than silently coerced.
+
+    The refusal is raised BEFORE any create call or resume claim, so a forged
+    class yields a typed error and zero spawn.
+    """
+    derived = classify_request(
+        agent_profile,
+        provider_supplied=provider_supplied,
+        is_resume=is_resume,
+        resume_override=resume_override,
+    )
+    if supplied_class is None or supplied_class == derived:
+        return derived
+    raise CellClassForged(
+        derived,
+        supplied_class,
+        (
+            f"{E_CELL_CLASS_FORGED}: caller-supplied cell_request_class "
+            f"'{supplied_class}' disagrees with the server-derived class "
+            f"'{derived}' for agent_profile '{agent_profile}' — the request "
+            "class is derived from the request shape and may not be overridden"
+        ),
+    )

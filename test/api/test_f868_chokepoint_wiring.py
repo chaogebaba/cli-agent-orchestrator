@@ -92,22 +92,54 @@ def test_post_sessions_legacy_name_threads_legacy(client):
     assert mock.create_session.call_args.kwargs["cell_request_class"] == "legacy"
 
 
-def test_post_sessions_client_class_override_wins(client):
-    """The MCP _create_terminal client already classified; an explicit
-    cell_request_class query param WINS over the route's re-classification."""
+def test_post_sessions_client_class_agreeing_is_accepted(client):
+    """F868 r4: the MCP _create_terminal client already classified; a
+    caller-supplied cell_request_class that AGREES with the server-derived class
+    is accepted and threads through. Here dev-kiro_cli (composed literal on a
+    real position) derives EXPLICIT, and the client sends explicit."""
     mock = MagicMock()
     mock.create_session = AsyncMock(return_value=_terminal())
-    with patch("cli_agent_orchestrator.api.main.session_service", mock):
+    with (
+        patch("cli_agent_orchestrator.api.main.session_service", mock),
+        patch("cli_agent_orchestrator.utils.agent_profiles._position_exists", return_value=True),
+    ):
         resp = client.post(
             "/sessions",
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "dev-kiro_cli",
-                "cell_request_class": "routing",
+                "cell_request_class": "explicit",
             },
         )
     assert resp.status_code == 201
-    assert mock.create_session.call_args.kwargs["cell_request_class"] == "routing"
+    assert mock.create_session.call_args.kwargs["cell_request_class"] == "explicit"
+
+
+def test_post_sessions_forged_class_is_refused(client):
+    """MUTANT KILLER (F868 r4, codex Stage B r2 EMPIRICAL-NO): a POSITION name
+    sent with a forged cell_request_class=legacy (to skip certification) is
+    refused with a typed E-CELL-CLASS-FORGED 403 and NO create. Trusting the
+    query param again (returning it verbatim) goes RED."""
+    mock = MagicMock()
+    mock.create_session = AsyncMock(return_value=_terminal())
+    with (
+        patch("cli_agent_orchestrator.api.main.session_service", mock),
+        patch("cli_agent_orchestrator.utils.agent_profiles._position_exists", return_value=True),
+    ):
+        resp = client.post(
+            "/sessions",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "dev",
+                "cell_request_class": "legacy",
+            },
+        )
+    assert resp.status_code == 403
+    body = resp.json()["detail"]
+    assert body["code"] == "E-CELL-CLASS-FORGED"
+    assert body["derived"] == "explicit"
+    assert body["supplied"] == "legacy"
+    mock.create_session.assert_not_called()
 
 
 # ==========================================================================
@@ -115,32 +147,81 @@ def test_post_sessions_client_class_override_wins(client):
 # ==========================================================================
 
 
-def test_post_terminals_route_threads_client_class(client):
+def test_post_terminals_route_agreeing_class_threads(client):
     """MUTANT KILLER (B3, assign's real route): POST /sessions/{s}/terminals is
-    what assign posts to. It must forward the caller's cell_request_class to
-    create_terminal verbatim. Dropping the kwarg goes RED."""
+    what assign posts to. F868 r4: the class is DERIVED server-side; a
+    caller-supplied class that AGREES with the derived one is accepted and
+    threaded to create_terminal. dev-kiro_cli derives EXPLICIT; the client sends
+    explicit. Dropping the kwarg (or not threading the derived class) goes RED."""
     mock = MagicMock()
     mock.create_terminal = AsyncMock(return_value=_terminal())
     mock.seed_resume_bootstrap = AsyncMock(return_value=None)
-    with patch("cli_agent_orchestrator.api.main.terminal_service", mock):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_service", mock),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=True,
+        ),
+    ):
         resp = client.post(
             "/sessions/cao-f868/terminals",
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "dev-kiro_cli",
-                "cell_request_class": "routing",
+                "cell_request_class": "explicit",
             },
         )
     assert resp.status_code == 201
-    assert mock.create_terminal.call_args.kwargs["cell_request_class"] == "routing"
+    assert mock.create_terminal.call_args.kwargs["cell_request_class"] == "explicit"
 
 
-def test_post_terminals_route_default_class_is_explicit(client):
-    """With no client class param the route defaults to EXPLICIT (fail-closed)."""
+def test_post_terminals_route_forged_class_is_refused(client):
+    """MUTANT KILLER (B3, F868 r4, codex Stage B r2 EMPIRICAL-NO): assign's real
+    route must NOT forward a forged class verbatim. A POSITION name sent with
+    cell_request_class=legacy is refused with a typed E-CELL-CLASS-FORGED 403 and
+    NO create_terminal call. The pre-r4 verbatim-forward behaviour goes RED."""
     mock = MagicMock()
     mock.create_terminal = AsyncMock(return_value=_terminal())
     mock.seed_resume_bootstrap = AsyncMock(return_value=None)
-    with patch("cli_agent_orchestrator.api.main.terminal_service", mock):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_service", mock),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=True,
+        ),
+    ):
+        resp = client.post(
+            "/sessions/cao-f868/terminals",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "dev",
+                "cell_request_class": "legacy",
+            },
+        )
+    assert resp.status_code == 403
+    body = resp.json()["detail"]
+    assert body["code"] == "E-CELL-CLASS-FORGED"
+    assert body["derived"] == "explicit"
+    assert body["supplied"] == "legacy"
+    mock.create_terminal.assert_not_called()
+
+
+def test_post_terminals_route_omitted_class_uses_derived(client):
+    """With NO cell_request_class param the route DERIVES the class server-side
+    (no forgeable default). dev-kiro_cli + provider derives EXPLICIT and threads
+    it through. A default that got validated against the derived class (the r4
+    bug where the "explicit" literal default disagreed with a legacy derivation)
+    goes RED."""
+    mock = MagicMock()
+    mock.create_terminal = AsyncMock(return_value=_terminal())
+    mock.seed_resume_bootstrap = AsyncMock(return_value=None)
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_service", mock),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=True,
+        ),
+    ):
         resp = client.post(
             "/sessions/cao-f868/terminals",
             params={"provider": "kiro_cli", "agent_profile": "dev-kiro_cli"},
@@ -218,3 +299,138 @@ async def test_run_agent_step_forwards_cell_request_class():
             pass  # we only care that create_terminal was reached with the class
 
     assert created.get("cell_request_class") == "routing"
+
+
+# ==========================================================================
+# F868 r4 — the forged-class bypass on the resume_from create surface
+# ==========================================================================
+
+
+def _admit_resume_stub(claimed_key="rk-1"):
+    """Stand in for _f829_admit_resume: return a link admission + a claimed key
+    + resolved overrides, so the resume path proceeds to the cell-class
+    reconcile without a live cao-server."""
+
+    async def _stub(**_kwargs):
+        overrides = {
+            "provider": "kiro_cli",
+            "agent_profile": "dev",
+            "working_directory": "/repo/wt",
+            "fork_context": None,
+            "authority_files": None,
+        }
+        return (object(), claimed_key, overrides)
+
+    return _stub
+
+
+def test_resume_from_forged_class_is_refused_and_compensates_claim(client):
+    """MUTANT KILLER (F868 r4, codex Stage B r2 EMPIRICAL-NO): a resume_from
+    create carrying a POSITION name with a forged cell_request_class=legacy is
+    refused with a typed E-CELL-CLASS-FORGED 403, NO create_terminal call, and
+    the resume claim taken during admission is COMPENSATED (cleared). The pre-r4
+    behaviour (forwarding the query param verbatim into create_terminal) goes
+    RED. A bare position supplied on resume derives EXPLICIT (the caller's own
+    cell choice), so legacy is a forgery."""
+    svc = MagicMock()
+    svc.create_terminal = AsyncMock(return_value=_terminal())
+    svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+    cleared = {}
+
+    def _clear(key, event=None):
+        cleared["key"] = key
+        cleared["event"] = event
+
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_service", svc),
+        patch(
+            "cli_agent_orchestrator.api.main._f829_admit_resume",
+            new=_admit_resume_stub("rk-forged"),
+        ),
+        patch("cli_agent_orchestrator.clients.database.clear_resume_claim", new=_clear),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=True,
+        ),
+    ):
+        resp = client.post(
+            "/sessions/cao-f868/terminals",
+            params={
+                "agent_profile": "dev",
+                "cell_request_class": "legacy",
+            },
+            json={"resume_from": "old12345"},
+        )
+    assert resp.status_code == 403
+    body = resp.json()["detail"]
+    assert body["code"] == "E-CELL-CLASS-FORGED"
+    assert body["supplied"] == "legacy"
+    # bare position on resume => the caller's EXPLICIT cell choice
+    assert body["derived"] == "explicit"
+    svc.create_terminal.assert_not_called()
+    # the resume claim taken during admission was compensated
+    assert cleared.get("key") == "rk-forged"
+    assert cleared.get("event") == "resume_failed"
+
+
+def test_resume_from_agreeing_class_proceeds(client):
+    """A plain resume (no bare-position override) derives RESUME; a client that
+    sends cell_request_class=resume AGREES and the create proceeds with the
+    derived class. Confirms the reconcile does not spuriously refuse a genuine
+    resume."""
+    svc = MagicMock()
+    svc.create_terminal = AsyncMock(return_value=_terminal())
+    svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_service", svc),
+        patch(
+            "cli_agent_orchestrator.api.main._f829_admit_resume",
+            new=_admit_resume_stub("rk-ok"),
+        ),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=False,
+        ),
+    ):
+        resp = client.post(
+            "/sessions/cao-f868/terminals",
+            params={
+                "agent_profile": "my_legacy_worker",
+                "cell_request_class": "resume",
+            },
+            json={"resume_from": "old12345"},
+        )
+    assert resp.status_code == 201
+    assert svc.create_terminal.call_args.kwargs["cell_request_class"] == "resume"
+
+
+def test_post_sessions_start_has_no_forgeable_class_param(client):
+    """POST /sessions/start derives the class server-side and exposes NO
+    cell_request_class query param, so it cannot be forged. Passing one is
+    ignored (FastAPI drops the unknown query param); the derived class is used."""
+    mock = MagicMock()
+    mock.start_session = AsyncMock(
+        return_value={
+            "schema_version": "cao.session-start/v1",
+            "session": {"name": "cao-f868"},
+            "supervisor_terminal": _terminal().model_dump(mode="json"),
+            "bootstrap": {"mode": "not_applicable", "status": "not_required"},
+            "manifest": None,
+            "manifest_error": None,
+        }
+    )
+    with (
+        patch("cli_agent_orchestrator.api.main.session_service", mock),
+        patch("cli_agent_orchestrator.utils.agent_profiles._position_exists", return_value=True),
+    ):
+        resp = client.post(
+            "/sessions/start",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "dev",
+                "cell_request_class": "legacy",  # ignored — not a route param
+            },
+        )
+    assert resp.status_code == 200
+    # server-derived EXPLICIT, NOT the forged legacy
+    assert mock.start_session.call_args.kwargs["cell_request_class"] == "explicit"

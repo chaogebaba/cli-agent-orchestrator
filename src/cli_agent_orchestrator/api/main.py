@@ -219,7 +219,9 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.cell_guard import CellClassForged
 from cli_agent_orchestrator.utils.cell_guard import classify_request as cell_guard_classify_request
+from cli_agent_orchestrator.utils.cell_guard import reconcile_request_class as cell_guard_reconcile
 from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -3900,11 +3902,17 @@ async def create_session(
         # its (position, provider) cell so the shared choke point in
         # create_terminal enforces the right certification asymmetry. A bare
         # position + provider= (or a composed literal) is EXPLICIT; a bare
-        # position with no provider is ROUTING; a legacy name is untouched. An
-        # explicit ``cell_request_class`` query param (from the MCP _create_terminal
-        # client, which already classified) WINS over re-classification here.
-        _cell_class = cell_request_class or cell_guard_classify_request(
-            agent_profile, provider_supplied=provider is not None
+        # position with no provider is ROUTING; a legacy name is untouched.
+        # F868 r4 (codex Stage B r2 EMPIRICAL-NO): the class is DERIVED here from
+        # the request shape and is NOT a value the caller may assert. The trusted
+        # MCP _create_terminal client already classified identically, so its
+        # ``cell_request_class`` query value is accepted only when it AGREES with
+        # the server-derived class; a disagreement (e.g. a POSITION name labelled
+        # ``legacy`` to skip certification) is a typed refusal with zero spawn.
+        _cell_class = cell_guard_reconcile(
+            agent_profile,
+            provider_supplied=provider is not None,
+            supplied_class=cell_request_class,
         )
 
         create_kwargs: Dict[str, Any] = dict(
@@ -3974,6 +3982,20 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except CellClassForged as e:
+        # F868 r4: a caller-supplied cell_request_class disagreed with the class
+        # the server derives from the request shape (e.g. a POSITION name sent
+        # with cell_request_class=legacy to skip certification). Refuse with a
+        # typed 403 BEFORE any create — zero spawn, zero claim.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": e.code,
+                "message": e.message,
+                "derived": e.derived,
+                "supplied": e.supplied,
+            },
+        ) from e
     except MailboxDomainError as e:
         raise _mailbox_http_exception(e) from e
     except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as e:
@@ -4646,7 +4668,7 @@ async def create_terminal_in_session(
     use_worktree: Optional[bool] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
-    cell_request_class: str = "explicit",
+    cell_request_class: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4695,6 +4717,13 @@ async def create_terminal_in_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _admit_supplied_terminal_id(terminal_id)
+    # F868 r4: capture the request shape the CALLER named, before resume
+    # admission overwrites agent_profile/provider from the reaped root. The
+    # server-derived cell class (and the forged-class refusal) is computed from
+    # what the caller actually sent, mirroring the MCP _assign_impl client's own
+    # classification (_resume_override = a position name supplied on resume).
+    _orig_agent_profile = agent_profile
+    _orig_provider_supplied = provider is not None
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -4838,6 +4867,47 @@ async def create_terminal_in_session(
                 fork_context = await terminal_service.seed_resume_bootstrap(
                     agent_profile, resolved_provider, working_directory or os.getcwd()
                 )
+        # F868 r4 (codex Stage B r2 EMPIRICAL-NO): DERIVE the cell class from the
+        # request shape the caller named and REFUSE a forged override. Before r4
+        # this route passed the caller's ``cell_request_class`` query param to
+        # create_terminal verbatim, so a POSITION name sent with
+        # ``cell_request_class=legacy`` reached the guard's legacy passthrough and
+        # skipped certification (also on a resume create). The class is now a pure
+        # function of (agent_profile shape, provider presence, resume state); the
+        # trusted MCP _assign_impl client already classifies identically, so its
+        # value is accepted only when it AGREES. A disagreement is a typed refusal
+        # raised HERE — after any resume claim is compensated by the except below.
+        _is_resume = bool(_resume_handle)
+        # Reference _position_exists through the module (not a bound import) so
+        # the same runtime store the guard uses is consulted, and so tests that
+        # patch it are honoured. A bare POSITION name supplied on resume is the
+        # caller's EXPLICIT cell choice (mirrors _assign_impl's _resume_override).
+        from cli_agent_orchestrator.utils import agent_profiles as _ap
+
+        _resume_override = _is_resume and _ap._position_exists(_orig_agent_profile)
+        try:
+            _cell_class = cell_guard_reconcile(
+                _orig_agent_profile,
+                provider_supplied=_orig_provider_supplied,
+                is_resume=_is_resume,
+                resume_override=_resume_override,
+                supplied_class=cell_request_class,
+            )
+        except CellClassForged:
+            # Compensate a taken resume claim before surfacing the refusal — a
+            # leaked claim would wedge the conversation until its TTL.
+            if _f829_claimed_key is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import clear_resume_claim
+
+                    clear_resume_claim(_f829_claimed_key, event="resume_failed")
+                except Exception:
+                    logger.warning(
+                        "F868 r4: claim compensation failed for %s",
+                        _f829_claimed_key,
+                        exc_info=True,
+                    )
+            raise
         try:
             result = await terminal_service.create_terminal(
                 provider=resolved_provider,
@@ -4874,7 +4944,7 @@ async def create_terminal_in_session(
                 ),
                 terminal_id=terminal_id,
                 is_box_hosted=is_box_hosted,
-                cell_request_class=cell_request_class,
+                cell_request_class=_cell_class,
                 root_admission=_f829_link_admission,
             )
         except BaseException:
@@ -4902,6 +4972,21 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except CellClassForged as _forged:
+        # F868 r4: the caller-supplied cell_request_class disagreed with the
+        # server-derived class (e.g. a POSITION name sent with
+        # cell_request_class=legacy, or a forged class on a resume_from create).
+        # Any taken resume claim was already compensated at the raise site.
+        # Typed 403, zero spawn.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": _forged.code,
+                "message": _forged.message,
+                "derived": _forged.derived,
+                "supplied": _forged.supplied,
+            },
+        ) from _forged
     except (PrincipalRefused, SeededSessionConflict) as _f829_exc:
         # F829 A2.3: a root-admission refusal from the create transaction
         # (a fresh seeded-uuid collision, or an unresolvable owner principal)
