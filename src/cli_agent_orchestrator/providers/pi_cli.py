@@ -731,6 +731,16 @@ class PiCliProvider(BaseProvider):
            BELOW the live working row, else the tail-window max), which BOTH the
            candidate qualifier and the composer-below structure consume. No
            consumer reads the whole-buffer maximum any more.
+
+           F847 r10 (#703): codex r9 EMPIRICAL-GATE-NO item 1. r9 wired the
+           structural width into the candidate qualifier but left the
+           composer-below check width-AGNOSTIC, so an adjacent narrow RESIZE
+           redraw pair (two 20-column artifacts) below a genuine 100-column live
+           working row was accepted as a complete idle composer and produced a
+           false COMPLETED (ADV-adjacent-narrow-resize-pair). Both consumers now
+           consume the ONE derived ``composer_width``: the below-check requires the
+           idle-composer rule PAIR to equal it, so only the current composer's own
+           width counts as its box.
         """
         lines = clean.splitlines()
         # 1) drop fenced rows (quoted spinner is not live)
@@ -811,15 +821,32 @@ class PiCliProvider(BaseProvider):
         #
         # F847 r9 (#703): ``composer_width`` above is the CURRENT composer's width
         # from ``_current_composer_width`` (structural), NOT the whole-buffer
-        # maximum — see step 5. This below-check was already width-agnostic (it
-        # matches a same-width pair at ANY width), so it needed no change to close
-        # the r8 blocker; the fix was deleting the global maximum from the
-        # candidate qualifier.
+        # maximum — see step 5.
+        #
+        # F847 r10 (#703) — codex r9 EMPIRICAL-GATE-NO item 1. The frozen repair
+        # contract requires BOTH consumers — the full-width candidate qualifier
+        # (step 5) AND this complete-composer-below check — to consume the ONE
+        # derived current ``composer_width``. r9 left this check width-AGNOSTIC (it
+        # matched a same-width pair at ANY width), which is a hole: a genuine live
+        # 100-column working row whose current composer draws TWO adjacent 20-column
+        # RESIZE redraw artifacts (plus the single real 100-column bottom rule and a
+        # footer) below it had that 20/20 artifact pair accepted as a "complete idle
+        # composer", so the live working row was disqualified and the pane read a
+        # false COMPLETED (ADV-adjacent-narrow-resize-pair). The pair is therefore
+        # required to equal the derived ``composer_width``: only a rule pair at the
+        # CURRENT composer's own width counts as its idle-composer box. The 20/20
+        # artifact pair (20 != 100) no longer qualifies, so the live working row
+        # stays PROCESSING; the r7/r8 stale-wider and two-composer COMPLETED
+        # contracts keep their genuine width-``composer_width`` idle pair below the
+        # wrap candidate and remain COMPLETED. The "nothing WIDER than the pair
+        # sandwiched between its members" cleanliness clause is retained (it still
+        # separates a genuine box from a resize double-draw at the composer width
+        # itself, e.g. the committed ``working-resize-3rule`` frame).
         def _clean_same_width_rule_pair_below(idx: int) -> bool:
             rule_widths = [_visible_width(r) for r in unfenced[idx + 1 :] if _EDITOR_RULE.match(r)]
             for i in range(len(rule_widths)):
                 for j in range(i + 1, len(rule_widths)):
-                    if rule_widths[i] == rule_widths[j] and all(
+                    if rule_widths[i] == rule_widths[j] == composer_width and all(
                         rule_widths[k] <= rule_widths[i] for k in range(i + 1, j)
                     ):
                         return True

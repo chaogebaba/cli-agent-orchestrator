@@ -1109,6 +1109,137 @@ class TestFalseIdleWorkingSpinner:
             provider.get_status(full_buf) == TerminalStatus.PROCESSING
         ), "the exact-width 100-col control must be PROCESSING"
 
+    # ── #703 r10: item 1 — the below-check must consume the derived width ───────
+    # (codex r9 EMPIRICAL-GATE-NO item 1). r9 wired ``_current_composer_width``
+    # into the CANDIDATE qualifier but left ``_clean_same_width_rule_pair_below``
+    # width-AGNOSTIC. The frozen repair contract requires BOTH consumers to use
+    # the ONE derived current-composer width. The adversary below is the verdict's
+    # ADV-adjacent-narrow-resize-pair, built from the genuine resize-family
+    # geometry (the committed ``working-resize-3rule`` frame's 20-column artifact
+    # class): a genuine 100-column live working top border, TWO adjacent 20-column
+    # redraw artifacts, the single real 100-column bottom rule, and a footer.
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_adjacent_narrow_resize_pair_below_live_row_is_processing(self, _native) -> None:
+        """ADV-adjacent-narrow-resize-pair (codex r9 EMPIRICAL-GATE-NO item 1): a
+        genuine live 100-column working row whose current composer draws TWO
+        ADJACENT 20-column RESIZE redraw artifacts below it (plus the single real
+        100-column bottom rule and a footer) must stay PROCESSING.
+
+        ``_current_composer_width`` is 100 (max rule below the live working row:
+        20, 20, 100), so the 100-column working row qualifies as a candidate.
+        RED on r9: ``_clean_same_width_rule_pair_below`` was width-agnostic, so the
+        ADJACENT 20/20 artifact pair (nothing wider sandwiched between the two
+        20-column rows) satisfied it, plus the footer disqualified the live row as
+        "a complete idle composer below" → a FALSE COMPLETED on a working pane.
+        GREEN on r10: the check requires the rule pair to equal the derived
+        ``composer_width`` (100), so the 20/20 pair (20 != 100) is NOT a composer
+        box, the live working row is retained → PROCESSING.
+
+        The CONTROL keeps the composer's OWN 100-column pair below the live row (a
+        second 100-column rule replacing one 20-column artifact) with a footer: it
+        is COMPLETED under BOTH r9 and r10 (a genuine same-width-100 idle composer
+        follows the row), isolating the artifact WIDTH — not the mere presence of
+        a pair — as what r10 newly excludes."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        live = _working_row("⠧", 100)
+        assert _visible_width(live) == 100
+        adversary = "\n".join(
+            [
+                " prior transcript output",
+                live,  # the GENUINE 100-col live working top border
+                " editor content",
+                "─" * 20,  # ┐ two ADJACENT 20-col resize redraw artifacts
+                "─" * 20,  # ┘ (a same-width pair at the WRONG width)
+                "─" * 100,  # the single REAL 100-col current-composer bottom rule
+                self._FOOTER,
+            ]
+        )
+        assert provider.get_status(adversary) == TerminalStatus.PROCESSING, (
+            "an adjacent 20/20 resize-artifact pair below a genuine live 100-col "
+            "working row must NOT be read as a complete idle composer "
+            "(ADV-adjacent-narrow-resize-pair, r9 read COMPLETED)"
+        )
+        # CONTROL: a genuine 100-col idle-composer PAIR below the live row (both
+        # the artifact rows widened to the composer width) → COMPLETED on r9 AND
+        # r10 (the pair equals composer_width either way).
+        control = "\n".join(
+            [
+                " prior transcript output",
+                live,
+                " editor content",
+                "─" * 100,  # ┐ a genuine same-width-100 idle composer pair
+                " ",
+                "─" * 100,  # ┘
+                self._FOOTER,
+            ]
+        )
+        assert provider.get_status(control) == TerminalStatus.COMPLETED, (
+            "control with a genuine 100-col idle-composer pair below the row must "
+            "be COMPLETED on both r9 and r10 (isolates artifact width as the cause)"
+        )
+
+    # ── #703 r10: item 2 — pin the BOTTOM-MOST working-row anchor (Stage A OWN-1)
+    # (codex r9 EMPIRICAL-GATE-NO item 2). ``_current_composer_width`` anchors on
+    # ``working_idxs[-1]`` — the BOTTOM-MOST working row is the CURRENT composer's
+    # top border. The Stage A OWN-1 mutant replaces ``[-1]`` with ``[0]`` (top-most
+    # anchor) and survived all 70 committed non-archive tests. This is the missing
+    # rolling-buffer shape that KILLS it: a STALE 120-column working row and its
+    # COMPLETED 120-column redraw (a complete 120-col idle composer box) ABOVE a
+    # genuine CURRENT 100-column live working composer.
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_stale_wide_working_above_live_narrow_pins_bottom_anchor(self, _native) -> None:
+        """Pins the BOTTOM-MOST working-row anchor in ``_current_composer_width``
+        (Stage A OWN-1: ``working_idxs[-1]`` → ``[0]``).
+
+        Rolling-buffer shape (the r9 verdict's exact construction): a STALE
+        120-column working row from an OLD frame, its COMPLETED redraw — a complete
+        120-column idle composer box (a 120-col rule pair + footer) — then the
+        GENUINE CURRENT 100-column live working top border, its editor body, the
+        current composer's own 100-column bottom rule, and a footer.
+
+        GREEN on r10: the width is anchored on the BOTTOM-MOST working row (the
+        current 100-col composer), so the rule below it is 100, the live 100-col
+        working row qualifies, and there is no complete 100-col composer below it →
+        PROCESSING.
+
+        RED under the OWN-1 mutant (``working_idxs[0]``, top-most anchor): the
+        width is derived from the STALE 120-col working row, whose rules below it
+        include the old frame's 120-col redraw → ``composer_width`` = 120. The
+        genuine 100-col live working row then fails ``== 120`` and is dropped from
+        candidates, while the stale 120-col working row sits above its OWN complete
+        120-col idle composer (rule pair + footer) and is disqualified → NO valid
+        candidate, so the idle-chrome fallback returns COMPLETED: a false, delivery-
+        eligible idle on a working pane. The bottom-most anchor is therefore
+        load-bearing and this frame is its committed killer."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        stale_working = _working_row("⠹", 120)  # a STALE 120-col working row (old frame)
+        live = _working_row("⠧", 100)  # the GENUINE current 100-col live working row
+        assert _visible_width(stale_working) == 120
+        assert _visible_width(live) == 100
+        buffer = "\n".join(
+            [
+                " prior transcript output",
+                stale_working,  # the STALE 120-col working row, high in scrollback
+                " stale editor body",
+                "─" * 120,  # ┐ its COMPLETED redraw: a complete 120-col idle
+                " stale composer line",  #   composer box (a 120-col rule PAIR + footer)
+                "─" * 120,  # ┘
+                self._FOOTER,
+                " turn 2 output",
+                live,  # the GENUINE CURRENT 100-col live working top border
+                " editor content",
+                "─" * 100,  # the current composer's own 100-col bottom rule
+                self._FOOTER,
+            ]
+        )
+        assert provider.get_status(buffer) == TerminalStatus.PROCESSING, (
+            "a genuine current 100-col live working composer BELOW a stale 120-col "
+            "working row and its completed 120-col redraw must be PROCESSING "
+            "(bottom-most anchor; the top-most-anchor OWN-1 mutant reads COMPLETED)"
+        )
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_archive_live_frames_all_processing(self, _native) -> None:
         """OPTIONAL, non-load-bearing arm: the full inherited live pi 0.85.1
