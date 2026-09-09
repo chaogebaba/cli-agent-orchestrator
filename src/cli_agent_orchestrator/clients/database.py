@@ -5648,6 +5648,34 @@ def clear_resume_claim(identity_key: str, *, event: Optional[str] = None) -> Non
         record_conversation_event(identity_key, event)
 
 
+def release_resume_claim_owned(identity_key: str, owner_principal: str) -> Dict[str, Any]:
+    """F829 A2.5: owner-guarded release of a LEAKED resume claim (operator recovery).
+
+    Backs ``cao identity release <key> --owner <principal>``. Clears the claim
+    ONLY when ``owner_principal`` matches the root's recorded owner — a recoverer
+    cannot release a claim on a conversation it does not own. Returns a small
+    result dict: ``{released: bool, reason: str}``.
+
+    Distinct from ``clear_resume_claim`` (an internal compensator that runs on
+    the server's own spawn-failure path and takes no owner argument): this is the
+    authorized OPERATOR verb.
+    """
+    with SessionLocal.begin() as db:
+        row = db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        if row is None:
+            return {"released": False, "reason": "unknown_identity"}
+        if row.owner_principal is None or row.owner_principal != owner_principal:
+            return {"released": False, "reason": "not_owner"}
+        if row.resume_claim is None:
+            return {"released": False, "reason": "no_active_claim"}
+        row.resume_claim = None
+        row.resume_claim_at = None
+        row.updated_at = _utcnow()
+        db.flush()
+    record_conversation_event(identity_key, "claim_released_by_owner")
+    return {"released": True, "reason": "released"}
+
+
 def publish_current_terminal(
     identity_key: str,
     *,

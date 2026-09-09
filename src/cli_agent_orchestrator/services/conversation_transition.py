@@ -89,9 +89,19 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
 
     root = _root_for_terminal(terminal_id)
     if root is None:
-        # No F829 identity → no hibernate contract to enforce; let the ordinary
-        # reap proceed and set no conversation lifecycle.
-        return HibernateDecision(allowed=True, lifecycle=None)
+        # A2.4 (astra Q4): a terminal with no canonical root — or a dangling
+        # link — has no honest recovery promise. Refuse the PLANNED hibernate
+        # INTACT (resumable:false) with a typed ``identity_missing`` reason,
+        # BEFORE any destructive cleanup, so the caller may choose an explicit
+        # ``force`` reap (which proceeds with the same diagnosis and no recovery
+        # promise). Post-A2 every fresh spawn mints a root, so this is the
+        # missing/dangling-identity case, not the normal path.
+        return HibernateDecision(
+            allowed=False,
+            lifecycle=None,
+            reason="identity_missing",
+            detail="no canonical conversation root/link for this terminal",
+        )
 
     # A capture_unknown root (kiro/codex pre-capture) has no recoverable identity
     # yet — refuse under the same shape with the capture_unknown reason, without
@@ -225,8 +235,12 @@ def authorize_and_classify_resume(
 
     key = root["identity_key"]
     owner = root.get("owner_principal")
-    # AUTHORIZE. A NULL owner is NOT open season — it requires an explicit claim.
-    if owner is None or (caller_principal is not None and owner != caller_principal):
+    # AUTHORIZE (A2.2, bypass 1 closed). Refuse when the caller is MISSING, the
+    # owner is MISSING, or they differ. Previously a ``None`` caller_principal
+    # silently passed any non-NULL owner (`caller_principal is not None and …`)
+    # — a request that could not identify itself was authorized. A NULL owner is
+    # also NOT open season: it requires an explicit `cao identity claim`.
+    if caller_principal is None or owner is None or owner != caller_principal:
         return ResumeAdmission(ok=False, identity_key=key, error="resume_not_owner")
 
     # CLASSIFY.
