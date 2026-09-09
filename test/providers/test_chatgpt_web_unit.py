@@ -209,6 +209,68 @@ def test_ac6_still_working_returns_pending() -> None:
     assert result.partial_text == "partial"
 
 
+def test_ac6_empty_assistant_node_finished_status_is_pending_not_disagreement() -> None:
+    # F862 r2 live finding: mid-stream, an assistant node appears with
+    # status=finished_successfully but end_turn=False AND EMPTY content (the node
+    # is armed, the model is still emitting). This is still-working, NOT the D6
+    # disagreement error (which is only for a CONTENT-bearing node whose two
+    # terminal flags conflict).
+    mapping = {}
+    mapping.update(_user_node())
+    mapping.update(
+        _assistant_node("asst-1", USER_MSG_ID, "", end_turn=False, status="finished_successfully")
+    )
+    conv = _conv(current="asst-1", mapping=mapping)
+    result = evaluate_gate(
+        conv, submitted_user_msg_id=USER_MSG_ID, run_id=RUN_ID, bundle_sha=BUNDLE_SHA
+    )
+    assert isinstance(result, GatePending)
+
+
+def test_ac6_content_bearing_disagreement_still_errors() -> None:
+    # The D6 typed error is the DANGEROUS direction: end_turn claims the turn is
+    # done but status does NOT confirm success. (end_turn=False is just still-
+    # streaming — F862 r2 — and is pending, not a disagreement.)
+    mapping = {}
+    mapping.update(_user_node())
+    mapping.update(
+        _assistant_node(
+            "asst-1",
+            USER_MSG_ID,
+            _accepted_body("real content"),
+            end_turn=True,
+            status="in_progress",
+        )
+    )
+    conv = _conv(current="asst-1", mapping=mapping)
+    with pytest.raises(RunnerError) as ei:
+        evaluate_gate(conv, submitted_user_msg_id=USER_MSG_ID, run_id=RUN_ID, bundle_sha=BUNDLE_SHA)
+    assert ei.value.code is RunnerErrorCode.TRUNCATED_ANSWER
+
+
+def test_ac6_end_turn_false_finished_status_content_is_pending() -> None:
+    # F862 r2: status flips to finished_successfully on a still-GROWING node
+    # before end_turn is set. With end_turn False this is streaming -> pending,
+    # NOT a disagreement (the earlier over-strict check failed run c live).
+    mapping = {}
+    mapping.update(_user_node())
+    mapping.update(
+        _assistant_node(
+            "asst-1",
+            USER_MSG_ID,
+            "partial content so far",
+            end_turn=False,
+            status="finished_successfully",
+        )
+    )
+    conv = _conv(current="asst-1", mapping=mapping)
+    result = evaluate_gate(
+        conv, submitted_user_msg_id=USER_MSG_ID, run_id=RUN_ID, bundle_sha=BUNDLE_SHA
+    )
+    assert isinstance(result, GatePending)
+    assert result.partial_text == "partial content so far"
+
+
 def test_ac5_model_drift_rejected() -> None:
     mapping = {}
     mapping.update(_user_node())
@@ -357,11 +419,12 @@ def test_conversation_id_regex() -> None:
         extract_conversation_id("https://chatgpt.com/c/11111111-2222-3333-4444-555555555555")
         == "11111111-2222-3333-4444-555555555555"
     )
-    # F862 live-spike finding: this account prefixes the id with "WEB:" and the
-    # GET path uses the id VERBATIM, so the whole prefixed token is captured.
+    # F862 live finding: the FRONT-END route prefixes the id with "WEB:", but the
+    # BACKEND path keys on the BARE uuid — a prefixed id 429s on the backend
+    # (F862 r2 probe). So extraction returns the bare uuid.
     assert (
         extract_conversation_id("https://chatgpt.com/c/WEB:57998290-2fb2-4223-85bf-948330bc94ab")
-        == "WEB:57998290-2fb2-4223-85bf-948330bc94ab"
+        == "57998290-2fb2-4223-85bf-948330bc94ab"
     )
     assert extract_conversation_id("https://chatgpt.com/") is None
     assert len(new_run_id()) == 32
@@ -445,15 +508,15 @@ def test_ac11b_owned_conversation_and_auth_session_allowed() -> None:
     assert is_same_origin_read_allowed("https://chatgpt.com/api/auth/session", owned)
 
 
-def test_ac11b_web_prefixed_owned_conversation_allowed() -> None:
-    # F862 live-spike: the account's conversation id is WEB:<uuid>; the read
-    # exception must accept the exact owned id (used verbatim in the GET path).
-    owned = "WEB:57998290-2fb2-4223-85bf-948330bc94ab"
+def test_ac11b_bare_uuid_owned_conversation_allowed() -> None:
+    # F862 r2: the runner keys on the BARE uuid (front-end WEB: prefix is stripped
+    # at extraction), and the backend GET path uses that bare id.
+    owned = "57998290-2fb2-4223-85bf-948330bc94ab"
     assert is_same_origin_read_allowed(
         f"https://chatgpt.com/backend-api/conversation/{owned}", owned
     )
-    # A DIFFERENT WEB-prefixed id is still refused.
-    other = "https://chatgpt.com/backend-api/conversation/WEB:00000000-0000-0000-0000-000000000000"
+    # A DIFFERENT conversation id is still refused.
+    other = "https://chatgpt.com/backend-api/conversation/00000000-0000-0000-0000-000000000000"
     assert is_same_origin_read_allowed(other, owned) is False
 
 

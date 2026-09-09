@@ -209,17 +209,32 @@ def evaluate_gate(
             delivery_state=DeliveryState.DELIVERED,
         )
 
-    # Completion conjunction. end_turn AND status must BOTH be terminal-good;
-    # a disagreement is a typed error, never a tiebreak (D6).
+    # Extract the answer bytes first. An assistant node with NO content yet is a
+    # mid-stream state (the node exists but the model is still thinking/emitting),
+    # regardless of a transient status flag — treat it as still-working (D6:
+    # "turn identity, not finishedness"), NOT a disagreement.
+    try:
+        raw_text = extract_answer_text(msg)
+    except RunnerError:
+        # A non-text part on a not-yet-complete node is a transient stream frame,
+        # not a final answer — keep polling rather than failing on a partial.
+        if end_turn is not True:
+            return GatePending()
+        raise
+
     finished_status = status == "finished_successfully"
-    if end_turn is not True and not finished_status:
-        # Genuinely still working.
-        try:
-            partial = extract_answer_text(msg)
-        except RunnerError:
-            partial = None
-        return GatePending(partial_text=partial)
-    if bool(end_turn) != bool(finished_status):
+    # Completion is gated on end_turn (D6: "turn identity, not finishedness").
+    # While end_turn is not yet True the turn is STILL STREAMING — regardless of
+    # a transient status flag or partial content (F862 r2 live: status flips to
+    # finished_successfully on a growing node before end_turn is set). Carry the
+    # partial and keep polling; never a disagreement error in this direction.
+    if end_turn is not True:
+        return GatePending(partial_text=raw_text or None)
+
+    # end_turn IS True. Now the status MUST also be finished_successfully; a
+    # conflict here is the D6 typed error (claiming a finished turn the status
+    # does not confirm — the dangerous direction).
+    if not finished_status:
         raise RunnerError(
             RunnerErrorCode.TRUNCATED_ANSWER,
             f"end_turn/status disagreement (end_turn={end_turn!r}, status={status!r})",
@@ -231,6 +246,14 @@ def evaluate_gate(
         raise RunnerError(
             RunnerErrorCode.TRUNCATED_ANSWER,
             "assistant node carries an error or refusal state",
+            delivery_state=DeliveryState.DELIVERED,
+        )
+
+    # A finished (end_turn True) node with no text is a truncated answer.
+    if not raw_text.strip():
+        raise RunnerError(
+            RunnerErrorCode.TRUNCATED_ANSWER,
+            "accepted node produced empty answer text",
             delivery_state=DeliveryState.DELIVERED,
         )
 
@@ -259,13 +282,6 @@ def evaluate_gate(
             delivery_state=DeliveryState.DELIVERED,
         )
 
-    raw_text = extract_answer_text(msg)
-    if not raw_text.strip():
-        raise RunnerError(
-            RunnerErrorCode.TRUNCATED_ANSWER,
-            "accepted node produced empty answer text",
-            delivery_state=DeliveryState.DELIVERED,
-        )
     stripped = strip_sentinel(raw_text, run_id, bundle_sha)
 
     return AcceptedAnswer(

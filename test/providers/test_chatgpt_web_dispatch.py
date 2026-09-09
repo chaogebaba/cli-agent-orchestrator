@@ -306,3 +306,18 @@ def test_extract_last_message_raises() -> None:
     p = _provider("design_findings")
     with pytest.raises(ValueError):
         p.extract_last_message_from_script("anything")
+
+
+def test_newest_user_msg_id_picks_latest_user_node() -> None:
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import _newest_user_msg_id
+
+    conv = {
+        "mapping": {
+            "u1": {"message": {"id": "u1", "author": {"role": "user"}, "create_time": 10.0}},
+            "a1": {"message": {"id": "a1", "author": {"role": "assistant"}, "create_time": 11.0}},
+            "u2": {"message": {"id": "u2", "author": {"role": "user"}, "create_time": 20.0}},
+        }
+    }
+    assert _newest_user_msg_id(conv) == "u2"
+    assert _newest_user_msg_id({"mapping": {}}) == ""
+    assert _newest_user_msg_id({}) == ""

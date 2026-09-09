@@ -17,12 +17,14 @@ from typing import Optional
 from cli_agent_orchestrator.chatgpt_web_runner.errors import DeliveryState
 
 #: A chatgpt.com conversation URL carries ``/c/<id>`` (ask.ts:50). On the Plus
-#: account the id observed live in the F862 spike is ``WEB:<uuid>`` (an optional
-#: uppercase source-prefix before the uuid), and the conversation GET path uses
-#: that id VERBATIM — so the capture keeps the whole ``[A-Za-z]+:``-prefixed
-#: token, not just the bare uuid. A plain ``<uuid>`` (no prefix) still matches.
+#: account the FRONT-END route id observed live in the F862 spike is ``WEB:<uuid>``
+#: (an uppercase source-prefix before the uuid), but the BACKEND-API path
+#: (``/backend-api/conversation/<id>``) and the conversation-GET body key on the
+#: BARE uuid — a ``WEB:``-prefixed id on the backend path returns 429/400 (F862 r2
+#: probe: bare id -> 200 with a bearer; prefixed id -> 429). So the capture keeps
+#: only the bare uuid regardless of any front-end prefix.
 CONVERSATION_ID_RE = re.compile(
-    r"/c/((?:[A-Za-z]+:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"/c/(?:[A-Za-z]+:)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
 
 #: The frontend send endpoint (findings §2). The ``/prepare`` pre-warm is
@@ -32,7 +34,10 @@ SEND_ENDPOINT_PREPARE_SUFFIX = "/prepare"
 
 
 def extract_conversation_id(url: str) -> Optional[str]:
-    """Return the ``/c/<uuid>`` conversation id in ``url``, or None."""
+    """Return the BARE-uuid conversation id in ``url``, or None.
+
+    A front-end ``/c/WEB:<uuid>`` route yields the bare ``<uuid>`` — that is the
+    id the backend-api path and the conversation-GET body key on (F862 r2)."""
     match = CONVERSATION_ID_RE.search(url or "")
     return match.group(1) if match else None
 
