@@ -119,23 +119,20 @@ class HerdrInboxService:
     def _default_socket_path(session_name: str = "cao") -> str:
         """Determine default herdr socket path for a named session.
 
-        The default session (name ``"default"``) uses a flat path:
-        ``~/.config/herdr/herdr.sock``.
+        Delegates to the single herdr transport leaf
+        ``adapters.herdr.client.default_socket_path`` (WP-HERDR H1, blueprint §4)
+        so the socket-path layout has ONE definition. Byte-identical to the
+        former inline resolution:
 
-        Named sessions use a sessions subdirectory:
-        ``~/.config/herdr/sessions/<session_name>/herdr.sock``.
+        - default session (name ``"default"``): ``<config>/herdr/herdr.sock``
+        - named sessions: ``<config>/herdr/sessions/<session_name>/herdr.sock``
 
         Args:
             session_name: Herdr session name. Defaults to ``"cao"``.
         """
-        import os
-        from pathlib import Path
+        from cli_agent_orchestrator.adapters.herdr.client import default_socket_path
 
-        # Check XDG_CONFIG_HOME first, fallback to ~/.config
-        config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        if session_name == "default":
-            return f"{config_home}/herdr/herdr.sock"
-        return f"{config_home}/herdr/sessions/{session_name}/herdr.sock"
+        return default_socket_path(session_name)
 
     def _invalidate_terminal_identity_locked(self, terminal_id: str) -> None:
         for key in [key for key in self._identity_records if key[0] == terminal_id]:

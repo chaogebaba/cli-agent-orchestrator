@@ -999,14 +999,15 @@ class HerdrBackend(TerminalBackend):
     def _session_socket_path(self) -> str:
         """Return the herdr socket path for the configured session.
 
-        Mirrors HerdrInboxService._default_socket_path():
-        - ``"default"`` session: ``~/.config/herdr/herdr.sock``
-        - Named sessions:       ``~/.config/herdr/sessions/<name>/herdr.sock``
+        Delegates to the single herdr transport leaf
+        ``adapters.herdr.client.default_socket_path`` (WP-HERDR H1, blueprint §4):
+        the socket-path layout now has ONE definition, in the client, and this
+        legacy shim imports it (legacy importing new code is permitted; the
+        reverse is not). Byte-identical to the former inline resolution.
         """
-        config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        if self._herdr_session == "default":
-            return f"{config_home}/herdr/herdr.sock"
-        return f"{config_home}/herdr/sessions/{self._herdr_session}/herdr.sock"
+        from cli_agent_orchestrator.adapters.herdr.client import default_socket_path
+
+        return default_socket_path(self._herdr_session)
 
     def _ensure_session_running(self) -> None:
         """Start the herdr session server if its socket does not exist.
