@@ -174,49 +174,6 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
-def _f829_resolve_caller_principal() -> Optional[str]:
-    """F829 D3: the caller's DURABLE principal for resume authorization.
-
-    The owner_principal stored on a conversation root is the seat's durable
-    mailbox id (the migration set it from ``terminals.caller_mailbox_id``), NOT a
-    disposable terminal id. Resolve THIS caller's mailbox the same way: read the
-    current terminal's metadata over HTTP and return its ``caller_mailbox_id``.
-    Falls back to the terminal id when no mailbox is recorded (a top-level
-    supervisor), and to None when there is no terminal at all. Best-effort: a
-    lookup failure returns None (authorize then treats it as not-owner, which is
-    the safe default — a resume is refused rather than wrongly granted).
-    """
-    terminal_id = _current_terminal_id()
-    if not terminal_id:
-        return None
-    try:
-        resp = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
-        resp.raise_for_status()
-        meta = resp.json()
-        principal = meta.get("caller_mailbox_id")
-        if isinstance(principal, str) and principal:
-            return principal
-    except Exception:
-        return None
-    # F857: a top-level supervisor has no caller_mailbox_id, but spawn identities
-    # are owned by its MAILBOX (database.py _mailbox_id_for_terminal). Resolve the
-    # mailbox whose current incarnation is this terminal before falling back.
-    try:
-        resp = cao_http.get("/mailboxes", timeout=_mcp_timeout())
-        resp.raise_for_status()
-        rows = resp.json()
-        if isinstance(rows, dict):
-            rows = rows.get("items", [])
-        for row in rows or []:
-            if isinstance(row, dict) and row.get("current_terminal_id") == terminal_id:
-                mailbox_id = row.get("id")
-                if isinstance(mailbox_id, str) and mailbox_id:
-                    return mailbox_id
-    except Exception:
-        pass
-    return terminal_id
-
-
 def _refresh_terminal_token_from_pane() -> Optional[str]:
     """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
 
@@ -789,6 +746,8 @@ def _create_terminal(
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     provider: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    resume_inherit_pins: bool = True,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -907,11 +866,30 @@ def _create_terminal(
                 json_body["barrier_member_key"] = barrier_member_key
             if authority_files is not None:
                 json_body["authority_files"] = authority_files
+            # F829 A2.1: a SEMANTIC RESUME forwards the raw handle + overrides;
+            # the SERVER runs prepare→authorize→claim→create. The shim does NO
+            # client-side resolution/authorization anymore.
+            if resume_from is not None:
+                json_body["resume_from"] = resume_from
+                json_body["resume_inherit_pins"] = resume_inherit_pins
+
+        # F829 A2.1: bind the caller by its own terminal token so the server can
+        # verify caller_id (verify_sender_token). Sent on the resume path; on the
+        # cold path it is harmless (the create route does not require it). The
+        # token is the terminal's own $CAO_TERMINAL_TOKEN.
+        _f829_headers = None
+        if resume_from is not None:
+            _f829_token = (
+                os.environ.get("CAO_TERMINAL_TOKEN") or _refresh_terminal_token_from_pane()
+            )
+            if _f829_token:
+                _f829_headers = {"X-CAO-Terminal-Token": _f829_token}
 
         response = cao_http.post(
             f"/sessions/{session_name}/terminals",
             params=params,
             json=json_body,
+            headers=_f829_headers,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -2544,75 +2522,19 @@ def _assign_impl(
             "message": "resume_refused: resume=True requires a resume handle",
         }
     if _resume_handle:
-        from cli_agent_orchestrator.services.resume_service import (
-            ResumeRefused,
-            prepare_resume,
-        )
+        # F829 A2.1 (Option A, scoped): the SHIM does NO client-side resolution
+        # or authorization anymore. It marks the assign as a resume and forwards
+        # the raw handle + overrides + its own terminal token to the create
+        # endpoint, where the SERVER runs prepare→authorize→claim→create bound to
+        # the caller's X-CAO-Terminal-Token. The typed refusal envelope (owner,
+        # token, claim, admission) is relayed verbatim by the create POST's
+        # error path below. ``_resume_prepared`` is a lightweight marker only.
+        _resume_prepared = {
+            "via_server": True,
+            "resume_from": _resume_handle,
+            "resumed_from": _resume_handle,
+        }
 
-        try:
-            _resume_prepared = prepare_resume(
-                resume_from=_resume_handle,
-                requested_agent_profile=agent_profile or None,
-                requested_working_directory=working_directory,
-                inherit_pins=inherit_pins,
-                caller_principal=_f829_resolve_caller_principal(),
-            )
-        except ResumeRefused as refusal:
-            return {
-                "success": False,
-                "terminal_id": None,
-                **refusal.as_dict(),
-                "message": f"resume_refused (missing {refusal.missing}): {refusal.how}",
-            }
-        # r1 #5: inherit_pins=False when the reaped terminal HAD frozen pins
-        # requires the caller to re-declare equivalent authority_files; else the
-        # continuation would run unpinned. Refuse with missing="profile".
-        if not inherit_pins and _resume_prepared.get("known_pins") and not authority_files:
-            return {
-                "success": False,
-                "terminal_id": None,
-                "error": "resume_refused",
-                "missing": "profile",
-                "reason": "pins_dropped_without_replacement",
-                "retryable": False,
-                "how": (
-                    "the reaped terminal had frozen authority pins; pass "
-                    "inherit_pins=True or equivalent authority_files= to re-pin"
-                ),
-                "message": "resume_refused (missing profile): frozen pins would be dropped",
-            }
-        # Adopt the resolved profile so downstream logging/labels are correct;
-        # position/routing machinery is skipped entirely below.
-        agent_profile = _resume_prepared["agent_profile"]
-        # F829 A1 (D3 step 4): for an identity-root resume, TAKE THE CAS CLAIM
-        # now — before any spawn effect. A lost CAS (another claimant or a moved
-        # generation) refuses with session_resume_in_progress and spawns nothing.
-        # The claim is held until the resumed worker reports its id, where
-        # attach_captured_uuid runs verify+publish and clears it (D3 steps 6-7);
-        # a dead attempt is reconciled by the claim TTL (D8).
-        if _resume_prepared.get("via_identity"):
-            from cli_agent_orchestrator.services.conversation_transition import (
-                claim_resume_admission,
-            )
-
-            _admission = _resume_prepared["admission"]
-            _claimant = _current_terminal_id() or "unknown"
-            _claimed = claim_resume_admission(_admission, claimant=_claimant)
-            if not _claimed.ok:
-                return {
-                    "success": False,
-                    "terminal_id": None,
-                    "error": "resume_refused",
-                    "missing": "identity",
-                    "reason": _claimed.error or "session_resume_in_progress",
-                    "retryable": True,
-                    "identity_key": _admission.identity_key,
-                    "how": (
-                        "another resume of this conversation is in progress; "
-                        "retry once it settles or is reconciled by the claim TTL"
-                    ),
-                    "message": "resume_refused (missing identity): session_resume_in_progress",
-                }
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
     # rewrites a position name into a profile.
@@ -2638,10 +2560,12 @@ def _assign_impl(
         )
 
         if _resume_prepared:
-            # Resume path: provider comes from the reaped identity; no position
-            # or routing resolution runs. agent_profile is already the resolved
-            # profile from the identity (or the caller's explicit override).
-            _resolved_provider = _resume_prepared["provider"]
+            # Resume path (A2.1 Option A): the SERVER resolves provider + profile
+            # + cwd from the reaped identity and OVERRIDES whatever the shim
+            # sends, so the shim does no position/routing resolution. It forwards
+            # the caller's provider hint (possibly None) unchanged; the create
+            # endpoint replaces it from the root.
+            _resolved_provider = provider
             _routing_driven = False
             _routing_position = None
             _fallback_profile: Optional[str] = None
@@ -2725,12 +2649,13 @@ def _assign_impl(
         # resume_requires_fork_from raise is gone — resume=True without a handle
         # already returned a typed refusal above.
         if _resume_prepared:
-            fork_context = _resume_prepared["fork_context"]
-            provider = _resume_prepared["provider"]
-            working_directory = _resume_prepared["working_directory"]
-            forked_from_info = _resume_prepared["forked_from_info"]
-            if _resume_prepared["authority_files"] and not authority_files:
-                authority_files = _resume_prepared["authority_files"]
+            # A2.1 Option A: the server resolves the launch spec; the shim sends
+            # NO fork_context (a raw resume fork_context would be refused as
+            # resume_not_admitted) and forwards the raw handle instead. provider/
+            # cwd stay whatever the caller passed; the server overrides both from
+            # the root. forked_from_info is a display stub filled from the handle.
+            fork_context = None
+            forked_from_info = {"resumed_from": _resume_prepared["resume_from"]}
             row = None
             _skip_fork_resolution = True
         else:
@@ -2963,6 +2888,8 @@ def _assign_impl(
             use_worktree=use_worktree,
             authority_files=authority_files,
             provider=_resolved_provider,
+            resume_from=(_resume_prepared["resume_from"] if _resume_prepared else None),
+            resume_inherit_pins=inherit_pins,
             **create_kwargs,
         )
 
@@ -3001,16 +2928,14 @@ def _assign_impl(
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
                 for af in authority_files
             ]
-        # RESUME HOT-FIX (addendum r1 #8): surface the resume result line.
+        # A2.1: surface the resume result line. The server owns pins/verify; the
+        # shim reports the handle and the new terminal it created.
         if _resume_prepared:
-            _old = _resume_prepared["forked_from_info"]["resumed_from"]
+            _old = _resume_prepared["resume_from"]
             result["resumed_from"] = _old
             result["worktree"] = working_directory
-            result["pins_inherited"] = _resume_prepared.get("pins_inherited", 0)
             result["resume_line"] = (
-                f"resumed from {_old} as {terminal_id} "
-                f"(worktree {working_directory}, pins_inherited "
-                f"{_resume_prepared.get('pins_inherited', 0)})"
+                f"resumed from {_old} as {terminal_id} (worktree {working_directory})"
             )
         # F497 D12 — surface the general-cell substitution to the operator.
         if _fallback_profile:
@@ -3033,6 +2958,17 @@ def _assign_impl(
                 "error": cap_detail,
                 "message": _render_terminal_cap_message(cap_detail, "Assignment"),
             }
+        # F829 A2.1: relay the SERVER's typed resume-refusal envelope verbatim
+        # (caller_unverified / caller_token_missing / resume_not_owner /
+        # session_resume_in_progress / resume_not_admitted / session_identity_conflict
+        # …). The shim does no authorization; it only forwards the server's verdict.
+        if exc.response is not None:
+            try:
+                _detail = exc.response.json().get("detail")
+            except Exception:
+                _detail = None
+            if isinstance(_detail, dict) and _detail.get("error") == "resume_refused":
+                return {"success": False, "terminal_id": None, **_detail}
         detail = (
             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
         )
