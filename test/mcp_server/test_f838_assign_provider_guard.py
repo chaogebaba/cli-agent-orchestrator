@@ -355,3 +355,110 @@ def test_assign_refuses_when_dangling_higher_shadows_lower_profile(tmp_path, mon
     assert E_PROVIDER_UNRESOLVED in result["message"]
     assert "no spawn" in result["message"].lower()
     create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r5 — public assign seam refuses when a bad HIGHER entry shadows a
+# lower same-name profile at EVERY lower precedence level, INCLUDING the packaged
+# built-in store (the codex r4 EMPIRICAL-GATE-NO counterexample: the r4 walk
+# omitted the built-in store, so a dangling local ``reviewer`` fell through to
+# the built-in ``reviewer`` and public assign reached _create_terminal).
+# ---------------------------------------------------------------------------
+
+_BUILTIN_PLAIN_NAME = "reviewer"
+
+
+def _assign_env(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    higher_slot: str,
+    lower_slot: str,
+) -> tuple[ExitStack, dict]:
+    """Wire local/agent/extra store dirs + real built-in store into the assign
+    seam, with _create_terminal and caller-metadata stubbed. Returns the stack
+    and the dict of scratch dirs."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    local_dir = tmp_path / "local-store"
+    agent_dir = tmp_path / "agent-dir"
+    extra_dir = tmp_path / "extra-dir"
+    for d in (local_dir, agent_dir, extra_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(patch_object(ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={"agent": str(agent_dir)},
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[str(extra_dir)],
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(_patch.object(server.cao_http, "get", return_value=_CallerResponse()))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        )
+    )
+    return stack, {"local": local_dir, "agent": agent_dir, "extra": extra_dir}
+
+
+def test_assign_refuses_when_dangling_local_shadows_builtin_profile(tmp_path, monkeypatch):
+    """codex r4 counterexample at the public seam: a dangling local ``reviewer``
+    shadows the packaged built-in ``reviewer`` plain profile. In r4 this reached
+    _create_terminal with the caller fallback; r5 must refuse (the built-in store
+    is now inside the precedence walk)."""
+    stack, dirs = _assign_env(tmp_path, monkeypatch, higher_slot="local", lower_slot="builtin")
+    with stack:
+        (dirs["local"] / f"{_BUILTIN_PLAIN_NAME}.md").symlink_to(
+            dirs["local"] / "missing-reviewer-target.md"
+        )
+        with _patch(_CREATE) as create:
+            result = _assign_impl(_BUILTIN_PLAIN_NAME, "task", working_directory="/repo")
+    assert result["success"] is False, result
+    assert E_PROVIDER_UNRESOLVED in result["message"]
+    assert "no spawn" in result["message"].lower()
+    create.assert_not_called()
+
+
+_ASSIGN_PAIRS = [
+    ("local", "agent"),
+    ("local", "extra"),
+    ("local", "builtin"),
+    ("agent", "extra"),
+    ("agent", "builtin"),
+    ("extra", "builtin"),
+]
+
+
+@pytest.mark.parametrize("higher_slot,lower_slot", _ASSIGN_PAIRS)
+def test_assign_refuses_bad_higher_shadowing_lower_seam(
+    tmp_path, monkeypatch, higher_slot, lower_slot
+):
+    """The public assign seam refuses (no spawn) for a dangling HIGHER entry
+    shadowing a readable LOWER same-name profile at EVERY (higher, lower) store
+    pair, including the built-in store as the lower."""
+    name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_seam"
+    stack, dirs = _assign_env(tmp_path, monkeypatch, higher_slot=higher_slot, lower_slot=lower_slot)
+    with stack:
+        (dirs[higher_slot] / f"{name}.md").symlink_to(dirs[higher_slot] / "missing-target.md")
+        if lower_slot != "builtin":
+            (dirs[lower_slot] / f"{name}.md").write_text(
+                "---\nprovider: claude_code\n---\nlower body\n", encoding="utf-8"
+            )
+        with _patch(_CREATE) as create:
+            result = _assign_impl(name, "task", working_directory="/repo")
+    assert result["success"] is False, (higher_slot, lower_slot, result)
+    assert E_PROVIDER_UNRESOLVED in result["message"]
+    create.assert_not_called()

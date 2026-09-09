@@ -449,3 +449,242 @@ def test_real_valid_local_shadows_lower_still_reads_once(tmp_path):
         with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
             assert resolve_provider("f838_shadow_once", "claude_code") == "pi_cli"
     assert reads.call_count == 1, f"expected 1 raw store read, got {reads.call_count}"
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r5 — CLASS fix: the precedence walk consumes the reader's OWN
+# ordered store list (codex r4 P0 blocker).
+#
+# The r4 walk (`_first_present_store_entry_is_unknown`) modelled precedence with
+# a SECOND, hand-copied list of store roots that OMITTED the packaged built-in
+# store — so a dangling local same-name entry still fell through to the built-in
+# profile and public assign reached creation. It also modelled only a dangling
+# symlink, not a `_safe_join`-rejected present entry (an escaping symlink). The
+# r5 fix removes the whole class: BOTH the reader and the walk consume the SAME
+# ordered store list, `_ordered_profile_stores`, so the walk can never search a
+# different set of directories than the reader reads.
+#
+# These tests (a) pin that both consumers use the one shared list, and (b)
+# parametrize a dangling / malformed / unreadable HIGHER entry shadowing a
+# readable LOWER entry over EVERY (higher, lower) store pair, INCLUDING the
+# built-in store as the lower, asserting typed refusal + zero reads of the
+# shadowed lower file.
+# ---------------------------------------------------------------------------
+
+# A built-in packaged profile that is a genuine PLAIN profile (no
+# provider/composition), so a shadow of it would — absent the fix — fall back to
+# the caller provider (the exact codex r4 counterexample).
+_BUILTIN_PLAIN_NAME = "reviewer"
+
+
+def test_walk_and_reader_share_one_ordered_store_list():
+    """The CLASS assertion (codex r4): the precedence walk and the reader consume
+    the IDENTICAL ordered store list, obtained from ONE shared function
+    (`_ordered_profile_stores`) — never a second hand-copied set that could omit
+    a store (the r1/r3/r4 defect, whose residual omission was the built-in
+    store). Proven by spying on the single shared function: BOTH
+    `read_agent_profile_source` and `_first_present_store_entry_is_unknown` call
+    it, and the object the reader iterates is the same list the walk classifies.
+    """
+    real = _ap._ordered_profile_stores
+    handed_out: list[list] = []
+
+    def spy(name: str):
+        stores = real(name)
+        handed_out.append(stores)
+        return stores
+
+    # The walk consumes the shared function.
+    with patch.object(_ap, "_ordered_profile_stores", side_effect=spy):
+        _ap._first_present_store_entry_is_unknown("nonexistent_probe_name")
+    assert len(handed_out) == 1, "the walk must obtain its store list from the shared function"
+    walk_roots = [type(s).__name__ for s in handed_out[0]]
+
+    handed_out.clear()
+    # The reader consumes the SAME shared function (a name with no match walks
+    # every store and raises FileNotFoundError).
+    with patch.object(_ap, "_ordered_profile_stores", side_effect=spy):
+        with pytest.raises(FileNotFoundError):
+            _ap.read_agent_profile_source("nonexistent_probe_name")
+    assert len(handed_out) == 1, "the reader must obtain its store list from the shared function"
+    reader_roots = [type(s).__name__ for s in handed_out[0]]
+
+    # Identical ordered store sequence (same store kinds, same order), and the
+    # built-in packaged store is the FINAL store in both — the r4 omission.
+    assert walk_roots == reader_roots
+    assert (
+        reader_roots[-1] == "_BuiltinProfileStore"
+    ), "the built-in packaged store must be the reader's (and walk's) final store"
+
+
+def test_ordered_stores_includes_builtin_last():
+    """Direct pin: `_ordered_profile_stores` ends with the packaged built-in
+    store (the store the r4 walk omitted)."""
+    stores = _ap._ordered_profile_stores("anything")
+    assert isinstance(stores[-1], _ap._BuiltinProfileStore)
+
+
+# --- Parametrized shadowing over every (higher, lower) store pair -----------
+#
+# Store levels in precedence order: local > agent-dir > extra-dir > built-in.
+# A "higher" slot is made a bad entry (dangling / escaping-symlink / malformed);
+# a "lower" slot holds a readable same-name profile the reader would fall
+# through to. Every (higher, lower) ordered pair is exercised; the built-in
+# store is a LOWER slot only (it is lowest precedence and holds no user
+# symlinks, so it is never a higher bad entry).
+
+_HIGHER_SLOTS = ["local", "agent", "extra"]
+_LOWER_SLOTS = ["agent", "extra", "builtin"]
+
+
+def _precedence_index(slot: str) -> int:
+    return {"local": 0, "agent": 1, "extra": 2, "builtin": 3}[slot]
+
+
+_STORE_PAIRS = [
+    (h, l)
+    for h in ("local", "agent", "extra")
+    for l in ("agent", "extra", "builtin")
+    if _precedence_index(l) > _precedence_index(h)
+]
+
+_BAD_HIGHER_KINDS = ["dangling", "escaping", "malformed", "unreadable"]
+
+
+def _configure_slots(tmp_path: Path, higher_slot: str, lower_slot: str) -> ExitStack:
+    """Wire the four store levels. Only the higher/lower slots that participate
+    in the current pair get real directories; the built-in store is always the
+    real packaged store. Returns the ExitStack of patches."""
+    local_dir = tmp_path / "local-store"
+    agent_dir = tmp_path / "agent-dir"
+    extra_dir = tmp_path / "extra-dir"
+    for d in (local_dir, agent_dir, extra_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={"agent": str(agent_dir)},
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[str(extra_dir)],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack._dirs = {"local": local_dir, "agent": agent_dir, "extra": extra_dir}  # type: ignore[attr-defined]
+    return stack
+
+
+def _write_bad_higher(dirs: dict, slot: str, name: str, kind: str, outside: Path) -> None:
+    d = dirs[slot]
+    flat = d / f"{name}.md"
+    if kind == "dangling":
+        flat.symlink_to(d / "missing-target.md")
+    elif kind == "escaping":
+        # A symlink whose live target escapes the store root: _safe_join rejects
+        # it (returns None), so the reader skips it — a present-but-unusable
+        # entry the r4 walk did not model.
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("---\nprovider: pi_cli\n---\noutside body\n", encoding="utf-8")
+        flat.symlink_to(outside)
+    elif kind == "malformed":
+        # A real readable file the reader STOPS at, but whose frontmatter is
+        # truncated (no closing delimiter) → UNKNOWN.
+        flat.write_text("---\nprovider: pi_cli\n", encoding="utf-8", newline="")
+    elif kind == "unreadable":
+        flat.write_text("---\nprovider: pi_cli\n---\nbody\n", encoding="utf-8")
+        flat.chmod(0)
+    else:  # pragma: no cover - guard
+        raise AssertionError(kind)
+
+
+def _write_lower_readable(dirs: dict, slot: str, name: str) -> None:
+    if slot == "builtin":
+        # The built-in slot uses a real packaged plain profile; the test picks
+        # that name, nothing to write.
+        return
+    d = dirs[slot]
+    (d / f"{name}.md").write_text(
+        "---\nprovider: claude_code\n---\nlower readable body\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)
+@pytest.mark.parametrize("bad_kind", _BAD_HIGHER_KINDS)
+def test_bad_higher_shadows_lower_refuses(tmp_path, higher_slot, lower_slot, bad_kind):
+    """For EVERY (higher, lower) store pair and every bad-higher shape: a higher
+    entry the reader cannot read (dangling / escaping-symlink / malformed /
+    unreadable) must NOT fall through to a readable lower same-name profile. The
+    resolver classifies UNKNOWN and raises E-PROVIDER-UNRESOLVED — including when
+    the lower store is the packaged BUILT-IN store (the codex r4 counterexample).
+    """
+    # The built-in lower slot must use a name that actually exists as a built-in
+    # plain profile; other slots use a fresh scratch name.
+    name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_shadow"
+    outside = tmp_path / "outside" / "escape.md"
+
+    stack = _configure_slots(tmp_path, higher_slot, lower_slot)
+    dirs = stack._dirs  # type: ignore[attr-defined]
+    with stack:
+        _write_bad_higher(dirs, higher_slot, name, bad_kind, outside)
+        _write_lower_readable(dirs, lower_slot, name)
+
+        intent, _, _ = _ap._classify_stub_intent(name)
+        assert intent == _ap._STUB_UNKNOWN, (higher_slot, lower_slot, bad_kind, intent)
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider(name, "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+    # Restore perms so tmp cleanup can remove the unreadable file.
+    if bad_kind == "unreadable":
+        (dirs[higher_slot] / f"{name}.md").chmod(0o600)
+
+
+@pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)
+def test_dangling_higher_shadows_lower_never_reads_lower(tmp_path, higher_slot, lower_slot):
+    """The stat-only precedence walk refuses a dangling-higher shadow BEFORE the
+    raw read is issued, so the shadowed lower file (built-in included) is NEVER
+    read. Pins raw_reads == 0 on the refusing path for every pair."""
+    name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_noread"
+    outside = tmp_path / "outside" / "escape.md"
+    original_read = _ap.read_agent_profile_source
+
+    stack = _configure_slots(tmp_path, higher_slot, lower_slot)
+    dirs = stack._dirs  # type: ignore[attr-defined]
+    with stack:
+        _write_bad_higher(dirs, higher_slot, name, "dangling", outside)
+        _write_lower_readable(dirs, lower_slot, name)
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            with pytest.raises(ProviderResolutionError):
+                resolve_provider(name, "claude_code")
+        assert reads.call_count == 0, (higher_slot, lower_slot, reads.call_count)
+
+
+@pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)
+def test_valid_higher_over_lower_resolves_higher(tmp_path, higher_slot, lower_slot):
+    """Mirror control for every pair: a VALID higher entry over a readable lower
+    same-name entry resolves the HIGHER provider (precedence stops at the first
+    readable entry); no spurious refusal. Skips the built-in-lower case where the
+    higher would need to out-rank it (already covered by the higher being a real
+    store above built-in)."""
+    if lower_slot == "builtin":
+        name = "f838_r5_valid_over_builtin"
+    else:
+        name = "f838_r5_valid"
+    stack = _configure_slots(tmp_path, higher_slot, lower_slot)
+    dirs = stack._dirs  # type: ignore[attr-defined]
+    with stack:
+        (dirs[higher_slot] / f"{name}.md").write_text(
+            "---\nprovider: pi_cli\n---\nhigher valid\n", encoding="utf-8"
+        )
+        _write_lower_readable(dirs, lower_slot, name)
+        assert resolve_provider(name, "claude_code") == "pi_cli"
