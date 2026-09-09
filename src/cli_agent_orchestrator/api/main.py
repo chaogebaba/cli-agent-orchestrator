@@ -4718,21 +4718,31 @@ async def create_terminal_in_session(
 
         fork_context = body.fork_context if body else None
         _resume_handle = body.resume_from if body else None
+        # F829 A2 (r5, codex r4 EMPIRICAL-NO): capture request-field PRESENCE
+        # BEFORE the value above is erased. Pydantic keeps the distinction the
+        # value cannot: an omitted field leaves an empty ``model_fields_set``
+        # ({} → cold create), while an EXPLICIT ``{"resume_from": null}`` puts
+        # "resume_from" IN ``model_fields_set`` even though its value is None.
+        # The route previously erased that distinction here and then classified
+        # on the None value alone, so an explicit null silently degraded into a
+        # cold spawn — the exact D3/AC2 class this amendment refuses.
+        _resume_field_present = bool(body is not None and "resume_from" in body.model_fields_set)
         _f829_link_admission = None
         _f829_claimed_key: Optional[str] = None
         _f829_resume_overrides: Dict[str, Any] = {}
 
         # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
         # truthiness. A present-but-blank handle ({"resume_from": ""} or all
-        # whitespace) is an EXPLICIT malformed resume request — it must be a
-        # typed refusal, never silently degrade to a cold create the way an
-        # `if _resume_handle:` truthiness gate would (empty string is falsy).
-        # This invents NO new policy branch (D3): it is the SAME
+        # whitespace) OR an explicitly present null ({"resume_from": null},
+        # r5) is an EXPLICIT malformed resume request — it must be a typed
+        # refusal, never silently degrade to a cold create the way an
+        # `if _resume_handle:` truthiness gate would (empty string and None are
+        # both falsy). This invents NO new policy branch (D3): it is the SAME
         # missing="identity"/resume_refused category the server already emits at
         # the resume entrance, distinguished only by the `resume_handle_blank`
-        # reason label. A field that is ABSENT (None) is a genuine cold create
-        # and is left untouched.
-        if _resume_handle is not None and not _resume_handle.strip():
+        # reason label. A field that is ABSENT (not in model_fields_set) is a
+        # genuine cold create and is left untouched.
+        if _resume_field_present and (_resume_handle is None or not _resume_handle.strip()):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={
@@ -4741,7 +4751,7 @@ async def create_terminal_in_session(
                     "reason": "resume_handle_blank",
                     "retryable": False,
                     "how": (
-                        "resume_from was supplied but empty/blank; pass a "
+                        "resume_from was supplied but null/empty/blank; pass a "
                         "non-empty handle (terminal id or uuid) or omit the "
                         "field entirely for a cold create"
                     ),

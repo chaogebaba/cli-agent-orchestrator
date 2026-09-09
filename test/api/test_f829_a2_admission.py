@@ -24,6 +24,13 @@ Plus the fresh-adversary defect (codex r3): a present-but-blank ``resume_from``
 must be a TYPED refusal with ZERO spawn, never a silent cold fallback
 → ``test_blank_resume_from_refused_zero_spawn`` (+ the MCP-shim sibling lives in
 ``test/mcp_server/test_assign_resume_from.py``).
+
+And the r5 fresh-adversary defect (codex r4): an EXPLICIT JSON null
+``{"resume_from": null}`` erased to the same ``None`` an omitted field
+produces and cold-fell-back. The route now classifies actual request-field
+presence from ``model_fields_set`` before the value is read
+→ ``test_explicit_null_resume_from_refused_zero_spawn`` (with
+``test_omitted_resume_from_is_cold_create`` as its boundary partner).
 """
 
 from __future__ import annotations
@@ -194,3 +201,89 @@ def test_blank_resume_from_refused_zero_spawn(client, blank):
     # ZERO spawn AND zero admission: neither the resume path nor the cold path ran.
     admit.assert_not_called()
     svc.create_terminal.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fresh adversary (codex r4) — an EXPLICIT JSON null resume_from is a typed
+# refusal, ZERO spawn. This is the presence-vs-value distinction the r4 gate
+# missed: ``{"resume_from": null}`` erased to the SAME ``None`` an omitted
+# field produces and cold-fell-back. The r5 route classifies actual field
+# presence from ``model_fields_set`` BEFORE the value is read.
+# ---------------------------------------------------------------------------
+def test_explicit_null_resume_from_refused_zero_spawn(client):
+    """codex r4 fresh adversary: ``{"resume_from": null}`` was accepted (201),
+    ``_f829_admit_resume`` was NOT called, and ``create_terminal`` ran with
+    ``root_admission=None`` — an EXPLICITLY supplied malformed resume field
+    degrading SILENTLY to a cold create, the same D3/AC2 no-cold-fallback
+    failure the empty/blank case was meant to close.
+
+    Pydantic keeps the distinction the value cannot: an OMITTED field leaves
+    ``model_fields_set`` empty (cold create), while an explicit ``null`` puts
+    ``"resume_from"`` INTO ``model_fields_set``. The r5 route consults presence
+    BEFORE erasing the value, so an explicit null is a TYPED ``resume_refused``
+    / ``resume_handle_blank`` (missing=identity, retryable=false) with ZERO
+    spawn. The regression that drops the presence check and classifies on the
+    None value alone lets cold-fallback back in and this goes RED (create
+    fires, admission skipped, 201 returned).
+    """
+    svc = _mock_terminal_service()
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main._f829_admit_resume",
+            AsyncMock(),
+        ) as admit,
+        patch("cli_agent_orchestrator.api.main.terminal_service", svc),
+    ):
+        response = client.post(
+            _ROUTE,
+            params={
+                "provider": "claude_code",
+                "agent_profile": "developer",
+                "caller_id": "abcd1234",
+            },
+            json={"resume_from": None},
+        )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "resume_refused"
+    assert detail["reason"] == "resume_handle_blank"
+    assert detail["retryable"] is False
+    # ZERO spawn AND zero admission: neither the resume path nor the cold path ran.
+    admit.assert_not_called()
+    svc.create_terminal.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Companion — an OMITTED resume_from is still a genuine cold create (201),
+# proving the presence gate refuses ONLY explicit nulls, not absence. This is
+# the boundary partner of the explicit-null test: it pins that the r5 change
+# did not turn every cold create into a refusal.
+# ---------------------------------------------------------------------------
+def test_omitted_resume_from_is_cold_create(client):
+    """A request whose JSON body omits ``resume_from`` entirely (empty
+    ``model_fields_set`` for that field) must remain a COLD create: 201, no
+    admission, ``root_admission=None``. The mutant that refuses on ABSENCE
+    rather than explicit presence breaks every cold create and trips this.
+    """
+    svc = _mock_terminal_service()
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main._f829_admit_resume",
+            AsyncMock(),
+        ) as admit,
+        patch("cli_agent_orchestrator.api.main.terminal_service", svc),
+    ):
+        response = client.post(
+            _ROUTE,
+            params={
+                "provider": "claude_code",
+                "agent_profile": "developer",
+                "caller_id": "abcd1234",
+            },
+            json={},
+        )
+
+    assert response.status_code == 201
+    admit.assert_not_called()
+    assert svc.create_terminal.call_args.kwargs["root_admission"] is None

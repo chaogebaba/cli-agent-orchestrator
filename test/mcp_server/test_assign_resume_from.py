@@ -201,6 +201,75 @@ def test_resume_from_reaches_body_even_with_defer_init_false(monkeypatch):
     assert captured["headers"] == {"X-CAO-Terminal-Token": "tok-abcd"}
 
 
+def test_cold_assign_body_omits_resume_from_key(monkeypatch):
+    """F829 A2 (r5, codex r4 close condition item 2): the shim's omission value
+    for ``resume_from`` is Python ``None``. A COLD assign (``resume_from=None``)
+    must OMIT the key from the POST body entirely — NOT send
+    ``"resume_from": null`` — so the r5 server-side presence gate
+    (``"resume_from" in body.model_fields_set``) does NOT mistake a cold assign
+    for an explicit-null resume and refuse it.
+
+    The regression that sends the key with a null value (e.g.
+    ``json_body["resume_from"] = resume_from`` unconditionally) puts
+    ``"resume_from"`` into the body and would trip the server's 422, breaking
+    every cold assign. This test asserts the key is absent AND no token header
+    is sent on the cold path.
+    """
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+
+    captured = {}
+
+    class _Resp:
+        status_code = 201
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(path, **kw):
+        return _Resp(
+            {
+                "provider": "kiro_cli",
+                "session_name": "cao-session",
+                "allowed_tools": None,
+            }
+        )
+
+    def _fake_post(path, **kw):
+        captured["path"] = path
+        captured["json"] = kw.get("json")
+        captured["headers"] = kw.get("headers")
+        return _Resp({"id": "new00001"})
+
+    with (
+        patch.object(server.cao_http, "get", side_effect=_fake_get),
+        patch.object(server.cao_http, "post", side_effect=_fake_post),
+        patch.object(server, "resolve_provider", return_value="kiro_cli"),
+        patch.object(server, "_resolve_child_allowed_tools", return_value=None),
+    ):
+        server._create_terminal(
+            "kiro_dev",
+            working_directory="/repo/wt",
+            defer_init=False,
+            resume_from=None,
+        )
+
+    body = captured["json"] or {}
+    assert "resume_from" not in body, (
+        "a cold assign (resume_from=None) must OMIT the resume_from key, not "
+        f"send it as null (got {body!r}) — else the server's presence gate "
+        "refuses the cold assign"
+    )
+    assert "resume_inherit_pins" not in body
+    # No caller-binding token header on the cold path.
+    assert captured.get("headers") is None
+
+
 @pytest.mark.parametrize("blank", ["", " ", "\t", "   \n  "])
 def test_blank_resume_from_refused_zero_spawn_shim(monkeypatch, blank):
     """F829 A2 (r4, codex r3 fresh adversary) — the MCP-shim half.
