@@ -294,7 +294,7 @@ async def launch(options: dict[str, Any]) -> Any:
     without them. Raises ``proc_exited`` if the browser cannot start.
     """
     try:
-        from cloakbrowser import (  # type: ignore[import-not-found]
+        from cloakbrowser import (  # type: ignore
             launch_persistent_context_async,
         )
     except Exception as exc:  # pragma: no cover - exercised only in the live lane

@@ -935,6 +935,12 @@ _CHATGPT_WEB_CODE_MAP: Dict[str, Tuple[ConditionKind, str]] = {
     "net_interrupted": (ConditionKind.NET_INTERRUPTED, "reconnect_once"),
     "context_too_large": (ConditionKind.CONTEXT_EXHAUSTED, "bundle_over_limit"),
     "proc_exited": (ConditionKind.PROC_EXITED, "browser_crash"),
+    # r3 (user live observation): the attachment upload never reached the
+    # upload-complete state (spinner gone + send enabled) within the bound. A
+    # transient upload stall — the runner failed closed BEFORE Enter
+    # (nothing-sent), so a fresh re-dispatch may succeed; surface it as a
+    # transient overload rather than a hard human-gate.
+    "attach_timeout": (ConditionKind.TRANSIENT_OVERLOAD, "attach_upload_stall"),
 }
 
 

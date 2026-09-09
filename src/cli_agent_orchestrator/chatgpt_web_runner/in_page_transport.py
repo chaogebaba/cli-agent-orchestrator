@@ -324,6 +324,13 @@ class Transport:
             )
             if readiness_reached(signals):
                 logger.debug("chatgpt_web attachment ready: %s", sorted(signals))
+                # r3 (user live observation): the two calibrated CHIP signals can
+                # appear while the upload is still finalizing server-side (spinner
+                # spinning, send button disabled). Wait for the upload-COMPLETE
+                # state — spinner GONE and the send button ENABLED — with a bounded
+                # timeout, so a later submit cannot hang; on timeout emit the typed
+                # attach_timeout CONDITION (never hang to the watchdog).
+                await self._wait_upload_complete(filename, timeout_s=90.0)
                 # D8/AC-9: capture a STABLE composer-side attachment reference for
                 # the identity tuple. Prefer a chip test id / dom id; fall back to
                 # the chip's own trimmed text. Non-empty is required (r2 gate B3).
@@ -360,6 +367,76 @@ class Transport:
             "attachment did not reach both calibrated readiness signals before Enter",
             delivery_state=DeliveryState.NOTHING_SENT,
         )
+
+    async def _wait_upload_complete(self, filename: str, *, timeout_s: float = 90.0) -> None:
+        """Wait for the upload-COMPLETE state before Enter (r3).
+
+        Complete = the decorative upload spinner is GONE (no ``.animate-spin`` /
+        ``[role=progressbar]`` near the chip) AND the send button is present and
+        ENABLED. On timeout, record a DOM excerpt under the artifacts dir and
+        raise the typed ``attach_timeout`` condition rather than hanging to the
+        process watchdog.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_s
+        last: dict[str, Any] = {}
+        while _time.monotonic() < deadline:
+            last = await self.page.evaluate(
+                "() => {\n"
+                "  const spinning = !!document.querySelector("
+                "\"[role='progressbar'], svg[class*='spin' i], .animate-spin\");\n"
+                "  const btn = document.querySelector(\"[data-testid='send-button']\");\n"
+                "  const send_present = !!btn;\n"
+                "  const send_enabled = !!btn && !btn.disabled && "
+                "btn.getAttribute('aria-disabled') !== 'true';\n"
+                "  return {spinning, send_present, send_enabled};\n"
+                "}"
+            )
+            if not last.get("spinning") and last.get("send_enabled"):
+                logger.debug("chatgpt_web upload complete: spinner gone, send enabled")
+                return
+            await self.page.wait_for_timeout(1000)
+        # Timed out waiting for upload-complete — record the DOM state and emit a
+        # typed condition (never hang).
+        self._record_stall_dom("attach_timeout", filename, last)
+        raise RunnerError(
+            RunnerErrorCode.ATTACH_TIMEOUT,
+            f"attachment did not reach upload-complete (spinner gone + send enabled) "
+            f"within {int(timeout_s)}s; last DOM state {last}",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+
+    def _record_stall_dom(self, reason: str, filename: str, state: dict[str, Any]) -> None:
+        """Best-effort: write a DOM/state excerpt for a stalled attach to the
+        artifacts dir (NON-SECRET — composer chrome only, no tokens)."""
+        import json as _json
+        import os as _os
+        import time as _time
+        from pathlib import Path as _Path
+
+        try:
+            out_dir = _Path(
+                _os.environ.get("CAO_ARTIFACTS_DIR")
+                or "/data/cao-scratch/worker-scratch/f862-build/r3-artifacts"
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = int(_time.time())
+            (out_dir / f"attach-stall-{reason}-{stamp}.json").write_text(
+                _json.dumps(
+                    {
+                        "reason": reason,
+                        "filename": filename,
+                        "dom_state": state,
+                        "url": getattr(self.page, "url", ""),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            logger.warning("chatgpt_web attach stall (%s) recorded: %s", reason, state)
+        except Exception:  # pragma: no cover - diagnostics are best-effort
+            pass
 
     async def read_conversation(self, conversation_id: str) -> dict[str, Any]:
         """Read the conversation GET via the containment-checked in-page fetch."""

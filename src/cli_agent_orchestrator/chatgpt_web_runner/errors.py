@@ -52,6 +52,7 @@ class RunnerErrorCode(str, Enum):
     # --- Input framing ------------------------------------------------------
     CONTEXT_TOO_LARGE = "context_too_large"
     UPLOAD_UNCONFIRMED = "upload_unconfirmed"
+    ATTACH_TIMEOUT = "attach_timeout"
     ATTACHMENT_IDENTITY = "attachment_identity"
     PIN_DRIFT = "pin_drift"
 

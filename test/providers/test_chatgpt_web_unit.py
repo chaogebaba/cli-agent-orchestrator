@@ -768,6 +768,93 @@ def test_condition_net_interrupted_and_context_and_proc() -> None:
     )
 
 
+def test_condition_attach_timeout_maps_to_transient_overload() -> None:
+    # r3 (user live observation): the attachment upload never reached the
+    # upload-complete state; the runner fails closed with attach_timeout and the
+    # condition plane surfaces it as a TRANSIENT_OVERLOAD (a fresh re-dispatch may
+    # succeed), NOT a hard human-gate.
+    cond = classify_condition("[chatgpt_web] CONDITION attach_timeout", "chatgpt_web")
+    assert cond is not None
+    assert cond.kind is ConditionKind.TRANSIENT_OVERLOAD
+    assert cond.subtype == "attach_upload_stall"
+
+
 def test_condition_marker_only_for_chatgpt_web_provider() -> None:
     # The marker must not fire for another provider's pane.
     assert classify_condition("[chatgpt_web] CONDITION auth_wall", "codex") is None
+
+
+# --- r3: _wait_upload_complete upload-COMPLETE gate ---------------------------
+# The user observed the composer stuck at attach (spinner spinning, composer
+# empty, send disabled). The runner must WAIT for the upload-complete DOM state
+# (spinner gone + send enabled) with a BOUNDED timeout, and on timeout fail
+# closed with the typed ``attach_timeout`` condition (never hang to the process
+# watchdog). These exercise both edges with a fake page (no live browser).
+
+
+class _FakeUploadPage:
+    """Minimal page stub for _wait_upload_complete: yields a scripted sequence of
+    DOM-state dicts from evaluate(); wait_for_timeout is a no-op so the poll loop
+    is fast. ``url`` supports the stall-DOM recorder."""
+
+    def __init__(self, states: list) -> None:
+        self._states = list(states)
+        self.url = "https://chatgpt.com/"
+        self.evaluate_calls = 0
+
+    async def evaluate(self, script, *a):
+        self.evaluate_calls += 1
+        # Return the next scripted state; repeat the last one once exhausted so a
+        # never-clearing spinner keeps returning "still spinning".
+        if len(self._states) > 1:
+            return self._states.pop(0)
+        return self._states[0]
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+
+def test_wait_upload_complete_returns_when_spinner_gone_and_send_enabled() -> None:
+    # Success path: after one "still uploading" tick the composer reaches the
+    # complete state (spinner gone, send enabled). _wait_upload_complete returns
+    # without raising.
+    import asyncio
+
+    page = _FakeUploadPage(
+        [
+            {"spinning": True, "send_present": True, "send_enabled": False},
+            {"spinning": False, "send_present": True, "send_enabled": True},
+        ]
+    )
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import Transport
+
+    transport = Transport(page)
+    asyncio.run(transport._wait_upload_complete("bundle.txt", timeout_s=5.0))
+    assert page.evaluate_calls >= 2
+
+
+def test_wait_upload_complete_timeout_raises_attach_timeout_and_records_dom(
+    tmp_path, monkeypatch
+) -> None:
+    # Timeout path: the spinner NEVER clears (the exact user-observed stall). The
+    # bounded wait must raise the typed ATTACH_TIMEOUT condition and write a
+    # NON-SECRET DOM excerpt to CAO_ARTIFACTS_DIR — never hang.
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    stuck = {"spinning": True, "send_present": True, "send_enabled": False}
+    page = _FakeUploadPage([stuck])
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import Transport
+
+    transport = Transport(page)
+    with pytest.raises(RunnerError) as exc:
+        # Tiny timeout so the bounded loop exits fast; wait_for_timeout is a no-op.
+        asyncio.run(transport._wait_upload_complete("bundle.txt", timeout_s=0.05))
+    assert exc.value.code is RunnerErrorCode.ATTACH_TIMEOUT
+    assert exc.value.delivery_state is DeliveryState.NOTHING_SENT
+    # A stall-DOM excerpt was recorded (diagnostics), and it is non-secret.
+    recorded = list(tmp_path.glob("attach-stall-attach_timeout-*.json"))
+    assert recorded, "expected a stall-DOM excerpt to be written"
+    body = recorded[0].read_text(encoding="utf-8")
+    assert "attach_timeout" in body
+    assert "dom_state" in body
