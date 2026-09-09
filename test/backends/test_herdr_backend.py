@@ -612,15 +612,28 @@ class TestHerdrBackendCommands:
         `foreground_processes[0].name` instead. This feeds a realistic
         process-info-shaped payload through the real subprocess/JSON-parsing
         path (not a mock of get_pane_current_command itself, which would
-        hide exactly this kind of field-name bug)."""
+        hide exactly this kind of field-name bug).
+
+        F880 (#733): the payload here is the REAL herdr 0.9.0 (protocol 22)
+        shape observed live on grok-box-009 — ``result.process_info.
+        foreground_processes`` — not the ``result.pane.foreground_processes``
+        shape a prior test assumed. The old reader looked under ``pane`` and so
+        returned None on 0.9.0, which is the launch-health defect this fixes."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
         panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
         process_info = json.dumps(
             {
-                "id": "cli:pane:process-info",
+                "id": "cli:pane:process_info",
                 "result": {
-                    "pane": {"foreground_processes": [{"name": "bash", "pid": 4242}]},
+                    "process_info": {
+                        "foreground_process_group_id": 4242,
+                        "foreground_processes": [
+                            {"name": "bash", "pid": 4242, "cmdline": "bash", "argv": ["bash"]}
+                        ],
+                        "pane_id": "w1:p1",
+                        "shell_pid": 4240,
+                    },
                     "type": "pane_process_info",
                 },
             }
@@ -1166,8 +1179,24 @@ class TestProbeProviderLiveness:
             return HerdrBackend(herdr_session="cao")
 
     def _proc_info(self, names):
-        procs = [{"name": n} for n in names]
-        return json.dumps({"pane": {"foreground_processes": procs}})
+        # Real herdr 0.9.0 (protocol 22) shape: result.process_info.foreground_processes
+        procs = [
+            {"name": n, "pid": 100 + i, "cmdline": n, "argv": [n]} for i, n in enumerate(names)
+        ]
+        return json.dumps(
+            {
+                "id": "cli:pane:process_info",
+                "result": {
+                    "process_info": {
+                        "foreground_process_group_id": 100,
+                        "foreground_processes": procs,
+                        "pane_id": "w1:p1",
+                        "shell_pid": 99,
+                    },
+                    "type": "pane_process_info",
+                },
+            }
+        )
 
     def test_alive_when_foreground_process_differs_from_baseline(self):
         """A real provider child (name != baseline shell) → 'alive'."""
@@ -1229,6 +1258,42 @@ class TestProbeProviderLiveness:
                 return_value=MagicMock(returncode=0, stdout=self._proc_info(["bash"])),
             ):
                 assert backend.probe_provider_liveness("s", "w", shell_baseline=None) == "unknown"
+
+    def test_alive_reads_real_0_9_0_process_info_nesting(self):
+        """F880 regression: the real herdr 0.9.0 payload nests foreground_processes
+        under result.process_info — the exact shape observed live on grok-box-009
+        where the old reader (result.pane.foreground_processes) yielded nothing and
+        the probe wrongly returned 'dead' for a live grok provider."""
+        backend = self._make_backend()
+        real_payload = json.dumps(
+            {
+                "id": "cli:pane:process_info",
+                "result": {
+                    "process_info": {
+                        "foreground_process_group_id": 765326,
+                        "foreground_processes": [
+                            {
+                                "argv": ["grok"],
+                                "cmdline": "grok",
+                                "cwd": "/w",
+                                "name": "grok",
+                                "pid": 765326,
+                            }
+                        ],
+                        "pane_id": "w1:p1",
+                        "shell_pid": 765260,
+                    },
+                    "type": "pane_process_info",
+                },
+            }
+        )
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend, "_run_herdr", return_value=MagicMock(returncode=0, stdout=real_payload)
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "alive"
+                # and get_pane_current_command reads the same nesting
+                assert backend.get_pane_current_command("s", "w") == "grok"
 
 
 # --- create_window window_shell ---

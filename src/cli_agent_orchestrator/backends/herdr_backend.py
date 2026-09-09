@@ -276,6 +276,38 @@ class HerdrBackend(TerminalBackend):
             return cast(dict, data["result"])
         return cast(dict, data)
 
+    @staticmethod
+    def _foreground_processes(parsed: dict) -> list[dict]:
+        """Extract ``foreground_processes`` from a parsed ``pane process-info`` body.
+
+        F880 (#733): herdr 0.9.0 (protocol 22) nests the list under
+        ``result.process_info.foreground_processes`` — after ``_parse_herdr_json``
+        strips the ``result`` envelope, that is ``parsed["process_info"]
+        ["foreground_processes"]``. The former readers looked for a top-level or
+        ``pane.foreground_processes`` key (the 0.7.x shape) and so ALWAYS got
+        ``None`` on 0.9.0 — which is why ``get_pane_current_command`` returned
+        ``None`` and the launch-health probe read an empty seat and raised
+        ``ProviderLaunchFailed`` for a live provider (observed live on
+        grok-box-009: process-info reported ``[{"name":"grok",...}]`` while the
+        old path yielded nothing). Tolerates both shapes so a schema that moves
+        it back to the top level still resolves. Returns [] on anything unexpected.
+        """
+        if not isinstance(parsed, dict):
+            return []
+        info = parsed.get("process_info")
+        if isinstance(info, dict) and isinstance(info.get("foreground_processes"), list):
+            return [p for p in info["foreground_processes"] if isinstance(p, dict)]
+        # Fallbacks for other/older shapes (top-level or under "pane").
+        for candidate in (
+            parsed,
+            parsed.get("pane") if isinstance(parsed.get("pane"), dict) else None,
+        ):
+            if isinstance(candidate, dict) and isinstance(
+                candidate.get("foreground_processes"), list
+            ):
+                return [p for p in candidate["foreground_processes"] if isinstance(p, dict)]
+        return []
+
     def _resolve_workspace_id(self, session_name: str) -> str:
         """Resolve session_name (workspace label) to workspace ID.
 
@@ -852,8 +884,7 @@ class HerdrBackend(TerminalBackend):
             return None
         try:
             data = self._parse_herdr_json(result.stdout)
-            info = data.get("pane", data) if isinstance(data, dict) else data
-            processes = info.get("foreground_processes")
+            processes = self._foreground_processes(data)
             if not processes:
                 return None
             return cast(Optional[str], processes[0].get("name"))
@@ -1026,8 +1057,7 @@ class HerdrBackend(TerminalBackend):
             return "unknown"
         try:
             data = self._parse_herdr_json(result.stdout)
-            info = data.get("pane", data) if isinstance(data, dict) else data
-            processes = info.get("foreground_processes")
+            processes = self._foreground_processes(data)
         except (json.JSONDecodeError, AttributeError, TypeError):
             return "unknown"
 
@@ -1035,10 +1065,7 @@ class HerdrBackend(TerminalBackend):
             # No foreground process at all: an empty seat / vanished pane.
             return "dead"
 
-        try:
-            names = [p.get("name") for p in processes if isinstance(p, dict)]
-        except (AttributeError, TypeError):
-            return "unknown"
+        names = [p.get("name") for p in processes if isinstance(p, dict)]
         names = [n for n in names if isinstance(n, str) and n]
         if not names:
             return "unknown"
