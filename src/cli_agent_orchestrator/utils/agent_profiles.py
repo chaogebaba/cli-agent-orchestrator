@@ -770,6 +770,116 @@ def _dangling_store_entry(agent_name: str) -> bool:
     return False
 
 
+def _first_present_store_entry_is_unknown(agent_name: str) -> bool:
+    """F838 (#695) r4 — does a higher-precedence DANGLING SYMLINK SHADOW a
+    lower-precedence readable same-named profile? Report True iff so.
+
+    This closes the codex r3 P0 blocker: ``read_agent_profile_source`` gates each
+    candidate on ``Path.exists()`` (which FOLLOWS a symlink), so a
+    higher-precedence dangling link reads as absent and the lookup silently
+    FALLS THROUGH to a lower-precedence same-named profile — the lower file is
+    then classified DECLARED/PLAIN and its provider (or the caller fallback)
+    reaches creation. ``_dangling_store_entry`` alone could not catch this: it is
+    consulted only inside the ``FileNotFoundError`` arm, which never fires when a
+    lower store satisfies the read.
+
+    Required semantics (r4): precedence resolution STOPS at the first store dir
+    that has an entry for the name; if that entry is UNKNOWN (dangling) it
+    refuses rather than continuing to a lower dir. Concretely this helper walks
+    the stores in the SAME order the reader does (local store → configured agent
+    dirs → extra dirs) and returns True as soon as it finds a dir whose only
+    entry for the name is a DANGLING SYMLINK **while a strictly-lower dir holds a
+    READABLE same-named entry** the reader would otherwise fall through to. It
+    returns False the moment it reaches a dir with a readable entry first (that
+    readable higher entry is what the reader returns — no shadowing), and False
+    for a bare dangling entry with NO lower readable match (that case is already
+    handled fail-closed by the classifier's ``FileNotFoundError`` →
+    ``_dangling_store_entry`` arm, which this helper deliberately leaves
+    UNCHANGED — including its single-read count).
+
+    This is a STAT-ONLY walk (``is_symlink``/``exists`` — no ``read_text``), so it
+    does NOT consume the single raw read the resolver is asserted to make exactly
+    once for a cleanly-read profile. Best-effort and never raises.
+    """
+
+    def _is_dangling(path: "Optional[Path]") -> bool:
+        try:
+            return path is not None and path.is_symlink() and not path.exists()
+        except OSError:
+            return False
+
+    def _readable(path: "Optional[Path]") -> bool:
+        # ``exists()`` follows symlinks: True only for a link whose target
+        # resolves, or a real file — exactly what the reader gates on.
+        try:
+            return path is not None and path.exists()
+        except OSError:
+            return False
+
+    try:
+        _validate_agent_name(agent_name)
+    except ValueError:
+        return False
+
+    try:
+        from cli_agent_orchestrator.services.settings_service import (
+            get_agent_dirs,
+            get_disabled_agent_dirs,
+            get_extra_agent_dirs,
+        )
+
+        disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
+
+        # Ordered store roots, mirroring read_agent_profile_source. (The composed
+        # store is only consulted for a ``<position>-<provider>`` name and is
+        # written atomically by the assign-time writer, never a user symlink, so
+        # it is not part of this dangling-shadow walk.)
+        ordered_roots: List[Path] = []
+        if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
+            ordered_roots.append(LOCAL_AGENT_STORE_DIR)
+        for dir_path in get_agent_dirs().values():
+            if normalized_path(dir_path) not in disabled:
+                ordered_roots.append(Path(dir_path))
+        for extra_dir in get_extra_agent_dirs():
+            if normalized_path(extra_dir) not in disabled:
+                ordered_roots.append(Path(extra_dir))
+
+        # Classify each dir's entry for the name in precedence order.
+        seen_higher_dangling = False
+        for root in ordered_roots:
+            flat = _safe_join(root, f"{agent_name}.md")
+            nested = _safe_join(root, agent_name, "agent.md")
+            raw_flat = root.joinpath(f"{agent_name}.md")
+            raw_nested = root.joinpath(agent_name, "agent.md")
+
+            dir_readable = _readable(flat) or _readable(nested)
+            dir_dangling = (
+                _is_dangling(raw_flat)
+                or _is_dangling(raw_nested)
+                or _is_dangling(flat)
+                or _is_dangling(nested)
+            )
+
+            if dir_readable:
+                # The reader stops at the first dir with a readable entry. If a
+                # STRICTLY-HIGHER dir was dangling, that dangling entry shadows
+                # THIS readable one — the forbidden fall-through. Otherwise this
+                # readable entry is the legitimate winner (no shadowing).
+                return seen_higher_dangling
+            if dir_dangling:
+                # A present-but-unreadable higher entry. Remember it; if a lower
+                # dir turns out readable, this shadows it.
+                seen_higher_dangling = True
+            # else: nothing for the name here — keep walking.
+
+        # Walked every store without hitting a readable entry. A bare dangling
+        # entry with no lower readable match is left to the FileNotFoundError →
+        # _dangling_store_entry arm (single-read behaviour preserved).
+        return False
+    except Exception:
+        return False
+
+
 # F838 (#695) r3 — the U+FEFF byte-order mark. A well-formed profile source
 # never begins with one; a BOM-prefixed stub defeats frontmatter detection
 # (the ``---`` opener is no longer at offset 0), so ``frontmatter.loads`` silently
@@ -841,15 +951,31 @@ def _classify_stub_intent(
     * ``UNKNOWN`` — the raw read raised anything else (permission/IO/decoding);
       the frontmatter failed to parse; the raw stub is MALFORMED (BOM-prefixed or
       a truncated/unterminated delimiter that ``frontmatter.loads`` hides as
-      empty metadata — codex r2 P0-A); OR the name resolves to a DANGLING SYMLINK
+      empty metadata — codex r2 P0-A); the name resolves to a DANGLING SYMLINK
       (a store entry that exists as a link but whose target is missing — NOT a
-      clean absence, codex r2 P0-A). We have NO reliable evidence of intent, so
-      this path MUST fail closed (F838 #695) — never treated as ``PLAIN``/``ABSENT``.
+      clean absence, codex r2 P0-A); OR the FIRST store dir (in precedence order)
+      that has an entry for the name holds it only as a dangling symlink, which
+      the ``.exists()``-gated reader would skip in favour of a LOWER-precedence
+      same-named profile (codex r3 P0 — a higher dangling stub must not fall
+      through). We have NO reliable evidence of intent, so this path MUST fail
+      closed (F838 #695) — never treated as ``PLAIN``/``ABSENT``.
 
     ``raw_text`` is the single raw read (or None when not readable), so the
     caller resolves the profile from these SAME bytes rather than issuing a
     second, racy disk read (codex Blocker: "resolve from one immutable read").
     """
+    # F838 (#695) r4 — PRECEDENCE-SHADOWED DANGLING STUB (codex r3 P0). Before
+    # the single read, walk the stores in read order: if the FIRST store dir
+    # that has an entry for the name holds that entry only as a DANGLING SYMLINK,
+    # resolution must STOP THERE and classify UNKNOWN. Otherwise
+    # ``read_agent_profile_source`` (which gates on ``.exists()``, following
+    # symlinks) skips the dangling higher entry and silently returns a
+    # LOWER-precedence same-named profile, whose provider/fallback then reaches
+    # creation. This stat-only check runs BEFORE the read, so the fail-closed
+    # verdict is reached without ever reading (and thus without trusting) the
+    # shadowed lower file.
+    if _first_present_store_entry_is_unknown(agent_profile_name):
+        return _STUB_UNKNOWN, None, None
     try:
         raw = read_agent_profile_source(agent_profile_name)
     except FileNotFoundError:

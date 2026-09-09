@@ -298,3 +298,60 @@ def test_assign_legacy_plain_no_intent_unchanged(store):
     assert captured["agent_profile"] == "f838_plain"
     # Not pre-resolved by the guard; legacy passthrough leaves provider None.
     assert captured["provider"] is None
+
+
+def test_assign_refuses_when_dangling_higher_shadows_lower_profile(tmp_path, monkeypatch):
+    """F838 r4 (codex r3 P0): a HIGHER-precedence dangling local entry shadows a
+    LOWER same-named DECLARING profile. ``read_agent_profile_source`` gates on
+    ``.exists()`` (follows symlinks), so the dangling higher link is skipped and
+    the lookup falls through to the lower ``claude_code`` file — which in r3
+    reached _create_terminal. r4 must classify UNKNOWN at the higher entry and
+    refuse: typed E-PROVIDER-UNRESOLVED, NO terminal created.
+
+    Unlike the ``store`` fixture (which disables every configured agent dir),
+    this test wires a LOWER store as a configured agent dir so the shadowing can
+    happen at all."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_shadow.md").symlink_to(higher / "missing-shadow-target.md")
+    (lower / "f838_shadow.md").write_text(
+        "---\nprovider: claude_code\n---\nlower body\n", encoding="utf-8"
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch_object(ap, "LOCAL_AGENT_STORE_DIR", higher))
+        stack.enter_context(
+            patch_dotted(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"lower": str(lower)},
+            )
+        )
+        stack.enter_context(
+            patch_dotted(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            )
+        )
+        stack.enter_context(
+            patch_dotted(
+                "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+                return_value=[],
+            )
+        )
+        stack.enter_context(_patch.object(server.cao_http, "get", return_value=_CallerResponse()))
+        stack.enter_context(
+            patch_dotted(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=None,
+            )
+        )
+        with _patch(_CREATE) as create:
+            result = _assign_impl("f838_shadow", "task", working_directory="/repo")
+
+    assert result["success"] is False, result
+    assert E_PROVIDER_UNRESOLVED in result["message"]
+    assert "no spawn" in result["message"].lower()
+    create.assert_not_called()

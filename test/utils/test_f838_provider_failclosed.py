@@ -294,3 +294,158 @@ def test_single_read_invariant_resolve_reads_store_once(tmp_path):
         with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
             resolve_provider("f838_once", "kiro_cli")
     assert reads.call_count == 1, f"expected 1 raw store read, got {reads.call_count}"
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r4 — PRECEDENCE-SHADOWED dangling stub (codex r3 P0 blocker).
+#
+# ``read_agent_profile_source`` gates each candidate on ``Path.exists()`` (which
+# FOLLOWS a symlink), so a HIGHER-precedence dangling link reads as absent and
+# the lookup silently FALLS THROUGH to a LOWER-precedence same-named profile.
+# The r3 code then classified that lower file DECLARED/PLAIN and its provider
+# (or the caller fallback) reached creation — the ``_dangling_store_entry`` check
+# never fired because a lower store satisfied the read. r4 requires: precedence
+# resolution STOPS at the first store dir that has an entry for the name; if that
+# entry is a dangling symlink it is UNKNOWN and REFUSES, never continuing to a
+# lower dir. Real files under a scratch local store (higher) + a configured
+# lower store, no mocks of the resolver internals.
+# ---------------------------------------------------------------------------
+
+
+def _store_patches_with_lower(higher: Path, lower: Path) -> ExitStack:
+    """Point the local store at ``higher`` and expose ``lower`` as a
+    lower-precedence configured agent dir; disable nothing else."""
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", higher))
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={"lower": str(lower)},
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    return stack
+
+
+def test_real_dangling_higher_over_declaring_lower_refuses(tmp_path):
+    """(1) A dangling local flat entry SHADOWS a lower same-named DECLARING
+    profile. The r3 code returned the lower profile's ``claude_code``; r4 must
+    classify UNKNOWN and refuse (E-PROVIDER-UNRESOLVED) — the higher dangling
+    entry stops resolution before the lower file is ever read."""
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_shadow_decl.md").symlink_to(higher / "missing-shadow-target.md")
+    (lower / "f838_shadow_decl.md").write_text(
+        "---\nprovider: claude_code\n---\nlower body\n", encoding="utf-8"
+    )
+    original_read = _ap.read_agent_profile_source
+    with _store_patches_with_lower(higher, lower):
+        intent, _, _ = _ap._classify_stub_intent("f838_shadow_decl")
+        assert intent == _ap._STUB_UNKNOWN
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            with pytest.raises(ProviderResolutionError) as ei:
+                resolve_provider("f838_shadow_decl", "pi_cli")
+        # The shadowed lower file must NEVER be read/trusted: the stat-only
+        # precedence walk refuses before the raw read is issued.
+        assert reads.call_count == 0
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+def test_real_dangling_higher_over_plain_lower_refuses(tmp_path):
+    """(2) A dangling local flat entry SHADOWS a lower same-named PLAIN profile.
+    The r3 code fell back to the caller provider; r4 must refuse — a dangling
+    higher entry is uncertainty, not permission to use the lower plain file."""
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_shadow_plain.md").symlink_to(higher / "missing-shadow-target.md")
+    (lower / "f838_shadow_plain.md").write_text(
+        "---\ndescription: lower plain profile\n---\nlower body\n", encoding="utf-8"
+    )
+    with _store_patches_with_lower(higher, lower):
+        intent, _, _ = _ap._classify_stub_intent("f838_shadow_plain")
+        assert intent == _ap._STUB_UNKNOWN
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider("f838_shadow_plain", "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+    assert "claude_code" in str(ei.value)
+
+
+def test_real_valid_higher_over_dangling_lower_resolves_higher(tmp_path):
+    """(3) The MIRROR control: a VALID higher entry over a lower DANGLING
+    same-named entry. Resolution stops at the first (higher) readable entry and
+    resolves ITS provider; the lower dangling entry is irrelevant and must not
+    trigger a spurious refusal. Guards the precedence walk against
+    over-refusing when the higher entry is the legitimate winner."""
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_valid_over_dangling.md").write_text(
+        "---\nprovider: pi_cli\n---\nhigher valid body\n", encoding="utf-8"
+    )
+    (lower / "f838_valid_over_dangling.md").symlink_to(lower / "missing-lower-target.md")
+    with _store_patches_with_lower(higher, lower):
+        intent, declared, _ = _ap._classify_stub_intent("f838_valid_over_dangling")
+        assert intent == _ap._STUB_DECLARED
+        assert declared == "pi_cli"
+        assert resolve_provider("f838_valid_over_dangling", "claude_code") == "pi_cli"
+
+
+def test_real_malformed_higher_over_valid_lower_refuses(tmp_path):
+    """A malformed (truncated) higher entry is a READABLE file, so the reader
+    stops there and the r3 malformed check classifies it UNKNOWN — the lower
+    valid profile is never reached. Pins that a malformed higher entry does not
+    fall through to a lower same-named file either."""
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_malformed_shadow.md").write_text(
+        "---\nprovider: pi_cli\n", encoding="utf-8", newline=""
+    )
+    (lower / "f838_malformed_shadow.md").write_text(
+        "---\nprovider: claude_code\n---\nlower body\n", encoding="utf-8"
+    )
+    with _store_patches_with_lower(higher, lower):
+        intent, _, _ = _ap._classify_stub_intent("f838_malformed_shadow")
+        assert intent == _ap._STUB_UNKNOWN
+        with pytest.raises(ProviderResolutionError) as ei:
+            resolve_provider("f838_malformed_shadow", "claude_code")
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+def test_real_valid_local_shadows_lower_still_reads_once(tmp_path):
+    """Single-read invariant control for the shadowing path: a normal VALID
+    higher entry (with an unrelated lower same-named file present) still resolves
+    in EXACTLY ONE raw read — the stat-only precedence walk adds no extra read on
+    the healthy path."""
+    higher = tmp_path / "agent-store"
+    lower = tmp_path / "lower-store"
+    higher.mkdir(parents=True, exist_ok=True)
+    lower.mkdir(parents=True, exist_ok=True)
+    (higher / "f838_shadow_once.md").write_text(
+        "---\nprovider: pi_cli\n---\nhigher\n", encoding="utf-8"
+    )
+    (lower / "f838_shadow_once.md").write_text(
+        "---\nprovider: claude_code\n---\nlower\n", encoding="utf-8"
+    )
+    original_read = _ap.read_agent_profile_source
+    with _store_patches_with_lower(higher, lower):
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            assert resolve_provider("f838_shadow_once", "claude_code") == "pi_cli"
+    assert reads.call_count == 1, f"expected 1 raw store read, got {reads.call_count}"
