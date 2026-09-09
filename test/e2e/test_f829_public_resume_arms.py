@@ -182,17 +182,28 @@ def _capture_diag(cao_server, tag: str) -> str:
 
 
 def _create_session_terminal(api: str, provider: str, profile: str, session: str,
-                             model: str | None, cao_server=None) -> tuple[str, str]:
+                             model: str | None, cao_server=None,
+                             initial_message: str | None = None) -> tuple[str, str]:
     # Real-provider terminal init (tmux spawn + MCP handshake + first system-
     # prompt turn) can take many minutes on a box; supervisor set a 600s create
     # budget + ONE retry. A watchdog thread captures tmux/pane/server.log if a
     # create call stays blocked past _CREATE_WATCHDOG_S, so a hang is diagnosable
     # (tmux spawn vs handshake vs first turn) even though POST /sessions blocks.
+    #
+    # initial_message: when set, delivered as the worker's FIRST turn (defer_init
+    # path). Critical for kiro B4: create_terminal injects the per-attempt
+    # capture_nonce into the kiro worker's first turn ONLY when there is an
+    # initial_message to append it to, so the nonce lands in the kiro session's
+    # messages.jsonl and the nonce-gated capture can attribute it.
     import threading
 
     params = {"provider": provider, "agent_profile": profile, "session_name": session}
     if model:
         params["model"] = model
+    json_body = None
+    if initial_message is not None:
+        params["defer_init"] = "true"
+        json_body = {"initial_message": initial_message}
     last = None
     for attempt in range(2):
         if attempt:
@@ -208,7 +219,8 @@ def _create_session_terminal(api: str, provider: str, profile: str, session: str
         wd = threading.Thread(target=_wd, daemon=True)
         wd.start()
         try:
-            resp = requests.post(f"{api}/sessions", params=params, timeout=_CREATE_TIMEOUT)
+            resp = requests.post(f"{api}/sessions", params=params, json=json_body,
+                                 timeout=_CREATE_TIMEOUT)
         except requests.exceptions.ReadTimeout as exc:
             last = f"ReadTimeout after {_CREATE_TIMEOUT}s: {exc}"
             _capture_diag(cao_server, f"create-timeout-{provider}-a{attempt}")
@@ -398,8 +410,17 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         assert _wait_ready_api(api, supervisor_id) in _READY, "supervisor not ready"
 
         # 1. FRESH SPAWN through production create/publish (spawn-mint fires).
+        # Deliver the plant as the worker's FIRST turn (initial_message) so that,
+        # for kiro, create_terminal injects the per-attempt capture_nonce into
+        # that first turn — the nonce then lands in the kiro session and the
+        # nonce-gated capture (B4) can attribute it. (For claude/codex/pi the
+        # initial_message is just the plant turn; capture is via their own path.)
+        plant_msg = (
+            f"Remember this exact token for later: {token}. Reply with just: ACK {token}"
+        )
         worker_id, _ = _create_session_terminal(
-            api, provider, profile, f"{session}-w", model, cao_server=cao_server
+            api, provider, profile, f"{session}-w", model, cao_server=cao_server,
+            initial_message=plant_msg,
         )
         st = _wait_ready_api(api, worker_id)
         assert st in _READY, f"worker not ready (status={st})"
@@ -409,11 +430,11 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         wmeta = requests.get(f"{api}/terminals/{worker_id}", timeout=30).json()
         worker_cwd = wmeta.get("cwd") or wmeta.get("working_directory")
 
-        # 2. PLANT the marker via a real provider turn.
-        plant = _drive_turn(
-            api, worker_id,
-            f"Remember this exact token for later: {token}. Reply with just: ACK {token}",
-        )
+        # 2. The plant turn was delivered at spawn (initial_message). Give it a
+        # moment to complete + capture the worker's output for the record.
+        _wait_ready_api(api, worker_id, timeout=_TURN_TIMEOUT)
+        time.sleep(3)
+        plant = extract_output(worker_id)
         rec("PLANT", plant[-1500:])
         banner = _quota_banner_hit(plant)
         if banner:
