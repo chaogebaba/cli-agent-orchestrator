@@ -126,3 +126,57 @@ def test_ambiguous_nonce_in_both_layouts_refuses(tmp_path):
     )
     assert sid is None
     assert reason == "capture_unknown"
+
+
+
+# --- D6 artifact resolver (session_artifact._resolve_kiro) dual-layout --------
+import os as _os
+
+from cli_agent_orchestrator.services.session_artifact import ArtifactState, resolve_artifact
+
+
+def _kiro_root(tmp_path, monkeypatch):
+    """Point the kiro sessions root (KIRO_HOME/.kiro/sessions) at a scratch dir."""
+    khome = tmp_path / "kh"
+    (khome / ".kiro" / "sessions").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("KIRO_HOME", str(khome / ".kiro"))
+    return khome / ".kiro" / "sessions"
+
+
+def test_d6_resolver_flat_layout_valid(tmp_path, monkeypatch):
+    """kiro-cli 2.20.1 flat store: sessions/cli/<uuid>.jsonl present+non-empty →
+    the D6 artifact resolver returns VALID (so planned hibernate is eligible)."""
+    sroot = _kiro_root(tmp_path, monkeypatch)
+    cli = sroot / "cli"; cli.mkdir(parents=True, exist_ok=True)
+    (cli / "flat-uuid-1.json").write_text(json.dumps({"id": "flat-uuid-1"}))
+    (cli / "flat-uuid-1.jsonl").write_text("turn\n")
+    st = resolve_artifact("kiro_cli", provider_session_id="flat-uuid-1",
+                          provider_namespace=None, cwd=CWD, artifact_locator=None)
+    assert st.state == ArtifactState.VALID, (st.state, st.detail)
+
+
+def test_d6_resolver_flat_empty_is_invalid(tmp_path, monkeypatch):
+    sroot = _kiro_root(tmp_path, monkeypatch)
+    cli = sroot / "cli"; cli.mkdir(parents=True, exist_ok=True)
+    (cli / "flat-empty.jsonl").write_text("")
+    st = resolve_artifact("kiro_cli", provider_session_id="flat-empty",
+                          provider_namespace=None, cwd=CWD, artifact_locator=None)
+    assert st.state == ArtifactState.INVALID, (st.state, st.detail)
+
+
+def test_d6_resolver_legacy_layout_still_valid(tmp_path, monkeypatch):
+    """Legacy v3 nested store still resolves VALID (dual-layout, not replaced)."""
+    sroot = _kiro_root(tmp_path, monkeypatch)
+    d = sroot / _cwd_hash(CWD) / "sess_leg-1"; d.mkdir(parents=True, exist_ok=True)
+    (d / "session.json").write_text(json.dumps({"id": "sess_leg-1", "rootPaths": [CWD]}))
+    (d / "messages.jsonl").write_text("turn\n")
+    st = resolve_artifact("kiro_cli", provider_session_id="sess_leg-1",
+                          provider_namespace=None, cwd=CWD, artifact_locator=None)
+    assert st.state == ArtifactState.VALID, (st.state, st.detail)
+
+
+def test_d6_resolver_absent_is_missing(tmp_path, monkeypatch):
+    _kiro_root(tmp_path, monkeypatch)
+    st = resolve_artifact("kiro_cli", provider_session_id="nope-uuid",
+                          provider_namespace=None, cwd=CWD, artifact_locator=None)
+    assert st.state == ArtifactState.MISSING, (st.state, st.detail)

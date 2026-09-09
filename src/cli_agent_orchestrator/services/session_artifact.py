@@ -158,44 +158,69 @@ def _normalise_kiro_id(uuid: str) -> str:
 
 
 def _resolve_kiro(uuid: str, namespace: Optional[str]) -> ArtifactStatus:
-    """kiro v3 nested store: ``sessions/<cwd-hash>/<sess_uuid>/`` with BOTH
-    ``session.json`` AND ``messages.jsonl`` required.
+    """kiro recoverable artifact — supports BOTH store layouts (kiro-cli versions
+    differ across the laptop and boxes; see the arm report's `kiro-cli --version`):
 
-    The uuid dir is globally unique across cwd-hashes (probe: "resolves globally
-    across cwds"), so we glob for the ``sess_<uuid>`` directory rather than
-    reimplement KAS's internal cwd hash. The old flat ``sessions/cli/<uuid>.jsonl``
-    (v1/v2) is deliberately NOT consulted.
+    * v3 NESTED: ``sessions/<cwd-hash>/<sess_uuid>/`` with BOTH ``session.json``
+      AND ``messages.jsonl`` required. The uuid dir is globally unique across
+      cwd-hashes, so we glob the ``sess_<uuid>`` dir rather than reimplement KAS's
+      cwd hash.
+    * FLAT (kiro-cli 2.20.1): ``sessions/cli/<uuid>.json`` (meta) + ``<uuid>.jsonl``
+      (transcript). A valid recoverable artifact when the transcript is present
+      and non-empty. (F829 kiro-harness: the flat store is what 2.20.1 actually
+      writes; treating it as "not consulted" wrongly refused hibernate with
+      session_artifact_unavailable.)
     """
-    home = _provider_home("kiro_cli")
-    if home is None:
+    # kiro has no provider-plane "native-home" object (provider_home raises), so
+    # resolve the kiro home the SAME way the capture path does — KIRO_HOME env
+    # else ~/.kiro — rather than via _provider_home (which returns None for kiro
+    # and wrongly yielded "kiro home unresolved" / session_artifact_unavailable).
+    from cli_agent_orchestrator.services.resume_service import _kiro_sessions_root
+
+    try:
+        sessions = _kiro_sessions_root()
+    except Exception:
         return ArtifactStatus(ArtifactState.INACCESSIBLE, detail="kiro home unresolved")
     sess_id = _normalise_kiro_id(uuid)
-    sessions = home / "sessions"
     try:
         if not sessions.is_dir():
             return ArtifactStatus(ArtifactState.MISSING, detail="no sessions dir")
         dirs = [p for p in sessions.glob(f"*/{sess_id}") if p.is_dir()]
     except OSError as exc:
         return ArtifactStatus(ArtifactState.INACCESSIBLE, detail=f"sessions unreadable: {exc}")
-    if not dirs:
-        return ArtifactStatus(ArtifactState.MISSING, detail="no v3 session dir")
-    session_dir = dirs[0]
-    session_json = session_dir / "session.json"
-    messages = session_dir / "messages.jsonl"
-    try:
-        have_json = session_json.is_file()
-        have_msgs = messages.is_file()
-    except OSError as exc:
-        return ArtifactStatus(ArtifactState.INACCESSIBLE, str(session_dir), f"stat failed: {exc}")
-    if not (have_json and have_msgs):
-        # Present-but-incomplete is INVALID, not missing: the dir exists but the
-        # required metadata pair is not both there (e.g. pre-first-turn).
-        return ArtifactStatus(
-            ArtifactState.INVALID,
-            str(session_dir),
-            f"required pair incomplete (session.json={have_json}, messages.jsonl={have_msgs})",
-        )
-    return ArtifactStatus(ArtifactState.VALID, str(messages))
+    if dirs:
+        session_dir = dirs[0]
+        session_json = session_dir / "session.json"
+        messages = session_dir / "messages.jsonl"
+        try:
+            have_json = session_json.is_file()
+            have_msgs = messages.is_file()
+        except OSError as exc:
+            return ArtifactStatus(
+                ArtifactState.INACCESSIBLE, str(session_dir), f"stat failed: {exc}"
+            )
+        if not (have_json and have_msgs):
+            return ArtifactStatus(
+                ArtifactState.INVALID,
+                str(session_dir),
+                f"required pair incomplete (session.json={have_json}, messages.jsonl={have_msgs})",
+            )
+        return ArtifactStatus(ArtifactState.VALID, str(messages))
+    # FLAT layout fallback: sessions/cli/<uuid>.jsonl (+ <uuid>.json). Accept both
+    # the bare-uuid and the sess_-prefixed forms for the filename stem.
+    cli_dir = sessions / "cli"
+    for stem in (uuid, sess_id, sess_id[len("sess_"):] if sess_id.startswith("sess_") else sess_id):
+        transcript = cli_dir / f"{stem}.jsonl"
+        try:
+            if transcript.is_file():
+                if transcript.stat().st_size == 0:
+                    return ArtifactStatus(
+                        ArtifactState.INVALID, str(transcript), "empty kiro flat session"
+                    )
+                return ArtifactStatus(ArtifactState.VALID, str(transcript))
+        except OSError as exc:
+            return ArtifactStatus(ArtifactState.INACCESSIBLE, str(transcript), f"stat failed: {exc}")
+    return ArtifactStatus(ArtifactState.MISSING, detail="no v3 session dir or flat cli/ session")
 
 
 def _resolve_pi(
