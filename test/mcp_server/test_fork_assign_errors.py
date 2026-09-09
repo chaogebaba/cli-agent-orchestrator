@@ -79,35 +79,35 @@ def test_fork_path_validation_errors_do_not_spawn(monkeypatch, code):
 
 @pytest.mark.parametrize("code", ["identity", "session_id"])
 def test_legacy_fork_resume_delegates_to_resume_refusal(monkeypatch, code):
-    """r1 #1: legacy fork_from+resume=True delegates into the resume service,
-    so a base name that is not a resolvable identity yields resume_refused —
-    NOT the old owner-probe/resume_profile_mismatch fork-path strings."""
+    """F829 A2.1 (Option A): legacy fork_from+resume=True is pure syntax that
+    FORWARDS the handle to the SERVER-SIDE resume admission (no client-side
+    resolution anymore). The shim marks it a resume and passes resume_from to
+    the create endpoint; the refusal (unknown handle / no captured session id)
+    is a SERVER decision, covered by test_f829_a2 / test_f829_ac_matrix. Here we
+    assert the shim FORWARDS rather than resolving the identity itself."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    from cli_agent_orchestrator.clients import database as _db
-
-    if code == "identity":
-        identity = None  # "base" resolves to nothing
-    else:  # session_id: an identity exists but has no captured provider session
-        identity = {
-            "terminal_id": "base",
-            "provider": "codex",
-            "agent_profile": "developer",
-            "cwd": "/repo",
-            "provider_session_id": None,
-            "worktree_path": None,
-            "worktree_branch": None,
-            "worktree_repo_root": None,
-            "git_sha": None,
-        }
     with (
-        patch.object(_db, "get_terminal_identity", return_value=identity),
-        patch.object(_db, "get_terminal_identity_by_provider_session_id", return_value=None),
-        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal",
+            return_value=("new00001", "codex"),
+        ) as create,
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value={"resolved_model": None},
+        ),
+        patch("cli_agent_orchestrator.mcp_server.server.generate_window_name", return_value="w"),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server.display_name",
+            return_value="developer(new00001)",
+        ),
     ):
-        result = _assign_impl("developer", "task", fork_from="base", resume=True)
-    assert result["error"] == "resume_refused"
-    assert result["missing"] == code
-    create.assert_not_called()
+        result = _assign_impl(
+            "developer", "task", fork_from="base", resume=True, working_directory="/repo"
+        )
+    # The legacy form translated into a resume forward, not a client-side refusal.
+    assert result.get("success") is True
+    assert create.call_args.kwargs["resume_from"] == "base"
+    assert create.call_args.kwargs["fork_context"] is None
 
 
 def test_capability_attribute_owns_pre_spawn_check(monkeypatch):
