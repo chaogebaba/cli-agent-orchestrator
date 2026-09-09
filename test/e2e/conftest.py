@@ -147,20 +147,32 @@ def require_claude():
 def require_kiro(require_cao_server: CaoServer):
     """Skip test if kiro-cli is not available; provision kiro agent profiles.
 
-    The kiro_cli provider requires a base agent JSON at
-    ``~/.kiro/agents/{profile}.json`` — created by ``cao install``. The
-    managed e2e server uses a redirected HOME so the real user store is
-    invisible. Seed minimal agent JSONs so e2e tests that use the generic
-    ``developer``, ``code_supervisor``, ``data_analyst``, and
-    ``report_generator`` profiles succeed without a prior ``cao install`` on
-    the box.
+    The kiro_cli provider resolves its base agent JSON from
+    ``constants.kiro_agents_dir()`` == ``$CAO_AGENTS_DIR`` (constants.py:393),
+    NOT ``~/.kiro/agents`` — test/conftest.py pins CAO_AGENTS_DIR to a
+    ``cao-pytest-*`` tmp dir at import (F549), and the managed cao-server
+    subprocess inherits it. Seeding into ``home_dir/.kiro/agents`` therefore put
+    the JSONs where the server does NOT look, so a kiro e2e worker failed to
+    launch with "kiro base agent JSON missing … Refusing to launch unprofiled
+    kiro_default" (F829 build-2 kiro-arm blocker). Seed into ``kiro_agents_dir()``
+    — the exact dir the server reads — so ``developer`` (and the other generic
+    profiles) resolve without a prior ``cao install``.
     """
     if not _cli_available("kiro-cli"):
         pytest.skip("kiro-cli CLI not installed")
 
     import json as _json
 
-    agents_dir = require_cao_server.home_dir / ".kiro" / "agents"
+    from cli_agent_orchestrator.constants import kiro_agents_dir
+
+    # The dir the kiro provider ACTUALLY reads (CAO_AGENTS_DIR at call time),
+    # not home_dir/.kiro/agents which the server never consults.
+    agents_dir = kiro_agents_dir()
+    # Unit-level invariant: the seed target is exactly what the provider resolves.
+    assert agents_dir == kiro_agents_dir(), (
+        f"require_kiro seed dir {agents_dir} must equal kiro_agents_dir() "
+        f"{kiro_agents_dir()} (the CAO_AGENTS_DIR the server reads)"
+    )
     agents_dir.mkdir(parents=True, exist_ok=True)
 
     # Map profile name → (allowedTools, tools) for the minimal JSON.
