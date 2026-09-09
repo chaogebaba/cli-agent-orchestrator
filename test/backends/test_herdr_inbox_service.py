@@ -16,10 +16,44 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
-def _writer_mock():
-    writer = MagicMock()
-    writer.drain = AsyncMock()
-    return writer
+class _FakeHerdrClient:
+    """A drop-in for ``HerdrClient`` that drives ``HerdrInboxService`` transport.
+
+    WP-HERDR H1 B3 collapsed the herdr socket transport onto ``HerdrClient``, so
+    the service no longer owns a ``StreamReader``/``StreamWriter``.  These tests
+    inject this fake as ``service._client``:
+
+    * :meth:`events` yields the scripted pushed-event dicts (already parsed —
+      that is what the real ``HerdrClient.events()`` yields), then raises
+      ``HerdrTransportError`` to mimic a socket close, which is how the real loop
+      ends (the old fakes fed a raw byte EOF that raised ``ConnectionError``).
+    * :meth:`subscribe` records the subscription list the service sent, replacing
+      the old ``writer.write`` payload assertions.
+    """
+
+    def __init__(self, events=None):
+        self._events = list(events or [])
+        self.subscribed = None
+        self.closed = False
+
+    async def connect(self):  # pragma: no cover - not exercised by unit tests
+        return None
+
+    async def subscribe(self, subscriptions):
+        self.subscribed = subscriptions
+        return {"type": "subscription_started"}
+
+    async def events(self):
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
+        for event in self._events:
+            yield event
+        # A socket close ends the real stream by raising; mirror that so the
+        # service's reconnect/except path is what actually terminates the loop.
+        raise HerdrTransportError("herdr socket closed")
+
+    async def close(self):
+        self.closed = True
 
 
 class TestHerdrInboxServiceRegistration:
@@ -48,20 +82,16 @@ class TestHerdrInboxServiceRegistration:
             service = HerdrInboxService(socket_path="/tmp/test.sock")
             service.register_terminal("tid1", "pane-old")
             service.register_terminal("tid1", "pane-new")
-            old_event = (
-                json.dumps(
-                    {
-                        "event": "pane.agent_status_changed",
-                        "data": {"pane_id": "pane-old", "agent_status": "idle"},
-                    }
-                ).encode()
-                + b"\n"
-            )
-            service._reader = AsyncMock()
-            service._reader.readline.side_effect = [old_event, asyncio.CancelledError()]
+            old_event = {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-old", "agent_status": "idle"},
+            }
+            from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
+            service._client = _FakeHerdrClient([old_event])
             try:
                 await service._event_loop()
-            except asyncio.CancelledError:
+            except HerdrTransportError:
                 pass
             assert service.get_native_event_gen("tid1", "pane-old") == 0
             assert service.get_native_event_gen("tid1", "pane-new") == 0
@@ -111,8 +141,8 @@ class TestHerdrInboxServiceRegisterReconnect:
         import asyncio
 
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        writer = MagicMock()
-        service._writer = writer
+        client = MagicMock()
+        service._client = client
         # Simulate a live connection with a captured loop, the state under which
         # the removed force-reconnect used to fire.
         service._connected = True
@@ -120,15 +150,15 @@ class TestHerdrInboxServiceRegisterReconnect:
 
         # Behavioral assertion: registration must not schedule ANY coroutine onto
         # the loop. This is the real contract (not a private-name check) and it is
-        # non-vacuous — writer.close/write alone pass even if a coroutine is merely
-        # scheduled on an un-run loop, so assert on the scheduling call itself.
+        # non-vacuous — client.close/subscribe alone pass even if a coroutine is
+        # merely scheduled on an un-run loop, so assert on the scheduling call.
         with patch.object(asyncio, "run_coroutine_threadsafe") as mock_schedule:
             service.register_terminal("tid1", "w1:p1", is_kiro=False)
             mock_schedule.assert_not_called()
 
         assert service._pane_to_terminal["w1:p1"] == "tid1"
-        writer.close.assert_not_called()
-        writer.write.assert_not_called()
+        client.close.assert_not_called()
+        client.subscribe.assert_not_called()
         # Belt-and-braces: the force-reconnect method is gone entirely, so it
         # cannot be reintroduced without also updating this guard.
         assert not hasattr(service, "_force_reconnect")
@@ -136,11 +166,11 @@ class TestHerdrInboxServiceRegisterReconnect:
     def test_register_before_start_does_not_reconnect(self):
         """register_terminal before start() has run must not touch the socket."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        writer = MagicMock()
-        service._writer = writer
+        client = MagicMock()
+        service._client = client
 
         # Pre-start state: start() has not run. Registration only updates the
-        # in-memory maps; it must not schedule a coroutine or write to the socket.
+        # in-memory maps; it must not schedule a coroutine or touch the client.
         assert not hasattr(service, "_force_reconnect")
 
         service.register_terminal("tid_early", "pane-early")
@@ -148,9 +178,9 @@ class TestHerdrInboxServiceRegisterReconnect:
         # Mapping is still recorded...
         assert service._pane_to_terminal["pane-early"] == "tid_early"
         assert service._terminal_to_pane["tid_early"] == "pane-early"
-        # ...but the socket is left untouched — registration never writes to it.
-        writer.close.assert_not_called()
-        writer.write.assert_not_called()
+        # ...but the transport is left untouched — registration never uses it.
+        client.close.assert_not_called()
+        client.subscribe.assert_not_called()
 
 
 class TestHerdrInboxServiceDelivery:
@@ -204,20 +234,19 @@ class TestHerdrInboxServiceSubscription:
         carries agent_status for every pane, so per-pane subscriptions are gone.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = _writer_mock()
+        service._client = _FakeHerdrClient()
         # Empty map: the broadcast subscription shape must NOT depend on any
         # registered panes — it is a single pane.updated with no per-pane entries.
         service._pane_to_terminal = {}
 
         _run_async(service._subscribe_all_events())
 
-        service._writer.write.assert_called_once()
-        msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
-        assert msg["method"] == "events.subscribe"
-        types = {s["type"] for s in msg["params"]["subscriptions"]}
+        subscriptions = service._client.subscribed
+        assert subscriptions is not None
+        types = {s["type"] for s in subscriptions}
         assert types == {"pane.updated", "pane.closed", "workspace.closed"}
         # Broadcast subscriptions carry no pane_id.
-        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
+        assert all("pane_id" not in s for s in subscriptions)
 
 
 class TestHerdrInboxServiceEventParsing:
@@ -235,59 +264,39 @@ class TestHerdrInboxServiceEventParsing:
         # Register a pane
         service.register_terminal("tid1", "pane-x", is_kiro=False)
 
-        # Simulate two events: one "idle" (delivery) and one "working" (no delivery)
-        idle_event = (
-            json.dumps(
-                {
-                    "event": "pane_updated",
-                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "idle"}},
-                }
-            ).encode()
-            + b"\n"
-        )
-        done_event = (
-            json.dumps(
-                {
-                    "event": "pane_updated",
-                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "done"}},
-                }
-            ).encode()
-            + b"\n"
-        )
-        # "working" event — should NOT trigger delivery
-        working_event = (
-            json.dumps(
-                {
-                    "event": "pane_updated",
-                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "working"}},
-                }
-            ).encode()
-            + b"\n"
-        )
-        # Unknown pane — should NOT trigger delivery
-        other_event = (
-            json.dumps(
-                {
-                    "event": "pane_updated",
-                    "data": {"pane": {"pane_id": "pane-other", "agent_status": "idle"}},
-                }
-            ).encode()
-            + b"\n"
-        )
+        # Simulate events (already-parsed dicts, as HerdrClient.events yields):
+        # one "idle" and one "done" (delivery), one "working" (no delivery), and
+        # one for an unmanaged pane (no delivery).
+        idle_event = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "pane-x", "agent_status": "idle"}},
+        }
+        done_event = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "pane-x", "agent_status": "done"}},
+        }
+        working_event = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "pane-x", "agent_status": "working"}},
+        }
+        other_event = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "pane-other", "agent_status": "idle"}},
+        }
+
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
         with patch(
             "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_rd:
             async def run():
-                reader = asyncio.StreamReader()
-                service._reader = reader
-                # Write events then close to end the loop
-                reader.feed_data(idle_event + done_event + working_event + other_event)
-                reader.feed_eof()
+                service._client = _FakeHerdrClient(
+                    [idle_event, done_event, working_event, other_event]
+                )
                 try:
                     await service._event_loop()
-                except ConnectionError:
-                    pass  # EOF raises ConnectionError — expected
+                except HerdrTransportError:
+                    pass  # socket close ends the loop — expected
 
             _run_async(run())
 
@@ -302,24 +311,15 @@ class TestHerdrInboxServiceEventParsing:
         service.register_terminal("tid1", "pane-x", is_kiro=False)
 
         # Old flat format — pane_id and agent_status at top level (not wrapped)
-        flat_event = (
-            json.dumps(
-                {
-                    "pane_id": "pane-x",
-                    "agent_status": "idle",
-                }
-            ).encode()
-            + b"\n"
-        )
+        flat_event = {"pane_id": "pane-x", "agent_status": "idle"}
+
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
         async def run():
-            reader = asyncio.StreamReader()
-            service._reader = reader
-            reader.feed_data(flat_event)
-            reader.feed_eof()
+            service._client = _FakeHerdrClient([flat_event])
             try:
                 await service._event_loop()
-            except ConnectionError:
+            except HerdrTransportError:
                 pass
 
         _run_async(run())
@@ -337,19 +337,16 @@ class TestHerdrInboxServiceEventParsing:
             "event": "pane_updated",
             "data": {"pane": {"pane_id": "w1:p1", "agent_status": "idle"}},
         }
-        reader = AsyncMock()
-        reader.readline.side_effect = [
-            (json.dumps(frame) + "\n").encode(),
-            b"",  # EOF ends the loop
-        ]
-        service._reader = reader
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
+        service._client = _FakeHerdrClient([frame])
         with patch(
             "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_rd:
             try:
                 _run_async(service._event_loop())
-            except ConnectionError:
-                pass  # EOF raises ConnectionError("Socket closed") — expected
+            except HerdrTransportError:
+                pass  # socket close ends the loop — expected
 
         mock_rd.assert_called_once_with("tid1")
 
@@ -365,12 +362,12 @@ class TestHerdrInboxServiceEventParsing:
             "event": "pane_updated",
             "data": {"pane": {"pane_id": "w9:p9", "agent_status": "idle"}},
         }
-        reader = AsyncMock()
-        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
-        service._reader = reader
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
+        service._client = _FakeHerdrClient([frame])
         try:
             _run_async(service._event_loop())
-        except ConnectionError:
+        except HerdrTransportError:
             pass
 
         callback.assert_not_called()
@@ -384,13 +381,13 @@ class TestHerdrInboxServiceEventParsing:
         service._pane_to_terminal = {"w1:p1": "tid1"}
 
         frame = {"event": "pane_updated", "data": {"pane": None}}
-        reader = AsyncMock()
-        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
-        service._reader = reader
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
+        service._client = _FakeHerdrClient([frame])
         try:
             _run_async(service._event_loop())
-        except ConnectionError:
-            pass  # EOF — expected
+        except HerdrTransportError:
+            pass  # socket close — expected
         # No AttributeError; malformed event is simply ignored (no delivery).
         callback.assert_not_called()
 
@@ -406,7 +403,7 @@ class TestHerdrInboxServiceReconnect:
         (no pane_id) covering every pane, plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = _writer_mock()
+        service._client = _FakeHerdrClient()
         # Register two terminals with their current pane_ids
         service._terminal_to_pane["tid1"] = "pane-1"
         service._pane_to_terminal["pane-1"] = "tid1"
@@ -415,13 +412,13 @@ class TestHerdrInboxServiceReconnect:
 
         _run_async(service._subscribe_all_events())
 
-        # Exactly ONE broadcast subscribe message (not one per pane).
-        service._writer.write.assert_called_once()
-        msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
-        types = {s["type"] for s in msg["params"]["subscriptions"]}
+        # Exactly ONE broadcast subscribe (not one per pane).
+        subscriptions = service._client.subscribed
+        assert subscriptions is not None
+        types = {s["type"] for s in subscriptions}
         assert types == {"pane.updated", "pane.closed", "workspace.closed"}
         # Broadcast subscriptions carry no pane_id.
-        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
+        assert all("pane_id" not in s for s in subscriptions)
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"
@@ -801,13 +798,13 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
     def test_socket_setup_issues_exactly_one_subscribe(self):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = _writer_mock()
+        service._client = _FakeHerdrClient()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
 
         _run_async(service._subscribe_all_events())
 
-        service._writer.write.assert_called_once()
+        assert service._client.subscribed is not None
 
 
 class TestHerdrInboxServiceLifecycleEvents:
@@ -1042,28 +1039,18 @@ class TestHerdrInboxServiceLifecycleEvents:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session["ws-x"] = "sess-x"
 
-        pane_closed = (
-            json.dumps(
-                {
-                    "event": "pane_closed",
-                    "data": {
-                        "pane_id": "pane-gone",
-                        "type": "pane_closed",
-                        "workspace_id": "ws-x",
-                    },
-                }
-            ).encode()
-            + b"\n"
-        )
-        ws_closed = (
-            json.dumps(
-                {
-                    "event": "workspace_closed",
-                    "data": {"type": "workspace_closed", "workspace_id": "ws-unknown"},
-                }
-            ).encode()
-            + b"\n"
-        )
+        pane_closed = {
+            "event": "pane_closed",
+            "data": {
+                "pane_id": "pane-gone",
+                "type": "pane_closed",
+                "workspace_id": "ws-x",
+            },
+        }
+        ws_closed = {
+            "event": "workspace_closed",
+            "data": {"type": "workspace_closed", "workspace_id": "ws-unknown"},
+        }
 
         handled = []
 
@@ -1075,14 +1062,13 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event = capture
 
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+
         async def run():
-            reader = asyncio.StreamReader()
-            service._reader = reader
-            reader.feed_data(pane_closed + ws_closed)
-            reader.feed_eof()
+            service._client = _FakeHerdrClient([pane_closed, ws_closed])
             try:
                 await service._event_loop()
-            except ConnectionError:
+            except HerdrTransportError:
                 pass
 
         _run_async(run())
@@ -1104,28 +1090,22 @@ class TestHerdrInboxServiceLifecycleEvents:
             "tmux_window": "",
         }
 
-        event = (
-            json.dumps(
-                {
-                    "event": "pane_closed",
-                    "data": {
-                        "pane_id": "pane-x",
-                        "type": "pane_closed",
-                        "workspace_id": "ws-x",
-                    },
-                }
-            ).encode()
-            + b"\n"
-        )
+        event = {
+            "event": "pane_closed",
+            "data": {
+                "pane_id": "pane-x",
+                "type": "pane_closed",
+                "workspace_id": "ws-x",
+            },
+        }
+
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
         async def run():
-            reader = asyncio.StreamReader()
-            service._reader = reader
-            reader.feed_data(event)
-            reader.feed_eof()
+            service._client = _FakeHerdrClient([event])
             try:
                 await service._event_loop()
-            except ConnectionError:
+            except HerdrTransportError:
                 pass
             await asyncio.gather(*service._lifecycle_tasks)
 
@@ -1140,34 +1120,28 @@ class TestHerdrInboxServiceLifecycleEvents:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid-a", "pane-a", is_kiro=False)
 
-        idle_event = (
-            json.dumps(
-                {
-                    "event": "pane_updated",
-                    "data": {
-                        "pane": {
-                            "agent": "claude",
-                            "agent_status": "idle",
-                            "pane_id": "pane-a",
-                            "workspace_id": "ws-a",
-                        }
-                    },
+        idle_event = {
+            "event": "pane_updated",
+            "data": {
+                "pane": {
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "pane_id": "pane-a",
+                    "workspace_id": "ws-a",
                 }
-            ).encode()
-            + b"\n"
-        )
+            },
+        }
+
+        from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
         with patch(
             "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_rd:
             async def run():
-                reader = asyncio.StreamReader()
-                service._reader = reader
-                reader.feed_data(idle_event)
-                reader.feed_eof()
+                service._client = _FakeHerdrClient([idle_event])
                 try:
                     await service._event_loop()
-                except ConnectionError:
+                except HerdrTransportError:
                     pass
 
             _run_async(run())

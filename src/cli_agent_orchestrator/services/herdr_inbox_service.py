@@ -24,6 +24,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Literal, Optional, Set
 
+from cli_agent_orchestrator.adapters.herdr.client import (
+    HerdrClient,
+    HerdrError,
+    default_socket_path,
+)
 from cli_agent_orchestrator.models.native_publish import NativePublishRequest
 
 logger = logging.getLogger(__name__)
@@ -110,9 +115,12 @@ class HerdrInboxService:
         self._lifecycle_tasks: Set[asyncio.Task] = set()
         self._workspace_close_routes: Dict[str, asyncio.Task] = {}
 
-        # Connection state
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
+        # Connection state — the ONE herdr socket transport in the tree
+        # (WP-HERDR H1 B3): this service no longer owns a raw StreamReader/Writer
+        # or an ``asyncio.open_unix_connection`` of its own; it drives
+        # ``HerdrClient`` (``adapters/herdr/client.py``), the sole socket/JSON-RPC
+        # implementation.  ``_client`` is built per (re)connect in ``_socket_loop``.
+        self._client: Optional[HerdrClient] = None
         self._backoff = _BACKOFF_BASE
 
     @staticmethod
@@ -130,8 +138,6 @@ class HerdrInboxService:
         Args:
             session_name: Herdr session name. Defaults to ``"cao"``.
         """
-        from cli_agent_orchestrator.adapters.herdr.client import default_socket_path
-
         return default_socket_path(session_name)
 
     def _invalidate_terminal_identity_locked(self, terminal_id: str) -> None:
@@ -411,9 +417,15 @@ class HerdrInboxService:
                 # Listen for events
                 await self._event_loop()
 
-            except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
+            except (ConnectionError, OSError, asyncio.IncompleteReadError, HerdrError) as e:
                 logger.warning(f"Herdr socket disconnected: {e}")
                 self._quarantine_identity_markers()
+                # Let go of the dropped client before backing off; the next
+                # iteration builds a fresh one in _connect.
+                client = self._client
+                self._client = None
+                if client is not None:
+                    await client.close()
 
                 # Exponential backoff
                 logger.info(f"Reconnecting in {self._backoff}s...")
@@ -659,8 +671,10 @@ class HerdrInboxService:
         return ReconcileOutcome("ok", self._confirmed_incarnations())
 
     async def _connect(self) -> None:
-        """Connect to the herdr socket."""
-        self._reader, self._writer = await asyncio.open_unix_connection(self._socket_path)
+        """Open the herdr socket through the one transport leaf (HerdrClient)."""
+        client = HerdrClient(self._socket_path)
+        await client.connect()
+        self._client = client
         logger.info(f"Connected to herdr socket: {self._socket_path}")
 
     async def _native_publisher_self_test(self) -> bool:
@@ -701,30 +715,24 @@ class HerdrInboxService:
             {"type": "pane.closed"},
             {"type": "workspace.closed"},
         ]
-        message = {
-            "id": "sub_all",
-            "method": "events.subscribe",
-            "params": {"subscriptions": subscriptions},
-        }
-        await self._send(message)
+        assert self._client is not None
+        await self._client.subscribe(subscriptions)
         logger.info(
             "Subscribed to broadcast pane.updated + lifecycle events "
             "in one events.subscribe call"
         )
 
     async def _event_loop(self) -> None:
-        """Listen for events and dispatch delivery."""
-        assert self._reader is not None
-        while True:
-            line = await self._reader.readline()
-            if not line:
-                raise ConnectionError("Socket closed")
+        """Listen for events and dispatch delivery.
 
-            try:
-                event = json.loads(line.decode())
-            except json.JSONDecodeError:
-                continue
-
+        Reads events through the one transport leaf: ``HerdrClient.events()``
+        yields already-parsed pushed-event dicts (and raises
+        ``HerdrTransportError`` — a ``HerdrError`` — when the socket closes,
+        which ``_socket_loop`` turns into a reconnect).  This method owns only
+        the DISPATCH; the JSON framing and socket read live in the client.
+        """
+        assert self._client is not None
+        async for event in self._client.events():
             # herdr identifies the event in the "event" key. Lifecycle events use
             # underscore names (pane_closed / workspace_closed); the agent-status
             # event uses the dotted name (pane.agent_status_changed). Normalize the
@@ -1076,10 +1084,3 @@ class HerdrInboxService:
                 self._deliver(terminal_id)
                 # Reset the timer so we don't spam
                 self._working_since[terminal_id] = now
-
-    async def _send(self, message: dict) -> None:
-        """Send a JSON message to the herdr socket."""
-        assert self._writer is not None
-        data = json.dumps(message).encode() + b"\n"
-        self._writer.write(data)
-        await self._writer.drain()

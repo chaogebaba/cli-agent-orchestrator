@@ -55,6 +55,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -181,9 +182,13 @@ class HerdrClient:
 
     A single ``asyncio.Lock`` serialises writes and the request/reply match, so a
     ``request`` issued while events are streaming reads its OWN reply rather than
-    a pushed event: pushed events carry no ``id`` and are routed to the event
-    queue, replies carry the awaited ``id`` and are handed back to
-    :meth:`request`.
+    a pushed event: pushed events carry no ``id`` and are BUFFERED for the event
+    stream (they are not dropped), replies carry the awaited ``id`` and are handed
+    back to :meth:`request`.  The buffer is the subscribe → snapshot → reconcile
+    recipe (§6) made mechanical: an event that races in between the
+    ``events.subscribe`` ack and the ``api.snapshot`` reply is held, then replayed
+    into :meth:`events` after the snapshot, in arrival order, exactly once — so
+    the reconnect path has no drop window.
     """
 
     def __init__(
@@ -201,6 +206,14 @@ class HerdrClient:
         self._id_counter = 0
         self._io_lock = asyncio.Lock()
         self._subscribed = False
+        #: Pushed events read off the wire while awaiting a request/subscribe
+        #: reply, held in ARRIVAL order for :meth:`events` to replay after the
+        #: snapshot.  This is the §6 reconcile buffer — the line an event stream
+        #: would otherwise lose when it interleaves with the subscribe→snapshot
+        #: handshake.  Bounded implicitly by how many events herdr can push
+        #: during the two round-trips of that handshake; it drains the instant
+        #: :meth:`events` runs.
+        self._event_buffer: deque[dict[str, Any]] = deque()
 
     @property
     def socket_path(self) -> str:
@@ -238,6 +251,7 @@ class HerdrClient:
         self._reader = None
         self._writer = None
         self._subscribed = False
+        self._event_buffer.clear()
         if writer is None:
             return
         try:
@@ -292,17 +306,28 @@ class HerdrClient:
                 raise HerdrTransportError(f"herdr sent a non-object line: {obj!r}")
             return obj
 
+    @staticmethod
+    def _is_pushed_event(line: dict[str, Any]) -> bool:
+        """Whether a wire line is a pushed event rather than a request reply.
+
+        A reply carries the awaited ``id`` and either ``result`` or ``error``; a
+        pushed event carries NO ``id`` and names itself in ``event``.  This is the
+        one place that distinction is spelled, so :meth:`request`, :meth:`subscribe`
+        and :meth:`events` all buffer/skip on the same rule.
+        """
+        return "id" not in line and "event" in line
+
     async def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Issue one JSON-RPC request and return its ``result`` body.
 
-        Matches the reply by ``id`` and DROPS any pushed event that arrives on the
-        wire first (events carry no ``id``), so a request issued on a subscribed
-        connection is still answered correctly.  A dropped event during a request
-        is not lost data in the way it looks: the caller that mixes ``request``
-        and ``events`` on one connection is the adapter, and it resnapshots after
-        (re)subscribing rather than trusting the event backlog — the herdr
-        client recipe (subscribe, snapshot, apply buffered events) that the docs
-        and ``herdr_inbox_service`` both follow.
+        Matches the reply by ``id``.  A pushed event (no ``id``) that arrives on
+        the wire before the reply is BUFFERED into :attr:`_event_buffer` — NOT
+        dropped — so it is replayed into :meth:`events` after the snapshot, in
+        arrival order, exactly once.  This is the §6 subscribe → snapshot →
+        reconcile recipe: an event that races into the handshake window is held,
+        not lost, closing B4's drop race.  A line that is neither this request's
+        reply nor a pushed event (a stray reply for another id — which should not
+        occur while the io lock serialises requests) is skipped.
         """
         async with self._io_lock:
             request_id = self._next_id()
@@ -311,11 +336,11 @@ class HerdrClient:
             )
             while True:
                 reply = await self._read_line()
-                if reply.get("id") != request_id:
-                    # A pushed event or an unrelated reply; not ours.  See the
-                    # method docstring for why dropping it here is safe.
-                    continue
-                return _envelope_result(reply)
+                if reply.get("id") == request_id:
+                    return _envelope_result(reply)
+                if self._is_pushed_event(reply):
+                    self._event_buffer.append(reply)
+                # else: a stray line for another id — skip; see docstring.
 
     async def check_protocol(self) -> dict[str, Any]:
         """Read ``api schema`` and refuse a protocol/schema this build does not pin.
@@ -374,11 +399,15 @@ class HerdrClient:
             )
             while True:
                 reply = await self._read_line()
-                if reply.get("id") != request_id:
-                    continue
-                ack = _envelope_result(reply)
-                self._subscribed = True
-                return ack
+                if reply.get("id") == request_id:
+                    ack = _envelope_result(reply)
+                    self._subscribed = True
+                    return ack
+                if self._is_pushed_event(reply):
+                    # An event that raced ahead of the ack: BUFFER it (§6). herdr
+                    # does not push before the ack in practice, but if it does the
+                    # event is held for events() rather than lost.
+                    self._event_buffer.append(reply)
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         """Yield pushed event objects until the socket closes.
@@ -393,6 +422,13 @@ class HerdrClient:
         """
         if not self._subscribed:
             raise HerdrError("events() requires a prior subscribe() on this connection")
+        # Replay any events buffered during the subscribe→snapshot handshake
+        # FIRST, in arrival order, before reading new ones off the wire (§6
+        # reconcile).  ``popleft`` drains oldest-first and each event leaves the
+        # buffer exactly once, so an event that raced into the handshake window is
+        # delivered exactly once, in order — never dropped, never duplicated.
+        while self._event_buffer:
+            yield self._event_buffer.popleft()
         while True:
             event = await self._read_line_streaming()
             if "id" in event and "event" not in event:

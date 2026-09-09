@@ -219,13 +219,14 @@ async def test_request_error_body_becomes_request_error(socket_path: str) -> Non
         await client.close()
 
 
-async def test_request_ignores_a_pushed_event_and_matches_by_id(socket_path: str) -> None:
+async def test_request_buffers_a_pushed_event_and_matches_by_id(socket_path: str) -> None:
     """A pushed event (no id) that arrives before the reply must not be mistaken
-    for the reply; the request reads the line carrying its own id."""
+    for the reply; the request reads the line carrying its own id, and the event
+    is BUFFERED for the stream (§6 reconcile) rather than dropped."""
 
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         # An unsolicited event first, then the real reply.
-        await server.push({"event": "pane_updated", "data": {"pane": {}}})
+        await server.push({"event": "pane_updated", "data": {"pane": {"n": 1}}})
         await server.reply(request["id"], {"ok": True})
 
     async with FakeHerdrServer(socket_path) as server:
@@ -234,6 +235,49 @@ async def test_request_ignores_a_pushed_event_and_matches_by_id(socket_path: str
         await client.connect()
         result = await client.request("pane.get")
         assert result == {"ok": True}
+        # The racing event was held, not dropped: it is the first thing the
+        # event stream yields.
+        assert list(client._event_buffer) == [
+            {"event": "pane_updated", "data": {"pane": {"n": 1}}}
+        ]
+        await client.close()
+
+
+async def test_event_between_subscribe_and_snapshot_is_delivered_once_in_order(
+    socket_path: str,
+) -> None:
+    """§6 race: a pane.updated that interleaves between the subscribe ack and the
+    snapshot reply is BUFFERED and replayed into the stream after the snapshot,
+    exactly once and in order, ahead of later live events."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        method = request.get("method")
+        request_id = request["id"]
+        if method == "events.subscribe":
+            await server.reply(request_id, {"type": "subscription_started"})
+            # An event races in AFTER the ack but BEFORE the snapshot request.
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+        elif method == "api.snapshot":
+            await server.reply(request_id, {"snapshot": {"panes": []}})
+            # A live event that arrives AFTER the snapshot.
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_connection()
+        else:
+            await server.reply(request_id, {})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        seen: list[int] = []
+        with pytest.raises(HerdrTransportError):
+            async for event in client.events():
+                seen.append(int(event["data"]["pane"]["seq"]))
+        # The buffered (seq=1) event replays first, then the live (seq=2) one —
+        # in order, each exactly once.
+        assert seen == [1, 2]
         await client.close()
 
 

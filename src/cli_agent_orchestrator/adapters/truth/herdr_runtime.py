@@ -44,8 +44,12 @@ own: its ``no_signal`` sweep maxes over probe timestamps that pane probing keeps
 fresh, and its pane fallback would silently revert the cohort to scraped
 lifecycle.  §6 makes the source itself emit the degraded signal: on a socket
 drop this producer appends ``pane.missing`` carrying ``DegradedReason.NO_SIGNAL``
-for every pane it was tracking, so the cohort degrades (and delivery eligibility
-is vetoed) instead of reverting.  Recovery is a resnapshot on reconnect — events
+(in the ``degraded_reason`` payload key the projector reads to override the
+kind-default reason) at ``authoritative`` confidence — the authoritative source
+declaring its OWN loss of signal, which the projector never mutes behind a stale
+source-health timestamp — for every pane it was tracking, so the cohort degrades
+(and delivery eligibility is vetoed) instead of reverting.  Recovery is a
+resnapshot on reconnect — events
 are not receipts, so the only safe recovery from a gap is to re-read the whole
 state, exactly the herdr client recipe (subscribe → snapshot → apply events).
 
@@ -193,6 +197,19 @@ class HerdrRuntimeSource:
         #: The stable identity handle last seen for this terminal's pane, carried
         #: into event provenance (§9): "<source>:<value>" of the agent_session.
         self._identity_ref: str | None = None
+        #: The STORED stable ``agent_session`` handle this source is bound to
+        #: (§7/§9), learned from the FIRST pane that matched by herdr terminal_id
+        #: and thereafter the load-bearing binding key.  herdr's ``terminal_id``
+        #: is new after every server restart, so once a stable session is known a
+        #: pane belongs when its stable session matches EVEN IF the terminal_id
+        #: changed — the restart case B1 falsified when binding was terminal_id
+        #: alone.  ``None`` until the first bind; a pane with no stable session
+        #: can only ever match on the initial terminal_id.
+        self._bound_session: tuple[str, str] | None = None
+        #: The herdr terminal_id currently associated with the bound session.
+        #: Re-learned on every stable-session match so provenance and payload
+        #: carry the LIVE ephemeral id while the binding stays on the stable one.
+        self._herdr_terminal_id: str = terminal_id
 
     # -- EventSource ---------------------------------------------------------
 
@@ -340,13 +357,60 @@ class HerdrRuntimeSource:
     def _pane_belongs(self, pane: dict[str, Any]) -> bool:
         """Whether this pane record is the one this source's terminal is bound to.
 
-        Bound by herdr ``terminal_id`` when present.  The binding is intentionally
-        NOT the pane_id (which herdr renumbers) and NOT assumed stable across a
-        restart; a source is created per CAO terminal and matches the herdr
-        ``terminal_id`` the pane carries.  A record with no ``terminal_id`` (an
-        un-agented pane) never belongs.
+        The binding key is the STORED stable ``agent_session`` (§7/§9), NOT the
+        ephemeral herdr ``terminal_id`` (which is new after every server restart)
+        and NOT the pane_id (which herdr renumbers).  Two phases:
+
+        * **Before a stable session is bound** the source matches by the herdr
+          ``terminal_id`` it was constructed with — the id herdr reports at first
+          contact — and learns that pane's stable ``agent_session`` as the
+          binding key (:meth:`_bind_session`).  A pane that carries no stable
+          session can only ever match here, on the initial terminal_id.
+        * **Once a stable session is bound** a pane belongs when its stable
+          session equals the bound one, EVEN IF its herdr ``terminal_id`` has
+          changed across a restart; the live terminal_id is then re-learned.  A
+          pane whose terminal_id still matches the last-known ephemeral id also
+          belongs (covers a pane record that omits the session mid-stream), but
+          the stable session is authoritative — a DIFFERENT stable session on the
+          same terminal_id does NOT belong.
         """
-        return pane.get("terminal_id") == self.terminal_id
+        session = self._session_key(pane)
+        if self._bound_session is not None:
+            if session is not None:
+                return session == self._bound_session
+            return pane.get("terminal_id") == self._herdr_terminal_id
+        # Unbound: match on the constructor's herdr terminal_id, then bind.
+        if pane.get("terminal_id") != self.terminal_id:
+            return False
+        self._bind_session(pane, session)
+        return True
+
+    @staticmethod
+    def _session_key(pane: dict[str, Any]) -> tuple[str, str] | None:
+        """The stable binding key ``(source, value)`` from a pane's agent_session.
+
+        ``None`` when the pane carries no usable stable session — an un-agented
+        pane, or a record that omits it — in which case the caller falls back to
+        the ephemeral terminal_id.
+        """
+        session = pane.get("agent_session")
+        if not isinstance(session, dict):
+            return None
+        source = session.get("source")
+        value = session.get("value")
+        if isinstance(source, str) and source and isinstance(value, str) and value:
+            return (source, value)
+        return None
+
+    def _bind_session(
+        self, pane: dict[str, Any], session: tuple[str, str] | None
+    ) -> None:
+        """Record the stable session as the binding key on first match."""
+        if session is not None:
+            self._bound_session = session
+        term = pane.get("terminal_id")
+        if isinstance(term, str) and term:
+            self._herdr_terminal_id = term
 
     def _process_pane(self, pane: dict[str, Any]) -> None:
         """Map one pane record's ``agent_status`` to a boundary and emit it.
@@ -374,13 +438,22 @@ class HerdrRuntimeSource:
         self._emit_status_event(pane, pane_id, status, kind)
 
     def _remember_identity(self, pane: dict[str, Any]) -> None:
-        """Record the stable ``agent_session`` handle for §9 resume identity."""
+        """Record the stable ``agent_session`` handle for §9 resume identity.
+
+        Also re-learns the LIVE herdr ``terminal_id`` for the bound session so a
+        post-restart record (new terminal_id, same stable session) carries the
+        current ephemeral id in its payload/provenance while the binding key
+        itself stays the stable session.
+        """
         session = pane.get("agent_session")
         if isinstance(session, dict):
             source = session.get("source")
             value = session.get("value")
             if source and value:
                 self._identity_ref = f"{source}:{value}"
+        term = pane.get("terminal_id")
+        if isinstance(term, str) and term:
+            self._herdr_terminal_id = term
 
     def _confidence_for(self, pane: dict[str, Any]) -> Confidence:
         """Hook-backed panes are authoritative; screen-manifest panes are derived.
@@ -447,12 +520,33 @@ class HerdrRuntimeSource:
                     terminal_id=self.terminal_id,
                     kind=EventKind.PANE_MISSING,
                     producer=Producer.SERVER,
-                    confidence=Confidence.DERIVED,
+                    # AUTHORITATIVE, not derived: this is the authoritative source
+                    # declaring its OWN loss of signal, not a derived pane
+                    # observation.  The projector mutes a DERIVED PANE_MISSING
+                    # while the source's health timestamp is still fresh
+                    # (projector.py `_is_muted`), and pane probing keeps that
+                    # timestamp fresh on a herdr pane — so a derived gap event
+                    # would be swallowed and the cohort would silently keep its
+                    # last live state (B2).  Emitting it AUTHORITATIVE takes the
+                    # `confidence is not DERIVED` fast-exit in `_is_muted`, so the
+                    # gap is never muted by stale source health.  §6: a certified
+                    # cohort in a subscription gap has NO lifecycle source and
+                    # MUST degrade rather than revert to scraped lifecycle.
+                    confidence=Confidence.AUTHORITATIVE,
                     observed_at=now,
                     source_ref=self._identity_ref,
                     payload={
+                        # `degraded_reason` is the payload key the projector's
+                        # `_payload_reason` reads to OVERRIDE the kind-default
+                        # reason (which for PANE_MISSING is `pane_unreadable`).
+                        # Setting it makes the gap project degraded(NO_SIGNAL)
+                        # end to end, closing B2's `pane_unreadable`!=`no_signal`
+                        # gap.  `reason` is kept for the raw-draft-level assertions
+                        # the shipped adapter test already makes.
+                        "degraded_reason": DegradedReason.NO_SIGNAL.value,
                         "reason": DegradedReason.NO_SIGNAL.value,
                         "cause": "herdr_subscription_gap",
+                        "herdr_terminal_id": self._herdr_terminal_id,
                         "tracked_panes": sorted(self._tracked_panes),
                     },
                 )
