@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 
 import pytest
 
@@ -58,6 +60,7 @@ class FakeHerdrServer:
         self._socket_path = socket_path
         self._server: asyncio.AbstractServer | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._serve_task: asyncio.Task[None] | None = None
         self.requests: list[dict[str, Any]] = []
         self.on_request: Handler = FakeHerdrServer._default_handler
 
@@ -66,12 +69,30 @@ class FakeHerdrServer:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        # Force the connection down rather than relying on ``wait_closed()``:
+        # on Python 3.13+ ``Server.wait_closed()`` blocks until every active
+        # connection handler returns, and ``_serve`` is parked on ``readline()``
+        # — so a plain ``close()``/``wait_closed()`` hangs the test.  Cancel the
+        # handler and close the writer, THEN close the server.
+        if self._serve_task is not None:
+            self._serve_task.cancel()
+            try:
+                await self._serve_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._serve_task = None
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            self._server = None
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._writer = writer
+        self._serve_task = asyncio.current_task()
         while True:
             line = await reader.readline()
             if not line:
@@ -118,14 +139,19 @@ class FakeHerdrServer:
 
 
 @pytest.fixture
-def socket_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+def socket_path(tmp_path: Path) -> Iterator[str]:
     # AF_UNIX paths are capped at ~108 bytes and a pytest tmp path (especially
-    # under a box's long ``--basetemp``) can exceed it. Binding a RELATIVE name
-    # sidesteps the limit entirely: the kernel stores the literal string passed
-    # to bind(), so ``"h.sock"`` is 6 bytes on the wire while the file still
-    # lands in this test's private ``tmp_path``. chdir is undone by monkeypatch.
-    monkeypatch.chdir(tmp_path)
-    return "h.sock"
+    # under a box's long ``--basetemp``) can exceed it.  Bind under a SHORT,
+    # unique, absolute dir instead — ``/dev/shm`` when present (Linux tmpfs),
+    # else a short ``/tmp`` dir — so the path is well under the limit and does
+    # not depend on ``chdir`` (which is unsafe under xdist's shared cwd).  The
+    # dir is removed after the test.
+    short_root = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+    d = Path(tempfile.mkdtemp(prefix="hc", dir=str(short_root)))
+    try:
+        yield str(d / "s")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
