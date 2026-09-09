@@ -1,0 +1,297 @@
+"""F867 (#723): pi_cli lanes were unreapable — no provider_session_id captured
+so a planned hibernate refused session_artifact_missing, and the force delete
+then 409'd resume_in_progress because the SESSION-wide teardown lease was blocked
+by shared leases held for UNRELATED sibling terminals.
+
+Two decisions, tested fail-before / pass-after:
+
+* D1 — pi captures its known-at-spawn session identity (session-id == terminal_id,
+  transcript <ts>_<terminal_id>.jsonl under the session dir) so the F829 root's
+  provider_session_id is non-null. Before the first completed turn the artifact
+  is still MISSING (a mid-turn crash is unrecoverable, D8) so hibernate still
+  refuses; once a turn has written the file, hibernate is allowed/resumable.
+
+* D2 — the per-terminal teardown lease is TERMINAL-scoped, so a force delete of
+  terminal X is NOT blocked by a shared lifecycle lease held for a sibling Y (a
+  concurrent create/resume in flight). A LIVE resume of THIS terminal (its
+  provider-session uuid lease held) still 409s, and a stale resume CAS claim is
+  reconciled on the way.
+
+Mutants guarded:
+  (a) skip the terminal-scoping (revert to session-wide exclusive) → the
+      sibling-shared-lease force-delete test 409s (fails).
+  (b) drop the pi session-id capture (base default None) → the resumable-capture
+      test refuses hibernate forever (fails). See test_pi_cli_unit.py
+      TestSpawnCapturedIdentity for the provider-level mutant guard.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+import cli_agent_orchestrator.services.session_lifecycle_lease as lease_mod
+from cli_agent_orchestrator.services import terminal_service
+
+
+# ---------------------------------------------------------------------------
+# Shared seed + delete-seam mocking
+# ---------------------------------------------------------------------------
+def _seed_pi_lane(d, tid: str, session: str, *, namespace: str | None = None) -> None:
+    d.create_terminal(
+        terminal_id=tid,
+        tmux_session=session,
+        tmux_window=f"win-{tid}",
+        agent_profile="empirical_reviewer_lite",
+        provider="pi_cli",
+    )
+    d.mint_spawn_identity(
+        identity_key=f"conv_{tid}",
+        provider="pi_cli",
+        provider_namespace=namespace,
+        agent_profile="empirical_reviewer_lite",
+        model=None,
+        reasoning_effort=None,
+        origin_callback_ref=None,
+        current_terminal_id=tid,
+        cwd="/data/cao-scratch/x",
+    )
+
+
+def _mock_delete_seams(monkeypatch):
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: MagicMock())
+    monkeypatch.setattr(
+        terminal_service,
+        "_delete_terminal_under_lease",
+        lambda t, token, **kw: {
+            "terminal_deleted": True,
+            "resumable": False,
+            "reason": "abandoned",
+        },
+    )
+    monkeypatch.setattr(
+        terminal_service,
+        "status_monitor",
+        MagicMock(get_boundary_observation=MagicMock(return_value=MagicMock(status=MagicMock()))),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.rebind_lease.acquire_rebind_lease",
+        lambda t: MagicMock(terminal_id=t),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.rebind_lease.release_rebind_lease", lambda _t: None
+    )
+
+
+# ---------------------------------------------------------------------------
+# D1: capture makes a pi lane resumable
+# ---------------------------------------------------------------------------
+def test_d1_pi_lane_with_captured_session_id_hibernates(real_sqlite_env, monkeypatch):
+    """D1 (fail-before/pass-after): once pi's spawn identity is bound AND a turn
+    has written the transcript, a NON-force delete hibernates the lane instead of
+    refusing session_artifact_missing. Before the turn it still refuses (D8)."""
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    tid = "d1capaaa"
+    session = "cao-d1cap"
+    sess_dir = Path(real_sqlite_env["tmp_path"]) / "pi-sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    _seed_pi_lane(d, tid, session)
+
+    # The provider reports its known-at-spawn identity; the create path binds it.
+    p = PiCliProvider(tid, session, f"win-{tid}", agent_profile="empirical_reviewer_lite")
+    p.session_dir = sess_dir
+    psid, pns, ploc = p.spawn_captured_identity()
+    ct.attach_captured_uuid(
+        tid,
+        provider_session_id=psid,
+        provider="pi_cli",
+        provider_namespace=pns,
+        artifact_locator=ploc,
+    )
+
+    # Before the first completed turn: no transcript → MISSING → refuse (correct).
+    before = ct.evaluate_planned_hibernate(tid)
+    assert before.allowed is False
+    assert before.reason == "session_artifact_missing"
+
+    # After a completed turn: pi wrote <ts>_<tid>.jsonl → hibernate allowed.
+    (sess_dir / f"2026-09-09T20-00-00-000Z_{tid}.jsonl").write_text('{"x":1}\n')
+    after = ct.evaluate_planned_hibernate(tid)
+    assert after.allowed is True
+    assert after.lifecycle == "hibernated"
+    assert after.artifact_locator is not None
+
+
+def test_d1_pi_lane_declared_nonresumable_reaps_cleanly(real_sqlite_env, monkeypatch):
+    """D1: a pi lane that never captured an id (no spawn-identity bind) reaps
+    cleanly on non-force with resumable=false and a typed reason (it does NOT
+    hang or error) — the refusal is the clean, typed hibernate_refused."""
+    import cli_agent_orchestrator.clients.database as d
+
+    tid = "d1nonres"
+    session = "cao-d1nonres"
+    _seed_pi_lane(d, tid, session)  # NULL provider_session_id
+    _mock_delete_seams(monkeypatch)
+
+    r = terminal_service.delete_terminal(tid)  # non-force
+    skipped = r["skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["kind"] == "hibernate_refused"
+    assert skipped[0]["reason"] == "session_artifact_missing"
+    assert skipped[0]["provider"] == "pi_cli"
+
+
+# ---------------------------------------------------------------------------
+# D2: force delete is not blocked by shared leases on OTHER terminals
+# ---------------------------------------------------------------------------
+def test_d2_refused_hibernate_then_force_reaps_no_409(real_sqlite_env, monkeypatch):
+    """D2: a refused non-force hibernate followed by force=True reaps with NO
+    409 (the refusal never took/leaked a lease; force proceeds)."""
+    import cli_agent_orchestrator.clients.database as d
+
+    tid = "d2reffor"
+    session = "cao-d2ref"
+    _seed_pi_lane(d, tid, session)
+    _mock_delete_seams(monkeypatch)
+
+    r1 = terminal_service.delete_terminal(tid)  # refused
+    assert r1["skipped"][0]["kind"] == "hibernate_refused"
+    r2 = terminal_service.delete_terminal(tid, force=True)  # must not 409
+    assert r2["reaped"] and r2["reaped"][0]["id"] == tid
+
+
+def test_d2_force_not_blocked_by_sibling_shared_lease(real_sqlite_env, monkeypatch):
+    """D2 (fail-before/pass-after; MUTANT (a) guard): a shared lifecycle lease
+    held for ANOTHER terminal (a sibling create in flight on the same session)
+    must NOT 409 the force delete of THIS terminal. Reverting to the session-wide
+    exclusive lease makes this raise resume_in_progress."""
+    import cli_agent_orchestrator.clients.database as d
+
+    tid = "d2sibfor"
+    session = "cao-d2sib"
+    _seed_pi_lane(d, tid, session)
+    _mock_delete_seams(monkeypatch)
+
+    held = lease_mod.acquire_session_lifecycle_shared(session)  # sibling create
+    assert held is not None
+    try:
+        r = terminal_service.delete_terminal(tid, force=True)
+    finally:
+        lease_mod.release_session_lifecycle_lease(held)
+    assert r["reaped"] and r["reaped"][0]["id"] == tid
+
+
+def test_d2_force_still_409s_while_resume_of_this_terminal_in_flight(real_sqlite_env, monkeypatch):
+    """D2 (gate keeps its purpose): a LIVE resume of THIS terminal holds its
+    provider-session uuid lease, so the force delete still 409s
+    resume_in_progress; once the resume releases, the force delete succeeds."""
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import conversation_transition as ct
+    from cli_agent_orchestrator.services import provider_session_lease as psl
+
+    tid = "d2resinf"
+    session = "cao-d2res"
+    uuid = tid  # pi's provider_session_id == terminal_id
+    _seed_pi_lane(d, tid, session, namespace="/data/cao-scratch/x")
+    # Bind the root's provider_session_id so the resume-in-flight guard sees it.
+    ct.attach_captured_uuid(
+        tid, provider_session_id=uuid, provider="pi_cli", provider_namespace="/data/cao-scratch/x"
+    )
+    _mock_delete_seams(monkeypatch)
+
+    held = psl.acquire_provider_session_lease(uuid)  # live resume of THIS terminal
+    assert held is not None
+    try:
+        with pytest.raises(RuntimeError, match="resume_in_progress"):
+            terminal_service.delete_terminal(tid, force=True)
+    finally:
+        psl.release_provider_session_lease(held)
+
+    # After the resume releases, the force delete succeeds.
+    r = terminal_service.delete_terminal(tid, force=True)
+    assert r["reaped"] and r["reaped"][0]["id"] == tid
+
+
+def test_d2_stale_resume_claim_reconciled_on_force(real_sqlite_env, monkeypatch):
+    """D2: the force-delete path reconciles a STALE resume CAS claim on the way
+    (best-effort), so a stale claim does not have to wait out the 600s TTL. A
+    non-stale/live resume is unaffected (its lease still blocks — see the
+    resume-in-flight test)."""
+    import cli_agent_orchestrator.clients.database as d
+
+    tid = "d2stalec"
+    session = "cao-d2stale"
+    _seed_pi_lane(d, tid, session)
+    _mock_delete_seams(monkeypatch)
+
+    called = {"n": 0}
+    real = terminal_service  # reconcile is imported inside _delete_terminal_inner
+
+    import cli_agent_orchestrator.services.conversation_reconcile as cr
+
+    def _spy():
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(cr, "reconcile_stale_claims", _spy)
+    r = terminal_service.delete_terminal(tid, force=True)
+    assert r["reaped"] and r["reaped"][0]["id"] == tid
+    assert called["n"] >= 1, "force delete must reconcile stale resume claims on the way"
+
+
+# ---------------------------------------------------------------------------
+# D2: terminal-scoped lease unit semantics
+# ---------------------------------------------------------------------------
+def _fresh_lease():
+    m = lease_mod
+    with m._guard:
+        m._shared.clear()
+        m._exclusive.clear()
+        m._terminal_exclusive.clear()
+    return m
+
+
+def test_terminal_exclusive_not_blocked_by_shared():
+    """A terminal-scoped exclusive acquires even while a session shared lease is
+    held (that shared lease belongs to some other terminal's create)."""
+    m = _fresh_lease()
+    shared = m.acquire_session_lifecycle_shared("s1")
+    assert shared is not None
+    tok = m.acquire_session_lifecycle_terminal_exclusive("s1", "term0001")
+    assert tok is not None
+    m.release_session_lifecycle_terminal_exclusive(tok)
+    m.release_session_lifecycle_lease(shared)
+
+
+def test_terminal_exclusive_conflicts_with_session_exclusive_both_ways():
+    """A terminal-scoped exclusive and a full session teardown are mutually
+    exclusive in BOTH directions (a session close never races a terminal delete)."""
+    m = _fresh_lease()
+    # Session exclusive held → terminal exclusive refused.
+    sx = m.acquire_session_lifecycle_exclusive("s2")
+    assert sx is not None
+    assert m.acquire_session_lifecycle_terminal_exclusive("s2", "term0001") is None
+    m.release_session_lifecycle_lease(sx)
+    # Terminal exclusive held → session exclusive refused.
+    tx = m.acquire_session_lifecycle_terminal_exclusive("s2", "term0001")
+    assert tx is not None
+    assert m.acquire_session_lifecycle_exclusive("s2") is None
+    m.release_session_lifecycle_terminal_exclusive(tx)
+
+
+def test_terminal_exclusive_same_id_is_exclusive():
+    """Two deletes of the SAME terminal cannot both hold the lease."""
+    m = _fresh_lease()
+    a = m.acquire_session_lifecycle_terminal_exclusive("s3", "term0001")
+    assert a is not None
+    assert m.acquire_session_lifecycle_terminal_exclusive("s3", "term0001") is None
+    # A DIFFERENT terminal on the same session is independent.
+    b = m.acquire_session_lifecycle_terminal_exclusive("s3", "term0002")
+    assert b is not None
+    m.release_session_lifecycle_terminal_exclusive(a)
+    m.release_session_lifecycle_terminal_exclusive(b)

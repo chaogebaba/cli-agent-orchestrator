@@ -3019,6 +3019,53 @@ async def create_terminal(
             allocated_uuid = None
             engine = (resolved_engine,)
 
+        # F867 (#723) D1: bind a provider's KNOWN-AT-SPAWN session identity onto
+        # the fresh F829 root. For a provider whose id is deterministic before
+        # the first turn (pi_cli launches with --session-id <terminal_id>), this
+        # fills provider_session_id so a later planned hibernate resolves the
+        # artifact instead of refusing session_artifact_missing on a pi lane that
+        # never captured an id. Fresh spawns only (a resume re-points an existing
+        # root via the resume publish path, and spawn_captured_identity returns
+        # None there). Best-effort and non-raising: the artifact's VALIDITY is
+        # still decided later by resolve_artifact (MISSING before the first
+        # completed turn — correctly unrecoverable, D8 — VALID after), so binding
+        # here never fabricates recoverability.
+        if not _is_resume_spawn:
+            try:
+                _spawn_ident = provider_instance.spawn_captured_identity()
+            except Exception:
+                _spawn_ident = None
+                logger.debug(
+                    "f867 spawn_captured_identity raised for %s", terminal_id, exc_info=True
+                )
+            # Only a well-formed (provider_session_id, namespace, locator) triple
+            # whose id is a non-empty str is bound. A provider that returns None
+            # (the base default) or any other shape — including a test double's
+            # MagicMock — is ignored, never unpacked blindly.
+            if (
+                isinstance(_spawn_ident, tuple)
+                and len(_spawn_ident) == 3
+                and isinstance(_spawn_ident[0], str)
+                and _spawn_ident[0]
+            ):
+                _psid, _pns, _ploc = _spawn_ident
+                try:
+                    from cli_agent_orchestrator.services.conversation_transition import (
+                        attach_captured_uuid,
+                    )
+
+                    attach_captured_uuid(
+                        terminal_id,
+                        provider_session_id=_psid,
+                        provider=provider,
+                        provider_namespace=_pns,
+                        artifact_locator=_ploc,
+                    )
+                except Exception:
+                    logger.debug(
+                        "f867 spawn-identity bind skipped for %s", terminal_id, exc_info=True
+                    )
+
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
         # send runs as a background task, so two concurrent assigns can each
@@ -7738,8 +7785,8 @@ def _delete_terminal_inner(
         release_rebind_lease,
     )
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_exclusive_blocking,
-        release_session_lifecycle_lease,
+        acquire_session_lifecycle_terminal_exclusive_blocking,
+        release_session_lifecycle_terminal_exclusive,
     )
     from cli_agent_orchestrator.services.terminal_guard_service import (
         TerminalProtectionError,
@@ -7749,22 +7796,85 @@ def _delete_terminal_inner(
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
 
-    # F513 (#368): the exclusive lifecycle lease is session-scoped, so a
-    # delete of THIS terminal is transiently blocked whenever an UNRELATED
-    # terminal on the same session holds a shared lease — most commonly a
-    # concurrent create's deferred-init background task, which holds it for
-    # the whole of provider.initialize(). That contention is normally
-    # short-lived, so wait a bounded interval before surfacing the 409 rather
-    # than failing instantly. Configurable; defaults to a few seconds, which
-    # covers ordinary sibling-create churn without letting a genuinely wedged
-    # init (up to the F509 watchdog) pin the delete indefinitely.
+    # F867 (#723) D2: the teardown lease is now TERMINAL-scoped, not
+    # session-scoped. The prior session-wide exclusive failed whenever ANY
+    # unrelated sibling on the same session held a shared lease — most commonly a
+    # concurrent create still inside its window-create/worktree/publish window —
+    # so on a continuously-dispatching supervisor a completed idle lane could not
+    # be force-reaped and 409'd resume_in_progress (issue #723: seven pi-lite
+    # lanes, plus a codex lane, all unreapable until a server bounce with no
+    # concurrent creates). A terminal-scoped exclusive is NOT blocked by shared
+    # leases held for OTHER terminals; it still mutually excludes a full session
+    # teardown and a duplicate delete of this same terminal. The per-terminal
+    # rebind lease (below) and the resume-claim reconcile (next) preserve the
+    # "a resume of THIS terminal in flight still 409s" invariant. The bounded
+    # wait now only covers a concurrent session close or a sibling delete of the
+    # same id, both short-lived.
     from cli_agent_orchestrator.services.config_service import ConfigService
 
     _lease_wait_s = float(ConfigService.get("delete.lifecycle_lease_wait_s", 5.0))
-    lifecycle_lease = acquire_session_lifecycle_exclusive_blocking(
-        session_name, timeout_s=_lease_wait_s
+    lifecycle_lease = acquire_session_lifecycle_terminal_exclusive_blocking(
+        session_name, terminal_id, timeout_s=_lease_wait_s
     )
     if lifecycle_lease is None:
+        raise RuntimeError("resume_in_progress")
+
+    # F867 (#723) D2: reconcile any STALE resume CAS claim on the way — an
+    # interrupted resume/detach could leave a claim that outlives its worker
+    # (bounded only by resume.claim_ttl_s = 600s), which is the DB-side sibling
+    # of the lease contention above. Reconciling here (best-effort, non-raising)
+    # means a force reap clears the stale claim rather than waiting out the TTL.
+    # A GENUINELY live resume of THIS terminal is NOT reconciled away — its claim
+    # is younger than the TTL and its provider-session lease is still held, so
+    # the resume-in-flight guard just below still refuses the delete.
+    try:
+        from cli_agent_orchestrator.services.conversation_reconcile import (
+            reconcile_stale_claims,
+        )
+
+        reconcile_stale_claims()
+    except Exception:
+        logger.debug("f867 stale-claim reconcile skipped for %s", terminal_id, exc_info=True)
+
+    # F867 (#723) D2: keep the gate's purpose — while THIS terminal is being
+    # RESUMED or REBOUND in place, the delete must be FULLY blocked and do
+    # nothing (the pre-#723 session-wide exclusive gave this for free; the
+    # terminal-scoped lease must reassert it explicitly). Two in-flight signals,
+    # both per-terminal:
+    #   * a rebind of THIS terminal holds its rebind lease, and
+    #   * a resume of THIS terminal holds its provider-session uuid lease.
+    # Checked HERE — right after the terminal-exclusive acquire and BEFORE any
+    # quiesce/teardown-intent/cascade work — so a racing rebind/resume 409s
+    # cleanly (resume_in_progress) without the delete disturbing the in-flight
+    # operation. The stale-claim reconcile above ensures only a LIVE resume
+    # (lease still held) blocks. The uuid is read from the terminal metadata row
+    # when present, else the F829 conversation root (D1 fills the root for pi
+    # even when the metadata column is not mirrored).
+    from cli_agent_orchestrator.services.provider_session_lease import (
+        provider_session_lease_held,
+    )
+    from cli_agent_orchestrator.services.rebind_lease import rebind_lease_held
+
+    _this_uuid = root.get("provider_session_id")
+    if not _this_uuid:
+        try:
+            from cli_agent_orchestrator.clients.database import (
+                get_conversation_identity,
+                get_terminal_identity,
+            )
+
+            _ti = get_terminal_identity(terminal_id)
+            _ikey = _ti.get("identity_key") if _ti else None
+            if _ikey:
+                _croot = get_conversation_identity(_ikey)
+                _this_uuid = _croot.get("provider_session_id") if _croot else None
+        except Exception:
+            logger.debug("f867 resume-guard uuid lookup failed for %s", terminal_id, exc_info=True)
+    _resume_in_flight = rebind_lease_held(terminal_id) or (
+        isinstance(_this_uuid, str) and bool(_this_uuid) and provider_session_lease_held(_this_uuid)
+    )
+    if _resume_in_flight:
+        release_session_lifecycle_terminal_exclusive(lifecycle_lease)
         raise RuntimeError("resume_in_progress")
     # F716 (#571) r2: declared out here so the lease's own `finally` also
     # releases the cascade's child intents, whatever exits the block.
@@ -7876,7 +7986,7 @@ def _delete_terminal_inner(
         try:
             _close_cascade_teardown_intents(_cascade_intent_ids, _cascade_marked)
         finally:
-            release_session_lifecycle_lease(lifecycle_lease)
+            release_session_lifecycle_terminal_exclusive(lifecycle_lease)
 
 
 def _quiesce_cascade_subtree_pre_plan(
