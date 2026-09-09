@@ -220,15 +220,42 @@ def capture_kiro_session_id_from_store(
     if recorded_locator:
         return recorded_locator, None, 1
     root = sessions_root if sessions_root is not None else _kiro_sessions_root()
-    hash_dir = root / _cwd_hash(cwd)
-    if not hash_dir.is_dir():
-        return None, "capture_unknown", 0
     target = os.path.realpath(cwd)
     # Prefer the per-attempt nonce marker (positive, non-copyable); fall back to
     # the per-terminal assign-trailer only when no nonce was minted.
     marker = capture_nonce if capture_nonce else f"[Assigned by terminal {terminal_id}"
-    cwd_matches = 0
+    # F829 kiro-harness: support BOTH kiro session-store layouts (kiro-cli
+    # versions differ across the laptop and boxes; record `kiro-cli --version`):
+    #   * LEGACY: ~/.kiro/sessions/<sha256(cwd)[:16]>/sess_<uuid>/session.json
+    #             + messages.jsonl
+    #   * FLAT (kiro-cli 2.20.1): ~/.kiro/sessions/cli/<uuid>.json (+ <uuid>.jsonl
+    #             transcript). Same POSITIVE-attribution rule in each: cwd-match
+    #             AND the injected nonce marker; NEVER newest-mtime; two same-cwd
+    #             candidates must resolve to the OWN (nonce-carrying) id. Attributed
+    #             ids are unioned; exactly one across BOTH layouts binds, else
+    #             (None, capture_unknown, count).
+    legacy_ids, legacy_count = _scan_kiro_legacy_layout(root, cwd, target, marker)
+    flat_ids, flat_count = _scan_kiro_flat_layout(root, target, marker)
+    attributed = list(dict.fromkeys(legacy_ids + flat_ids))
+    cwd_matches = legacy_count + flat_count
+    if len(attributed) == 1:
+        return attributed[0], None, cwd_matches
+    # Zero attributed, or ambiguous (>1) — refuse to guess.
+    return None, "capture_unknown", cwd_matches
+
+
+def _scan_kiro_legacy_layout(
+    root: Path, cwd: str, target_realpath: str, marker: str
+) -> tuple[list[str], int]:
+    """LEGACY layout: ~/.kiro/sessions/<sha256(cwd)[:16]>/sess_<uuid>/session.json
+    + messages.jsonl. Identical positive-attribution rule as before this change:
+    the cwd hash dir, cwd-match via session.json, nonce/assign marker in
+    messages.jsonl. Returns (attributed_ids, cwd_match_count)."""
+    hash_dir = root / _cwd_hash(cwd)
+    if not hash_dir.is_dir():
+        return [], 0
     attributed: list[str] = []
+    cwd_matches = 0
     for sess_dir in hash_dir.iterdir():
         if not sess_dir.is_dir() or not sess_dir.name.startswith("sess_"):
             continue
@@ -237,7 +264,7 @@ def capture_kiro_session_id_from_store(
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not _session_matches_cwd(meta, target):
+        if not _session_matches_cwd(meta, target_realpath):
             continue
         cwd_matches += 1
         session_id = meta.get("id")
@@ -245,10 +272,38 @@ def capture_kiro_session_id_from_store(
             continue
         if _transcript_contains_marker(sess_dir / "messages.jsonl", marker):
             attributed.append(session_id)
-    if len(attributed) == 1:
-        return attributed[0], None, cwd_matches
-    # Zero attributed, or ambiguous (>1) — refuse to guess.
-    return None, "capture_unknown", cwd_matches
+    return attributed, cwd_matches
+
+
+def _scan_kiro_flat_layout(
+    root: Path, target_realpath: str, marker: str
+) -> tuple[list[str], int]:
+    """FLAT layout (kiro-cli 2.20.1): ~/.kiro/sessions/cli/<uuid>.json (meta) +
+    <uuid>.jsonl (transcript). Same positive-attribution rule: cwd-match (from
+    the <uuid>.json meta) AND the nonce/assign marker in the sibling
+    <uuid>.jsonl; NEVER newest-mtime. Returns (attributed_ids, cwd_match_count)."""
+    cli_dir = root / "cli"
+    if not cli_dir.is_dir():
+        return [], 0
+    attributed: list[str] = []
+    cwd_matches = 0
+    for meta_path in sorted(cli_dir.glob("*.json")):
+        uuid_stem = meta_path.stem
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not _session_matches_cwd(meta, target_realpath):
+            continue
+        cwd_matches += 1
+        # kiro's own id field, else the filename stem (the uuid kiro keys by).
+        session_id = meta.get("id") if isinstance(meta.get("id"), str) and meta.get("id") else uuid_stem
+        if not session_id:
+            continue
+        transcript = cli_dir / f"{uuid_stem}.jsonl"
+        if _transcript_contains_marker(transcript, marker):
+            attributed.append(session_id)
+    return attributed, cwd_matches
 
 
 def _transcript_contains_marker(transcript: Path, marker: str) -> bool:
