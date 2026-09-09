@@ -457,18 +457,22 @@ def test_real_valid_local_shadows_lower_still_reads_once(tmp_path):
 #
 # The r4 walk (`_first_present_store_entry_is_unknown`) modelled precedence with
 # a SECOND, hand-copied list of store roots that OMITTED the packaged built-in
-# store — so a dangling local same-name entry still fell through to the built-in
-# profile and public assign reached creation. It also modelled only a dangling
-# symlink, not a `_safe_join`-rejected present entry (an escaping symlink). The
-# r5 fix removes the whole class: BOTH the reader and the walk consume the SAME
-# ordered store list, `_ordered_profile_stores`, so the walk can never search a
-# different set of directories than the reader reads.
+# store; r5 added the built-in store but stayed STORE-granular, so a readable
+# NESTED entry masked a dangling/escaping FLAT entry in the SAME store (codex r5
+# P0-A) and the composed candidate was outside the shared list (codex r5 P0-B).
+# The r6 fix models precedence at CANDIDATE granularity: BOTH the reader and the
+# walk iterate the SAME ordered candidate list, `_ordered_profile_candidates`
+# (composed first, then per-store flat-then-nested, built-in last), so precedence
+# stops at the FIRST PRESENT candidate and neither consumer can search a
+# different or coarser sequence than the other.
 #
-# These tests (a) pin that both consumers use the one shared list, and (b)
-# parametrize a dangling / malformed / unreadable HIGHER entry shadowing a
-# readable LOWER entry over EVERY (higher, lower) store pair, INCLUDING the
-# built-in store as the lower, asserting typed refusal + zero reads of the
-# shadowed lower file.
+# These tests (a) instrument the FILESYSTEM reads so a reader that iterates the
+# shared list in a different order (or drops the last candidate) is caught — a
+# factory-call spy that compares only classes cannot see that (the r5 gap the
+# verdict named), and (b) parametrize a dangling / malformed / unreadable HIGHER
+# entry shadowing a readable LOWER entry over EVERY (higher, lower) store pair,
+# INCLUDING the built-in store as the lower, asserting typed refusal + zero reads
+# of the shadowed lower file.
 # ---------------------------------------------------------------------------
 
 # A built-in packaged profile that is a genuine PLAIN profile (no
@@ -477,51 +481,225 @@ def test_real_valid_local_shadows_lower_still_reads_once(tmp_path):
 _BUILTIN_PLAIN_NAME = "reviewer"
 
 
-def test_walk_and_reader_share_one_ordered_store_list():
-    """The CLASS assertion (codex r4): the precedence walk and the reader consume
-    the IDENTICAL ordered store list, obtained from ONE shared function
-    (`_ordered_profile_stores`) — never a second hand-copied set that could omit
-    a store (the r1/r3/r4 defect, whose residual omission was the built-in
-    store). Proven by spying on the single shared function: BOTH
-    `read_agent_profile_source` and `_first_present_store_entry_is_unknown` call
-    it, and the object the reader iterates is the same list the walk classifies.
+class _RecordingCandidate:
+    """Wraps a real `_ProfileCandidate` and records, into a shared per-consumer
+    log, every time this candidate is TOUCHED by a consumer — via the reader's
+    content seam (`read`) or the walk's stat seams
+    (`is_present_readable`/`is_present_unusable`). The recorded value is the
+    candidate's stable sequence position, so the log is the exact ORDER in which
+    a consumer iterated the shared candidate list — not merely which list object
+    it was handed. A reader that iterated `reversed(...)` or dropped the last
+    candidate produces a DIFFERENT log and is caught."""
+
+    def __init__(self, inner, index: int, kind: str, log: list) -> None:
+        self._inner = inner
+        self._index = index
+        self.kind = kind
+        self._log = log
+
+    def _touch(self) -> None:
+        self._log.append((self._index, self.kind))
+
+    def read(self):
+        self._touch()
+        return self._inner.read()
+
+    def is_present_readable(self) -> bool:
+        self._touch()
+        return self._inner.is_present_readable()
+
+    def is_present_unusable(self) -> bool:
+        self._touch()
+        return self._inner.is_present_unusable()
+
+
+def _first_touch_order(log: list) -> list:
+    """Collapse a touch log to the ORDER in which candidates were first visited
+    (a consumer may stat the same candidate more than once)."""
+    seen = []
+    for idx, kind in log:
+        if (idx, kind) not in seen:
+            seen.append((idx, kind))
+    return seen
+
+
+def test_reader_and_walk_touch_identical_candidate_sequence(tmp_path):
+    """r6 CLASS assertion (codex r5 "same sequence" section): the reader and the
+    fail-closed walk touch the IDENTICAL ordered candidate sequence, observed by
+    instrumenting the candidates' filesystem seams (not a factory-call spy that
+    compares only classes — the r5 gap the verdict named). Run over a MATRIX of
+    layouts (empty, flat-only, nested-only, composed present) so the sequence is
+    pinned for real precedence shapes, and pin that the built-in candidate is the
+    LAST element of the shared list in every layout.
+
+    Divergent-consumer mutant check (report): with this test in place, mutating
+    ONLY the reader loop to iterate `reversed(_ordered_profile_candidates(...))`
+    or `[:-1]` (drop the built-in) makes the two touch orders differ (or the
+    built-in-last assertion fail) and this test FAILS — the exact mutants that
+    SURVIVED the r5 class-comparing test. A hand-copied second list in either
+    consumer likewise diverges here.
     """
-    real = _ap._ordered_profile_stores
-    handed_out: list[list] = []
+    local_dir = tmp_path / "local-store"
+    agent_dir = tmp_path / "agent-dir"
+    extra_dir = tmp_path / "extra-dir"
+    for d in (local_dir, agent_dir, extra_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    def spy(name: str):
-        stores = real(name)
-        handed_out.append(stores)
-        return stores
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={"agent": str(agent_dir)},
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[str(extra_dir)],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
 
-    # The walk consumes the shared function.
-    with patch.object(_ap, "_ordered_profile_stores", side_effect=spy):
-        _ap._first_present_store_entry_is_unknown("nonexistent_probe_name")
-    assert len(handed_out) == 1, "the walk must obtain its store list from the shared function"
-    walk_roots = [type(s).__name__ for s in handed_out[0]]
+    real_ordered = _ap._ordered_profile_candidates
 
-    handed_out.clear()
-    # The reader consumes the SAME shared function (a name with no match walks
-    # every store and raises FileNotFoundError).
-    with patch.object(_ap, "_ordered_profile_stores", side_effect=spy):
-        with pytest.raises(FileNotFoundError):
-            _ap.read_agent_profile_source("nonexistent_probe_name")
-    assert len(handed_out) == 1, "the reader must obtain its store list from the shared function"
-    reader_roots = [type(s).__name__ for s in handed_out[0]]
+    def make_recording_factory(log: list):
+        def factory(name: str):
+            wrapped = [
+                _RecordingCandidate(c, i, c.kind, log) for i, c in enumerate(real_ordered(name))
+            ]
+            return wrapped
 
-    # Identical ordered store sequence (same store kinds, same order), and the
-    # built-in packaged store is the FINAL store in both — the r4 omission.
-    assert walk_roots == reader_roots
-    assert (
-        reader_roots[-1] == "_BuiltinProfileStore"
-    ), "the built-in packaged store must be the reader's (and walk's) final store"
+        return factory
+
+    # A matrix of layouts. Each entry is a callable that writes files for the
+    # probe name and the name to resolve. All use names with NO match anywhere
+    # readable, so BOTH consumers walk the WHOLE candidate list to the end
+    # (reader → FileNotFoundError; walk → False), giving the full sequence.
+    def layout_empty(_name):
+        pass
+
+    def layout_flat_present_dangling(name):
+        # A dangling flat in agent-dir + a readable nested below it: the reader
+        # must still walk to the end for a NAME THAT NEVER RESOLVES, but the
+        # ordering (flat before nested) is exercised structurally.
+        (agent_dir / f"{name}.md").symlink_to(agent_dir / "missing.md")
+
+    def layout_nested_only(name):
+        nested = extra_dir / name / "agent.md"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        # dangling so the name never resolves and the whole list is walked
+        nested.symlink_to(extra_dir / name / "missing.md")
+
+    layouts = [layout_empty, layout_flat_present_dangling, layout_nested_only]
+
+    with stack:
+        for i, layout in enumerate(layouts):
+            name = f"seq_probe_{i}"  # legacy flat name → no composed candidate
+            layout(name)
+
+            walk_log: list = []
+            with patch.object(
+                _ap, "_ordered_profile_candidates", side_effect=make_recording_factory(walk_log)
+            ):
+                _ap._first_present_store_entry_is_unknown(name)
+
+            reader_log: list = []
+            with patch.object(
+                _ap, "_ordered_profile_candidates", side_effect=make_recording_factory(reader_log)
+            ):
+                with pytest.raises(FileNotFoundError):
+                    _ap.read_agent_profile_source(name)
+
+            walk_order = _first_touch_order(walk_log)
+            reader_order = _first_touch_order(reader_log)
+            assert walk_order, (i, "walk touched no candidate")
+            assert reader_order, (i, "reader touched no candidate")
+            # The decisive assertion: the two consumers visit the identical
+            # ordered candidate sequence (index+kind), so neither can iterate a
+            # different order or drop a candidate the other keeps.
+            assert walk_order == reader_order, (i, walk_order, reader_order)
+            # Indices must be a contiguous 0..n prefix in order (no reordering,
+            # no skipped/duplicated positions) — kills reversed()/[:-1] mutants.
+            assert [idx for idx, _ in reader_order] == list(range(len(reader_order))), (
+                i,
+                reader_order,
+            )
+            # Built-in candidate is the LAST element of the shared list.
+            full = real_ordered(name)
+            assert full[-1].kind == "builtin", (i, [c.kind for c in full])
 
 
-def test_ordered_stores_includes_builtin_last():
-    """Direct pin: `_ordered_profile_stores` ends with the packaged built-in
-    store (the store the r4 walk omitted)."""
-    stores = _ap._ordered_profile_stores("anything")
-    assert isinstance(stores[-1], _ap._BuiltinProfileStore)
+def test_ordered_candidates_builtin_last_and_flat_before_nested(tmp_path):
+    """Direct pin on the shared candidate list: the built-in candidate is LAST,
+    and inside a configured store the flat `{name}.md` candidate precedes the
+    nested `{name}/agent.md` candidate (the r5 P0-A ordering the store-granular
+    model collapsed)."""
+    agent_dir = tmp_path / "agent-dir"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", tmp_path / "local"))
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"agent": str(agent_dir)},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+                return_value=[],
+            )
+        )
+        cands = _ap._ordered_profile_candidates("anything")
+    kinds = [c.kind for c in cands]
+    assert kinds[-1] == "builtin", kinds
+    # local flat, then agent-dir flat, then agent-dir nested, then builtin.
+    assert kinds == ["flat", "flat", "nested", "builtin"], kinds
+
+
+def test_composed_candidate_is_first_for_effective_name(tmp_path, monkeypatch):
+    """The composed candidate is the FIRST element of the shared list for an
+    effective `<position>-<provider>` name (codex r5 P0-B: it must be INSIDE the
+    shared list, not a reader-only pre-check the walk cannot see). A legacy flat
+    name has NO composed candidate."""
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "home"))
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", tmp_path / "local"))
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+                return_value=[],
+            )
+        )
+        # An effective name: <position>-<provider> with a real provider token.
+        eff = _ap._ordered_profile_candidates("reviewer-pi_cli")
+        legacy = _ap._ordered_profile_candidates("reviewer")
+    assert eff[0].kind == "composed", [c.kind for c in eff]
+    assert "composed" not in [c.kind for c in legacy], [c.kind for c in legacy]
 
 
 # --- Parametrized shadowing over every (higher, lower) store pair -----------
@@ -687,4 +865,189 @@ def test_valid_higher_over_lower_resolves_higher(tmp_path, higher_slot, lower_sl
             "---\nprovider: pi_cli\n---\nhigher valid\n", encoding="utf-8"
         )
         _write_lower_readable(dirs, lower_slot, name)
+        assert resolve_provider(name, "claude_code") == "pi_cli"
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r6 — CANDIDATE-granular precedence: same-store flat-over-nested
+# and the composed candidate (codex r5 P0-A and P0-B).
+#
+# P0-A: each configured/extra directory is a TWO-candidate store — flat
+# `{name}.md` precedes nested `{name}/agent.md`. The r5 store-granular walk let
+# a readable nested entry make the whole store look readable, masking a
+# dangling/escaping FLAT entry in the SAME store, so the reader skipped the bad
+# flat and read the nested bytes → DECLARED, and public assign reached creation.
+# P0-B: the composed `agent-store/composed/{name}.md` candidate (for an effective
+# `<position>-<provider>` name) was outside the shared list, so a dangling/escaping
+# composed entry fell through to a lower local same-name profile.
+#
+# The r6 candidate-granular model puts BOTH inside the one shared candidate list,
+# so precedence stops at the first PRESENT candidate. These tests exercise both
+# shapes on the direct resolver (the assign-seam mirror is in
+# test/mcp_server/test_f838_assign_provider_guard.py).
+# ---------------------------------------------------------------------------
+
+
+def _same_store_env(tmp_path: Path, store_kind: str) -> tuple[ExitStack, Path]:
+    """Wire ONE configured or extra store dir (with local disabled/empty) so a
+    flat-vs-nested candidate ordering inside that single store can be exercised.
+    Returns the stack and the store dir."""
+    local_dir = tmp_path / "local-store"
+    store_dir = tmp_path / f"{store_kind}-store"
+    for d in (local_dir, store_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    agent_dirs = {"cfg": str(store_dir)} if store_kind == "agent" else {}
+    extra_dirs = [str(store_dir)] if store_kind == "extra" else []
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value=agent_dirs,
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=extra_dirs,
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    return stack, store_dir
+
+
+def _write_nested(store_dir: Path, name: str, raw: str) -> None:
+    nested = store_dir / name / "agent.md"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text(raw, encoding="utf-8", newline="")
+
+
+@pytest.mark.parametrize("store_kind", ["agent", "extra"])
+@pytest.mark.parametrize("bad_kind", ["dangling", "escaping"])
+def test_same_store_bad_flat_over_readable_nested_refuses(tmp_path, store_kind, bad_kind):
+    """codex r5 P0-A: a dangling OR escaping FLAT `{name}.md` in a configured/extra
+    store must NOT fall through to a readable NESTED `{name}/agent.md` in the SAME
+    store. The r6 candidate-granular walk stops at the bad flat candidate:
+    UNKNOWN, typed refusal, and the nested entry is NEVER read (raw_reads == 0)."""
+    name = "f838_r6_same_store"
+    stack, store_dir = _same_store_env(tmp_path, store_kind)
+    original_read = _ap.read_agent_profile_source
+    with stack:
+        flat = store_dir / f"{name}.md"
+        if bad_kind == "dangling":
+            flat.symlink_to(store_dir / "missing-flat-target.md")
+        else:  # escaping — flat symlink whose live target is outside the root
+            outside = tmp_path / "outside" / "live.md"
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_text("---\nprovider: pi_cli\n---\noutside\n", encoding="utf-8")
+            flat.symlink_to(outside)
+        _write_nested(store_dir, name, "---\nprovider: pi_cli\n---\nnested lower\n")
+
+        intent, _, _ = _ap._classify_stub_intent(name)
+        assert intent == _ap._STUB_UNKNOWN, (store_kind, bad_kind, intent)
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            with pytest.raises(ProviderResolutionError) as ei:
+                resolve_provider(name, "claude_code")
+        assert reads.call_count == 0, (store_kind, bad_kind, reads.call_count)
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+@pytest.mark.parametrize("store_kind", ["agent", "extra"])
+def test_same_store_valid_flat_over_nested_resolves_flat(tmp_path, store_kind):
+    """Mirror control: a VALID flat entry over a readable nested entry in the same
+    store resolves the FLAT provider (precedence stops at the first readable
+    candidate); no spurious refusal from the candidate-granular walk."""
+    name = "f838_r6_same_store_ok"
+    stack, store_dir = _same_store_env(tmp_path, store_kind)
+    with stack:
+        (store_dir / f"{name}.md").write_text(
+            "---\nprovider: pi_cli\n---\nflat higher\n", encoding="utf-8"
+        )
+        _write_nested(store_dir, name, "---\nprovider: claude_code\n---\nnested lower\n")
+        assert resolve_provider(name, "claude_code") == "pi_cli"
+
+
+def _composed_env(tmp_path: Path, monkeypatch) -> tuple[ExitStack, Path, Path]:
+    """Point CAO_HOME_DIR at scratch so `composed_store_dir()` resolves under it,
+    with a real local store as the lower candidate. Returns stack, composed dir,
+    local dir."""
+    from cli_agent_orchestrator.constants import composed_store_dir
+
+    home = tmp_path / "home"
+    local_dir = tmp_path / "local-store"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CAO_HOME_DIR", str(home))
+    stack = ExitStack()
+    stack.enter_context(patch.object(_ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={},
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    composed = composed_store_dir()
+    composed.mkdir(parents=True, exist_ok=True)
+    return stack, composed, local_dir
+
+
+@pytest.mark.parametrize("bad_kind", ["dangling", "escaping"])
+def test_composed_bad_over_lower_local_refuses(tmp_path, monkeypatch, bad_kind):
+    """codex r5 P0-B: a dangling OR escaping composed `{name}.md` (for an effective
+    `<position>-<provider>` name) must NOT fall through to a readable LOWER local
+    same-name profile. The composed candidate is now the FIRST element of the
+    shared list, so the r6 walk stops there: UNKNOWN, typed refusal, and the
+    lower local entry is NEVER read (raw_reads == 0)."""
+    # An effective name whose provider suffix is a real provider token.
+    name = "reviewer-pi_cli"
+    stack, composed, local_dir = _composed_env(tmp_path, monkeypatch)
+    original_read = _ap.read_agent_profile_source
+    with stack:
+        if bad_kind == "dangling":
+            (composed / f"{name}.md").symlink_to(composed / "missing.md")
+        else:
+            outside = tmp_path / "outside.md"
+            outside.write_text("---\nprovider: claude_code\n---\noutside\n", encoding="utf-8")
+            (composed / f"{name}.md").symlink_to(outside)
+        (local_dir / f"{name}.md").write_text(
+            "---\nprovider: pi_cli\n---\nlower local\n", encoding="utf-8"
+        )
+        intent, _, _ = _ap._classify_stub_intent(name)
+        assert intent == _ap._STUB_UNKNOWN, (bad_kind, intent)
+        with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
+            with pytest.raises(ProviderResolutionError) as ei:
+                resolve_provider(name, "claude_code")
+        assert reads.call_count == 0, (bad_kind, reads.call_count)
+    assert ei.value.code == E_PROVIDER_UNRESOLVED
+
+
+def test_composed_valid_over_lower_local_resolves_composed(tmp_path, monkeypatch):
+    """Mirror control: a VALID composed entry over a readable lower local same-name
+    profile resolves the COMPOSED provider (precedence stops at the first readable
+    candidate — the composed one)."""
+    name = "reviewer-pi_cli"
+    stack, composed, local_dir = _composed_env(tmp_path, monkeypatch)
+    with stack:
+        (composed / f"{name}.md").write_text(
+            "---\nprovider: pi_cli\n---\ncomposed higher\n", encoding="utf-8"
+        )
+        (local_dir / f"{name}.md").write_text(
+            "---\nprovider: claude_code\n---\nlower local\n", encoding="utf-8"
+        )
         assert resolve_provider(name, "claude_code") == "pi_cli"

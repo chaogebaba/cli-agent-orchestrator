@@ -462,3 +462,145 @@ def test_assign_refuses_bad_higher_shadowing_lower_seam(
     assert result["success"] is False, (higher_slot, lower_slot, result)
     assert E_PROVIDER_UNRESOLVED in result["message"]
     create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F838 (#695) r6 — public assign seam refuses for the CANDIDATE-granular shapes
+# the r5 store-granular walk missed (codex r5 P0-A, P0-B):
+#   A. a dangling/escaping FLAT `{name}.md` shadowing a readable NESTED
+#      `{name}/agent.md` in the SAME configured/extra store;
+#   B. a dangling/escaping composed `{name}.md` (effective <position>-<provider>
+#      name) shadowing a readable lower local same-name profile.
+# In r5 both reached _create_terminal with a resolved provider; r6 must refuse.
+# ---------------------------------------------------------------------------
+
+
+def _same_store_assign_env(tmp_path, monkeypatch, store_kind: str) -> tuple[ExitStack, Path]:
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    local_dir = tmp_path / "local-store"
+    store_dir = tmp_path / f"{store_kind}-store"
+    for d in (local_dir, store_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(patch_object(ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    agent_dirs = {"cfg": str(store_dir)} if store_kind == "agent" else {}
+    extra_dirs = [str(store_dir)] if store_kind == "extra" else []
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value=agent_dirs,
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=extra_dirs,
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(_patch.object(server.cao_http, "get", return_value=_CallerResponse()))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        )
+    )
+    return stack, store_dir
+
+
+@pytest.mark.parametrize("store_kind", ["agent", "extra"])
+@pytest.mark.parametrize("bad_kind", ["dangling", "escaping"])
+def test_assign_refuses_same_store_bad_flat_over_nested(
+    tmp_path, monkeypatch, store_kind, bad_kind
+):
+    """codex r5 P0-A at the public seam: a dangling/escaping FLAT entry shadowing
+    a readable NESTED entry in the SAME store → typed refusal, NO spawn."""
+    name = "f838_r6_seam_same_store"
+    stack, store_dir = _same_store_assign_env(tmp_path, monkeypatch, store_kind)
+    with stack:
+        flat = store_dir / f"{name}.md"
+        if bad_kind == "dangling":
+            flat.symlink_to(store_dir / "missing-flat-target.md")
+        else:
+            outside = tmp_path / "outside" / "live.md"
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_text("---\nprovider: pi_cli\n---\noutside\n", encoding="utf-8")
+            flat.symlink_to(outside)
+        nested = store_dir / name / "agent.md"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_text("---\nprovider: pi_cli\n---\nnested lower\n", encoding="utf-8")
+        with _patch(_CREATE) as create:
+            result = _assign_impl(name, "task", working_directory="/repo")
+    assert result["success"] is False, (store_kind, bad_kind, result)
+    assert E_PROVIDER_UNRESOLVED in result["message"]
+    assert "no spawn" in result["message"].lower()
+    create.assert_not_called()
+
+
+def _composed_assign_env(tmp_path, monkeypatch) -> tuple[ExitStack, Path, Path]:
+    from cli_agent_orchestrator.constants import composed_store_dir
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "home"))
+    local_dir = tmp_path / "local-store"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    stack = ExitStack()
+    stack.enter_context(patch_object(ap, "LOCAL_AGENT_STORE_DIR", local_dir))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            return_value={},
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            return_value=[],
+        )
+    )
+    stack.enter_context(_patch.object(server.cao_http, "get", return_value=_CallerResponse()))
+    stack.enter_context(
+        patch_dotted(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value=None,
+        )
+    )
+    composed = composed_store_dir()
+    composed.mkdir(parents=True, exist_ok=True)
+    return stack, composed, local_dir
+
+
+@pytest.mark.parametrize("bad_kind", ["dangling", "escaping"])
+def test_assign_refuses_composed_bad_over_lower_local(tmp_path, monkeypatch, bad_kind):
+    """codex r5 P0-B at the public seam: a dangling/escaping composed entry (for an
+    effective <position>-<provider> name) shadowing a readable lower local same-name
+    profile → typed refusal, NO spawn."""
+    name = "reviewer-pi_cli"
+    stack, composed, local_dir = _composed_assign_env(tmp_path, monkeypatch)
+    with stack:
+        if bad_kind == "dangling":
+            (composed / f"{name}.md").symlink_to(composed / "missing.md")
+        else:
+            outside = tmp_path / "outside.md"
+            outside.write_text("---\nprovider: claude_code\n---\noutside\n", encoding="utf-8")
+            (composed / f"{name}.md").symlink_to(outside)
+        (local_dir / f"{name}.md").write_text(
+            "---\nprovider: pi_cli\n---\nlower local\n", encoding="utf-8"
+        )
+        with _patch(_CREATE) as create:
+            result = _assign_impl(name, "task", working_directory="/repo")
+    assert result["success"] is False, (bad_kind, result)
+    assert E_PROVIDER_UNRESOLVED in result["message"]
+    assert "no spawn" in result["message"].lower()
+    create.assert_not_called()

@@ -570,44 +570,6 @@ def compose_agent_profile_source(raw_text: str, profile_name: str) -> str:
     return str(frontmatter.dumps(post)) + "\n"
 
 
-class _ProfileStore:
-    """F838 (#695) r5 — ONE store dir the reader consults for a name, in
-    precedence order, modelled so BOTH the reader and the precedence walk decide
-    identically.
-
-    A store contributes an ordered list of candidate locations for the name (a
-    flat ``{name}.md`` and, for the on-disk directory stores, a nested
-    ``{name}/agent.md``). Every consumer asks the SAME three questions of a
-    store, in this exact order, so the reader's "which bytes win" and the walk's
-    "what is the first present entry" can never diverge:
-
-    * :meth:`read` — the reader's action: return the bytes of the FIRST candidate
-      the reader would accept (``exists()``/``is_file()`` after ``_safe_join``),
-      or ``None`` if this store has no readable entry for the name. This is the
-      only method that touches file *contents*.
-    * :meth:`has_readable_entry` — stat-only: would :meth:`read` return bytes?
-      (An ``exists()``/``is_file()`` candidate that ``_safe_join`` accepted.)
-    * :meth:`has_present_but_unusable_entry` — stat-only: is there an entry for
-      the name PHYSICALLY PRESENT in this store that the reader nonetheless will
-      NOT read — a dangling symlink, or a path ``_safe_join`` rejects because it
-      escapes the store root? This is the codex r4 "present-but-rejected" case:
-      the reader skips it and falls through, so the walk must treat it as an
-      UNKNOWN first entry and fail closed.
-
-    Concrete stores differ only in how a candidate is located and read; the
-    precedence logic lives once, in :func:`_ordered_profile_stores`.
-    """
-
-    def read(self) -> "Optional[str]":  # pragma: no cover - overridden
-        raise NotImplementedError
-
-    def has_readable_entry(self) -> bool:  # pragma: no cover - overridden
-        raise NotImplementedError
-
-    def has_present_but_unusable_entry(self) -> bool:  # pragma: no cover - overridden
-        raise NotImplementedError
-
-
 def _is_dangling_symlink(path: "Optional[Path]") -> bool:
     """True iff ``path`` is a symlink whose target does not resolve.
 
@@ -621,81 +583,103 @@ def _is_dangling_symlink(path: "Optional[Path]") -> bool:
         return False
 
 
-class _DirProfileStore(_ProfileStore):
-    """An on-disk store directory. The configured/extra stores look up a flat
-    ``{name}.md`` then a nested ``{name}/agent.md``; the local store is
-    flat-only (``nested=False``), matching the reader's historical behaviour.
-    Every candidate is gated through ``_safe_join`` exactly as the reader gates
-    it."""
+class _ProfileCandidate:
+    """F838 (#695) r6 — ONE candidate location the reader may consume for a
+    name, at CANDIDATE granularity (not store granularity).
 
-    def __init__(self, root: Path, agent_name: str, *, nested: bool = True) -> None:
-        self._root = root
-        self._name = agent_name
-        self._nested_enabled = nested
-        # The reader's candidate locations, in the reader's order.
-        self._safe_flat: "Optional[Path]" = _safe_join(root, f"{agent_name}.md")
-        self._raw_flat: Path = root.joinpath(f"{agent_name}.md")
-        self._safe_nested: "Optional[Path]" = None
-        self._raw_nested: "Optional[Path]" = None
-        if nested:
-            self._safe_nested = _safe_join(root, agent_name, "agent.md")
-            self._raw_nested = root.joinpath(agent_name, "agent.md")
+    The reader's real precedence chain is a flat list of candidate *files*, not
+    a list of stores: the composed ``agent-store/composed/{name}.md`` (for a
+    ``<position>-<provider>`` name), then per on-disk store the flat ``{name}.md``
+    BEFORE the nested ``{name}/agent.md``, local → configured → extra, then the
+    packaged built-in ``{name}.md`` last. Modelling precedence at STORE
+    granularity (the r5 defect, codex r5 P0-A) let a readable nested entry mask a
+    dangling/escaping flat entry in the SAME store; and it omitted the composed
+    candidate entirely (codex r5 P0-B). Representing every candidate as one
+    element of :func:`_ordered_profile_candidates` removes both: precedence stops
+    at the FIRST PRESENT candidate, and both the reader and the fail-closed walk
+    iterate the identical candidate sequence.
 
-    def _candidates(self) -> "List[Optional[Path]]":
-        return [self._safe_flat, self._safe_nested] if self._nested_enabled else [self._safe_flat]
+    Every candidate answers the SAME three questions the reader would ask of it,
+    so "which bytes win" (reader) and "what is the first present candidate"
+    (walk) can never diverge:
+
+    * :meth:`read` — the reader's action for THIS candidate: return its bytes if
+      the reader would accept it (``exists()``/``is_file()`` after ``_safe_join``),
+      else ``None``. The ONLY method that touches file *contents*; any read error
+      PROPAGATES (a permission-denied file surfaces as UNKNOWN, not "absent").
+    * :meth:`is_present_readable` — stat-only: would :meth:`read` return bytes?
+    * :meth:`is_present_unusable` — stat-only: is THIS candidate PHYSICALLY
+      PRESENT but one the reader will NOT read — a dangling symlink, or a path
+      ``_safe_join`` rejects because it escapes its root? The reader skips it and
+      falls through, so the walk must treat it as an UNKNOWN first candidate and
+      fail closed.
+    """
+
+    #: Short kind tag used only by tests to assert the ordered candidate
+    #: sequence the reader and walk share.
+    kind: str = "candidate"
+
+    def read(self) -> "Optional[str]":  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def is_present_readable(self) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def is_present_unusable(self) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class _PathCandidate(_ProfileCandidate):
+    """A single on-disk candidate file (``composed``, a store's flat entry, or a
+    store's nested entry). ``_safe_join`` is evaluated once at construction, so
+    ``safe`` is the resolver-accepted path (or ``None`` when the join escapes the
+    root) and ``raw`` is the un-resolved join used only to detect a present-but-
+    rejected entry the reader will skip."""
+
+    def __init__(self, kind: str, safe: "Optional[Path]", raw: Path) -> None:
+        self.kind = kind
+        self._safe = safe
+        self._raw = raw
 
     def read(self) -> "Optional[str]":
         # Mirror read_agent_profile_source EXACTLY: gate on .exists() (which
-        # follows symlinks) and, when a candidate exists, read it and let any
-        # read error PROPAGATE (a permission-denied file must surface as an
-        # error the classifier maps to UNKNOWN, not be swallowed into "absent").
-        for candidate in self._candidates():
-            if candidate is not None and candidate.exists():
-                return candidate.read_text(encoding="utf-8")
+        # follows symlinks) and, when the safe candidate exists, read it and let
+        # any read error PROPAGATE (permission-denied → UNKNOWN, not swallowed).
+        if self._safe is not None and self._safe.exists():
+            return self._safe.read_text(encoding="utf-8")
         return None
 
-    def has_readable_entry(self) -> bool:
-        for candidate in self._candidates():
+    def is_present_readable(self) -> bool:
+        try:
+            return self._safe is not None and self._safe.exists()
+        except OSError:
+            return False
+
+    def is_present_unusable(self) -> bool:
+        # A dangling symlink (raw or safe form), OR a candidate location that is
+        # physically present (as a link or entry) but which _safe_join REJECTED
+        # (escapes the root → safe is None): the reader will not read it, so it
+        # is a present-but-unusable candidate that must STOP precedence.
+        if _is_dangling_symlink(self._safe) or _is_dangling_symlink(self._raw):
+            return True
+        if self._safe is None:
             try:
-                if candidate is not None and candidate.exists():
+                if self._raw.is_symlink() or self._raw.exists():
                     return True
             except OSError:
-                continue
-        return False
-
-    def has_present_but_unusable_entry(self) -> bool:
-        # A dangling symlink (either the raw join or a _safe_join result), OR a
-        # candidate location that physically exists as a link/entry but which
-        # _safe_join REJECTED (escapes the root → None) so the reader skips it.
-        raw_candidates = (
-            [self._raw_flat, self._raw_nested] if self._nested_enabled else [self._raw_flat]
-        )
-        safe_candidates = self._candidates()
-        for path in (*raw_candidates, *safe_candidates):
-            if _is_dangling_symlink(path):
-                return True
-        # _safe_join rejected (None) but the entry is physically present: a
-        # symlink pointing outside the root, or a traversal the resolver refused.
-        # The reader will not read it, so it is a present-but-unusable first
-        # entry that must stop precedence.
-        pairs: "List[tuple[Optional[Path], Optional[Path]]]" = [(self._safe_flat, self._raw_flat)]
-        if self._nested_enabled:
-            pairs.append((self._safe_nested, self._raw_nested))
-        for safe, raw in pairs:
-            if safe is None and raw is not None:
-                try:
-                    if raw.is_symlink() or raw.exists():
-                        return True
-                except OSError:
-                    continue
+                return False
         return False
 
 
-class _BuiltinProfileStore(_ProfileStore):
-    """The packaged built-in store (``cli_agent_orchestrator.agent_store``),
-    which the reader searches LAST. Accessed through the ``importlib.resources``
-    traversable exactly as :func:`read_agent_profile_source` does, so the walk
-    models the same final store the reader does (codex r4 P0: it was omitted)."""
+class _BuiltinCandidate(_ProfileCandidate):
+    """The packaged built-in ``{name}.md`` (``cli_agent_orchestrator.agent_store``),
+    the reader's LAST candidate. Accessed through the ``importlib.resources``
+    traversable exactly as :func:`read_agent_profile_source` does. The packaged
+    store is read-only files installed with CAO and holds no user symlinks, so it
+    is never present-but-unusable — a name that is not a readable file is simply
+    absent here."""
+
+    kind = "builtin"
 
     def __init__(self, agent_name: str) -> None:
         self._name = agent_name
@@ -711,110 +695,137 @@ class _BuiltinProfileStore(_ProfileStore):
             return False
 
     def read(self) -> "Optional[str]":
-        # Mirror the reader: read the packaged file if present and let any read
-        # error propagate (UNKNOWN, not swallowed).
         if self._is_file():
             return self._entry.read_text(encoding="utf-8")
         return None
 
-    def has_readable_entry(self) -> bool:
+    def is_present_readable(self) -> bool:
         return self._is_file()
 
-    def has_present_but_unusable_entry(self) -> bool:
-        # The packaged store is read-only files installed with CAO; it holds no
-        # user symlinks. A name that is not a readable file is simply absent here.
+    def is_present_unusable(self) -> bool:
         return False
 
 
-def _ordered_profile_stores(agent_name: str) -> "List[_ProfileStore]":
-    """F838 (#695) r5 — THE single source of truth for profile-store precedence.
+def _ordered_profile_candidates(agent_name: str) -> "List[_ProfileCandidate]":
+    """F838 (#695) r6 — THE single source of truth for profile-precedence, at
+    CANDIDATE granularity.
 
-    Returns the stores the reader consults for ``agent_name``, in the reader's
-    exact precedence order:
+    Returns EVERY candidate the reader can consume for ``agent_name``, in the
+    reader's exact precedence order:
 
-    1. Local store (``LOCAL_AGENT_STORE_DIR``), honouring the disable toggle.
-    2. Provider-specific configured directories (``get_agent_dirs()``).
-    3. Extra user-added directories (``get_extra_agent_dirs()``).
-    4. The packaged built-in store (searched LAST by the reader).
+    0. The composed ``agent-store/composed/{name}.md`` candidate — but ONLY for
+       an effective ``<position>-<provider>`` name (``split_effective_name`` is
+       not None). The reader consults it FIRST for such a name; a legacy flat
+       name never matches, so this candidate is simply absent for the whole
+       legacy corpus.
+    1. Local store (``LOCAL_AGENT_STORE_DIR``) — flat ``{name}.md`` only.
+    2. Each configured directory (``get_agent_dirs()``) — flat ``{name}.md`` then
+       nested ``{name}/agent.md``.
+    3. Each extra directory (``get_extra_agent_dirs()``) — flat then nested.
+    4. The packaged built-in ``{name}.md`` — LAST.
 
     ``read_agent_profile_source`` (the reader) AND
-    ``_first_present_store_entry_is_unknown`` (the precedence walk) BOTH consume
-    this one list, so the walk can never model a different, hand-copied set of
-    directories than the reader actually reads (the codex r1/r3/r4 CLASS defect:
-    each round a second hand-listed set omitted a store the reader searched — the
-    built-in store was the residual omission). A test pins that both consumers
-    receive the identical ordered store sequence.
-
-    The composed store (``agent-store/composed/``) is intentionally NOT part of
-    this precedence list: it is consulted by the reader only for a
-    ``<position>-<provider>`` name, is materialised atomically by the assign-time
-    writer (never a user-authored symlink), and is a build artefact rather than a
-    same-name shadow surface — so it cannot produce the dangling/rejected
-    shadow this walk defends against. It is handled separately at the top of the
-    reader for the legacy-name no-op it is.
+    ``_first_present_store_entry_is_unknown`` (the precedence walk) BOTH iterate
+    THIS list, so the walk can never model a different, hand-copied set of
+    candidates than the reader actually reads. This is the r6 CLASS fix for the
+    codex r5 P0 blockers: the r5 model was store-granular, so a readable NESTED
+    entry masked a dangling/escaping FLAT entry in the same store (P0-A), and the
+    composed candidate was outside the shared list entirely (P0-B). At candidate
+    granularity precedence stops at the FIRST PRESENT candidate — a dangling flat
+    stops before its own store's readable nested, and a dangling/escaping composed
+    stops before any lower store. A test instruments the FILESYSTEM reads and pins
+    that the reader and walk touch the identical candidate sequence.
     """
+    from cli_agent_orchestrator.constants import composed_store_dir
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
         get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
+    candidates: "List[_ProfileCandidate]" = []
+
+    # 0. Composed candidate FIRST, for an effective <position>-<provider> name.
+    #    The composed store is a build artefact, but the read path makes no
+    #    provenance assumption: a composed entry can still be a dangling/escaping
+    #    symlink, and if it is, it must stop precedence exactly like any other
+    #    higher candidate rather than fall through to a lower same-name profile
+    #    (codex r5 P0-B). So it is a first-class member of the shared list.
+    if split_effective_name(agent_name) is not None:
+        composed_root = composed_store_dir()
+        candidates.append(
+            _PathCandidate(
+                "composed",
+                _safe_join(composed_root, f"{agent_name}.md"),
+                composed_root.joinpath(f"{agent_name}.md"),
+            )
+        )
+
     disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
-    stores: "List[_ProfileStore]" = []
+
+    def _dir_candidates(root: Path, *, nested: bool) -> None:
+        candidates.append(
+            _PathCandidate(
+                "flat",
+                _safe_join(root, f"{agent_name}.md"),
+                root.joinpath(f"{agent_name}.md"),
+            )
+        )
+        if nested:
+            candidates.append(
+                _PathCandidate(
+                    "nested",
+                    _safe_join(root, agent_name, "agent.md"),
+                    root.joinpath(agent_name, "agent.md"),
+                )
+            )
+
+    # 1. Local store (flat only), 2. configured dirs, 3. extra dirs — each
+    #    flat-then-nested, honouring the disable toggle.
     if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
-        stores.append(_DirProfileStore(LOCAL_AGENT_STORE_DIR, agent_name, nested=False))
+        _dir_candidates(LOCAL_AGENT_STORE_DIR, nested=False)
     for dir_path in get_agent_dirs().values():
         if normalized_path(dir_path) not in disabled:
-            stores.append(_DirProfileStore(Path(dir_path), agent_name))
+            _dir_candidates(Path(dir_path), nested=True)
     for extra_dir in get_extra_agent_dirs():
         if normalized_path(extra_dir) not in disabled:
-            stores.append(_DirProfileStore(Path(extra_dir), agent_name))
-    stores.append(_BuiltinProfileStore(agent_name))
-    return stores
+            _dir_candidates(Path(extra_dir), nested=True)
+
+    # 4. Packaged built-in candidate, LAST.
+    candidates.append(_BuiltinCandidate(agent_name))
+    return candidates
 
 
 def read_agent_profile_source(agent_name: str) -> str:
     """Locate an agent profile across configured stores and return the raw text.
 
-    Search order:
+    Search order (at candidate granularity):
+    0. Composed store ``agent-store/composed/{name}.md`` (only for an effective
+       ``<position>-<provider>`` name)
     1. Local store: <CAO_HOME_DIR>/agent-store/{name}.md (default
        ~/.aws/cli-agent-orchestrator/agent-store/)
-    2. Provider-specific directories (flat {name}.md or {name}/agent.md)
-    3. Extra user-added directories (flat {name}.md or {name}/agent.md)
+    2. Provider-specific directories (flat {name}.md then {name}/agent.md)
+    3. Extra user-added directories (flat {name}.md then {name}/agent.md)
     4. Built-in store (packaged with CAO)
 
     Shared by ``load_agent_profile`` (which parses the text into an
     ``AgentProfile``) and the install service (which writes the raw text to
     the context file). Centralising the lookup keeps the two callers in sync.
 
-    The store precedence itself is defined ONCE in
-    :func:`_ordered_profile_stores`; this reader and the fail-closed precedence
-    walk (:func:`_first_present_store_entry_is_unknown`) consume that same
-    ordered list so they can never search different directories (F838 #695 r5).
+    The precedence itself is defined ONCE in :func:`_ordered_profile_candidates`;
+    this reader and the fail-closed precedence walk
+    (:func:`_first_present_store_entry_is_unknown`) iterate that same ordered
+    candidate list so they can never search different files (F838 #695 r6 — the
+    composed candidate and every flat/nested candidate are one shared list, no
+    second hand-copied set that could omit or reorder a candidate).
     """
     _validate_agent_name(agent_name)
 
-    # F786 (#643) D8 — a position-composed spawn name (``<position>-<provider>``)
-    # is materialised under ``agent-store/composed/`` by the assign-time writer;
-    # it has no flat store file. Look there FIRST for any name whose suffix is a
-    # known provider so a composed profile always loads by name (the seam that
-    # makes a profile-less spawn impossible). A legacy flat name never matches
-    # split_effective_name, so this is a no-op for the whole legacy corpus.
-    if split_effective_name(agent_name) is not None:
-        from cli_agent_orchestrator.constants import composed_store_dir
-
-        composed = _safe_join(composed_store_dir(), f"{agent_name}.md")
-        if composed is not None and composed.exists():
-            return composed.read_text(encoding="utf-8")
-
-    # Walk the ordered stores (local → configured agent dirs → extra dirs →
-    # packaged built-in) defined ONCE in _ordered_profile_stores. Each store
-    # gates its candidates through _safe_join and honours the disable toggle, so
-    # this reader and the fail-closed precedence walk consume the identical
-    # ordered directory list (F838 #695 r5 — no second hand-copied set that could
-    # omit a store, the r1/r3/r4 CLASS defect).
-    for store in _ordered_profile_stores(agent_name):
-        found = store.read()
+    # Read the FIRST candidate that yields bytes, in the shared precedence order
+    # (composed → local → configured → extra → built-in). The composed candidate
+    # is inside the shared list (r6), so a legacy name simply never has one.
+    for candidate in _ordered_profile_candidates(agent_name):
+        found = candidate.read()
         if found is not None:
             return found
 
@@ -892,14 +903,14 @@ def _dangling_store_entry(agent_name: str) -> bool:
         return False
 
     try:
-        # Consume the SAME ordered store list the reader uses (built-in store
-        # included), so this dangling probe can never search a different set of
-        # directories than read_agent_profile_source (F838 #695 r5). The
-        # built-in packaged store holds no user symlinks, so it never reports a
-        # dangling entry — but modelling it here keeps every store consumer on
-        # the one shared list.
-        for store in _ordered_profile_stores(agent_name):
-            if store.has_present_but_unusable_entry():
+        # Consume the SAME ordered CANDIDATE list the reader uses (composed and
+        # built-in candidates included), so this dangling probe can never search
+        # a different set of files than read_agent_profile_source (F838 #695 r6).
+        # The composed/built-in candidates hold no user symlinks in the healthy
+        # case, but modelling every candidate here keeps every consumer on the
+        # one shared list.
+        for candidate in _ordered_profile_candidates(agent_name):
+            if candidate.is_present_unusable():
                 return True
     except Exception:
         return False
@@ -907,43 +918,44 @@ def _dangling_store_entry(agent_name: str) -> bool:
 
 
 def _first_present_store_entry_is_unknown(agent_name: str) -> bool:
-    """F838 (#695) r5 — is the FIRST store (in the reader's precedence order)
-    that has an entry for ``agent_name`` one the reader will NOT read? Report
-    True iff so, so resolution fails closed instead of falling through.
+    """F838 (#695) r6 — is the FIRST CANDIDATE (in the reader's precedence order)
+    that is PRESENT for ``agent_name`` one the reader will NOT read? Report True
+    iff so, so resolution fails closed instead of falling through.
 
-    This closes the codex r3/r4 P0 blockers as a CLASS. ``read_agent_profile_source``
+    This closes the codex r3/r4/r5 P0 blockers as a CLASS. ``read_agent_profile_source``
     gates each candidate on ``Path.exists()`` (which FOLLOWS a symlink) and on
-    ``_safe_join`` (which rejects a path escaping the store root). So a
-    higher-precedence entry that is a DANGLING symlink, or a symlink whose target
-    escapes the root, reads as "not here" and the reader silently FALLS THROUGH
-    to a lower-precedence same-named profile — the lower file is then classified
-    DECLARED/PLAIN and its provider (or the caller fallback) reaches creation.
+    ``_safe_join`` (which rejects a path escaping the root). So a
+    higher-precedence candidate that is a DANGLING symlink, or a symlink whose
+    target escapes the root, reads as "not here" and the reader silently FALLS
+    THROUGH to a lower-precedence same-named candidate — the lower file is then
+    classified DECLARED/PLAIN and its provider (or the caller fallback) reaches
+    creation.
 
-    The r3/r4 fixes each modelled precedence with a SECOND, hand-copied list of
-    store roots — and each such list omitted a store the reader actually
-    searches (r4: the packaged BUILT-IN store; and it modelled only a dangling
-    link, not a ``_safe_join``-rejected present entry). The r5 fix removes the
-    class of defect: this walk consumes the SAME ordered store list the reader
-    consumes, :func:`_ordered_profile_stores` — one shared function, no second
-    hand-copied set — so it models EVERY store the reader models, built-in
-    included, and asks each store the same present/readable questions the reader
-    would (a test pins that both consumers receive the identical store sequence).
+    Every prior round modelled precedence at STORE granularity with a list that
+    was missing something the reader consumed: r4 omitted the packaged BUILT-IN
+    store; r5 added it but stayed store-granular, so (P0-A) a readable NESTED
+    entry masked a dangling/escaping FLAT entry in the SAME store, and (P0-B) the
+    composed candidate was outside the shared list. The r6 fix removes the class
+    of defect: precedence is modelled at CANDIDATE granularity, and this walk
+    iterates the SAME ordered candidate list the reader consumes,
+    :func:`_ordered_profile_candidates` — one shared function, composed and every
+    flat/nested and built-in candidate in it, no second hand-copied set — so it
+    can never model a different or coarser precedence than the reader reads (a
+    filesystem-read-spy test pins that both consumers touch the identical
+    candidate sequence).
 
-    Required semantics: precedence STOPS at the first store that has an entry for
-    the name. This helper reports the SHADOWING case — a higher store's present
-    entry is one the reader will not read (a dangling symlink, or a present entry
-    ``_safe_join`` rejects — see :meth:`_ProfileStore.has_present_but_unusable_entry`)
-    while a STRICTLY-LOWER store holds a READABLE same-named entry the reader
-    would otherwise fall through to. It returns False the moment it reaches a
-    store with a readable entry first (that readable entry is the legitimate
-    winner — no shadowing), and False for a bare unusable entry with NO lower
-    readable match: that case is left to the classifier's ``FileNotFoundError``
-    → :func:`_dangling_store_entry` arm, which this helper deliberately leaves
-    UNCHANGED (including its single raw-read count). The only behavioural change
-    from r4 is that the walk now models EVERY store the reader models — the
-    packaged built-in store and ``_safe_join``-rejected present entries — so a
-    dangling local entry shadowing a built-in same-name profile, or an
-    escaping-symlink higher entry shadowing a lower profile, is caught.
+    Required semantics: precedence STOPS at the FIRST candidate that is PRESENT
+    (readable OR present-but-unusable). This helper reports the SHADOWING case —
+    the first present candidate is one the reader will NOT read (a dangling
+    symlink, or a present entry ``_safe_join`` rejects — see
+    :meth:`_ProfileCandidate.is_present_unusable`) while some STRICTLY-LOWER
+    candidate is READABLE and the reader would otherwise fall through to it. It
+    returns False the moment it reaches a READABLE candidate first (that readable
+    candidate is the legitimate winner — no shadowing), and False for a bare
+    unusable candidate with NO lower readable match: that case is left to the
+    classifier's ``FileNotFoundError`` → :func:`_dangling_store_entry` arm, which
+    this helper deliberately leaves UNCHANGED (including its single raw-read
+    count).
 
     This is a STAT-ONLY walk (``is_symlink``/``exists``/``is_file`` — no
     ``read_text``), so it does NOT consume the single raw read the resolver is
@@ -957,23 +969,23 @@ def _first_present_store_entry_is_unknown(agent_name: str) -> bool:
 
     try:
         seen_higher_unusable = False
-        for store in _ordered_profile_stores(agent_name):
-            # Precedence stops at the FIRST store that has any entry for the name.
-            if store.has_readable_entry():
-                # The reader reads this store's bytes. If a STRICTLY-HIGHER store
-                # was present-but-unusable, that entry shadows THIS readable one
-                # — the forbidden fall-through. Otherwise this is the legitimate
-                # winner (no shadowing).
+        for candidate in _ordered_profile_candidates(agent_name):
+            # Precedence stops at the FIRST candidate that is PRESENT.
+            if candidate.is_present_readable():
+                # The reader reads THIS candidate's bytes. If a STRICTLY-HIGHER
+                # candidate was present-but-unusable, that entry shadows THIS
+                # readable one — the forbidden fall-through. Otherwise this is the
+                # legitimate winner (no shadowing).
                 return seen_higher_unusable
-            if store.has_present_but_unusable_entry():
-                # A present-but-unreadable higher entry (dangling / escapes root).
-                # Remember it; if a lower store turns out readable, this shadows
-                # it. If no lower store is readable, the FileNotFoundError →
+            if candidate.is_present_unusable():
+                # A present-but-unreadable higher candidate (dangling / escapes
+                # its root). Remember it; if a lower candidate turns out readable,
+                # this shadows it. If none is readable, the FileNotFoundError →
                 # _dangling_store_entry arm handles it (single-read preserved).
                 seen_higher_unusable = True
-            # else: nothing for the name in this store — keep walking.
-        # Walked every store without a readable entry. A bare unusable entry with
-        # no lower readable match is left to the FileNotFoundError →
+            # else: nothing for the name at this candidate — keep walking.
+        # Walked every candidate without a readable one. A bare unusable candidate
+        # with no lower readable match is left to the FileNotFoundError →
         # _dangling_store_entry arm (single-read behaviour preserved).
         return False
     except Exception:
