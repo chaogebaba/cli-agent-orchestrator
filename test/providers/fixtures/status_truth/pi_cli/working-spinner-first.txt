@@ -1,0 +1,45 @@
+[48;2;40;50;40m
+ [1m[38;2;212;212;212m$ cd /data/cao-scratch/gate-700-701/base-700-701 && CAO_SUITE_SLOT_WAIT=1 PYTHONPATH=$PWD/src uv run pytest -q test/providers/ 2>/data/cao-scratch/gate-700-701/base-providers-err.txt | tail
+[0m[48;2;40;50;40m [1m[38;2;212;212;212m-2 | tee /data/cao-scratch/gate-700-701/base-providers.txt; grep FAILED /data/cao-scratch/gate-700-701/base-providers-err.txt >/dev/null 2>&1; CAO_SUITE_SLOT_WAIT=1 PYTHONPATH=$PWD/src uv
+[0m[48;2;40;50;40m [1m[38;2;212;212;212mrun pytest -q test/providers/ 2>&1 | grep -E "^(FAILED|\[suite-slot\])" | sort | tee /data/cao-scratch/gate-700-701/base-providers-failed.txt | wc -l[0m[38;2;128;128;128m[48;2;40;50;40m (timeout 1200s)[39m
+
+ [38;2;128;128;128mERROR test/providers/test_native_status_shared.py::TestSharedNativeStatus::test_native_processing_resets_flush_timers[omp][39m
+ [38;2;128;128;128m8 failed, 2431 passed, 13 skipped, 7 xfailed, 193 errors in 63.58s (0:01:03)[39m
+ [38;2;128;128;128m10[39m
+
+ [38;2;128;128;128mTook 147.4s[39m
+
+
+
+ [1m[38;2;212;212;212m$ cat /data/cao-scratch/gate-700-701/base-providers-failed.txt[0m[48;2;40;50;40m
+
+ [38;2;128;128;128m... (7 earlier lines,[39m [38;2;102;102;102mctrl+o[38;2;128;128;128m to expand)[39m
+ [38;2;128;128;128mFAILED test/providers/test_f843_pi_cap_condition.py::test_pi_cap_wrapped_classifies_capped[39m
+ [38;2;128;128;128mFAILED test/providers/test_pi_cli_unit.py::TestErrorNotSticky::test_capped_banner_at_composer_is_idle_not_error[39m
+ [38;2;128;128;128mFAILED test/providers/test_pi_cli_unit.py::TestErrorNotSticky::test_error_then_processing_then_idle_sequence[39m
+ [38;2;128;128;128m[suite-slot] lock acquired — pid=741532 terminal=6ea8560f since=2026-09-08T22:54:45Z[39m
+ [38;2;128;128;128m[suite-slot] watchdog armed — pgid=741532, self-destruct in 3600s[39m
+
+ [38;2;128;128;128mTook 0.0s[39m
+
+
+[49m [3m[38;2;128;128;128mThinking...[0m
+
+ Base: 8F/2431P (2 pre-existing claude_code failures + 5 new tests RED; 193 pre-existing errors). Now head:
+
+[48;2;40;40;50m
+ [1m[38;2;212;212;212m$ cd /data/cao-scratch/gate-700-701/head-700-701 && CAO_SUITE_SLOT_WAIT=1 PYTHONPATH=$PWD/src uv run pytest -q test/providers/ 2>/data/cao-scratch/gate-700-701/head-providers-err.txt | tail
+[0m[48;2;40;40;50m [1m[38;2;212;212;212m-2 | tee /data/cao-scratch/gate-700-701/head-providers.txt; CAO_SUITE_SLOT_WAIT=1 PYTHONPATH=$PWD/src uv run pytest -q test/providers/ 2>&1 | grep -E "^FAILED" | sort >
+[0m[48;2;40;40;50m [1m[38;2;212;212;212m/data/cao-scratch/gate-700-701/head-providers-failed.txt; wc -l < /data/cao-scratch/gate-700-701/head-providers-failed.txt; cat /data/cao-scratch/gate-700-701/head-providers-failed.txt[0m[38;2;128;128;128m[48;2;40;40;50m
+[39m [38;2;128;128;128m(timeout 1200s)[39m
+
+ [38;2;128;128;128mElapsed 102.2s[39m
+
+
+[38;2;178;148;187m[49m[38;2;178;148;187m[49m⠴[39m [38;2;178;148;187mWorking ────────────────────────────────────────────────────────────────────────────────────────────────────
+[7m[39m [0m
+[38;2;178;148;187m────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;2;102;102;102m/data/cao-scratch/worktrees/cli-agent-orchestrator/6ea8560f (cao/6ea8560f)[39m
+[38;2;178;148;187m────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[38;2;102;102;102m↑48k ↓8.4k R731k CH98.8% $0.017 3.0%/1.0M (auto)                cline-pass/glm-5.3-flash • high
+[38;2;138;190;183m🔌 MCP: 1 server enabled[39m

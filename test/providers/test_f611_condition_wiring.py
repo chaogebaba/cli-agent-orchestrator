@@ -308,3 +308,110 @@ def test_fleet_response_condition_none_when_absent(monkeypatch) -> None:
     fleet = fs.build_fleet("sess-f611b")
     rows = {r["id"]: r for r in fleet["terminals"]}
     assert rows[tid]["condition"] is None
+
+
+# ── #700/#701 r2: the PI provider's condition OPT-IN is wired end-to-end ────────
+#
+# The codex EMPIRICAL-GATE-NO found the #700/#701 wiring gap: every existing arm
+# above drives the seam with a `_FakeProvider("codex")` (a fake key-based stand-
+# in) or calls the module `classify_condition(...)` directly, so NONE asserts the
+# Pi provider's own `condition_provider_key = "pi_cli"` opt-in. The ledger's OWN
+# mutant (M6: `condition_provider_key` → None) therefore SURVIVED. This arm
+# instantiates a REAL `PiCliProvider` and drives its verbatim 429 pane through
+# the production `_classify_and_deliver_condition` seam; it goes RED when the
+# opt-in is None (BaseProvider.classify_condition returns None → zero surfaces).
+
+# The verbatim ClinePass 429 banner from the live pi panes (issue #700/#701).
+_PI_BANNER = (
+    'Error: 429: {"code":"INFERENCE_CAP_ERROR","message":"Error 429: You have '
+    "reached your 5-hour Clinepass limit. The limit resets in 1h 29m, please try "
+    'again later."}'
+)
+_PI_RETRY_FAILED = (
+    'Error: Retry failed after 3 attempts: 429: {"code":"INFERENCE_CAP_ERROR",'
+    '"message":"Error 429: You have reached your 5-hour Clinepass limit. The '
+    'limit resets in 1h 29m, please try again later."}'
+)
+
+
+def _pi_capped_pane() -> str:
+    """A live pi capped pane: the 429 banner storm above the idle composer."""
+    rule = "─" * 120
+    footer = "↑26k ↓172 R3.9k CH97.6% $0.002 0.4%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+    return "\n".join(
+        [
+            " Call the probe tool. Then say DONE.",
+            "",
+            _PI_BANNER,
+            _PI_BANNER,
+            _PI_RETRY_FAILED,
+            "",
+            rule,
+            " ",
+            rule,
+            "/data/scratch/probe",
+            footer,
+        ]
+    )
+
+
+def test_pi_cli_condition_wiring_delivers_capped_once() -> None:
+    """A REAL PiCliProvider driven through the status-monitor transition seam
+    delivers exactly one CAPPED event to the fleet field, the supervisor inbox,
+    and the CLI projection — because it opts in via
+    ``condition_provider_key = "pi_cli"``. This arm turns RED when that opt-in is
+    None (the ledger's SURVIVED M6 mutant): BaseProvider.classify_condition then
+    returns None and no surface fires."""
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    sm = StatusMonitor()
+    tid = "9a9a9a9a"
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+    sm._buffer_epochs[tid] = 1
+
+    # A REAL provider instance (not a fake key stand-in) — its own class-level
+    # condition_provider_key is what routes the pane to the CAPPED classifier.
+    provider = PiCliProvider(tid, "sess", "win0")
+    assert (
+        type(provider).condition_provider_key == "pi_cli"
+    ), "precondition: pi opts into the F611 seam; the M6 mutant sets this None"
+
+    sm._classify_and_deliver_condition(tid, provider, _pi_capped_pane())
+
+    assert rec["fleet"] == [(tid, "CAPPED")], "fleet condition field must be set for pi"
+    assert rec["inbox"] == [(tid, "CAPPED")], "exactly one supervisor inbox push for pi"
+    assert rec["cli"] == [(tid, "CAPPED")], "exactly one CLI/bus projection for pi"
+
+
+def test_pi_cli_condition_wiring_read_back_by_getter() -> None:
+    """The live fleet field the seam sets for a real PiCliProvider is read back by
+    ``get_condition`` (the getter terminal_service.get_terminal uses). A second,
+    non-capped pane transition clears it — proving it is the live field, not a
+    latched artifact."""
+    from cli_agent_orchestrator.providers.condition import ConditionDelivery
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    sm = StatusMonitor()
+    tid = "9b9b9b9b"
+    sm._buffer_epochs[tid] = 1
+    delivery = ConditionDelivery(
+        fleet_sink=sm._condition_fleet_sink,
+        inbox_sink=lambda tid_, cond_: None,
+        cli_sink=lambda tid_, cond_, label_: None,
+    )
+    sm._condition_delivery = delivery
+
+    provider = PiCliProvider(tid, "sess", "win0")
+    sm._classify_and_deliver_condition(tid, provider, _pi_capped_pane())
+    assert sm.get_condition(tid) == "CAPPED"
+
+    # A clean composer pane (no 429 banner) → no condition → field cleared.
+    sm._buffer_epochs[tid] = 2
+    rule = "─" * 120
+    footer = "↑1k ↓1k R1k CH1% $0.001 0.1%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+    clean_pane = "\n".join([" All done.", "", rule, " ", rule, footer])
+    sm._classify_and_deliver_condition(tid, provider, clean_pane)
+    assert sm.get_condition(tid) is None

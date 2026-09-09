@@ -145,9 +145,9 @@ def test_pi_cap_quoted_in_fence_does_not_fire() -> None:
     """A code-fenced quote of the banner is transcript, not a live cap → no
     CAPPED (F836 quoted-text discipline)."""
     cond = classify_condition(_quoted_in_fence_pane(), "pi_cli")
-    assert cond is None or cond.kind is not ConditionKind.CAPPED, (
-        f"a fenced/quoted 429 must not fire CAPPED, got {cond}"
-    )
+    assert (
+        cond is None or cond.kind is not ConditionKind.CAPPED
+    ), f"a fenced/quoted 429 must not fire CAPPED, got {cond}"
 
 
 def test_pi_cap_reset_hint_comma_boundary() -> None:

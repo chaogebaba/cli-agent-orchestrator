@@ -117,18 +117,54 @@ _EDITOR_RULE = re.compile(r"^\s*[─━—-]{20,}\s*$")
 _BRAILLE_SPINNER = r"\u2800-\u28ff"
 
 # The active spinner line while Pi is working, e.g. "── ⠧ Working ──────" or
-# (mid-redraw) "⠴ Working ────".  A braille spinner glyph adjacent to
-# ``Working`` with a box rule on EITHER side is Pi's live working chrome.  The
-# spinner glyph varies frame to frame, so all frames are accepted; the rule may
-# lead OR trail so a redraw that draws the trailing rule first still matches
-# (#703 F847: a long-running tool's ``Elapsed``/``(timeout Ns)`` block above the
-# spinner row must not suppress this — the row is matched wherever it appears in
-# the buffer).  A rule-flanked ``Working`` with a non-braille marker is still
-# honored via the second alternative (legacy #700/#701 shape).
-_WORKING = re.compile(
-    r"(?:[─━—-]{2,}\s*)?[" + _BRAILLE_SPINNER + r"]\s*Working\b" r"|[─━—-]{2,}\s*\S?\s*Working\b",
-    re.IGNORECASE,
+# (mid-redraw) "⠴ Working ────".  This is a WHOLE ROW the TUI draws — a braille
+# spinner glyph adjacent to ``Working`` with a Pi box rule (``──…`` run) on the
+# SAME row, on EITHER side of the glyph.  The spinner glyph varies frame to
+# frame, so all frames in the braille block are accepted; the rule may LEAD
+# (``── ⠧ Working ──``) or TRAIL (mid-redraw ``⠴ Working ────``, spinner-first)
+# so a redraw that draws the trailing rule first still matches (#703 F847, the
+# genuine false-idle frame the base rule-must-lead regex missed).
+#
+# F847 r2 (#703): the match is now BRAILLE-ONLY and a WHOLE-ROW anchor
+# (``^…$`` under MULTILINE), and a same-row box rule is REQUIRED, for two
+# reasons the r1 shape got wrong (codex EMPIRICAL-GATE-NO):
+#   1. r1's first alternative made the rule OPTIONAL, so bare
+#      ``⠦ Working on the summary now`` PROSE fired PROCESSING. Requiring a
+#      same-row rule and anchoring the row fixes that overmatch.
+#   2. r1 also carried permissive ``\S? Working`` NON-braille alternatives, so a
+#      stray non-spinner glyph matched and — worse — those alternatives MASKED
+#      the braille class entirely (narrowing the braille set to one glyph still
+#      matched every spinner-first frame via ``\S?``, so the ledger's glyph
+#      mutant would survive). Every real pi spinner in the capture corpus uses a
+#      braille frame, so the non-braille alternatives are dropped: the braille
+#      class is now the sole gate on which glyphs count as a live spinner.
+# Positional scoping to the live bottom-of-viewport status region (and
+# fence-dropping) is done by ``_live_working_spinner`` (r1's whole-buffer
+# ``.search`` overmatched a fenced quote and a stale spinner 40 rows above the
+# composer).
+_RULE_RUN = r"[─━—\-]{2,}"
+_WORKING_ROW = re.compile(
+    r"^[ \t]*" r"(?:"
+    # rule-leading: ── ⠧ Working ─(─…)?
+    r"" + _RULE_RUN + r"[ \t]*[" + _BRAILLE_SPINNER + r"][ \t]*Working\b"
+    # spinner-first: ⠴ Working ──── (trailing rule required)
+    r"|[" + _BRAILLE_SPINNER + r"][ \t]*Working\b[ \t]*" + _RULE_RUN + r"" r")",
+    re.IGNORECASE | re.MULTILINE,
 )
+# Backwards-compatible module alias: ``_WORKING`` is referenced by the r1 tests
+# and by ``_has_idle_chrome``/``extract_last_message_from_script`` as a cheap
+# "does this pane show a working spinner at all" predicate. It now points at the
+# whole-row anchor; positional/fence scoping is applied only in get_status via
+# ``_live_working_spinner``.
+_WORKING = _WORKING_ROW
+
+# How many trailing (non-blank-stripped) rows count as Pi's LIVE status region.
+# Pi's live working spinner sits in the composer box at the bottom of the
+# viewport, directly above the footer/context readout; a spinner glyph far above
+# that region is stale transcript, not the live state (#703 overmatch). 12 rows
+# comfortably covers the composer box + footer + MCP line while excluding a
+# spinner scrolled tens of rows up.
+_LIVE_TAIL_ROWS = 12
 
 # The footer context/budget readout, e.g. "0.3%/1.0M (auto)" or "?/1.0M".
 # Presence of this plus two rules is Pi's idle/completed chrome.
@@ -473,6 +509,48 @@ class PiCliProvider(BaseProvider):
         return self._read_pane()
 
     @staticmethod
+    def _live_working_spinner(clean: str) -> bool:
+        """Return whether the LIVE bottom-of-viewport status region shows Pi's
+        working spinner row.
+
+        F847 r2 (#703): the r1 code matched ``_WORKING`` anywhere in the whole
+        cleaned buffer, which overmatched (a) a fenced/quoted spinner row a human
+        pasted, and (b) a stale spinner scrolled tens of rows above the current
+        composer. Pi's genuine live spinner is a WHOLE ROW drawn in the composer
+        box at the bottom of the viewport, directly above the footer. So the
+        match is scoped, with the SAME discipline as the #693 footer classifier
+        (position-anchored, fence-excluded, whole-row):
+
+        1. Drop rows inside a Markdown code fence (a pasted/quoted spinner is
+           transcript, never the live row — mirrors ``condition._pi_live_rows``).
+        2. Strip trailing whitespace-only padding (pi pads the pane bottom).
+        3. Only the last ``_LIVE_TAIL_ROWS`` rows — the live status region — are
+           eligible; a spinner further up is stale transcript.
+        4. A row in that window is the live spinner only if it matches the
+           whole-row ``_WORKING_ROW`` anchor (a braille/marker + ``Working`` with
+           a box rule on the same row), never bare prose that merely says
+           "Working".
+        """
+        lines = clean.splitlines()
+        # 1) drop fenced rows (quoted spinner is not live)
+        unfenced: list[str] = []
+        in_fence = False
+        for row in lines:
+            if row.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            unfenced.append(row)
+        # 2) strip trailing blank padding so the tail lands on real chrome
+        while unfenced and not unfenced[-1].strip():
+            unfenced.pop()
+        # 3) bottom-of-viewport window only
+        tail = unfenced[-_LIVE_TAIL_ROWS:]
+        # 4) whole-row spinner anchor within the live window
+        return any(_WORKING_ROW.match(row) for row in tail)
+
+    @staticmethod
     def _has_idle_chrome(clean: str) -> bool:
         """Return whether the stripped buffer shows Pi's idle/completed chrome.
 
@@ -486,7 +564,7 @@ class PiCliProvider(BaseProvider):
         so we STRIP trailing blank/whitespace-only lines BEFORE taking the tail
         window. Blank lines interspersed within the chrome are preserved.
         """
-        if _WORKING.search(clean):
+        if PiCliProvider._live_working_spinner(clean):
             return False
         lines = clean.splitlines()
         # Drop trailing whitespace-only lines (pi's bottom padding) so the tail
@@ -538,11 +616,14 @@ class PiCliProvider(BaseProvider):
         # chrome re-derives the true state every poll, so a runtime error banner
         # left in scrollback (the 429 cap, #700) can never latch a sticky ERROR
         # over a pane that is in fact working or waiting at its composer. The
-        # ``⠴ Working`` spinner row (F847 #703) is matched wherever it sits in the
-        # buffer and BEFORE the idle/composer chrome, so a long-running tool's
-        # ``Elapsed``/``(timeout Ns)`` block printed above the spinner cannot flip
-        # a working pane to a false IDLE (the delivery-eligible state).
-        if _WORKING.search(clean):
+        # ``⠴ Working`` spinner row (F847 #703) is matched only in the LIVE
+        # bottom-of-viewport status region (whole-row anchor, fence-excluded —
+        # ``_live_working_spinner``) and BEFORE the idle/composer chrome, so a
+        # long-running tool's ``Elapsed``/``(timeout Ns)`` block printed above the
+        # spinner cannot flip a working pane to a false IDLE (the delivery-
+        # eligible state), while a quoted/fenced or stale-far-above spinner glyph
+        # in transcript can no longer flip an idle pane to a false PROCESSING.
+        if self._live_working_spinner(clean):
             self._tui_processing_seen = True
             return TerminalStatus.PROCESSING
 
@@ -573,7 +654,7 @@ class PiCliProvider(BaseProvider):
         the initial banner).
         """
         clean = strip_terminal_escapes(script_output)
-        if _WORKING.search(clean):
+        if self._live_working_spinner(clean):
             raise ValueError("No completed Pi response found while Pi is working")
 
         lines = clean.splitlines()

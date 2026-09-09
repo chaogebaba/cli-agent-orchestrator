@@ -488,6 +488,128 @@ class TestFalseIdleWorkingSpinner:
         provider = self._provider(dispatched=True, processing_seen=True)
         assert provider.get_status(buffer) == TerminalStatus.COMPLETED
 
+    # ── #703 r2: the GENUINE false-idle reproduction (codex EMPIRICAL-GATE-NO) ──
+
+    # The byte-exact incident (working-1.txt) is a RULE-LEADING frame that BASE
+    # already classifies PROCESSING, so it does NOT establish the false-idle
+    # root cause. The genuine repro is the SPINNER-FIRST redraw phase of the same
+    # animation, filed as working-spinner-first.txt: pi draws the glyph before
+    # its trailing rule (⠴ Working ────) while the two composer box rules are
+    # still on screen. Base's rule-must-lead regex misses it → the intact
+    # two-rule composer chrome wins → false idle/completed (RED); head's
+    # braille-first whole-row anchor classifies it PROCESSING (GREEN).
+    _CORPUS_SPINNER_FIRST = FIXTURES / "status_truth" / "pi_cli" / "working-spinner-first.txt"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_spinner_first_corpus_capture_is_processing_raw(self, _native) -> None:
+        """RED-on-base/GREEN-on-head: the spinner-first incident redraw frame
+        (raw ANSI) classifies PROCESSING, not a false idle."""
+        raw = self._CORPUS_SPINNER_FIRST.read_text(encoding="utf-8")
+        assert self._provider(dispatched=True, processing_seen=True).get_status(raw) == (
+            TerminalStatus.PROCESSING
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_spinner_first_corpus_capture_is_processing_ansi_stripped(self, _native) -> None:
+        """Same spinner-first frame ANSI-stripped (the buffer get_status parses)
+        still classifies PROCESSING."""
+        clean = strip_terminal_escapes(self._CORPUS_SPINNER_FIRST.read_text(encoding="utf-8"))
+        assert self._provider(dispatched=True, processing_seen=True).get_status(clean) == (
+            TerminalStatus.PROCESSING
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_all_braille_spinner_frames_spinner_first_are_processing(self, _native) -> None:
+        """#703 r2 (kills M703-2): EVERY canonical spinner frame drawn
+        SPINNER-FIRST (glyph leads, rule trails) → PROCESSING. The r1 legacy
+        second alternative kept every rule-LEADING glyph test green while the
+        sole spinner-first test used only ``⠴``; narrowing the braille class to
+        ``⠴`` survived. This asserts all ten glyphs in the spinner-first shape."""
+        for glyph in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
+            buffer = f"{glyph} Working " + "─" * 100 + "\n"
+            assert self._provider(dispatched=True).get_status(buffer) == (
+                TerminalStatus.PROCESSING
+            ), f"spinner-first frame {glyph!r} not detected as working"
+
+    # ── #703 r2: transcript OVERMATCH negatives (codex EMPIRICAL-GATE-NO) ───────
+
+    _RULE = "─" * 120
+    _FOOTER = "↑48k ↓8.4k R731k CH98.8% $0.017 3.0%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_braille_working_transcript_prose_does_not_fire(self, _native) -> None:
+        """A braille glyph that merely PRECEDES the word 'Working' in transcript
+        prose — with no box rule on the row — must NOT fire PROCESSING (the r1
+        first alternative made the rule optional and overmatched this). Idle
+        chrome below it wins."""
+        buffer = "\n".join(
+            [
+                ' The user quoted: "⠦ Working on the summary now" in the last turn.',
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_fenced_working_spinner_quote_does_not_fire(self, _native) -> None:
+        """A spinner row a human PASTED inside a Markdown code fence is transcript,
+        not the live status row (F836 quoted-text discipline). It must NOT fire
+        PROCESSING; the live idle composer below the fence wins."""
+        buffer = "\n".join(
+            [
+                " Here is the frame I saw:",
+                "```",
+                "── ⠼ Working " + self._RULE,
+                "```",
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_stale_spinner_far_above_composer_does_not_fire(self, _native) -> None:
+        """A stale spinner row scrolled tens of transcript rows ABOVE the current
+        composer is not the live state. Only the bottom-of-viewport status region
+        is eligible, so the idle composer below wins (not a false PROCESSING)."""
+        lines = ["── ⠹ Working " + self._RULE]
+        lines += [f" transcript reflow line {i}" for i in range(45)]
+        lines += [self._RULE, " ", self._RULE, self._FOOTER]
+        buffer = "\n".join(lines)
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_idle_after_error_corpus_is_idle_not_error(self, _native) -> None:
+        """#703 r2 item 2b: the second real capture (idle-after-error-1.txt) has
+        several transcript ``Error:`` lines but ends in idle composer chrome — it
+        must classify IDLE (not a sticky ERROR), and COMPLETED with a dispatched
+        task + prior processing frame. Never ERROR."""
+        corpus = FIXTURES / "status_truth" / "pi_cli" / "idle-after-error-1.txt"
+        raw = corpus.read_text(encoding="utf-8")
+        # Fresh instance, no dispatch/processing yet → IDLE (not ERROR).
+        assert self._provider(dispatched=False, processing_seen=False).get_status(raw) == (
+            TerminalStatus.IDLE
+        )
+        # ANSI-stripped identical verdict.
+        clean = strip_terminal_escapes(raw)
+        assert self._provider(dispatched=False, processing_seen=False).get_status(clean) == (
+            TerminalStatus.IDLE
+        )
+        # With a dispatched task + a processing frame seen → COMPLETED, never ERROR.
+        assert self._provider(dispatched=True, processing_seen=True).get_status(raw) == (
+            TerminalStatus.COMPLETED
+        )
+
 
 # ─── F844 (#701): an error verdict must not be sticky ───────────────────────────
 
