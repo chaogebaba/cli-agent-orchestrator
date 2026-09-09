@@ -209,7 +209,11 @@ def _resolve_kiro(uuid: str, namespace: Optional[str]) -> ArtifactStatus:
     # FLAT layout fallback: sessions/cli/<uuid>.jsonl (+ <uuid>.json). Accept both
     # the bare-uuid and the sess_-prefixed forms for the filename stem.
     cli_dir = sessions / "cli"
-    for stem in (uuid, sess_id, sess_id[len("sess_"):] if sess_id.startswith("sess_") else sess_id):
+    for stem in (
+        uuid,
+        sess_id,
+        sess_id[len("sess_") :] if sess_id.startswith("sess_") else sess_id,
+    ):
         transcript = cli_dir / f"{stem}.jsonl"
         try:
             if transcript.is_file():
@@ -219,7 +223,9 @@ def _resolve_kiro(uuid: str, namespace: Optional[str]) -> ArtifactStatus:
                     )
                 return ArtifactStatus(ArtifactState.VALID, str(transcript))
         except OSError as exc:
-            return ArtifactStatus(ArtifactState.INACCESSIBLE, str(transcript), f"stat failed: {exc}")
+            return ArtifactStatus(
+                ArtifactState.INACCESSIBLE, str(transcript), f"stat failed: {exc}"
+            )
     return ArtifactStatus(ArtifactState.MISSING, detail="no v3 session dir or flat cli/ session")
 
 
