@@ -20,6 +20,7 @@ The authorization/claim/refusal semantics themselves are covered server-side
 
 from unittest.mock import patch
 
+import pytest
 import requests
 
 from cli_agent_orchestrator.mcp_server import server
@@ -198,3 +199,25 @@ def test_resume_from_reaches_body_even_with_defer_init_false(monkeypatch):
     assert body.get("resume_inherit_pins") is True
     # The caller-binding token header is sent on the resume path regardless.
     assert captured["headers"] == {"X-CAO-Terminal-Token": "tok-abcd"}
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", "   \n  "])
+def test_blank_resume_from_refused_zero_spawn_shim(monkeypatch, blank):
+    """F829 A2 (r4, codex r3 fresh adversary) — the MCP-shim half.
+
+    A present-but-blank ``resume_from`` classified by TRUTHINESS would fall
+    through the ``if resume_from:`` gate to a COLD assign (no handle, no
+    admission, no refusal). The shim now classifies by PRESENCE: a blank handle
+    is a typed ``resume_refused`` / ``resume_handle_blank`` with ZERO spawn —
+    ``_create_terminal`` is never called. The regression that restores the
+    truthiness gate lets the blank degrade to a cold create and makes
+    ``create.assert_not_called`` RED.
+    """
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    with patch.object(server, "_create_terminal") as create:
+        result = server._assign_impl("kiro_dev", "task", resume_from=blank)
+    assert result["success"] is False
+    assert result["error"] == "resume_refused"
+    assert result["reason"] == "resume_handle_blank"
+    assert result["retryable"] is False
+    create.assert_not_called()

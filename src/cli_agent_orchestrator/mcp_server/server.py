@@ -2520,6 +2520,28 @@ def _assign_impl(
             "how": "pass resume_from OR (legacy) fork_from+resume=True, not both",
             "message": "resume_refused: resume_from conflicts with fork_from/resume",
         }
+    # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
+    # truthiness. A present-but-blank handle (resume_from="" or all whitespace)
+    # is an EXPLICIT malformed resume request; the truthiness gate below would
+    # let it fall through to a COLD create (no handle, no admission, no
+    # refusal). Refuse it here with ZERO spawn — the create endpoint below is
+    # never reached. Same missing="identity"/resume_refused category the server
+    # emits (no new D3 policy branch); a wholly ABSENT field (None) stays a
+    # genuine cold create.
+    if resume_from is not None and not resume_from.strip():
+        return {
+            "success": False,
+            "terminal_id": None,
+            "error": "resume_refused",
+            "missing": "identity",
+            "reason": "resume_handle_blank",
+            "retryable": False,
+            "how": (
+                "resume_from was supplied but empty/blank; pass a non-empty "
+                "handle (terminal id or uuid) or omit it for a cold assign"
+            ),
+            "message": "resume_refused: resume_from is empty/blank",
+        }
     if resume_from:
         _resume_handle = resume_from
     elif resume and fork_from:

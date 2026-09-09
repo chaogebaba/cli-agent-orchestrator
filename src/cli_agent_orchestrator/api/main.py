@@ -4722,6 +4722,33 @@ async def create_terminal_in_session(
         _f829_claimed_key: Optional[str] = None
         _f829_resume_overrides: Dict[str, Any] = {}
 
+        # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
+        # truthiness. A present-but-blank handle ({"resume_from": ""} or all
+        # whitespace) is an EXPLICIT malformed resume request — it must be a
+        # typed refusal, never silently degrade to a cold create the way an
+        # `if _resume_handle:` truthiness gate would (empty string is falsy).
+        # This invents NO new policy branch (D3): it is the SAME
+        # missing="identity"/resume_refused category the server already emits at
+        # the resume entrance, distinguished only by the `resume_handle_blank`
+        # reason label. A field that is ABSENT (None) is a genuine cold create
+        # and is left untouched.
+        if _resume_handle is not None and not _resume_handle.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": "resume_handle_blank",
+                    "retryable": False,
+                    "how": (
+                        "resume_from was supplied but empty/blank; pass a "
+                        "non-empty handle (terminal id or uuid) or omit the "
+                        "field entirely for a cold create"
+                    ),
+                    "message": "resume_refused (missing identity): resume_handle_blank",
+                },
+            )
+
         if _resume_handle:
             # F829 A2.1: SERVER-SIDE resume admission (prepare→authorize→claim).
             # The caller is bound by its X-CAO-Terminal-Token, NOT by a
