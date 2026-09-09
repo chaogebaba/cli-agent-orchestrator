@@ -642,15 +642,23 @@ class PiCliProvider(BaseProvider):
            full-width transcript row (codex r5 EMPIRICAL-GATE-NO). The structural
            invariant that separates it: the live working row IS the composer TOP
            border, so there is only ONE composer and the working row belongs to
-           the BOTTOM-most one — there is never a COMPLETE idle composer (two or
-           more FULL-WIDTH rules AND a footer) drawn ENTIRELY BELOW the live
-           working row. The wrapped transcript row, by contrast, sits above the
-           genuine idle composer, so a complete composer follows it. Measured on
-           the archive: 0 of 424 live frames have a complete composer below their
-           last working row (422 have exactly one full rule after, one transient
-           resize frame has three rules of which the extra two are NOT full-width,
-           one has zero), so this rejects the wrap without a single false
-           negative. A candidate with a complete composer below it is disqualified.
+           the BOTTOM-most one — there is never a COMPLETE idle composer (a
+           self-consistent same-width rule PAIR AND a footer) drawn ENTIRELY BELOW
+           the live working row. The wrapped transcript row, by contrast, sits
+           above the genuine idle composer, so a complete composer follows it.
+           Measured on the archive: 0 of 424 live frames have a complete composer
+           below their last working row (422 have exactly one rule after, one
+           transient resize frame has three rules whose two extra rows are a
+           narrow artifact pair bracketing the real rule — a resize double-draw,
+           not a composer box — one has zero), so this rejects the wrap without a
+           single false negative. A candidate with a complete composer below it is
+           disqualified.
+
+           F847 r8 (#703): the "complete idle composer below" test is a
+           self-consistent same-width rule pair + footer, NOT two rules matching
+           the GLOBAL maximum editor-rule width. A stale wider rule left in the
+           accumulated buffer used to poison that maximum and hide the current
+           composer's own (narrower) rule pair; see ``_has_complete_composer_below``.
         """
         lines = clean.splitlines()
         # 1) drop fenced rows (quoted spinner is not live)
@@ -692,15 +700,48 @@ class PiCliProvider(BaseProvider):
 
         # 6) composer-structure check: a candidate is the live TOP BORDER only if
         # it is NOT sitting above a COMPLETE idle composer (a wrapped full-width
-        # transcript row does). "Complete idle composer below" = two or more
-        # FULL-WIDTH rules AND a footer, all strictly after the candidate.
+        # transcript row does). "Complete idle composer below" = a SELF-CONSISTENT
+        # composer box (a pair of editor rules of EQUAL width to EACH OTHER, with
+        # a footer) drawn strictly after the candidate.
+        #
+        # F847 r8 (#703) — codex r7 EMPIRICAL-GATE-NO. The r6/r7 test counted the
+        # below rules against ``composer_width``, the MAXIMUM editor-rule width in
+        # the WHOLE unfenced rolling buffer. Pi's documented input is an
+        # accumulated raw pipe-pane buffer whose escape cleanup turns redraws into
+        # separate logical rows, so a STALE wider rule from an OLD frame can
+        # coexist above the current composer. Such a stale 120-column rule fixes
+        # ``composer_width`` at 120; the current idle composer's own two 100-column
+        # rules then no longer equal ``composer_width`` and are NOT counted, so a
+        # 120-column wrapped-transcript candidate above a COMPLETE 100-column idle
+        # composer read PROCESSING (ADV-stale-wider-rule). Deleting only the stale
+        # rule flipped it to COMPLETED.
+        #
+        # The fix DECOUPLES this check from the poisoned global width: a complete
+        # composer below is a pair of editor rules of EQUAL width to EACH OTHER
+        # (whatever that width is) plus a footer. The pair is required to be CLEAN
+        # — no editor rule WIDER than the pair sandwiched between its two members —
+        # which distinguishes a genuine composer box (its two rules bracket the
+        # editor body; nothing wider sits between them) from a transient RESIZE
+        # double-draw, where a wider rule is redrawn BETWEEN two narrow artifact
+        # rows (the committed ``working-resize-3rule`` frame: two 20-column
+        # artifacts bracketing the real 100-column rule — NOT a composer, so the
+        # live working row there stays PROCESSING). This keeps the r6 full-width
+        # candidate qualifier (``_visible_width(row) == composer_width`` above)
+        # intact for the resize fixtures while no longer letting an unrelated
+        # historical maximum hide the current composer.
+        def _clean_same_width_rule_pair_below(idx: int) -> bool:
+            rule_widths = [_visible_width(r) for r in unfenced[idx + 1 :] if _EDITOR_RULE.match(r)]
+            for i in range(len(rule_widths)):
+                for j in range(i + 1, len(rule_widths)):
+                    if rule_widths[i] == rule_widths[j] and all(
+                        rule_widths[k] <= rule_widths[i] for k in range(i + 1, j)
+                    ):
+                        return True
+            return False
+
         def _has_complete_composer_below(idx: int) -> bool:
-            below = unfenced[idx + 1 :]
-            full_rules = sum(
-                1 for r in below if _EDITOR_RULE.match(r) and _visible_width(r) == composer_width
-            )
-            has_footer = any(_FOOTER_CONTEXT.search(r) for r in below)
-            return full_rules >= 2 and has_footer
+            has_footer = any(_FOOTER_CONTEXT.search(r) for r in unfenced[idx + 1 :])
+            return _clean_same_width_rule_pair_below(idx) and has_footer
 
         return any(not _has_complete_composer_below(idx) for idx in candidates)
 

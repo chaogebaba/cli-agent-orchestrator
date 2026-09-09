@@ -863,6 +863,71 @@ class TestFalseIdleWorkingSpinner:
         )
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_stale_wider_rule_above_complete_composer_is_completed(self, _native) -> None:
+        """ADV-stale-wider-rule (codex r7 EMPIRICAL-GATE-NO): a STALE wider editor
+        rule left in the accumulated rolling buffer must NOT hide a COMPLETE idle
+        composer below the candidate.
+
+        Construction (the r8 verdict's exact adversary):
+          1. a stale 120-column editor rule (an OLD frame's composer top border
+             still in scrollback — pi's escape cleanup turns redraws into separate
+             logical rows, so old-width rules coexist with the current composer);
+          2. a 120-column ``_WORKING_ROW``-matching first physical row of a WRAPPED
+             quoted transcript line, followed by its one-column continuation;
+          3. a COMPLETE current idle composer strictly below it: two 100-column
+             rules, editor content, and a valid footer.
+
+        Under the r7 rule (``full_rules >= 2`` where ``full_rules`` counts rules
+        equal to ``composer_width`` = the GLOBAL MAXIMUM editor-rule width) the
+        stale rule fixed ``composer_width`` at 120, the current composer's two
+        100-column rules did not equal 120 and were NOT counted, the wrap
+        candidate had "no complete composer below", and the frame read PROCESSING
+        (a FALSE busy on an idle, delivery-eligible pane). The r8 rule tests for a
+        self-consistent same-width rule PAIR + footer below the candidate,
+        decoupled from the poisoned global width, so the 100-column pair is seen
+        and the wrap is disqualified → COMPLETED.
+
+        This test is RED on the r7 source and GREEN on r8 (see mutant (a) in the
+        report: reverting ``_has_complete_composer_below`` to the global-max
+        ``full_rules`` count restores PROCESSING here). The CONTROL removes only
+        the stale wider rule; it is COMPLETED on BOTH r7 and r8 (deleting the
+        stale rule alone already flips the r7 reading), so the pair isolates the
+        stale rule as the sole cause.
+        """
+        provider = self._provider(dispatched=True, processing_seen=True)
+        stale_wider = "─" * 120  # (1) an OLD frame's 120-col rule still in buffer
+        # (2) the wrapped quoted-transcript working row: EXACTLY 120 cols, ending
+        # on a box rule (its first physical row), then the 1-col wrap continuation.
+        lead = "── ⠦ Working ── quoted spinner in transcript "
+        wrap_row = lead + "─" * (120 - _visible_width(lead))
+        assert _visible_width(wrap_row) == 120, "wrap candidate build error"
+        rule_100 = "─" * 100  # (3) the CURRENT composer's own rules (narrower)
+        adversary = "\n".join(
+            [
+                " prior transcript output line one",
+                " prior transcript output line two",
+                stale_wider,  # (1) stale WIDER rule above everything
+                " more transcript between the stale rule and the wrap",
+                wrap_row,  # (2) 120-col wrapped-transcript first physical row
+                "─",  # the 1-column wrap continuation
+                "",
+                rule_100,  # ┐ (3) the COMPLETE current idle composer, BELOW the wrap
+                " editor content",
+                rule_100,  # ┘ two 100-col rules (same width to each other) + footer
+                self._FOOTER,
+            ]
+        )
+        # CONTROL: identical frame with ONLY the stale wider rule removed.
+        control = "\n".join(r for r in adversary.splitlines() if r != stale_wider)
+        assert provider.get_status(adversary) == TerminalStatus.COMPLETED, (
+            "a stale wider rule above the wrap must NOT hide the complete "
+            "100-col idle composer below it (ADV-stale-wider-rule, r7 read PROCESSING)"
+        )
+        assert (
+            provider.get_status(control) == TerminalStatus.COMPLETED
+        ), "control with the stale wider rule removed must be COMPLETED"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_archive_live_frames_all_processing(self, _native) -> None:
         """OPTIONAL, non-load-bearing arm: the full inherited live pi 0.85.1
         capture archive (the frames the r3-r6 gates were measured on) classifies
