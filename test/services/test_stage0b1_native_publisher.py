@@ -4,11 +4,12 @@ import threading
 import time
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from typing import Any, AsyncIterator, cast
 from unittest.mock import MagicMock
 
 import pytest
 
-from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
+from cli_agent_orchestrator.adapters.herdr.client import HerdrClient, HerdrTransportError
 from cli_agent_orchestrator.backends.herdr_backend import NativeFetch, map_native_status
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
@@ -118,10 +119,10 @@ class _OneEventClient:
     ``HerdrClient.events()`` and no longer owns a ``StreamReader``.
     """
 
-    def __init__(self, events):
+    def __init__(self, events: list[dict[str, Any]]) -> None:
         self._events = list(events)
 
-    async def events(self):
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
         for event in self._events:
             yield event
         raise HerdrTransportError("herdr socket closed")
@@ -154,7 +155,7 @@ async def test_real_wire_spellings_publish(wire_name, data):
         "event": wire_name,
         "data": data,
     }
-    service._client = _OneEventClient([event])
+    service._client = cast(HerdrClient, _OneEventClient([event]))
     with pytest.raises(HerdrTransportError):
         await service._event_loop()
     assert len(published) == 1

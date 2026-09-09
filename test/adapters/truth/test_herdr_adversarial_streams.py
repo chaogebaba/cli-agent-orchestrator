@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
@@ -55,7 +56,7 @@ def pane(
     status: str,
     *,
     terminal_id: str = OLD_TID,
-    session: dict[str, object] | None = STABLE_SESSION,
+    session: Mapping[str, object] | None = STABLE_SESSION,
 ) -> dict[str, object]:
     rec: dict[str, object] = {
         "pane_id": "w2:p1",
