@@ -267,21 +267,32 @@ def drain_class_declines_inbox(kind: str, subtype: Optional[str]) -> bool:
     F807 (#664) extends the class by ONE subtype: a CONTEXT_EXHAUSTED
     ``low_context_tip`` is the soft "Running low on context? Type /compact" tip
     (Confidence.MEDIUM), decision-free liveness noise of the same character as a
-    BUSY ping — declined here so it never reaches the seat. HARD exhaustion
-    (``footer_percent_status``, a footer at/below the threshold) is a real stop
-    and KEEPS its inbox leg (kind CONTEXT_EXHAUSTED stays ``inbox=True`` in the
-    map); only the tip subtype declines.
+    BUSY ping — declined here so it never reaches the seat.
+
+    F836 r6 (#693) extends the class by ONE more subtype: a CONTEXT_EXHAUSTED
+    ``footer_percent_status`` (the pie-glyph/percent status-bar reading). The
+    classifier's ONLY input is plaintext pane bytes (base.py:348-376,
+    fleet_app.py:577-592, condition.py:952), so a pasted/truncated full snapshot
+    that ends at the viewport bottom is indistinguishable from live chrome (codex
+    EMPIRICAL-GATE-NO r5). It therefore caps at MEDIUM (never HIGH) at the
+    producer AND is declined here: it is an ADVISORY surfaced on fleet/TUI/CLI
+    but NEVER pushed to the seat, so a plaintext-only footer match can never
+    trigger a hard stop. This is the SAME advisory posture as ``low_context_tip``.
 
     ANOMALY-class conditions (DIALOG_BLOCKED, CAPPED, AUTH_EXPIRED, an unknown
-    kind, a non-``command_exit_code`` PROC_EXITED, a hard CONTEXT_EXHAUSTED
-    footer, …) return False and keep the inbox leg — F790/F807 do not touch
-    their behaviour.
+    kind, a non-``command_exit_code`` PROC_EXITED, …) return False and keep the
+    inbox leg — F790/F807/F836 do not touch their behaviour.
     """
     if kind == "BUSY":
         return True
     if kind == "PROC_EXITED" and subtype == "command_exit_code":
         return True
     if kind == "CONTEXT_EXHAUSTED" and subtype == "low_context_tip":
+        return True
+    if kind == "CONTEXT_EXHAUSTED" and subtype == "footer_percent_status":
+        # F836 r6 (#693): plaintext-only footer reading — advisory, never a hard
+        # stop. Surfaces on fleet/TUI/CLI (MEDIUM passes should_deliver) but the
+        # inbox/acting leg is declined so it never wakes the seat.
         return True
     return False
 

@@ -13,9 +13,12 @@ F807 wires it:
   seat inbox, with or without a durable log store;
 * (b) the ANOMALY-class deaths (CAPPED / DIALOG_BLOCKED / a real PROC_EXITED)
   still enqueue exactly one inbox push, unchanged;
-* (c) a CONTEXT_EXHAUSTED ``low_context_tip`` (the soft "/compact" tip) is
-  declined — no inbox row — while HARD exhaustion (``footer_percent_status``)
-  keeps its inbox leg;
+* (c) a CONTEXT_EXHAUSTED ``low_context_tip`` (the soft "/compact" tip) AND a
+  CONTEXT_EXHAUSTED ``footer_percent_status`` (the plaintext-only status-bar
+  reading, made ADVISORY by F836 r6 #693 because a pasted/truncated full snapshot
+  is indistinguishable from live chrome) are BOTH declined — no inbox row — while
+  the CONTEXT_EXHAUSTED kind map stays ``inbox=True`` so the decline is a
+  subtype-scoped predicate, not a map-row flip;
 * (d) the PRODUCTION construction (``StatusMonitor._get_condition_delivery``)
   wires a real ``DbConditionLogStore``.
 """
@@ -174,7 +177,13 @@ def test_c_low_context_tip_declined(db_env):
     ) in rows
 
 
-def test_c_hard_exhaustion_still_enqueues(db_env):
+def test_c_footer_percent_status_declines_inbox(db_env):
+    """F836 r6 (#693): footer_percent_status is now ADVISORY — the classifier's
+    only input is plaintext pane bytes, so a pasted/truncated full snapshot is
+    indistinguishable from live chrome (codex EMPIRICAL-GATE-NO). It caps at
+    MEDIUM at the producer AND declines the inbox (acting) leg here, exactly like
+    low_context_tip: it surfaces on fleet/bus but never wakes the seat, so a
+    plaintext-only footer match can never trigger a hard stop."""
     inbox = []
     d = ConditionDelivery(
         inbox_sink=lambda t, c: inbox.append(c.subtype),
@@ -183,27 +192,34 @@ def test_c_hard_exhaustion_still_enqueues(db_env):
     res = d.deliver(
         "wrk", _cond(ConditionKind.CONTEXT_EXHAUSTED, subtype="footer_percent_status"), epoch=1
     )
-    assert res.inbox_pushes == 1
-    assert inbox == ["footer_percent_status"]  # hard stop still reaches the seat
+    assert res.inbox_pushes == 0
+    assert inbox == []  # advisory: never reaches the seat
 
 
 def test_c_predicate_distinguishes_subtypes():
-    """The drain-class predicate declines ONLY the low_context_tip subtype; hard
-    exhaustion returns False and keeps its inbox leg. Pins the subtype split."""
+    """F836 r6 (#693): the drain-class predicate now declines BOTH the
+    low_context_tip AND the footer_percent_status subtypes of CONTEXT_EXHAUSTED —
+    both are plaintext-only advisories, never hard stops. Any OTHER
+    CONTEXT_EXHAUSTED subtype keeps its inbox leg. Pins the subtype split."""
     assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "low_context_tip") is True
-    assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "footer_percent_status") is False
-    # the kind-keyed map is UNCHANGED — hard exhaustion must stay inbox=True
+    assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "footer_percent_status") is True
+    # a hypothetical hard subtype (none plaintext-only) keeps its inbox leg
+    assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "some_future_hard_signal") is False
+    # the kind-keyed map is UNCHANGED — the decline is a SUBTYPE predicate, not a
+    # map-row flip, so a genuinely-independent-signal subtype could still enqueue.
     assert surfaces_for_kind("CONTEXT_EXHAUSTED").inbox is True
 
 
-def test_c_mutant_flip_kind_map_would_break_hard_exhaustion():
+def test_c_mutant_flip_kind_map_would_break_context_exhausted():
     """MUTANT: flipping the CONTEXT_EXHAUSTED *map row* to inbox=False (instead of
-    the subtype predicate) would silence HARD exhaustion too. This asserts the
-    kind map stays inbox=True so the fix cannot be a map-row flip."""
+    the subtype predicate) would silence ANY future non-plaintext hard exhaustion
+    at the kind level. This asserts the kind map stays inbox=True so the r6 fix is
+    a SUBTYPE-scoped decline, not a map-row flip."""
     real = surfaces_for_kind("CONTEXT_EXHAUSTED")
     assert real.inbox is True  # mutant map-row flip would make this False
-    # yet the tip is still declined via the subtype predicate, not the map
+    # yet the plaintext-only advisories are declined via the subtype predicate
     assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "low_context_tip") is True
+    assert drain_class_declines_inbox("CONTEXT_EXHAUSTED", "footer_percent_status") is True
 
 
 # ══ (d) the production construction wires a real DbConditionLogStore ═════════

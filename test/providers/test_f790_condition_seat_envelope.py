@@ -153,7 +153,10 @@ def test_r1b1_map_declined_kinds_never_enqueue(db_env, kind):
         (ConditionKind.DIALOG_BLOCKED, "trust_dir_dialog"),
         (ConditionKind.CAPPED, "usage_limit_hard"),
         (ConditionKind.AUTH_EXPIRED, "token_refresh_failed"),
-        (ConditionKind.CONTEXT_EXHAUSTED, "footer_percent_status"),
+        # F836 r6 (#693): CONTEXT_EXHAUSTED/footer_percent_status is NO LONGER
+        # anomaly-class — it is a plaintext-only ADVISORY declined at the inbox
+        # leg (see test_f807_upstream_decline_wired). It is deliberately absent
+        # from this ENQUEUING set.
         (ConditionKind.PROC_EXITED, "shell_baseline_return"),
     ],
 )
