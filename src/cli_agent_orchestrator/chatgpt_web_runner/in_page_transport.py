@@ -21,6 +21,7 @@ Measured seams reimplemented from the bun spike (cited per the blueprint's
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -31,12 +32,22 @@ from cli_agent_orchestrator.chatgpt_web_runner.errors import (
     RunnerErrorCode,
 )
 
+logger = logging.getLogger(__name__)
+
 # --- DOM locators (humanize-safe CSS / testid), findings §7 --------------------
 SEL_COMPOSER = "div.ProseMirror[contenteditable='true']"
 SEL_USER_TURN = "div[data-message-author-role='user']"
 SEL_ASSISTANT_TURN = "div[data-message-author-role='assistant']"
 SEL_FILE_INPUT = "input#upload-files"
 SEL_PLUS_BTN = "#composer-plus-btn"
+
+
+@dataclass(frozen=True)
+class SubmitOutcome:
+    """The classified result of the submit-confirm window (D7)."""
+
+    delivery_state: DeliveryState
+    conversation_id: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -185,3 +196,102 @@ class Transport:
         script = build_conversation_fetch_script(conversation_id)
         result = await self.page.evaluate(script)
         return result if isinstance(result, dict) else {"httpStatus": 0, "ok": False, "body": None}
+
+    async def submit_and_confirm(self, timeout_s: float = 30.0) -> "SubmitOutcome":
+        """Press Enter, then run the four-way submit-confirm window (D7).
+
+        Returns the classified DeliveryState and the resolved conversation id
+        (from the URL or the observed SSE). Never resends.
+        """
+        import time as _time
+
+        from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import (
+            SubmitObservation,
+            classify_delivery,
+            extract_conversation_id,
+        )
+
+        users_before = await self.page.locator(SEL_USER_TURN).count()
+        await self.page.locator(SEL_COMPOSER).first.press("Enter")
+        deadline = _time.monotonic() + timeout_s
+        conv_id: Optional[str] = self.owned_conversation_id
+        delivered = False
+        while _time.monotonic() < deadline and not delivered:
+            await self.page.wait_for_timeout(500)
+            url = self.page.url
+            found = extract_conversation_id(url)
+            if found:
+                conv_id = found
+            users_now = await self.page.locator(SEL_USER_TURN).count()
+            if users_now > users_before or self.saw_send or conv_id:
+                delivered = True
+        composer_text = (await self.page.locator(SEL_COMPOSER).first.inner_text()).strip()
+        logger.debug(
+            "chatgpt_web submit-confirm delivered=%s conv=%s saw_send=%s cleared=%s",
+            delivered,
+            bool(conv_id),
+            self.saw_send,
+            composer_text == "",
+        )
+        obs = SubmitObservation(
+            enter_dispatched=True,
+            new_user_turn=delivered and conv_id is not None,
+            send_response_seen=self.saw_send,
+            conversation_id=conv_id,
+            composer_cleared=(composer_text == ""),
+            deadline_exhausted=not delivered,
+        )
+        state = classify_delivery(obs)
+        self.owned_conversation_id = conv_id
+        return SubmitOutcome(delivery_state=state, conversation_id=conv_id)
+
+    async def poll_to_gate(
+        self,
+        conversation_id: str,
+        submitted_user_msg_id: str,
+        run_id: str,
+        bundle_sha: str,
+        *,
+        timeout_s: float = 900.0,
+    ) -> Any:
+        """Poll the conversation GET to the binary done-gate (D6).
+
+        Reads no faster than one per 3 seconds (AC-11b). Returns an
+        AcceptedAnswer or raises a typed RunnerError; on deadline with a partial
+        it raises truncated_answer carrying a dom/get partial source.
+        """
+        import time as _time
+
+        from cli_agent_orchestrator.chatgpt_web_runner.poll_gate import (
+            AcceptedAnswer,
+            GatePending,
+            evaluate_gate,
+        )
+
+        deadline = _time.monotonic() + timeout_s
+        last_partial: Optional[str] = None
+        while _time.monotonic() < deadline:
+            probe = await self.read_conversation(conversation_id)
+            body = probe.get("body")
+            if probe.get("ok") and isinstance(body, dict):
+                result = evaluate_gate(
+                    body,
+                    submitted_user_msg_id=submitted_user_msg_id,
+                    run_id=run_id,
+                    bundle_sha=bundle_sha,
+                )
+                if isinstance(result, AcceptedAnswer):
+                    return result
+                if isinstance(result, GatePending) and result.partial_text:
+                    last_partial = result.partial_text
+            await self.page.wait_for_timeout(3000)  # >= 1 read / 3s (AC-11b)
+        err = RunnerError(
+            RunnerErrorCode.TRUNCATED_ANSWER,
+            "poll deadline exhausted before the gate closed",
+            delivery_state=DeliveryState.DELIVERED,
+        )
+        if last_partial:
+            from cli_agent_orchestrator.chatgpt_web_runner.output import PartialSource
+
+            err.partial_source = PartialSource.CONVERSATION_GET  # type: ignore[attr-defined]
+        raise err

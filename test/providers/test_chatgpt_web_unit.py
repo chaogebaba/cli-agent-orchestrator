@@ -357,6 +357,12 @@ def test_conversation_id_regex() -> None:
         extract_conversation_id("https://chatgpt.com/c/11111111-2222-3333-4444-555555555555")
         == "11111111-2222-3333-4444-555555555555"
     )
+    # F862 live-spike finding: this account prefixes the id with "WEB:" and the
+    # GET path uses the id VERBATIM, so the whole prefixed token is captured.
+    assert (
+        extract_conversation_id("https://chatgpt.com/c/WEB:57998290-2fb2-4223-85bf-948330bc94ab")
+        == "WEB:57998290-2fb2-4223-85bf-948330bc94ab"
+    )
     assert extract_conversation_id("https://chatgpt.com/") is None
     assert len(new_run_id()) == 32
 
@@ -437,6 +443,18 @@ def test_ac11b_owned_conversation_and_auth_session_allowed() -> None:
         f"https://chatgpt.com/backend-api/conversation/{owned}", owned
     )
     assert is_same_origin_read_allowed("https://chatgpt.com/api/auth/session", owned)
+
+
+def test_ac11b_web_prefixed_owned_conversation_allowed() -> None:
+    # F862 live-spike: the account's conversation id is WEB:<uuid>; the read
+    # exception must accept the exact owned id (used verbatim in the GET path).
+    owned = "WEB:57998290-2fb2-4223-85bf-948330bc94ab"
+    assert is_same_origin_read_allowed(
+        f"https://chatgpt.com/backend-api/conversation/{owned}", owned
+    )
+    # A DIFFERENT WEB-prefixed id is still refused.
+    other = "https://chatgpt.com/backend-api/conversation/WEB:00000000-0000-0000-0000-000000000000"
+    assert is_same_origin_read_allowed(other, owned) is False
 
 
 def test_ac11b_off_origin_refused() -> None:

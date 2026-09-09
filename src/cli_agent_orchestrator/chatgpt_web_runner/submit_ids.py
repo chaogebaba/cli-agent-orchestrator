@@ -16,9 +16,13 @@ from typing import Optional
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import DeliveryState
 
-#: A chatgpt.com conversation URL carries ``/c/<uuid>`` (ask.ts:50).
+#: A chatgpt.com conversation URL carries ``/c/<id>`` (ask.ts:50). On the Plus
+#: account the id observed live in the F862 spike is ``WEB:<uuid>`` (an optional
+#: uppercase source-prefix before the uuid), and the conversation GET path uses
+#: that id VERBATIM — so the capture keeps the whole ``[A-Za-z]+:``-prefixed
+#: token, not just the bare uuid. A plain ``<uuid>`` (no prefix) still matches.
 CONVERSATION_ID_RE = re.compile(
-    r"/c/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"/c/((?:[A-Za-z]+:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
 
 #: The frontend send endpoint (findings §2). The ``/prepare`` pre-warm is
