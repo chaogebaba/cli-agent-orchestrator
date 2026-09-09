@@ -24,7 +24,6 @@ from cli_agent_orchestrator.adapters.truth import herdr_runtime
 from cli_agent_orchestrator.adapters.truth.herdr_runtime import HerdrRuntimeSource
 from cli_agent_orchestrator.core.events import EventDraft, EventKind
 
-
 OLD_TID = "term_before_restart"
 NEW_TID = "term_after_restart"
 STABLE_SESSION = {
@@ -32,6 +31,14 @@ STABLE_SESSION = {
     "kind": "path",
     "source": "herdr:pi",
     "value": "/sessions/stable-agent-session.jsonl",
+}
+#: A SECOND stable session differing only in ``value`` — an impostor agent that
+#: reuses the same herdr ``terminal_id`` after a restart (S-1 / mutant M2).
+S_B = {
+    "agent": "pi",
+    "kind": "path",
+    "source": "herdr:pi",
+    "value": "/sessions/impostor-agent-session.jsonl",
 }
 
 
@@ -44,16 +51,23 @@ def rows(monkeypatch: pytest.MonkeyPatch) -> list[EventDraft]:
     return emitted
 
 
-def pane(status: str, *, terminal_id: str = OLD_TID) -> dict[str, object]:
-    return {
+def pane(
+    status: str,
+    *,
+    terminal_id: str = OLD_TID,
+    session: dict[str, object] | None = STABLE_SESSION,
+) -> dict[str, object]:
+    rec: dict[str, object] = {
         "pane_id": "w2:p1",
         "terminal_id": terminal_id,
         "agent": "pi",
-        "agent_session": dict(STABLE_SESSION),
         "agent_status": status,
         "screen_detection_skipped": True,
         "state_change_seq": 10,
     }
+    if session is not None:
+        rec["agent_session"] = dict(session)
+    return rec
 
 
 def kinds(rows: list[EventDraft]) -> list[str]:
@@ -103,3 +117,16 @@ def test_blocked_burst_emits_nothing(rows: list[EventDraft]) -> None:
     for _ in range(5):
         push(source, pane("blocked"))
     assert rows == []
+
+
+def test_adj_s1_different_session_same_terminal_id_is_rejected(rows: list[EventDraft]) -> None:
+    """S-1 (Opus r2, kills mutant M2): a NEW agent (different stable session)
+    reusing the same herdr terminal_id must NOT be accepted as this source's
+    terminal — the bound branch must check the stable session, never the
+    ephemeral terminal_id, first.  Verbatim from the reviewer probe
+    /data/cao-scratch/herdr-adj-r2/probes/test_adj_r2_streams.py."""
+    src = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    push(src, pane("working"))
+    assert kinds(rows) == [EventKind.TURN_STARTED.value]
+    push(src, pane("idle", session=S_B))  # same terminal_id, different session
+    assert kinds(rows) == [EventKind.TURN_STARTED.value], "impostor session leaked a boundary"

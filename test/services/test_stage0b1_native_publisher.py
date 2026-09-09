@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 from cli_agent_orchestrator.backends.herdr_backend import NativeFetch, map_native_status
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
@@ -109,6 +110,23 @@ def test_pure_native_wire_mapping(wire, expected):
     assert map_native_status(wire) == expected
 
 
+class _OneEventClient:
+    """Minimal HerdrClient double: yields scripted parsed events, then closes.
+
+    WP-HERDR H1 B3 moved the socket read and JSON framing into
+    ``adapters/herdr/client.py``; ``HerdrInboxService._event_loop`` now consumes
+    ``HerdrClient.events()`` and no longer owns a ``StreamReader``.
+    """
+
+    def __init__(self, events):
+        self._events = list(events)
+
+    async def events(self):
+        for event in self._events:
+            yield event
+        raise HerdrTransportError("herdr socket closed")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("wire_name", "data"),
@@ -136,10 +154,8 @@ async def test_real_wire_spellings_publish(wire_name, data):
         "event": wire_name,
         "data": data,
     }
-    service._reader = asyncio.StreamReader()
-    service._reader.feed_data((json.dumps(event) + "\n").encode())
-    service._reader.feed_eof()
-    with pytest.raises(ConnectionError):
+    service._client = _OneEventClient([event])
+    with pytest.raises(HerdrTransportError):
         await service._event_loop()
     assert len(published) == 1
     assert published[0].agent_status == "blocked"

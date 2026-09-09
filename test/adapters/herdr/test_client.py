@@ -237,9 +237,7 @@ async def test_request_buffers_a_pushed_event_and_matches_by_id(socket_path: str
         assert result == {"ok": True}
         # The racing event was held, not dropped: it is the first thing the
         # event stream yields.
-        assert list(client._event_buffer) == [
-            {"event": "pane_updated", "data": {"pane": {"n": 1}}}
-        ]
+        assert list(client._event_buffer) == [{"event": "pane_updated", "data": {"pane": {"n": 1}}}]
         await client.close()
 
 
@@ -482,10 +480,7 @@ async def test_snapshot_without_a_snapshot_body_raises(socket_path: str) -> None
 
 
 async def test_default_socket_path_named_session() -> None:
-    assert (
-        default_socket_path("cao", config_home="/c")
-        == "/c/herdr/sessions/cao/herdr.sock"
-    )
+    assert default_socket_path("cao", config_home="/c") == "/c/herdr/sessions/cao/herdr.sock"
 
 
 async def test_default_socket_path_default_session_is_flat() -> None:
@@ -501,3 +496,162 @@ async def test_default_socket_path_matches_legacy_backend(monkeypatch: pytest.Mo
         else:
             legacy = f"/xdg/herdr/sessions/{session}/herdr.sock"
         assert default_socket_path(session) == legacy
+
+
+async def test_adj_r4_event_pushed_BEFORE_the_subscribe_ack_is_buffered(
+    socket_path: str,
+) -> None:
+    """S-2 (Opus r2, kills mutant M8): subscribe()'s own buffer branch — an event
+    that arrives AHEAD of the subscription ack must be held for events(), not
+    dropped.  The shipped race test and both r2 races push the racing event AFTER
+    the ack, so only request()'s buffer was covered; this covers subscribe()'s.
+    Verbatim from the reviewer probe
+    /data/cao-scratch/herdr-adj-r2/probes/test_adj_r2_race.py."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        method = request.get("method")
+        rid = request["id"]
+        if method == "api.schema":
+            await server.reply(
+                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
+            )
+        elif method == "events.subscribe":
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+            await server.reply(rid, {"type": "subscription_started"})
+        elif method == "api.snapshot":
+            await server.reply(rid, {"snapshot": {"panes": []}})
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_connection()
+        else:
+            await server.reply(rid, {})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        seen: list[int] = []
+        with pytest.raises(HerdrTransportError):
+            async for event in client.events():
+                seen.append(int(event["data"]["pane"]["seq"]))
+        assert seen == [1, 2]
+        await client.close()
+
+
+async def test_adj_r1_event_arrives_during_the_snapshot_response_itself(
+    socket_path: str,
+) -> None:
+    """Ordering race (Opus r2, contributes to killing mutant M6): the racing
+    events are pushed BEFORE the snapshot reply (inside the snapshot round trip),
+    the tighter half of the §6 window; they must replay in ARRIVAL order ahead of
+    the live event.  Verbatim from the reviewer probe test_adj_r2_race.py."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        method = request.get("method")
+        rid = request["id"]
+        if method == "api.schema":
+            await server.reply(
+                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
+            )
+        elif method == "events.subscribe":
+            await server.reply(rid, {"type": "subscription_started"})
+        elif method == "api.snapshot":
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.reply(rid, {"snapshot": {"panes": []}})
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
+            await server.close_connection()
+        else:
+            await server.reply(rid, {})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        seen: list[int] = []
+        with pytest.raises(HerdrTransportError):
+            async for event in client.events():
+                seen.append(int(event["data"]["pane"]["seq"]))
+        assert seen == [1, 2, 3]
+        await client.close()
+
+
+async def test_adj_r2_burst_of_fifty_interleaved_events_no_drop_dup_or_reorder(
+    socket_path: str,
+) -> None:
+    """50 events straddling the handshake window: exactly once, in order — the
+    shipped test that KILLS mutant M6 (LIFO replay), because it buffers many
+    events whose order a reorder would break.  Verbatim from the reviewer probe
+    test_adj_r2_race.py."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        method = request.get("method")
+        rid = request["id"]
+        if method == "api.schema":
+            await server.reply(
+                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
+            )
+        elif method == "events.subscribe":
+            await server.reply(rid, {"type": "subscription_started"})
+            for i in range(1, 21):  # 20 between ack and snapshot request
+                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+        elif method == "api.snapshot":
+            for i in range(21, 41):  # 20 more inside the snapshot round trip
+                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+            await server.reply(rid, {"snapshot": {"panes": []}})
+            for i in range(41, 51):  # 10 live, after the snapshot
+                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+            await server.close_connection()
+        else:
+            await server.reply(rid, {})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        seen: list[int] = []
+        with pytest.raises(HerdrTransportError):
+            async for event in client.events():
+                seen.append(int(event["data"]["pane"]["seq"]))
+        assert len(seen) == 50, f"drop/dup: {len(seen)}"
+        assert len(set(seen)) == 50, "duplicates"
+        assert seen == sorted(seen), f"reorder: {seen}"
+        assert seen == list(range(1, 51))
+        await client.close()
+
+
+async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
+    socket_path: str,
+) -> None:
+    """The buffer must not survive a close() (no cross-connection replay).
+    Verbatim from the reviewer probe test_adj_r2_race.py."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        method = request.get("method")
+        rid = request["id"]
+        if method == "api.schema":
+            await server.reply(
+                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
+            )
+        elif method == "events.subscribe":
+            await server.reply(rid, {"type": "subscription_started"})
+            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+        elif method == "api.snapshot":
+            await server.reply(rid, {"snapshot": {"panes": []}})
+        else:
+            await server.reply(rid, {})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        assert len(client._event_buffer) == 1
+        await client.close()
+        assert len(client._event_buffer) == 0
