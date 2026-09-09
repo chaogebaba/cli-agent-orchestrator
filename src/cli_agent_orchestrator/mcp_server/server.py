@@ -866,12 +866,20 @@ def _create_terminal(
                 json_body["barrier_member_key"] = barrier_member_key
             if authority_files is not None:
                 json_body["authority_files"] = authority_files
-            # F829 A2.1: a SEMANTIC RESUME forwards the raw handle + overrides;
-            # the SERVER runs prepare→authorize→claim→create. The shim does NO
-            # client-side resolution/authorization anymore.
-            if resume_from is not None:
-                json_body["resume_from"] = resume_from
-                json_body["resume_inherit_pins"] = resume_inherit_pins
+
+        # F829 A2.1 (r3, verdict SHOULD-2): a SEMANTIC RESUME forwards the raw
+        # handle + overrides so the SERVER runs prepare→authorize→claim→create.
+        # This MUST land in the body REGARDLESS of ``defer_init`` — otherwise a
+        # ``defer_init=False`` resume carried no ``resume_from`` and degraded
+        # SILENTLY into a cold create (no handle, no admission, no refusal). The
+        # blueprint A2.1 forwards the handle unconditionally (it is not gated on
+        # any unrelated flag), and D3 forbids inventing a new refusal token, so
+        # we carry it rather than refuse a defer_init=False resume. The shim does
+        # NO client-side resolution/authorization.
+        if resume_from is not None:
+            json_body = json_body or {}
+            json_body["resume_from"] = resume_from
+            json_body["resume_inherit_pins"] = resume_inherit_pins
 
         # F829 A2.1: bind the caller by its own terminal token so the server can
         # verify caller_id (verify_sender_token). Sent on the resume path; on the

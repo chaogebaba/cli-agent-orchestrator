@@ -131,3 +131,70 @@ def test_server_resume_refused_relayed_verbatim(monkeypatch):
     assert result["error"] == "resume_refused"
     assert result["reason"] == "caller_unverified"
     assert result["retryable"] is False
+
+
+def test_resume_from_reaches_body_even_with_defer_init_false(monkeypatch):
+    """F829 A2.1 (r3, verdict SHOULD-2): the defer_init trap.
+
+    Before the fix, ``_create_terminal`` added ``resume_from`` to the request
+    body ONLY inside ``if defer_init:``. A ``defer_init=False`` resume therefore
+    POSTed a body with NO ``resume_from`` — the server never entered admission
+    and the resume degraded SILENTLY into a cold create. This test drives
+    ``_create_terminal`` with ``defer_init=False`` and asserts the POSTed body
+    carries ``resume_from`` (and the token header is sent). It FAILS on the
+    pre-fix code path.
+    """
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    monkeypatch.setenv("CAO_TERMINAL_TOKEN", "tok-abcd")
+
+    captured = {}
+
+    class _Resp:
+        status_code = 201
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(path, **kw):
+        # Supervisor terminal metadata lookup inside _create_terminal.
+        return _Resp(
+            {
+                "provider": "kiro_cli",
+                "session_name": "cao-session",
+                "allowed_tools": None,
+            }
+        )
+
+    def _fake_post(path, **kw):
+        captured["path"] = path
+        captured["json"] = kw.get("json")
+        captured["headers"] = kw.get("headers")
+        return _Resp({"id": "new00001"})
+
+    with (
+        patch.object(server.cao_http, "get", side_effect=_fake_get),
+        patch.object(server.cao_http, "post", side_effect=_fake_post),
+        patch.object(server, "resolve_provider", return_value="kiro_cli"),
+        patch.object(server, "_resolve_child_allowed_tools", return_value=None),
+    ):
+        server._create_terminal(
+            "kiro_dev",
+            working_directory="/repo/wt",
+            defer_init=False,
+            resume_from="old12345",
+        )
+
+    body = captured["json"] or {}
+    assert body.get("resume_from") == "old12345", (
+        "defer_init=False resume must still carry resume_from in the body "
+        f"(got {body!r}) — else it degrades to a silent cold create"
+    )
+    assert body.get("resume_inherit_pins") is True
+    # The caller-binding token header is sent on the resume path regardless.
+    assert captured["headers"] == {"X-CAO-Terminal-Token": "tok-abcd"}
