@@ -118,10 +118,14 @@ class FakeHerdrServer:
 
 
 @pytest.fixture
-def socket_path(tmp_path: Path) -> str:
-    # A short path under tmp: unix socket paths have a ~108-byte limit, and a
-    # deep pytest tmp path can exceed it.
-    return str(tmp_path / "h.sock")
+def socket_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    # AF_UNIX paths are capped at ~108 bytes and a pytest tmp path (especially
+    # under a box's long ``--basetemp``) can exceed it. Binding a RELATIVE name
+    # sidesteps the limit entirely: the kernel stores the literal string passed
+    # to bind(), so ``"h.sock"`` is 6 bytes on the wire while the file still
+    # lands in this test's private ``tmp_path``. chdir is undone by monkeypatch.
+    monkeypatch.chdir(tmp_path)
+    return "h.sock"
 
 
 # --------------------------------------------------------------------------
@@ -407,18 +411,18 @@ async def test_snapshot_without_a_snapshot_body_raises(socket_path: str) -> None
 # --------------------------------------------------------------------------
 
 
-def test_default_socket_path_named_session() -> None:
+async def test_default_socket_path_named_session() -> None:
     assert (
         default_socket_path("cao", config_home="/c")
         == "/c/herdr/sessions/cao/herdr.sock"
     )
 
 
-def test_default_socket_path_default_session_is_flat() -> None:
+async def test_default_socket_path_default_session_is_flat() -> None:
     assert default_socket_path("default", config_home="/c") == "/c/herdr/herdr.sock"
 
 
-def test_default_socket_path_matches_legacy_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_default_socket_path_matches_legacy_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """The client's resolution equals the former inline backend/inbox logic."""
     monkeypatch.setenv("XDG_CONFIG_HOME", "/xdg")
     for session in ("cao", "default", "p0-r2"):
