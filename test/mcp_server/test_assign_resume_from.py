@@ -59,6 +59,46 @@ def test_resume_from_forwards_handle_to_create(monkeypatch):
     assert "resumed from old12345 as new00001" in result["resume_line"]
 
 
+def test_resume_path_forwards_caller_provider_hint_to_create(monkeypatch):
+    """r6 merge regression: main's F838 (#695) guard-checked provider carrier
+    ``_f838_checked_provider`` is initialized only in the non-resume (``else``)
+    branch of ``_assign_impl``, but BOTH branches converge on the shared
+    ``_create_terminal`` call whose ``provider=_resolved_provider or
+    _f838_checked_provider`` argument reads it. Merging main into the r5 resume
+    branch left the resume path reaching that call with the carrier UNBOUND.
+
+    The crash only manifests when ``_resolved_provider`` is FALSY (a cold caller
+    provider hint of ``None`` — the common case), because ``or`` then evaluates
+    the right operand and touches the unbound name → ``UnboundLocalError``. A
+    truthy hint would short-circuit and hide the bug, so this test deliberately
+    drives the resume path with NO provider hint (``provider`` defaults to
+    ``None``) and asserts the caller's hint (``None``) is forwarded to
+    ``_create_terminal`` — the resume path re-resolves provider SERVER-SIDE from
+    the reaped root, so the shim forwards the hint unchanged.
+
+    Without the resume-branch ``_f838_checked_provider = None`` init this fails:
+    the UnboundLocalError is caught by the assign try/except and returns
+    ``success=False`` with no ``_create_terminal`` call at all.
+    """
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    p_create, p_meta, p_win, p_dn = _shim_patches()
+    with p_create as create, p_meta, p_win, p_dn:
+        result = server._assign_impl(
+            "kiro_dev",
+            "task",
+            resume_from="old12345",
+            working_directory="/repo/wt",
+        )
+    assert result["success"] is True, (
+        "resume path must not raise UnboundLocalError on the F838 provider "
+        f"carrier (got {result!r})"
+    )
+    create.assert_called_once()
+    # The resume path forwards the caller's provider hint (None here) unchanged;
+    # evaluating ``None or _f838_checked_provider`` must not raise.
+    assert create.call_args.kwargs["provider"] is None
+
+
 def test_legacy_fork_from_resume_forwards_as_resume(monkeypatch):
     """r1 #1 preserved: fork_from + resume=True is pure syntax that translates
     into the SAME resume_from forward (no separate execution path)."""

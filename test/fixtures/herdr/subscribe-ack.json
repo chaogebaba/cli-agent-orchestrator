@@ -1,0 +1,11 @@
+{
+  "ack": {
+    "id": "p2_pi",
+    "result": {
+      "type": "subscription_started"
+    },
+    "_recv_ms": 1788911251896,
+    "_recv_iso": "2026-09-08T23:47:31Z"
+  },
+  "error": null
+}

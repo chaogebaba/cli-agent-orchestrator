@@ -1,0 +1,8 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "derived",
+  "derivation": "derived from working-1.txt: the working row's message was set to 'Working (esc to interrupt)' (pi 0.85.1 interactive-mode.js:1768) and the trailing box-rule run shortened by exactly the columns the message adds, so the row's total visible width stays 191 == working-1.txt's composer width (renderTopBorder sizes the trailing rule from width). ANSI colouring, composer chrome and footer are preserved.",
+  "geometry": "composer width 191; working row visible width 191 (equal, per test_pi_working_fixture_rows_are_composer_width).",
+  "notes": "Opus r4 EMPIRICAL-GATE-NO Blocker 2: the r4 version was 19 columns short (a row pi cannot draw). Regenerated at correct geometry. Must classify PROCESSING raw + ANSI-stripped. This shape could not be triggered live, so a geometry-correct derived fixture is legitimate here (the overflow shape uses a genuine live capture)."
+}

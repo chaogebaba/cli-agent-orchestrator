@@ -1,0 +1,100 @@
+{
+  "done": {
+    "agent": "pi",
+    "agent_session": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/workspace/cao/home/.pi/agent/sessions/--home-box-box-scratch-herdr-p0-r2--/2026-09-08T23-47-32-228Z_01a0836b-7304-7533-89e6-17c8e9189a66.jsonl"
+    },
+    "agent_status": "done",
+    "cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "focused": false,
+    "foreground_cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "interactive_ready": true,
+    "name": "p2pi",
+    "pane_id": "w2:p1",
+    "revision": 1,
+    "screen_detection_skipped": true,
+    "state_change_seq": 11,
+    "tab_id": "w2:t1",
+    "terminal_id": "term_65b015bb41ad32",
+    "terminal_title": "\u03c0 - herdr-p0-r2",
+    "terminal_title_stripped": "\u03c0 - herdr-p0-r2",
+    "workspace_id": "w2"
+  },
+  "idle": {
+    "agent": "pi",
+    "agent_session": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/workspace/cao/home/.pi/agent/sessions/--home-box-box-scratch-herdr-p0-r2--/2026-09-08T23-47-32-228Z_01a0836b-7304-7533-89e6-17c8e9189a66.jsonl"
+    },
+    "agent_status": "idle",
+    "cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "focused": false,
+    "foreground_cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "pane_id": "w2:p1",
+    "revision": 1,
+    "scroll": {
+      "max_offset_from_bottom": 0,
+      "offset_from_bottom": 0,
+      "viewport_rows": 40
+    },
+    "tab_id": "w2:t1",
+    "terminal_id": "term_65b015bb41ad32",
+    "terminal_title": "\u03c0 - herdr-p0-r2",
+    "terminal_title_stripped": "\u03c0 - herdr-p0-r2",
+    "workspace_id": "w2"
+  },
+  "unknown": {
+    "agent": "pi",
+    "agent_session": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/workspace/cao/home/.pi/agent/sessions/--home-box-box-scratch-herdr-p0-r2--/2026-09-08T23-47-32-228Z_01a0836b-7304-7533-89e6-17c8e9189a66.jsonl"
+    },
+    "agent_status": "unknown",
+    "cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "focused": false,
+    "foreground_cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "pane_id": "w2:p1",
+    "revision": 1,
+    "scroll": {
+      "max_offset_from_bottom": 0,
+      "offset_from_bottom": 0,
+      "viewport_rows": 40
+    },
+    "tab_id": "w2:t1",
+    "terminal_id": "term_65b015bb41ad32",
+    "terminal_title": "\u03c0 - herdr-p0-r2",
+    "terminal_title_stripped": "\u03c0 - herdr-p0-r2",
+    "workspace_id": "w2"
+  },
+  "working": {
+    "agent": "pi",
+    "agent_session": {
+      "agent": "pi",
+      "kind": "path",
+      "source": "herdr:pi",
+      "value": "/workspace/cao/home/.pi/agent/sessions/--home-box-box-scratch-herdr-p0-r2--/2026-09-08T23-47-32-228Z_01a0836b-7304-7533-89e6-17c8e9189a66.jsonl"
+    },
+    "agent_status": "working",
+    "cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "focused": false,
+    "foreground_cwd": "/home/box/box-scratch/herdr-p0-r2",
+    "interactive_ready": true,
+    "name": "p2pi",
+    "pane_id": "w2:p1",
+    "revision": 1,
+    "screen_detection_skipped": true,
+    "state_change_seq": 10,
+    "tab_id": "w2:t1",
+    "terminal_id": "term_65b015bb41ad32",
+    "terminal_title": "\u03c0 - herdr-p0-r2",
+    "terminal_title_stripped": "\u03c0 - herdr-p0-r2",
+    "workspace_id": "w2"
+  }
+}

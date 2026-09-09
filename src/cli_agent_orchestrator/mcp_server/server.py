@@ -2609,6 +2609,16 @@ def _assign_impl(
             _fallback_profile: Optional[str] = None
             _d9_position: Optional[str] = None
             _d9_cell: Optional[str] = None
+            # Merge (r6): main's F838 (#695) guard-checked provider is initialized
+            # only in the else (non-resume) branch below, but both branches
+            # converge on the shared _create_terminal call whose
+            # ``provider=_resolved_provider or _f838_checked_provider`` reads it.
+            # The resume path re-resolves provider server-side from the reaped
+            # root, so the legacy-alias guard does not apply here; initialize the
+            # carrier to None so the resume path forwards the caller's provider
+            # hint unchanged (provider or None == provider) and never raises
+            # UnboundLocalError.
+            _f838_checked_provider: Optional[str] = None
         else:
             _routing_driven = provider is None and _position_exists(agent_profile)
             _routing_position = agent_profile if _routing_driven else None
@@ -2628,6 +2638,114 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
+            # F838 (#695) r2 — the guard-checked provider for a legacy alias,
+            # carried INTO _create_terminal so creation never re-resolves from
+            # the mutable store between validation and use (codex Blocker 2).
+            _f838_checked_provider = None
+
+            # F838 (#695) r2 — fail-closed provider guard for a LEGACY ALIAS STUB.
+            # resolve_assignment_target passes a legacy name through with
+            # _resolved_provider=None, deferring provider derivation to
+            # _create_terminal's resolve_provider(fallback=caller_provider). That
+            # fallback silently spawned a pi_cli alias stub as the supervisor's
+            # claude_code/Opus when composition resolved to no provider. VALIDATE
+            # here from the stub's own frontmatter: on any unresolved/mismatch,
+            # REFUSE with a typed result and NO spawn. r2 (codex Blocker 2):
+            # instead of leaving the derivation to a SECOND, racy store read in
+            # _create_terminal, we CARRY the guard-checked provider into creation
+            # via _f838_checked_provider so the value validated here is the value
+            # used — creation never re-resolves from the mutable store. We still
+            # do NOT pin _resolved_provider (which would activate the position
+            # D8/D9 writer paths meant for position names); the checked value
+            # flows through _create_terminal's F613 ``provider=`` seam instead.
+            if _resolved_provider is None:
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    _STUB_DECLARED,
+                    _STUB_UNKNOWN,
+                    E_PROVIDER_UNRESOLVED,
+                    ProviderResolutionError,
+                    _classify_stub_intent,
+                    _resolve_provider_from_classification,
+                )
+
+                # r3 (codex EMPIRICAL-GATE-NO Blocker B): read+classify the stub
+                # EXACTLY ONCE here, then resolve from THAT immutable
+                # classification. The r2 guard read twice — once via
+                # ``_stub_declared_provider_safe`` for intent and again inside
+                # ``resolve_provider`` — so an empty-provider stub that DISAPPEARED
+                # between the two reads was reclassified ABSENT on the second read
+                # and fell back to the caller's provider, which was then carried
+                # into creation. With a single read a mid-flight disappearance
+                # cannot change the verdict: the bytes classified are the bytes
+                # resolved.
+                _intent, _declared_provider, _raw = _classify_stub_intent(agent_profile)
+                # A stub DECLARES intent when it names provider/extends/position;
+                # an UNKNOWN stub (unreadable/unparseable/malformed/dangling) is
+                # ALSO routed through the fail-closed resolver rather than the
+                # legacy passthrough. Only a cleanly-read PLAIN/ABSENT name skips
+                # the guard (the sole fallback paths).
+                if _intent in (_STUB_DECLARED, _STUB_UNKNOWN):
+                    _caller_provider = None
+                    _cur = _current_terminal_id()
+                    if _cur:
+                        try:
+                            _cur_resp = cao_http.get(f"/terminals/{_cur}", timeout=_mcp_timeout())
+                            if _cur_resp.status_code == 200:
+                                _caller_provider = _cur_resp.json().get("provider")
+                        except Exception:
+                            _caller_provider = None
+                    try:
+                        _checked = _resolve_provider_from_classification(
+                            agent_profile,
+                            _caller_provider or DEFAULT_PROVIDER,
+                            _intent,
+                            _declared_provider,
+                            _raw,
+                        )
+                    except ProviderResolutionError as exc:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": f"Assignment refused (no spawn): {exc}",
+                        }
+                    # Defence-in-depth: the resolved provider must equal the
+                    # stub's declared provider (when the stub named one) — never
+                    # a silent substitution, even one that happens to be valid.
+                    if _declared_provider and _checked != _declared_provider:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' declares provider "
+                                f"'{_declared_provider}' but resolution produced "
+                                f"'{_checked}' (F838 #695 provider-substitution guard)"
+                            ),
+                        }
+                    # r3: creation must REFUSE when the guard-verified value is
+                    # None/empty (the brief's explicit requirement for the
+                    # empty-provider disappearance). The resolver already returns
+                    # a non-empty valid provider or raises, but a belt-and-braces
+                    # check here means an empty value never silently reaches
+                    # _create_terminal (whose F613 seam would treat a blank
+                    # provider as "not supplied" and re-derive from disk).
+                    if not (isinstance(_checked, str) and _checked.strip()):
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' resolved to an empty provider "
+                                f"({_checked!r}); refusing to fall back (F838 #695)"
+                            ),
+                        }
+                    # r2/r3: carry the guard-checked provider into _create_terminal
+                    # so creation uses exactly this value (no re-resolution from
+                    # the mutable store between guard and create). _resolved_provider
+                    # stays None (legacy passthrough) so no position machinery fires.
+                    _f838_checked_provider = _checked
         if not _resume_prepared and _routing_driven and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (
@@ -2925,7 +3043,7 @@ def _assign_impl(
             lifecycle=lifecycle,
             use_worktree=use_worktree,
             authority_files=authority_files,
-            provider=_resolved_provider,
+            provider=_resolved_provider or _f838_checked_provider,
             resume_from=(_resume_prepared["resume_from"] if _resume_prepared else None),
             resume_inherit_pins=inherit_pins,
             **create_kwargs,

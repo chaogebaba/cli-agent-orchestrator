@@ -63,6 +63,15 @@ AC11_LEGACY_IMPORTERS = {
     # ``app`` may not import ``services``, so the bridge lives on the legacy
     # side and the composition root wires it.
     "services/queue_carrier.py",
+    # WP-HERDR H1 (#702): the herdr socket transport moved to the single leaf
+    # ``adapters/herdr/client.py`` (blueprint §4), and the two legacy herdr
+    # modules now IMPORT it for socket-path resolution — legacy importing new
+    # code is exactly what AC11 sanctions. ``backends/herdr_backend.py`` becomes
+    # a thin shim over the client and retires with it in H3; the inbox service's
+    # socket-path helper delegates to the same leaf so the layout has one
+    # definition. Neither adds a second herdr client.
+    "backends/herdr_backend.py",
+    "services/herdr_inbox_service.py",
 }
 
 _LEGACY_DIRS = (
@@ -236,3 +245,61 @@ def test_bootstrap_is_the_only_new_module_touching_legacy() -> None:
             if "cli_agent_orchestrator.constants" in text:
                 offenders.append(f"{path.relative_to(SRC)} -> constants")
     assert not offenders, offenders
+
+
+
+# WP-HERDR H1 B3: the single-transport invariant, asserted at the source.
+# ``adapters/herdr/client.py`` is the SOLE herdr socket/JSON-RPC implementation
+# in the tree (blueprint §4 one-client invariant).  Import-linter cannot express
+# "no call to ``asyncio.open_unix_connection`` outside this file" because it
+# reasons about module imports, not attribute-call sites — so this AST scan is
+# the mechanical contract the verdict's B3 asked for.  It is byte-cheap and runs
+# with the other import contracts.
+
+#: The one file allowed to open a unix socket for herdr transport.
+_HERDR_SOCKET_TRANSPORT = "adapters/herdr/client.py"
+
+
+def _open_unix_connection_sites() -> list[str]:
+    """Every ``asyncio.open_unix_connection`` call site under ``src/``.
+
+    AST-based, not text-based: a comment or a docstring mentioning the name (the
+    ported ``herdr_inbox_service`` keeps one in a comment explaining why it no
+    longer calls it) must NOT count as a call, or the contract would forbid even
+    documenting the invariant.
+    """
+    import ast
+
+    sites: list[str] = []
+    for path in SRC.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # Match ``asyncio.open_unix_connection(...)`` and a bare
+            # ``open_unix_connection(...)`` imported from asyncio.
+            name = None
+            if isinstance(func, ast.Attribute):
+                name = func.attr
+            elif isinstance(func, ast.Name):
+                name = func.id
+            if name == "open_unix_connection":
+                sites.append(str(path.relative_to(SRC)))
+    return sites
+
+
+def test_herdr_socket_transport_has_exactly_one_home() -> None:
+    """No file but the herdr client leaf opens a herdr unix socket (B3, §4).
+
+    Before H1 r2 the socket transport was DUPLICATED: ``HerdrClient`` and
+    ``services/herdr_inbox_service.py`` each called
+    ``asyncio.open_unix_connection``.  The inbox service now drives ``HerdrClient``
+    for its transport, so the call site collapses to one; this asserts it stays
+    that way and would fail loudly if a second socket client were reintroduced.
+    """
+    sites = sorted(set(_open_unix_connection_sites()))
+    assert sites == [_HERDR_SOCKET_TRANSPORT], (
+        "asyncio.open_unix_connection must appear only in "
+        f"{_HERDR_SOCKET_TRANSPORT!r}; found call sites: {sites}"
+    )

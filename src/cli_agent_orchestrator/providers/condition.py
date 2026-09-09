@@ -228,7 +228,12 @@ _CAPPED_RESET_HINTS: Tuple[Tuple[str, Callable[["re.Match[str]"], str]], ...] = 
     # (regex to search for a reset hint on the capped pane, hint-extractor)
     (r"try again at ([0-9]{1,2}:[0-9]{2}\s*[AP]M)", lambda m: f"try again at {m.group(1)}"),
     (r"return next month", lambda m: "return next month"),
-    (r"resets in ([0-9dhms\s]+?)(?:[.)]|$)", lambda m: f"resets in {m.group(1).strip()}"),
+    # F843 (#700): the pi/ClinePass 429 banner phrases the window as
+    # "The limit resets in 1h 29m, please try again later." — the duration is
+    # terminated by a COMMA, not a period/paren, so the boundary class carries
+    # ``,`` too. The extracted hint stays the human "resets in 1h 29m" string
+    # (retry_after seconds are derivable from it: 1h 29m → 5340s).
+    (r"resets in ([0-9dhms\s]+?)(?:[.,)]|$)", lambda m: f"resets in {m.group(1).strip()}"),
     (r"once you have usage again", lambda m: "Try Again once you have usage again"),
 )
 
@@ -250,6 +255,19 @@ _GROK_CAP = re.compile(r"You hit your (?:weekly|daily|monthly) limit", re.IGNORE
 _CLINE_CAP = re.compile(
     r"reached your monthly Clinepass limit|ClinePass limit reached", re.IGNORECASE
 )
+# F843 (#700): the pi_cli / ClinePass 5-hour window cap. Pi surfaces it as a
+# banner line
+#   Error: 429: {"code":"INFERENCE_CAP_ERROR","message":"Error 429: You have
+#   reached your 5-hour Clinepass limit. The limit resets in 1h 29m, please try
+#   again later."}
+# repeated per retry, then a final
+#   Error: Retry failed after 3 attempts: 429: {...same...}
+# The stable, wrap-safe discriminator is the machine ``INFERENCE_CAP_ERROR``
+# code, which pi prints on the FIRST wrapped row of the banner (the ``{"code":
+# "INFERENCE_CAP_ERROR"`` prefix precedes the long human ``message`` that wraps).
+# Anchoring on the code (not the wrappable human sentence) matches whether or
+# not the pane wrapped the JSON across two rows.
+_PI_CAP = re.compile(r"INFERENCE_CAP_ERROR", re.IGNORECASE)
 
 _CODEX_AUTH = re.compile(r"access token could not be refreshed|Please sign in again", re.IGNORECASE)
 _CLAUDE_AUTH = re.compile(r"Failed to authenticate: OAuth session expired", re.IGNORECASE)
@@ -602,6 +620,32 @@ def _codex_live_rows(rows: List[str]) -> List[str]:
     return rows[boundary + 1 :]
 
 
+def _pi_live_rows(rows: List[str]) -> List[str]:
+    """F843 (#700): the pi rows eligible to carry a LIVE cap banner.
+
+    Pi prints its own 429 cap as a flush ``Error: 429: {…INFERENCE_CAP_ERROR…}``
+    banner in the transcript. A supervisor/user who QUOTES that banner back to
+    the seat inside a fenced code block (```` ``` ````) is transcript text, not a
+    live cap — the same F836 discipline that a quoted status line must never fire.
+    Pi does not prefix its user echo with a ``You``/``›`` glyph (so
+    ``banner_rows`` cannot suppress it by prefix), but a quoted banner a human
+    pastes is delimited by a Markdown code fence. This helper drops every row
+    that sits BETWEEN a pair of fence delimiters so a fenced/quoted
+    ``INFERENCE_CAP_ERROR`` cannot be mistaken for pi's own live banner; pi's
+    genuine banner is never fenced, so it is untouched.
+    """
+    out: List[str] = []
+    in_fence = False
+    for row in rows:
+        if row.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        out.append(row)
+    return out
+
+
 def _scoped_proc_exited_evidence(brows: List[str]) -> Optional[str]:
     """F775 (#632): the exit-code line ONLY when it is live evidence.
 
@@ -646,6 +690,7 @@ def _classify_capped(provider: str, brows: List[str]) -> Optional[Condition]:
         "kiro_cli": _KIRO_CAP,
         "grok_cli": _GROK_CAP,
         "cline_cli": _CLINE_CAP,
+        "pi_cli": _PI_CAP,
     }.get(provider)
     if cap_pat is None:
         return None
@@ -657,6 +702,7 @@ def _classify_capped(provider: str, brows: List[str]) -> Optional[Condition]:
         "kiro_cli": "monthly_usage_limit",
         "grok_cli": "weekly_limit_choice",
         "cline_cli": "usage_limit_monthly",
+        "pi_cli": "usage_limit_window",
     }[provider]
     hint = _extract_reset_hint("\n".join(brows))
     return Condition(
@@ -982,6 +1028,12 @@ def classify_condition(
     raw_rows = [strip_terminal_escapes(r) for r in pane.splitlines()]
     if provider == "codex":
         live_rows = _codex_live_rows(raw_rows)
+        capped_brows = banner_rows("\n".join(live_rows))
+    elif provider == "pi_cli":
+        # F843 (#700): drop fenced/quoted rows so a supervisor-pasted 429 banner
+        # (a code-fenced quote of INFERENCE_CAP_ERROR) never fires a false cap;
+        # pi's own live banner is never fenced. Same F836 quoted-text discipline.
+        live_rows = _pi_live_rows(raw_rows)
         capped_brows = banner_rows("\n".join(live_rows))
     else:
         capped_brows = brows
