@@ -851,7 +851,13 @@ class TestColdStartStallDetection:
         content stops changing."""
         manager = self._manager(tmp_path, monkeypatch)
         try:
-            manager.create_reader("term-e2e", pane_probe=lambda: "content", rearm=lambda: None, terminal_generation=1, incarnation_id=None)
+            manager.create_reader(
+                "term-e2e",
+                pane_probe=lambda: "content",
+                rearm=lambda: None,
+                terminal_generation=1,
+                incarnation_id=None,
+            )
             with manager._lock:
                 assert manager._registered_at.get("term-e2e") is not None
                 assert manager._ever_delivered.get("term-e2e") is False
@@ -1065,11 +1071,7 @@ class TestConcurrencyRaces:
                 # so the test thread's own ``terminal_id in manager._readers``
                 # assertions later in the body pass straight through to the
                 # real dict instead of re-entering this wait and deadlocking.
-                if (
-                    key == terminal_id
-                    and not check_entered.is_set()
-                    and not check_release.is_set()
-                ):
+                if key == terminal_id and not check_entered.is_set() and not check_release.is_set():
                     check_entered.set()
                     # Unbounded wait — only the test thread releases this. No
                     # timeout means CPU starvation cannot expire the hold and
@@ -1153,12 +1155,10 @@ class TestConcurrencyRaces:
                 reader.join(timeout=5.0)
 
         # Post-join assertions: both threads must have exited cleanly.
-        assert stopper is not None and not stopper.is_alive(), (
-            "stop_reader did not complete within 5s after lock release"
-        )
-        assert not reader.is_alive(), (
-            "reader thread did not exit within 5s after stop_flag"
-        )
+        assert (
+            stopper is not None and not stopper.is_alive()
+        ), "stop_reader did not complete within 5s after lock release"
+        assert not reader.is_alive(), "reader thread did not exit within 5s after stop_flag"
 
         # After stop_reader completes, the terminal must be fully cleaned.
         assert terminal_id not in manager._last_data_at, (
@@ -1237,3 +1237,443 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+class TestStopAllReadersF767:
+    """Issue #624 (F767): deterministic teardown of every leaked reader.
+
+    A test that called create_reader but never stop_reader left daemon reader
+    threads spinning; at interpreter shutdown they raise as their module
+    globals are torn down and print 'Exception ignored in thread' tracebacks to
+    stderr (~42 MB across a full suite). stop_all_readers() is the one call a
+    teardown makes to guarantee no reader thread survives it.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_stops_every_tracked_reader(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        tids = [f"term-{i}" for i in range(5)]
+        for tid in tids:
+            manager.create_reader(tid)
+        threads = []
+        with manager._lock:
+            for tid in tids:
+                t = manager._threads.get(tid)
+                assert t is not None and t.is_alive()
+                threads.append(t)
+
+        leaked = manager.stop_all_readers()
+
+        assert leaked == []
+        for t in threads:
+            t.join(timeout=3.0)
+            assert not t.is_alive()
+        # Registry fully drained.
+        with manager._lock:
+            assert manager._threads == {}
+            assert manager._readers == {}
+        # No reader FIFOs left on disk.
+        assert not list(tmp_path.glob("term-*.fifo"))
+
+    def test_is_noop_when_no_readers(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        # Must not raise and must report no leak.
+        assert manager.stop_all_readers() == []
+
+    def test_module_singleton_has_stop_all(self):
+        """The conftest teardown calls fifo_manager.stop_all_readers()."""
+        assert hasattr(fr.fifo_manager, "stop_all_readers")
+        assert callable(fr.fifo_manager.stop_all_readers)
+
+
+def test_leaked_readers_emit_no_stderr_at_shutdown(tmp_path):
+    """End-to-end: a process that leaks readers then drains them exits clean.
+
+    Reproduces the #624 shutdown class in a child interpreter: create several
+    readers, then call stop_all_readers() (the teardown the conftest fixture
+    performs) and exit. Assert the child's stderr carries NO thread-shutdown
+    traceback. This is the regression the 42 MB stderr run would fail.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs require a POSIX platform")
+
+    fifo_dir = tmp_path / "fifos"
+    fifo_dir.mkdir()
+    script = textwrap.dedent(f"""
+        import time
+        from pathlib import Path
+        import cli_agent_orchestrator.services.fifo_reader as fr
+        fr.FIFO_DIR = Path({str(fifo_dir)!r})
+        mgr = fr.fifo_manager
+        for i in range(6):
+            mgr.create_reader(f"leak-{{i}}")
+        time.sleep(0.2)
+        # The teardown the conftest fixture performs:
+        leaked = mgr.stop_all_readers()
+        assert leaked == [], leaked
+        """)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    # The exact shutdown-noise signatures the issue reported.
+    assert "Exception ignored in thread" not in proc.stderr, proc.stderr
+    assert "Traceback (most recent call last)" not in proc.stderr, proc.stderr
+
+
+class _StubbornThread(threading.Thread):
+    """A daemon thread that stays alive until explicitly released.
+
+    Used to exercise the survivor/timeout contract deterministically: a real
+    FIFO reader observes its stop flag within one poll interval and exits
+    promptly, which cannot prove that ``stop_all_readers`` honours ``join_timeout``
+    or truthfully reports a reader that refuses to die. This thread does.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(daemon=True, name=name)
+        self._release = threading.Event()
+        self.join_timeouts: list[float | None] = []
+
+    def run(self) -> None:  # pragma: no cover - timing dependent
+        # Block well past any small join_timeout the test supplies.
+        self._release.wait(30)
+
+    def join(self, timeout=None):  # type: ignore[override]
+        # Record every bound the manager asks us to join with, but never
+        # actually block for it — the point is to look stubbornly alive.
+        self.join_timeouts.append(timeout)
+        super().join(0)
+
+    def release(self) -> None:
+        self._release.set()
+        super().join(2.0)
+
+
+class TestStopAllReadersTimeoutContractF767:
+    """Issue #624 §Gate blocker 2: join_timeout is honoured and survivors are
+    reported truthfully.
+
+    codex's probe showed the shipped implementation ignored ``join_timeout``
+    (it always joined with a hardcoded 2.0s) and could never report a survivor
+    (``stop_reader`` popped ``_threads[id]`` before joining, so the post-hoc
+    ``_threads.get`` survivor pass always saw ``None`` and returned ``[]``).
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_join_timeout_is_forwarded_to_the_reader_join(self, tmp_path, monkeypatch):
+        """The supplied join_timeout reaches thread.join, not the hardcoded 2.0s."""
+        manager = self._manager(tmp_path, monkeypatch)
+        stub = _StubbornThread("stubborn-fwd")
+        stub.start()
+        try:
+            with manager._lock:
+                manager._readers["stubborn-fwd"] = threading.Event()
+                manager._threads["stubborn-fwd"] = stub
+
+            manager.stop_all_readers(join_timeout=0.03125)
+
+            # The manager must have asked THIS thread to join with the bound we
+            # passed — proving the parameter is wired through stop_reader's join
+            # rather than dropped for a hardcoded 2.0.
+            assert 0.03125 in stub.join_timeouts, stub.join_timeouts
+            assert 2.0 not in stub.join_timeouts, stub.join_timeouts
+        finally:
+            stub.release()
+
+    def test_still_alive_reader_is_reported_as_a_survivor(self, tmp_path, monkeypatch):
+        """A reader that outlives join_timeout is returned, not silently dropped."""
+        manager = self._manager(tmp_path, monkeypatch)
+        stub = _StubbornThread("stubborn-survivor")
+        stub.start()
+        try:
+            with manager._lock:
+                manager._readers["stubborn-survivor"] = threading.Event()
+                manager._threads["stubborn-survivor"] = stub
+
+            survivors = manager.stop_all_readers(join_timeout=0.03125)
+
+            # The whole point of the contract: the stubborn reader IS reported.
+            assert survivors == ["stubborn-survivor"], survivors
+        finally:
+            stub.release()
+
+    def test_does_not_hang_on_a_stubborn_reader(self, tmp_path, monkeypatch):
+        """stop_all_readers returns within a small multiple of join_timeout even
+        when the reader never exits — it must not block on the full 30s life."""
+        manager = self._manager(tmp_path, monkeypatch)
+        stub = _StubbornThread("stubborn-nohang")
+        stub.start()
+        try:
+            with manager._lock:
+                manager._readers["stubborn-nohang"] = threading.Event()
+                manager._threads["stubborn-nohang"] = stub
+
+            start = time.monotonic()
+            manager.stop_all_readers(join_timeout=0.05)
+            elapsed = time.monotonic() - start
+
+            # Generous ceiling: the reader join + watchdog join are both bounded
+            # by join_timeout; nowhere near the stub's 30s wait.
+            assert elapsed < 5.0, elapsed
+        finally:
+            stub.release()
+
+    def test_stop_reader_returns_survivor_thread(self, tmp_path, monkeypatch):
+        """stop_reader itself returns the still-alive thread (None on clean stop).
+
+        This is the mechanism stop_all_readers relies on — the thread is popped
+        from _threads before the join, so the return value is the only survivor
+        signal left.
+        """
+        manager = self._manager(tmp_path, monkeypatch)
+        stub = _StubbornThread("stubborn-direct")
+        stub.start()
+        try:
+            with manager._lock:
+                manager._readers["stubborn-direct"] = threading.Event()
+                manager._threads["stubborn-direct"] = stub
+
+            survivor = manager.stop_reader("stubborn-direct", join_timeout=0.03125)
+            assert survivor is stub
+
+            # A clean stop returns None.
+            manager.create_reader("clean-one")
+            assert manager.stop_reader("clean-one", join_timeout=2.0) is None
+        finally:
+            stub.release()
+
+    def test_timed_out_watchdog_handle_is_retained(self, tmp_path, monkeypatch):
+        """§Bounded shutdown judgment: a watchdog that does not exit within the
+        bound must keep its stop flag set and its handle retained — never
+        cleared/dropped, which would let a stale probe resume unobserved and
+        leak the thread.
+        """
+        manager = self._manager(tmp_path, monkeypatch)
+        stub_watchdog = _StubbornThread("stubborn-watchdog")
+        stub_watchdog.start()
+        try:
+            manager._watchdog_thread = stub_watchdog
+
+            survivors = manager.stop_all_readers(join_timeout=0.03125)
+
+            assert survivors == []  # no readers, only the wedged watchdog
+            # Stop flag stays set (do not resume a live watchdog) ...
+            assert manager._watchdog_stop.is_set()
+            # ... and the handle is retained so a later stop can join the SAME
+            # thread rather than leaking this one.
+            assert manager._watchdog_thread is stub_watchdog
+        finally:
+            stub_watchdog.release()
+
+    def test_clean_watchdog_handle_is_reset_for_reuse(self, tmp_path, monkeypatch):
+        """The complement: a watchdog that DOES exit within the bound is cleared
+        so the next server/test can arm a fresh one."""
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader(
+            "wd-term",
+            pane_probe=lambda: "",
+            rearm=lambda: None,
+            terminal_generation=1,
+            incarnation_id=None,
+        )
+        assert manager._watchdog_thread is not None
+
+        survivors = manager.stop_all_readers()
+
+        assert survivors == []
+        assert manager._watchdog_thread is None
+        assert not manager._watchdog_stop.is_set()
+
+
+class TestProductionShutdownDrainsReadersF767:
+    """Issue #624 §Gate blocker 1: the orderly production shutdown path drains
+    readers, not just the watchdog.
+
+    codex's probe created three real readers, ran the production shutdown hook
+    (which called only stop_watchdog()), and found all three still alive. The
+    lifespan now calls stop_all_readers(); this test asserts the drained state
+    that hook must now leave behind, exercised against real reader threads.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_real_readers_are_all_gone_after_stop_all_readers(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        tids = [f"prod-{i}" for i in range(3)]
+        for tid in tids:
+            manager.create_reader(tid)
+        threads = []
+        with manager._lock:
+            for tid in tids:
+                t = manager._threads.get(tid)
+                assert t is not None and t.is_alive()
+                threads.append(t)
+
+        leaked = manager.stop_all_readers()
+
+        assert leaked == []
+        for t in threads:
+            t.join(timeout=3.0)
+            assert not t.is_alive()
+        with manager._lock:
+            assert manager._threads == {}
+            assert manager._readers == {}
+
+    def test_watchdog_only_stop_leaves_readers_alive(self, tmp_path, monkeypatch):
+        """Negative control: the OLD hook (stop_watchdog only) does NOT drain
+        readers. This is the exact codex counterexample; it documents why the
+        lifespan had to switch to stop_all_readers.
+        """
+        manager = self._manager(tmp_path, monkeypatch)
+        for i in range(3):
+            manager.create_reader(f"prod-{i}")
+        try:
+            manager.stop_watchdog()
+            alive = []
+            with manager._lock:
+                for tid, t in manager._threads.items():
+                    if t.is_alive():
+                        alive.append(tid)
+            assert sorted(alive) == ["prod-0", "prod-1", "prod-2"]
+        finally:
+            # Real drain so this test does not leak into the suite.
+            manager.stop_all_readers()
+
+    def test_lifespan_shutdown_calls_stop_all_readers(self):
+        """The production lifespan wires stop_all_readers into shutdown.
+
+        Guards the wiring itself (mutant: revert to stop_watchdog()). Reads the
+        api.main source rather than booting the whole ASGI app: the lifespan
+        pulls in the full server graph, but the single line we must protect is
+        the drain call in the teardown half.
+        """
+        import inspect
+
+        from cli_agent_orchestrator.api import main as api_main
+
+        src = inspect.getsource(api_main.lifespan)
+        assert (
+            "fifo_manager.stop_all_readers()" in src
+        ), "orderly shutdown must drain FIFO readers, not only the watchdog"
+
+
+def _run_mini_pytest(tmp_path, *, with_drain_fixture: bool):
+    """Run a one-test pytest session in a child process and return its result.
+
+    The mini test leaks a FIFO reader (create_reader, never stop_reader). A
+    session-scoped finalizer asserts NO reader thread survives the session.
+    When the autouse drain fixture is present it cleans the leak up and the
+    session passes; when it is removed the leaked daemon reader survives and the
+    finalizer fails — this is the integration coverage codex found missing
+    (mutant M5: deleting the drain fixture left all focused tests green).
+    """
+    import subprocess
+    import sys
+
+    fifo_dir = tmp_path / "fifos"
+    fifo_dir.mkdir(parents=True)
+
+    drain_fixture = (
+        (
+            "@pytest.fixture(autouse=True)\n"
+            "def _drain_leaked_fifo_readers():\n"
+            "    yield\n"
+            "    mod = sys.modules.get('cli_agent_orchestrator.services.fifo_reader')\n"
+            "    if mod is None:\n"
+            "        return\n"
+            "    mgr = getattr(mod, 'fifo_manager', None)\n"
+            "    if mgr is None:\n"
+            "        return\n"
+            "    survivors = mgr.stop_all_readers()\n"
+            "    if survivors:\n"
+            "        pytest.fail(f'survivors: {survivors}')\n"
+        )
+        if with_drain_fixture
+        else ""
+    )
+
+    conftest = (
+        "import sys\n"
+        "import threading\n"
+        "import pytest\n" + drain_fixture + "@pytest.fixture(scope='session', autouse=True)\n"
+        "def _no_leaked_readers():\n"
+        "    baseline = {t.ident for t in threading.enumerate()}\n"
+        "    yield\n"
+        "    survivors = [\n"
+        "        t for t in threading.enumerate()\n"
+        "        if t.ident not in baseline\n"
+        "        and t.is_alive()\n"
+        "        and t.name.startswith('fifo-')\n"
+        "    ]\n"
+        "    if survivors:\n"
+        "        names = ', '.join(sorted(t.name for t in survivors))\n"
+        "        pytest.fail(f'leaked FIFO reader thread(s) past the session: {names}')\n"
+    )
+    test_mod = (
+        "from pathlib import Path\n"
+        "import cli_agent_orchestrator.services.fifo_reader as fr\n"
+        "\n"
+        "def test_leaks_a_reader(monkeypatch):\n"
+        f"    monkeypatch.setattr(fr, 'FIFO_DIR', Path({str(fifo_dir)!r}))\n"
+        "    # Leak: create a reader, never stop it. Exactly the pattern the\n"
+        "    # autouse drain exists to clean up.\n"
+        "    fr.fifo_manager.create_reader('leaked-int')\n"
+        "    assert fr.fifo_manager._threads.get('leaked-int') is not None\n"
+    )
+    proj = tmp_path / "proj"
+    (proj / "test").mkdir(parents=True)
+    (proj / "test" / "conftest.py").write_text(conftest)
+    (proj / "test" / "test_leak.py").write_text(test_mod)
+
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(proj / "test" / "test_leak.py"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_drain_fixture_is_what_cleans_leaked_readers(tmp_path):
+    """Integration: the session leak-guard PASSES with the drain fixture and
+    FAILS without it — so removing the autouse drain (mutant M5) is caught.
+    """
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs require a POSIX platform")
+
+    with_drain = _run_mini_pytest(tmp_path / "a", with_drain_fixture=True)
+    assert with_drain.returncode == 0, (
+        "with the drain fixture the leaked reader is cleaned up and the session "
+        f"guard passes\nSTDOUT:\n{with_drain.stdout}\nSTDERR:\n{with_drain.stderr}"
+    )
+
+    without_drain = _run_mini_pytest(tmp_path / "b", with_drain_fixture=False)
+    assert without_drain.returncode != 0, (
+        "without the drain fixture the leaked daemon reader survives the "
+        "session and the guard MUST fail\n"
+        f"STDOUT:\n{without_drain.stdout}\nSTDERR:\n{without_drain.stderr}"
+    )
+    assert "leaked FIFO reader thread" in without_drain.stdout, without_drain.stdout
