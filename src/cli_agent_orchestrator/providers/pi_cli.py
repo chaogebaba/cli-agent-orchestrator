@@ -229,6 +229,67 @@ _LIVE_TAIL_ROWS = 12
 # Presence of this plus two rules is Pi's idle/completed chrome.
 _FOOTER_CONTEXT = re.compile(r"(?:\d+(?:\.\d+)?%|\?)/\d+(?:\.\d+)?[kKmM]?\b")
 
+
+def _current_composer_width(unfenced: list[str]) -> int | None:
+    """Width, in terminal columns, of the CURRENT (bottom-most) composer's rule.
+
+    F847 r9 (#703) — codex r8 EMPIRICAL-GATE-NO. This is the SINGLE, structural
+    derivation of the current composer width; both the full-width candidate
+    qualifier and the composer-below check consume it and NOTHING reads a global
+    maximum any more.
+
+    The blocker it closes: r5-r8 sized the composer from
+    ``max(_visible_width(row) for row in <every editor rule in the buffer>)`` —
+    the GLOBAL maximum over the whole accumulated rolling buffer. Pi's documented
+    input is an accumulated raw pipe-pane buffer whose escape cleanup turns
+    redraws into separate logical rows, so a STALE WIDER rule from an OLD frame
+    coexists ABOVE the current composer. That stale 120-column rule fixed the
+    global maximum at 120; a GENUINE live 100-column working row (whose width IS
+    its own composer's) then failed ``_visible_width(row) == composer_width`` and
+    was dropped from ``candidates`` entirely, so the idle-chrome fallback read the
+    working pane as COMPLETED — a false, delivery-eligible status on a busy pane
+    (ADV-stale-wider-live-candidate). Windowing the maximum to the live tail does
+    NOT fix it: the stale rule can sit close enough to fall inside the tail.
+
+    The structural truth the current composer is anchored by: the live working
+    row IS the current composer's TOP border, and the current composer's rules are
+    the ones drawn BELOW it (its editor body's bottom rule, just above the
+    footer). Stale/old-frame rules sit ABOVE the live working row, in transcript.
+    So the current composer width is:
+
+    - the MAXIMUM editor-rule width among the rules positioned strictly BELOW the
+      bottom-most ``_WORKING_ROW`` match. "Below the live working row" excludes
+      the stale wider rule (it is above) and an old composer's rule pair (also
+      above), while a transient RESIZE double-draw's narrow artifact rows are
+      NARROWER than the real rule they bracket, so the max still lands on the real
+      composer rule (the committed ``working-resize-3rule`` frame: rules 20, 100,
+      20 below the working row → 100, not 20 — the live working row stays a valid
+      full-width candidate and classifies PROCESSING);
+    - else — when no editor rule is drawn below the bottom-most working row (the
+      composer is drawn ABOVE the candidate, e.g. a short quoted-spinner adversary
+      at the very bottom) — the maximum editor-rule width within the LIVE TAIL
+      window. This is still local to the current viewport, never the whole
+      buffer;
+    - ``None`` when no editor rule is visible at all (no width evidence).
+    """
+    working_idxs = [i for i, row in enumerate(unfenced) if _WORKING_ROW.match(row)]
+    if working_idxs:
+        last_working = working_idxs[-1]
+        below = [
+            _visible_width(row) for row in unfenced[last_working + 1 :] if _EDITOR_RULE.match(row)
+        ]
+        if below:
+            return max(below)
+    # No rule below the live working row → the composer is above the candidate;
+    # size it from the tail window (still local to the current viewport).
+    tail_widths = [
+        _visible_width(row) for row in unfenced[-_LIVE_TAIL_ROWS:] if _EDITOR_RULE.match(row)
+    ]
+    if tail_widths:
+        return max(tail_widths)
+    return None
+
+
 # Startup / authorization / crash banners that mean the launch never reached a
 # usable prompt.  Kept narrow so ordinary agent output mentioning "error" is not
 # misread as a launch failure.
@@ -659,6 +720,17 @@ class PiCliProvider(BaseProvider):
            the GLOBAL maximum editor-rule width. A stale wider rule left in the
            accumulated buffer used to poison that maximum and hide the current
            composer's own (narrower) rule pair; see ``_has_complete_composer_below``.
+
+           F847 r9 (#703): codex r8 EMPIRICAL-GATE-NO. r8 removed the global
+           maximum from the below-check but left it powering the full-width
+           CANDIDATE qualifier in step 5, so the SAME stale wider rule could still
+           drop a genuine narrower live working row from ``candidates`` and yield
+           a false COMPLETED (ADV-stale-wider-live-candidate). The global maximum
+           is now DELETED: the current composer width comes from the single
+           structural ``_current_composer_width`` helper (the max editor-rule width
+           BELOW the live working row, else the tail-window max), which BOTH the
+           candidate qualifier and the composer-below structure consume. No
+           consumer reads the whole-buffer maximum any more.
         """
         lines = clean.splitlines()
         # 1) drop fenced rows (quoted spinner is not live)
@@ -680,11 +752,19 @@ class PiCliProvider(BaseProvider):
         if not any(_WORKING_ROW.match(row) for row in tail):
             return False
         # 5) full-composer-width invariant: the live working row spans the pane.
-        rules = [row for row in unfenced if _EDITOR_RULE.match(row)]
-        if not rules:
+        # F847 r9 (#703): the composer width is derived STRUCTURALLY from the
+        # current (bottom-most) composer via the single ``_current_composer_width``
+        # helper — the max editor-rule width BELOW the live working row, else the
+        # tail-window max. It is NO LONGER the global maximum over every rule in
+        # the accumulated buffer, so a STALE WIDER rule left in scrollback can no
+        # longer poison the width and drop a genuine narrower live working row from
+        # ``candidates`` (codex r8 EMPIRICAL-GATE-NO: ADV-stale-wider-live-
+        # candidate). Both this candidate filter and the composer-below check
+        # consume the current composer's structure; nothing reads the global max.
+        composer_width = _current_composer_width(unfenced)
+        if composer_width is None:
             # No composer rule visible → no width evidence; do not narrow.
             return True
-        composer_width = max(_visible_width(row) for row in rules)
         # Candidate positions in the FULL unfenced buffer (not just the tail), so
         # step 6 can inspect what is drawn BELOW each candidate.
         tail_start = len(unfenced) - len(tail)
@@ -725,10 +805,16 @@ class PiCliProvider(BaseProvider):
         # double-draw, where a wider rule is redrawn BETWEEN two narrow artifact
         # rows (the committed ``working-resize-3rule`` frame: two 20-column
         # artifacts bracketing the real 100-column rule — NOT a composer, so the
-        # live working row there stays PROCESSING). This keeps the r6 full-width
+        # live working row there stays PROCESSING). This keeps the full-width
         # candidate qualifier (``_visible_width(row) == composer_width`` above)
-        # intact for the resize fixtures while no longer letting an unrelated
-        # historical maximum hide the current composer.
+        # intact for the resize fixtures.
+        #
+        # F847 r9 (#703): ``composer_width`` above is the CURRENT composer's width
+        # from ``_current_composer_width`` (structural), NOT the whole-buffer
+        # maximum — see step 5. This below-check was already width-agnostic (it
+        # matches a same-width pair at ANY width), so it needed no change to close
+        # the r8 blocker; the fix was deleting the global maximum from the
+        # candidate qualifier.
         def _clean_same_width_rule_pair_below(idx: int) -> bool:
             rule_widths = [_visible_width(r) for r in unfenced[idx + 1 :] if _EDITOR_RULE.match(r)]
             for i in range(len(rule_widths)):

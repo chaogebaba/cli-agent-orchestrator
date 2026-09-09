@@ -927,6 +927,188 @@ class TestFalseIdleWorkingSpinner:
             provider.get_status(control) == TerminalStatus.COMPLETED
         ), "control with the stale wider rule removed must be COMPLETED"
 
+    # ── #703 r9: stale wider rule poisons the CANDIDATE filter (codex r8 NO) ────
+    # r8 removed the whole-buffer maximum from the composer-BELOW check but left
+    # it powering the full-width CANDIDATE qualifier (step 5). A stale wider rule
+    # in scrollback then fixed ``composer_width`` at the stale width, so a GENUINE
+    # narrower live working row failed ``_visible_width(row) == composer_width``,
+    # was dropped from ``candidates`` entirely, and the idle-chrome fallback read
+    # the working pane as COMPLETED — a false, delivery-eligible status. r9
+    # derives the composer width STRUCTURALLY from the current composer
+    # (``_current_composer_width``): the max editor-rule width BELOW the live
+    # working row, else the tail-window max — never the whole-buffer maximum. The
+    # helper is the SINGLE derivation both consumers use.
+
+    def _live_narrow_composer(self, stale: str | None, width: int = 100) -> str:
+        """The r8 verdict's ADV-stale-wider-live-candidate: an optional STALE
+        rule (``stale``) far above; then the GENUINE live working top border of
+        ``width`` columns, its editor body, ONE ``width``-column bottom rule, and a
+        valid footer. With ``stale`` wider than ``width`` this is the exact
+        blocker; ``stale=None`` is the isolating control (no stale rule)."""
+        rows = [" prior transcript output line one", " prior transcript output line two"]
+        if stale is not None:
+            rows += [stale, " transcript between the stale rule and the live composer"]
+        rows += [
+            _working_row("⠧", width),  # the GENUINE live working top border
+            " editor content",
+            "─" * width,  # the current composer's own bottom rule (narrower)
+            self._FOOTER,
+        ]
+        return "\n".join(rows)
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_stale_wider_rule_does_not_hide_live_narrow_candidate(self, _native) -> None:
+        """ADV-stale-wider-live-candidate (codex r8 EMPIRICAL-GATE-NO): a stale
+        120-column rule left in scrollback must NOT drop a GENUINE live 100-column
+        working row from the candidate set. The current composer top border is
+        exactly 100 columns; its body, one 100-column bottom rule, and a footer
+        follow it. There is NO complete composer below the live row, so it is the
+        live top border → PROCESSING.
+
+        RED on r8: step 5 sized ``composer_width`` from the whole-buffer maximum
+        (120, from the stale rule), so the 100-column working row failed the
+        full-width qualifier, was not a candidate, and the idle-chrome fallback —
+        seeing the stale 120 rule + the 100 bottom rule + footer — returned
+        COMPLETED (a false idle on a working pane). GREEN on r9: the width is the
+        current composer's own (100, the max rule BELOW the live working row), so
+        the working row qualifies and PROCESSING is returned.
+
+        The CONTROL deletes ONLY the stale wider rule; it is PROCESSING on BOTH r8
+        and r9 (with no stale rule the max is 100 either way), isolating the stale
+        rule as the sole cause of the r8 misread."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        stale_wider = "─" * 120
+        adversary = self._live_narrow_composer(stale_wider, width=100)
+        control = self._live_narrow_composer(None, width=100)
+        assert provider.get_status(adversary) == TerminalStatus.PROCESSING, (
+            "a stale wider rule must NOT hide a genuine live 100-col working row "
+            "(ADV-stale-wider-live-candidate, r8 read COMPLETED)"
+        )
+        assert (
+            provider.get_status(control) == TerminalStatus.PROCESSING
+        ), "control with the stale wider rule removed must be PROCESSING"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_stale_narrower_rule_above_live_candidate_is_processing(self, _native) -> None:
+        """A stale NARROWER rule (80-col) above a 100-col live candidate →
+        PROCESSING. r8 ALREADY passed this (the global max was 100, since
+        100 > 80, so the live row qualified); it is committed so the r9 structural
+        width can never REGRESS a case the global max got right."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        stale_narrower = "─" * 80
+        buffer = self._live_narrow_composer(stale_narrower, width=100)
+        assert (
+            provider.get_status(buffer) == TerminalStatus.PROCESSING
+        ), "a stale 80-col rule must not disturb a genuine live 100-col working row"
+
+    def _two_composers(self, candidate: str) -> str:
+        """Two COMPLETE composers of different widths in one buffer: an OLD
+        120-column composer (rule pair + footer) high in scrollback, then
+        ``candidate`` region, then the CURRENT 100-column composer at the tail
+        (one bottom rule + footer). ``candidate`` is spliced in between the old
+        composer and the current one."""
+        return "\n".join(
+            [
+                " prior transcript",
+                "─" * 120,  # ┐ OLD composer, complete
+                " old editor body",
+                "─" * 120,  # ┘ two 120-col rules
+                self._FOOTER,
+                " turn 2 output",
+                candidate,  # the row under test
+                " editor content",
+                "─" * 100,  # the CURRENT composer's bottom rule (100)
+                self._FOOTER,
+            ]
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_two_composers_live_current_candidate_is_processing(self, _native) -> None:
+        """Two complete composers, old 120 above and current 100 at the tail, with
+        a GENUINE live 100-col working row as the current composer's top border →
+        PROCESSING.
+
+        RED on r8: the whole-buffer maximum is 120 (the old composer), so the
+        100-col live working row failed the full-width qualifier and the pane read
+        COMPLETED. GREEN on r9: the current composer width is 100 (the rule below
+        the live working row), so the live row qualifies → PROCESSING."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        live = _working_row("⠧", 100)
+        assert _visible_width(live) == 100
+        assert provider.get_status(self._two_composers(live)) == TerminalStatus.PROCESSING, (
+            "a genuine live 100-col working row at the current composer must be "
+            "PROCESSING even with an old 120-col composer above it (r8 read COMPLETED)"
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_two_composers_wrapped_candidate_above_current_is_completed(self, _native) -> None:
+        """Same two composers, but the row above the current composer is a WRAPPED
+        transcript row (a 100-col ``_WORKING_ROW`` first physical row + a 1-col
+        continuation) — NOT the live top border. A complete 100-col composer sits
+        below it, so it is disqualified → COMPLETED.
+
+        r8 already returned COMPLETED here (via the below-check); committed so r9
+        keeps the wrap rejection while the current composer is idle."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        lead = "── ⠦ Working ── quoted spinner in transcript "
+        wrap = lead + "─" * (100 - _visible_width(lead))
+        assert _visible_width(wrap) == 100
+        buffer = "\n".join(
+            [
+                " prior transcript",
+                "─" * 120,  # ┐ OLD composer, complete
+                " old editor body",
+                "─" * 120,  # ┘
+                self._FOOTER,
+                " turn 2 output",
+                wrap,  # wrapped transcript first physical row (100 cols)
+                "─",  # its 1-column wrap continuation
+                "",
+                "─" * 100,  # ┐ the CURRENT idle composer, complete
+                " editor content",
+                "─" * 100,  # ┘ two 100-col rules + footer
+                self._FOOTER,
+            ]
+        )
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED, (
+            "a wrapped 100-col transcript row above a complete 100-col idle "
+            "composer must be COMPLETED, not the live top border"
+        )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_near_width_candidate_needs_exact_equality(self, _native) -> None:
+        """The full-width candidate qualifier is EXACT equality, not ±1. A
+        transcript ``_WORKING_ROW`` of 99 columns (one short of the 100-column
+        current composer) sitting as the bottom-most live-tail row — composer
+        ABOVE it, nothing complete below — is transcript → COMPLETED. Under a
+        mutant that relaxes ``_visible_width(row) == composer_width`` to a
+        one-column tolerance, the 99-col row would be admitted as a candidate and
+        the frame would flip to PROCESSING. The 100-col full-width control is the
+        PROCESSING witness. This is the committed killer for the ±1 mutant (the r8
+        verdict's independent mutant)."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        lead = "── ⠦ Working "
+        near = lead + "─" * (99 - _visible_width(lead))
+        assert _visible_width(near) == 99
+        # Composer (100-col pair + footer) ABOVE, near-width candidate at the
+        # bottom so no complete composer follows it (the width check is the sole
+        # discriminator).
+        near_buf = "\n".join(
+            [" prior transcript line", "─" * 100, " ", "─" * 100, self._FOOTER, near]
+        )
+        assert provider.get_status(near_buf) == TerminalStatus.COMPLETED, (
+            "a 99-col working row one short of the 100-col composer must be "
+            "transcript (exact width equality; ±1 tolerance would fire PROCESSING)"
+        )
+        full = lead + "─" * (100 - _visible_width(lead))
+        assert _visible_width(full) == 100
+        full_buf = "\n".join(
+            [" prior transcript line", "─" * 100, " ", "─" * 100, self._FOOTER, full]
+        )
+        assert (
+            provider.get_status(full_buf) == TerminalStatus.PROCESSING
+        ), "the exact-width 100-col control must be PROCESSING"
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_archive_live_frames_all_processing(self, _native) -> None:
         """OPTIONAL, non-load-bearing arm: the full inherited live pi 0.85.1
