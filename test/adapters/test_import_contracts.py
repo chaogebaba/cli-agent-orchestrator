@@ -63,6 +63,15 @@ AC11_LEGACY_IMPORTERS = {
     # ``app`` may not import ``services``, so the bridge lives on the legacy
     # side and the composition root wires it.
     "services/queue_carrier.py",
+    # WP-HERDR H1 (#702): the herdr socket transport moved to the single leaf
+    # ``adapters/herdr/client.py`` (blueprint §4), and the two legacy herdr
+    # modules now IMPORT it for socket-path resolution — legacy importing new
+    # code is exactly what AC11 sanctions. ``backends/herdr_backend.py`` becomes
+    # a thin shim over the client and retires with it in H3; the inbox service's
+    # socket-path helper delegates to the same leaf so the layout has one
+    # definition. Neither adds a second herdr client.
+    "backends/herdr_backend.py",
+    "services/herdr_inbox_service.py",
 }
 
 _LEGACY_DIRS = (

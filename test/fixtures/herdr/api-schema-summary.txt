@@ -1,0 +1,7 @@
+Herdr API schema
+protocol: 22
+schema_version: 1
+schemas: error_response, event, request, subscription_event, success_response
+
+Use `herdr api schema --json` to print the full schema.
+Use `herdr api schema --output PATH` to write it to a file.
