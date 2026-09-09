@@ -19,10 +19,7 @@ def test_ac12_session_start_block_unchanged_and_transcript_hook_present():
     settings = _settings()
     session_start = settings["hooks"]["SessionStart"][0]
     assert session_start["matcher"] == "startup|resume|clear|compact"
-    assert (
-        "cli_agent_orchestrator.hooks.transcript_binding"
-        in session_start["hooks"][0]["command"]
-    )
+    assert "cli_agent_orchestrator.hooks.transcript_binding" in session_start["hooks"][0]["command"]
 
 
 def test_open_edge_blocks_present():
@@ -61,4 +58,5 @@ def test_all_marker_hooks_have_timeout_5():
     for event in ("Notification", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop"):
         for block in hooks[event]:
             for hook in block["hooks"]:
-                assert hook["timeout"] == 5
+                if "cli_agent_orchestrator.hooks.question_marker" in hook["command"]:
+                    assert hook["timeout"] == 5
