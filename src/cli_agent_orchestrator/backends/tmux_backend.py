@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.backends.base import (
+    LivenessVerdict,
     PaneIdentityReadResult,
     ScopeProbe,
     TerminalBackend,
@@ -516,6 +517,61 @@ class TmuxBackend(TerminalBackend):
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_current_command(session_name, window_name)
+
+    def probe_provider_liveness(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        shell_baseline: Optional[str],
+    ) -> "LivenessVerdict":
+        """F880 (#733): tmux liveness — the former ``_provider_child_alive``
+        Steps 3-6, moved behind the port verbatim.
+
+        Behaviour is byte-for-byte the pre-F880 in-caller logic: resolve the
+        window's first pane pid, verify its ``/proc`` entry, walk the descendant
+        tree (>1 → alive), else compare the live foreground command against the
+        shell baseline (differs → exec-replaced → alive; equals → empty shell →
+        dead; missing baseline/command → inconclusive). The procfs-availability
+        gate stays with the caller (it is not tmux-specific), so this is only
+        ever reached when procfs is present.
+        """
+        from cli_agent_orchestrator.services.fork_context_service import (
+            _PROC_ROOT,
+            _descendants,
+        )
+        from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
+
+        try:
+            pid = _pane_pid(session_name, window_name)
+        except Exception:
+            return "dead"
+
+        # Verify the pane PID's /proc entry exists
+        if not (_PROC_ROOT / str(pid) / "stat").exists():
+            return "dead"
+
+        # Full descendant tree
+        descendants = _descendants(pid)
+        if len(descendants) > 1:
+            return "alive"
+
+        # Exec-replacement check (pane command != shell baseline)
+        try:
+            current_command = self.get_pane_current_command(session_name, window_name)
+        except Exception:
+            current_command = None
+
+        if not shell_baseline or not current_command:
+            # Cannot compare — inconclusive
+            return "unknown"
+
+        if current_command != shell_baseline:
+            # Shell was exec-replaced by the provider binary
+            return "alive"
+
+        # current command equals baseline → confirmed empty shell
+        return "dead"
 
     def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
         return self._client.get_pane_size(session_name, window_name)

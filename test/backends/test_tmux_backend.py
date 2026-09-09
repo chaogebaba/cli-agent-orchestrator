@@ -250,3 +250,83 @@ class TestTmuxPaneIdentity:
 
         assert backend.read_pane_identity("session", "one").identity == "term-101"
         assert backend.read_pane_identity("session", "two").identity == "term-202"
+
+
+# --- F880 (#733): tmux launch-health liveness through the port ---
+
+
+class TestTmuxProbeProviderLiveness:
+    """F880: TmuxBackend.probe_provider_liveness reproduces the former
+    _provider_child_alive Steps 3-6 (pane pid + procfs descendants + exec
+    replacement), now behind the port."""
+
+    def _backend(self):
+        with patch("cli_agent_orchestrator.backends.tmux_backend.TmuxClient"):
+            return TmuxBackend(client=MagicMock())
+
+    def test_alive_when_descendant_tree_has_children(self, tmp_path, monkeypatch):
+        """A pane pid with >1 descendant → 'alive'."""
+        import cli_agent_orchestrator.services.fork_context_service as fcs
+
+        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
+        for pid, ppid in [(100, 1), (200, 100)]:
+            (tmp_path / str(pid)).mkdir()
+            (tmp_path / str(pid) / "stat").write_text(
+                f"{pid} (node) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+            )
+        monkeypatch.setattr(fcs, "pane_pid", lambda sess, win: 100)
+        backend = self._backend()
+        assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "alive"
+
+    def test_alive_on_exec_replacement(self, tmp_path, monkeypatch):
+        """No descendants but pane command differs from baseline → 'alive'."""
+        import cli_agent_orchestrator.services.fork_context_service as fcs
+
+        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
+        (tmp_path / "100").mkdir()
+        (tmp_path / "100" / "stat").write_text("100 (kiro) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+        monkeypatch.setattr(fcs, "pane_pid", lambda sess, win: 100)
+        backend = self._backend()
+        monkeypatch.setattr(backend, "get_pane_current_command", lambda s, w: "kiro-cli")
+        assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "alive"
+
+    def test_dead_on_empty_shell(self, tmp_path, monkeypatch):
+        """No descendants + pane command == baseline → 'dead'."""
+        import cli_agent_orchestrator.services.fork_context_service as fcs
+
+        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
+        (tmp_path / "100").mkdir()
+        (tmp_path / "100" / "stat").write_text("100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+        monkeypatch.setattr(fcs, "pane_pid", lambda sess, win: 100)
+        backend = self._backend()
+        monkeypatch.setattr(backend, "get_pane_current_command", lambda s, w: "bash")
+        assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "dead"
+
+    def test_dead_when_pane_pid_unresolvable(self, tmp_path, monkeypatch):
+        """pane_pid raising → 'dead'."""
+        import cli_agent_orchestrator.services.fork_context_service as fcs
+
+        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
+
+        def _boom(sess, win):
+            raise OSError("no panes")
+
+        monkeypatch.setattr(fcs, "pane_pid", _boom)
+        backend = self._backend()
+        assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "dead"
+
+    def test_unknown_without_baseline(self, tmp_path, monkeypatch):
+        """No descendants + no baseline to compare → 'unknown' (inconclusive)."""
+        import cli_agent_orchestrator.services.fork_context_service as fcs
+
+        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
+        (tmp_path / "100").mkdir()
+        (tmp_path / "100" / "stat").write_text("100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+        monkeypatch.setattr(fcs, "pane_pid", lambda sess, win: 100)
+        backend = self._backend()
+        monkeypatch.setattr(backend, "get_pane_current_command", lambda s, w: "bash")
+        assert backend.probe_provider_liveness("s", "w", shell_baseline=None) == "unknown"
+
+    def test_backend_health_ok(self):
+        """F882: tmux has no separate control plane → backend_health() == 'ok'."""
+        assert self._backend().backend_health() == "ok"

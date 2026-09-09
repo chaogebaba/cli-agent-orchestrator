@@ -5373,8 +5373,6 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
         None  — inconclusive (missing procfs/baseline) → degrade to F110 watchdog
     """
     from cli_agent_orchestrator.services.fork_context_service import (
-        _PROC_ROOT,
-        _descendants,
         _procfs_available,
     )
 
@@ -5395,50 +5393,48 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
         )
         return None
 
-    # Step 3: resolve pane PID
+    # Step 3: resolve terminal metadata
     metadata = get_terminal_metadata(terminal_id)
     if metadata is None:
         return False
 
-    from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
-
-    try:
-        pid = _pane_pid(metadata["tmux_session"], metadata["tmux_window"])
-    except Exception:
-        return False
-
-    # Verify the pane PID's /proc entry exists
-    if not (_PROC_ROOT / str(pid) / "stat").exists():
-        return False
-
-    # Step 4: full descendant tree
-    descendants = _descendants(pid)
-    if len(descendants) > 1:
-        return True
-
-    # Step 5: exec-replacement check (pane command != shell baseline)
+    # Steps 4-6 (F880 #733): the "is a provider child alive behind this seat"
+    # question is BACKEND-SPECIFIC and is answered through the terminal-backend
+    # port. tmux resolves a pane pid and walks procfs (its former in-line
+    # Steps 3-6, moved verbatim to TmuxBackend.probe_provider_liveness); herdr
+    # asks its own ``pane process-info`` instead of ``tmux list-panes`` on a
+    # workspace that has no tmux panes — the defect that made every herdr spawn
+    # die ``provider_launch_failed``. The port's three-valued verdict maps 1:1
+    # onto this function's (True/False/None) contract, so the retry/deadline
+    # semantics in _confirm_launch_health are unchanged for both backends.
     baseline = getattr(provider, "shell_baseline", None) or getattr(
         provider, "_shell_baseline", None
     )
     try:
         from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
 
-        current_command = _get_backend().get_pane_current_command(
-            metadata["tmux_session"], metadata["tmux_window"]
+        verdict = _get_backend().probe_provider_liveness(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            shell_baseline=baseline,
         )
     except Exception:
-        current_command = None
-
-    if not baseline or not current_command:
-        # Cannot compare — inconclusive
+        # A backend that raises (e.g. an unimplemented primitive, or a transient
+        # transport error mid-probe) is inconclusive, not a confirmed death:
+        # degrade to the F110 watchdog rather than failing a possibly-live seat.
+        logger.warning(
+            "f880_liveness_probe_error terminal=%s — degrading to F110 watchdog",
+            terminal_id,
+            exc_info=True,
+        )
         return None
 
-    if current_command != baseline:
-        # Shell was exec-replaced by the provider binary
+    if verdict == "alive":
         return True
-
-    # Step 6: current command equals baseline → confirmed empty shell
-    return False
+    if verdict == "dead":
+        return False
+    # "unknown" — inconclusive, non-fatal
+    return None
 
 
 # F163-a: module-level constants for _confirm_launch_health retry loop.

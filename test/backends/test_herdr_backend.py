@@ -18,9 +18,10 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
 @pytest.fixture
 def backend():
-    # Patch os.path.exists so _ensure_session_running finds the socket immediately,
-    # avoiding the 5-second poll timeout in unit tests.
-    with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+    # Patch _socket_is_live so _ensure_session_running treats the session as
+    # already running, avoiding the 15-second poll timeout in unit tests
+    # (F882: liveness, not mere path existence).
+    with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
         yield HerdrBackend(send_delay_ms=0)
 
 
@@ -713,9 +714,7 @@ class TestMultiPaneResolution:
 
     @pytest.fixture
     def backend(self):
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             yield HerdrBackend(send_delay_ms=0)
 
     @patch("subprocess.run")
@@ -980,27 +979,21 @@ class TestSessionSocketPath:
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_named_session_uses_subdir(self):
         """Named session should produce <config_home>/herdr/<name>/herdr.sock."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="cao")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/cao/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_default_session_uses_flat_path(self):
         """'default' session should produce <config_home>/herdr/herdr.sock (no subdir)."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="default")
         assert b._session_socket_path() == "/custom/config/herdr/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_arbitrary_session_name(self):
         """An arbitrary session name should appear as a subdirectory."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="my-workspace")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/my-workspace/herdr.sock"
 
@@ -1011,58 +1004,218 @@ class TestSessionSocketPath:
 class TestEnsureSessionRunning:
     """Test _ensure_session_running startup logic."""
 
-    def test_does_nothing_when_socket_exists(self):
-        """If socket already exists, no Popen should be called."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+    def test_does_nothing_when_socket_live(self):
+        """If the socket is LIVE (a server answers), no Popen should be called."""
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             with patch("subprocess.Popen") as mock_popen:
                 HerdrBackend(herdr_session="cao")
         mock_popen.assert_not_called()
 
-    def test_starts_server_when_socket_absent(self):
-        """If socket is absent, Popen should be called with herdr server args."""
-        # Socket absent initially, then appears after first poll.
-        exists_sequence = [False, True]
+    def test_starts_server_when_socket_not_live(self):
+        """If the socket is not live, Popen should be called with herdr server args."""
+        # Not live initially, then live after first poll.
+        live_sequence = [False, True]
 
-        def exists_side_effect(path):
-            return exists_sequence.pop(0) if exists_sequence else True
+        def live_side_effect(path):
+            return live_sequence.pop(0) if live_sequence else True
 
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            side_effect=exists_side_effect,
-        ):
-            with patch("subprocess.Popen") as mock_popen:
-                with patch("time.sleep"):
-                    HerdrBackend(herdr_session="cao")
+        with patch.object(HerdrBackend, "_socket_is_live", side_effect=live_side_effect):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch("subprocess.Popen") as mock_popen:
+                    with patch("time.sleep"):
+                        HerdrBackend(herdr_session="cao")
 
         mock_popen.assert_called_once()
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["herdr", "--session", "cao", "server"]
 
-    def test_logs_warning_when_socket_never_appears(self):
-        """If socket never appears within 15s, a warning is logged and no error raised."""
-        # Simulate clock: first call returns 0.0 (sets deadline=15.0),
-        # all subsequent calls return 16.0 (past deadline, exits loop).
-        # Using a counter so exhaustion from logging internals is not an issue.
+    def test_unlinks_stale_socket_before_restart(self):
+        """F882 (#735): a present-but-dead socket is unlinked before restart."""
+        # _socket_is_live: False (dead) initially, then True after start; the
+        # inode is present (os.path.exists True) so it must be unlinked.
+        live_sequence = [False, True]
+
+        def live_side_effect(path):
+            return live_sequence.pop(0) if live_sequence else True
+
+        with patch.object(HerdrBackend, "_socket_is_live", side_effect=live_side_effect):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=True,
+            ):
+                with patch(
+                    "cli_agent_orchestrator.backends.herdr_backend.os.unlink"
+                ) as mock_unlink:
+                    with patch("subprocess.Popen") as mock_popen:
+                        with patch("time.sleep"):
+                            HerdrBackend(herdr_session="cao")
+
+        mock_unlink.assert_called_once()
+        mock_popen.assert_called_once()
+
+    def test_logs_warning_when_socket_never_live(self):
+        """If the socket never becomes live within 15s, a warning is logged and no error raised."""
         call_count = {"n": 0}
 
         def fake_time():
             call_count["n"] += 1
             return 0.0 if call_count["n"] == 1 else 16.0
 
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=False,
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=False):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch("subprocess.Popen"):
+                    with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"):
+                        with patch(
+                            "cli_agent_orchestrator.backends.herdr_backend.time.time",
+                            side_effect=fake_time,
+                        ):
+                            # Should not raise
+                            HerdrBackend(herdr_session="cao")
+
+
+# --- F882 (#735): socket-liveness health ---
+
+
+class TestBackendHealthSocketLiveness:
+    """F882: backend_health + _socket_is_live reflect real socket liveness."""
+
+    def _make_backend(self):
+        # Construct without touching a real socket during __init__.
+        with patch.object(HerdrBackend, "_ensure_session_running"):
+            return HerdrBackend(herdr_session="cao")
+
+    def test_socket_is_live_true_when_server_listening(self, tmp_path):
+        """A real listening unix socket → _socket_is_live True."""
+        import socket as _socket
+
+        sock_path = str(tmp_path / "herdr.sock")
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        server.bind(sock_path)
+        server.listen(1)
+        try:
+            assert HerdrBackend._socket_is_live(sock_path) is True
+        finally:
+            server.close()
+
+    def test_socket_is_live_false_when_absent(self, tmp_path):
+        """A missing socket path → _socket_is_live False."""
+        assert HerdrBackend._socket_is_live(str(tmp_path / "gone.sock")) is False
+
+    def test_socket_is_live_false_on_stale_inode(self, tmp_path):
+        """A socket-file inode with NO listener → _socket_is_live False (A3)."""
+        # A regular file at the path: exists() is True but connect() fails.
+        stale = tmp_path / "herdr.sock"
+        stale.write_text("")
+        assert HerdrBackend._socket_is_live(str(stale)) is False
+
+    def test_backend_health_ok_when_live(self, tmp_path):
+        backend = self._make_backend()
+        with patch.object(backend, "_session_socket_path", return_value=str(tmp_path / "s.sock")):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+            ):
+                with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
+                    assert backend.backend_health() == "ok"
+
+    def test_backend_health_socket_closed_when_stale(self, tmp_path):
+        """F882: present inode + dead listener → 'socket_closed', not 'ok'."""
+        backend = self._make_backend()
+        with patch.object(backend, "_session_socket_path", return_value=str(tmp_path / "s.sock")):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+            ):
+                with patch.object(HerdrBackend, "_socket_is_live", return_value=False):
+                    assert backend.backend_health() == "socket_closed"
+
+    def test_backend_health_unavailable_when_absent(self, tmp_path):
+        backend = self._make_backend()
+        with patch.object(backend, "_session_socket_path", return_value=str(tmp_path / "s.sock")):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=False
+            ):
+                assert backend.backend_health() == "unavailable"
+
+
+# --- F880 (#733): launch-health liveness via the backend port ---
+
+
+class TestProbeProviderLiveness:
+    """F880: HerdrBackend.probe_provider_liveness classifies via pane process-info."""
+
+    def _make_backend(self):
+        with patch.object(HerdrBackend, "_ensure_session_running"):
+            return HerdrBackend(herdr_session="cao")
+
+    def _proc_info(self, names):
+        procs = [{"name": n} for n in names]
+        return json.dumps({"pane": {"foreground_processes": procs}})
+
+    def test_alive_when_foreground_process_differs_from_baseline(self):
+        """A real provider child (name != baseline shell) → 'alive'."""
+        backend = self._make_backend()
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend,
+                "_run_herdr",
+                return_value=MagicMock(returncode=0, stdout=self._proc_info(["kiro-cli"])),
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "alive"
+
+    def test_dead_when_only_baseline_shell(self):
+        """Only a bare baseline shell in the seat → 'dead' (empty seat)."""
+        backend = self._make_backend()
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend,
+                "_run_herdr",
+                return_value=MagicMock(returncode=0, stdout=self._proc_info(["bash"])),
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "dead"
+
+    def test_dead_when_no_foreground_processes(self):
+        """An empty foreground-process list → 'dead' (vanished pane)."""
+        backend = self._make_backend()
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend,
+                "_run_herdr",
+                return_value=MagicMock(returncode=0, stdout=self._proc_info([])),
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "dead"
+
+    def test_dead_when_pane_unresolved(self):
+        """Pane cannot be resolved → 'dead'."""
+        backend = self._make_backend()
+        with patch.object(
+            backend, "_resolve_pane_id_from_window", side_effect=TerminalBackendError("t", "no")
         ):
-            with patch("subprocess.Popen"):
-                with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"):
-                    with patch(
-                        "cli_agent_orchestrator.backends.herdr_backend.time.time",
-                        side_effect=fake_time,
-                    ):
-                        # Should not raise
-                        HerdrBackend(herdr_session="cao")
+            assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "dead"
+
+    def test_unknown_on_process_info_error(self):
+        """herdr process-info non-zero exit → 'unknown' (inconclusive, non-fatal)."""
+        backend = self._make_backend()
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend, "_run_herdr", return_value=MagicMock(returncode=1, stdout="")
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline="bash") == "unknown"
+
+    def test_unknown_when_lone_shell_and_no_baseline(self):
+        """A lone shell but NO baseline to compare → 'unknown' (cannot disambiguate)."""
+        backend = self._make_backend()
+        with patch.object(backend, "_resolve_pane_id_from_window", return_value="%1"):
+            with patch.object(
+                backend,
+                "_run_herdr",
+                return_value=MagicMock(returncode=0, stdout=self._proc_info(["bash"])),
+            ):
+                assert backend.probe_provider_liveness("s", "w", shell_baseline=None) == "unknown"
 
 
 # --- create_window window_shell ---
@@ -1469,7 +1622,6 @@ class TestEnvValueRedaction:
         assert "<redacted>" in msg
 
 
-
 # --- Herdr allowed_blocked_values propagation (F450 r2) ---
 
 
@@ -1482,10 +1634,7 @@ class TestHerdrAllowedBlockedValues:
 
     @pytest.fixture
     def backend(self) -> "HerdrBackend":
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=True,
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             return HerdrBackend(send_delay_ms=0)
 
     def test_persona_codex_home_accepted_via_allowed_blocked_values(
@@ -1502,9 +1651,7 @@ class TestHerdrAllowedBlockedValues:
         joined = " ".join(args)
         assert f"CODEX_HOME={persona_home}" in joined
 
-    def test_arbitrary_codex_home_dropped_without_escape(
-        self, backend: "HerdrBackend"
-    ) -> None:
+    def test_arbitrary_codex_home_dropped_without_escape(self, backend: "HerdrBackend") -> None:
         """CODEX_HOME with no allowed_blocked_values is dropped."""
         args = backend._build_env_args(
             "tid1",
@@ -1514,9 +1661,7 @@ class TestHerdrAllowedBlockedValues:
         joined = " ".join(args)
         assert "CODEX_HOME" not in joined
 
-    def test_mismatched_allowed_value_still_dropped(
-        self, backend: "HerdrBackend"
-    ) -> None:
+    def test_mismatched_allowed_value_still_dropped(self, backend: "HerdrBackend") -> None:
         """CODEX_HOME dropped when value doesn't match allowed_blocked_values."""
         args = backend._build_env_args(
             "tid1",
@@ -1598,3 +1743,87 @@ class TestHerdrAllowedBlockedValues:
         # tab create call is the second subprocess call
         cmd = mock_run.call_args_list[1][0][0]
         assert f"CODEX_HOME={persona_home}" in cmd
+
+
+# --- F881 (#734): kill_window is tab-close, workspace closes only on last tab ---
+
+
+class TestKillWindowTabClose:
+    """F881 decision (B): closing a terminal closes its TAB; the workspace is
+    closed only when it is the last tab. A root-terminal teardown must leave the
+    workspace and its sibling tabs alive."""
+
+    def _backend(self):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
+            return HerdrBackend(herdr_session="cao")
+
+    def test_closes_tab_and_keeps_workspace_when_siblings_remain(self):
+        """A sibling tab remains → `tab close <tab_id>`, workspace NOT closed."""
+        backend = self._backend()
+        calls = []
+
+        def fake_run(args, check=True):
+            calls.append(list(args))
+            return MagicMock(returncode=0, stdout="{}")
+
+        with patch.object(backend, "_resolve_workspace_id", return_value="ws-1"):
+            with patch.object(backend, "_resolve_tab_id", return_value="tab-A"):
+                with patch.object(backend, "_tabs_in_workspace", return_value=["tab-A", "tab-B"]):
+                    with patch.object(backend, "_run_herdr", side_effect=fake_run):
+                        assert backend.kill_window("cao", "w-A") is True
+
+        assert ["tab", "close", "tab-A"] in calls
+        assert not any(c[:2] == ["workspace", "close"] for c in calls)
+
+    def test_closes_workspace_when_last_tab(self):
+        """The last tab → `workspace close <workspace_id>` exactly once."""
+        backend = self._backend()
+        calls = []
+
+        def fake_run(args, check=True):
+            calls.append(list(args))
+            return MagicMock(returncode=0, stdout="{}")
+
+        with patch.object(backend, "_resolve_workspace_id", return_value="ws-1"):
+            with patch.object(backend, "_resolve_tab_id", return_value="tab-A"):
+                with patch.object(backend, "_tabs_in_workspace", return_value=["tab-A"]):
+                    with patch.object(backend, "_run_herdr", side_effect=fake_run):
+                        assert backend.kill_window("cao", "w-A") is True
+
+        ws_closes = [c for c in calls if c[:2] == ["workspace", "close"]]
+        assert ws_closes == [["workspace", "close", "ws-1"]]
+        assert not any(c[:2] == ["tab", "close"] for c in calls)
+
+    def test_returns_false_when_tab_unresolvable(self):
+        """A tab that cannot be resolved (already gone) → False, no close call."""
+        backend = self._backend()
+        with patch.object(backend, "_resolve_workspace_id", return_value="ws-1"):
+            with patch.object(
+                backend,
+                "_resolve_tab_id",
+                side_effect=TerminalBackendError("cao", "no tab"),
+            ):
+                with patch.object(backend, "_run_herdr") as mock_run:
+                    assert backend.kill_window("cao", "w-A") is False
+                    mock_run.assert_not_called()
+
+    def test_empty_enumeration_closes_tab_not_workspace(self):
+        """If tab enumeration cannot confirm this is the sole tab (empty/failed
+        list), close only THIS tab — never collapse a workspace whose sibling
+        set is unknown. Leaking an empty workspace is recoverable; collapsing an
+        unseen sibling is the A2 regression."""
+        backend = self._backend()
+        calls = []
+
+        def fake_run(args, check=True):
+            calls.append(list(args))
+            return MagicMock(returncode=0, stdout="{}")
+
+        with patch.object(backend, "_resolve_workspace_id", return_value="ws-1"):
+            with patch.object(backend, "_resolve_tab_id", return_value="tab-A"):
+                with patch.object(backend, "_tabs_in_workspace", return_value=[]):
+                    with patch.object(backend, "_run_herdr", side_effect=fake_run):
+                        assert backend.kill_window("cao", "w-A") is True
+
+        assert ["tab", "close", "tab-A"] in calls
+        assert not any(c[:2] == ["workspace", "close"] for c in calls)

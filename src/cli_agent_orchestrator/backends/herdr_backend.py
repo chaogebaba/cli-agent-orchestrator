@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional, cast
 
 from cli_agent_orchestrator.backends.base import (
+    LivenessVerdict,
     NativeIdentityResult,
     TerminalBackend,
     TerminalBackendError,
@@ -540,19 +541,115 @@ class HerdrBackend(TerminalBackend):
         logger.info(f"Created herdr tab in workspace {session_name}")
         return window_name
 
-    def kill_window(self, session_name: str, window_name: str) -> bool:
-        """Kill a pane by resolving session_name:window_name to its pane_id."""
+    def _tabs_in_workspace(self, workspace_id: str) -> list[str]:
+        """Return the tab_ids currently in ``workspace_id`` (F881 #734).
+
+        Used by ``kill_window`` to decide tab-close vs workspace-close. Returns
+        an empty list on any lookup/parse failure — the caller treats "cannot
+        tell" as "do not assume this is the last tab", so it never collapses a
+        workspace it failed to enumerate.
+        """
         try:
-            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+            result = self._run_herdr(["tab", "list"], check=False)
+            if result.returncode != 0:
+                return []
+            data = self._parse_herdr_json(result.stdout)
+            tabs = data.get("tabs", []) if isinstance(data, dict) else data
+        except (json.JSONDecodeError, TerminalBackendError, AttributeError, TypeError):
+            return []
+        out: list[str] = []
+        for tab in tabs:
+            if isinstance(tab, dict) and tab.get("workspace_id") == workspace_id:
+                tid = tab.get("tab_id")
+                if tid is not None:
+                    out.append(str(tid))
+        return out
+
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Close a single terminal's TAB, collapsing the workspace only when it
+        is the last tab (F881 #734, decision B).
+
+        herdr topology is one workspace per CAO session and one tab per CAO
+        terminal. The former implementation closed the terminal's *pane*
+        (``pane close``); for the workspace's root pane that collapses the ENTIRE
+        workspace, taking every sibling tab with it — the A2 defect where a
+        root-terminal launch failure 404'd later ``POST /sessions/{s}/terminals``.
+
+        tmux parity is "the session survives while any window exists". So:
+        - resolve this window's tab and enumerate the workspace's tabs;
+        - if OTHER tabs remain, ``tab close <tab_id>`` — the workspace and its
+          siblings stay alive;
+        - if this is the LAST tab (or the workspace can no longer be enumerated
+          and only this pane resolves), ``workspace close`` so the empty
+          workspace is torn down exactly once.
+
+        Explicit whole-session teardown still goes through ``kill_session``
+        (``workspace close``) unchanged; this method only governs per-terminal
+        teardown.
+        """
+        # Resolve the workspace and this window's tab. If either cannot be
+        # resolved the terminal/tab is already gone — nothing to close.
+        try:
+            workspace_id = self._resolve_workspace_id(session_name)
+            tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
         except TerminalBackendError:
-            logger.warning(f"kill_window: could not resolve pane for {session_name}:{window_name}")
+            logger.warning(f"kill_window: could not resolve tab for {session_name}:{window_name}")
             return False
 
-        result = self._run_herdr(["pane", "close", pane_id], check=False)
+        tab_ids = self._tabs_in_workspace(workspace_id)
+        other_tabs = [tid for tid in tab_ids if tid != tab_id]
 
+        # Collapse the workspace ONLY when enumeration positively shows this is
+        # the sole remaining tab. If enumeration failed/returned empty we cannot
+        # prove there are no siblings, so we close only this tab and leave the
+        # workspace — leaking an empty workspace is recoverable; collapsing one
+        # that still holds an unseen sibling is the A2 regression this fixes.
+        is_confirmed_last_tab = tab_ids == [tab_id]
+
+        if not is_confirmed_last_tab:
+            # Siblings remain (or the sibling set is unknown) — close only this
+            # tab, never the workspace.
+            result = self._run_herdr(["tab", "close", tab_id], check=False)
+            if result.returncode == 0:
+                logger.info(
+                    "Closed herdr tab %s for %s:%s (workspace %s kept; enumerated tabs=%s)",
+                    tab_id,
+                    session_name,
+                    window_name,
+                    workspace_id,
+                    tab_ids or "unknown",
+                )
+                return True
+            logger.warning(
+                "kill_window: tab close %s failed (rc=%s) for %s:%s",
+                tab_id,
+                result.returncode,
+                session_name,
+                window_name,
+            )
+            return False
+
+        # Confirmed last tab — close the workspace exactly once so the now-empty
+        # session is torn down.
+        result = self._run_herdr(["workspace", "close", workspace_id], check=False)
         if result.returncode == 0:
-            logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
+            logger.info(
+                "Closed herdr workspace %s for %s:%s (last tab %s)",
+                workspace_id,
+                session_name,
+                window_name,
+                tab_id,
+            )
+            # Drop the workspace cache so a later create_session re-resolves.
+            self._workspace_cache.pop(session_name, None)
             return True
+        logger.warning(
+            "kill_window: workspace close %s failed (rc=%s) for %s:%s",
+            workspace_id,
+            result.returncode,
+            session_name,
+            window_name,
+        )
         return False
 
     # --- Input ---
@@ -886,6 +983,80 @@ class HerdrBackend(TerminalBackend):
         """Compatibility projection of :meth:`fetch_native_status`."""
         return self.fetch_native_status(session_name, window_name).status
 
+    def probe_provider_liveness(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        shell_baseline: Optional[str],
+    ) -> "LivenessVerdict":
+        """F880 (#733): herdr launch-health liveness via ``herdr pane process-info``.
+
+        herdr owns the provider process — the agent child is NOT a descendant of
+        CAO's own pane pid tree the way a tmux-spawned shell is, so the tmux path
+        (``tmux list-panes`` → procfs ``_descendants``) has no answer for a herdr
+        workspace and raised, failing every spawn ``provider_launch_failed``.
+        herdr instead reports the pane's live foreground processes; a real
+        provider child is present exactly when that list is non-empty AND names
+        something other than a bare login shell.
+
+        Verdict:
+        - ``"dead"`` — the pane cannot be resolved, or its only foreground
+          process is a bare shell equal to ``shell_baseline`` (an empty seat,
+          the same "shell never exec-replaced" signal the tmux path uses).
+        - ``"alive"`` — a foreground process is present that is not the baseline
+          shell (the provider exec-replaced the shell or runs beneath it).
+        - ``"unknown"`` — herdr could not answer (process-info returned nothing
+          / errored), or there is no ``shell_baseline`` to disambiguate a lone
+          shell from a real child; the caller degrades to the watchdog.
+
+        This mirrors the tmux exec-replacement test rather than counting a
+        descendant tree, because herdr's ``foreground_processes`` is a pane-local
+        view, not a pid ancestry CAO can walk.
+        """
+        try:
+            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        except TerminalBackendError:
+            return "dead"
+
+        result = self._run_herdr(["pane", "process-info", "--pane", pane_id], check=False)
+        if result.returncode != 0:
+            # herdr could not answer (transient socket/CLI error) — inconclusive,
+            # not a confirmed death.
+            return "unknown"
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            info = data.get("pane", data) if isinstance(data, dict) else data
+            processes = info.get("foreground_processes")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return "unknown"
+
+        if not processes:
+            # No foreground process at all: an empty seat / vanished pane.
+            return "dead"
+
+        try:
+            names = [p.get("name") for p in processes if isinstance(p, dict)]
+        except (AttributeError, TypeError):
+            return "unknown"
+        names = [n for n in names if isinstance(n, str) and n]
+        if not names:
+            return "unknown"
+
+        # Without a baseline shell to compare against, a foreground process
+        # could be either the idle login shell or a real provider child — the
+        # exec-replacement test cannot fire, so the seat is inconclusive.
+        if not shell_baseline:
+            return "unknown"
+
+        # A process whose name is not the baseline shell is a live provider
+        # child (exec-replaced or nested beneath the shell).
+        if any(name != shell_baseline for name in names):
+            return "alive"
+
+        # Every foreground process equals the baseline shell → empty seat.
+        return "dead"
+
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
 
@@ -1009,21 +1180,95 @@ class HerdrBackend(TerminalBackend):
 
         return default_socket_path(self._herdr_session)
 
-    def _ensure_session_running(self) -> None:
-        """Start the herdr session server if its socket does not exist.
+    @staticmethod
+    def _socket_is_live(socket_path: str) -> bool:
+        """Return True only if a herdr server is actually listening on the socket.
 
-        Checks for the session socket file. If absent, starts the server
-        headlessly and waits up to 5 seconds for the socket to appear.
-        Logs a warning if the socket never appears but does not raise —
+        F882 (#735): ``os.path.exists`` is not liveness. A herdr server that was
+        SIGKILLed leaves its unix-socket inode on disk, so an existence check
+        reports a dead session as running — that is A3 in the live report
+        (``_ensure_session_running`` no-ops on a stale sock; ``GET /health``
+        stays ``ok``). A real ``connect()`` to the unix socket distinguishes a
+        listening server (connect succeeds) from a leftover inode with no
+        listener (``ConnectionRefusedError``) and from a path that is gone
+        (``FileNotFoundError``). Cheap, synchronous, and never raises: any
+        failure is reported as "not live".
+        """
+        import socket as _socket
+
+        if not os.path.exists(socket_path):
+            return False
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.settimeout(1.0)
+            sock.connect(socket_path)
+            return True
+        except OSError:
+            # ConnectionRefusedError (stale inode, no listener), timeout, or any
+            # other socket error → not live.
+            return False
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def backend_health(self) -> str:
+        """F882 (#735): report herdr health from real socket liveness.
+
+        Returns ``"ok"`` only when a herdr server is listening on the configured
+        session socket, ``"socket_closed"`` when the socket path is present but
+        no server answers (a SIGKILLed/exited session leaving a stale inode),
+        and ``"unavailable"`` when the socket path does not exist at all. This
+        replaces the health endpoint's ``shutil.which("herdr")`` probe, which
+        only proved the binary is installed and reported ``ok`` across a dead
+        socket.
+        """
+        socket_path = self._session_socket_path()
+        if not os.path.exists(socket_path):
+            return "unavailable"
+        return "ok" if self._socket_is_live(socket_path) else "socket_closed"
+
+    def _ensure_session_running(self) -> None:
+        """Start the herdr session server if it is not actually listening.
+
+        F882 (#735): checks socket LIVENESS, not mere existence. A herdr server
+        that died by signal leaves its unix-socket inode behind, so the former
+        ``os.path.exists`` short-circuit treated a dead session as running and
+        every subsequent operation failed with ``server_not_running`` until the
+        inode was unlinked by hand (A3 in the live report). Now a present but
+        unresponsive socket is unlinked and the server restarted; a live socket
+        still short-circuits exactly as before.
+
+        Logs a warning if the socket never becomes live but does not raise —
         the first actual herdr operation will produce a clear error.
         """
         socket_path = self._session_socket_path()
-        if os.path.exists(socket_path):
+        if self._socket_is_live(socket_path):
             return
+
+        # A present-but-dead socket (stale inode from a SIGKILLed server) must be
+        # removed before starting a new server, or herdr refuses to bind and the
+        # session stays wedged. Best-effort: a race that removes it first, or a
+        # permission error, is not fatal — the start attempt below still runs.
+        if os.path.exists(socket_path):
+            logger.warning(
+                f"Herdr session '{self._herdr_session}' socket {socket_path} is present "
+                f"but not accepting connections (stale) — unlinking before restart."
+            )
+            try:
+                os.unlink(socket_path)
+            except OSError as exc:
+                logger.warning(
+                    "herdr_stale_socket_unlink_failed session=%s path=%s error=%s",
+                    self._herdr_session,
+                    socket_path,
+                    exc,
+                )
 
         logger.info(
             f"Herdr session '{self._herdr_session}' not running "
-            f"(socket {socket_path} absent) — starting server."
+            f"(socket {socket_path} not live) — starting server."
         )
         subprocess.Popen(
             ["herdr", "--session", self._herdr_session, "server"],
@@ -1035,13 +1280,13 @@ class HerdrBackend(TerminalBackend):
         # Give herdr a moment to create the socket file before polling.
         time.sleep(0.5)
 
-        # Poll up to 15 seconds for the socket to appear.
+        # Poll up to 15 seconds for the socket to become live.
         deadline = time.time() + 15.0
         max_iterations = max(1, int(15.0 / 0.1 * 3))
         iterations = 0
         while time.time() < deadline and iterations < max_iterations:
             iterations += 1
-            if os.path.exists(socket_path):
+            if self._socket_is_live(socket_path):
                 logger.info(f"Herdr session '{self._herdr_session}' is ready.")
                 return
             time.sleep(0.1)
@@ -1051,7 +1296,7 @@ class HerdrBackend(TerminalBackend):
                 "_ensure_herdr_running: iteration cap reached (%d), exiting", max_iterations
             )
         logger.warning(
-            f"Herdr session '{self._herdr_session}' socket did not appear within 15s "
+            f"Herdr session '{self._herdr_session}' socket did not become live within 15s "
             f"at {socket_path}. The first herdr operation will fail with a clear error."
         )
 
