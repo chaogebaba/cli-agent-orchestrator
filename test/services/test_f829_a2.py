@@ -1199,3 +1199,115 @@ def test_f865_r2_principal_states_ii_iii_separated_in_audit(real_sqlite_env):
     assert r_ii.audit == "schema_unavailable"
     assert r_iii.audit == "lookup_failed"
     assert r_ii.audit != r_iii.audit
+
+
+# ==========================================================================
+# F865 R3 — F874 #730: a resume whose resolved agent_profile will not load must
+# refuse BEFORE the CAS claim (profile validated pre-claim), so the claim is
+# NEVER held for the TTL. Fix in api.main._f829_admit_resume (+ _validate_resume_
+# profile_loads). Do NOT change what names resume ACCEPTS (#712 separate).
+#
+# fail-before/pass-after: claim taken → profile missing → claim cleared, next
+# resume succeeds. MUTANT: skip-the-pre-claim-profile-validation.
+# ==========================================================================
+
+
+def _mkroot_resumable(key, *, owner="mb_owner", profile="dev", uuid="u-r3"):
+    """A hibernated, owned, resolvable root (prepare_resume resolves the
+    identity_key directly) with a stored agent_profile + manifest cwd."""
+    d.mint_conversation_identity(
+        identity_key=key,
+        provider="codex",
+        provider_namespace="ns",
+        agent_profile=profile,
+        model="m",
+        reasoning_effort=None,
+        owner_principal=owner,
+        origin_callback_ref=None,
+        current_terminal_id=f"t_{key}",
+        provider_session_id=uuid,
+    )
+    d.set_conversation_lifecycle(key, "hibernated")
+    d.upsert_recovery_manifest(key, cwd="/tmp")
+
+
+async def _admit(resume_handle, requested_profile, *, caller="own00099"):
+    """Drive the REAL api admission core with the token bind + principal patched
+    (they are orthogonal to F874). Returns (link, claimed_key, overrides) or
+    raises the HTTPException the route would relay."""
+    from unittest.mock import patch
+
+    from cli_agent_orchestrator.api.main import _f829_admit_resume
+    from cli_agent_orchestrator.clients.database import PrincipalResult
+
+    with (
+        patch("cli_agent_orchestrator.api.main._f829_verify_caller_binding", return_value=None),
+        patch(
+            "cli_agent_orchestrator.clients.database.principal_for_terminal",
+            return_value=PrincipalResult(ok=True, principal="mb_owner"),
+        ),
+    ):
+        return await _f829_admit_resume(
+            request=object(),  # unused: token bind is patched out
+            caller_id=caller,
+            resume_handle=resume_handle,
+            requested_agent_profile=requested_profile,
+            requested_working_directory="/tmp",
+            inherit_pins=True,
+            authority_files=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_f865_r3_missing_profile_refuses_before_claim_next_resume_succeeds(real_sqlite_env):
+    from unittest.mock import patch
+
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.utils.agent_profiles import AgentProfile
+
+    _mkroot_resumable("conv_r3", owner="mb_owner", profile="dev")
+
+    # requested_agent_profile is a POSITION NAME with no store file (the F874
+    # scenario). load_agent_profile raises FileNotFoundError for it, else returns
+    # a real AgentProfile.
+    def _load(name):
+        if name == "missing-position":
+            raise FileNotFoundError(f"no such profile: {name}")
+        return AgentProfile(name=name, description="d")
+
+    with patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", side_effect=_load):
+        # RESUME with the missing position name → typed missing=profile refusal.
+        with pytest.raises(HTTPException) as ei:
+            await _admit("conv_r3", "missing-position")
+        detail = ei.value.detail
+        assert detail["error"] == "resume_refused"
+        assert detail["missing"] == "profile"
+        assert detail["reason"] == "profile_missing"
+        assert detail["retryable"] is False
+        # THE POINT (fail-before): the CAS claim was NEVER taken — the
+        # conversation is not wedged as session_resume_in_progress.
+        assert d.get_conversation_identity("conv_r3")["resume_claim"] is None
+        # NEXT resume with a LOADABLE profile succeeds and takes the claim.
+        link, claimed_key, overrides = await _admit("conv_r3", "dev")
+        assert claimed_key == "conv_r3"
+        assert d.get_conversation_identity("conv_r3")["resume_claim"] is not None
+        assert overrides["agent_profile"] == "dev"
+
+
+@pytest.mark.asyncio
+async def test_f865_r3_valid_profile_resume_is_unaffected(real_sqlite_env):
+    """Control: a resume whose resolved profile loads takes the claim as before
+    (the pre-claim validation refuses ONLY a genuinely missing profile)."""
+    from unittest.mock import patch
+
+    from cli_agent_orchestrator.utils.agent_profiles import AgentProfile
+
+    _mkroot_resumable("conv_r3_ok", owner="mb_owner", profile="dev")
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        return_value=AgentProfile(name="dev", description="d"),
+    ):
+        link, claimed_key, overrides = await _admit("conv_r3_ok", None)
+    assert claimed_key == "conv_r3_ok"
+    assert d.get_conversation_identity("conv_r3_ok")["resume_claim"] is not None
