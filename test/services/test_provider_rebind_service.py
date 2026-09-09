@@ -1,10 +1,12 @@
 import asyncio
 import threading
 from types import SimpleNamespace
+from typing import Any, AsyncIterator, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.adapters.herdr.client import HerdrClient
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
@@ -384,19 +386,19 @@ async def test_herdr_proof_waits_for_exact_new_pane_native_event(monkeypatch):
     task = asyncio.create_task(service._wait_for_backend_proof("term", metadata, MagicMock(), 0))
     await asyncio.sleep(0)
     assert not task.done()
-    event = (
-        __import__("json")
-        .dumps(
-            {
-                "event": "pane.agent_status_changed",
-                "data": {"pane_id": "pane-new", "agent_status": "working"},
-            }
-        )
-        .encode()
-        + b"\n"
-    )
-    inbox._reader = AsyncMock()
-    inbox._reader.readline.side_effect = [event, asyncio.CancelledError()]
+    event = {
+        "event": "pane.agent_status_changed",
+        "data": {"pane_id": "pane-new", "agent_status": "working"},
+    }
+
+    class _OneEventThenCancel:
+        """HerdrClient double (WP-HERDR H1 B3): _event_loop reads events()."""
+
+        async def events(self) -> AsyncIterator[dict[str, Any]]:
+            yield event
+            raise asyncio.CancelledError()
+
+    inbox._client = cast(HerdrClient, _OneEventThenCancel())
     with pytest.raises(asyncio.CancelledError):
         await inbox._event_loop()
     await asyncio.wait_for(task, timeout=1)

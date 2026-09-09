@@ -1,0 +1,17 @@
+client:
+  version: 0.9.0
+  channel: stable
+  protocol: 22
+  endpoint_protocol_generation: 1
+
+server:
+  status: running
+  version: 0.9.0
+  endpoint_compatible: yes
+  private_protocol: 22
+  private_protocol_compatible: yes
+  socket: /workspace/cao/home/.config/herdr/sessions/cao-p0-r2/herdr.sock
+
+update:
+  restart_needed: no
+  server_binary_stale: no

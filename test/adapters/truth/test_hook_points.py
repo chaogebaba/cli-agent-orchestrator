@@ -69,9 +69,17 @@ AC11_LEGACY_IMPORTERS = {
     # legacy-to-legacy call. So the file a reviewer must read to see what legacy
     # now depends on is still exactly one.
     "services/queue_carrier.py",
+    # WP-HERDR H1 (#702) adds two, and for the fourth time the same reason. The
+    # herdr socket transport moved to the single leaf ``adapters/herdr/client.py``
+    # (blueprint §4); the two legacy herdr modules now import it for socket-path
+    # resolution — legacy importing new code, exactly what AC11 sanctions.
+    # ``backends/herdr_backend.py`` becomes a thin shim over the client and
+    # retires with it in H3; the inbox service's socket-path helper delegates to
+    # the same leaf. Neither adds a second herdr client, and neither names an
+    # adapter anywhere but the delegating call.
+    "backends/herdr_backend.py",
+    "services/herdr_inbox_service.py",
 }
-
-#: The subset lane B is responsible for.
 LANE_B_IMPORTERS = {
     "providers/codex.py",
     "services/status_monitor.py",
