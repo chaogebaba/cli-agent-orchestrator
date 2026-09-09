@@ -763,9 +763,19 @@ def _configure_slots(tmp_path: Path, higher_slot: str, lower_slot: str) -> ExitS
     return stack
 
 
-def _write_bad_higher(dirs: dict, slot: str, name: str, kind: str, outside: Path) -> None:
+def _write_bad_higher(
+    dirs: dict, slot: str, name: str, kind: str, outside: Path, position: str = "flat"
+) -> None:
     d = dirs[slot]
-    flat = d / f"{name}.md"
+    if position == "nested":
+        # The nested `{name}/agent.md` candidate is a first-class member of the
+        # shared candidate list; a bad entry HERE must stop precedence exactly as
+        # a bad flat entry does. Without this position the suite cannot detect a
+        # regression in _PathCandidate.is_present_unusable for nested candidates.
+        flat = d / name / "agent.md"
+        flat.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        flat = d / f"{name}.md"
     if kind == "dangling":
         flat.symlink_to(d / "missing-target.md")
     elif kind == "escaping":
@@ -799,13 +809,23 @@ def _write_lower_readable(dirs: dict, slot: str, name: str) -> None:
 
 @pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)
 @pytest.mark.parametrize("bad_kind", _BAD_HIGHER_KINDS)
-def test_bad_higher_shadows_lower_refuses(tmp_path, higher_slot, lower_slot, bad_kind):
-    """For EVERY (higher, lower) store pair and every bad-higher shape: a higher
-    entry the reader cannot read (dangling / escaping-symlink / malformed /
-    unreadable) must NOT fall through to a readable lower same-name profile. The
-    resolver classifies UNKNOWN and raises E-PROVIDER-UNRESOLVED — including when
-    the lower store is the packaged BUILT-IN store (the codex r4 counterexample).
+@pytest.mark.parametrize("bad_position", ["flat", "nested"])
+def test_bad_higher_shadows_lower_refuses(
+    tmp_path, higher_slot, lower_slot, bad_kind, bad_position
+):
+    """For EVERY (higher, lower) store pair, every bad-higher shape, and BOTH
+    candidate POSITIONS (flat and nested): a higher entry the reader cannot read
+    (dangling / escaping-symlink / malformed / unreadable) must NOT fall through
+    to a readable lower same-name profile. The resolver classifies UNKNOWN and
+    raises E-PROVIDER-UNRESOLVED — including when the lower store is the packaged
+    BUILT-IN store (the codex r4 counterexample), and including when the BAD entry
+    is the NESTED `{name}/agent.md` candidate (the Opus r6 blocker: mutant M5,
+    which returns False from _PathCandidate.is_present_unusable for nested
+    candidates, is killed here).
     """
+    # The local store is flat-only by design, so it has no nested candidate.
+    if bad_position == "nested" and higher_slot == "local":
+        pytest.skip("local store is flat-only; no nested candidate")
     # The built-in lower slot must use a name that actually exists as a built-in
     # plain profile; other slots use a fresh scratch name.
     name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_shadow"
@@ -814,24 +834,42 @@ def test_bad_higher_shadows_lower_refuses(tmp_path, higher_slot, lower_slot, bad
     stack = _configure_slots(tmp_path, higher_slot, lower_slot)
     dirs = stack._dirs  # type: ignore[attr-defined]
     with stack:
-        _write_bad_higher(dirs, higher_slot, name, bad_kind, outside)
+        _write_bad_higher(dirs, higher_slot, name, bad_kind, outside, bad_position)
         _write_lower_readable(dirs, lower_slot, name)
 
         intent, _, _ = _ap._classify_stub_intent(name)
-        assert intent == _ap._STUB_UNKNOWN, (higher_slot, lower_slot, bad_kind, intent)
+        assert intent == _ap._STUB_UNKNOWN, (
+            higher_slot,
+            lower_slot,
+            bad_kind,
+            bad_position,
+            intent,
+        )
         with pytest.raises(ProviderResolutionError) as ei:
             resolve_provider(name, "claude_code")
     assert ei.value.code == E_PROVIDER_UNRESOLVED
-    # Restore perms so tmp cleanup can remove the unreadable file.
+    # Restore perms so tmp cleanup can remove the unreadable file. The unreadable
+    # entry lives at the flat OR nested path depending on bad_position.
     if bad_kind == "unreadable":
-        (dirs[higher_slot] / f"{name}.md").chmod(0o600)
+        bad_path = (
+            dirs[higher_slot] / name / "agent.md"
+            if bad_position == "nested"
+            else dirs[higher_slot] / f"{name}.md"
+        )
+        bad_path.chmod(0o600)
 
 
 @pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)
-def test_dangling_higher_shadows_lower_never_reads_lower(tmp_path, higher_slot, lower_slot):
+@pytest.mark.parametrize("bad_position", ["flat", "nested"])
+def test_dangling_higher_shadows_lower_never_reads_lower(
+    tmp_path, higher_slot, lower_slot, bad_position
+):
     """The stat-only precedence walk refuses a dangling-higher shadow BEFORE the
     raw read is issued, so the shadowed lower file (built-in included) is NEVER
-    read. Pins raw_reads == 0 on the refusing path for every pair."""
+    read. Pins raw_reads == 0 on the refusing path for every pair, at BOTH the
+    flat and nested candidate positions (nested is the Opus r6 blocker position)."""
+    if bad_position == "nested" and higher_slot == "local":
+        pytest.skip("local store is flat-only; no nested candidate")
     name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_noread"
     outside = tmp_path / "outside" / "escape.md"
     original_read = _ap.read_agent_profile_source
@@ -839,12 +877,12 @@ def test_dangling_higher_shadows_lower_never_reads_lower(tmp_path, higher_slot, 
     stack = _configure_slots(tmp_path, higher_slot, lower_slot)
     dirs = stack._dirs  # type: ignore[attr-defined]
     with stack:
-        _write_bad_higher(dirs, higher_slot, name, "dangling", outside)
+        _write_bad_higher(dirs, higher_slot, name, "dangling", outside, bad_position)
         _write_lower_readable(dirs, lower_slot, name)
         with patch.object(_ap, "read_agent_profile_source", wraps=original_read) as reads:
             with pytest.raises(ProviderResolutionError):
                 resolve_provider(name, "claude_code")
-        assert reads.call_count == 0, (higher_slot, lower_slot, reads.call_count)
+        assert reads.call_count == 0, (higher_slot, lower_slot, bad_position, reads.call_count)
 
 
 @pytest.mark.parametrize("higher_slot,lower_slot", _STORE_PAIRS)

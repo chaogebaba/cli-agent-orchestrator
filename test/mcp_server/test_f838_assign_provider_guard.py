@@ -443,23 +443,35 @@ _ASSIGN_PAIRS = [
 
 
 @pytest.mark.parametrize("higher_slot,lower_slot", _ASSIGN_PAIRS)
+@pytest.mark.parametrize("bad_position", ["flat", "nested"])
 def test_assign_refuses_bad_higher_shadowing_lower_seam(
-    tmp_path, monkeypatch, higher_slot, lower_slot
+    tmp_path, monkeypatch, higher_slot, lower_slot, bad_position
 ):
     """The public assign seam refuses (no spawn) for a dangling HIGHER entry
     shadowing a readable LOWER same-name profile at EVERY (higher, lower) store
-    pair, including the built-in store as the lower."""
+    pair, including the built-in store as the lower — at BOTH the flat and nested
+    candidate positions. The nested position is the Opus r6 blocker: it pins that
+    the create seam is covered when the bad candidate is `{name}/agent.md`
+    (mutant M5's uncovered position)."""
+    # The local store is flat-only, so it has no nested candidate.
+    if bad_position == "nested" and higher_slot == "local":
+        pytest.skip("local store is flat-only; no nested candidate")
     name = _BUILTIN_PLAIN_NAME if lower_slot == "builtin" else "f838_r5_seam"
     stack, dirs = _assign_env(tmp_path, monkeypatch, higher_slot=higher_slot, lower_slot=lower_slot)
     with stack:
-        (dirs[higher_slot] / f"{name}.md").symlink_to(dirs[higher_slot] / "missing-target.md")
+        if bad_position == "nested":
+            bad = dirs[higher_slot] / name / "agent.md"
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.symlink_to(dirs[higher_slot] / name / "missing-target.md")
+        else:
+            (dirs[higher_slot] / f"{name}.md").symlink_to(dirs[higher_slot] / "missing-target.md")
         if lower_slot != "builtin":
             (dirs[lower_slot] / f"{name}.md").write_text(
                 "---\nprovider: claude_code\n---\nlower body\n", encoding="utf-8"
             )
         with _patch(_CREATE) as create:
             result = _assign_impl(name, "task", working_directory="/repo")
-    assert result["success"] is False, (higher_slot, lower_slot, result)
+    assert result["success"] is False, (higher_slot, lower_slot, bad_position, result)
     assert E_PROVIDER_UNRESOLVED in result["message"]
     create.assert_not_called()
 
