@@ -66,8 +66,16 @@ def _make_lane(
     uuid_value="uuid-lane0001",
     profile="codex_dev",
     cwd="/home/chao/repo",
+    owner="mb_test",
+    lifecycle="hibernated",
 ):
-    return create_terminal(
+    # F829 A2.3: post-A2 every spawn mints a conversation root, so a lane that a
+    # resume test resolves MUST have one. Mint an OWNED, hibernated (resumable)
+    # root linked to this incarnation so prepare_resume(caller_principal=owner)
+    # authorizes + classifies it.
+    from cli_agent_orchestrator.clients.database import RootAdmission
+
+    result = create_terminal(
         terminal_id,
         SESSION,
         f"worker-{terminal_id}",
@@ -75,7 +83,23 @@ def _make_lane(
         agent_profile=profile,
         working_directory=cwd,
         provider_session_id=uuid_value,
+        root_admission=RootAdmission(
+            mode="mint",
+            identity_key=f"conv_{terminal_id}",
+            provider=provider,
+            provider_namespace="ns",
+            provider_session_id=uuid_value,
+            owner_principal=owner,
+        ),
     )
+    from cli_agent_orchestrator.clients.database import (
+        set_conversation_lifecycle,
+        upsert_recovery_manifest,
+    )
+
+    upsert_recovery_manifest(f"conv_{terminal_id}", cwd=cwd)
+    set_conversation_lifecycle(f"conv_{terminal_id}", lifecycle)
+    return result
 
 
 # ── Deliverable 1: the resolver ─────────────────────────────────────────────
@@ -544,6 +568,7 @@ def test_prepare_resume_inherit_pins(db_env, tmp_path):
         requested_agent_profile=None,
         requested_working_directory=cwd,
         inherit_pins=True,
+        caller_principal="mb_test",
     )
     assert out["authority_files"] == [{"file_path": "/a/b.md", "sha256": "b" * 64}]
     assert out["fork_context"].mode == "resume"
@@ -560,6 +585,7 @@ def test_prepare_resume_inherit_pins_defaults_true(db_env, tmp_path):
         requested_agent_profile=None,
         requested_working_directory=cwd,
         # inherit_pins omitted → default True
+        caller_principal="mb_test",
     )
     assert out["pins_inherited"] == 1
     assert out["authority_files"] == [{"file_path": "/a/b.md", "sha256": "d" * 64}]
@@ -576,6 +602,7 @@ def test_prepare_resume_inherit_pins_false_reports_known_pins(db_env, tmp_path):
         requested_agent_profile=None,
         requested_working_directory=cwd,
         inherit_pins=False,
+        caller_principal="mb_test",
     )
     assert out["authority_files"] is None
     assert out["known_pins"] == [{"file_path": "/a/b.md", "sha256": "e" * 64}]
@@ -591,9 +618,10 @@ def test_prepare_resume_grok_refuses_provider_capability(db_env, tmp_path):
             requested_agent_profile=None,
             requested_working_directory=cwd,
             inherit_pins=True,
+            caller_principal="mb_test",
         )
     assert exc.value.missing == "provider_capability"
-    assert "F829 build 2" in exc.value.how
+    assert exc.value.reason == "grok_cli_resume_not_declared"
 
 
 def test_prepare_resume_cwd_missing_no_provenance_refuses(db_env):
@@ -605,6 +633,7 @@ def test_prepare_resume_cwd_missing_no_provenance_refuses(db_env):
             requested_agent_profile=None,
             requested_working_directory=None,
             inherit_pins=True,
+            caller_principal="mb_test",
         )
     assert exc.value.missing == "cwd"
     assert exc.value.reason == "cwd_missing_no_provenance"
@@ -623,7 +652,10 @@ def test_prepare_resume_cwd_reconstructs_from_provenance(db_env, tmp_path, monke
     _git(["add", "."], wt)
     _git(["commit", "-qm", "progress"], wt)
     commit = _git(["rev-parse", "HEAD"], wt).stdout.strip()
-    # Register an identity with the worktree provenance, then remove the checkout.
+    # Register an identity WITH an F829 root (post-A2 every spawn mints one) and
+    # the worktree provenance, then remove the checkout.
+    from cli_agent_orchestrator.clients.database import RootAdmission
+
     create_terminal(
         "recon01",
         SESSION,
@@ -638,14 +670,37 @@ def test_prepare_resume_cwd_reconstructs_from_provenance(db_env, tmp_path, monke
             "expected_branch": "cao/recon01",
             "terminal_id": "recon01",
         },
+        root_admission=RootAdmission(
+            mode="mint",
+            identity_key="conv_recon01",
+            provider="codex",
+            provider_namespace="ns",
+            provider_session_id="uuid-recon",
+            owner_principal="mb_test",
+        ),
     )
-    # Record the commit on the identity row (git_sha).
-    from cli_agent_orchestrator.clients.database import SessionLocal, TerminalIdentityModel
+    # Record the commit on the identity row (git_sha) AND the root manifest
+    # (worktree_commit), and mark the root hibernated (resumable).
+    from cli_agent_orchestrator.clients.database import (
+        SessionLocal,
+        TerminalIdentityModel,
+        set_conversation_lifecycle,
+        upsert_recovery_manifest,
+    )
 
     with SessionLocal() as db:
         row = db.query(TerminalIdentityModel).filter_by(terminal_id="recon01").one()
         row.git_sha = commit
         db.commit()
+    upsert_recovery_manifest(
+        "conv_recon01",
+        cwd=wt,
+        repo_root=str(repo),
+        worktree_path=wt,
+        worktree_branch="cao/recon01",
+        worktree_commit=commit,
+    )
+    set_conversation_lifecycle("conv_recon01", "hibernated")
     # Remove the checkout (simulate abandon/GC) but keep the branch.
     worktree_service.remove_worktree(str(repo), "recon01", worktree_path=wt)
     assert not Path(wt).is_dir()
@@ -655,6 +710,7 @@ def test_prepare_resume_cwd_reconstructs_from_provenance(db_env, tmp_path, monke
         requested_agent_profile=None,
         requested_working_directory=None,
         inherit_pins=True,
+        caller_principal="mb_test",
     )
     assert out["working_directory"] == wt
     assert Path(wt).is_dir()  # reconstructed at the exact path
