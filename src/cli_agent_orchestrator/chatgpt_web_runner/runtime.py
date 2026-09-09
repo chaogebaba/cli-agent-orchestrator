@@ -294,7 +294,9 @@ async def launch(options: dict[str, Any]) -> Any:
     without them. Raises ``proc_exited`` if the browser cannot start.
     """
     try:
-        from cloakbrowser import launch_persistent_context  # type: ignore[import-not-found]
+        from cloakbrowser import (  # type: ignore[import-not-found]
+            launch_persistent_context_async,
+        )
     except Exception as exc:  # pragma: no cover - exercised only in the live lane
         raise RunnerError(
             RunnerErrorCode.PROC_EXITED,
@@ -303,10 +305,11 @@ async def launch(options: dict[str, Any]) -> Any:
         ) from exc
     seed = options["fingerprint_seed"]
     try:
-        context = await launch_persistent_context(
+        context = await launch_persistent_context_async(
             user_data_dir=options["user_data_dir"],
             headless=False,
             humanize=False,
+            stealth_args=False,
             args=[f"--fingerprint={seed}"],
         )
     except Exception as exc:  # pragma: no cover - live lane

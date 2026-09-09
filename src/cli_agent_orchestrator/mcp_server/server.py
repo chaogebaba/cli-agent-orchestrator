@@ -107,6 +107,18 @@ def _mcp_timeout() -> float:
     return float(get_server_settings()["mcp_request_timeout"])
 
 
+def _f862_strip_provider_suffix(name: Optional[str]) -> str:
+    """F862 (#718) D14: derive the position from a composed profile name.
+
+    Accepts ``<position>-chatgpt_web`` (composed spawn name) or a bare
+    ``<position>`` and returns the position segment, so the D14 refusal guard can
+    resolve the routing cell on every dispatch path (AC-3)."""
+    if not name:
+        return ""
+    suffix = f"-{ProviderType.CHATGPT_WEB.value}"
+    return name[: -len(suffix)] if name.endswith(suffix) else name
+
+
 def _api_headers() -> dict[str, str]:
     bearer = get_local_bearer()
     return {"Authorization": f"Bearer {bearer}"} if bearer else {}
@@ -2758,6 +2770,64 @@ def _assign_impl(
                     # the mutable store between guard and create). _resolved_provider
                     # stays None (legacy passthrough) so no position machinery fires.
                     _f838_checked_provider = _checked
+        # F862 (#718) D14 — findings-only enforcement for the chatgpt_web
+        # provider, made UNCONDITIONAL across all three reachable dispatch paths
+        # (AC-3): routing-driven (provider omitted), explicit-provider (which sets
+        # _routing_driven False at :2635 and would otherwise skip the check), and
+        # the resume-prepared branch. The fork-wide skip is tracked separately as
+        # issue #724; F862 closes it only for THIS provider and does not wait on
+        # it. resolve_routing_binding is reused verbatim (never a second refusal
+        # implementation): it refuses an uncertified/stale GATE cell and allows a
+        # certified design_findings/general cell, so a gate position + chatgpt_web
+        # is refused before any terminal is created, while design_findings is not.
+        _f862_position = None
+        _f862_provider = None
+        if _resume_prepared:
+            _f862_provider = _resume_prepared.get("provider")
+            _f862_position = _f862_strip_provider_suffix(agent_profile)
+        elif _resolved_provider:
+            # Routing-driven: the position is _routing_position; the existing
+            # block below handles it, but we still assert here so a future edit
+            # to that block cannot silently drop the chatgpt_web refusal.
+            _f862_provider = _resolved_provider
+            _f862_position = _routing_position
+        else:
+            # Explicit-provider path: provider was supplied and agent_profile
+            # still names the position (resolve_assignment_target passed it
+            # through with _resolved_provider None).
+            _f862_provider = _f838_checked_provider or provider
+            _f862_position = _f862_strip_provider_suffix(agent_profile)
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            _position_exists as _f862_position_exists,
+        )
+
+        if (
+            _f862_provider == ProviderType.CHATGPT_WEB.value
+            and _f862_position
+            and _f862_position_exists(_f862_position)
+        ):
+            from cli_agent_orchestrator.constants import positions_store_dir as _f862_positions_dir
+            from cli_agent_orchestrator.constants import routing_toml_path as _f862_routing_path
+            from cli_agent_orchestrator.utils.routing import RoutingError as _F862RoutingError
+            from cli_agent_orchestrator.utils.routing import load_routing_table as _f862_load_rt
+            from cli_agent_orchestrator.utils.routing import (
+                resolve_routing_binding as _f862_resolve,
+            )
+
+            try:
+                _f862_resolve(
+                    _f862_position,
+                    _f862_provider,
+                    table=_f862_load_rt(_f862_routing_path()),
+                    positions_dir=_f862_positions_dir(),
+                )
+            except _F862RoutingError as exc:
+                # Refused before any terminal creation / browser launch (AC-3).
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "message": f"Assignment refused (no spawn): {exc}",
+                }
         if not _resume_prepared and _routing_driven and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (
