@@ -192,7 +192,12 @@ def test_d7_position_without_provider_hard_fails(monkeypatch):
 
 
 def test_d7_disallowed_provider_hard_fails_no_terminal(monkeypatch):
-    """A provider outside the position allowlist is E-PROVIDER-NOT-ALLOWED, no spawn."""
+    """F868 #724 r2 (B1): a provider outside the position allowlist on an EXPLICIT
+    position override collapses to the ONE typed D1 error E-CELL-UNCERTIFIED
+    (naming the position + provider), NOT E-PROVIDER-NOT-ALLOWED. The allowlist
+    check now runs INSIDE the shared cell-guard choke point after position
+    parsing, so a disallowed provider and an uncertified cell yield the same one
+    operator code. No terminal is created."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     with (
         _patch_positions({"empirical_reviewer": {"providers": ["codex"]}}),
@@ -203,7 +208,10 @@ def test_d7_disallowed_provider_hard_fails_no_terminal(monkeypatch):
         )
 
     assert result["success"] is False
-    assert "E-PROVIDER-NOT-ALLOWED" in result["message"]
+    # B1: the ONE typed code, never the old E-PROVIDER-NOT-ALLOWED leak.
+    assert "E-CELL-UNCERTIFIED" in result["message"]
+    assert "E-PROVIDER-NOT-ALLOWED" not in result["message"]
+    assert "empirical_reviewer" in result["message"] and "grok_cli" in result["message"]
     create.assert_not_called()
 
 

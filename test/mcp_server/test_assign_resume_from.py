@@ -155,3 +155,42 @@ def test_inherit_pins_false_with_known_pins_refuses_profile(monkeypatch):
     assert result["missing"] == "profile"
     assert result["reason"] == "pins_dropped_without_replacement"
     create.assert_not_called()
+
+
+def test_resume_threads_resume_cell_class(monkeypatch):
+    """F868/F870 r2 (B4/D5c): an ordinary resume threads cell_request_class="resume"
+    (ROUTING-EQUIVALENT continuation) to _create_terminal, so the shared choke
+    point re-classifies the resumed cell as routing-equivalent (non-gate
+    uncertified allowed with the marker, gate uncertified refused)."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    p_id, p_pins, p_isdir, p_create, p_meta, p_win, p_dn = _resume_patches()
+    with p_id, p_pins, p_isdir, p_create as create, p_meta, p_win, p_dn:
+        result = server._assign_impl("kiro_dev", "task", resume_from="old12345")
+    assert result["success"] is True
+    assert create.call_args.kwargs["cell_request_class"] == "resume"
+
+
+def test_resume_bare_position_override_threads_explicit_cell_class(monkeypatch):
+    """F868/F870 r2 (D5c): a caller-supplied bare-POSITION override on resume is
+    the caller's EXPLICIT cell choice (the named position differs from the
+    recorded identity's kiro_dev), so it threads cell_request_class="explicit"
+    and must be PASS-certified."""
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+    p_id, p_pins, p_isdir, p_create, p_meta, p_win, p_dn = _resume_patches()
+    with (
+        p_id,
+        p_pins,
+        p_isdir,
+        p_create as create,
+        p_meta,
+        p_win,
+        p_dn,
+        # 'dev' is a real position AND differs from the identity's kiro_dev.
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles._position_exists",
+            return_value=True,
+        ),
+    ):
+        result = server._assign_impl("dev", "task", resume_from="old12345")
+    assert result["success"] is True
+    assert create.call_args.kwargs["cell_request_class"] == "explicit"

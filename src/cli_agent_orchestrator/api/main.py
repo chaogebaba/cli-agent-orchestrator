@@ -217,6 +217,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.cell_guard import classify_request as cell_guard_classify_request
 from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -3792,6 +3793,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
+    cell_request_class: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3882,6 +3884,17 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        # F868/F870 r2 (D4/D5): classify how this operator-facing create selected
+        # its (position, provider) cell so the shared choke point in
+        # create_terminal enforces the right certification asymmetry. A bare
+        # position + provider= (or a composed literal) is EXPLICIT; a bare
+        # position with no provider is ROUTING; a legacy name is untouched. An
+        # explicit ``cell_request_class`` query param (from the MCP _create_terminal
+        # client, which already classified) WINS over re-classification here.
+        _cell_class = cell_request_class or cell_guard_classify_request(
+            agent_profile, provider_supplied=provider is not None
+        )
+
         create_kwargs: Dict[str, Any] = dict(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -3900,6 +3913,7 @@ async def create_session(
             metadata=body.metadata if body else None,
             terminal_id=terminal_id,
             is_box_hosted=is_box_hosted,
+            cell_request_class=_cell_class,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -3994,6 +4008,10 @@ async def start_session_endpoint(
             agent_profile, fallback_provider="kiro_cli"
         )
         require_provider_admitted(resolved_provider)
+        # F868/F870 r2 (D4/D5): classify the operator-facing cell selection.
+        _cell_class = cell_guard_classify_request(
+            agent_profile, provider_supplied=provider is not None
+        )
         result = await session_service.start_session(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -4005,6 +4023,7 @@ async def start_session_endpoint(
             allow_incomplete_brief=allow_incomplete_brief,
             terminal_id=terminal_id,
             is_box_hosted=is_box_hosted,
+            cell_request_class=_cell_class,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -4033,6 +4052,12 @@ async def start_session_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "provider_init_timeout", "message": str(exc)},
         ) from exc
+    except ValueError as exc:
+        # F868/F870 r2 (D4/B3): a cell-guard refusal (E-CELL-UNCERTIFIED /
+        # E-COMPOSITION-MISSING) reaches here as a ValueError carrying the typed
+        # code; surface it as a typed 400 so the operator sees the same code the
+        # MCP envelope uses, with NO terminal created.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except RuntimeError as exc:
         code = str(exc)
         if code in {
@@ -4428,6 +4453,7 @@ async def create_terminal_in_session(
     use_worktree: Optional[bool] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
+    cell_request_class: str = "explicit",
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4559,6 +4585,7 @@ async def create_terminal_in_session(
             authority_files=body.authority_files if body else None,
             terminal_id=terminal_id,
             is_box_hosted=is_box_hosted,
+            cell_request_class=cell_request_class,
         )
         return result
     except HTTPException:
@@ -4604,6 +4631,10 @@ async def create_terminal_in_session(
         if str(e).startswith(
             ("invalid_working_directory: ", "invalid_barrier", "barrier_", "ambiguous_barrier")
         ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        # F868/F870 r2 (D4/B3): a cell-guard refusal is a bad request (typed
+        # code, no resource created), NOT a missing session — 400, not 404.
+        if "E-CELL-UNCERTIFIED" in str(e) or "E-COMPOSITION-MISSING" in str(e):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:

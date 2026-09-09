@@ -773,6 +773,7 @@ def _create_terminal(
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     provider: Optional[str] = None,
+    cell_request_class: str = "explicit",
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -850,6 +851,11 @@ def _create_terminal(
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
+        # F868/F870 r2 (D4/D5): tell the server-side choke point how this cell
+        # was selected so it applies the right certification asymmetry. assign
+        # already ran the guard client-side (adapter below); the server call is
+        # the shared backstop that also covers direct HTTP.
+        params["cell_request_class"] = cell_request_class
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
@@ -922,6 +928,11 @@ def _create_terminal(
             "agent_profile": agent_profile,
             "session_name": session_name,
         }
+        # F868/F870 r2 (D4/D5): carry the caller's cell classification onto the
+        # new-session route too, so a routing-driven assign that lands here (no
+        # CAO_TERMINAL_ID) is not re-classified EXPLICIT from its resolved
+        # composed-literal name.
+        params["cell_request_class"] = cell_request_class
         if working_directory:
             params["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -2480,6 +2491,10 @@ def _assign_impl(
     # (fork/worktree/supervisor cwd) rewrites it — a remote node interprets the
     # path on its own filesystem, where the resolved one does not exist.
     _requested_working_directory = working_directory
+    # F868/F870 r2 (D5c): snapshot the caller's ORIGINAL agent_profile before any
+    # resume/routing resolution overwrites it, so a bare-position override on
+    # resume can be distinguished from an ordinary continuation.
+    _caller_agent_profile = agent_profile
     terminal_id: Optional[str] = None
     # F754 (#611): a brief citing a dead seat id must not spawn a worker that
     # then has nowhere to report. Checked before the profile/provider
@@ -2616,6 +2631,9 @@ def _assign_impl(
         # apply, never the cert/fallback validator. Detect the routing-driven
         # case BEFORE resolution mutates ``agent_profile``.
         from cli_agent_orchestrator.utils.agent_profiles import (
+            E_PROVIDER_NOT_ALLOWED as E_PROVIDER_NOT_ALLOWED_CODE,
+        )
+        from cli_agent_orchestrator.utils.agent_profiles import (
             AssignmentResolutionError,
             _position_exists,
             resolve_assignment_target,
@@ -2633,6 +2651,17 @@ def _assign_impl(
             _fallback_profile: Optional[str] = None
             _d9_position: Optional[str] = None
             _d9_cell: Optional[str] = None
+            # F868/F870 r2 (D5c): resume is a ROUTING-EQUIVALENT continuation of a
+            # prior spawn — non-gate uncertified allowed with the marker, gate
+            # uncertified refused. A caller-supplied bare-POSITION name on resume
+            # (the caller explicitly named a position, rather than letting the
+            # reaped identity decide the profile) is the caller's EXPLICIT cell
+            # choice and must be PASS-certified. A plain resume (no such override,
+            # or a legacy/composed name) stays routing-equivalent.
+            _resume_override = bool(
+                _caller_agent_profile and _position_exists(_caller_agent_profile)
+            )
+            _cell_request_class = "explicit" if _resume_override else "resume"
         else:
             # F868 #724 — a POSITION-name assign is certification-driven whether
             # the provider comes from routing.toml (``provider is None``) OR is an
@@ -2647,12 +2676,51 @@ def _assign_impl(
             _provider_source = "explicit" if (provider is not None and _position_assign) else None
             _routing_driven = provider is None and _position_assign
             _routing_position = agent_profile if _position_assign else None
+            # F868/F870 r2 (D5): the class threaded to the server-side choke point
+            # backstop. EXPLICIT when the operator supplied provider= on a
+            # position; ROUTING when a bare position resolves its provider from
+            # routing.toml; LEGACY otherwise (no cell).
+            if _position_assign:
+                _cell_request_class = "explicit" if _provider_source == "explicit" else "routing"
+            else:
+                _cell_request_class = "legacy"
 
             try:
                 agent_profile, _resolved_provider = resolve_assignment_target(
                     agent_profile, provider
                 )
             except AssignmentResolutionError as exc:
+                # F868 #724 r2 (B1): an EXPLICIT position override whose provider
+                # is not in the position allowlist must collapse to the ONE typed
+                # E-CELL-UNCERTIFIED (naming position, provider, certified cells)
+                # — never leak E-PROVIDER-NOT-ALLOWED for a position request. The
+                # allowlist check moves INSIDE the shared choke point, which runs
+                # it after position parsing and returns E-CELL-UNCERTIFIED. Route
+                # ONLY the allowlist rejection through the guard; other resolution
+                # errors (unknown position, needs-provider, retired legacy) keep
+                # their own message.
+                if (
+                    _provider_source == "explicit"
+                    and getattr(exc, "code", None) == E_PROVIDER_NOT_ALLOWED_CODE
+                    and provider is not None
+                ):
+                    from cli_agent_orchestrator.utils.cell_guard import (
+                        CellGuardRefused,
+                        guard_cell_admission,
+                    )
+
+                    try:
+                        guard_cell_admission(
+                            _routing_position or _caller_agent_profile,
+                            provider,
+                            request_class="explicit",
+                        )
+                    except CellGuardRefused as _refusal:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": f"Assignment refused (no spawn): {_refusal.message}",
+                        }
                 return {
                     "success": False,
                     "terminal_id": None,
@@ -3139,6 +3207,7 @@ def _assign_impl(
             use_worktree=use_worktree,
             authority_files=authority_files,
             provider=_resolved_provider or _f838_checked_provider,
+            cell_request_class=_cell_request_class,
             **create_kwargs,
         )
 
