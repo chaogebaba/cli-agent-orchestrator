@@ -458,6 +458,61 @@ class TestFalseIdleWorkingSpinner:
                 TerminalStatus.PROCESSING
             ), f"frame {glyph!r} not detected as working"
 
+    # ── #703 r4: live composer-border shapes that carry content before the ──────
+    # closing rule (Opus r3 EMPIRICAL-GATE-NO). The r3 ``$``-after-whitespace tail
+    # asserted "nothing but whitespace/optional-rule follows Working" and regressed
+    # every one of these live rows from PROCESSING to UNKNOWN, re-opening the #703
+    # false-idle from the other side (status_monitor latches the prior status on a
+    # detected UNKNOWN). The r4 tail pins on the CLOSING border rule, so a row that
+    # ENDS on the rule stays PROCESSING however much real content precedes it. Each
+    # fixture is source-derived from the real working-1.txt capture (only the
+    # message+tail substituted; ANSI/chrome preserved) — see the .json sidecars.
+    _OVERFLOW_FIXTURES = (
+        # custom-editor.js:37-40 — hidden-line overflow label inside the rule run.
+        "working-overflow-queued",
+        # interactive-mode.js:1768 — "Working (esc to interrupt)".
+        "working-esc-interrupt",
+        # interactive-mode.js:1906 — extension setWorkingMessage("Working on tool call").
+        "working-on-tool-call",
+    )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_live_border_content_before_closing_rule_is_processing(self, _native) -> None:
+        """The three live pi 0.85.1 working-border shapes that draw real content
+        between ``Working`` and the closing composer rule (overflow ``↑ N more``
+        label, ``(esc to interrupt)``, ``on tool call``) classify PROCESSING —
+        raw AND ANSI-stripped, at dispatched+processing_seen and on a fresh
+        provider. These are the rows the r3 ``$`` tail wrongly rejected."""
+        for name in self._OVERFLOW_FIXTURES:
+            raw = (FIXTURES / "status_truth" / "pi_cli" / f"{name}.txt").read_text(encoding="utf-8")
+            clean = strip_terminal_escapes(raw)
+            assert self._provider(dispatched=True, processing_seen=True).get_status(raw) == (
+                TerminalStatus.PROCESSING
+            ), f"{name}: raw must be PROCESSING (live working border)"
+            assert self._provider(dispatched=True, processing_seen=True).get_status(clean) == (
+                TerminalStatus.PROCESSING
+            ), f"{name}: ANSI-stripped must be PROCESSING"
+            # A fresh provider (no dispatch/processing yet) must not read the live
+            # working border as anything but PROCESSING either.
+            assert self._provider(dispatched=False, processing_seen=False).get_status(raw) == (
+                TerminalStatus.PROCESSING
+            ), f"{name}: fresh-provider raw must be PROCESSING"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_all_glyphs_overflow_and_message_borders_are_processing(self, _native) -> None:
+        """Every canonical glyph, in each of the three live border shapes that
+        carry content before the closing rule, → PROCESSING. Guards the r4
+        closing-rule tail against a future narrowing that only handles the plain
+        frame."""
+        rule = "─" * 90
+        tails = (f"─── ↑ 12 more {rule}", f"(esc to interrupt) {rule}", f"on tool call {rule}")
+        for glyph in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
+            for tail in tails:
+                buffer = f"── {glyph} Working {tail}\n"
+                assert self._provider(dispatched=True).get_status(buffer) == (
+                    TerminalStatus.PROCESSING
+                ), f"glyph {glyph!r} tail {tail[:16]!r} not PROCESSING"
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_spinner_first_shape_is_not_a_live_frame(self, _native) -> None:
         """#703 r3 (codex r2 EMPIRICAL-GATE-NO + LIVE capture): a "spinner-first"

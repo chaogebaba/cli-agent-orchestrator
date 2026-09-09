@@ -116,50 +116,61 @@ _EDITOR_RULE = re.compile(r"^\s*[─━—-]{20,}\s*$")
 # counts, while ordinary ASCII prose that merely says "Working" does not.
 _BRAILLE_SPINNER = r"\u2800-\u28ff"
 
-# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────" or
-# (mid-redraw) "⠴ Working ────".  This is a WHOLE ROW the TUI draws — a braille
-# spinner glyph adjacent to ``Working`` with a Pi box rule (``──…`` run) on the
-# SAME row, on EITHER side of the glyph.  The spinner glyph varies frame to
-# frame, so all frames in the braille block are accepted; the rule may LEAD
-# (``── ⠧ Working ──``) or TRAIL (mid-redraw ``⠴ Working ────``, spinner-first)
-# so a redraw that draws the trailing rule first still matches (#703 F847, the
-# genuine false-idle frame the base rule-must-lead regex missed).
+# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────".  This
+# is a WHOLE ROW the TUI draws — a Pi box rule (``──…`` run) LEADING a braille
+# spinner glyph adjacent to ``Working``, the row then ending on the composer's
+# closing border rule (see ``_WORKING_TAIL`` below).  The spinner glyph varies
+# frame to frame, so all frames in the braille block are accepted.  The row is
+# always RULE-LEADING: a live capture of pi 0.85.1 (#703 r3) found zero
+# spinner-first frames, and ``CustomEditor.renderTopBorder`` prepends a rule on
+# every branch while ``WorkingStatusIndicator.renderInBorder`` returns the
+# glyph+message with no rule of its own — the r2 "spinner-first" alternative was
+# removed in r3.
 #
-# F847 r2 (#703): the match is now BRAILLE-ONLY and a WHOLE-ROW anchor
-# (``^…$`` under MULTILINE), and a same-row box rule is REQUIRED, for two
-# reasons the r1 shape got wrong (codex EMPIRICAL-GATE-NO):
+# F847 r2 (#703): the match is BRAILLE-ONLY and requires a same-row box rule, for
+# two reasons the r1 shape got wrong (codex EMPIRICAL-GATE-NO):
 #   1. r1's first alternative made the rule OPTIONAL, so bare
 #      ``⠦ Working on the summary now`` PROSE fired PROCESSING. Requiring a
-#      same-row rule and anchoring the row fixes that overmatch.
+#      same-row rule fixes that overmatch.
 #   2. r1 also carried permissive ``\S? Working`` NON-braille alternatives, so a
 #      stray non-spinner glyph matched and — worse — those alternatives MASKED
 #      the braille class entirely (narrowing the braille set to one glyph still
-#      matched every spinner-first frame via ``\S?``, so the ledger's glyph
-#      mutant would survive). Every real pi spinner in the capture corpus uses a
-#      braille frame, so the non-braille alternatives are dropped: the braille
-#      class is now the sole gate on which glyphs count as a live spinner.
+#      matched via ``\S?``, so the ledger's glyph mutant would survive). Every
+#      real pi spinner in the capture corpus uses a braille frame, so the
+#      non-braille alternatives are dropped: the braille class is now the sole
+#      gate on which glyphs count as a live spinner.
 # Positional scoping to the live bottom-of-viewport status region (and
 # fence-dropping) is done by ``_live_working_spinner`` (r1's whole-buffer
 # ``.search`` overmatched a fenced quote and a stale spinner 40 rows above the
 # composer).
 _RULE_RUN = r"[─━—\-]{2,}"
-# F847 r3 (#703): the row is now anchored at BOTH ends (``^…$`` under MULTILINE).
-# r2 left the row unanchored at the tail (``Working\b`` with no ``$``), and
-# ``_live_working_spinner`` matches with ``re.match`` — which accepts a matching
-# PREFIX — so a transcript row that merely OPENS with the spinner chrome, e.g.
-# ``── ⠦ Working ── was quoted in the previous answer.``, fired PROCESSING even
-# though the report and comments both claim a WHOLE-ROW anchor (codex r2
-# EMPIRICAL-GATE-NO, the unmutated missing end anchor). The genuine live rows
-# end in the composer box rule with no trailing prose:
-#   rule-leading:  ── ⠧ Working ──────────  (trailing rule optional in r2 draw)
-#   spinner-first: ⠴ Working ────────────   (trailing rule required)
-# so after ``Working`` the ONLY thing a live row may carry to end-of-line is
-# whitespace and an optional box-rule run. ``_WORKING_TAIL`` encodes exactly
-# that and pins ``$``; any trailing prose (a sentence, a quote, more words) now
-# fails the whole-row match and is treated as transcript.
-_WORKING_TAIL = r"[ \t]*(?:" + _RULE_RUN + r"[ \t]*)?$"
+# F847 r4 (#703) — the tail is pinned on the CLOSING BORDER RULE, not on ``$``
+# after whitespace/optional-rule (Opus r3 EMPIRICAL-GATE-NO). The r3 tail
+# ``[ \t]*(?:_RULE_RUN[ \t]*)?$`` asserted "the ONLY thing a live row may carry
+# to end-of-line is whitespace and an optional box-rule run" — a descriptive
+# absolute that pi 0.85.1's own composer border code contradicts on three live
+# paths (all regressed 40/40 live frames from PROCESSING to UNKNOWN on the r3
+# head, re-opening the #703 false-idle harm from the other side).
+#
+# What holds across every live draw is that the row IS the composer TOP BORDER
+# and therefore ENDS on the border rule — NOT that nothing follows ``Working``.
+# Pi draws real content between the message and that closing rule:
+#   ── ⠧ Working ─────────────           (the plain turn/resize frame)
+#   ── ⠧ Working ─── ↑ 15 more ───────   (custom-editor.js:37-40 overflow label,
+#      drawn whenever the composer holds hidden lines while a turn runs — an
+#      operator typing the next message mid-turn is ordinary behaviour)
+#   ── ⠧ Working (esc to interrupt) ───  (interactive-mode.js:1768)
+#   ── ⠹ Working on tool call ────────   (interactive-mode.js:1906, extension-set;
+#      CAO launches pi with --mcp-config, so extensions are on)
+# So the tail is pinned on the CLOSING rule instead of on "whitespace only":
+# a transcript row ends in a word or punctuation and still fails the whole-row
+# match, while a live working row — whatever content precedes it — ends on the
+# border rule. This also admits the one-``─`` narrow-width branch
+# (custom-editor.js:46-47) that the r3 ``_RULE_RUN{2,}`` tail rejected.
+_WORKING_TAIL = r"[^\n]*?[─━—\-]+[ \t]*$"
 _WORKING_ROW = re.compile(
-    # rule-leading: ── ⠧ Working ─(─…)?  then whitespace/optional-rule to EOL
+    # rule-leading: ── ⠧ Working …<closing rule> — a leading box rule, the braille
+    # glyph, ``Working``, then any content ending on the closing composer rule.
     r"^[ \t]*" + _RULE_RUN + r"[ \t]*[" + _BRAILLE_SPINNER + r"][ \t]*Working\b" + _WORKING_TAIL,
     re.IGNORECASE | re.MULTILINE,
 )

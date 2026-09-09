@@ -1,0 +1,7 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "source-derived from working-1.txt: only the working-row message+tail was substituted, preserving the real capture's verbatim ANSI colouring, composer chrome, footer and byte structure.",
+  "derivation": "pi 0.85.1 CustomEditor.renderTopBorder overflow branch (pi-coding-agent/dist/modes/interactive/components/custom-editor.js:37-40) draws the hidden-line label INSIDE the trailing rule run while a turn is active and the composer holds hidden lines (e.g. an operator typing the next message mid-turn): '── \u2827 Working \u2500\u2500\u2500 \u2191 15 more \u2500\u2500\u2500'.",
+  "notes": "Opus r3 EMPIRICAL-GATE-NO: the r3 '$'-after-whitespace/optional-rule tail regressed this live row from PROCESSING to UNKNOWN (40/40 live frames), re-opening the #703 false-idle from the other side. r4 pins the tail on the CLOSING border rule; this fixture must classify PROCESSING (raw + ANSI-stripped)."
+}

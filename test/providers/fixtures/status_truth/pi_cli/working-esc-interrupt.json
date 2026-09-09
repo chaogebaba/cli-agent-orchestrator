@@ -1,0 +1,7 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "source-derived from working-1.txt: only the working-row message+tail was substituted, preserving the real capture's verbatim ANSI colouring, composer chrome, footer and byte structure.",
+  "derivation": "pi 0.85.1 interactive-mode.js:1768 sets exactly this message on the ACTIVE working indicator: '── \u2827 Working (esc to interrupt) \u2500\u2500\u2500\u2500'.",
+  "notes": "Opus r3 EMPIRICAL-GATE-NO: the r3 '$'-tail regressed this live row from PROCESSING to UNKNOWN. r4 closing-rule tail must classify it PROCESSING (raw + ANSI-stripped)."
+}
