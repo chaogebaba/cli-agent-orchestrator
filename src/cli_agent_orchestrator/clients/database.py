@@ -5315,14 +5315,29 @@ def publish_current_terminal(
         )
 
 
-def set_conversation_lifecycle(identity_key: str, lifecycle: str) -> None:
-    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach)."""
+def set_conversation_lifecycle(
+    identity_key: str,
+    lifecycle: str,
+    *,
+    artifact_locator: Optional[str] = None,
+) -> None:
+    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach).
+
+    F867 (#723) r2 R2-1: when ``artifact_locator`` is supplied it is persisted
+    onto the root in the SAME transaction as the lifecycle write, so a hibernate
+    commit lands the discovered recoverable-artifact path atomically with the
+    ``hibernated`` lifecycle. A ``None`` locator leaves the stored value intact
+    (never blanks a previously-bound locator).
+    """
     with SessionLocal.begin() as db:
+        _fields: Dict[Any, Any] = {
+            ConversationIdentityModel.lifecycle: lifecycle,
+            ConversationIdentityModel.updated_at: _utcnow(),
+        }
+        if artifact_locator is not None:
+            _fields[ConversationIdentityModel.artifact_locator] = artifact_locator
         db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
-            {
-                ConversationIdentityModel.lifecycle: lifecycle,
-                ConversationIdentityModel.updated_at: _utcnow(),
-            },
+            _fields,
             synchronize_session=False,
         )
 

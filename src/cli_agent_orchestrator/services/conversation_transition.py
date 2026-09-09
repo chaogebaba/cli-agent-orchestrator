@@ -141,6 +141,13 @@ def commit_hibernate(decision: HibernateDecision) -> None:
     Only writes when the decision allowed a hibernate AND named a lifecycle
     (i.e. there was an F829 root and its artifact validated). Records a
     ``hibernated`` event with the validated artifact locator.
+
+    F867 (#723) r2 R2-1: the discovered recoverable-artifact locator is PERSISTED
+    onto the root (not merely recorded in the event), in the same transaction as
+    the lifecycle write. Without this, ``evaluate_planned_hibernate`` finds the
+    JSONL and returns it in ``HibernateDecision.artifact_locator`` but the root's
+    column stays NULL, so the pi resume arm later raises ``pi_artifact_locator_null``
+    and the hibernated conversation is not actually resumable.
     """
     if not decision.allowed or decision.lifecycle is None or decision.identity_key is None:
         return
@@ -149,7 +156,11 @@ def commit_hibernate(decision: HibernateDecision) -> None:
         set_conversation_lifecycle,
     )
 
-    set_conversation_lifecycle(decision.identity_key, decision.lifecycle)
+    set_conversation_lifecycle(
+        decision.identity_key,
+        decision.lifecycle,
+        artifact_locator=decision.artifact_locator,
+    )
     record_conversation_event(
         decision.identity_key,
         "hibernated",

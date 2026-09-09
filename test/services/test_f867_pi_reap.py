@@ -295,3 +295,204 @@ def test_terminal_exclusive_same_id_is_exclusive():
     assert b is not None
     m.release_session_lifecycle_terminal_exclusive(a)
     m.release_session_lifecycle_terminal_exclusive(b)
+
+
+# ===========================================================================
+# F867 r2 — fold codex EMPIRICAL-GATE-NO (verdict-f867-r1)
+# ===========================================================================
+
+
+def test_r2_1_commit_hibernate_persists_locator_and_resume_arm_uses_it(
+    real_sqlite_env, monkeypatch
+):
+    """R2-1 (verdict §1, the adversary shape): evaluate finds the JSONL →
+    commit_hibernate persists it onto the root → the pi resume arm launches with
+    ``--session <that JSONL>`` (no pi_artifact_locator_null).
+
+    Fail-before: without R2-1a, commit_hibernate left root.artifact_locator None
+    and prepare_resume raised pi_artifact_locator_null."""
+    from pathlib import Path
+
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    tid = "r2locaaa"
+    session = "cao-r2loc"
+    sess_dir = Path(real_sqlite_env["tmp_path"]) / "pi-sessions"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = sess_dir / f"2026-09-09T20-00-00-000Z_{tid}.jsonl"
+    jsonl.write_text('{"x":1}\n')
+
+    d.create_terminal(
+        terminal_id=tid,
+        tmux_session=session,
+        tmux_window=f"win-{tid}",
+        agent_profile="empirical_reviewer_lite",
+        provider="pi_cli",
+    )
+    # Bind the spawn identity with the session dir as namespace (as create does),
+    # an explicit owner so the resume authorize gate passes, and a REAL cwd so
+    # the resume cwd-reconstruction gate is satisfied (this test isolates the
+    # locator, not cwd provenance).
+    _cwd = str(real_sqlite_env["tmp_path"])
+    d.mint_spawn_identity(
+        identity_key=f"conv_{tid}",
+        provider="pi_cli",
+        provider_namespace=str(sess_dir),
+        agent_profile="empirical_reviewer_lite",
+        model=None,
+        reasoning_effort=None,
+        origin_callback_ref=None,
+        current_terminal_id=tid,
+        cwd=_cwd,
+        owner_principal="owner-1",
+    )
+    ct.attach_captured_uuid(
+        tid, provider_session_id=tid, provider="pi_cli", provider_namespace=str(sess_dir)
+    )
+
+    # Evaluate → allowed, locator discovered.
+    decision = ct.evaluate_planned_hibernate(tid)
+    assert decision.allowed and decision.lifecycle == "hibernated"
+    assert decision.artifact_locator == str(jsonl)
+
+    # Commit → the locator is PERSISTED onto the root (R2-1a).
+    ct.commit_hibernate(decision)
+    root = d.get_conversation_identity(f"conv_{tid}")
+    assert root["artifact_locator"] == str(jsonl), "commit_hibernate must persist the JSONL locator"
+    assert root["lifecycle"] == "hibernated"
+
+    # The pi resume arm reads that locator and would launch pi with --session it,
+    # WITHOUT raising pi_artifact_locator_null. Resolve through the F829 identity
+    # path (owner authorises); assert the JSONL rides into session_artifact_path.
+    from cli_agent_orchestrator.services import resume_service
+
+    prepared = resume_service._prepare_resume_via_identity(
+        resume_from=tid,
+        requested_agent_profile=None,
+        requested_working_directory=None,
+        caller_principal="owner-1",
+        inherit_pins=True,
+    )
+    assert prepared is not None
+    assert prepared["session_artifact_path"] == str(jsonl)
+    assert prepared["fork_context"].session_artifact_path == str(jsonl)
+
+
+def test_r2_1_reap_resolver_reports_pi_resumable(real_sqlite_env, monkeypatch):
+    """R2-1b (MUTANT (b) guard): a pi lane whose root has a captured id reports
+    resumable=true with reason 'resumable' (was provider_pi_cli_not_resumable
+    because the resolver read only legacy supports_resume)."""
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    tid = "r2reapaa"
+    session = "cao-r2reap"
+    d.create_terminal(
+        terminal_id=tid,
+        tmux_session=session,
+        tmux_window=f"win-{tid}",
+        agent_profile="empirical_reviewer_lite",
+        provider="pi_cli",
+        provider_session_id=tid,
+    )
+    d.mint_spawn_identity(
+        identity_key=f"conv_{tid}",
+        provider="pi_cli",
+        provider_namespace="/data/cao-scratch/x",
+        agent_profile="empirical_reviewer_lite",
+        model=None,
+        reasoning_effort=None,
+        origin_callback_ref=None,
+        current_terminal_id=tid,
+        cwd="/data/cao-scratch/x",
+    )
+    # Fill the terminal_identity row's provider_session_id (as create's bind does).
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    ct.attach_captured_uuid(
+        tid, provider_session_id=tid, provider="pi_cli", provider_namespace="/data/cao-scratch/x"
+    )
+
+    captured, resumable, reason = ts._resolve_reap_resume_key(
+        tid, d.get_terminal_metadata(tid), force=False
+    )
+    assert resumable is True, (captured, resumable, reason)
+    assert reason == "resumable"
+
+
+def test_r2_1_provider_supports_resume_honors_declared_capabilities():
+    """R2-1b unit: provider_supports_resume is True for pi_cli via
+    declared_capabilities['resume'] even though it sets no legacy supports_resume."""
+    from cli_agent_orchestrator.services.resume_service import provider_supports_resume
+
+    assert provider_supports_resume("pi_cli") is True
+    # codex/kiro (legacy flag) remain resumable; an unknown provider is not.
+    assert provider_supports_resume("codex") is True
+    assert provider_supports_resume("no_such_provider") is False
+
+
+def test_r2_2_delayed_create_after_parent_force_delete_is_refused(real_sqlite_env, monkeypatch):
+    """R2-2 (verdict §2 adversary, restores the §3 no-late-publication invariant):
+    an admitted same-session create whose captured caller_id was force-deleted
+    between admission and publication is REFUSED with E-CALLER-GONE and publishes
+    NO child row.
+
+    Fail-before: without the fail-closed revalidation, the child row was
+    published pointing at a dead caller_id."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    session = "cao-r2race"
+    parent = "r2parent0"
+    child = "r2child00"
+    # Seed a live parent.
+    d.create_terminal(
+        terminal_id=parent,
+        tmux_session=session,
+        tmux_window=f"win-{parent}",
+        agent_profile="developer",
+        provider="pi_cli",
+    )
+    # Simulate the parent being under teardown (delete_terminal marks this BEFORE
+    # killing the window) AND then gone.
+    from cli_agent_orchestrator.services.teardown_intent_service import mark_teardown
+
+    mark_teardown(parent)
+    d.delete_terminal(parent)  # parent row removed → caller now missing
+
+    # A backend/profile stub so create reaches the publication gate.
+    monkeypatch.setattr(ts, "get_backend", lambda: MagicMock())
+    monkeypatch.setattr(
+        ts,
+        "load_agent_profile",
+        lambda _n: SimpleNamespace(
+            sessionBrief=None,
+            lifecycle=None,
+            contextPolicy=None,
+            name="developer",
+            skills=None,
+            allowedTools=None,
+            role=None,
+            mcpServers=None,
+            engine=None,
+            default_use_worktree=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="E-CALLER-GONE"):
+        asyncio.run(
+            ts.create_terminal(
+                "pi_cli",
+                "developer",
+                session_name=session,
+                new_session=False,
+                caller_id=parent,
+                terminal_id=child,
+            )
+        )
+    # No child row was published.
+    assert d.get_terminal_metadata(child) is None

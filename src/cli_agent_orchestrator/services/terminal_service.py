@@ -2558,6 +2558,44 @@ async def create_terminal(
                     # F129: Pass authority_files through to the DB publication function
                     if authority_files:
                         init_fields["authority_files"] = authority_files
+                    # F867 (#723) r2 R2-2 (verdict §2): FAIL-CLOSED caller
+                    # revalidation immediately before publication. Terminal-scoped
+                    # force delete no longer conflicts with an unrelated sibling's
+                    # session SHARED lease (the r1 fix), but that also means an
+                    # ADMITTED same-session create whose parent was force-deleted
+                    # between admission and here could otherwise publish a child
+                    # pointing at a dead caller_id. So, still under the lifecycle
+                    # lock and BEFORE the row is made visible, re-check that a
+                    # child create's captured caller still exists AND is not under
+                    # teardown; refuse (typed E-CALLER-GONE) otherwise. The refusal
+                    # leaves NO row and unwinds through the same rollback/lease
+                    # release path as any other pre-publication failure (the outer
+                    # except releases the cap lock + lifecycle/uuid leases and
+                    # rolls back the backend resource).
+                    #
+                    # Scoped to an EXISTING-session child create (``not
+                    # new_session``): that is the admission→publication window the
+                    # verdict names. A new-session launch has no same-session
+                    # parent to have vanished, and its caller_id is the launcher,
+                    # not a co-session terminal, so it is never gated. caller_id is
+                    # None for a top-level supervisor/operator create — never gated.
+                    if caller_id and not new_session:
+                        from cli_agent_orchestrator.services.teardown_intent_service import (
+                            active_teardown_scope_keys,
+                        )
+
+                        _caller_meta = get_terminal_metadata(caller_id)
+                        _teardown_keys = active_teardown_scope_keys()
+                        _caller_gone = _caller_meta is None
+                        _caller_tearing_down = (
+                            caller_id in _teardown_keys or session_name in _teardown_keys
+                        )
+                        if _caller_gone or _caller_tearing_down:
+                            _why = "missing" if _caller_gone else "under_teardown"
+                            raise RuntimeError(
+                                f"E-CALLER-GONE: caller '{caller_id}' {_why} at publication "
+                                f"of child '{terminal_id}'; refusing to publish an orphan child"
+                            )
                     # F439 (#294) round 5 / BLOCKER 1: mark this create's terminal id as a
                     # reserved-but-publishing slot BEFORE the row is made visible below.
                     # From this instant the row — the moment it appears in the listing —
@@ -2759,6 +2797,12 @@ async def create_terminal(
                         _created_window_name,
                         created_session=_created_session,
                     )
+                    # F867 (#723) r2 R2-2: preserve the typed caller-gone refusal
+                    # verbatim (do NOT reshape it into db_publish_failed) so the
+                    # caller sees E-CALLER-GONE and knows the create was refused
+                    # because its parent vanished, not that the DB write failed.
+                    if str(exc).startswith("E-CALLER-GONE"):
+                        raise
                     if lease_token is not None:
                         raise RuntimeError("db_publish_failed") from exc
                     raise
@@ -3031,10 +3075,30 @@ async def create_terminal(
         # completed turn — correctly unrecoverable, D8 — VALID after), so binding
         # here never fabricates recoverability.
         if not _is_resume_spawn:
+            # F867 (#723) r2 (verdict §4): a provider that DECLARES resume/capture
+            # must not SILENTLY degrade if its known-at-spawn identity fails to
+            # bind (hook raises, malformed return, attach_captured_uuid raises or
+            # reports a non-success status, or a bound-uniqueness conflict). A
+            # silent debug-only "bind nothing and continue" leaves the lane
+            # advertised as capture/resume-capable while re-creating the null-id
+            # hibernate refusal. So for such a provider we WARN and record a typed
+            # ``capture_bind_failed`` event on the F829 root (observable telemetry
+            # naming the reason); a provider that declares neither is unaffected.
+            _declares_capture_or_resume = False
+            try:
+                _decl = getattr(provider_instance, "declared_capabilities", None)
+                _declares_capture_or_resume = bool(
+                    isinstance(_decl, dict) and (_decl.get("capture") or _decl.get("resume"))
+                )
+            except Exception:
+                _declares_capture_or_resume = False
+
+            _spawn_ident = None
+            _bind_failure_reason: Optional[str] = None
             try:
                 _spawn_ident = provider_instance.spawn_captured_identity()
             except Exception:
-                _spawn_ident = None
+                _bind_failure_reason = "spawn_captured_identity_raised"
                 logger.debug(
                     "f867 spawn_captured_identity raised for %s", terminal_id, exc_info=True
                 )
@@ -3042,28 +3106,66 @@ async def create_terminal(
             # whose id is a non-empty str is bound. A provider that returns None
             # (the base default) or any other shape — including a test double's
             # MagicMock — is ignored, never unpacked blindly.
-            if (
+            _well_formed = (
                 isinstance(_spawn_ident, tuple)
                 and len(_spawn_ident) == 3
                 and isinstance(_spawn_ident[0], str)
-                and _spawn_ident[0]
-            ):
-                _psid, _pns, _ploc = _spawn_ident
+                and bool(_spawn_ident[0])
+            )
+            if _well_formed:
+                _psid, _pns, _ploc = _spawn_ident  # type: ignore[misc]
                 try:
                     from cli_agent_orchestrator.services.conversation_transition import (
                         attach_captured_uuid,
                     )
 
-                    attach_captured_uuid(
+                    _bind = attach_captured_uuid(
                         terminal_id,
                         provider_session_id=_psid,
                         provider=provider,
                         provider_namespace=_pns,
                         artifact_locator=_ploc,
                     )
+                    _bind_status = (_bind or {}).get("status")
+                    if _bind_status not in ("captured", "resume_published", "no_root"):
+                        _bind_failure_reason = f"bind_{_bind_status or 'unknown'}"
+                except Exception:
+                    _bind_failure_reason = "attach_captured_uuid_raised"
+                    logger.debug(
+                        "f867 spawn-identity bind raised for %s", terminal_id, exc_info=True
+                    )
+            elif _spawn_ident is not None and _bind_failure_reason is None:
+                # A non-None but malformed return from a provider that opted in.
+                _bind_failure_reason = "spawn_identity_malformed"
+
+            # Non-silent degradation ONLY for a provider that declared the
+            # capability; a None return from a non-capturing provider is normal
+            # and never a failure.
+            if _bind_failure_reason is not None and _declares_capture_or_resume:
+                logger.warning(
+                    "f867 capture bind FAILED for %s (provider=%s declares capture/resume): "
+                    "%s — lane will not be resumable via a captured spawn identity",
+                    terminal_id,
+                    provider,
+                    _bind_failure_reason,
+                    exc_info=True,
+                )
+                try:
+                    from cli_agent_orchestrator.clients.database import (
+                        record_conversation_event,
+                    )
+
+                    record_conversation_event(
+                        f"conv_{terminal_id}",
+                        "capture_bind_failed",
+                        terminal_id=terminal_id,
+                        detail={"provider": provider, "reason": _bind_failure_reason},
+                    )
                 except Exception:
                     logger.debug(
-                        "f867 spawn-identity bind skipped for %s", terminal_id, exc_info=True
+                        "f867 capture_bind_failed event write skipped for %s",
+                        terminal_id,
+                        exc_info=True,
                     )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -7437,18 +7539,7 @@ def delete_terminal(
     caller_id: str | None = None,
 ) -> dict[str, Any]:
     """Cascade-delete a terminal's managed descendant tree."""
-    from cli_agent_orchestrator.services.rebind_lease import (
-        acquire_rebind_lease,
-        release_rebind_lease,
-    )
-    from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_exclusive,
-        release_session_lifecycle_lease,
-    )
-    from cli_agent_orchestrator.services.terminal_guard_service import (
-        TerminalProtectionError,
-        require_delete_allowed,
-    )
+    from cli_agent_orchestrator.services.terminal_guard_service import require_delete_allowed
 
     root = get_terminal_metadata(terminal_id)
     if root is None:
