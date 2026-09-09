@@ -814,16 +814,18 @@ class _FakeUploadPage:
         return None
 
 
-def test_wait_upload_complete_returns_when_spinner_gone_and_send_enabled() -> None:
-    # Success path: after one "still uploading" tick the composer reaches the
-    # complete state (spinner gone, send enabled). _wait_upload_complete returns
-    # without raising.
+def test_wait_upload_complete_returns_when_send_enabled_despite_lingering_spinner() -> None:
+    # Success path (live-observed edge): a page-global upload spinner can linger
+    # after the upload actually finishes. Send-enabled is the authoritative
+    # completion signal, so _wait_upload_complete must return even while
+    # `spinning` is still True — otherwise it falsely times out (user-confirmed:
+    # "the upload is done" with send already enabled).
     import asyncio
 
     page = _FakeUploadPage(
         [
             {"spinning": True, "send_present": True, "send_enabled": False},
-            {"spinning": False, "send_present": True, "send_enabled": True},
+            {"spinning": True, "send_present": True, "send_enabled": True},
         ]
     )
     from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import Transport

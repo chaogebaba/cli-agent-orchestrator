@@ -371,11 +371,16 @@ class Transport:
     async def _wait_upload_complete(self, filename: str, *, timeout_s: float = 90.0) -> None:
         """Wait for the upload-COMPLETE state before Enter (r3).
 
-        Complete = the decorative upload spinner is GONE (no ``.animate-spin`` /
-        ``[role=progressbar]`` near the chip) AND the send button is present and
-        ENABLED. On timeout, record a DOM excerpt under the artifacts dir and
-        raise the typed ``attach_timeout`` condition rather than hanging to the
-        process watchdog.
+        The AUTHORITATIVE completion signal is the send button being present and
+        ENABLED — that is the state in which ChatGPT accepts the turn with the
+        attachment. A page-global upload spinner (``.animate-spin`` /
+        ``[role=progressbar]``) is NOT a reliable veto: live runs show unrelated
+        chrome keeps such a node mounted after the upload finishes, so requiring
+        "spinner gone" produced a false ``attach_timeout`` while send was already
+        enabled (user-confirmed: "the upload is done"). We therefore gate on
+        send-enabled; the spinner is captured only for diagnostics. On timeout,
+        record a DOM excerpt under the artifacts dir and raise the typed
+        ``attach_timeout`` condition rather than hanging to the process watchdog.
         """
         import time as _time
 
@@ -393,8 +398,13 @@ class Transport:
                 "  return {spinning, send_present, send_enabled};\n"
                 "}"
             )
-            if not last.get("spinning") and last.get("send_enabled"):
-                logger.debug("chatgpt_web upload complete: spinner gone, send enabled")
+            # Send-enabled is the authoritative upload-complete signal; a lingering
+            # page-global spinner must NOT veto an enabled send button.
+            if last.get("send_enabled"):
+                logger.debug(
+                    "chatgpt_web upload complete: send enabled (spinner=%s)",
+                    last.get("spinning"),
+                )
                 return
             await self.page.wait_for_timeout(1000)
         # Timed out waiting for upload-complete — record the DOM state and emit a
@@ -402,7 +412,7 @@ class Transport:
         self._record_stall_dom("attach_timeout", filename, last)
         raise RunnerError(
             RunnerErrorCode.ATTACH_TIMEOUT,
-            f"attachment did not reach upload-complete (spinner gone + send enabled) "
+            f"attachment did not reach upload-complete (send button enabled) "
             f"within {int(timeout_s)}s; last DOM state {last}",
             delivery_state=DeliveryState.NOTHING_SENT,
         )
