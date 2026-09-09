@@ -338,9 +338,9 @@ def test_resume_threads_resume_cell_class(monkeypatch):
     point re-classifies the resumed cell as routing-equivalent (non-gate
     uncertified allowed with the marker, gate uncertified refused)."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    p_id, p_pins, p_isdir, p_create, p_meta, p_win, p_dn = _resume_patches()
-    with p_id, p_pins, p_isdir, p_create as create, p_meta, p_win, p_dn:
-        result = server._assign_impl("kiro_dev", "task", resume_from="old12345")
+    p_create, p_meta, p_win, p_dn = _shim_patches()
+    with p_create as create, p_meta, p_win, p_dn:
+        result = server._assign_impl("kiro_dev", "task", resume_from="old12345", working_directory="/repo/wt")
     assert result["success"] is True
     assert create.call_args.kwargs["cell_request_class"] == "resume"
 
@@ -351,11 +351,8 @@ def test_resume_bare_position_override_threads_explicit_cell_class(monkeypatch):
     recorded identity's kiro_dev), so it threads cell_request_class="explicit"
     and must be PASS-certified."""
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    p_id, p_pins, p_isdir, p_create, p_meta, p_win, p_dn = _resume_patches()
+    p_create, p_meta, p_win, p_dn = _shim_patches()
     with (
-        p_id,
-        p_pins,
-        p_isdir,
         p_create as create,
         p_meta,
         p_win,
@@ -366,6 +363,6 @@ def test_resume_bare_position_override_threads_explicit_cell_class(monkeypatch):
             return_value=True,
         ),
     ):
-        result = server._assign_impl("dev", "task", resume_from="old12345")
+        result = server._assign_impl("dev", "task", resume_from="old12345", working_directory="/repo/wt")
     assert result["success"] is True
     assert create.call_args.kwargs["cell_request_class"] == "explicit"
