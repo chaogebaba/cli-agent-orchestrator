@@ -18,6 +18,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator
@@ -597,3 +598,105 @@ def isolated_memory_db(tmp_path, monkeypatch):
         yield engine
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# F767 (#624): FIFO reader thread leak — deterministic teardown + leak guard
+# ---------------------------------------------------------------------------
+# A test that exercised the real create_terminal() flow (or called
+# fifo_manager.create_reader directly) started a daemon reader thread but often
+# never called stop_reader. Those daemon threads do not block interpreter exit,
+# but at process shutdown — while they are still spinning in select()/os.read()
+# — the interpreter tears their module globals down underneath them and each
+# raises, printing an "Exception ignored in thread" traceback to stderr. A full
+# suite that leaks many readers compounded this into ~42 MB of stderr (WP-ARCH
+# 3b build lane, grok-box-004 2026-09-05) that swamped the pytest reporting
+# stream and cost two wasted A/B arms until stderr was redirected to its own
+# file. Two guards below:
+#   (1) per-test autouse teardown: drain any leaked FIFO readers deterministically
+#       so none survive into shutdown;
+#   (2) session-scoped guard: fail the run if any NON-DAEMON thread the suite
+#       started outlives it (a genuinely un-collectable thread — every CAO
+#       application thread is daemon=True by construction).
+
+
+@pytest.fixture(autouse=True)
+def _drain_leaked_fifo_readers() -> Iterator[None]:
+    """Stop any FIFO reader/watchdog threads a test left running (issue #624).
+
+    Reads sys.modules rather than importing fifo_reader unconditionally: the
+    module is only present once a test has touched the terminal/FIFO stack, so
+    a trivial test that never imports it pays nothing and its process state is
+    unchanged (same discipline as _isolate_terminal_service_registries above).
+
+    Teardown surfaces failures rather than swallowing them (issue #624 §Gate
+    blocker 3): a blanket ``except Exception: pass`` erased exactly the cleanup
+    failures this fixture exists to catch. Instead:
+
+    - if ``stop_all_readers`` RAISES, the exception propagates and pytest
+      reports the test in error (nothing is masked);
+    - if ``stop_all_readers`` returns a non-empty survivor list (readers that
+      refused to die within the join bound), the fixture fails the test with the
+      survivor ids, so a genuine teardown leak is loud instead of silent.
+
+    Running in teardown (after ``yield``), a failure here is reported against
+    the just-finished test without erasing that test's own body result — a
+    passing body still surfaces the leak, a failing body still surfaces its own
+    assertion.
+    """
+    yield
+    module = sys.modules.get("cli_agent_orchestrator.services.fifo_reader")
+    if module is None:
+        return
+    fifo_manager = getattr(module, "fifo_manager", None)
+    if fifo_manager is None:
+        return
+    survivors = fifo_manager.stop_all_readers()
+    if survivors:
+        pytest.fail(
+            "FIFO reader thread(s) survived teardown drain: "
+            f"{', '.join(survivors)}. stop_all_readers() could not join them "
+            "within the bound — a reader was leaked (issue #624)."
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_leaked_non_daemon_threads() -> Iterator[None]:
+    """Fail the session if a non-daemon thread the suite started survives it.
+
+    Baselines the non-daemon threads alive at session start (pytest's own
+    machinery, the interpreter's) and asserts no NEW non-daemon thread is still
+    alive at session end. A leaked reader thread is daemon, so this does not
+    catch it directly — guard (1) handles that class — but it is the durable
+    backstop the issue asks for: any thread that could actually block a clean
+    interpreter exit is a hard failure, surfaced by name.
+
+    Third-party test-machinery threads are excluded by name prefix: the
+    ``pytest-timeout`` plugin runs a NON-daemon per-item ``Timer`` thread named
+    after the current test node id, and the timer for the final test can still
+    be alive at session teardown — that is the plugin's business, not a CAO
+    leak, so it must not fail the run.
+    """
+    # Prefixes of threads owned by test machinery / third-party plugins, not by
+    # CAO code. pytest-timeout names its Timer thread "<plugin> <nodeid>".
+    _IGNORED_THREAD_PREFIXES = ("pytest_timeout", "pytest-timeout")
+
+    baseline = {t.ident for t in threading.enumerate()}
+    yield
+    survivors = [
+        t
+        for t in threading.enumerate()
+        if t.ident not in baseline
+        and t is not threading.main_thread()
+        and t.is_alive()
+        and not t.daemon
+        and not t.name.startswith(_IGNORED_THREAD_PREFIXES)
+    ]
+    if survivors:
+        names = ", ".join(sorted(f"{t.name}(id={t.ident})" for t in survivors))
+        pytest.fail(
+            "Non-daemon thread(s) leaked past the test session: "
+            f"{names}. A surviving non-daemon thread blocks a clean interpreter "
+            "exit and points at a service/fixture that started a thread without "
+            "joining it (issue #624)."
+        )

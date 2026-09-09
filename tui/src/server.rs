@@ -694,6 +694,14 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::VerifyScope => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifySuiteLog => None,
+        // F829 `cao identity *` + `cao terminal hibernated` are classified HIDE (F829
+        // diagnostics / owner-authorised recovery ops), so the TUI never routes them; these
+        // arms exist only because the match is exhaustive on purpose.
+        CommandId::TerminalHibernated => None,
+        CommandId::IdentityList => None,
+        CommandId::IdentityDiag => None,
+        CommandId::IdentityAttach => None,
+        CommandId::IdentityClaim => None,
         // `cao workflow approve` is classified HIDE, so the TUI never routes it — and this arm
         // exists only because the match is exhaustive on purpose. It is deliberately `None` rather
         // than a real binding: routing a command the TUI does not offer would build a reachable

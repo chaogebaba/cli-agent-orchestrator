@@ -174,6 +174,33 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
+def _f829_resolve_caller_principal() -> Optional[str]:
+    """F829 D3: the caller's DURABLE principal for resume authorization.
+
+    The owner_principal stored on a conversation root is the seat's durable
+    mailbox id (the migration set it from ``terminals.caller_mailbox_id``), NOT a
+    disposable terminal id. Resolve THIS caller's mailbox the same way: read the
+    current terminal's metadata over HTTP and return its ``caller_mailbox_id``.
+    Falls back to the terminal id when no mailbox is recorded (a top-level
+    supervisor), and to None when there is no terminal at all. Best-effort: a
+    lookup failure returns None (authorize then treats it as not-owner, which is
+    the safe default — a resume is refused rather than wrongly granted).
+    """
+    terminal_id = _current_terminal_id()
+    if not terminal_id:
+        return None
+    try:
+        resp = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        resp.raise_for_status()
+        meta = resp.json()
+        principal = meta.get("caller_mailbox_id")
+        if isinstance(principal, str) and principal:
+            return principal
+        return terminal_id
+    except Exception:
+        return None
+
+
 def _refresh_terminal_token_from_pane() -> Optional[str]:
     """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
 
@@ -2512,6 +2539,7 @@ def _assign_impl(
                 requested_agent_profile=agent_profile or None,
                 requested_working_directory=working_directory,
                 inherit_pins=inherit_pins,
+                caller_principal=_f829_resolve_caller_principal(),
             )
         except ResumeRefused as refusal:
             return {
@@ -2540,6 +2568,35 @@ def _assign_impl(
         # Adopt the resolved profile so downstream logging/labels are correct;
         # position/routing machinery is skipped entirely below.
         agent_profile = _resume_prepared["agent_profile"]
+        # F829 A1 (D3 step 4): for an identity-root resume, TAKE THE CAS CLAIM
+        # now — before any spawn effect. A lost CAS (another claimant or a moved
+        # generation) refuses with session_resume_in_progress and spawns nothing.
+        # The claim is held until the resumed worker reports its id, where
+        # attach_captured_uuid runs verify+publish and clears it (D3 steps 6-7);
+        # a dead attempt is reconciled by the claim TTL (D8).
+        if _resume_prepared.get("via_identity"):
+            from cli_agent_orchestrator.services.conversation_transition import (
+                claim_resume_admission,
+            )
+
+            _admission = _resume_prepared["admission"]
+            _claimant = _current_terminal_id() or "unknown"
+            _claimed = claim_resume_admission(_admission, claimant=_claimant)
+            if not _claimed.ok:
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": _claimed.error or "session_resume_in_progress",
+                    "retryable": True,
+                    "identity_key": _admission.identity_key,
+                    "how": (
+                        "another resume of this conversation is in progress; "
+                        "retry once it settles or is reconciled by the claim TTL"
+                    ),
+                    "message": "resume_refused (missing identity): session_resume_in_progress",
+                }
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
     # rewrites a position name into a profile.
@@ -2593,6 +2650,114 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
+            # F838 (#695) r2 — the guard-checked provider for a legacy alias,
+            # carried INTO _create_terminal so creation never re-resolves from
+            # the mutable store between validation and use (codex Blocker 2).
+            _f838_checked_provider = None
+
+            # F838 (#695) r2 — fail-closed provider guard for a LEGACY ALIAS STUB.
+            # resolve_assignment_target passes a legacy name through with
+            # _resolved_provider=None, deferring provider derivation to
+            # _create_terminal's resolve_provider(fallback=caller_provider). That
+            # fallback silently spawned a pi_cli alias stub as the supervisor's
+            # claude_code/Opus when composition resolved to no provider. VALIDATE
+            # here from the stub's own frontmatter: on any unresolved/mismatch,
+            # REFUSE with a typed result and NO spawn. r2 (codex Blocker 2):
+            # instead of leaving the derivation to a SECOND, racy store read in
+            # _create_terminal, we CARRY the guard-checked provider into creation
+            # via _f838_checked_provider so the value validated here is the value
+            # used — creation never re-resolves from the mutable store. We still
+            # do NOT pin _resolved_provider (which would activate the position
+            # D8/D9 writer paths meant for position names); the checked value
+            # flows through _create_terminal's F613 ``provider=`` seam instead.
+            if _resolved_provider is None:
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    _STUB_DECLARED,
+                    _STUB_UNKNOWN,
+                    E_PROVIDER_UNRESOLVED,
+                    ProviderResolutionError,
+                    _classify_stub_intent,
+                    _resolve_provider_from_classification,
+                )
+
+                # r3 (codex EMPIRICAL-GATE-NO Blocker B): read+classify the stub
+                # EXACTLY ONCE here, then resolve from THAT immutable
+                # classification. The r2 guard read twice — once via
+                # ``_stub_declared_provider_safe`` for intent and again inside
+                # ``resolve_provider`` — so an empty-provider stub that DISAPPEARED
+                # between the two reads was reclassified ABSENT on the second read
+                # and fell back to the caller's provider, which was then carried
+                # into creation. With a single read a mid-flight disappearance
+                # cannot change the verdict: the bytes classified are the bytes
+                # resolved.
+                _intent, _declared_provider, _raw = _classify_stub_intent(agent_profile)
+                # A stub DECLARES intent when it names provider/extends/position;
+                # an UNKNOWN stub (unreadable/unparseable/malformed/dangling) is
+                # ALSO routed through the fail-closed resolver rather than the
+                # legacy passthrough. Only a cleanly-read PLAIN/ABSENT name skips
+                # the guard (the sole fallback paths).
+                if _intent in (_STUB_DECLARED, _STUB_UNKNOWN):
+                    _caller_provider = None
+                    _cur = _current_terminal_id()
+                    if _cur:
+                        try:
+                            _cur_resp = cao_http.get(f"/terminals/{_cur}", timeout=_mcp_timeout())
+                            if _cur_resp.status_code == 200:
+                                _caller_provider = _cur_resp.json().get("provider")
+                        except Exception:
+                            _caller_provider = None
+                    try:
+                        _checked = _resolve_provider_from_classification(
+                            agent_profile,
+                            _caller_provider or DEFAULT_PROVIDER,
+                            _intent,
+                            _declared_provider,
+                            _raw,
+                        )
+                    except ProviderResolutionError as exc:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": f"Assignment refused (no spawn): {exc}",
+                        }
+                    # Defence-in-depth: the resolved provider must equal the
+                    # stub's declared provider (when the stub named one) — never
+                    # a silent substitution, even one that happens to be valid.
+                    if _declared_provider and _checked != _declared_provider:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' declares provider "
+                                f"'{_declared_provider}' but resolution produced "
+                                f"'{_checked}' (F838 #695 provider-substitution guard)"
+                            ),
+                        }
+                    # r3: creation must REFUSE when the guard-verified value is
+                    # None/empty (the brief's explicit requirement for the
+                    # empty-provider disappearance). The resolver already returns
+                    # a non-empty valid provider or raises, but a belt-and-braces
+                    # check here means an empty value never silently reaches
+                    # _create_terminal (whose F613 seam would treat a blank
+                    # provider as "not supplied" and re-derive from disk).
+                    if not (isinstance(_checked, str) and _checked.strip()):
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": (
+                                f"Assignment refused (no spawn): "
+                                f"{E_PROVIDER_UNRESOLVED}: agent profile "
+                                f"'{agent_profile}' resolved to an empty provider "
+                                f"({_checked!r}); refusing to fall back (F838 #695)"
+                            ),
+                        }
+                    # r2/r3: carry the guard-checked provider into _create_terminal
+                    # so creation uses exactly this value (no re-resolution from
+                    # the mutable store between guard and create). _resolved_provider
+                    # stays None (legacy passthrough) so no position machinery fires.
+                    _f838_checked_provider = _checked
         if not _resume_prepared and _routing_driven and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (
@@ -2889,7 +3054,7 @@ def _assign_impl(
             lifecycle=lifecycle,
             use_worktree=use_worktree,
             authority_files=authority_files,
-            provider=_resolved_provider,
+            provider=_resolved_provider or _f838_checked_provider,
             **create_kwargs,
         )
 
@@ -3519,9 +3684,25 @@ def _send_message_impl(
                     ),
                 }
             terminal_payload = response.json()
-            receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
-                "caller_id"
-            )
+            # F829 D3/AC5: prefer the conversation-root owner_principal for a
+            # bare callback so a RESUMED worker replies to the ORIGINAL caller,
+            # not the recovering supervisor recorded on its fresh terminal row.
+            # The server resolves root-owner-first, then caller_mailbox_id /
+            # caller_id; caller_unavailable semantics are unchanged downstream.
+            try:
+                _ct = cao_http.get(
+                    f"/terminals/{own_terminal_id}/callback-target",
+                    timeout=_mcp_timeout(),
+                    headers=_api_headers(),
+                )
+                if _ct.ok:
+                    receiver_id = _ct.json().get("receiver_id")
+            except Exception:
+                receiver_id = None
+            if not receiver_id:
+                receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
+                    "caller_id"
+                )
             if not receiver_id:
                 return {
                     "success": False,

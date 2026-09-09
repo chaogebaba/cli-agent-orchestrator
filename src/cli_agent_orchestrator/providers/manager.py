@@ -165,6 +165,7 @@ class ProviderManager:
                     persona_plan=persona_plan,
                     model=model,
                     resume_session_id=resume_session_id,
+                    fork_context=fork_context,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -265,6 +266,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    fork_context=fork_context,
                 )
             elif provider_type == ProviderType.GROK_CLI.value:
                 provider = GrokCliProvider(

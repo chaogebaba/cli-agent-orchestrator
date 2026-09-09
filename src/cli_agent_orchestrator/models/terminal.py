@@ -155,6 +155,16 @@ class ForkContext(BaseModel):
     base_name: str
     provider: str
     initial_preamble: str
+    # F829 A1 (D3): per-provider resume input carried on a resume-mode context so
+    # the single fork_context thread reaches every adapter. codex/kiro read
+    # session_uuid (resume mode); claude reads resume_session_id (--resume <sid>);
+    # pi reads session_artifact_path (--session <path>, never a fresh --session-id).
+    # All optional and default None, so a fork-mode context and every existing
+    # resume-mode context are byte-unchanged.
+    resume_session_id: Optional[str] = None
+    session_artifact_path: Optional[str] = None
+    identity_key: Optional[str] = None
+    capability_unverified: Optional[str] = None
 
 
 class AgentStepResult(BaseModel):

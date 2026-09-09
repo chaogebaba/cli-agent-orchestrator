@@ -144,6 +144,19 @@ class BaseProvider(ABC):
     # input path is exercised in this slice: codex + kiro. grok/claude/pi stay
     # False here (F829 proper wires the rest).
     supports_resume: bool = False
+    # F829 A1 (D10): the DECLARED capability matrix — {fork, resume, capture,
+    # artifact_locate} — a superset axis over supports_fork_context /
+    # supports_resume. A declaration alone never ADVERTISES a capability
+    # (effective-for-advertising = declaration ∧ passing evidence, AC1/D9); at
+    # runtime only a FAILED exact-key evidence row refuses, a missing/stale key
+    # lets the resume proceed carrying ``capability_unverified`` (D10). Adapters
+    # override the keys they support; the default is conservative (all False).
+    declared_capabilities: dict[str, bool] = {
+        "fork": False,
+        "resume": False,
+        "capture": False,
+        "artifact_locate": False,
+    }
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
 

@@ -13,6 +13,7 @@ from cli_agent_orchestrator.cli.commands.diag import diag
 from cli_agent_orchestrator.cli.commands.doctor import doctor
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fold import fold
+from cli_agent_orchestrator.cli.commands.identity import identity
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
@@ -23,6 +24,7 @@ from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.memory import memory
 from cli_agent_orchestrator.cli.commands.messages import messages
 from cli_agent_orchestrator.cli.commands.profile import profile
+from cli_agent_orchestrator.cli.commands.providers import providers
 from cli_agent_orchestrator.cli.commands.redeploy import redeploy
 from cli_agent_orchestrator.cli.commands.sandbox import sandbox
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
@@ -84,6 +86,8 @@ cli.add_command(diag)
 cli.add_command(update)
 cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 cli.add_command(auto_answers)  # F530: whitelist auto-responder diagnostics
+cli.add_command(identity)  # F829 D5: durable conversation identity verbs
+cli.add_command(providers)  # F829 D10: declared ∧ measured capability read-out
 
 
 if __name__ == "__main__":

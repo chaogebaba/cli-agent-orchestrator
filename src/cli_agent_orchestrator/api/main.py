@@ -334,6 +334,33 @@ async def deferred_init_watchdog(registry: PluginRegistry) -> None:
         await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
 
 
+async def conversation_reconcile_daemon() -> None:
+    """F829 D8: periodic per-tick liveness reconciliation of `live` conversation
+    roots (beyond the one-shot startup sweep).
+
+    Re-runs ``reconcile_live_roots`` on the slow reconcile cadence so a worker
+    that dies WHILE the server is up (a tombstone written after boot) has its
+    conversation root crash-detached without waiting for the next restart. Cheap
+    and idempotent: only ``live`` roots are examined, and a root is examined at
+    most once — crash-detach moves it to ``detached`` and out of the set. Stale
+    resume claims are swept on the same cadence. Never lets a sweep failure kill
+    the daemon.
+    """
+    from cli_agent_orchestrator.services import conversation_reconcile
+
+    logger.info("F829 conversation reconcile daemon started")
+    while True:
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
+        try:
+            await asyncio.to_thread(conversation_reconcile.reconcile_stale_claims)
+            await asyncio.to_thread(conversation_reconcile.reconcile_live_roots)
+            await asyncio.to_thread(conversation_reconcile.sweep_kiro_capture)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("F829 conversation reconcile sweep failed")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -1805,6 +1832,27 @@ async def lifespan(app: FastAPI):
             reconcile_result["skipped_session_live"],
         )
 
+    # F829 D8 (N1): reconcile every `live` conversation root and clear stale
+    # resume claims. A root whose current terminal is CONFIRMED dead (tombstone)
+    # is crash-detached; an unconfirmed/alive root is left `live` for the next
+    # boot. Must run after the dead-session reconcile above so a terminal whose
+    # whole session vanished is already gone before the tombstone check. Never
+    # raises into lifespan.
+    try:
+        from cli_agent_orchestrator.services import conversation_reconcile as _f829_reconcile
+
+        _f829_claims = _f829_reconcile.reconcile_stale_claims()
+        _f829_roots = _f829_reconcile.reconcile_live_roots()
+    except Exception:
+        logger.exception("F829 startup conversation reconciliation failed; deferring to next boot")
+    else:
+        logger.info(
+            "startup_f829_reconcile live_roots_checked=%d detached=%d claims_cleared=%d",
+            _f829_roots["checked"],
+            _f829_roots["detached"],
+            len(_f829_claims),
+        )
+
     # D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
     try:
         rearm_result = terminal_service.rearm_fifo_readers_at_startup()
@@ -1902,6 +1950,8 @@ async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
+    # F829 D8: periodic reconciliation of live conversation roots + stale claims.
+    conversation_reconcile_task = asyncio.create_task(conversation_reconcile_daemon())
 
     # F747 (#604): periodic idle-seat wake reconcile. The client-side rewake
     # watcher is re-armed only by Stop/PostToolUse, which an idle seat cannot
@@ -1983,6 +2033,7 @@ async def lifespan(app: FastAPI):
     watchdog_task.cancel()
     callback_barrier_task.cancel()
     deferred_init_watchdog_task.cancel()
+    conversation_reconcile_task.cancel()  # F829 D8
     # F295 AC4: Stop grok config watcher
     if grok_config_watcher_task is not None:
         grok_config_watcher_task.cancel()
@@ -2012,6 +2063,7 @@ async def lifespan(app: FastAPI):
             watchdog_task,
             callback_barrier_task,
             deferred_init_watchdog_task,
+            conversation_reconcile_task,  # F829 D8
             *([daemon_task] if daemon_task is not None else []),
             return_exceptions=True,
         )
@@ -2041,10 +2093,21 @@ async def lifespan(app: FastAPI):
         pass
 
     await terminal_service.shutdown_deferred_tasks()
-    # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
-    # threading.Thread (not asyncio), so join it directly rather than via
-    # asyncio.gather with the tasks above.
-    fifo_manager.stop_watchdog()
+    # Deterministically tear down every FIFO reader AND the pipe-pane liveness
+    # watchdog thread (issue #388 for the watchdog, issue #624 F767 for the
+    # readers). stop_all_readers() subsumes the old watchdog-only stop: it stops
+    # every tracked reader on the bounded stop_reader path first, then the
+    # watchdog. Without this, orderly shutdown left the reader threads spinning
+    # in select()/os.read() while the interpreter tore their module globals
+    # down, printing "Exception ignored in thread" tracebacks to stderr. These
+    # are plain threading.Threads (not asyncio), so this joins them directly
+    # rather than via asyncio.gather with the tasks above.
+    leaked_readers = fifo_manager.stop_all_readers()
+    if leaked_readers:
+        logger.warning(
+            "FIFO reader thread(s) did not exit during shutdown: %s",
+            ", ".join(leaked_readers),
+        )
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:
@@ -4652,6 +4715,25 @@ async def resolve_terminal_by_window(session: str, window: str) -> Terminal:
         )
 
 
+@app.get("/terminals/{terminal_id}/callback-target")
+async def get_terminal_callback_target(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> dict[str, Any]:
+    """F829 D3/AC5: the no-receiver send_message target for this sender.
+
+    Returns ``{"receiver_id": <mailbox-or-terminal-id or null>}`` — the sender's
+    conversation-root ``owner_principal`` when it is bound to an F829 root with
+    an owner, else the terminal-row caller_mailbox_id/caller_id. The MCP
+    send_message no-receiver branch prefers this so a RESUMED worker's bare
+    callback routes to the ORIGINAL caller, not the recovering supervisor.
+    """
+    from cli_agent_orchestrator.clients.database import resolve_bare_callback_receiver
+
+    receiver = await asyncio.to_thread(resolve_bare_callback_receiver, terminal_id)
+    return {"receiver_id": receiver}
+
+
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(
     terminal_id: TerminalId,
@@ -4892,6 +4974,44 @@ async def bind_transcript(
         # NEW epoch, so the tailer has to learn about the epoch to announce
         # ``session.resumed`` while keeping the cursor that stops it replaying.
         _wt_claude_truth.attach_transcript_source(terminal_id, candidate_real, body.session_id)
+        # F829 (build-2 B2): attach the hook-reported claude session id to this
+        # terminal's conversation_identity ROOT so a claude worker becomes
+        # resumable across an account switch (planned hibernate needs a captured
+        # provider_session_id on the root — D6). claude does not opt into the
+        # capture_session_uuid seam that codex uses, and unlike kiro it has no
+        # nonce poll; the SessionStart hook is where claude's id first exists, so
+        # this is the attach point. attach_captured_uuid is best-effort and
+        # non-raising: it is idempotent on a re-reported same id, runs the
+        # resume verify+publish branch when a resume claim is held (claude's
+        # same-file divergence rule applies there), and REFUSES a foreign id
+        # already bound to a different identity (uuid_capture_rejected) rather
+        # than stealing it. A terminal with no F829 root (pre-F829) is a no-op.
+        try:
+            from cli_agent_orchestrator.services.conversation_transition import (
+                attach_captured_uuid,
+            )
+
+            # Attach the hook-reported claude session id to the F829 conversation
+            # ROOT. The reap/hibernate resolver (_resolve_reap_resume_key) reads
+            # this root id to fill the reaped terminal_identity row and mark the
+            # worker resumable — so a claude worker survives an account switch by
+            # resume (D6). attach_captured_uuid is best-effort/non-raising:
+            # idempotent on a re-reported id, runs the resume verify+publish
+            # branch under a claim (claude same-file divergence), and REFUSES a
+            # foreign id already bound to a different identity (uuid_capture_
+            # rejected) rather than stealing it. Pre-F829 terminal = no-op.
+            attach_captured_uuid(
+                terminal_id,
+                provider_session_id=body.session_id,
+                provider="claude_code",
+                artifact_locator=candidate_real,
+            )
+        except Exception:
+            logger.debug(
+                "f829 claude root-attach from transcript-binding failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
         return {"success": True, "binding": row}
     except ValueError as exc:
         raise HTTPException(
@@ -5146,6 +5266,50 @@ async def supervisor_drain_ack_endpoint(
     _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-ACK-CALLER")
     logger.debug("d22 supervisor drain-ack terminal=%s", terminal_id)
     return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
+
+
+@app.post("/terminals/{terminal_id}/native-unpublished")
+async def native_unpublished_endpoint(
+    terminal_id: TerminalId,
+    body: InboxDrainRequest,
+    request: Request,
+    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F810 #667 BLOCKER 6: the register hook's journal-visible unpublished edge.
+
+    D1 requires a throttled, journal-visible WARN emitted VIA THE SERVER when the
+    register hook can derive no team (the seat is not natively reachable right
+    now). Hook stderr alone is not the fleet/server trace path D1 asks for, so
+    the register hook best-effort POSTs here after its own per-terminal 10-minute
+    throttle; this edge appends one ``f810.native_unpublished`` row to the shared
+    ``inbox_message_trace_event`` journal (``message_id=0`` — a non-per-message
+    condition, the same sentinel ``f219.session_notice`` uses). Best-effort and
+    idempotent-enough: the hook throttles, so at most one row lands per window.
+    404 on an unknown terminal; the caller is bound to the route terminal exactly
+    like the drain edges (F707).
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_native_unpublished: terminal_id does not match route",
+        )
+    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-NATIVE-UNPUB-CALLER")
+    try:
+        from cli_agent_orchestrator.clients.database import record_message_trace_event
+
+        await asyncio.to_thread(
+            record_message_trace_event,
+            0,
+            "f810.native_unpublished",
+            phase="register",
+            reason="socket_unpublished",
+            payload={"terminal_id": terminal_id, "detail": body.ts or ""},
+        )
+    except Exception:
+        logger.debug("f810 native-unpublished trace best-effort failed", exc_info=True)
+    return {"success": True, "terminal_id": terminal_id, "op": "native-unpublished"}
 
 
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")

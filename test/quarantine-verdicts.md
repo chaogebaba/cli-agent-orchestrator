@@ -148,11 +148,24 @@ Format: nodeid heading, bucket tag, root cause, arm counts, fix commit or retire
 
 ## test_backend_failure_warning_is_rate_limited_per_terminal
 
-- **Bucket:** (d) irreproducible
-- **Root cause:** Hypothesized module-level state; not reproduced.
-- **Arm counts:** A 3/3, B 20/20, C 20/20, D 5/5
-- **Retirement date:** 2026-08-18
-- **Re-quarantine trigger:** Any failure under `-n 2`.
+- **Bucket:** (d) irreproducible → **RE-QUARANTINED 2026-09-08 (F829 r1 #686)**
+- **Status:** re-quarantined as `xdist_flaky` (test/quarantine.toml, owner F829-r1).
+- **Root cause (unresolved):** module-level rate-limit state
+  (`receiver_state_view._backend_failure_last_logged`) plus a monotonic-clock
+  iterator the test assumes is read exactly three times — the retirement-era
+  "hypothesized module-level state; not reproduced" hypothesis is retained, now
+  with a concrete reproduction.
+- **F829 r1 head A/B evidence:** in the pinned brief-exact same-box A/B
+  (`-m "not e2e and not slow"`), this node was the sole only-in-head FAILED
+  entry under `-n 2` (`[gw0]`); the solo rerun PASSED. Per the prior retirement
+  entry's explicit re-quarantine trigger ("Any failure under `-n 2`"), the solo
+  green does NOT override the trigger.
+- **Re-quarantine trigger (still in force):** Any failure under `-n 2`.
+- **Burn-down criterion:** prove isolation under `CAO_TEST_QUARANTINE=off -n 2`
+  (repeat runs, no failure) after resolving the module-level rate-limit state
+  and the monotonic-iterator determinism, before retiring again.
+- **Original arm counts (2026-08-18 retirement):** A 3/3, B 20/20, C 20/20, D 5/5.
+- **Original retirement date:** 2026-08-18 (now superseded by re-quarantine).
 
 ## test_ready_completion_at_deadline_has_one_lawful_owner
 

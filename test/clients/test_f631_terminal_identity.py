@@ -558,6 +558,13 @@ def test_ac15_migrated_table_matches_the_model(tmp_path, monkeypatch):
     migrated = tmp_path / "migrated.db"
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", migrated, raising=True)
     _migrate_f631_terminal_identity()
+    # F829 D1: on a real existing DB init_db runs the F829 migration right after
+    # F631, and it REBUILDS terminal_identity to add the identity_key FK column.
+    # So the "migrated" table only matches the model (which now carries
+    # identity_key) once BOTH migrations have run — mirror that chain here.
+    from cli_agent_orchestrator.clients.database import _migrate_f829_conversation_identity
+
+    _migrate_f829_conversation_identity()
 
     fresh = tmp_path / "fresh.db"
     fresh_engine = create_engine(f"sqlite:///{fresh}")

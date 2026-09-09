@@ -26,10 +26,51 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResumeLaunchSpec:
+    """F829 A1 (D3): the per-provider resume input the create path consumes.
+
+    Built from the conversation ROOT + its recovery MANIFEST (never from a
+    filename), it carries EXACTLY the resume input each adapter's initialization
+    needs, so MCP/HTTP/CLI can hand the same spec end to end:
+
+    * codex / kiro — a resume-mode ``ForkContext`` carrying the stored
+      ``provider_session_id`` (kiro's is the ``sess_<uuid>`` form, prefix
+      included). ``fork_context`` is populated.
+    * claude_code — ``resume_session_id`` (threaded to the claude constructor,
+      ``--resume <sid>``). ``resume_session_id`` is populated.
+    * pi — the recorded artifact path, launched as ``--session <artifact_locator>``
+      (NEVER a fresh ``--session-id``). ``session_artifact_path`` is populated.
+
+    ``identity_key`` and the resolved workspace/model/effort/namespace come from
+    the root; ``capability_unverified`` names an unmeasured D10 capability key
+    when the resume proceeds without passing evidence (D10). Exactly one of the
+    three provider-input fields is set for a given provider.
+    """
+
+    identity_key: str
+    provider: str
+    provider_session_id: str
+    provider_namespace: Optional[str] = None
+    artifact_locator: Optional[str] = None
+    working_directory: Optional[str] = None
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    # Per-provider resume input (exactly one set per provider):
+    fork_context: Any = None  # ForkContext(mode="resume") for codex/kiro
+    resume_session_id: Optional[str] = None  # claude_code --resume
+    session_artifact_path: Optional[str] = None  # pi --session <path>
+    # D10: set to the unmeasured capability key when resume proceeds on an
+    # unverified (missing/stale) capability row rather than a failed one.
+    capability_unverified: Optional[str] = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 # The closed set of missing-fact tokens the ONE resume refusal can name
@@ -55,23 +96,44 @@ class ResumeRefused(Exception):
     on the resume path. The fork path keeps those strings unchanged.
     """
 
-    def __init__(self, missing: str, how: str, *, reason: str, retryable: bool = False):
+    def __init__(
+        self,
+        missing: str,
+        how: str,
+        *,
+        reason: str,
+        retryable: bool = False,
+        identity_key: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ):
         if missing not in RESUME_MISSING_TOKENS:
             raise ValueError(f"unknown resume-missing token: {missing!r}")
         self.missing = missing
         self.how = how
         self.reason = reason
         self.retryable = retryable
+        # A1 D3: an AUTHORIZED refusal names the identity_key it concerns; an
+        # optional evidence_ref points at a diag/event record. Both are omitted
+        # from the envelope when None (unauthorized callers learn no identity).
+        self.identity_key = identity_key
+        self.evidence_ref = evidence_ref
         super().__init__(f"resume_refused:{missing}:{reason}")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "error": "resume_refused",
             "missing": self.missing,
             "how": self.how,
             "reason": self.reason,
             "retryable": self.retryable,
         }
+        # A1 D3: additive — present only when known, so the hot-fix envelope
+        # shape is unchanged for a pre-authorization refusal.
+        if self.identity_key is not None:
+            out["identity_key"] = self.identity_key
+        if self.evidence_ref is not None:
+            out["evidence_ref"] = self.evidence_ref
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +188,7 @@ def capture_kiro_session_id_from_store(
     cwd: str,
     terminal_id: str,
     *,
+    capture_nonce: Optional[str] = None,
     recorded_locator: Optional[str] = None,
     sessions_root: Optional[Path] = None,
 ) -> tuple[Optional[str], Optional[str], int]:
@@ -140,29 +203,59 @@ def capture_kiro_session_id_from_store(
     * ``candidate_count`` — how many cwd-matching sessions were seen (for the
       hint).
 
-    Addendum r1 #2 — POSITIVE ATTRIBUTION ONLY. The former "newest by mtime,
-    single candidate after launch epoch" rule is STRUCK. A session id binds
-    only when:
+    Addendum r1 #2 / verdict B4 — PER-ATTEMPT POSITIVE ATTRIBUTION ONLY. The
+    former "newest by mtime" rule is STRUCK. A session id binds only when:
       (1) ``recorded_locator`` is set (a locator CAO already recorded) — used
           verbatim; OR
       (2) EXACTLY ONE session under ``~/.kiro/sessions/<sha256(cwd)[:16]>/``
           whose ``session.json`` names ``cwd`` (rootPaths/workspacePaths) AND
-          whose ``messages.jsonl`` contains THIS terminal's own unique seed
-          marker — the ``[Assigned by terminal <terminal_id>…]`` assign-trailer
-          text, which is unique per terminal.
-    Never binds on cwd+mtime alone. Zero or >1 attributed matches → (None,
-    "capture_unknown", count).
-    """
+          whose ``messages.jsonl`` carries THIS launch attempt's marker.
+
+    The attempt marker is the per-launch ``capture_nonce`` when one was minted
+    and injected (verdict B4: a per-attempt nonce, not a copyable per-terminal
+    string). When no nonce was recorded (legacy rows / a spawn before this
+    slice) it falls back to the per-terminal ``[Assigned by terminal <id>``
+    assign-trailer marker. Never binds on cwd+mtime alone. Zero or >1 attributed
+    matches → (None, "capture_unknown", count)."""
     if recorded_locator:
         return recorded_locator, None, 1
     root = sessions_root if sessions_root is not None else _kiro_sessions_root()
+    target = os.path.realpath(cwd)
+    # Prefer the per-attempt nonce marker (positive, non-copyable); fall back to
+    # the per-terminal assign-trailer only when no nonce was minted.
+    marker = capture_nonce if capture_nonce else f"[Assigned by terminal {terminal_id}"
+    # F829 kiro-harness: support BOTH kiro session-store layouts (kiro-cli
+    # versions differ across the laptop and boxes; record `kiro-cli --version`):
+    #   * LEGACY: ~/.kiro/sessions/<sha256(cwd)[:16]>/sess_<uuid>/session.json
+    #             + messages.jsonl
+    #   * FLAT (kiro-cli 2.20.1): ~/.kiro/sessions/cli/<uuid>.json (+ <uuid>.jsonl
+    #             transcript). Same POSITIVE-attribution rule in each: cwd-match
+    #             AND the injected nonce marker; NEVER newest-mtime; two same-cwd
+    #             candidates must resolve to the OWN (nonce-carrying) id. Attributed
+    #             ids are unioned; exactly one across BOTH layouts binds, else
+    #             (None, capture_unknown, count).
+    legacy_ids, legacy_count = _scan_kiro_legacy_layout(root, cwd, target, marker)
+    flat_ids, flat_count = _scan_kiro_flat_layout(root, target, marker)
+    attributed = list(dict.fromkeys(legacy_ids + flat_ids))
+    cwd_matches = legacy_count + flat_count
+    if len(attributed) == 1:
+        return attributed[0], None, cwd_matches
+    # Zero attributed, or ambiguous (>1) — refuse to guess.
+    return None, "capture_unknown", cwd_matches
+
+
+def _scan_kiro_legacy_layout(
+    root: Path, cwd: str, target_realpath: str, marker: str
+) -> tuple[list[str], int]:
+    """LEGACY layout: ~/.kiro/sessions/<sha256(cwd)[:16]>/sess_<uuid>/session.json
+    + messages.jsonl. Identical positive-attribution rule as before this change:
+    the cwd hash dir, cwd-match via session.json, nonce/assign marker in
+    messages.jsonl. Returns (attributed_ids, cwd_match_count)."""
     hash_dir = root / _cwd_hash(cwd)
     if not hash_dir.is_dir():
-        return None, "capture_unknown", 0
-    target = os.path.realpath(cwd)
-    marker = f"[Assigned by terminal {terminal_id}"
-    cwd_matches = 0
+        return [], 0
     attributed: list[str] = []
+    cwd_matches = 0
     for sess_dir in hash_dir.iterdir():
         if not sess_dir.is_dir() or not sess_dir.name.startswith("sess_"):
             continue
@@ -171,7 +264,7 @@ def capture_kiro_session_id_from_store(
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not _session_matches_cwd(meta, target):
+        if not _session_matches_cwd(meta, target_realpath):
             continue
         cwd_matches += 1
         session_id = meta.get("id")
@@ -179,10 +272,38 @@ def capture_kiro_session_id_from_store(
             continue
         if _transcript_contains_marker(sess_dir / "messages.jsonl", marker):
             attributed.append(session_id)
-    if len(attributed) == 1:
-        return attributed[0], None, cwd_matches
-    # Zero attributed, or ambiguous (>1) — refuse to guess.
-    return None, "capture_unknown", cwd_matches
+    return attributed, cwd_matches
+
+
+def _scan_kiro_flat_layout(
+    root: Path, target_realpath: str, marker: str
+) -> tuple[list[str], int]:
+    """FLAT layout (kiro-cli 2.20.1): ~/.kiro/sessions/cli/<uuid>.json (meta) +
+    <uuid>.jsonl (transcript). Same positive-attribution rule: cwd-match (from
+    the <uuid>.json meta) AND the nonce/assign marker in the sibling
+    <uuid>.jsonl; NEVER newest-mtime. Returns (attributed_ids, cwd_match_count)."""
+    cli_dir = root / "cli"
+    if not cli_dir.is_dir():
+        return [], 0
+    attributed: list[str] = []
+    cwd_matches = 0
+    for meta_path in sorted(cli_dir.glob("*.json")):
+        uuid_stem = meta_path.stem
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not _session_matches_cwd(meta, target_realpath):
+            continue
+        cwd_matches += 1
+        # kiro's own id field, else the filename stem (the uuid kiro keys by).
+        session_id = meta.get("id") if isinstance(meta.get("id"), str) and meta.get("id") else uuid_stem
+        if not session_id:
+            continue
+        transcript = cli_dir / f"{uuid_stem}.jsonl"
+        if _transcript_contains_marker(transcript, marker):
+            attributed.append(session_id)
+    return attributed, cwd_matches
 
 
 def _transcript_contains_marker(transcript: Path, marker: str) -> bool:
@@ -463,12 +584,311 @@ def _nearest_repo_ancestor(path: str) -> Optional[str]:
         current = parent
 
 
+# --------------------------------------------------------------------------
+# A1 D3: identity-root resolution + authorization → ResumeLaunchSpec
+# --------------------------------------------------------------------------
+
+# D3 blocker order maps each classify/authorize/claim token to exactly one of
+# the six public ``missing`` categories. State/claim/ownership refusals are all
+# ``identity``; an artifact-state refusal is ``artifact``.
+_RESUME_TOKEN_TO_MISSING = {
+    "resume_not_owner": "identity",
+    "session_live_owned": "identity",
+    "session_abandoned": "identity",
+    "session_expired": "identity",
+    "session_resume_in_progress": "identity",
+    "session_ambiguous": "identity",
+    "session_artifact_missing": "artifact",
+    "session_artifact_unavailable": "artifact",
+    "session_artifact_invalid": "artifact",
+    "session_identity_mismatch": "artifact",
+    "session_identity_conflict": "artifact",
+}
+
+_RESUME_TOKEN_RETRYABLE = {
+    "session_resume_in_progress": True,
+    "session_artifact_unavailable": True,
+}
+
+
+def _build_launch_spec(
+    root: dict[str, Any],
+    manifest: Optional[dict[str, Any]],
+    working_directory: Optional[str],
+) -> "ResumeLaunchSpec":
+    """A1 D3 step 5: build the per-provider ``ResumeLaunchSpec`` from root+manifest.
+
+    The provider arm is gated by the D10 runtime admission (``admit_capability``):
+    a FAILED ``resume`` evidence row refuses here with
+    ``missing=provider_capability``; a missing/stale key admits and the spec
+    carries ``capability_unverified``. Exactly one provider-input field is set:
+    codex/kiro → ``fork_context`` (resume mode, stored id incl. kiro ``sess_``
+    prefix); claude → ``resume_session_id``; pi → ``session_artifact_path``
+    (the recorded artifact locator, launched as ``--session <path>``).
+    """
+    from cli_agent_orchestrator.models.terminal import ForkContext
+    from cli_agent_orchestrator.services.capability_evidence import admit_resume_capability
+
+    provider = root["provider"]
+    identity_key = root["identity_key"]
+    session_uuid = root.get("provider_session_id")
+    namespace = root.get("provider_namespace")
+    artifact_locator = root.get("artifact_locator") or (
+        manifest.get("worktree_path") if manifest else None
+    )
+
+    # D10 runtime admission for the resume operation. This is the PRODUCTION
+    # seam (blueprint D10): it enforces declaration (provider_declares) AND reads
+    # the persisted exact-key evidence — a FAILED row refuses here with
+    # missing=provider_capability; a missing/stale key admits and the spec
+    # carries capability_unverified; a provider that does not DECLARE resume is
+    # refused before any evidence read.
+    verdict = admit_resume_capability(provider)
+    if not verdict.admitted:
+        raise ResumeRefused(
+            missing="provider_capability",
+            how=(
+                f"provider {provider!r} resume capability is not admitted "
+                f"({verdict.reason}); re-probe with `cao providers probe "
+                f"--provider {provider}` or resume a provider whose resume "
+                f"capability is declared and not failed"
+            ),
+            reason=verdict.reason or f"provider_{provider}_resume_capability_failed",
+            retryable=True,
+            identity_key=identity_key,
+        )
+
+    if not session_uuid:
+        raise ResumeRefused(
+            missing="session_id",
+            how=(
+                f"conversation {identity_key!r} has no captured provider session id "
+                f"(capture_unknown); it has nothing to resume by uuid"
+            ),
+            reason="provider_session_id_null",
+            identity_key=identity_key,
+        )
+
+    spec = ResumeLaunchSpec(
+        identity_key=identity_key,
+        provider=provider,
+        provider_session_id=session_uuid,
+        provider_namespace=namespace,
+        artifact_locator=artifact_locator,
+        working_directory=working_directory,
+        model=root.get("model"),
+        reasoning_effort=root.get("reasoning_effort"),
+        capability_unverified=verdict.unverified_key,
+    )
+    # Per-provider resume input (exactly one). All arms carry a resume-mode
+    # ForkContext so the single create-path fork_context thread reaches every
+    # adapter; codex/kiro use session_uuid, claude uses resume_session_id, pi
+    # uses session_artifact_path (the extra fields are ignored by adapters that
+    # do not read them).
+    if provider in ("codex", "kiro_cli", "grok_cli"):
+        spec.fork_context = ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name=str(identity_key),
+            provider=provider,
+            identity_key=identity_key,
+            capability_unverified=verdict.unverified_key,
+            initial_preamble=(
+                f"[RESUMED] Re-attached to your prior conversation "
+                f"(identity {identity_key}). Continue where you left off."
+            ),
+        )
+    elif provider == "claude_code":
+        spec.resume_session_id = session_uuid
+        spec.fork_context = ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name=str(identity_key),
+            provider=provider,
+            resume_session_id=session_uuid,
+            identity_key=identity_key,
+            capability_unverified=verdict.unverified_key,
+            initial_preamble=(
+                f"[RESUMED] Re-attached to your prior conversation "
+                f"(identity {identity_key}). Continue where you left off."
+            ),
+        )
+    elif provider == "pi_cli":
+        if not artifact_locator:
+            raise ResumeRefused(
+                missing="artifact",
+                how=(
+                    f"pi conversation {identity_key!r} recorded no artifact path; "
+                    f"a mid-turn crash leaves no durable artifact (session_artifact_missing)"
+                ),
+                reason="pi_artifact_locator_null",
+                identity_key=identity_key,
+            )
+        spec.session_artifact_path = artifact_locator
+        spec.fork_context = ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name=str(identity_key),
+            provider=provider,
+            session_artifact_path=artifact_locator,
+            identity_key=identity_key,
+            capability_unverified=verdict.unverified_key,
+            initial_preamble=(
+                f"[RESUMED] Re-attached to your prior conversation "
+                f"(identity {identity_key}). Continue where you left off."
+            ),
+        )
+    else:
+        raise ResumeRefused(
+            missing="provider_capability",
+            how=f"provider {provider!r} has no resume launch arm in this build",
+            reason=f"provider_{provider}_no_resume_arm",
+            identity_key=identity_key,
+        )
+    return spec
+
+
+def _prepare_resume_via_identity(
+    *,
+    resume_from: str,
+    requested_agent_profile: Optional[str],
+    requested_working_directory: Optional[str],
+    caller_principal: Optional[str],
+    inherit_pins: bool,
+) -> Optional[dict[str, Any]]:
+    """A1 D3: resolve through the conversation ROOT + recovery MANIFEST, authorize
+    against ``owner_principal``, and return the enriched prepared dict — or None
+    when there is NO F829 root for ``resume_from`` (the caller then falls back to
+    the hot-fix terminal_identity path).
+
+    On an authorization/classify/artifact refusal raises ``ResumeRefused`` with
+    the mapped ``missing`` category and ``identity_key`` populated (D3 six-category
+    envelope). The CAS CLAIM is NOT taken here — it is taken at spawn time by the
+    server entrance (claim_resume_admission), preserving the existing claim seam.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        get_frozen_pins,
+        get_recovery_manifest,
+        resolve_conversation_identity,
+    )
+    from cli_agent_orchestrator.services.conversation_transition import (
+        authorize_and_classify_resume,
+    )
+
+    try:
+        root = resolve_conversation_identity(resume_from)
+    except ValueError as exc:
+        # resolve raises session_ambiguous for >1 canonical match.
+        token = str(exc) or "session_ambiguous"
+        missing = _RESUME_TOKEN_TO_MISSING.get(token, "identity")
+        raise ResumeRefused(
+            missing=missing,
+            how="multiple conversations match; pass the identity_key",
+            reason=token,
+        )
+    if root is None:
+        return None  # no F829 root — fall back to the hot-fix path
+
+    identity_key = root["identity_key"]
+    # AUTHORIZE + CLASSIFY (owner_principal; resumable set {hibernated,detached}).
+    admission = authorize_and_classify_resume(root, caller_principal)
+    if not admission.ok:
+        token = admission.error or "resume_not_owner"
+        raise ResumeRefused(
+            missing=_RESUME_TOKEN_TO_MISSING.get(token, "identity"),
+            how=_resume_how_for_token(token, identity_key),
+            reason=token,
+            retryable=_RESUME_TOKEN_RETRYABLE.get(token, False),
+            identity_key=identity_key,
+        )
+
+    provider = root["provider"]
+    agent_profile = requested_agent_profile or root.get("agent_profile")
+    if not agent_profile:
+        raise ResumeRefused(
+            missing="profile",
+            how=f"pass agent_profile= for the resumed worker (none recorded for {identity_key!r})",
+            reason="agent_profile_unrecorded",
+            identity_key=identity_key,
+        )
+
+    manifest = get_recovery_manifest(identity_key)
+    # cwd from the manifest (authoritative), else the root has none recorded.
+    row_cwd = manifest.get("cwd") if manifest else None
+    wt_path = manifest.get("worktree_path") if manifest else None
+    wt_branch = manifest.get("worktree_branch") if manifest else None
+    wt_repo = manifest.get("repo_root") if manifest else None
+    wt_commit = manifest.get("worktree_commit") if manifest else None
+    working_directory = requested_working_directory or _ensure_resume_cwd(
+        row_cwd, wt_path, wt_branch, wt_repo, wt_commit, str(identity_key)
+    )
+
+    spec = _build_launch_spec(root, manifest, working_directory)
+
+    # Frozen pins inherited from the CURRENT incarnation (D2/A1 inherit_pins).
+    current_terminal = root.get("current_terminal_id")
+    known_pins = get_frozen_pins(str(current_terminal)) if current_terminal else []
+    authority_files: Optional[list[dict[str, str]]] = None
+    pins_inherited = 0
+    if inherit_pins:
+        authority_files = known_pins or None
+        pins_inherited = len(known_pins)
+
+    fork_context = spec.fork_context
+    if fork_context is None:
+        # claude/pi have no ForkContext; the create path uses resume_session_id /
+        # session_artifact_path from the spec. Provide a minimal resume-mode
+        # ForkContext only for the providers that consume it; others pass None.
+        pass
+
+    return {
+        "via_identity": True,
+        "identity_key": identity_key,
+        "launch_spec": spec,
+        "fork_context": fork_context,
+        "resume_session_id": spec.resume_session_id,
+        "session_artifact_path": spec.session_artifact_path,
+        "capability_unverified": spec.capability_unverified,
+        "provider": provider,
+        "agent_profile": agent_profile,
+        "working_directory": working_directory,
+        "admission": admission,
+        "forked_from_info": {
+            "name": str(current_terminal or identity_key),
+            "cwd": working_directory,
+            "resumed_from": str(resume_from),
+            "provider": provider,
+            "identity_key": identity_key,
+        },
+        "authority_files": authority_files,
+        "pins_inherited": pins_inherited,
+        "known_pins": known_pins,
+    }
+
+
+def _resume_how_for_token(token: str, identity_key: str) -> str:
+    """A human ``how`` remedy for an authorize/classify refusal token."""
+    return {
+        "resume_not_owner": (
+            "you are not the recorded owner of this conversation; the owner must "
+            "claim it with `cao identity claim` before it can be resumed"
+        ),
+        "session_live_owned": "the conversation is still live and owned; interrupt it, do not resume",
+        "session_abandoned": "the conversation was explicitly reaped (abandoned); it is not resumable",
+        "session_expired": "the conversation expired under the configured retention policy",
+        "session_artifact_missing": (
+            f"conversation {identity_key!r} has no captured/recoverable artifact"
+        ),
+    }.get(token, f"resume of {identity_key!r} refused: {token}")
+
+
 def prepare_resume(
     *,
     resume_from: str,
     requested_agent_profile: Optional[str],
     requested_working_directory: Optional[str],
     inherit_pins: bool = True,
+    caller_principal: Optional[str] = None,
 ) -> dict[str, Any]:
     """Resolve everything an ``assign(resume_from=…)`` needs, or raise ResumeRefused.
 
@@ -492,6 +912,22 @@ def prepare_resume(
     """
     from cli_agent_orchestrator.clients.database import get_frozen_pins
     from cli_agent_orchestrator.models.terminal import ForkContext
+
+    # A1 D3: resolve through the conversation ROOT + recovery MANIFEST first,
+    # authorizing against owner_principal and building a ResumeLaunchSpec that
+    # carries the correct per-provider arm (codex/kiro fork_context, claude
+    # resume_session_id, pi --session <artifact>). Returns None only when there
+    # is NO F829 root for this handle, in which case we fall back to the hot-fix
+    # terminal_identity path below (backward compatibility for pre-F829 rows).
+    via_identity = _prepare_resume_via_identity(
+        resume_from=resume_from,
+        requested_agent_profile=requested_agent_profile,
+        requested_working_directory=requested_working_directory,
+        caller_principal=caller_principal,
+        inherit_pins=inherit_pins,
+    )
+    if via_identity is not None:
+        return via_identity
 
     row = resolve_resume_target(resume_from)
     provider = row.get("provider")

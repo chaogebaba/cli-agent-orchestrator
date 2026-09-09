@@ -110,6 +110,25 @@ def _cli_available(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+# F829 build-2 live arms (arm-scoped, gated by F829_EXTRA_HOME_SYMLINKS): the
+# shared cao_server fixture symlinks only ~/.bun and ~/.kiro into the redirected
+# scratch HOME, so claude/codex/pi have their BINARY but not their CONFIG/AUTH
+# there — claude then re-runs its interactive first-run theme wizard in the CAO
+# pane and init times out. When the flag is set (only by the F829 arm box-run),
+# extend _PROVIDER_HOME_SYMLINKS with the provider config/auth dot-entries so the
+# arms can reach real auth + a completed-onboarding ~/.claude.json. Box-local,
+# read-only symlinks, disposable box (no F549-class concern there). NOT applied
+# to the general e2e suite (production fixture untouched).
+if os.environ.get("F829_EXTRA_HOME_SYMLINKS"):
+    from test.fixtures import cao_server as _f829_cao_server
+
+    _F829_EXTRA = (".claude", ".claude.json", ".codex", ".pi", ".config/cao")
+    _existing = set(_f829_cao_server._PROVIDER_HOME_SYMLINKS)
+    _f829_cao_server._PROVIDER_HOME_SYMLINKS = _f829_cao_server._PROVIDER_HOME_SYMLINKS + tuple(
+        e for e in _F829_EXTRA if e not in _existing
+    )
+
+
 @pytest.fixture()
 def require_codex():
     """Skip test if codex CLI is not available."""
@@ -128,20 +147,32 @@ def require_claude():
 def require_kiro(require_cao_server: CaoServer):
     """Skip test if kiro-cli is not available; provision kiro agent profiles.
 
-    The kiro_cli provider requires a base agent JSON at
-    ``~/.kiro/agents/{profile}.json`` — created by ``cao install``. The
-    managed e2e server uses a redirected HOME so the real user store is
-    invisible. Seed minimal agent JSONs so e2e tests that use the generic
-    ``developer``, ``code_supervisor``, ``data_analyst``, and
-    ``report_generator`` profiles succeed without a prior ``cao install`` on
-    the box.
+    The kiro_cli provider resolves its base agent JSON from
+    ``constants.kiro_agents_dir()`` == ``$CAO_AGENTS_DIR`` (constants.py:393),
+    NOT ``~/.kiro/agents`` — test/conftest.py pins CAO_AGENTS_DIR to a
+    ``cao-pytest-*`` tmp dir at import (F549), and the managed cao-server
+    subprocess inherits it. Seeding into ``home_dir/.kiro/agents`` therefore put
+    the JSONs where the server does NOT look, so a kiro e2e worker failed to
+    launch with "kiro base agent JSON missing … Refusing to launch unprofiled
+    kiro_default" (F829 build-2 kiro-arm blocker). Seed into ``kiro_agents_dir()``
+    — the exact dir the server reads — so ``developer`` (and the other generic
+    profiles) resolve without a prior ``cao install``.
     """
     if not _cli_available("kiro-cli"):
         pytest.skip("kiro-cli CLI not installed")
 
     import json as _json
 
-    agents_dir = require_cao_server.home_dir / ".kiro" / "agents"
+    from cli_agent_orchestrator.constants import kiro_agents_dir
+
+    # The dir the kiro provider ACTUALLY reads (CAO_AGENTS_DIR at call time),
+    # not home_dir/.kiro/agents which the server never consults.
+    agents_dir = kiro_agents_dir()
+    # Unit-level invariant: the seed target is exactly what the provider resolves.
+    assert agents_dir == kiro_agents_dir(), (
+        f"require_kiro seed dir {agents_dir} must equal kiro_agents_dir() "
+        f"{kiro_agents_dir()} (the CAO_AGENTS_DIR the server reads)"
+    )
     agents_dir.mkdir(parents=True, exist_ok=True)
 
     # Map profile name → (allowedTools, tools) for the minimal JSON.
@@ -169,6 +200,20 @@ def require_kiro(require_cao_server: CaoServer):
                 ),
                 encoding="utf-8",
             )
+
+
+@pytest.fixture()
+def require_pi():
+    """Skip test if the pi CLI is not available.
+
+    The pi_cli provider resolves its binary (``pi``) and config from
+    ``Path.home()``; the managed e2e server symlinks ``.bun`` (where the bun-
+    installed ``pi`` lives) and other provider dot-dirs into the redirected
+    HOME (see ``_PROVIDER_HOME_SYMLINKS``), so an authenticated ``pi`` on the
+    host is reachable without copying any credential material.
+    """
+    if not _cli_available("pi"):
+        pytest.skip("pi CLI not installed")
 
 
 @pytest.fixture()

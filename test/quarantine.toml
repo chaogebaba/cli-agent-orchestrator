@@ -524,3 +524,23 @@ owner     = "WP-ARCH-p1-train"
 filed     = "2026-09-03"
 expires   = "2026-10-03"
 review_by = "2026-10-03"
+
+
+# --- F829 r1 A/B (#686): stage0 backend-failure rate-limit probe ---
+# Root cause: module-level rate-limit state (receiver_state_view.
+# _backend_failure_last_logged) + a monotonic-clock iterator the test assumes
+# is read exactly 3x — remains unresolved. Passed solo but FAILED under -n 2
+# (gw0) in the F829 r1 head A/B; the node's retired verdict (F153/F262 lineage,
+# quarantine-verdicts.md) sets an explicit re-quarantine trigger: "Any failure
+# under -n 2". Solo green does not override that trigger. SERIALIZED (not
+# deselected) so coverage is unchanged. Burn-down: prove isolation under
+# CAO_TEST_QUARANTINE=off -n 2 before retiring again.
+
+[[entry]]
+nodeid    = "test/services/test_stage0_flip_machinery.py::test_backend_failure_warning_is_rate_limited_per_terminal"
+class     = "xdist_flaky"
+reason    = "F829 r1 A/B (#686): failed under -n 2 (gw0) and passed solo; retired verdict's explicit re-quarantine trigger fired; module-level rate-limit state (_backend_failure_last_logged) + monotonic-iterator determinism remains unresolved"
+owner     = "F829-r1"
+filed     = "2026-09-08"
+expires   = "2026-10-08"
+review_by = "2026-10-08"

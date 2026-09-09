@@ -570,88 +570,264 @@ def compose_agent_profile_source(raw_text: str, profile_name: str) -> str:
     return str(frontmatter.dumps(post)) + "\n"
 
 
-def read_agent_profile_source(agent_name: str) -> str:
-    """Locate an agent profile across configured stores and return the raw text.
+def _is_dangling_symlink(path: "Optional[Path]") -> bool:
+    """True iff ``path`` is a symlink whose target does not resolve.
 
-    Search order:
-    1. Local store: <CAO_HOME_DIR>/agent-store/{name}.md (default
-       ~/.aws/cli-agent-orchestrator/agent-store/)
-    2. Provider-specific directories (flat {name}.md or {name}/agent.md)
-    3. Extra user-added directories (flat {name}.md or {name}/agent.md)
-    4. Built-in store (packaged with CAO)
-
-    Shared by ``load_agent_profile`` (which parses the text into an
-    ``AgentProfile``) and the install service (which writes the raw text to
-    the context file). Centralising the lookup keeps the two callers in sync.
+    ``is_symlink()`` tests the link itself (does NOT follow it), so it is True
+    for a dangling link where ``exists()`` (which follows) is False. Best-effort:
+    a stat that raises is not a dangling link for our purposes.
     """
-    _validate_agent_name(agent_name)
+    try:
+        return path is not None and path.is_symlink() and not path.exists()
+    except OSError:
+        return False
 
+
+class _ProfileCandidate:
+    """F838 (#695) r6 — ONE candidate location the reader may consume for a
+    name, at CANDIDATE granularity (not store granularity).
+
+    The reader's real precedence chain is a flat list of candidate *files*, not
+    a list of stores: the composed ``agent-store/composed/{name}.md`` (for a
+    ``<position>-<provider>`` name), then per on-disk store the flat ``{name}.md``
+    BEFORE the nested ``{name}/agent.md``, local → configured → extra, then the
+    packaged built-in ``{name}.md`` last. Modelling precedence at STORE
+    granularity (the r5 defect, codex r5 P0-A) let a readable nested entry mask a
+    dangling/escaping flat entry in the SAME store; and it omitted the composed
+    candidate entirely (codex r5 P0-B). Representing every candidate as one
+    element of :func:`_ordered_profile_candidates` removes both: precedence stops
+    at the FIRST PRESENT candidate, and both the reader and the fail-closed walk
+    iterate the identical candidate sequence.
+
+    Every candidate answers the SAME three questions the reader would ask of it,
+    so "which bytes win" (reader) and "what is the first present candidate"
+    (walk) can never diverge:
+
+    * :meth:`read` — the reader's action for THIS candidate: return its bytes if
+      the reader would accept it (``exists()``/``is_file()`` after ``_safe_join``),
+      else ``None``. The ONLY method that touches file *contents*; any read error
+      PROPAGATES (a permission-denied file surfaces as UNKNOWN, not "absent").
+    * :meth:`is_present_readable` — stat-only: would :meth:`read` return bytes?
+    * :meth:`is_present_unusable` — stat-only: is THIS candidate PHYSICALLY
+      PRESENT but one the reader will NOT read — a dangling symlink, or a path
+      ``_safe_join`` rejects because it escapes its root? The reader skips it and
+      falls through, so the walk must treat it as an UNKNOWN first candidate and
+      fail closed.
+    """
+
+    #: Short kind tag used only by tests to assert the ordered candidate
+    #: sequence the reader and walk share.
+    kind: str = "candidate"
+
+    def read(self) -> "Optional[str]":  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def is_present_readable(self) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def is_present_unusable(self) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class _PathCandidate(_ProfileCandidate):
+    """A single on-disk candidate file (``composed``, a store's flat entry, or a
+    store's nested entry). ``_safe_join`` is evaluated once at construction, so
+    ``safe`` is the resolver-accepted path (or ``None`` when the join escapes the
+    root) and ``raw`` is the un-resolved join used only to detect a present-but-
+    rejected entry the reader will skip."""
+
+    def __init__(self, kind: str, safe: "Optional[Path]", raw: Path) -> None:
+        self.kind = kind
+        self._safe = safe
+        self._raw = raw
+
+    def read(self) -> "Optional[str]":
+        # Mirror read_agent_profile_source EXACTLY: gate on .exists() (which
+        # follows symlinks) and, when the safe candidate exists, read it and let
+        # any read error PROPAGATE (permission-denied → UNKNOWN, not swallowed).
+        if self._safe is not None and self._safe.exists():
+            return self._safe.read_text(encoding="utf-8")
+        return None
+
+    def is_present_readable(self) -> bool:
+        try:
+            return self._safe is not None and self._safe.exists()
+        except OSError:
+            return False
+
+    def is_present_unusable(self) -> bool:
+        # A dangling symlink (raw or safe form), OR a candidate location that is
+        # physically present (as a link or entry) but which _safe_join REJECTED
+        # (escapes the root → safe is None): the reader will not read it, so it
+        # is a present-but-unusable candidate that must STOP precedence.
+        if _is_dangling_symlink(self._safe) or _is_dangling_symlink(self._raw):
+            return True
+        if self._safe is None:
+            try:
+                if self._raw.is_symlink() or self._raw.exists():
+                    return True
+            except OSError:
+                return False
+        return False
+
+
+class _BuiltinCandidate(_ProfileCandidate):
+    """The packaged built-in ``{name}.md`` (``cli_agent_orchestrator.agent_store``),
+    the reader's LAST candidate. Accessed through the ``importlib.resources``
+    traversable exactly as :func:`read_agent_profile_source` does. The packaged
+    store is read-only files installed with CAO and holds no user symlinks, so it
+    is never present-but-unusable — a name that is not a readable file is simply
+    absent here."""
+
+    kind = "builtin"
+
+    def __init__(self, agent_name: str) -> None:
+        self._name = agent_name
+        agent_store = resources.files("cli_agent_orchestrator.agent_store")
+        self._entry = agent_store / f"{agent_name}.md"
+
+    def _is_file(self) -> bool:
+        # Mirror the reader's guard: the traversable API concatenates the name as
+        # a single segment, so re-validate the resulting name before trusting it.
+        try:
+            return self._entry.name == f"{self._name}.md" and self._entry.is_file()
+        except OSError:
+            return False
+
+    def read(self) -> "Optional[str]":
+        if self._is_file():
+            return self._entry.read_text(encoding="utf-8")
+        return None
+
+    def is_present_readable(self) -> bool:
+        return self._is_file()
+
+    def is_present_unusable(self) -> bool:
+        return False
+
+
+def _ordered_profile_candidates(agent_name: str) -> "List[_ProfileCandidate]":
+    """F838 (#695) r6 — THE single source of truth for profile-precedence, at
+    CANDIDATE granularity.
+
+    Returns EVERY candidate the reader can consume for ``agent_name``, in the
+    reader's exact precedence order:
+
+    0. The composed ``agent-store/composed/{name}.md`` candidate — but ONLY for
+       an effective ``<position>-<provider>`` name (``split_effective_name`` is
+       not None). The reader consults it FIRST for such a name; a legacy flat
+       name never matches, so this candidate is simply absent for the whole
+       legacy corpus.
+    1. Local store (``LOCAL_AGENT_STORE_DIR``) — flat ``{name}.md`` only.
+    2. Each configured directory (``get_agent_dirs()``) — flat ``{name}.md`` then
+       nested ``{name}/agent.md``.
+    3. Each extra directory (``get_extra_agent_dirs()``) — flat then nested.
+    4. The packaged built-in ``{name}.md`` — LAST.
+
+    ``read_agent_profile_source`` (the reader) AND
+    ``_first_present_store_entry_is_unknown`` (the precedence walk) BOTH iterate
+    THIS list, so the walk can never model a different, hand-copied set of
+    candidates than the reader actually reads. This is the r6 CLASS fix for the
+    codex r5 P0 blockers: the r5 model was store-granular, so a readable NESTED
+    entry masked a dangling/escaping FLAT entry in the same store (P0-A), and the
+    composed candidate was outside the shared list entirely (P0-B). At candidate
+    granularity precedence stops at the FIRST PRESENT candidate — a dangling flat
+    stops before its own store's readable nested, and a dangling/escaping composed
+    stops before any lower store. A test instruments the FILESYSTEM reads and pins
+    that the reader and walk touch the identical candidate sequence.
+    """
+    from cli_agent_orchestrator.constants import composed_store_dir
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
         get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
-    # F786 (#643) D8 — a position-composed spawn name (``<position>-<provider>``)
-    # is materialised under ``agent-store/composed/`` by the assign-time writer;
-    # it has no flat store file. Look there FIRST for any name whose suffix is a
-    # known provider so a composed profile always loads by name (the seam that
-    # makes a profile-less spawn impossible). A legacy flat name never matches
-    # split_effective_name, so this is a no-op for the whole legacy corpus.
+    candidates: "List[_ProfileCandidate]" = []
+
+    # 0. Composed candidate FIRST, for an effective <position>-<provider> name.
+    #    The composed store is a build artefact, but the read path makes no
+    #    provenance assumption: a composed entry can still be a dangling/escaping
+    #    symlink, and if it is, it must stop precedence exactly like any other
+    #    higher candidate rather than fall through to a lower same-name profile
+    #    (codex r5 P0-B). So it is a first-class member of the shared list.
     if split_effective_name(agent_name) is not None:
-        from cli_agent_orchestrator.constants import composed_store_dir
+        composed_root = composed_store_dir()
+        candidates.append(
+            _PathCandidate(
+                "composed",
+                _safe_join(composed_root, f"{agent_name}.md"),
+                composed_root.joinpath(f"{agent_name}.md"),
+            )
+        )
 
-        composed = _safe_join(composed_store_dir(), f"{agent_name}.md")
-        if composed is not None and composed.exists():
-            return composed.read_text(encoding="utf-8")
-
-    # Honour the disable toggle on the load path too, so disabling a directory
-    # actually swaps which same-named profile wins (GH #280), not just what the
-    # Settings list shows.
     disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
 
-    # Every filesystem read below goes through _safe_join so the path is
-    # normalised and verified to stay inside its configured root. This is
-    # belt-and-braces on top of _validate_agent_name above — the name check
-    # rejects obvious traversal inputs, and _safe_join additionally blocks
-    # anything that sneaks past (e.g. symlinks resolving outside the root).
+    def _dir_candidates(root: Path, *, nested: bool) -> None:
+        candidates.append(
+            _PathCandidate(
+                "flat",
+                _safe_join(root, f"{agent_name}.md"),
+                root.joinpath(f"{agent_name}.md"),
+            )
+        )
+        if nested:
+            candidates.append(
+                _PathCandidate(
+                    "nested",
+                    _safe_join(root, agent_name, "agent.md"),
+                    root.joinpath(agent_name, "agent.md"),
+                )
+            )
+
+    # 1. Local store (flat only), 2. configured dirs, 3. extra dirs — each
+    #    flat-then-nested, honouring the disable toggle.
     if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
-        local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
-        if local_profile is not None and local_profile.exists():
-            return local_profile.read_text(encoding="utf-8")
-
-    def _lookup_in_directory(directory: Path) -> str | None:
-        if not directory.exists():
-            return None
-        flat = _safe_join(directory, f"{agent_name}.md")
-        if flat is not None and flat.exists():
-            return flat.read_text(encoding="utf-8")
-        nested = _safe_join(directory, agent_name, "agent.md")
-        if nested is not None and nested.exists():
-            return nested.read_text(encoding="utf-8")
-        return None
-
+        _dir_candidates(LOCAL_AGENT_STORE_DIR, nested=False)
     for dir_path in get_agent_dirs().values():
-        if normalized_path(dir_path) in disabled:
-            continue
-        found = _lookup_in_directory(Path(dir_path))
-        if found is not None:
-            return found
-
+        if normalized_path(dir_path) not in disabled:
+            _dir_candidates(Path(dir_path), nested=True)
     for extra_dir in get_extra_agent_dirs():
-        if normalized_path(extra_dir) in disabled:
-            continue
-        found = _lookup_in_directory(Path(extra_dir))
+        if normalized_path(extra_dir) not in disabled:
+            _dir_candidates(Path(extra_dir), nested=True)
+
+    # 4. Packaged built-in candidate, LAST.
+    candidates.append(_BuiltinCandidate(agent_name))
+    return candidates
+
+
+def read_agent_profile_source(agent_name: str) -> str:
+    """Locate an agent profile across configured stores and return the raw text.
+
+    Search order (at candidate granularity):
+    0. Composed store ``agent-store/composed/{name}.md`` (only for an effective
+       ``<position>-<provider>`` name)
+    1. Local store: <CAO_HOME_DIR>/agent-store/{name}.md (default
+       ~/.aws/cli-agent-orchestrator/agent-store/)
+    2. Provider-specific directories (flat {name}.md then {name}/agent.md)
+    3. Extra user-added directories (flat {name}.md then {name}/agent.md)
+    4. Built-in store (packaged with CAO)
+
+    Shared by ``load_agent_profile`` (which parses the text into an
+    ``AgentProfile``) and the install service (which writes the raw text to
+    the context file). Centralising the lookup keeps the two callers in sync.
+
+    The precedence itself is defined ONCE in :func:`_ordered_profile_candidates`;
+    this reader and the fail-closed precedence walk
+    (:func:`_first_present_store_entry_is_unknown`) iterate that same ordered
+    candidate list so they can never search different files (F838 #695 r6 — the
+    composed candidate and every flat/nested candidate are one shared list, no
+    second hand-copied set that could omit or reorder a candidate).
+    """
+    _validate_agent_name(agent_name)
+
+    # Read the FIRST candidate that yields bytes, in the shared precedence order
+    # (composed → local → configured → extra → built-in). The composed candidate
+    # is inside the shared list (r6), so a legacy name simply never has one.
+    for candidate in _ordered_profile_candidates(agent_name):
+        found = candidate.read()
         if found is not None:
             return found
-
-    # Built-in store is inside the installed package — the traversable API
-    # still concatenates agent_name as a single segment, so validate the
-    # result's name before reading.
-    agent_store = resources.files("cli_agent_orchestrator.agent_store")
-    built_in = agent_store / f"{agent_name}.md"
-    if built_in.name == f"{agent_name}.md" and built_in.is_file():
-        return built_in.read_text(encoding="utf-8")
 
     raise FileNotFoundError(f"Agent profile not found: {agent_name}")
 
@@ -679,43 +855,429 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
 
-def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
-    """Resolve the provider to use for an agent profile.
+class ProviderResolutionError(ValueError):
+    """F838 (#695): provider resolution for a composition/alias stub failed
+    fail-closed (carries a stable ``.code``). Raised instead of silently
+    substituting the caller's provider when the stub declares a
+    provider/composition but resolves to no valid provider."""
 
-    Loads the agent profile from the CAO agent store and checks for a
-    ``provider`` key.  If present and valid, returns the profile's provider.
-    Otherwise returns the fallback provider (typically inherited from the
-    calling terminal).
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+# F838 (#695) r2 — tri-state stub-intent classification. The r1 helper was
+# binary (declares? yes/no) with a ``_safe`` wrapper that swallowed EVERY read
+# error into ``(False, None)`` — the codex EMPIRICAL-GATE-NO Blocker 1: a raw
+# stub that is unreadable/unparseable/vanished became "no declared intent" and
+# so fell back to the caller's provider. The correct classification is
+# tri-state, and UNKNOWN must FAIL CLOSED for the resolution path.
+_STUB_DECLARED = "declared"  # read OK, frontmatter carries provider/extends/position
+_STUB_PLAIN = "plain"  # read OK, genuine legacy plain profile (no such intent)
+_STUB_ABSENT = "absent"  # FileNotFoundError — name truly absent, nothing to contradict
+_STUB_UNKNOWN = "unknown"  # read/parse error, or ambiguous — evidence unavailable
+
+
+def _dangling_store_entry(agent_name: str) -> bool:
+    """F838 (#695) r3 — does ``agent_name`` map to a DANGLING SYMLINK in any of
+    the configured stores?
+
+    ``read_agent_profile_source`` gates every candidate on ``Path.exists()``,
+    which FOLLOWS a symlink — so a link whose target is missing reads as
+    ``False`` and the whole lookup falls through to ``FileNotFoundError``, i.e.
+    it is indistinguishable from a truly-absent name. But a dangling link is a
+    store entry that IS present (as a link) and cannot be read: that is
+    uncertainty, not a clean absence, and the resolver must fail closed on it
+    (codex r2 P0-A). This mirrors the flat/nested candidate locations of
+    ``read_agent_profile_source`` and reports True when any candidate exists as a
+    symlink whose target does not resolve. ``Path.is_symlink()`` tests the link
+    itself (it does not follow it), so it is True for a dangling link where
+    ``exists()`` is False. Best-effort and never raises: a lookup helper that
+    itself blew up would just be a differently-shaped uncertainty, and the read
+    error path already covers that.
+    """
+
+    try:
+        _validate_agent_name(agent_name)
+    except ValueError:
+        return False
+
+    try:
+        # Consume the SAME ordered CANDIDATE list the reader uses (composed and
+        # built-in candidates included), so this dangling probe can never search
+        # a different set of files than read_agent_profile_source (F838 #695 r6).
+        # The composed/built-in candidates hold no user symlinks in the healthy
+        # case, but modelling every candidate here keeps every consumer on the
+        # one shared list.
+        for candidate in _ordered_profile_candidates(agent_name):
+            if candidate.is_present_unusable():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _first_present_store_entry_is_unknown(agent_name: str) -> bool:
+    """F838 (#695) r6 — is the FIRST CANDIDATE (in the reader's precedence order)
+    that is PRESENT for ``agent_name`` one the reader will NOT read? Report True
+    iff so, so resolution fails closed instead of falling through.
+
+    This closes the codex r3/r4/r5 P0 blockers as a CLASS. ``read_agent_profile_source``
+    gates each candidate on ``Path.exists()`` (which FOLLOWS a symlink) and on
+    ``_safe_join`` (which rejects a path escaping the root). So a
+    higher-precedence candidate that is a DANGLING symlink, or a symlink whose
+    target escapes the root, reads as "not here" and the reader silently FALLS
+    THROUGH to a lower-precedence same-named candidate — the lower file is then
+    classified DECLARED/PLAIN and its provider (or the caller fallback) reaches
+    creation.
+
+    Every prior round modelled precedence at STORE granularity with a list that
+    was missing something the reader consumed: r4 omitted the packaged BUILT-IN
+    store; r5 added it but stayed store-granular, so (P0-A) a readable NESTED
+    entry masked a dangling/escaping FLAT entry in the SAME store, and (P0-B) the
+    composed candidate was outside the shared list. The r6 fix removes the class
+    of defect: precedence is modelled at CANDIDATE granularity, and this walk
+    iterates the SAME ordered candidate list the reader consumes,
+    :func:`_ordered_profile_candidates` — one shared function, composed and every
+    flat/nested and built-in candidate in it, no second hand-copied set — so it
+    can never model a different or coarser precedence than the reader reads (a
+    filesystem-read-spy test pins that both consumers touch the identical
+    candidate sequence).
+
+    Required semantics: precedence STOPS at the FIRST candidate that is PRESENT
+    (readable OR present-but-unusable). This helper reports the SHADOWING case —
+    the first present candidate is one the reader will NOT read (a dangling
+    symlink, or a present entry ``_safe_join`` rejects — see
+    :meth:`_ProfileCandidate.is_present_unusable`) while some STRICTLY-LOWER
+    candidate is READABLE and the reader would otherwise fall through to it. It
+    returns False the moment it reaches a READABLE candidate first (that readable
+    candidate is the legitimate winner — no shadowing), and False for a bare
+    unusable candidate with NO lower readable match: that case is left to the
+    classifier's ``FileNotFoundError`` → :func:`_dangling_store_entry` arm, which
+    this helper deliberately leaves UNCHANGED (including its single raw-read
+    count).
+
+    This is a STAT-ONLY walk (``is_symlink``/``exists``/``is_file`` — no
+    ``read_text``), so it does NOT consume the single raw read the resolver is
+    asserted to make exactly once for a cleanly-read profile. Best-effort and
+    never raises.
+    """
+    try:
+        _validate_agent_name(agent_name)
+    except ValueError:
+        return False
+
+    try:
+        seen_higher_unusable = False
+        for candidate in _ordered_profile_candidates(agent_name):
+            # Precedence stops at the FIRST candidate that is PRESENT.
+            if candidate.is_present_readable():
+                # The reader reads THIS candidate's bytes. If a STRICTLY-HIGHER
+                # candidate was present-but-unusable, that entry shadows THIS
+                # readable one — the forbidden fall-through. Otherwise this is the
+                # legitimate winner (no shadowing).
+                return seen_higher_unusable
+            if candidate.is_present_unusable():
+                # A present-but-unreadable higher candidate (dangling / escapes
+                # its root). Remember it; if a lower candidate turns out readable,
+                # this shadows it. If none is readable, the FileNotFoundError →
+                # _dangling_store_entry arm handles it (single-read preserved).
+                seen_higher_unusable = True
+            # else: nothing for the name at this candidate — keep walking.
+        # Walked every candidate without a readable one. A bare unusable candidate
+        # with no lower readable match is left to the FileNotFoundError →
+        # _dangling_store_entry arm (single-read behaviour preserved).
+        return False
+    except Exception:
+        return False
+
+
+# F838 (#695) r3 — the U+FEFF byte-order mark. A well-formed profile source
+# never begins with one; a BOM-prefixed stub defeats frontmatter detection
+# (the ``---`` opener is no longer at offset 0), so ``frontmatter.loads`` silently
+# returns EMPTY metadata and the r2 classifier mislabelled it ``PLAIN`` and fell
+# back. A leading BOM is treated as a MALFORMED (UNKNOWN) stub (codex r2 P0-A).
+_BOM = "\ufeff"
+
+
+def _raw_stub_is_malformed(raw: str) -> bool:
+    """F838 (#695) r3 — does this successfully-read raw stub look like it INTENDED
+    to carry frontmatter but is malformed, so ``frontmatter.loads`` silently
+    produced empty metadata?
+
+    Two adversaries the r2 classifier accepted as ``PLAIN`` (codex EMPIRICAL-GATE
+    P0 blocker A) are caught here:
+
+    * **BOM-prefixed** — the source begins with U+FEFF, which pushes the ``---``
+      opener off offset 0 so the YAML handler never detects frontmatter. A clean
+      profile never starts with a BOM.
+    * **Truncated / unterminated delimiter** — the source opens with ``---`` (the
+      handler DETECTS a frontmatter block) but has no valid closing delimiter, so
+      the handler's split RAISES and ``loads`` swallows it into empty metadata.
+
+    A genuine legacy plain profile (no frontmatter block at all, or a well-formed
+    but empty ``---\\n---`` block) is NOT malformed: the handler either does not
+    detect a block, or detects and splits it cleanly. Those keep ``PLAIN``.
+    """
+    if raw.startswith(_BOM):
+        return True
+    handler = frontmatter.YAMLHandler()
+    try:
+        detected = handler.detect(raw)
+    except Exception:
+        # The detector itself choked on the bytes — indeterminate, treat as
+        # malformed (fail closed) rather than silently plain.
+        return True
+    if not detected:
+        # No frontmatter block opener — a genuine plain profile (no declared
+        # intent). Not malformed.
+        return False
+    # A frontmatter opener IS present. It must split cleanly into (metadata,
+    # content); if the closing delimiter is missing/garbled the handler raises
+    # and ``frontmatter.loads`` would have hidden that as empty metadata.
+    try:
+        handler.split(raw)
+    except Exception:
+        return True
+    return False
+
+
+def _classify_stub_intent(
+    agent_profile_name: str,
+) -> "tuple[str, Optional[str], Optional[str]]":
+    """Read a profile's RAW stub ONCE and classify its declared intent (tri-state+).
+
+    Returns ``(intent, declared_provider, raw_text)`` where ``intent`` is one of
+    :data:`_STUB_DECLARED`, :data:`_STUB_PLAIN`, :data:`_STUB_ABSENT`,
+    :data:`_STUB_UNKNOWN`:
+
+    * ``DECLARED`` — the frontmatter parsed cleanly and carries ANY of
+      ``provider:``/``extends:``/``position:``; ``declared_provider`` is the raw
+      ``provider:`` value (or None if only ``extends:``/``position:`` present).
+    * ``PLAIN`` — the frontmatter parsed cleanly and carries NONE of those keys:
+      a genuine legacy plain profile, for which the caller-provider fallback is
+      correct (pinned by ``test_returns_fallback_when_no_provider_key`` et al.).
+    * ``ABSENT`` — ``read_agent_profile_source`` raised ``FileNotFoundError`` AND
+      no store entry for the name is a dangling symlink: the name is truly
+      absent, nothing in the store to contradict.
+    * ``UNKNOWN`` — the raw read raised anything else (permission/IO/decoding);
+      the frontmatter failed to parse; the raw stub is MALFORMED (BOM-prefixed or
+      a truncated/unterminated delimiter that ``frontmatter.loads`` hides as
+      empty metadata — codex r2 P0-A); the name resolves to a DANGLING SYMLINK
+      (a store entry that exists as a link but whose target is missing — NOT a
+      clean absence, codex r2 P0-A); OR the FIRST store dir (in precedence order)
+      that has an entry for the name holds it only as a dangling symlink, which
+      the ``.exists()``-gated reader would skip in favour of a LOWER-precedence
+      same-named profile (codex r3 P0 — a higher dangling stub must not fall
+      through). We have NO reliable evidence of intent, so this path MUST fail
+      closed (F838 #695) — never treated as ``PLAIN``/``ABSENT``.
+
+    ``raw_text`` is the single raw read (or None when not readable), so the
+    caller resolves the profile from these SAME bytes rather than issuing a
+    second, racy disk read (codex Blocker: "resolve from one immutable read").
+    """
+    # F838 (#695) r4 — PRECEDENCE-SHADOWED DANGLING STUB (codex r3 P0). Before
+    # the single read, walk the stores in read order: if the FIRST store dir
+    # that has an entry for the name holds that entry only as a DANGLING SYMLINK,
+    # resolution must STOP THERE and classify UNKNOWN. Otherwise
+    # ``read_agent_profile_source`` (which gates on ``.exists()``, following
+    # symlinks) skips the dangling higher entry and silently returns a
+    # LOWER-precedence same-named profile, whose provider/fallback then reaches
+    # creation. This stat-only check runs BEFORE the read, so the fail-closed
+    # verdict is reached without ever reading (and thus without trusting) the
+    # shadowed lower file.
+    if _first_present_store_entry_is_unknown(agent_profile_name):
+        return _STUB_UNKNOWN, None, None
+    try:
+        raw = read_agent_profile_source(agent_profile_name)
+    except FileNotFoundError:
+        # A plain ``.exists()`` miss can hide a DANGLING SYMLINK (a store entry
+        # that IS present as a link but whose target is gone). That is not a
+        # clean absence; fail closed rather than inheriting the caller provider.
+        if _dangling_store_entry(agent_profile_name):
+            return _STUB_UNKNOWN, None, None
+        return _STUB_ABSENT, None, None
+    except Exception:
+        # Exists (or its readability is indeterminate) but we cannot read it —
+        # evidence unavailable. UNKNOWN, fail closed for the resolution path.
+        return _STUB_UNKNOWN, None, None
+    # The bytes were read. Reject MALFORMED frontmatter (BOM / truncated
+    # delimiter) that ``frontmatter.loads`` would silently reduce to empty
+    # metadata and thereby mislabel as a plain profile.
+    if _raw_stub_is_malformed(raw):
+        return _STUB_UNKNOWN, None, raw
+    try:
+        metadata = frontmatter.loads(raw).metadata
+    except Exception:
+        # The bytes are present but not parseable frontmatter — indeterminate.
+        return _STUB_UNKNOWN, None, raw
+    declares = any(k in metadata for k in ("provider", *PROFILE_COMPOSITION_KEYS))
+    provider = metadata.get("provider")
+    provider = provider if isinstance(provider, str) and provider else None
+    return (_STUB_DECLARED if declares else _STUB_PLAIN), provider, raw
+
+
+def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
+    """Resolve the provider to use for an agent profile (F838 #695 FAIL-CLOSED).
+
+    The provider is resolved from a SINGLE immutable raw read of the profile's
+    stub (F838 #695 r2 — codex EMPIRICAL-GATE-NO Blocker 1): the stub is read
+    once, its declared intent is classified from those bytes, and the profile is
+    composed/parsed from those SAME bytes. No second, racy disk read decides the
+    fallback question.
+
+    Fail-closed contract for a name whose stub DECLARES a provider/composition
+    (``provider:``/``extends:``/``position:``): if it does not resolve to a
+    valid provider — because it composed/parsed to no provider, an invalid
+    provider, or the composition/parse RAISED — this raises
+    :class:`ProviderResolutionError` (``E-PROVIDER-UNRESOLVED``) rather than
+    silently substituting the caller's provider (the #695 bug: a ``pi_cli``
+    alias stub spawned as the supervisor's ``claude_code``/Opus).
+
+    An UNKNOWN stub — the raw read errored, or the frontmatter would not parse —
+    also fails closed: an unreadable/unparseable store entry for a legacy alias
+    is a REFUSAL, not caller-provider inheritance (codex: "an unreadable,
+    unparseable, changed, or disappeared store entry must be a refusal"). The
+    ``ProviderResolutionError`` carries the sentinel provider name ``<unknown>``.
+
+    The caller-provider fallback survives for EXACTLY two cases, both requiring a
+    SUCCESSFUL read:
+      * ``PLAIN`` — the stub read cleanly and declares NO provider/composition
+        intent (a genuine legacy plain profile).
+      * ``ABSENT`` — the name is truly absent (``FileNotFoundError``); nothing in
+        the store to contradict (provider.initialize surfaces the real error).
 
     Args:
         agent_profile_name: Name of the agent profile to look up.
-        fallback_provider: Provider to use when the profile does not specify
-            one or specifies an invalid value.
+        fallback_provider: Provider to use ONLY for a PLAIN or ABSENT stub.
 
     Returns:
         Resolved provider type string.
+
+    Raises:
+        ProviderResolutionError: the stub declares a provider/composition but
+            does not resolve to a valid provider, OR the stub is UNKNOWN
+            (unreadable/unparseable) — fail closed, no spawn.
     """
-    try:
-        profile = load_agent_profile(agent_profile_name)
-    except (FileNotFoundError, RuntimeError):
-        # Profile not found or failed to load — provider.initialize()
-        # will surface a clear error later.  Fall back for now.
+    intent, declared_provider, raw_text = _classify_stub_intent(agent_profile_name)
+    return _resolve_provider_from_classification(
+        agent_profile_name,
+        fallback_provider,
+        intent,
+        declared_provider,
+        raw_text,
+    )
+
+
+def _resolve_provider_from_classification(
+    agent_profile_name: str,
+    fallback_provider: str,
+    intent: str,
+    declared_provider: "Optional[str]",
+    raw_text: "Optional[str]",
+) -> str:
+    """F838 (#695) r3 — resolve a provider from an ALREADY-CLASSIFIED stub.
+
+    This is the resolution half of :func:`resolve_provider`, split out so a
+    caller that has already read+classified the stub ONCE (the assign guard)
+    can resolve from that SAME immutable classification without issuing a second
+    ``_classify_stub_intent`` (and thus a second disk read). ``resolve_provider``
+    itself is now a one-read wrapper around this function, so its external
+    behaviour is byte-identical — but the guard no longer reads the store twice
+    (codex r2 P0 blocker B: the guard "still spans two mutable reads", so an
+    empty-provider file that DISAPPEARS between the intent read and the resolver
+    read was reclassified ``ABSENT`` and fell back). With a single read, a
+    mid-flight disappearance cannot change the verdict.
+
+    The fail-closed contract is identical to :func:`resolve_provider`: UNKNOWN
+    and a DECLARED-but-unresolvable stub REFUSE; only a cleanly-read PLAIN or a
+    truly ABSENT name may fall back.
+    """
+    if intent == _STUB_ABSENT:
+        # Name truly absent — nothing to contradict; fall back.
         return fallback_provider
 
-    if profile.provider:
-        if profile.provider in PROVIDERS:
-            return profile.provider
-        else:
-            logger.warning(
-                "Agent profile '%s' has invalid provider '%s'. "
-                "Valid providers: %s. Falling back to '%s'.",
-                agent_profile_name,
-                profile.provider,
-                PROVIDERS,
-                fallback_provider,
-            )
+    if intent == _STUB_UNKNOWN:
+        # Unreadable/unparseable/malformed/dangling store entry — evidence
+        # unavailable. A legacy alias that cannot be read must be REFUSED, never
+        # inherit the caller.
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"could not be read/parsed from the store (provider undeterminable); "
+            f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+        )
 
+    # intent is PLAIN or DECLARED — the stub read cleanly. Resolve the profile
+    # from the SAME raw bytes we classified, so nothing re-reads the mutable
+    # store between the intent decision and the resolution.
+    try:
+        profile = resolve_agent_profile(resolve_env_vars(raw_text or ""), agent_profile_name)
+    except (FileNotFoundError, ValueError, RuntimeError):
+        # Composition/parse failed AFTER a clean stub read. For a PLAIN profile
+        # this cannot normally happen (plain parse), but treat any failure on a
+        # DECLARED stub as the #695 defect — fail closed.
+        if intent == _STUB_DECLARED:
+            raise ProviderResolutionError(
+                E_PROVIDER_UNRESOLVED,
+                f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+                f"declares a provider/composition but failed to load/compose; "
+                f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+            )
+        # PLAIN stub that nonetheless failed to parse — indeterminate, refuse.
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"read but failed to parse (provider undeterminable); "
+            f"refusing to fall back to '{fallback_provider}' (F838 #695)",
+        )
+
+    if profile.provider and profile.provider in PROVIDERS:
+        return profile.provider
+
+    if profile.provider and profile.provider not in PROVIDERS:
+        logger.warning(
+            "Agent profile '%s' has invalid provider '%s'. Valid providers: %s.",
+            agent_profile_name,
+            profile.provider,
+            PROVIDERS,
+        )
+
+    # Loaded cleanly but carries no valid provider. F838: a DECLARED stub that
+    # resolves to no valid provider is a defect — fail closed. Only a genuine
+    # PLAIN profile (no declared intent) keeps the caller-provider fallback.
+    if intent == _STUB_DECLARED:
+        raise ProviderResolutionError(
+            E_PROVIDER_UNRESOLVED,
+            f"{E_PROVIDER_UNRESOLVED}: agent profile '{agent_profile_name}' "
+            f"declares a provider/composition but resolved to no valid provider "
+            f"(got {profile.provider!r}); refusing to fall back to "
+            f"'{fallback_provider}' (F838 #695)",
+        )
     return fallback_provider
+
+
+def _stub_declared_provider_safe(agent_profile_name: str) -> "tuple[bool, Optional[str]]":
+    """F838 #695 assign-guard helper: is the stub's declared intent known, and
+    what provider does it name?
+
+    Returns ``(declares_intent, declared_provider)``. Unlike the r1 version this
+    is NOT best-effort: a ``DECLARED`` stub returns ``(True, provider)`` and a
+    genuinely ``PLAIN`` stub returns ``(False, None)`` — but an ``UNKNOWN`` stub
+    (unreadable/unparseable) ALSO returns ``(True, None)`` so the assign guard
+    routes it through ``resolve_provider`` (which fails closed on UNKNOWN) rather
+    than silently treating an unreadable alias as "no intent → legacy
+    passthrough" (codex Blocker 1). Only a clean PLAIN/ABSENT read yields
+    ``(False, …)`` — the sole paths allowed to fall back."""
+    intent, declared_provider, _ = _classify_stub_intent(agent_profile_name)
+    if intent == _STUB_DECLARED:
+        return True, declared_provider
+    if intent == _STUB_UNKNOWN:
+        # Unreadable/unparseable: NOT a "no intent" signal. Route through the
+        # fail-closed resolver rather than the legacy passthrough.
+        return True, None
+    # PLAIN or ABSENT — a clean read with no declared intent.
+    return False, declared_provider
 
 
 # --- F497 D7 — assign(provider=) position-name resolution ------------------
@@ -733,6 +1295,10 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
 E_POSITION_NEEDS_PROVIDER = "E-POSITION-NEEDS-PROVIDER"
 E_PROVIDER_NOT_ALLOWED = "E-PROVIDER-NOT-ALLOWED"
 E_UNKNOWN_POSITION = "E-UNKNOWN-POSITION"
+# F838 (#695): a profile whose stub DECLARES a provider/composition but resolves
+# to no valid provider — the fail-closed replacement for the silent
+# caller-provider fallback that spawned a pi_cli alias stub as claude_code/Opus.
+E_PROVIDER_UNRESOLVED = "E-PROVIDER-UNRESOLVED"
 # F786 D3 — a dispatch naming a RETIRED legacy profile is refused BEFORE the
 # legacy passthrough; the mapping and this code live in ``routing_guard`` so the
 # root PreToolUse hook twin shares them (D7).

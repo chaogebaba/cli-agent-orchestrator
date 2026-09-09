@@ -75,7 +75,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -231,6 +231,17 @@ class PiCliProvider(BaseProvider):
     # condition is never a TerminalStatus member (D1).
     condition_provider_key = "pi_cli"
 
+    # F829 A1 (D10): pi is PARTIAL (D9) — it RECOVERS after a COMPLETED turn (the
+    # transcript is written atomically at turn end), so resume/artifact are
+    # declared; a mid-turn kill leaves NO artifact (that boundary is D8's
+    # session_artifact_missing, not a capability failure). It cannot FORK.
+    declared_capabilities = {
+        "fork": False,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
+
     def __init__(
         self,
         terminal_id: str,
@@ -240,8 +251,11 @@ class PiCliProvider(BaseProvider):
         allowed_tools: Optional[list[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        fork_context: Optional["ForkContext"] = None,
     ) -> None:
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(
+            terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context
+        )
         self._agent_profile = agent_profile
         self._model = model
         self._initialized = False
@@ -424,15 +438,37 @@ class PiCliProvider(BaseProvider):
             # (live-probed 2026-09-07), breaking the send_message callback path.
             "--no-skills",
             "--no-prompt-templates",
-            "--session-id",
-            self.terminal_id,
-            "--session-dir",
-            str(self.session_dir),
-            "--append-system-prompt",
-            str(self.prompt_path),
-            "--mcp-config",
-            str(self.mcp_config_path),
         ]
+
+        # F829 A1 (D3): pi resume arm. On a resume-mode fork_context carrying a
+        # recorded artifact path, re-attach the PRIOR session with
+        # ``--session <artifact_locator>`` (D9-confirmed: does NOT create a new
+        # session) rather than minting a fresh ``--session-id <terminal_id>``.
+        _fc = self._fork_context
+        _pi_resume_path = (
+            _fc.session_artifact_path
+            if _fc is not None and getattr(_fc, "mode", None) == "resume"
+            else None
+        )
+        if _pi_resume_path:
+            command_parts.extend(["--session", str(_pi_resume_path)])
+        else:
+            command_parts.extend(
+                [
+                    "--session-id",
+                    self.terminal_id,
+                    "--session-dir",
+                    str(self.session_dir),
+                ]
+            )
+        command_parts.extend(
+            [
+                "--append-system-prompt",
+                str(self.prompt_path),
+                "--mcp-config",
+                str(self.mcp_config_path),
+            ]
+        )
 
         model = self._resolve_model(profile)
         self._resolved_model = model if (isinstance(model, str) and model) else None
