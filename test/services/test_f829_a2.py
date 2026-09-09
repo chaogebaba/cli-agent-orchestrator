@@ -589,15 +589,20 @@ def test_ac_a2_5_claim_released_on_post_claim_failure(real_sqlite_env):
 
 def test_ac_a2_5_release_verb_is_owner_guarded(real_sqlite_env):
     """cao identity release <key> --owner: clears a leaked claim ONLY for the
-    recorded owner; a non-owner cannot release."""
+    recorded owner; a non-owner cannot release. A leaked claim is a DEAD claimant
+    (past the AC4 TTL) — modelled here with claim_ttl_s=0.0 so the interlock
+    treats it as releasable."""
     _mk_owned_root("k_rel", owner="mb_owner")
     gen = d.get_conversation_identity("k_rel")["generation"]
     d.claim_resume("k_rel", gen, "claimant")
-    # Wrong owner refused.
-    assert d.release_resume_claim_owned("k_rel", "mb_intruder")["reason"] == "not_owner"
+    # Wrong owner refused (owner check precedes the liveness interlock).
+    assert (
+        d.release_resume_claim_owned("k_rel", "mb_intruder", claim_ttl_s=0.0)["reason"]
+        == "not_owner"
+    )
     assert d.get_conversation_identity("k_rel")["resume_claim"] is not None
-    # Correct owner releases.
-    assert d.release_resume_claim_owned("k_rel", "mb_owner")["released"] is True
+    # Correct owner releases a dead/leaked claim.
+    assert d.release_resume_claim_owned("k_rel", "mb_owner", claim_ttl_s=0.0)["released"] is True
     assert d.get_conversation_identity("k_rel")["resume_claim"] is None
 
 
@@ -909,13 +914,17 @@ def test_f865_b4_release_plane_is_owner_cas_not_terminal_token(real_sqlite_env):
     assert d.get_conversation_identity("k_b4")["resume_claim"] is not None
     # No X-CAO-Terminal-Token, no live owning terminal — the owner principal
     # alone (compare-and-set) releases. This is the operator plane the blueprint
-    # should name; the terminal-token plane would be UNSATISFIABLE here.
-    out = d.release_resume_claim_owned("k_b4", "mb_owner")
+    # should name; the terminal-token plane would be UNSATISFIABLE here. A leaked
+    # claim is a DEAD claimant (past the AC4 TTL) — claim_ttl_s=0.0 models that.
+    out = d.release_resume_claim_owned("k_b4", "mb_owner", claim_ttl_s=0.0)
     assert out.get("released") is True
     assert d.get_conversation_identity("k_b4")["resume_claim"] is None
     # And a non-owner principal is refused even with everything else identical.
     d.claim_resume("k_b4", d.get_conversation_identity("k_b4")["generation"], "again")
-    assert d.release_resume_claim_owned("k_b4", "mb_not_owner")["reason"] == "not_owner"
+    assert (
+        d.release_resume_claim_owned("k_b4", "mb_not_owner", claim_ttl_s=0.0)["reason"]
+        == "not_owner"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1007,3 +1016,186 @@ def test_f865_s4_diag_distinguishes_all_five_states(real_sqlite_env):
     )
     assert _gci("conv_s4_bind")["provider_session_id"] is None
     assert _diag("conv_s4_bind")["state"] == "binding_or_artifact_missing"
+
+
+# ==========================================================================
+# F865 R2 — Opus DESIGN-delta folds (blueprint 41ca40cd: A2.5 release interlock
+# + liveness refusal; A2.2 no owner-override claim + operator backfill entry
+# point; AC-A2.9 audit-record separation).
+#
+# CODE (fail-before/pass-after + named mutants):
+#   * A2.5 release interlock →
+#       test_f865_r2_release_refuses_live_claimant
+#       test_f865_r2_release_quiesces_dead_claimant
+#       test_f865_r2_release_never_rewrites_owner_or_stamps_resumed_by
+#     mutants: skip-the-liveness-check; rewrite-owner-on-release
+#   * AC-A2.9 audit separation →
+#       test_f865_r2_principal_states_ii_iii_separated_in_audit
+# ADDED surface + test:
+#   * A2.2 operator backfill entry point →
+#       test_f865_r2_operator_backfill_entry_point_recovers_skipped_root
+#   * A2.2 no owner-override on claim →
+#       test_f865_r2_claim_has_no_owner_override_mode
+# ==========================================================================
+
+
+def _claim_with_age(identity_key: str, claimant: str, *, age_seconds: float) -> None:
+    """Take a resume claim, then backdate resume_claim_at by age_seconds so the
+    AC4 TTL interlock can be exercised deterministically."""
+    import datetime as _dt
+
+    gen = d.get_conversation_identity(identity_key)["generation"]
+    assert d.claim_resume(identity_key, gen, claimant) is True
+    backdated = d._utcnow() - _dt.timedelta(seconds=age_seconds)
+    with d.SessionLocal.begin() as db:
+        db.query(d.ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            {d.ConversationIdentityModel.resume_claim_at: backdated}, synchronize_session=False
+        )
+
+
+# --------------------------------------------------------------------------
+# A2.5 release interlock — REFUSE a live/uncertain claimant (within TTL).
+# MUTANT: skip-the-liveness-check → this test fails (a live claim is released).
+# --------------------------------------------------------------------------
+def test_f865_r2_release_refuses_live_claimant(real_sqlite_env):
+    _mk_owned_root("k_r2_live", owner="mb_owner")
+    # A fresh claim (age 0) is well within the TTL → live/uncertain.
+    _claim_with_age("k_r2_live", "claimant", age_seconds=0)
+    out = d.release_resume_claim_owned("k_r2_live", "mb_owner", claim_ttl_s=600.0)
+    assert out["released"] is False and out["reason"] == "claimant_live", out
+    # The claim is left INTACT — release never raced a resume in flight.
+    assert d.get_conversation_identity("k_r2_live")["resume_claim"] is not None
+    names = [e["event"] for e in d.get_conversation_events("k_r2_live")]
+    assert "claim_released_by_owner" not in names
+
+
+def test_f865_r2_release_quiesces_dead_claimant(real_sqlite_env):
+    """A claim PAST the TTL is a confirmed-dead claimant: quiesced
+    (claim_reconciled) then released (claim_released_by_owner)."""
+    _mk_owned_root("k_r2_dead", owner="mb_owner")
+    _claim_with_age("k_r2_dead", "dead-claimant", age_seconds=1200)
+    out = d.release_resume_claim_owned("k_r2_dead", "mb_owner", claim_ttl_s=600.0)
+    assert out["released"] is True, out
+    assert d.get_conversation_identity("k_r2_dead")["resume_claim"] is None
+    names = [e["event"] for e in d.get_conversation_events("k_r2_dead")]
+    assert "claim_reconciled" in names  # quiesced first
+    assert "claim_released_by_owner" in names  # then released
+
+
+def test_f865_r2_release_never_rewrites_owner_or_stamps_resumed_by(real_sqlite_env):
+    """Release clears the claim ONLY: owner_principal is untouched, resumed_by is
+    never stamped, and the release is audited as a conversation event."""
+    _mk_owned_root("k_r2_inv", owner="mb_owner")
+    _claim_with_age("k_r2_inv", "dead", age_seconds=1200)
+    out = d.release_resume_claim_owned("k_r2_inv", "mb_owner", claim_ttl_s=600.0)
+    assert out["released"] is True
+    root = d.get_conversation_identity("k_r2_inv")
+    assert root["owner_principal"] == "mb_owner"  # NEVER rewritten
+    assert root["resume_claim"] is None
+    names = [e["event"] for e in d.get_conversation_events("k_r2_inv")]
+    assert "claim_released_by_owner" in names  # audit event written
+    assert "resumed_by" not in names  # never stamped by release
+
+
+# --------------------------------------------------------------------------
+# A2.2 — `cao identity claim` has NO owner-override mode: --owner on an
+# already-owned (non-legacy) root refuses already_owned.
+# --------------------------------------------------------------------------
+def test_f865_r2_claim_has_no_owner_override_mode(real_sqlite_env):
+    _mk_owned_root("k_r2_owned", owner="mb_owner")
+    # An operator trying to override the owner via claim --owner is refused.
+    res = d.claim_identity_owner("k_r2_owned", "mb_usurper")
+    assert res["status"] == "already_owned"
+    assert res["owner_principal"] == "mb_owner"
+    assert d.get_conversation_identity("k_r2_owned")["owner_principal"] == "mb_owner"
+    # And the CLI surfaces already_owned (no --owner override path exists).
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.identity import identity_claim
+
+    res_cli = CliRunner().invoke(identity_claim, ["k_r2_owned", "--owner", "mb_usurper"])
+    assert res_cli.exit_code != 0
+    assert "already owned" in res_cli.output
+
+
+# --------------------------------------------------------------------------
+# A2.2 — the explicit OPERATOR backfill entry point recovers a terminal-fallback
+# root that the once-at-start migration SKIPPED (active claim then): release the
+# stuck claim, then re-run the backfill through the operator command.
+# --------------------------------------------------------------------------
+def test_f865_r2_operator_backfill_entry_point_recovers_skipped_root(real_sqlite_env):
+    db_file = real_sqlite_env["db_file"]
+    from unittest.mock import patch
+
+    import cli_agent_orchestrator.constants as consts
+
+    with real_sqlite_env["TestSession"]() as db:
+        _seed_incarnation(db, "beefcafe")
+        _seed_mailbox(db, "mb_recovered", "beefcafe")
+        d.mint_conversation_identity(
+            identity_key="conv_r2_bf",
+            provider="codex",
+            provider_namespace="ns",
+            agent_profile="dev",
+            model="m",
+            reasoning_effort=None,
+            owner_principal="beefcafe",  # bare terminal-id fallback owner
+            origin_callback_ref=None,
+            current_terminal_id="beefcafe",
+            db=db,
+        )
+        db.commit()
+    # Simulate the once-at-start run skipping it because a claim was active.
+    gen = d.get_conversation_identity("conv_r2_bf")["generation"]
+    d.claim_resume("conv_r2_bf", gen, "some-claimant")
+    with patch.object(consts, "DATABASE_FILE", str(db_file)):
+        d._migrate_f829_a2_owner_backfill()
+    assert d.get_conversation_identity("conv_r2_bf")["owner_principal"] == "beefcafe"  # skipped
+    # Recovery path: release the stuck claim (dead), then re-run via the operator
+    # entry point — NOT a claim owner-override.
+    # Backdate the claim so release treats it as dead.
+    import datetime as _dt
+
+    with d.SessionLocal.begin() as db:
+        db.query(d.ConversationIdentityModel).filter_by(identity_key="conv_r2_bf").update(
+            {
+                d.ConversationIdentityModel.resume_claim_at: d._utcnow()
+                - _dt.timedelta(seconds=1200)
+            },
+            synchronize_session=False,
+        )
+    assert d.release_resume_claim_owned("conv_r2_bf", "beefcafe", claim_ttl_s=600.0)["released"]
+    with patch.object(consts, "DATABASE_FILE", str(db_file)):
+        tally = d.run_owner_backfill_operator()
+    assert tally["backfilled"] >= 1, tally
+    assert d.get_conversation_identity("conv_r2_bf")["owner_principal"] == "mb_recovered"
+    # Idempotent: a second operator run rewrites nothing.
+    with patch.object(consts, "DATABASE_FILE", str(db_file)):
+        tally2 = d.run_owner_backfill_operator()
+    assert tally2["backfilled"] == 0
+
+
+# --------------------------------------------------------------------------
+# AC-A2.9 — states (ii) schema-unavailable and (iii) lookup-failed share the
+# coarse error (principal_unavailable / retryable true) and are separated ONLY
+# in the audit record.
+# --------------------------------------------------------------------------
+def test_f865_r2_principal_states_ii_iii_separated_in_audit(real_sqlite_env):
+    from unittest.mock import patch
+
+    S = real_sqlite_env["TestSession"]
+    # (ii) schema unavailable.
+    with S() as db:
+        with patch.object(d, "_mailbox_schema_available", return_value=False):
+            r_ii = d.principal_for_terminal("term_ii00", db=db)
+    # (iii) lookup raised.
+    with S() as db:
+        with patch.object(db, "query", side_effect=RuntimeError("db boom")):
+            r_iii = d.principal_for_terminal("term_iii0", db=db)
+    # Same COARSE outcome for both...
+    assert r_ii.error == r_iii.error == "principal_unavailable"
+    assert r_ii.retryable is True and r_iii.retryable is True
+    # ...separated ONLY in the audit record.
+    assert r_ii.audit == "schema_unavailable"
+    assert r_iii.audit == "lookup_failed"
+    assert r_ii.audit != r_iii.audit

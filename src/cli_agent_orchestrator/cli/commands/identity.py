@@ -232,4 +232,32 @@ def identity_release(identity_key: str, owner_principal: str) -> None:
         raise click.ClickException(f"no conversation identity '{identity_key}'")
     if reason == "no_active_claim":
         raise click.ClickException("no active resume claim to release")
+    if reason == "claimant_live":
+        raise click.ClickException(
+            "the resume claim is still within its TTL (claimant live or of "
+            "uncertain liveness); refusing to release a claim that may race a "
+            "resume in flight — retry after resume.claim_ttl_s elapses"
+        )
     raise click.ClickException(f"release failed: {reason}")
+
+
+@identity.command("backfill-owners")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def identity_backfill_owners(as_json: bool) -> None:
+    """F829 A2.2: re-run the provenance-checked owner backfill (operator entry point).
+
+    The automatic backfill runs once at server start; this re-runs the SAME
+    idempotent logic on demand so an operator can recover a terminal-fallback
+    root that was skipped then (e.g. it held an active resume claim). Recovery
+    path: ``cao identity release`` to clear a stuck claim, then this. There is NO
+    owner-override on ``cao identity claim`` — this is the sanctioned recovery.
+    """
+    from cli_agent_orchestrator.clients.database import run_owner_backfill_operator
+
+    tally = run_owner_backfill_operator()
+    if as_json:
+        click.echo(_json.dumps(tally, indent=2))
+        return
+    click.echo(
+        f"owner backfill complete: backfilled={tally['backfilled']} " f"skipped={tally['skipped']}"
+    )

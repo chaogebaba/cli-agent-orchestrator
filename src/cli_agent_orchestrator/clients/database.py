@@ -3584,6 +3584,47 @@ def _migrate_f829_a2_owner_backfill() -> None:
         logger.debug("f829 A2 owner backfill migration skipped", exc_info=True)
 
 
+def run_owner_backfill_operator() -> Dict[str, int]:
+    """F829 A2.2 (F865 r2): explicit OPERATOR entry point for the owner backfill.
+
+    The automatic backfill runs once at server start through the migrator
+    registry (its idempotency is by predicate, not a version stamp — after a
+    rewrite the owner is ``mb_``-prefixed and no longer selected). This thin,
+    idempotent command re-runs the SAME provenance-checked logic on demand, so
+    an operator can recover a terminal-fallback root that was skipped at start
+    (e.g. it held an active resume claim then; the recovery path in A2.2 is
+    ``cao identity release`` to clear the stuck claim, then this re-run). It is
+    the ONLY sanctioned owner-recovery for such a root — ``cao identity claim``
+    has NO owner-override mode.
+
+    Returns a tally read back from the audit trail delta:
+    ``{backfilled, skipped}`` counting the events this run appended.
+    """
+    before = _count_owner_backfill_events()
+    _migrate_f829_a2_owner_backfill()
+    after = _count_owner_backfill_events()
+    return {
+        "backfilled": after[0] - before[0],
+        "skipped": after[1] - before[1],
+    }
+
+
+def _count_owner_backfill_events() -> tuple[int, int]:
+    """(owner_backfilled, owner_backfill_skipped) event counts — audit tally."""
+    with SessionLocal() as db:
+        done = (
+            db.query(ConversationEventModel)
+            .filter(ConversationEventModel.event == "owner_backfilled")
+            .count()
+        )
+        skipped = (
+            db.query(ConversationEventModel)
+            .filter(ConversationEventModel.event == "owner_backfill_skipped")
+            .count()
+        )
+        return int(done), int(skipped)
+
+
 def _restrict_db_file_permissions() -> None:
     """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
 
@@ -4660,6 +4701,13 @@ class PrincipalResult:
     principal: Optional[str] = None
     error: Optional[str] = None
     retryable: bool = False
+    # F865 r2 (AC-A2.9): a finer AUDIT cause that DISTINGUISHES states which
+    # share the coarse ``error`` token. States (ii) schema-unavailable and (iii)
+    # lookup-failed BOTH emit ``error=principal_unavailable``/retryable true and
+    # are separated ONLY here — this is the audit-record separation the AC
+    # asserts (never a second refusal outcome). One of: ``schema_unavailable`` |
+    # ``lookup_failed`` | ``no_caller`` | ``inconsistent_membership`` | None.
+    audit: Optional[str] = None
 
 
 def principal_for_terminal(terminal_id: Optional[str], *, db: Any) -> PrincipalResult:
@@ -4690,24 +4738,40 @@ def principal_for_terminal(terminal_id: Optional[str], *, db: Any) -> PrincipalR
     if not terminal_id:
         # No caller at all — never treat as an owner (bypass 1). A missing caller
         # is a schema-independent refusal.
-        return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+        return PrincipalResult(
+            ok=False, error="principal_unavailable", retryable=True, audit="no_caller"
+        )
     try:
         if not _mailbox_schema_available(db):
             # (ii) cannot tell whether this seat has a mailbox — refuse rather
-            # than guess an identity.
-            return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+            # than guess an identity. Shares the coarse error with (iii);
+            # separated by audit=schema_unavailable (AC-A2.9).
+            return PrincipalResult(
+                ok=False,
+                error="principal_unavailable",
+                retryable=True,
+                audit="schema_unavailable",
+            )
         rows = (
             db.query(MailboxIncarnationModel.mailbox_id)
             .filter(MailboxIncarnationModel.terminal_id == terminal_id)
             .all()
         )
     except Exception:
-        # (iii) any DB error is retryable and never a silent owner.
-        return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+        # (iii) any DB error is retryable and never a silent owner. Same coarse
+        # error as (ii); separated by audit=lookup_failed (AC-A2.9).
+        return PrincipalResult(
+            ok=False, error="principal_unavailable", retryable=True, audit="lookup_failed"
+        )
     distinct = {str(r[0]) for r in rows if r[0] is not None}
     if len(distinct) > 1:
         # (iv) inconsistent membership — never pick one; not retryable.
-        return PrincipalResult(ok=False, error="principal_inconsistent", retryable=False)
+        return PrincipalResult(
+            ok=False,
+            error="principal_inconsistent",
+            retryable=False,
+            audit="inconsistent_membership",
+        )
     if distinct:
         return PrincipalResult(ok=True, principal=next(iter(distinct)))
     # (i) no incarnation row, schema present → positively-known mailbox-less seat.
@@ -5648,18 +5712,49 @@ def clear_resume_claim(identity_key: str, *, event: Optional[str] = None) -> Non
         record_conversation_event(identity_key, event)
 
 
-def release_resume_claim_owned(identity_key: str, owner_principal: str) -> Dict[str, Any]:
+def release_resume_claim_owned(
+    identity_key: str,
+    owner_principal: str,
+    *,
+    claim_ttl_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """F829 A2.5: owner-guarded release of a LEAKED resume claim (operator recovery).
 
-    Backs ``cao identity release <key> --owner <principal>``. Clears the claim
-    ONLY when ``owner_principal`` matches the root's recorded owner — a recoverer
-    cannot release a claim on a conversation it does not own. Returns a small
-    result dict: ``{released: bool, reason: str}``.
+    Backs ``cao identity release <key> --owner <principal>``. Interlock rules:
+
+    * ``owner_principal`` must equal the root's recorded owner — a recoverer
+      cannot release a claim on a conversation it does not own (``not_owner``).
+      ``--owner`` is a correctness compare-and-set, not a credential (A2.5).
+    * The claim is CLEARED ONLY: this never rewrites ``owner_principal`` and
+      never stamps ``resumed_by`` (those belong to a real resume publish). It is
+      audited as a conversation event.
+    * AC4 TTL/liveness interlock: a claim still WITHIN its ``resume.claim_ttl_s``
+      window is a claimant that is live or of UNCERTAIN liveness — release
+      REFUSES ``claimant_live`` so it can never race a resume in flight. Only a
+      claim PAST the TTL (a confirmed-dead / abandoned claimant) is quiesced
+      (audited ``claim_reconciled``) and then released.
 
     Distinct from ``clear_resume_claim`` (an internal compensator that runs on
     the server's own spawn-failure path and takes no owner argument): this is the
     authorized OPERATOR verb.
+
+    ``claim_ttl_s`` defaults to ``resume.claim_ttl_s`` (600s) when omitted.
+    Returns ``{released: bool, reason: str}``.
     """
+    if claim_ttl_s is None:
+        from cli_agent_orchestrator.services.conversation_reconcile import (
+            DEFAULT_CLAIM_TTL_S,
+        )
+
+        claim_ttl_s = DEFAULT_CLAIM_TTL_S
+        try:
+            from cli_agent_orchestrator.services.config_service import ConfigService
+
+            claim_ttl_s = float(ConfigService.get("resume.claim_ttl_s", DEFAULT_CLAIM_TTL_S))
+        except Exception:
+            logger.debug("resume.claim_ttl_s read failed; using default", exc_info=True)
+
+    quiesced = False
     with SessionLocal.begin() as db:
         row = db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
         if row is None:
@@ -5668,10 +5763,25 @@ def release_resume_claim_owned(identity_key: str, owner_principal: str) -> Dict[
             return {"released": False, "reason": "not_owner"}
         if row.resume_claim is None:
             return {"released": False, "reason": "no_active_claim"}
+        # AC4 interlock: a claim within its TTL is a live/uncertain claimant.
+        # Never release it out from under a resume that may still be in flight.
+        claimed_at = row.resume_claim_at
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            if claimed_at > (_utcnow() - timedelta(seconds=claim_ttl_s)):
+                return {"released": False, "reason": "claimant_live"}
+            # Past the TTL: a confirmed-dead claimant is quiesced, then released.
+            quiesced = True
+        # No resume_claim_at at all is treated as reconcilable (matches
+        # reconcile_stale_resume_claims) — an already-stale/abandoned claim.
         row.resume_claim = None
         row.resume_claim_at = None
         row.updated_at = _utcnow()
+        # OWNER IS NEVER REWRITTEN HERE — release clears the claim only.
         db.flush()
+    if quiesced:
+        record_conversation_event(identity_key, "claim_reconciled")
     record_conversation_event(identity_key, "claim_released_by_owner")
     return {"released": True, "reason": "released"}
 
