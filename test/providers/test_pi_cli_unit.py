@@ -673,6 +673,17 @@ class TestFalseIdleWorkingSpinner:
                 provider.get_status(buffer) == TerminalStatus.COMPLETED
             ), f"dash-ending adversary fired PROCESSING (overmatch): {adv!r}"
 
+    def _idle_composer_then_candidate(self, candidate: str) -> str:
+        """A frame with a COMPLETE idle composer (two full 120-col rules + footer)
+        ABOVE, then the candidate as the bottom-most live-tail row. Because no
+        complete composer follows the candidate, the r6 composer-structure check
+        does NOT mask this frame — so the closing-class and width-equality checks
+        are the SOLE discriminators here (the r5 layout put adversaries ABOVE the
+        composer, where the r6 structural check would mask both)."""
+        return "\n".join(
+            [" prior transcript line", self._RULE, " ", self._RULE, self._FOOTER, candidate]
+        )
+
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_full_width_ascii_or_em_dash_tail_is_transcript(self, _native) -> None:
         """A transcript row that OPENS with the spinner chrome, is padded to the
@@ -680,18 +691,156 @@ class TestFalseIdleWorkingSpinner:
         in ASCII hyphens or em dashes rather than box drawing → transcript. This
         is the case that DISTINGUISHES the box-drawing-only closing class from the
         wider ``[─━—\\-]`` one, so it is the witness that kills the widen-closing-
-        class mutant (Opus r4: that mutant SURVIVED with no committed test)."""
+        class mutant (Opus r4: that mutant SURVIVED with no committed test).
+        Composer ABOVE, candidate at the bottom, so the r6 structural check does
+        not mask the closing-class check."""
         provider = self._provider(dispatched=True, processing_seen=True)
         for label, dash in (("ascii-hyphen", "-"), ("em-dash", "—")):
             lead = f"── ⠦ Working ── ends in {label} "
             row = lead + dash * (120 - _visible_width(lead))
             assert _visible_width(row) == 120, f"{label}: build error"
-            buffer = "\n".join(
-                [" prior transcript line", row, "", self._RULE, " ", self._RULE, self._FOOTER]
-            )
+            assert (
+                provider.get_status(self._idle_composer_then_candidate(row))
+                == TerminalStatus.COMPLETED
+            ), f"{label}-tailed full-width row fired PROCESSING (closing class too wide)"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_short_box_drawing_candidate_is_transcript(self, _native) -> None:
+        """A box-drawing working row SHORT of the composer width (not the live top
+        border, which spans the pane) → transcript. Composer ABOVE, candidate at
+        the bottom so the r6 structural check does not mask it: this is the sole
+        witness for the width-equality check (kills the drop-composer-width
+        mutant). A full-composer-width box row is the PROCESSING control."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        lead = "── ⠦ Working "
+        short = lead + "─" * (60 - _visible_width(lead))
+        assert _visible_width(short) == 60
+        assert (
+            provider.get_status(self._idle_composer_then_candidate(short))
+            == TerminalStatus.COMPLETED
+        ), "short (60-col) box-drawing working row fired PROCESSING (width check dropped)"
+        full = lead + "─" * (120 - _visible_width(lead))
+        assert _visible_width(full) == 120
+        assert (
+            provider.get_status(self._idle_composer_then_candidate(full))
+            == TerminalStatus.PROCESSING
+        ), "full-width box working row must be PROCESSING (control)"
+
+    # ── #703 r6: wrapped full-width transcript row (codex r5 EMPIRICAL-GATE-NO) ──
+    # A logical transcript row one column LONGER than the composer wraps: its
+    # first physical row is exactly composer-wide and, if it ends on a box char,
+    # matches _WORKING_ROW at the full width — a manufactured full-width transcript
+    # row that width equality alone cannot reject. The genuine idle composer (two
+    # full rules + footer) sits below the wrap. The composer-structure check (a
+    # candidate with a COMPLETE idle composer below it is not the live top border)
+    # rejects it while keeping every archived live frame PROCESSING.
+
+    def _wrap_candidate(self, width: int = 120) -> str:
+        """A ``_WORKING_ROW``-matching row of EXACTLY ``width`` columns ending on a
+        box rule — the first physical row of a wrapped (width+1)-column logical
+        transcript line."""
+        lead = "── ⠦ Working ── quoted spinner in transcript "
+        row = lead + "─" * (width - _visible_width(lead))
+        assert _visible_width(row) == width, "wrap candidate build error"
+        return row
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_wrapped_full_width_transcript_row_does_not_fire(self, _native) -> None:
+        """A (composer+1)-column transcript row shown as its two terminal physical
+        rows — a full-width first row ending on a box rule, then a 1-column
+        continuation — sitting ABOVE the genuine idle composer must classify
+        transcript (COMPLETED), not PROCESSING. Width equality holds, so only the
+        composer-structure check rejects it. This is the r5 blocker's minimal
+        reproduction."""
+        row1 = self._wrap_candidate(120)
+        buffer = "\n".join(
+            [
+                " prior transcript line",
+                row1,  # physical row 1: exactly 120 cols, ends on a box rule
+                "─",  # physical row 2: the 1-column wrap continuation
+                "",
+                self._RULE,  # ┐ the genuine idle composer, complete, BELOW the wrap
+                " ",
+                self._RULE,  # ┘ two full-width rules + footer
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert (
+            provider.get_status(buffer) == TerminalStatus.COMPLETED
+        ), "wrapped full-width transcript row fired PROCESSING on an idle pane"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_unwrapped_121_and_119_rows_are_transcript(self, _native) -> None:
+        """Controls for the wrap case: the same logical row supplied UNWRAPPED at
+        121 columns is over-wide (fails the width equality), and a 119-column row
+        is under-wide — both transcript, so the wrap negative is not passing for a
+        trivial reason."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        lead = "── ⠦ Working ── quoted spinner in transcript "
+        for width in (121, 119):
+            row = lead + "─" * (width - _visible_width(lead))
+            assert _visible_width(row) == width
+            buffer = "\n".join([" prior", row, "", self._RULE, " ", self._RULE, self._FOOTER])
             assert (
                 provider.get_status(buffer) == TerminalStatus.COMPLETED
-            ), f"{label}-tailed full-width row fired PROCESSING (closing class too wide)"
+            ), f"{width}-column row fired PROCESSING"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_full_width_cjk_emoji_working_row_is_processing(self, _native) -> None:
+        """A GENUINE live working row whose message carries wide CJK + emoji glyphs
+        (``工具🚀``) still spans the full composer width and classifies PROCESSING.
+        This is the committed regression the r5 verdict asked for: it is RED if the
+        East-Asian-width handling in ``_visible_width`` is dropped (the wide glyphs
+        would then under-count and the row would miss the width invariant)."""
+        lead = "── ⠋ Working 工具🚀 processing "
+        # Hard-code the trailing rule length so the row is EXACTLY 120 visible
+        # columns under the real (East-Asian-width-aware) helper — NOT computed
+        # via _visible_width, so it does not self-compensate when the EAW handling
+        # is mutated away. lead is 31 visible cols (3 wide glyphs), so 89 dashes
+        # make 120; dropping EAW under-counts lead to 28 and the row to 117 (a
+        # width mismatch), which is what makes this arm kill the EAW mutant.
+        row = lead + "─" * 89
+        assert _visible_width(row) == 120, "cjk/emoji row build error"
+        # Genuine live shape: the working row IS the top border; blank editor, one
+        # bottom rule, footer (exactly one full rule below — a real live frame).
+        buffer = "\n".join([" prior turn output", row, "", self._RULE, self._FOOTER])
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert (
+            provider.get_status(buffer) == TerminalStatus.PROCESSING
+        ), "full-width CJK/emoji working row must be PROCESSING (EAW width handling)"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_archive_live_frames_all_processing(self, _native) -> None:
+        """The inherited live pi 0.85.1 capture archive (the frames the r3-r5
+        gates were measured on) must classify PROCESSING for every frame that
+        carries a working row — raw AND ANSI-stripped — under the r6
+        composer-structure check. This is the anti-over-narrowing guard: the wrap
+        fix must not regress a single genuine live frame. Skips cleanly when the
+        archive is absent (it lives in gate scratch, not the repo)."""
+        import glob as _glob
+
+        roots = [
+            "/data/cao-scratch/gate-700-703-r3/capture/frames/frame_*.txt",
+            "/data/cao-scratch/gate-700-703-r3/capture3/frames/q_*.txt",
+            "/data/cao-scratch/gate-700-703-r3/capture3/frames/w_before.txt",
+        ]
+        files = [f for pat in roots for f in sorted(_glob.glob(pat))]
+        if not files:
+            pytest.skip("live-frame archive not present (gate scratch only)")
+        provider = self._provider(dispatched=True, processing_seen=True)
+        working = 0
+        for f in files:
+            raw = open(f, encoding="utf-8", errors="replace").read()
+            clean = strip_terminal_escapes(raw)
+            if not any(_WORKING_ROW.match(r) for r in clean.splitlines()):
+                continue
+            working += 1
+            assert provider.get_status(raw) == TerminalStatus.PROCESSING, f"{f}: raw not PROCESSING"
+            assert (
+                provider.get_status(clean) == TerminalStatus.PROCESSING
+            ), f"{f}: ANSI-stripped not PROCESSING"
+        assert working == 424, f"expected 424 archived working frames, found {working}"
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_braille_working_transcript_prose_does_not_fire(self, _native) -> None:

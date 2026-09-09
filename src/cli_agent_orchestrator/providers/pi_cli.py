@@ -635,6 +635,22 @@ class PiCliProvider(BaseProvider):
            class alone still let through (Opus r4 EMPIRICAL-GATE-NO). When no
            composer rule is visible there is no width evidence, so a candidate is
            accepted rather than narrowed away.
+        6. F847 r6 (#703): width equality is NECESSARY but not SUFFICIENT. A
+           logical transcript row one column longer than the composer WRAPS: its
+           first physical row is exactly composer-wide and, if it ends on a box
+           char, matches ``_WORKING_ROW`` at the full width — a manufactured
+           full-width transcript row (codex r5 EMPIRICAL-GATE-NO). The structural
+           invariant that separates it: the live working row IS the composer TOP
+           border, so there is only ONE composer and the working row belongs to
+           the BOTTOM-most one — there is never a COMPLETE idle composer (two or
+           more FULL-WIDTH rules AND a footer) drawn ENTIRELY BELOW the live
+           working row. The wrapped transcript row, by contrast, sits above the
+           genuine idle composer, so a complete composer follows it. Measured on
+           the archive: 0 of 424 live frames have a complete composer below their
+           last working row (422 have exactly one full rule after, one transient
+           resize frame has three rules of which the extra two are NOT full-width,
+           one has zero), so this rejects the wrap without a single false
+           negative. A candidate with a complete composer below it is disqualified.
         """
         lines = clean.splitlines()
         # 1) drop fenced rows (quoted spinner is not live)
@@ -653,8 +669,7 @@ class PiCliProvider(BaseProvider):
         # 3) bottom-of-viewport window only
         tail = unfenced[-_LIVE_TAIL_ROWS:]
         # 4) whole-row spinner anchor within the live window
-        hits = [row for row in tail if _WORKING_ROW.match(row)]
-        if not hits:
+        if not any(_WORKING_ROW.match(row) for row in tail):
             return False
         # 5) full-composer-width invariant: the live working row spans the pane.
         rules = [row for row in unfenced if _EDITOR_RULE.match(row)]
@@ -662,7 +677,32 @@ class PiCliProvider(BaseProvider):
             # No composer rule visible → no width evidence; do not narrow.
             return True
         composer_width = max(_visible_width(row) for row in rules)
-        return any(_visible_width(row) == composer_width for row in hits)
+        # Candidate positions in the FULL unfenced buffer (not just the tail), so
+        # step 6 can inspect what is drawn BELOW each candidate.
+        tail_start = len(unfenced) - len(tail)
+        candidates = [
+            idx
+            for idx, row in enumerate(unfenced)
+            if idx >= tail_start
+            and _WORKING_ROW.match(row)
+            and _visible_width(row) == composer_width
+        ]
+        if not candidates:
+            return False
+
+        # 6) composer-structure check: a candidate is the live TOP BORDER only if
+        # it is NOT sitting above a COMPLETE idle composer (a wrapped full-width
+        # transcript row does). "Complete idle composer below" = two or more
+        # FULL-WIDTH rules AND a footer, all strictly after the candidate.
+        def _has_complete_composer_below(idx: int) -> bool:
+            below = unfenced[idx + 1 :]
+            full_rules = sum(
+                1 for r in below if _EDITOR_RULE.match(r) and _visible_width(r) == composer_width
+            )
+            has_footer = any(_FOOTER_CONTEXT.search(r) for r in below)
+            return full_rules >= 2 and has_footer
+
+        return any(not _has_complete_composer_below(idx) for idx in candidates)
 
     @staticmethod
     def _has_idle_chrome(clean: str) -> bool:
