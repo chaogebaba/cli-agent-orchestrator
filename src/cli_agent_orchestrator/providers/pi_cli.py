@@ -143,12 +143,24 @@ _BRAILLE_SPINNER = r"\u2800-\u28ff"
 # ``.search`` overmatched a fenced quote and a stale spinner 40 rows above the
 # composer).
 _RULE_RUN = r"[─━—\-]{2,}"
+# F847 r3 (#703): the row is now anchored at BOTH ends (``^…$`` under MULTILINE).
+# r2 left the row unanchored at the tail (``Working\b`` with no ``$``), and
+# ``_live_working_spinner`` matches with ``re.match`` — which accepts a matching
+# PREFIX — so a transcript row that merely OPENS with the spinner chrome, e.g.
+# ``── ⠦ Working ── was quoted in the previous answer.``, fired PROCESSING even
+# though the report and comments both claim a WHOLE-ROW anchor (codex r2
+# EMPIRICAL-GATE-NO, the unmutated missing end anchor). The genuine live rows
+# end in the composer box rule with no trailing prose:
+#   rule-leading:  ── ⠧ Working ──────────  (trailing rule optional in r2 draw)
+#   spinner-first: ⠴ Working ────────────   (trailing rule required)
+# so after ``Working`` the ONLY thing a live row may carry to end-of-line is
+# whitespace and an optional box-rule run. ``_WORKING_TAIL`` encodes exactly
+# that and pins ``$``; any trailing prose (a sentence, a quote, more words) now
+# fails the whole-row match and is treated as transcript.
+_WORKING_TAIL = r"[ \t]*(?:" + _RULE_RUN + r"[ \t]*)?$"
 _WORKING_ROW = re.compile(
-    r"^[ \t]*" r"(?:"
-    # rule-leading: ── ⠧ Working ─(─…)?
-    r"" + _RULE_RUN + r"[ \t]*[" + _BRAILLE_SPINNER + r"][ \t]*Working\b"
-    # spinner-first: ⠴ Working ──── (trailing rule required)
-    r"|[" + _BRAILLE_SPINNER + r"][ \t]*Working\b[ \t]*" + _RULE_RUN + r"" r")",
+    # rule-leading: ── ⠧ Working ─(─…)?  then whitespace/optional-rule to EOL
+    r"^[ \t]*" + _RULE_RUN + r"[ \t]*[" + _BRAILLE_SPINNER + r"][ \t]*Working\b" + _WORKING_TAIL,
     re.IGNORECASE | re.MULTILINE,
 )
 # Backwards-compatible module alias: ``_WORKING`` is referenced by the r1 tests

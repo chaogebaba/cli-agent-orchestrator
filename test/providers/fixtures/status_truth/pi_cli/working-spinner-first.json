@@ -1,7 +1,0 @@
-{
-  "provider": "pi_cli",
-  "state": "working",
-  "source": "derived from /data/cao-scratch/quirk-samples/pi-false-idle-6ea8560f-185803.txt (issue #703 / F847): the SPINNER-FIRST redraw phase of the same live pi working animation, with the incident's verbatim transcript + ANSI colouring + footer preserved.",
-  "captured_at": "2026-09-08T18:58:03Z (same incident as working-1.txt, spinner-first redraw frame)",
-  "notes": "F847 #703 r2: the byte-exact incident capture (working-1.txt) is a RULE-LEADING spinner frame (── ⠴ Working ──) which BASE b1e4d48c already classifies PROCESSING, so it is NOT the causal false-idle repro (codex EMPIRICAL-GATE-NO). The GENUINE false-idle is this spinner-first redraw frame: pi draws the spinner glyph BEFORE its trailing rule (⠴ Working ────) while the two composer box rules are still on screen. BASE's rule-must-lead _WORKING regex misses this row and the intact two-rule composer chrome wins => false idle/completed (RED). HEAD's braille-first _WORKING_ROW anchor, scoped to the live bottom-of-viewport region, classifies it PROCESSING (GREEN). Verified: base=COMPLETED/IDLE, head=PROCESSING."
-}

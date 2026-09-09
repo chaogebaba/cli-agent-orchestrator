@@ -459,12 +459,29 @@ class TestFalseIdleWorkingSpinner:
             ), f"frame {glyph!r} not detected as working"
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
-    def test_spinner_first_rule_after_is_processing(self, _native) -> None:
-        """A mid-redraw frame where the spinner LEADS and the rule TRAILS
-        (``⠴ Working ────``) must still classify PROCESSING — the fix that closes
-        #703 (the old rule-must-lead regex missed this shape)."""
-        buffer = "⠴ Working " + "─" * 100 + "\n"
-        assert self._provider(dispatched=True).get_status(buffer) == TerminalStatus.PROCESSING
+    def test_spinner_first_shape_is_not_a_live_frame(self, _native) -> None:
+        """#703 r3 (codex r2 EMPIRICAL-GATE-NO + LIVE capture): a "spinner-first"
+        row where the glyph LEADS and the rule TRAILS (``⠴ Working ────``, no
+        leading box rule) is NOT a real pi 0.85.1 frame and must NOT classify
+        PROCESSING. r2 matched this shape on a mid-redraw theory the verdict
+        rejected; a live capture of pi 0.85.1 (390 frames @ 20 ms across 6 turn
+        starts + 6 resizes) produced 383 working rows, ALL rule-leading, ZERO
+        spinner-first — and the pi-tui source composes the border rule-leading
+        inside a synchronized-output transaction, so no such intermediate is
+        observable. The row is therefore treated as transcript: idle chrome below
+        it wins (COMPLETED)."""
+        buffer = "\n".join(
+            [
+                " I pasted a status line: ⠴ Working " + "─" * 40,
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_prose_working_without_spinner_or_rule_is_not_processing(self, _native) -> None:
@@ -488,48 +505,19 @@ class TestFalseIdleWorkingSpinner:
         provider = self._provider(dispatched=True, processing_seen=True)
         assert provider.get_status(buffer) == TerminalStatus.COMPLETED
 
-    # ── #703 r2: the GENUINE false-idle reproduction (codex EMPIRICAL-GATE-NO) ──
-
-    # The byte-exact incident (working-1.txt) is a RULE-LEADING frame that BASE
-    # already classifies PROCESSING, so it does NOT establish the false-idle
-    # root cause. The genuine repro is the SPINNER-FIRST redraw phase of the same
-    # animation, filed as working-spinner-first.txt: pi draws the glyph before
-    # its trailing rule (⠴ Working ────) while the two composer box rules are
-    # still on screen. Base's rule-must-lead regex misses it → the intact
-    # two-rule composer chrome wins → false idle/completed (RED); head's
-    # braille-first whole-row anchor classifies it PROCESSING (GREEN).
-    _CORPUS_SPINNER_FIRST = FIXTURES / "status_truth" / "pi_cli" / "working-spinner-first.txt"
-
-    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
-    def test_spinner_first_corpus_capture_is_processing_raw(self, _native) -> None:
-        """RED-on-base/GREEN-on-head: the spinner-first incident redraw frame
-        (raw ANSI) classifies PROCESSING, not a false idle."""
-        raw = self._CORPUS_SPINNER_FIRST.read_text(encoding="utf-8")
-        assert self._provider(dispatched=True, processing_seen=True).get_status(raw) == (
-            TerminalStatus.PROCESSING
-        )
-
-    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
-    def test_spinner_first_corpus_capture_is_processing_ansi_stripped(self, _native) -> None:
-        """Same spinner-first frame ANSI-stripped (the buffer get_status parses)
-        still classifies PROCESSING."""
-        clean = strip_terminal_escapes(self._CORPUS_SPINNER_FIRST.read_text(encoding="utf-8"))
-        assert self._provider(dispatched=True, processing_seen=True).get_status(clean) == (
-            TerminalStatus.PROCESSING
-        )
-
-    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
-    def test_all_braille_spinner_frames_spinner_first_are_processing(self, _native) -> None:
-        """#703 r2 (kills M703-2): EVERY canonical spinner frame drawn
-        SPINNER-FIRST (glyph leads, rule trails) → PROCESSING. The r1 legacy
-        second alternative kept every rule-LEADING glyph test green while the
-        sole spinner-first test used only ``⠴``; narrowing the braille class to
-        ``⠴`` survived. This asserts all ten glyphs in the spinner-first shape."""
-        for glyph in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
-            buffer = f"{glyph} Working " + "─" * 100 + "\n"
-            assert self._provider(dispatched=True).get_status(buffer) == (
-                TerminalStatus.PROCESSING
-            ), f"spinner-first frame {glyph!r} not detected as working"
+    # ── #703 r3: the atomic RULE-LEADING frame is the only live shape ───────────
+    #
+    # The byte-exact incident (working-1.txt) is a RULE-LEADING frame. BASE
+    # b1e4d48c already classifies it PROCESSING, so it is not a false-idle
+    # RED→GREEN repro — it is the positive ANCHOR that the live pi 0.85.1 working
+    # row (always ``── ⠧ Working ──``, emitted atomically in a synchronized-output
+    # transaction) stays PROCESSING. r2's DERIVED ``working-spinner-first.txt``
+    # fixture and its mid-redraw tests were REMOVED in r3: a live capture found no
+    # spinner-first frame in 390 samples (see the fork report r3 measurement), so
+    # the fixture had no live basis. M703-2 (braille class narrowed to only
+    # ``⠴``) is now killed by ``test_all_braille_spinner_frames_are_processing``
+    # above — the rule-leading all-glyph arm — which no longer has a permissive
+    # alternative masking the braille class.
 
     # ── #703 r2: transcript OVERMATCH negatives (codex EMPIRICAL-GATE-NO) ───────
 
@@ -585,6 +573,78 @@ class TestFalseIdleWorkingSpinner:
         lines += [f" transcript reflow line {i}" for i in range(45)]
         lines += [self._RULE, " ", self._RULE, self._FOOTER]
         buffer = "\n".join(lines)
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    # ── #703 r3: WHOLE-ROW end-anchor negatives (codex r2 EMPIRICAL-GATE-NO) ────
+    #
+    # r2 anchored the spinner row at ``^`` but NOT at ``$``, and
+    # ``_live_working_spinner`` matches with ``re.match`` (a matching PREFIX is
+    # accepted), so a transcript row that OPENS with the spinner chrome and then
+    # carries trailing prose/quote fired a false PROCESSING even in the LIVE
+    # tail — the row is in the composer region, so the fence/stale scoping above
+    # does not catch it. These three rows sit in the live bottom-of-viewport
+    # region (no fence, at the composer) and are rejected ONLY by the ``$`` end
+    # anchor added in r3; each asserts COMPLETED (idle chrome wins), proving the
+    # trailing text made the whole-row match fail.
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_working_row_with_trailing_prose_does_not_fire(self, _native) -> None:
+        """The verdict's exact adversary: ``── ⠦ Working ── was quoted in the
+        previous answer.`` — spinner chrome then a rule then PROSE, in the live
+        composer region. The whole-row ``$`` anchor rejects the trailing prose so
+        it is transcript, not PROCESSING."""
+        buffer = "\n".join(
+            [
+                " Summarising the thread:",
+                "── ⠦ Working ── was quoted in the previous answer.",
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_working_row_with_trailing_sentence_does_not_fire(self, _native) -> None:
+        """A rule-leading spinner row that continues into a full sentence
+        (``── ⠧ Working ── and then the model finished the summary``) is
+        transcript prose, not a live redraw frame: the ``$`` anchor rejects the
+        trailing words."""
+        buffer = "\n".join(
+            [
+                " The assistant wrote:",
+                "── ⠧ Working ── and then the model finished the summary",
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
+        provider = self._provider(dispatched=True, processing_seen=True)
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_working_row_with_trailing_quote_does_not_fire(self, _native) -> None:
+        """A spinner-first row (glyph leads, rule trails) followed by a trailing
+        QUOTED string (``⠴ Working ──── "quoted status banner"``) is transcript,
+        not the live spinner: the ``$`` anchor rejects everything after the
+        composer rule run."""
+        buffer = "\n".join(
+            [
+                " I pasted the status line I saw:",
+                '⠴ Working ──── "quoted status banner"',
+                "",
+                self._RULE,
+                " ",
+                self._RULE,
+                self._FOOTER,
+            ]
+        )
         provider = self._provider(dispatched=True, processing_seen=True)
         assert provider.get_status(buffer) == TerminalStatus.COMPLETED
 
