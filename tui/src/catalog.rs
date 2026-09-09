@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 115;
+const COMMAND_COUNT: usize = 116;
 
 /// What the TUI does with a command.
 ///
@@ -250,6 +250,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::IdentityDiag,
     CommandId::IdentityAttach,
     CommandId::IdentityClaim,
+    CommandId::IdentityRelease,
     CommandId::ProvidersCapabilities,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
@@ -593,6 +594,8 @@ pub enum CommandId {
     IdentityAttach,
     /// `cao identity claim`
     IdentityClaim,
+    /// `cao identity release`
+    IdentityRelease,
     /// `cao providers capabilities`
     ProvidersCapabilities,
     /// `cao terminal hibernated`
@@ -1300,6 +1303,16 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "identity_key", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: F829 owner-authorised op, not a launcher action
+        },
+        CommandId::IdentityRelease => Command {
+            id: CommandId::IdentityRelease,
+            parent: Some("identity"),
+            leaf_name: "release",
+            summary: "Owner-guarded release of a leaked resume claim (operator recovery).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "identity_key", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: F829 A2.5 owner-authorised recovery op, not a launcher action
         },
 
         CommandId::ProvidersCapabilities => Command {
@@ -2096,6 +2109,7 @@ mod tests {
                     CommandId::IdentityDiag => CommandId::IdentityDiag,
                     CommandId::IdentityAttach => CommandId::IdentityAttach,
                     CommandId::IdentityClaim => CommandId::IdentityClaim,
+                    CommandId::IdentityRelease => CommandId::IdentityRelease,
                     CommandId::ProvidersCapabilities => CommandId::ProvidersCapabilities,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
@@ -2216,6 +2230,7 @@ mod tests {
                 CommandId::IdentityDiag,
                 CommandId::IdentityAttach,
                 CommandId::IdentityClaim,
+                CommandId::IdentityRelease,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,

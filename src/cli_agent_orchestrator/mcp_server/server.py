@@ -885,13 +885,21 @@ def _create_terminal(
             if _f829_token:
                 _f829_headers = {"X-CAO-Terminal-Token": _f829_token}
 
-        response = cao_http.post(
-            f"/sessions/{session_name}/terminals",
-            params=params,
-            json=json_body,
-            headers=_f829_headers,
-            timeout=_mcp_timeout(),
-        )
+        if _f829_headers is not None:
+            response = cao_http.post(
+                f"/sessions/{session_name}/terminals",
+                params=params,
+                json=json_body,
+                headers=_f829_headers,
+                timeout=_mcp_timeout(),
+            )
+        else:
+            response = cao_http.post(
+                f"/sessions/{session_name}/terminals",
+                params=params,
+                json=json_body,
+                timeout=_mcp_timeout(),
+            )
         response.raise_for_status()
         terminal = response.json()
     else:
