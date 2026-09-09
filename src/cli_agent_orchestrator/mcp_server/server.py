@@ -196,9 +196,25 @@ def _f829_resolve_caller_principal() -> Optional[str]:
         principal = meta.get("caller_mailbox_id")
         if isinstance(principal, str) and principal:
             return principal
-        return terminal_id
     except Exception:
         return None
+    # F857: a top-level supervisor has no caller_mailbox_id, but spawn identities
+    # are owned by its MAILBOX (database.py _mailbox_id_for_terminal). Resolve the
+    # mailbox whose current incarnation is this terminal before falling back.
+    try:
+        resp = cao_http.get("/mailboxes", timeout=_mcp_timeout())
+        resp.raise_for_status()
+        rows = resp.json()
+        if isinstance(rows, dict):
+            rows = rows.get("items", [])
+        for row in rows or []:
+            if isinstance(row, dict) and row.get("current_terminal_id") == terminal_id:
+                mailbox_id = row.get("id")
+                if isinstance(mailbox_id, str) and mailbox_id:
+                    return mailbox_id
+    except Exception:
+        pass
+    return terminal_id
 
 
 def _refresh_terminal_token_from_pane() -> Optional[str]:
