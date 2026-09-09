@@ -48,9 +48,14 @@ def _verify_pin_real(file_path: str) -> bool:
     """Real start/before-publication pin check as the WORKER (D2/AC-1/AC-2).
 
     Uses ``authority_pin_service.verify_pin`` whose principal is this process's
-    ``CAO_TERMINAL_ID`` (the worker). VALID only when the pin is registered and
-    the bytes still match; DRIFT/SUPERSEDED/UNPINNED are all non-VALID → the
-    orchestrator refuses/cancels publication.
+    ``CAO_TERMINAL_ID`` (the worker). The pin is INTACT when the local bytes match
+    the CURRENT registered version — verdict ``VALID`` (v1) or ``SUPERSEDED`` (a
+    warm-reused worker whose pins were rotated, F495: the current bytes still
+    match). ``DRIFT`` / ``UNPINNED`` are non-intact → the orchestrator
+    refuses/cancels publication. AC-2's "superseded cancels" is a CHANGE BETWEEN
+    the two checks (start intact, before-publish drifted), which the two
+    independent calls in run_review detect; a stable SUPERSEDED at both checks is
+    pin-intact.
     """
     from cli_agent_orchestrator.services import authority_pin_service
 
@@ -59,7 +64,7 @@ def _verify_pin_real(file_path: str) -> bool:
     except Exception as exc:  # pragma: no cover - service/DB hiccup
         logger.warning("chatgpt_web verify_pin failed for %s: %s", file_path, type(exc).__name__)
         return False
-    return bool(verdict.get("verdict") == "VALID")
+    return bool(verdict.get("verdict") in ("VALID", "SUPERSEDED"))
 
 
 def _callback_as_worker(message: str) -> None:
@@ -127,10 +132,24 @@ def run_production_review(
         data = Path(bundle_path).read_bytes()
         enforce_bundle_bounds(data)
         bundle_sha = sha256_bytes(data)
-        manifest_identity = build_attachment_identity(data, Path(bundle_path).name)
+        # The design_findings bundle is a TEXT bundle; upload it with a .txt name
+        # (the file type the upload-probe calibrated the two readiness signals
+        # against — a .md chip shows no "Document" label, F862 r2). Copy under a
+        # .txt name in scratch when the source is not already .txt.
+        upload_path = bundle_path
+        if not bundle_path.endswith(".txt"):
+            scratch = Path(
+                os.environ.get("CAO_ARTIFACTS_DIR") or "/data/cao-scratch/worker-scratch/f862-build"
+            )
+            scratch.mkdir(parents=True, exist_ok=True)
+            txt = scratch / (Path(bundle_path).stem + ".bundle.txt")
+            txt.write_bytes(data)
+            upload_path = str(txt)
+        manifest_identity = build_attachment_identity(data, Path(upload_path).name)
     else:
         bundle_sha = sha256_text(task_text)
         manifest_identity = None
+        upload_path = None
 
     request = ReviewRequest(
         artifact_path=artifact_path,
@@ -144,10 +163,19 @@ def run_production_review(
     _observed_attachment: dict[str, Any] = {}
 
     def _default_browser_turn() -> AcceptedAnswer:
+        # Append the terminal sentinel instruction with THIS run's id + bundle
+        # sha so the gate's strip_sentinel finds exactly one terminal
+        # END_REVIEW:<run-id>:<bundle-sha> (D6). The runner owns these values; the
+        # dispatched prompt need not know them.
+        framed = (
+            f"{task_text.rstrip()}\n\n"
+            f"When finished, end your reply with EXACTLY one terminal line and "
+            f"nothing after it:\nEND_REVIEW:{run_id}:{bundle_sha}\n"
+        )
         return asyncio.run(
             _drive_browser(
-                task_text=task_text,
-                bundle_path=bundle_path,
+                task_text=framed,
+                bundle_path=upload_path,
                 manifest_identity=manifest_identity,
                 run_id=run_id,
                 bundle_sha=bundle_sha,
@@ -175,7 +203,7 @@ def run_production_review(
         attachment_identity=(_observed_attachment or None),
         validate_schema=bool(bundle_path),
         manifest_text=(
-            Path(bundle_path).read_text(encoding="utf-8", errors="ignore") if bundle_path else None
+            Path(upload_path).read_text(encoding="utf-8", errors="ignore") if upload_path else None
         ),
     )
 

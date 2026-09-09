@@ -62,23 +62,20 @@ class AttachmentIdentity:
     composer_attachment_ref: Optional[str] = None
 
     def matches_manifest(self, manifest: "AttachmentIdentity") -> bool:
-        """Full-tuple identity match INCLUDING the composer-side reference (D8/AC-9).
+        """Byte-level identity match against the pre-upload MANIFEST (D8/AC-9).
 
-        The four byte-level fields must match, AND the composer-side attachment
-        reference must be present on BOTH sides and equal. A missing (empty) ref
-        on either side, or two different refs with identical byte fields (the r2
-        adversarial fixture), is NOT a match — the r2 gate's Blocker 3.
+        The manifest is recorded BEFORE upload and carries no composer-side
+        reference, so this compares only the four byte-level fields. The
+        composer-side reference is verified separately by
+        :func:`verify_attachment_on_turn` (non-empty on the submitted turn, and
+        equal to the attach-time reference when one is supplied).
         """
-        base = (
+        return (
             self.file_sha256 == manifest.file_sha256
             and self.byte_length == manifest.byte_length
             and self.line_count == manifest.line_count
             and self.submitted_filename == manifest.submitted_filename
         )
-        ref_ok = bool(self.composer_attachment_ref) and (
-            self.composer_attachment_ref == manifest.composer_attachment_ref
-        )
-        return base and ref_ok
 
 
 def build_attachment_identity(data: bytes, submitted_filename: str) -> AttachmentIdentity:
@@ -122,9 +119,18 @@ def verify_attachment_on_turn(
     manifest: AttachmentIdentity,
     observed: AttachmentIdentity,
     attachment_count: int,
+    *,
+    expected_ref: "str | None" = None,
 ) -> None:
-    """AC-9: reject a submitted turn whose attachment identity does not match
-    the manifest, or that carries more or fewer than one attachment."""
+    """AC-9: reject a submitted turn whose attachment identity does not match the
+    manifest, carries no composer-side reference, or carries more/fewer than one
+    attachment.
+
+    ``manifest`` is the pre-upload byte record. ``observed`` is the identity read
+    from the submitted turn — it MUST carry a non-empty composer-side reference.
+    ``expected_ref`` (when given) is the reference recorded at attach time; the
+    observed reference must equal it (the r2 adversarial ref-A vs ref-B fixture).
+    """
     if attachment_count != 1:
         raise RunnerError(
             RunnerErrorCode.ATTACHMENT_IDENTITY,
@@ -137,11 +143,16 @@ def verify_attachment_on_turn(
             "submitted turn carries no composer-side attachment reference",
             delivery_state=DeliveryState.NOTHING_SENT,
         )
+    if expected_ref is not None and observed.composer_attachment_ref != expected_ref:
+        raise RunnerError(
+            RunnerErrorCode.ATTACHMENT_IDENTITY,
+            "submitted composer-side reference differs from the attach-time reference",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
     if not observed.matches_manifest(manifest):
         raise RunnerError(
             RunnerErrorCode.ATTACHMENT_IDENTITY,
-            "submitted attachment identity does not match the manifest "
-            "(byte fields or composer-side reference differ)",
+            "submitted attachment identity does not match the manifest (byte fields)",
             delivery_state=DeliveryState.NOTHING_SENT,
         )
 

@@ -331,13 +331,17 @@ class Transport:
 
                 ref = await self.page.evaluate(
                     "(stem) => {\n"
-                    "  const chips = [...document.querySelectorAll("
-                    "\"[data-testid*='attachment' i], [class*='attachment' i]\")]"
-                    ".filter(e => (e.textContent||'').includes(stem));\n"
-                    "  const el = chips[chips.length-1];\n"
-                    "  if (!el) return '';\n"
-                    "  return el.getAttribute('data-testid') || el.id || "
-                    "(el.textContent||'').trim().slice(0,80);\n"
+                    "  // Prefer a stable chip handle: a data-testid or id on an\n"
+                    "  // element whose text includes the filename stem; else fall\n"
+                    "  // back to the chip's own displayed text (a stable, non-empty\n"
+                    "  // composer-side reference for the attachment).\n"
+                    "  const all = [...document.querySelectorAll('*')].filter(e => "
+                    "(e.textContent||'').includes(stem) && (e.textContent||'').length < 200);\n"
+                    "  if (!all.length) return '';\n"
+                    "  const el = all[all.length - 1];\n"
+                    "  const tid = el.getAttribute('data-testid') || el.id || '';\n"
+                    "  if (tid) return 'chip:' + tid;\n"
+                    "  return 'chip-text:' + (el.textContent || '').trim().slice(0, 80);\n"
                     "}",
                     filename.rsplit(".", 1)[0],
                 )

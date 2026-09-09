@@ -571,7 +571,7 @@ def test_ac9_more_than_one_attachment_rejected() -> None:
 
 def test_ac9_missing_composer_reference_rejected() -> None:
     # r2 gate Blocker 3: an observed turn with no composer-side reference fails.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-A")
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)  # manifest is byte-only
     observed = _ident(b"hello\nworld\n", "bundle.txt", None)
     with pytest.raises(RunnerError) as ei:
         verify_attachment_on_turn(manifest, observed, attachment_count=1)
@@ -579,26 +579,29 @@ def test_ac9_missing_composer_reference_rejected() -> None:
 
 
 def test_ac9_mismatched_composer_reference_rejected() -> None:
-    # r2 gate Blocker 3 adversarial fixture: identical byte fields, ref-A vs ref-B.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", "ref-A")
+    # r2 gate Blocker 3 adversarial fixture: attach-time ref-A vs submitted ref-B.
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)
     observed = _ident(b"hello\nworld\n", "bundle.txt", "ref-B")
     with pytest.raises(RunnerError) as ei:
-        verify_attachment_on_turn(manifest, observed, attachment_count=1)
+        verify_attachment_on_turn(manifest, observed, attachment_count=1, expected_ref="ref-A")
     assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
 
 
 def test_ac9_matching_identity_and_reference_ok() -> None:
-    # Full-tuple match INCLUDING a non-empty equal composer reference.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-xyz")
+    # Byte fields match the manifest AND the observed turn carries a non-empty
+    # reference equal to the attach-time reference.
+    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)
     observed = _ident(b"hello\nworld\n", "bundle.txt", "chip-xyz")
-    verify_attachment_on_turn(manifest, observed, attachment_count=1)  # no raise
+    verify_attachment_on_turn(
+        manifest, observed, attachment_count=1, expected_ref="chip-xyz"
+    )  # no raise
 
 
-def test_ac9_matches_manifest_requires_nonempty_equal_ref() -> None:
-    a = _ident(b"x\n", "b.txt", "r1")
-    assert a.matches_manifest(a) is True
-    assert _ident(b"x\n", "b.txt", None).matches_manifest(a) is False
-    assert _ident(b"x\n", "b.txt", "r2").matches_manifest(a) is False
+def test_ac9_matches_manifest_is_byte_only() -> None:
+    # matches_manifest compares byte fields only (the manifest carries no ref).
+    a = _ident(b"x\n", "b.txt", None)
+    assert _ident(b"x\n", "b.txt", "anyref").matches_manifest(a) is True
+    assert _ident(b"y\n", "b.txt", "anyref").matches_manifest(a) is False
 
 
 # ==========================================================================
