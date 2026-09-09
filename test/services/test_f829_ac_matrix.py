@@ -87,8 +87,10 @@ def _assign(resume_from, caller="mb_owner", **kw):
 
     # A2.1 server pins-drop guard: inherit_pins=False while the reaped terminal
     # HAD frozen pins and no replacement authority_files → missing=profile.
-    if not kw.get("inherit_pins", True) and prepared.get("known_pins") and not kw.get(
-        "authority_files"
+    if (
+        not kw.get("inherit_pins", True)
+        and prepared.get("known_pins")
+        and not kw.get("authority_files")
     ):
         return (
             {

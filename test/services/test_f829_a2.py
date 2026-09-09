@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -618,3 +619,75 @@ def test_ac_a2_4_cold_reap_of_rootless_terminal_is_allowed(real_sqlite_env):
         db.commit()
     dec = evaluate_planned_hibernate("rootless1")
     assert dec.allowed is True and dec.lifecycle is None
+
+
+# ==========================================================================
+# AC-A2.3 (r2 M-1) — the named mutant "drop the namespace on the seeded root".
+# The other A2.3 test hands create_terminal a ready-made RootAdmission, so it
+# never exercises the SERVICE construction site (terminal_service.py:2383-2397).
+# This probe (supplied verbatim by the EMPIRICAL r1 verdict) drives the REAL
+# create path with the db writer mocked and asserts the admission the SERVICE
+# built carries the seeded uuid AND the non-NULL wrapper namespace — so
+# substituting provider_namespace=None at the construction site is KILLED here.
+# ==========================================================================
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+@patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+@patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+@patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+@patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+@patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+@patch("cli_agent_orchestrator.backends.registry._backend")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+@patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+@patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+async def test_ac_a2_3_service_built_seed_admission_carries_namespace(
+    mock_load_profile,
+    mock_gen_id,
+    mock_gen_session,
+    mock_gen_window,
+    mock_tmux,
+    mock_db_create,
+    mock_provider_manager,
+    mock_fifo_dir,
+    mock_fifo_manager,
+    mock_status_monitor,
+    mock_delete,
+):
+    from unittest.mock import AsyncMock
+
+    from cli_agent_orchestrator.models.terminal import ForkContext
+    from cli_agent_orchestrator.providers.codex import _resolved_codex_home
+    from cli_agent_orchestrator.services.terminal_service import create_terminal
+    from cli_agent_orchestrator.utils.agent_profiles import AgentProfile
+
+    mock_gen_id.return_value = "cdx01234"
+    mock_gen_session.return_value = "cao-session"
+    mock_gen_window.return_value = "dev-abcd"
+    mock_tmux.session_exists.return_value = False
+    mock_load_profile.return_value = AgentProfile(name="dev", description="d")
+    mock_provider = AsyncMock()
+    mock_provider.initialize.return_value = True
+    mock_provider_manager.create_provider.return_value = mock_provider
+    mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+    fc = ForkContext(
+        mode="resume",
+        session_uuid="seed-uuid-probe",
+        base_name="seed",
+        provider="codex",
+        initial_preamble="",
+    )
+    await create_terminal("codex", "dev", new_session=True, fork_context=fc)
+
+    adm = mock_db_create.call_args.kwargs["root_admission"]
+    assert adm is not None and adm.mode == "mint"
+    assert adm.provider_session_id == "seed-uuid-probe"
+    expected_ns = str(_resolved_codex_home("cdx01234")).rstrip("/")
+    # Mutant kill: provider_namespace=None at the construction site fails HERE.
+    assert adm.provider_namespace == expected_ns, (
+        f"seeded root namespace {adm.provider_namespace!r} != wrapper "
+        f"_resolved_codex_home {expected_ns!r}"
+    )
+    assert adm.provider_namespace is not None
