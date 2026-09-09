@@ -174,6 +174,33 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
+def _f829_resolve_caller_principal() -> Optional[str]:
+    """F829 D3: the caller's DURABLE principal for resume authorization.
+
+    The owner_principal stored on a conversation root is the seat's durable
+    mailbox id (the migration set it from ``terminals.caller_mailbox_id``), NOT a
+    disposable terminal id. Resolve THIS caller's mailbox the same way: read the
+    current terminal's metadata over HTTP and return its ``caller_mailbox_id``.
+    Falls back to the terminal id when no mailbox is recorded (a top-level
+    supervisor), and to None when there is no terminal at all. Best-effort: a
+    lookup failure returns None (authorize then treats it as not-owner, which is
+    the safe default — a resume is refused rather than wrongly granted).
+    """
+    terminal_id = _current_terminal_id()
+    if not terminal_id:
+        return None
+    try:
+        resp = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        resp.raise_for_status()
+        meta = resp.json()
+        principal = meta.get("caller_mailbox_id")
+        if isinstance(principal, str) and principal:
+            return principal
+        return terminal_id
+    except Exception:
+        return None
+
+
 def _refresh_terminal_token_from_pane() -> Optional[str]:
     """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
 
@@ -2512,6 +2539,7 @@ def _assign_impl(
                 requested_agent_profile=agent_profile or None,
                 requested_working_directory=working_directory,
                 inherit_pins=inherit_pins,
+                caller_principal=_f829_resolve_caller_principal(),
             )
         except ResumeRefused as refusal:
             return {
@@ -2540,6 +2568,35 @@ def _assign_impl(
         # Adopt the resolved profile so downstream logging/labels are correct;
         # position/routing machinery is skipped entirely below.
         agent_profile = _resume_prepared["agent_profile"]
+        # F829 A1 (D3 step 4): for an identity-root resume, TAKE THE CAS CLAIM
+        # now — before any spawn effect. A lost CAS (another claimant or a moved
+        # generation) refuses with session_resume_in_progress and spawns nothing.
+        # The claim is held until the resumed worker reports its id, where
+        # attach_captured_uuid runs verify+publish and clears it (D3 steps 6-7);
+        # a dead attempt is reconciled by the claim TTL (D8).
+        if _resume_prepared.get("via_identity"):
+            from cli_agent_orchestrator.services.conversation_transition import (
+                claim_resume_admission,
+            )
+
+            _admission = _resume_prepared["admission"]
+            _claimant = _current_terminal_id() or "unknown"
+            _claimed = claim_resume_admission(_admission, claimant=_claimant)
+            if not _claimed.ok:
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": _claimed.error or "session_resume_in_progress",
+                    "retryable": True,
+                    "identity_key": _admission.identity_key,
+                    "how": (
+                        "another resume of this conversation is in progress; "
+                        "retry once it settles or is reconciled by the claim TTL"
+                    ),
+                    "message": "resume_refused (missing identity): session_resume_in_progress",
+                }
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
     # rewrites a position name into a profile.
@@ -3519,9 +3576,25 @@ def _send_message_impl(
                     ),
                 }
             terminal_payload = response.json()
-            receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
-                "caller_id"
-            )
+            # F829 D3/AC5: prefer the conversation-root owner_principal for a
+            # bare callback so a RESUMED worker replies to the ORIGINAL caller,
+            # not the recovering supervisor recorded on its fresh terminal row.
+            # The server resolves root-owner-first, then caller_mailbox_id /
+            # caller_id; caller_unavailable semantics are unchanged downstream.
+            try:
+                _ct = cao_http.get(
+                    f"/terminals/{own_terminal_id}/callback-target",
+                    timeout=_mcp_timeout(),
+                    headers=_api_headers(),
+                )
+                if _ct.ok:
+                    receiver_id = _ct.json().get("receiver_id")
+            except Exception:
+                receiver_id = None
+            if not receiver_id:
+                receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
+                    "caller_id"
+                )
             if not receiver_id:
                 return {
                     "success": False,

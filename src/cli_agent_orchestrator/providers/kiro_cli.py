@@ -221,10 +221,18 @@ class KiroCliProvider(BaseProvider):
     # FORK one (supports_fork_context stays False). The resume path checks ONLY
     # this explicit supports_resume flag. Fork stays refused for kiro.
     supports_resume = True
-    # ...but NOT for the stale-PROCESSING self-heal: on a rendered frame the composer
-    # placeholder sits below the working line and the credits line — the opposite of
-    # the byte-stream order this detector's checks were tuned against — so a busy pane
-    # reads as COMPLETED and would sticky-latch for the rest of the turn.
+    # F829 A1 (D10): kiro RECOVERS resume/capture/artifact (D9) but cannot FORK.
+    declared_capabilities = {
+        "fork": False,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
+    # Stale-PROCESSING self-heal stays OFF for kiro: on a rendered frame the
+    # composer placeholder sits below the working line and the credits line — the
+    # opposite of the byte-stream order this detector's checks were tuned against
+    # — so a busy pane reads as COMPLETED and would sticky-latch for the rest of
+    # the turn.
     supports_stale_capture_selfheal = False
     # F566 (fixes F560): kiro session identity is HARVESTED, never minted.
     # Empirical rule (kiro-cli 2.20.1, probe report

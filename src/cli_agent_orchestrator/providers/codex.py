@@ -2139,6 +2139,13 @@ class CodexProvider(BaseProvider):
     supports_resume = True
     supports_seed_resume_identity = True
     supports_reauth_rebind = True
+    # F829 A1 (D10): codex RECOVERS on all D9 arms (fork+resume+capture+artifact).
+    declared_capabilities = {
+        "fork": True,
+        "resume": True,
+        "capture": True,
+        "artifact_locate": True,
+    }
 
     def capture_shell_baseline(self) -> str | None:
         """Capture through this module's backend seam before Codex starts."""
@@ -2790,13 +2797,15 @@ class CodexProvider(BaseProvider):
                     return validated
                 return max(matches, key=lambda p: p.stat().st_mtime)
 
-        # --- Last resort: newest rollout file in sessions dir ---
-        all_rollouts = list(sessions_dir.glob("**/rollout-*.jsonl"))
-        if len(all_rollouts) == 1:
-            return all_rollouts[0]
-        if all_rollouts:
-            return max(all_rollouts, key=lambda p: p.stat().st_mtime)
-
+        # F829 D4: the shared-directory "newest rollout file" last resort is
+        # REMOVED as a resolution path. Newest-file selection is never a valid
+        # attribution for CAPTURE (it can attach a foreign rollout under a shared
+        # CODEX_HOME — the #685/AC3 hazard). The resume path never reaches here
+        # (it always passes an explicit session_uuid / resume seed above, which
+        # the D9 probe confirmed resolves precisely by uuid), so returning None
+        # only removes the capture-time newest-file guess. The caller polls
+        # again or, for capture, the D4 attribution path in capture_codex_uuid
+        # (positive fd-scan / isolated-namespace) decides.
         return None
 
     @staticmethod

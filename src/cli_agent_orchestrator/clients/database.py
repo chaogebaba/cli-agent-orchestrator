@@ -325,12 +325,243 @@ class TerminalIdentityModel(Base):
     dirty_hashes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     reaped_at = Column(DateTime(timezone=True), nullable=True)
+    # F829 D1: FK to the canonical conversation_identity root. Every incarnation
+    # of one conversation shares an identity_key; the root owns lifecycle,
+    # ownership and the current-terminal pointer. NULL only transiently before
+    # the root is minted (and on a pre-F829 row until the migration back-fills
+    # it). Indexed because resolve_base follows a historical terminal id to its
+    # root through this column.
+    identity_key = Column(String, nullable=True, index=True)
     __table_args__ = (
         # D2: a two-value lifecycle on a NEW table, so this CHECK collides with
         # nothing — contrast terminals.lifecycle, which means ephemeral|sticky.
+        # F829 D1: terminal_identity KEEPS its per-incarnation live|reaped
+        # meaning. The six-value conversation lifecycle lives on the NEW
+        # conversation_identity root, not here. The F829 migration rebuilds this
+        # table only to add the identity_key column+index atomically (never
+        # ADD COLUMN then rebuild); the rebuilt CHECK stays byte-identical to
+        # this one.
         CheckConstraint(
             "lifecycle IN ('live','reaped')",
             name="ck_terminal_identity_lifecycle",
+        ),
+    )
+
+
+class ConversationIdentityModel(Base):
+    """F829 D1: the canonical conversation identity — the root that owns
+    resumability.
+
+    One row per *conversation*, minted at spawn BEFORE any provider session id
+    exists (``identity_key`` is an internal handle, not a provider uuid).
+    ``terminal_identity`` rows are its per-terminal INCARNATIONS (children via
+    ``terminal_identity.identity_key``); the never-deleted incarnation history
+    stays where F631 put it, and no consumer of terminal-id lookups changes.
+
+    Only the root carries conversation lifecycle, durable ownership
+    (``owner_principal`` — the seat's mailbox/principal, NOT a disposable
+    terminal id), the assignment/callback correlation (``origin_callback_ref``),
+    the current-incarnation pointer (``current_terminal_id``) and the single
+    resume claim. Two historical terminal rows sharing a provider uuid are
+    legitimate history; making each independently own resumability was the
+    F829 defect, and a single owning root removes it by construction.
+
+    DB invariants (D1):
+    - UNIQUE ``(provider, provider_namespace, provider_session_id)`` where the
+      uuid is not NULL — one conversation per bound provider identity.
+    - the resume claim is a ROOT column, so "one active claim per conversation"
+      holds by construction (no separate claim table to race).
+    - the CAS that serializes resume before spawn is
+      ``UPDATE conversation_identity SET resume_claim=?, generation=generation+1
+      WHERE identity_key=? AND resume_claim IS NULL AND generation=?`` — zero
+      rows affected ⇒ ``session_resume_in_progress`` (see ``claim_resume``).
+    """
+
+    __tablename__ = "conversation_identity"
+
+    # Internal durable handle, minted at spawn before any provider uuid. This is
+    # what a child terminal_identity row points at, and what `cao diag
+    # <identity_key>` / `fork_from=<identity_key>` address when there is no uuid.
+    identity_key = Column(String, primary_key=True)
+    provider = Column(String, nullable=False)
+    # The store the recoverable artifact lives in: CODEX_HOME / kiro session
+    # store / pi session dir / claude project dir. Part of the UNIQUE bound
+    # identity because isolated homes make the same uuid mean different
+    # conversations across stores (D6/D9).
+    provider_namespace = Column(String, nullable=True)
+    # NULL until the provider session id is captured (D4/D7). Bound-uniqueness is
+    # enforced only where this is not NULL (partial index below).
+    provider_session_id = Column(String, nullable=True)
+    artifact_locator = Column(String, nullable=True)
+    agent_profile = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    reasoning_effort = Column(String, nullable=True)
+    # Durable caller identity — the seat's mailbox/principal id, NOT its
+    # disposable terminal id. Survives every transition (D2). May be NULL for a
+    # top-level conversation with no caller, or a legacy_unknown_owner root.
+    owner_principal = Column(String, nullable=True)
+    # Assignment/callback correlation, so a resumed worker's no-receiver callback
+    # can be routed back to the original seat's CURRENT binding (D3/AC5).
+    origin_callback_ref = Column(String, nullable=True)
+    current_terminal_id = Column(String, nullable=True)
+    generation = Column(Integer, nullable=False, default=0, server_default="0")
+    # Six-value conversation lifecycle (distinct from terminal_identity's
+    # per-incarnation live|reaped).
+    lifecycle = Column(String, nullable=False, default="live", server_default="live")
+    # NULL or a JSON blob {"claimant","generation","started_at"}. A root column,
+    # so one-active-claim holds by construction (D1).
+    resume_claim = Column(Text, nullable=True)
+    resume_claim_at = Column(DateTime(timezone=True), nullable=True)
+    # How this root came to exist: a fresh spawn, a resume, or the one-time
+    # legacy migration collapse of pre-F829 rows with no known owner.
+    origin = Column(String, nullable=False, default="spawn", server_default="spawn")
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    __table_args__ = (
+        # Bound-identity uniqueness: one conversation per (provider, namespace,
+        # uuid) once the uuid is known. Partial (uuid IS NOT NULL) so the many
+        # not-yet-captured roots (kiro before first turn, every NULL-uuid legacy
+        # root) do not collide on NULL. This index is AC7's "drop the UNIQUE
+        # bound-identity index → duplicate bind test fails" mutant target.
+        Index(
+            "uq_conversation_identity_bound",
+            "provider",
+            "provider_namespace",
+            "provider_session_id",
+            unique=True,
+            sqlite_where=(provider_session_id.isnot(None)),
+        ),
+        Index("ix_conversation_identity_owner", "owner_principal"),
+        Index("ix_conversation_identity_lifecycle", "lifecycle"),
+        Index("ix_conversation_identity_current_terminal", "current_terminal_id"),
+        CheckConstraint(
+            "lifecycle IN ("
+            "'live','hibernated','capture_unknown','detached','expired','abandoned'"
+            ")",
+            name="ck_conversation_identity_lifecycle",
+        ),
+        CheckConstraint(
+            "origin IN ('spawn','resume','legacy_unknown_owner')",
+            name="ck_conversation_identity_origin",
+        ),
+    )
+
+
+class ConversationEventModel(Base):
+    """F829 D5: append-only event timeline for one conversation identity.
+
+    ``cao diag <uuid|identity_key|terminal_id>`` follows any id to the root and
+    prints these in order (spawn, capture, capture rejections, detach, resume
+    attempts with outcome tokens, claims). D4's ``uuid_capture_rejected`` and
+    D8's ``warm_intent_dropped`` land here too. Never mutated after insert.
+    """
+
+    __tablename__ = "conversation_event"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    identity_key = Column(String, nullable=False, index=True)
+    # snake_case event token, e.g. spawn / uuid_captured / uuid_capture_rejected
+    # / crash_detached / warm_intent_dropped / resume_claimed / resume_published
+    # / resume_failed / claim_reconciled.
+    event = Column(String, nullable=False)
+    terminal_id = Column(String, nullable=True)
+    # free-form JSON detail (conflicting identity, reason, outcome token…).
+    detail = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
+    __table_args__ = (
+        Index("ix_conversation_event_identity_created", "identity_key", "created_at", "id"),
+    )
+
+
+class RecoveryManifestModel(Base):
+    """F829 A1 (D1): the 1:1 recovery manifest owned by one conversation root.
+
+    Exactly one row per ``conversation_identity`` root (PK == ``identity_key``,
+    FK to the root). The ROOT stays authoritative for provider / uuid /
+    namespace / artifact / profile / model / effort / owner / lifecycle; the
+    manifest NEVER duplicates lifecycle or ownership. It records the *recovery
+    surface* a resume must reconstruct: the exact workspace, its verified git
+    provenance, the retained store references, the launch provenance that lets
+    D4 attribute a capture, the frozen pin-set revision, and the latest
+    instruction checkpoint token the D3 blind-checkpoint attestation compares
+    against. Transition writers update the root AND this row atomically
+    (same transaction).
+    """
+
+    __tablename__ = "recovery_manifest"
+
+    identity_key = Column(
+        String, ForeignKey("conversation_identity.identity_key"), primary_key=True
+    )
+    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
+    # Exact workspace directory the incarnation ran in (authoritative on resume).
+    cwd = Column(String, nullable=True)
+    # Verified git provenance: the repo root the worktree belongs to, the
+    # worktree checkout path, its branch, and the exact commit — all recorded
+    # so a gone checkout is reconstructed from verified facts, never a name guess.
+    repo_root = Column(String, nullable=True)
+    worktree_path = Column(String, nullable=True)
+    worktree_branch = Column(String, nullable=True)
+    worktree_commit = Column(String, nullable=True)
+    # Reference to the preserved dirty/untracked snapshot, written ONLY when the
+    # worktree path itself cannot be retained (D3/D6: in-place retention is the
+    # default; this points under the CAO state dir when a snapshot was taken).
+    dirty_snapshot_ref = Column(String, nullable=True)
+    # Retained persona/session-store references (kiro session dir, codex home,
+    # claude project dir, pi session dir) so a GC never releases them while live.
+    retained_store_refs = Column(Text, nullable=True)  # JSON
+    # Launch provenance (D4 attribution): the attempt id, the random capture
+    # nonce injected as first-prompt metadata, the launch epoch, and the store
+    # namespace the artifact must live in.
+    launch_attempt_id = Column(String, nullable=True)
+    capture_nonce = Column(String, nullable=True)
+    launch_epoch = Column(DateTime(timezone=True), nullable=True)
+    launch_namespace = Column(String, nullable=True)
+    # Operator-facing task label (for diag/listing), the frozen pin-set revision
+    # inherited on resume, and the latest instruction checkpoint token the
+    # D3 blind-checkpoint attestation compares against (never leaked in a prompt).
+    task_label = Column(String, nullable=True)
+    frozen_pin_revision = Column(Integer, nullable=True)
+    checkpoint_token = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
+class CapabilityEvidenceModel(Base):
+    """F829 A1 (D10): persisted exact-key measured-capability evidence.
+
+    One row per exact evidence key — ``(provider, cli_version, adapter_version,
+    mode, store_format_fingerprint, operation)`` — recording the MEASURED
+    ``state`` (passed|failed|unknown) with a timestamp and an optional evidence
+    path/hash. Runtime admission reads the exact-key row: a ``failed`` row
+    refuses a resume (``missing=provider_capability``); a missing/stale key is
+    admitted carrying ``capability_unverified`` (D10). The declared∧measured
+    ADVERTISING gate (release time) joins this MEASURED state with the adapter's
+    declaration. The key columns default to ``"*"`` (a wildcard sentinel) so a
+    probe that measured a capability without pinning every axis still lands an
+    exact-key lookup — never NULL, so the unique key is always well-formed.
+    """
+
+    __tablename__ = "capability_evidence"
+
+    provider = Column(String, primary_key=True)
+    cli_version = Column(String, primary_key=True, default="*", server_default="*")
+    adapter_version = Column(String, primary_key=True, default="*", server_default="*")
+    mode = Column(String, primary_key=True, default="*", server_default="*")
+    store_format_fingerprint = Column(String, primary_key=True, default="*", server_default="*")
+    operation = Column(String, primary_key=True)
+    # state ∈ {passed, failed, unknown}.
+    state = Column(String, nullable=False)
+    evidence_path = Column(String, nullable=True)
+    evidence_hash = Column(String, nullable=True)
+    measured_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('passed','failed','unknown')",
+            name="ck_capability_evidence_state",
         ),
     )
 
@@ -1822,6 +2053,17 @@ def init_db() -> None:
     # promises. Disjoint from every table above, so registry order is immaterial
     # here too; appended LAST.
     _migrate_f631_terminal_identity()
+    # F829 canonical conversation identity. Creates conversation_identity, does
+    # the ONE rebuild of terminal_identity that adds its identity_key FK column
+    # (never ADD COLUMN then rebuild), and runs the legacy collapse rule that
+    # back-fills roots + FK. Depends on terminal_identity existing (F631 above)
+    # and reads terminals, so it MUST come after _migrate_f631_terminal_identity;
+    # appended LAST.
+    _migrate_f829_conversation_identity()
+    # F829 A1 (D10) measured-capability evidence. ONE brand-new table
+    # (capability_evidence), no rebuild of anything above — additive. Disjoint
+    # from every table above, so registry order is immaterial; appended LAST.
+    _migrate_f829_capability_evidence()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -2708,6 +2950,499 @@ def _migrate_f631_terminal_identity() -> None:
                 f"f631_terminal_identity migration failed: required columns still "
                 f"absent after migration: {missing}"
             )
+
+
+# F829 D1: the six-value conversation lifecycle and the origin enum, kept beside
+# the migration so the collapse rule and the model can share one source of truth.
+CONVERSATION_LIFECYCLES = (
+    "live",
+    "hibernated",
+    "capture_unknown",
+    "detached",
+    "expired",
+    "abandoned",
+)
+CONVERSATION_ORIGINS = ("spawn", "resume", "legacy_unknown_owner")
+
+
+def _f829_default_namespace(provider: str) -> str:
+    """The back-filled ``provider_namespace`` for a legacy row that has none.
+
+    D1's collapse rule keys "one root per distinct (provider, back-filled default
+    namespace per provider, uuid)". Legacy ``terminal_identity`` rows never
+    recorded a namespace, so the migration supplies a per-provider default that
+    matches where the running resolver (D6) looks by default. The value only has
+    to be *stable and per-provider* for the collapse grouping to be correct; the
+    live resolver re-derives the real store at resume time.
+    """
+    return f"default:{provider}"
+
+
+def _migrate_f829_conversation_identity() -> None:
+    """F829 D1: canonical ``conversation_identity`` root + ``terminal_identity``
+    ``identity_key`` FK + the one-time legacy collapse.
+
+    Three phases, all idempotent, in ONE migration (never ADD COLUMN then
+    rebuild):
+
+    (A) CREATE ``conversation_identity`` IF NOT EXISTS — column-for-column
+        identical to ``ConversationIdentityModel`` (``test_f829_*`` asserts they
+        agree, mirroring F631's AC).
+
+    (B) The ONE rebuild: if ``terminal_identity`` lacks ``identity_key``, rebuild
+        it (create shadow with the column, copy every existing column, drop,
+        rename) and recreate its index. SQLite cannot ADD a column AND keep the
+        table's rootpage, and the blueprint forbids ADD-COLUMN-then-rebuild, so
+        this is a single rebuild. Skipped entirely once the column exists, so a
+        second run is a no-op (idempotent).
+
+    (C) The legacy collapse rule (measured: ~434 rows = 8 live + 426 reaped, 224
+        NULL-uuid, 1 duplicate codex pair):
+        - FIRST branch: a ``terminal_identity`` row in lifecycle ``live`` WITH a
+          surviving ``terminals`` row becomes a ``live`` root
+          (``current_terminal_id`` = that terminal, ``owner_principal`` = the
+          terminal's ``caller_mailbox_id`` else NULL, ``origin=spawn``). The
+          migration runs at server start while worker tmux sessions survive a
+          restart, so this is the NORMAL case, not an edge. A ``live`` row whose
+          ``terminals`` row is gone falls through to the reaped handling.
+        - Then, over the remaining (reaped, or live-without-terminal) rows that
+          carry a uuid: a row whose (provider, default-namespace, uuid) already
+          matched a ``live`` root ATTACHES to that root as an older incarnation
+          (never a second root — S1). Otherwise ONE root per distinct (provider,
+          default-namespace, uuid), every matching row attached ordered by
+          created_at, ``current_terminal_id`` = the newest, lifecycle
+          ``hibernated`` if its artifact validates else ``capture_unknown`` (the
+          migration cannot validate artifacts, so it lands ``capture_unknown``
+          and the live resolver upgrades it on demand — never worse than the
+          truth).
+        - every NULL-uuid row gets its OWN root in ``capture_unknown``.
+        - all legacy roots carry ``origin=legacy_unknown_owner`` and
+          ``owner_principal=NULL`` (never assigned to a requester; resume →
+          ``resume_not_owner`` until an owner claims via ``cao identity claim``)
+          — EXCEPT the live-branch roots, which have a real owner.
+        - every ``terminal_identity`` row ends with its ``identity_key`` set.
+
+    Idempotent under a half-migrated db: rows that already have an
+    ``identity_key`` are skipped by phase (C)'s ``WHERE identity_key IS NULL``,
+    and phase (A)/(B) are guarded on existence. Best-effort, logged at debug,
+    never propagated — matching every migrator above.
+    """
+    import sqlite3
+    import uuid as uuidlib
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    lifecycles = "','".join(CONVERSATION_LIFECYCLES)
+    origins = "','".join(CONVERSATION_ORIGINS)
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            # -------- Phase (A): conversation_identity ------------------------
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_identity ("
+                "identity_key VARCHAR NOT NULL, "
+                "provider VARCHAR NOT NULL, "
+                "provider_namespace VARCHAR, "
+                "provider_session_id VARCHAR, "
+                "artifact_locator VARCHAR, "
+                "agent_profile VARCHAR, "
+                "model VARCHAR, "
+                "reasoning_effort VARCHAR, "
+                "owner_principal VARCHAR, "
+                "origin_callback_ref VARCHAR, "
+                "current_terminal_id VARCHAR, "
+                "generation INTEGER DEFAULT 0 NOT NULL, "
+                "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+                "resume_claim TEXT, "
+                "resume_claim_at DATETIME, "
+                "origin VARCHAR DEFAULT 'spawn' NOT NULL, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (identity_key), "
+                "CONSTRAINT ck_conversation_identity_lifecycle "
+                f"CHECK (lifecycle IN ('{lifecycles}')), "
+                "CONSTRAINT ck_conversation_identity_origin "
+                f"CHECK (origin IN ('{origins}'))"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversation_identity_bound "
+                "ON conversation_identity(provider, provider_namespace, provider_session_id) "
+                "WHERE provider_session_id IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_owner "
+                "ON conversation_identity(owner_principal)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_lifecycle "
+                "ON conversation_identity(lifecycle)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_identity_current_terminal "
+                "ON conversation_identity(current_terminal_id)"
+            )
+
+            # conversation_event: the D5 diag timeline (append-only).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_event ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "identity_key VARCHAR NOT NULL, "
+                "event VARCHAR NOT NULL, "
+                "terminal_id VARCHAR, "
+                "detail TEXT, "
+                "created_at DATETIME"
+                ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_event_identity_created "
+                "ON conversation_event(identity_key, created_at, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_conversation_event_identity_key "
+                "ON conversation_event(identity_key)"
+            )
+
+            # recovery_manifest: the 1:1 A1 recovery surface per root (D1).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS recovery_manifest ("
+                "identity_key VARCHAR NOT NULL, "
+                "schema_version INTEGER NOT NULL DEFAULT 1, "
+                "cwd VARCHAR, "
+                "repo_root VARCHAR, "
+                "worktree_path VARCHAR, "
+                "worktree_branch VARCHAR, "
+                "worktree_commit VARCHAR, "
+                "dirty_snapshot_ref VARCHAR, "
+                "retained_store_refs TEXT, "
+                "launch_attempt_id VARCHAR, "
+                "capture_nonce VARCHAR, "
+                "launch_epoch DATETIME, "
+                "launch_namespace VARCHAR, "
+                "task_label VARCHAR, "
+                "frozen_pin_revision INTEGER, "
+                "checkpoint_token VARCHAR, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (identity_key), "
+                "FOREIGN KEY (identity_key) REFERENCES conversation_identity(identity_key)"
+                ")"
+            )
+
+            # -------- Phase (B): the ONE rebuild of terminal_identity ----------
+            ti_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_identity'"
+            ).fetchone()
+            if ti_exists is not None:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(terminal_identity)")}
+                if "identity_key" not in cols:
+                    conn.execute("DROP TABLE IF EXISTS terminal_identity__f829_new")
+                    # Shadow table carries the FULL current column set — the
+                    # F631 base columns AND the hot-fix worktree columns
+                    # (worktree_path/branch/repo_root, added by
+                    # _migrate_f631_terminal_identity which runs BEFORE this) —
+                    # plus the new identity_key. Dropping any of them here would
+                    # silently strip a column the ORM dereferences (rebase-safety
+                    # against the hot-fix schema).
+                    conn.execute(
+                        "CREATE TABLE terminal_identity__f829_new ("
+                        "terminal_id VARCHAR NOT NULL, "
+                        "provider VARCHAR NOT NULL, "
+                        "agent_profile VARCHAR, "
+                        "cwd VARCHAR, "
+                        "session_name VARCHAR, "
+                        "provider_session_id VARCHAR, "
+                        "base_name VARCHAR NOT NULL, "
+                        "retained_persona_home VARCHAR, "
+                        "worktree_path VARCHAR, "
+                        "worktree_branch VARCHAR, "
+                        "worktree_repo_root VARCHAR, "
+                        "lifecycle VARCHAR DEFAULT 'live' NOT NULL, "
+                        "git_sha VARCHAR, "
+                        "dirty_hashes TEXT, "
+                        "created_at DATETIME, "
+                        "reaped_at DATETIME, "
+                        "identity_key VARCHAR, "
+                        "PRIMARY KEY (terminal_id), "
+                        "CONSTRAINT ck_terminal_identity_lifecycle "
+                        "CHECK (lifecycle IN ('live','reaped'))"
+                        ")"
+                    )
+
+                    # Copy every base column; carry each worktree column only
+                    # when the SOURCE table has it (a legacy/test table may
+                    # predate the hot-fix add), else NULL — so the rebuild works
+                    # on both the hot-fix-migrated prod table and a bare legacy
+                    # table.
+                    def _src(colname: str) -> str:
+                        return colname if colname in cols else "NULL"
+
+                    conn.execute(
+                        "INSERT INTO terminal_identity__f829_new ("
+                        "terminal_id, provider, agent_profile, cwd, session_name, "
+                        "provider_session_id, base_name, retained_persona_home, "
+                        "worktree_path, worktree_branch, worktree_repo_root, "
+                        "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
+                        "identity_key) "
+                        "SELECT terminal_id, provider, agent_profile, cwd, session_name, "
+                        "provider_session_id, base_name, retained_persona_home, "
+                        f"{_src('worktree_path')}, {_src('worktree_branch')}, "
+                        f"{_src('worktree_repo_root')}, "
+                        "lifecycle, git_sha, dirty_hashes, created_at, reaped_at, "
+                        "NULL FROM terminal_identity"
+                    )
+                    conn.execute("DROP TABLE terminal_identity")
+                    conn.execute(
+                        "ALTER TABLE terminal_identity__f829_new RENAME TO terminal_identity"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS ix_terminal_identity_provider_session_id "
+                        "ON terminal_identity(provider_session_id)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS ix_terminal_identity_identity_key "
+                        "ON terminal_identity(identity_key)"
+                    )
+            else:
+                # Fresh DB: create_all already built terminal_identity WITH the
+                # identity_key column from the model; nothing to rebuild.
+                pass
+
+            # -------- Phase (C): the legacy collapse rule ---------------------
+            _f829_collapse_legacy_rows(conn, uuidlib)
+            # -------- Phase (D): recovery_manifest backfill (A1) --------------
+            _f829_backfill_recovery_manifests(conn)
+            conn.commit()
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug
+        logger.debug(f"f829_conversation_identity migration skipped: {e}")
+
+
+def _f829_collapse_legacy_rows(conn: Any, uuidlib: Any) -> None:
+    """The collapse rule proper (phase C of ``_migrate_f829_conversation_identity``).
+
+    Operates ONLY on ``terminal_identity`` rows whose ``identity_key IS NULL``
+    (so it is idempotent and never re-collapses an already-rooted row). Splits
+    the source rows into: LIVE-with-terminal (first branch), uuid-bearing
+    (grouped into roots), and NULL-uuid (one root each). Every touched row ends
+    with its ``identity_key`` set and a matching root created.
+    """
+    now = _utcnow().isoformat(sep=" ")
+
+    def _new_key() -> str:
+        return f"conv_{uuidlib.uuid4().hex}"
+
+    # Only unrooted rows participate (idempotency).
+    rows = conn.execute(
+        "SELECT terminal_id, provider, agent_profile, provider_session_id, "
+        "created_at FROM terminal_identity WHERE identity_key IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+
+    # A terminals row still present means the incarnation survived a restart.
+    live_terminal_ids = {
+        r[0]
+        for r in conn.execute(
+            "SELECT ti.terminal_id FROM terminal_identity ti "
+            "WHERE ti.lifecycle='live' AND EXISTS "
+            "(SELECT 1 FROM terminals t WHERE t.id=ti.terminal_id)"
+        ).fetchall()
+    }
+
+    def _caller_mailbox(terminal_id: str) -> Any:
+        row = conn.execute(
+            "SELECT caller_mailbox_id FROM terminals WHERE id=?", (terminal_id,)
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+    # Bound (provider, namespace, uuid) -> identity_key, seeded from any root
+    # already present (half-migrated db) so the second pass ATTACHES rather than
+    # colliding on the UNIQUE index (S1).
+    bound_root: dict[tuple[str, str, str], str] = {}
+    for ik, prov, ns, uid in conn.execute(
+        "SELECT identity_key, provider, provider_namespace, provider_session_id "
+        "FROM conversation_identity WHERE provider_session_id IS NOT NULL"
+    ).fetchall():
+        bound_root[(prov, ns, uid)] = ik
+
+    # ---- FIRST branch: live rows with a surviving terminals row --------------
+    live_rows = [r for r in rows if r[0] in live_terminal_ids]
+    handled: set[str] = set()
+    for terminal_id, provider, profile, uid, _created in live_rows:
+        namespace = _f829_default_namespace(provider)
+        owner = _caller_mailbox(terminal_id)
+        # E3 (D1/AC7): on a HALF-migrated db a live incarnation may be unrooted
+        # while its (provider, namespace, uuid) root already exists (a prior
+        # partial run). Attach to that bound root instead of INSERTing a fresh
+        # one — a blind INSERT collides on uq_conversation_identity_bound and the
+        # swallowed exception would leave the row permanently unrooted. Idempotent
+        # across repeated runs: the second pass observes the same bound root and
+        # re-attaches to the identical key.
+        existing = bound_root.get((provider, namespace, uid)) if uid is not None else None
+        if existing is not None:
+            key = existing
+            # Promote the existing root to live and point it at this surviving
+            # terminal; fill owner only if it was NULL (D1: never overwrite a
+            # recorded owner). Keeps the second run byte-for-byte stable.
+            conn.execute(
+                "UPDATE conversation_identity "
+                "SET lifecycle='live', current_terminal_id=?, "
+                "owner_principal=COALESCE(owner_principal, ?), updated_at=? "
+                "WHERE identity_key=?",
+                (terminal_id, owner, now, key),
+            )
+        else:
+            key = _new_key()
+            conn.execute(
+                "INSERT INTO conversation_identity ("
+                "identity_key, provider, provider_namespace, provider_session_id, "
+                "agent_profile, owner_principal, current_terminal_id, generation, "
+                "lifecycle, origin, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,0,'live','spawn',?,?)",
+                (key, provider, namespace, uid, profile, owner, terminal_id, now, now),
+            )
+            if uid is not None:
+                bound_root[(provider, namespace, uid)] = key
+        conn.execute(
+            "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+            (key, terminal_id),
+        )
+        handled.add(terminal_id)
+
+    # ---- Second pass: remaining uuid-bearing rows collapse into roots --------
+    remaining = [r for r in rows if r[0] not in handled]
+    uuid_rows = [r for r in remaining if r[3] is not None]
+    # Group by (provider, namespace, uuid), ordered by created_at so the newest
+    # becomes the current incarnation.
+    groups: dict[tuple[str, str, str], list[tuple[Any, ...]]] = {}
+    for r in uuid_rows:
+        provider = r[1]
+        namespace = _f829_default_namespace(provider)
+        groups.setdefault((provider, namespace, r[3]), []).append(r)
+    for (provider, namespace, uid), members in groups.items():
+        members.sort(key=lambda m: (m[4] or "", m[0]))
+        existing = bound_root.get((provider, namespace, uid))
+        if existing is not None:
+            # ATTACH to the live (or already-created) root — never a 2nd root.
+            key = existing
+            for terminal_id, *_ in members:
+                conn.execute(
+                    "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+                    (key, terminal_id),
+                )
+            continue
+        key = _new_key()
+        newest = members[-1]
+        conn.execute(
+            "INSERT INTO conversation_identity ("
+            "identity_key, provider, provider_namespace, provider_session_id, "
+            "agent_profile, owner_principal, current_terminal_id, generation, "
+            "lifecycle, origin, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,NULL,?,0,'capture_unknown','legacy_unknown_owner',?,?)",
+            (key, provider, namespace, uid, newest[2], newest[0], now, now),
+        )
+        bound_root[(provider, namespace, uid)] = key
+        for terminal_id, *_ in members:
+            conn.execute(
+                "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+                (key, terminal_id),
+            )
+
+    # ---- NULL-uuid rows: one root each, capture_unknown ----------------------
+    null_rows = [r for r in remaining if r[3] is None]
+    for terminal_id, provider, profile, _uid, _created in null_rows:
+        namespace = _f829_default_namespace(provider)
+        key = _new_key()
+        conn.execute(
+            "INSERT INTO conversation_identity ("
+            "identity_key, provider, provider_namespace, provider_session_id, "
+            "agent_profile, owner_principal, current_terminal_id, generation, "
+            "lifecycle, origin, created_at, updated_at) "
+            "VALUES (?,?,?,NULL,?,NULL,?,0,'capture_unknown','legacy_unknown_owner',?,?)",
+            (key, provider, namespace, profile, terminal_id, now, now),
+        )
+        conn.execute(
+            "UPDATE terminal_identity SET identity_key=? WHERE terminal_id=?",
+            (key, terminal_id),
+        )
+
+
+def _f829_backfill_recovery_manifests(conn: Any) -> None:
+    """F829 A1 (D1): backfill one ``recovery_manifest`` row per root that lacks
+    one, in the SAME schema-versioned migration pass, idempotently.
+
+    Provenance is drawn from the root's CURRENT incarnation's ``terminal_identity``
+    row (cwd + worktree path/branch/repo_root + git_sha as the recorded commit) —
+    the manifest never duplicates lifecycle/ownership, only the recovery surface.
+    ``INSERT OR IGNORE`` on the PK makes a second run a no-op (a manifest already
+    present is never overwritten by the backfill), so this is safe on a
+    half-migrated db. Rows the backfill cannot enrich are still created (all
+    NULL provenance) so every root ends with its 1:1 manifest.
+    """
+    now = _utcnow().isoformat(sep=" ")
+    roots = conn.execute(
+        "SELECT identity_key, current_terminal_id FROM conversation_identity"
+    ).fetchall()
+    for identity_key, current_terminal_id in roots:
+        prov = (None, None, None, None, None)
+        if current_terminal_id is not None:
+            ti = conn.execute(
+                "SELECT cwd, worktree_path, worktree_branch, worktree_repo_root, git_sha "
+                "FROM terminal_identity WHERE terminal_id=?",
+                (current_terminal_id,),
+            ).fetchone()
+            if ti is not None:
+                prov = (ti[0], ti[1], ti[2], ti[3], ti[4])
+        cwd, wt_path, wt_branch, repo_root, commit = prov
+        conn.execute(
+            "INSERT OR IGNORE INTO recovery_manifest ("
+            "identity_key, schema_version, cwd, repo_root, worktree_path, "
+            "worktree_branch, worktree_commit, created_at, updated_at) "
+            "VALUES (?,1,?,?,?,?,?,?,?)",
+            (identity_key, cwd, repo_root, wt_path, wt_branch, commit, now, now),
+        )
+
+
+def _migrate_f829_capability_evidence() -> None:
+    """F829 A1 (D10): create the ``capability_evidence`` table IF NOT EXISTS.
+
+    ONE brand-new additive table, column-for-column identical to
+    ``CapabilityEvidenceModel``. The exact evidence key is the composite PK
+    ``(provider, cli_version, adapter_version, mode, store_format_fingerprint,
+    operation)`` with the version/mode/fingerprint axes defaulting to the
+    ``"*"`` wildcard sentinel so a lookup is never keyed on NULL. Idempotent;
+    best-effort, logged at debug, never propagated — matching every migrator
+    above.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS capability_evidence ("
+                "provider VARCHAR NOT NULL, "
+                "cli_version VARCHAR NOT NULL DEFAULT '*', "
+                "adapter_version VARCHAR NOT NULL DEFAULT '*', "
+                "mode VARCHAR NOT NULL DEFAULT '*', "
+                "store_format_fingerprint VARCHAR NOT NULL DEFAULT '*', "
+                "operation VARCHAR NOT NULL, "
+                "state VARCHAR NOT NULL, "
+                "evidence_path VARCHAR, "
+                "evidence_hash VARCHAR, "
+                "measured_at DATETIME, "
+                "created_at DATETIME, "
+                "updated_at DATETIME, "
+                "PRIMARY KEY (provider, cli_version, adapter_version, mode, "
+                "store_format_fingerprint, operation), "
+                "CONSTRAINT ck_capability_evidence_state "
+                "CHECK (state IN ('passed','failed','unknown'))"
+                ")"
+            )
+    except Exception:
+        logger.debug("f829 capability_evidence migration skipped", exc_info=True)
 
 
 def _restrict_db_file_permissions() -> None:
@@ -4003,6 +4738,749 @@ def get_frozen_pins(task_key: str) -> List[Dict[str, str]]:
         if file_path not in latest:
             latest[file_path] = str(row.sha256)
     return [{"file_path": fp, "sha256": sha} for fp, sha in latest.items()]
+
+
+# ===========================================================================
+# F829 D1/D3/D5/D8: conversation_identity accessors
+# ===========================================================================
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def resolve_bare_callback_receiver(sender_terminal_id: str) -> Optional[str]:
+    """F829 D3/AC5: resolve a no-receiver ``send_message`` target for a sender.
+
+    A resumed worker's terminal ROW records the recovering supervisor as its
+    caller, but its conversation ROOT preserves the ORIGINAL caller as
+    ``owner_principal``. A bare callback must reach the original caller's CURRENT
+    binding, never the recovering terminal. So:
+
+    * if the sender's ``terminal_identity`` resolves to a conversation root whose
+      ``owner_principal`` is set, return that ``owner_principal`` (a mailbox id) —
+      the delivery layer then resolves mailbox → current terminal, and its
+      ``caller_unavailable`` semantics are unchanged when that mailbox has no
+      live terminal;
+    * otherwise (no root, or a NULL-owner / legacy_unknown_owner root) fall back
+      to the terminal row's ``caller_mailbox_id`` then ``caller_id``.
+
+    Returns the resolved receiver id (mailbox or terminal id), or None when the
+    sender has no recorded caller at all.
+    """
+    with SessionLocal() as db:
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=sender_terminal_id).one_or_none()
+        if ti is not None and ti.identity_key:
+            root = (
+                db.query(ConversationIdentityModel)
+                .filter_by(identity_key=ti.identity_key)
+                .one_or_none()
+            )
+            if root is not None and root.owner_principal:
+                return cast(str, root.owner_principal)
+        term = db.query(TerminalModel).filter_by(id=sender_terminal_id).one_or_none()
+        if term is None:
+            return None
+        if term.caller_mailbox_id:
+            return cast(str, term.caller_mailbox_id)
+        if term.caller_id:
+            return cast(str, term.caller_id)
+        return None
+
+
+def record_conversation_event(
+    identity_key: str,
+    event: str,
+    *,
+    terminal_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 D5: append one row to the conversation timeline.
+
+    Accepts an open ``db`` so an event lands in the SAME transaction as the
+    lifecycle write it describes (D4 rejections, D8 detach). With no ``db`` it
+    opens its own short transaction. Best-effort: an event-log failure must not
+    fail the operation it annotates.
+    """
+    import json as _json
+
+    payload = _json.dumps(detail) if detail is not None else None
+
+    def _write(session: Session) -> None:
+        session.add(
+            ConversationEventModel(
+                identity_key=identity_key,
+                event=event,
+                terminal_id=terminal_id,
+                detail=payload,
+                created_at=_utcnow(),
+            )
+        )
+        session.flush()
+
+    try:
+        if db is not None:
+            _write(db)
+        else:
+            with SessionLocal.begin() as own:
+                _write(own)
+    except Exception:  # noqa: BLE001 — the annotation must never fail the write
+        logger.debug("record_conversation_event failed", exc_info=True)
+
+
+def mint_conversation_identity(
+    *,
+    identity_key: str,
+    provider: str,
+    provider_namespace: Optional[str],
+    agent_profile: Optional[str],
+    model: Optional[str],
+    reasoning_effort: Optional[str],
+    owner_principal: Optional[str],
+    origin_callback_ref: Optional[str],
+    current_terminal_id: Optional[str],
+    db: Optional[Session] = None,
+) -> None:
+    """F829 D1: create a fresh conversation root at spawn (origin=spawn, live).
+
+    Minted BEFORE any provider uuid exists (``provider_session_id`` NULL). If a
+    ``db`` is supplied the root is written in the terminal's own transaction so
+    root + terminal_identity + terminals commit together.
+    """
+
+    def _write(session: Session) -> None:
+        session.add(
+            ConversationIdentityModel(
+                identity_key=identity_key,
+                provider=provider,
+                provider_namespace=provider_namespace,
+                provider_session_id=None,
+                agent_profile=agent_profile,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                owner_principal=owner_principal,
+                origin_callback_ref=origin_callback_ref,
+                current_terminal_id=current_terminal_id,
+                generation=0,
+                lifecycle="live",
+                origin="spawn",
+                created_at=_utcnow(),
+                updated_at=_utcnow(),
+            )
+        )
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def mint_capture_nonce() -> str:
+    """F829 D4/B4: a per-launch-attempt capture nonce.
+
+    A short random token minted at spawn, stored on the root's
+    ``recovery_manifest``, and injected into the worker's first turn so a kiro
+    session written under a shared cwd can be POSITIVELY attributed to THIS
+    attempt (never "newest updatedAt", never a copyable per-terminal string).
+    """
+    import secrets
+
+    return f"cao-nonce-{secrets.token_hex(16)}"
+
+
+def mint_spawn_identity(
+    *,
+    identity_key: str,
+    provider: str,
+    provider_namespace: Optional[str],
+    agent_profile: Optional[str],
+    model: Optional[str],
+    reasoning_effort: Optional[str],
+    owner_principal: Optional[str] = None,
+    owner_caller_id: Optional[str] = None,
+    origin_callback_ref: Optional[str],
+    current_terminal_id: str,
+    cwd: Optional[str],
+    worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    worktree_commit: Optional[str] = None,
+    capture_nonce: Optional[str] = None,
+    launch_attempt_id: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D3 step 4): mint a FRESH conversation root + its recovery manifest
+    at production spawn, in ONE transaction.
+
+    Additive: called only for a genuinely fresh spawn (never a resume, whose new
+    incarnation re-points an EXISTING root via publish_current_terminal). Mints
+    the ``conversation_identity`` root (origin=spawn, live) AND the 1:1
+    ``recovery_manifest`` carrying the cwd, worktree provenance, the per-attempt
+    ``capture_nonce`` and ``launch_attempt_id``. When ``db`` is supplied the
+    mint lands in the terminal's own transaction so root + manifest + terminals
+    row commit together. Idempotent on identity_key (a pre-existing root is left
+    untouched).
+
+    The durable owner is ``owner_principal`` when given, else the mailbox that
+    owns ``owner_caller_id`` (resolved WITHIN this write's session so no extra
+    metadata read happens on the create path)."""
+
+    def _write(session: Session) -> None:
+        exists = (
+            session.query(ConversationIdentityModel.identity_key)
+            .filter_by(identity_key=identity_key)
+            .first()
+        )
+        if exists is not None:
+            return
+        _owner = owner_principal
+        if _owner is None and owner_caller_id is not None:
+            _owner = _mailbox_id_for_terminal(session, owner_caller_id) or owner_caller_id
+        mint_conversation_identity(
+            identity_key=identity_key,
+            provider=provider,
+            provider_namespace=provider_namespace,
+            agent_profile=agent_profile,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            owner_principal=_owner,
+            origin_callback_ref=origin_callback_ref,
+            current_terminal_id=current_terminal_id,
+            db=session,
+        )
+        upsert_recovery_manifest(
+            identity_key,
+            cwd=cwd,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            worktree_branch=worktree_branch,
+            worktree_commit=worktree_commit,
+            capture_nonce=capture_nonce,
+            launch_attempt_id=launch_attempt_id,
+            db=session,
+        )
+        # Link this spawn's terminal_identity incarnation to the new root.
+        session.query(TerminalIdentityModel).filter_by(terminal_id=current_terminal_id).update(
+            {TerminalIdentityModel.identity_key: identity_key},
+            synchronize_session=False,
+        )
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def upsert_recovery_manifest(
+    identity_key: str,
+    *,
+    cwd: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    worktree_path: Optional[str] = None,
+    worktree_branch: Optional[str] = None,
+    worktree_commit: Optional[str] = None,
+    dirty_snapshot_ref: Optional[str] = None,
+    retained_store_refs: Optional[Dict[str, Any]] = None,
+    launch_attempt_id: Optional[str] = None,
+    capture_nonce: Optional[str] = None,
+    launch_epoch: Optional[datetime] = None,
+    launch_namespace: Optional[str] = None,
+    task_label: Optional[str] = None,
+    frozen_pin_revision: Optional[int] = None,
+    checkpoint_token: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D1): create or update the 1:1 recovery manifest for a root.
+
+    Upsert semantics: a first call creates the row; later calls update ONLY the
+    fields explicitly supplied (a None argument leaves the stored value intact),
+    so an incremental capture/checkpoint update never blanks earlier provenance.
+    When ``db`` is supplied the write lands in the caller's transaction so the
+    root and its manifest commit together (D1: transition writes are atomic).
+    """
+    import json as _json
+
+    fields: Dict[str, Any] = {
+        "cwd": cwd,
+        "repo_root": repo_root,
+        "worktree_path": worktree_path,
+        "worktree_branch": worktree_branch,
+        "worktree_commit": worktree_commit,
+        "dirty_snapshot_ref": dirty_snapshot_ref,
+        "retained_store_refs": (
+            _json.dumps(retained_store_refs) if retained_store_refs is not None else None
+        ),
+        "launch_attempt_id": launch_attempt_id,
+        "capture_nonce": capture_nonce,
+        "launch_epoch": launch_epoch,
+        "launch_namespace": launch_namespace,
+        "task_label": task_label,
+        "frozen_pin_revision": frozen_pin_revision,
+        "checkpoint_token": checkpoint_token,
+    }
+    supplied = {k: v for k, v in fields.items() if v is not None}
+
+    def _write(session: Session) -> None:
+        row = (
+            session.query(RecoveryManifestModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if row is None:
+            row = RecoveryManifestModel(identity_key=identity_key, schema_version=1)
+            for k, v in supplied.items():
+                setattr(row, k, v)
+            session.add(row)
+        else:
+            for k, v in supplied.items():
+                setattr(row, k, v)
+            row.updated_at = _utcnow()
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def get_recovery_manifest(identity_key: str) -> Optional[Dict[str, Any]]:
+    """F829 A1 (D1): read the recovery manifest row for a root, or None.
+
+    ``retained_store_refs`` is decoded from its JSON column into a dict; every
+    other column is returned as stored.
+    """
+    import json as _json
+
+    with SessionLocal() as db:
+        row = db.query(RecoveryManifestModel).filter_by(identity_key=identity_key).one_or_none()
+        if row is None:
+            return None
+        out = _row_to_dict(row)
+        raw = out.get("retained_store_refs")
+        if isinstance(raw, str) and raw:
+            try:
+                out["retained_store_refs"] = _json.loads(raw)
+            except ValueError:
+                pass
+        return out
+
+
+def record_capability_evidence(
+    provider: str,
+    operation: str,
+    state: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+    evidence_path: Optional[str] = None,
+    evidence_hash: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """F829 A1 (D10): upsert one exact-key measured-capability evidence row.
+
+    Keyed by the D9 exact key ``(provider, cli_version, adapter_version, mode,
+    store_format_fingerprint, operation)``; the version/mode/fingerprint axes
+    default to the ``"*"`` wildcard sentinel (never NULL, so the composite PK is
+    always well-formed and re-lookups hit the same row). ``state`` must be one
+    of ``passed|failed|unknown``. A later measurement of the same key overwrites
+    the prior state and refreshes ``measured_at`` (the newest measurement is the
+    truth; D10 records each attempt as fresh evidence).
+    """
+    if operation not in ("fork", "resume", "capture", "artifact_locate"):
+        raise ValueError(f"unknown capability operation: {operation!r}")
+    if state not in ("passed", "failed", "unknown"):
+        raise ValueError(f"unknown evidence state: {state!r}")
+
+    def _write(session: Session) -> None:
+        row = (
+            session.query(CapabilityEvidenceModel)
+            .filter_by(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+            )
+            .one_or_none()
+        )
+        now = _utcnow()
+        if row is None:
+            row = CapabilityEvidenceModel(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+                state=state,
+                evidence_path=evidence_path,
+                evidence_hash=evidence_hash,
+                measured_at=now,
+            )
+            session.add(row)
+        else:
+            row.state = state
+            row.evidence_path = evidence_path
+            row.evidence_hash = evidence_hash
+            row.measured_at = now
+            row.updated_at = now
+        session.flush()
+
+    if db is not None:
+        _write(db)
+    else:
+        with SessionLocal.begin() as own:
+            _write(own)
+
+
+def get_capability_evidence(
+    provider: str,
+    operation: str,
+    *,
+    cli_version: str = "*",
+    adapter_version: str = "*",
+    mode: str = "*",
+    store_format_fingerprint: str = "*",
+) -> Optional[Dict[str, Any]]:
+    """F829 A1 (D10): read the exact-key evidence row, or None when unmeasured.
+
+    The exact key mirrors ``record_capability_evidence``. Returns the row dict
+    (including ``state``) when a row exists, else None (an unmeasured key). The
+    runtime admission caller maps a None / non-``failed`` state to
+    ``capability_unverified`` and only a ``failed`` state to a refusal (D10).
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(CapabilityEvidenceModel)
+            .filter_by(
+                provider=provider,
+                cli_version=cli_version,
+                adapter_version=adapter_version,
+                mode=mode,
+                store_format_fingerprint=store_format_fingerprint,
+                operation=operation,
+            )
+            .one_or_none()
+        )
+        return _row_to_dict(row) if row is not None else None
+
+
+def list_capability_evidence(provider: Optional[str] = None) -> List[Dict[str, Any]]:
+    """F829 A1 (D10): all measured evidence rows, optionally scoped to a provider.
+
+    Feeds the ``cao providers capabilities`` read-out, which joins these MEASURED
+    states with the adapter's DECLARATION to render the declared∧measured
+    advertising view.
+    """
+    with SessionLocal() as db:
+        q = db.query(CapabilityEvidenceModel)
+        if provider is not None:
+            q = q.filter_by(provider=provider)
+        return [_row_to_dict(r) for r in q.all()]
+
+
+def get_conversation_identity(identity_key: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        return _row_to_dict(row) if row is not None else None
+
+
+def resolve_conversation_identity(value: str) -> Optional[Dict[str, Any]]:
+    """F829 D3 step 1: resolve any identifier to its canonical root.
+
+    Accepts an ``identity_key``, a provider ``provider_session_id`` (uuid), or
+    any historical ``terminal_id`` (followed through ``terminal_identity``).
+    Returns the root row dict, or None if nothing resolves. Raises
+    ``ValueError('session_ambiguous')`` when a bare uuid matches roots in more
+    than one namespace (disambiguate by identity_key, D5).
+    """
+    with SessionLocal() as db:
+        # 1) identity_key exact
+        root = db.query(ConversationIdentityModel).filter_by(identity_key=value).one_or_none()
+        if root is not None:
+            return _row_to_dict(root)
+        # 2) historical terminal id -> its root
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=value).one_or_none()
+        if ti is not None and ti.identity_key:
+            root = (
+                db.query(ConversationIdentityModel)
+                .filter_by(identity_key=ti.identity_key)
+                .one_or_none()
+            )
+            if root is not None:
+                return _row_to_dict(root)
+        # 3) bare provider_session_id (uuid). May match >1 namespace.
+        matches = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.provider_session_id == value)
+            .all()
+        )
+        if len(matches) == 1:
+            return _row_to_dict(matches[0])
+        if len(matches) > 1:
+            raise ValueError("session_ambiguous")
+        return None
+
+
+def claim_resume(identity_key: str, expected_generation: int, claimant: str) -> bool:
+    """F829 D1 CAS: atomically take the single resume claim.
+
+    ``UPDATE conversation_identity SET resume_claim=?, generation=generation+1
+    WHERE identity_key=? AND resume_claim IS NULL AND generation=?`` — returns
+    True iff exactly one row changed. Zero rows ⇒ another claimant holds it or
+    the generation moved ⇒ caller raises ``session_resume_in_progress``.
+    """
+    import json as _json
+
+    claim = _json.dumps(
+        {
+            "claimant": claimant,
+            "generation": expected_generation + 1,
+            "started_at": _utcnow().isoformat(),
+        }
+    )
+    with SessionLocal.begin() as db:
+        affected = (
+            db.query(ConversationIdentityModel)
+            .filter(
+                ConversationIdentityModel.identity_key == identity_key,
+                ConversationIdentityModel.resume_claim.is_(None),
+                ConversationIdentityModel.generation == expected_generation,
+            )
+            .update(
+                {
+                    ConversationIdentityModel.resume_claim: claim,
+                    ConversationIdentityModel.resume_claim_at: _utcnow(),
+                    ConversationIdentityModel.generation: expected_generation + 1,
+                },
+                synchronize_session=False,
+            )
+        )
+        return bool(affected == 1)
+
+
+def clear_resume_claim(identity_key: str, *, event: Optional[str] = None) -> None:
+    """F829 D3: release the claim (on failure at spawn/verify, or after publish)."""
+    with SessionLocal.begin() as db:
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            {
+                ConversationIdentityModel.resume_claim: None,
+                ConversationIdentityModel.resume_claim_at: None,
+                ConversationIdentityModel.updated_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
+    if event is not None:
+        record_conversation_event(identity_key, event)
+
+
+def publish_current_terminal(
+    identity_key: str,
+    *,
+    terminal_id: str,
+    provider_session_id: Optional[str] = None,
+    provider_namespace: Optional[str] = None,
+    artifact_locator: Optional[str] = None,
+    lifecycle: str = "live",
+) -> None:
+    """F829 D3 step 7: move the current-incarnation pointer and clear the claim.
+
+    Called only AFTER identity + readiness are verified (never before — AC7
+    mutant). Optionally rebinds the provider_session_id (claude divergence
+    branch); the caller is responsible for the UNIQUE recheck.
+    """
+    with SessionLocal.begin() as db:
+        values: Dict[Any, Any] = {
+            ConversationIdentityModel.current_terminal_id: terminal_id,
+            ConversationIdentityModel.lifecycle: lifecycle,
+            ConversationIdentityModel.resume_claim: None,
+            ConversationIdentityModel.resume_claim_at: None,
+            ConversationIdentityModel.origin: "resume",
+            ConversationIdentityModel.updated_at: _utcnow(),
+        }
+        if provider_session_id is not None:
+            values[ConversationIdentityModel.provider_session_id] = provider_session_id
+        if provider_namespace is not None:
+            values[ConversationIdentityModel.provider_namespace] = provider_namespace
+        if artifact_locator is not None:
+            values[ConversationIdentityModel.artifact_locator] = artifact_locator
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            values, synchronize_session=False
+        )
+
+
+def set_conversation_lifecycle(identity_key: str, lifecycle: str) -> None:
+    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach)."""
+    with SessionLocal.begin() as db:
+        db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
+            {
+                ConversationIdentityModel.lifecycle: lifecycle,
+                ConversationIdentityModel.updated_at: _utcnow(),
+            },
+            synchronize_session=False,
+        )
+
+
+def bind_provider_session_id(
+    identity_key: str,
+    *,
+    provider_session_id: str,
+    provider_namespace: Optional[str] = None,
+    artifact_locator: Optional[str] = None,
+) -> bool:
+    """F829 D4/D7: bind a captured uuid to a root, honouring bound-uniqueness.
+
+    Returns False (no raise) when the (provider, namespace, uuid) triple is
+    already bound to a DIFFERENT identity — the caller records
+    ``uuid_capture_rejected`` and leaves the root unbound. True on success.
+    """
+    with SessionLocal.begin() as db:
+        root = (
+            db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if root is None:
+            return False
+        ns = provider_namespace if provider_namespace is not None else root.provider_namespace
+        conflict = (
+            db.query(ConversationIdentityModel)
+            .filter(
+                ConversationIdentityModel.provider == root.provider,
+                ConversationIdentityModel.provider_namespace == ns,
+                ConversationIdentityModel.provider_session_id == provider_session_id,
+                ConversationIdentityModel.identity_key != identity_key,
+            )
+            .first()
+        )
+        if conflict is not None:
+            return False
+        root.provider_session_id = provider_session_id
+        if provider_namespace is not None:
+            root.provider_namespace = provider_namespace
+        if artifact_locator is not None:
+            root.artifact_locator = artifact_locator
+        root.updated_at = _utcnow()
+        db.flush()
+        return True
+
+
+def claim_identity_owner(identity_key: str, new_owner_principal: str) -> Dict[str, Any]:
+    """F829 D5: `cao identity claim` — an owner claims a NULL-owner / legacy root.
+
+    A root minted with owner_principal=NULL (a top-level spawn, supervisor ask 1)
+    or a legacy_unknown_owner root is resumable only after an explicit claim that
+    sets its owner. Refuses to overwrite an existing non-NULL owner (returns
+    ``{"status": "already_owned"}``); a legacy_unknown_owner origin is upgraded to
+    ``spawn`` on claim. Returns ``{"status": "claimed"|"already_owned"|"no_root"}``.
+    """
+    with SessionLocal.begin() as db:
+        root = (
+            db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        )
+        if root is None:
+            return {"status": "no_root"}
+        if root.owner_principal is not None and root.origin != "legacy_unknown_owner":
+            return {"status": "already_owned", "owner_principal": root.owner_principal}
+        root.owner_principal = new_owner_principal
+        if root.origin == "legacy_unknown_owner":
+            root.origin = "spawn"
+        root.updated_at = _utcnow()
+        db.flush()
+    record_conversation_event(
+        identity_key, "identity_claimed", detail={"owner_principal": new_owner_principal}
+    )
+    return {"status": "claimed", "owner_principal": new_owner_principal}
+
+
+def list_hibernated_identities(owner_principal: Optional[str] = None) -> List[Dict[str, Any]]:
+    """F829 D5: roots in a recoverable/parked state, optionally filtered to an owner.
+
+    Listing NEVER mutates lifecycle (D6). Recoverable set for the listing is
+    {hibernated, detached, capture_unknown} — the states a `cao terminals
+    resume`/`identity attach` can still act on.
+    """
+    parked = ("hibernated", "detached", "capture_unknown")
+    with SessionLocal() as db:
+        q = db.query(ConversationIdentityModel).filter(
+            ConversationIdentityModel.lifecycle.in_(parked)
+        )
+        if owner_principal is not None:
+            q = q.filter(ConversationIdentityModel.owner_principal == owner_principal)
+        rows = q.order_by(ConversationIdentityModel.updated_at.desc()).all()
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_conversation_incarnations(identity_key: str) -> List[Dict[str, Any]]:
+    """F829 D5: every terminal_identity incarnation of a root, oldest first."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalIdentityModel)
+            .filter_by(identity_key=identity_key)
+            .order_by(TerminalIdentityModel.created_at, TerminalIdentityModel.terminal_id)
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_conversation_events(identity_key: str) -> List[Dict[str, Any]]:
+    """F829 D5: the ordered event timeline for `cao diag`."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(ConversationEventModel)
+            .filter_by(identity_key=identity_key)
+            .order_by(ConversationEventModel.created_at, ConversationEventModel.id)
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
+
+
+def reconcile_stale_resume_claims(claim_ttl_s: float) -> List[str]:
+    """F829 D8: clear resume claims older than ``claim_ttl_s`` before a new resume.
+
+    Returns the identity_keys whose claim was reconciled (an event is recorded
+    per key). A claim with no ``resume_claim_at`` is treated as reconcilable.
+    """
+    cutoff = _utcnow() - timedelta(seconds=claim_ttl_s)
+    reconciled: List[str] = []
+    with SessionLocal.begin() as db:
+        rows = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.resume_claim.isnot(None))
+            .all()
+        )
+        for root in rows:
+            claimed_at = root.resume_claim_at
+            if claimed_at is not None:
+                # SQLite hands back naive datetimes; normalise to UTC-aware
+                # before comparing against the aware cutoff.
+                if claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+                if claimed_at > cutoff:
+                    continue
+            root.resume_claim = None
+            root.resume_claim_at = None
+            root.updated_at = _utcnow()
+            reconciled.append(root.identity_key)
+        db.flush()
+    for key in reconciled:
+        record_conversation_event(key, "claim_reconciled")
+    return reconciled
+
+
+def list_live_conversation_roots() -> List[Dict[str, Any]]:
+    """F829 D8 (N1): every root in lifecycle ``live`` — startup reconciliation input."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(ConversationIdentityModel)
+            .filter(ConversationIdentityModel.lifecycle == "live")
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
 
 
 def create_terminal(
@@ -6068,6 +7546,80 @@ def delete_terminal_and_warm_intent(
         "reason": (resume_reason if reap_facts else "no_identity_row_pre_registry_terminal"),
         "cwd": (reap_facts["cwd"] if reap_facts else None),
         "artifact_locator": (reap_facts["artifact_locator"] if reap_facts else None),
+    }
+
+
+def crash_detach_terminal(terminal_id: str) -> Dict[str, Any]:
+    """F829 D8: the ONE idempotent crash-detach transition — NOT the reap cascade.
+
+    Factored narrowly out of ``delete_terminal_and_warm_intent`` (whose full
+    cascade cancels barriers as ``owner_gone``, flips membership GONE and
+    reparents children). This does EXACTLY four things, in one transaction:
+
+    (i)   ``mark_receiver_gone`` on the dead terminal's inbox rows, so nothing
+          stays PENDING/EMITTED against a removed receiver (matches the reap
+          path's :5879 call) — this neither cancels barriers nor reparents;
+    (ii)  mailbox ``current_terminal_id`` → NULL for this terminal (FAM-1);
+    (iii) delete the warm intent row (UNIQUE on worker_terminal_id), recording
+          ``warm_intent_dropped`` on the identity when one existed;
+    (iv)  remove the ``terminals`` row so F439 cap consumption ends.
+
+    It then flips the conversation root to ``detached`` (a distinct writer from
+    planned hibernate / explicit reap). It does NOT cancel barriers, does NOT
+    flip membership GONE, does NOT touch frozen pins — those are the #299
+    suspension/reactivation dependency, named in D8. Idempotent: a second call
+    for an already-removed terminal is a no-op that still returns cleanly.
+
+    Returns ``{terminal_deleted, intent_dropped, identity_key, lifecycle}``.
+    """
+    identity_key: Optional[str] = None
+    intent_dropped = False
+    terminal_deleted = False
+    with SessionLocal.begin() as db:
+        # Resolve the conversation root for this terminal (for the lifecycle
+        # flip + events), before the terminals row is removed.
+        ti = db.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).one_or_none()
+        if ti is not None and ti.identity_key:
+            identity_key = cast(str, ti.identity_key)
+        # (i) F829 A1 (D8i): settle BOTH delivery authorities for the dead
+        # receiver in this ONE transaction — the ledger (mark_receiver_gone:
+        # pending/emitted → undeliverable(receiver_gone)) AND the inbox
+        # (_settle_inbox_receiver_gone: pending/delivering →
+        # delivery_failed(receiver_gone)). NEITHER is swallowed: a failed
+        # settlement aborts the whole transaction so the receiver is NOT deleted
+        # with an unsettled authority (A1 D8i replaces the old swallow at :5879).
+        # Both counts are captured and returned. Inbox settlement is scoped to
+        # crash-detach only (the reap path's inbox settlement is owned by the
+        # WPM4b delivery-attempt pipeline).
+        ledger_settled = mark_receiver_gone(db, receiver_id=terminal_id)
+        inbox_settled = _settle_inbox_receiver_gone(db, receiver_id=terminal_id)
+        # (ii) nullify mailbox authority for this terminal.
+        db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
+            {MailboxModel.current_terminal_id: None},
+            synchronize_session=False,
+        )
+        # (iii) drop the warm intent (if any).
+        intent_dropped = (
+            db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
+        )
+        # (iv) remove the terminals row → cap consumption ends.
+        terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
+    invalidate_terminal_metadata_cache(terminal_id)
+    # Root lifecycle → detached (its own writer). Events recorded outside the
+    # narrow transaction so a logging failure cannot roll back the detach.
+    lifecycle_out = "detached"
+    if identity_key is not None:
+        set_conversation_lifecycle(identity_key, "detached")
+        if intent_dropped:
+            record_conversation_event(identity_key, "warm_intent_dropped", terminal_id=terminal_id)
+        record_conversation_event(identity_key, "crash_detached", terminal_id=terminal_id)
+    return {
+        "terminal_deleted": terminal_deleted,
+        "intent_dropped": intent_dropped,
+        "identity_key": identity_key,
+        "lifecycle": lifecycle_out,
+        "ledger_settled": ledger_settled,
+        "inbox_settled": inbox_settled,
     }
 
 
@@ -13391,7 +14943,16 @@ def mark_receiver_gone(
     """D8/S1 (AC22): a receiver was reaped or reclaimed — transition its
     undelivered ledger rows to ``undeliverable(receiver_gone)`` in the SAME
     transaction as the delete, not on a later sweep. Acked/terminal rows are
-    untouched. Returns the count transitioned."""
+    untouched. Returns the count transitioned.
+
+    Ledger-ONLY by design: the ``inbox`` row's own settlement on the reap path
+    is owned by the WPM4b delivery-attempt pipeline
+    (``recover_wpm2_stale_attempt`` / orphan reconciliation), which requires the
+    row to still read ``delivering`` when it settles it. The D8 crash-detach path
+    settles the inbox row itself (see ``crash_detach_terminal`` via
+    ``_settle_inbox_receiver_gone``); this shared helper must not, or it would
+    race that pipeline out of its ``delivering`` precondition (F829 E2 scoping).
+    """
     now = _utcnow()
     rows = (
         db.query(DeliveryLedgerModel)
@@ -13408,6 +14969,31 @@ def mark_receiver_gone(
         row.blocked_reason = None
         row.blocked_since = None
         row.updated_at = now
+        count += 1
+    return count
+
+
+def _settle_inbox_receiver_gone(db: Session, *, receiver_id: str) -> int:
+    """F829 E2 (D8): settle a dead receiver's UNDELIVERED inbox rows to
+    ``delivery_failed(receiver_gone)`` in the caller's transaction.
+
+    Scoped to the D8 crash-detach path (``crash_detach_terminal``), NOT the
+    shared reap helper ``mark_receiver_gone`` — on the reap path the WPM4b
+    delivery-attempt pipeline owns inbox settlement and needs the row to stay
+    ``delivering`` until it acts. Rows in ``pending``/``delivering`` are settled;
+    terminal rows are untouched. Returns the count settled."""
+    inbox_rows = (
+        db.query(InboxModel)
+        .filter(
+            InboxModel.receiver_id == receiver_id,
+            InboxModel.status.in_([MessageStatus.PENDING.value, MessageStatus.DELIVERING.value]),
+        )
+        .all()
+    )
+    count = 0
+    for row in inbox_rows:
+        row.status = MessageStatus.DELIVERY_FAILED.value
+        row.failure_reason = UndeliverableReason.RECEIVER_GONE.value
         count += 1
     return count
 

@@ -286,6 +286,78 @@ def test_capture_kiro_no_store_returns_none(tmp_path):
     assert got is None and reason == "capture_unknown" and count == 0
 
 
+# ── verdict B4: per-attempt capture_nonce positive attribution ──────────────
+
+
+def test_capture_kiro_nonce_two_same_cwd_candidates_returns_own(tmp_path):
+    """B4: two sessions under the SAME cwd — one carries THIS attempt's
+    capture_nonce, the other is a foreign/copied session (newer mtime, and even
+    carrying the copyable assign-trailer). The nonce selector returns the OWN
+    session, never the newest."""
+    cwd = str(tmp_path / "wt")
+    Path(cwd).mkdir()
+    root = tmp_path / "sessions"
+    nonce = "cao-nonce-deadbeefdeadbeefdeadbeefdeadbeef"
+    # OWN session: carries the per-attempt nonce (older mtime).
+    _write_kiro_session(
+        root,
+        cwd,
+        "sess_own-0000-0000-0000-000000000001",
+        marker=f"task…\n<!-- cao-capture-nonce: {nonce} -->",
+        created_at="2026-09-08T04:00:00.000Z",
+    )
+    # FOREIGN session: newer, and even carries the copyable per-terminal
+    # assign-trailer — the OLD newest/trailer heuristics would wrongly pick it.
+    _write_kiro_session(
+        root,
+        cwd,
+        "sess_foreign-0000-0000-0000-000000000002",
+        marker="[Assigned by terminal abcd1234. …]",
+        created_at="2026-09-09T09:00:00.000Z",
+    )
+    got, reason, count = capture_kiro_session_id_from_store(
+        cwd, "abcd1234", capture_nonce=nonce, sessions_root=root
+    )
+    assert got == "sess_own-0000-0000-0000-000000000001"
+    assert reason is None and count == 2
+
+
+def test_capture_kiro_nonce_no_carrier_refuses(tmp_path):
+    """When the nonce is set but NO candidate carries it, refuse (never fall back
+    to newest/mtime)."""
+    cwd = str(tmp_path / "wt")
+    Path(cwd).mkdir()
+    root = tmp_path / "sessions"
+    _write_kiro_session(
+        root,
+        cwd,
+        "sess_x-0000-0000-0000-000000000001",
+        marker="[Assigned by terminal abcd1234. …]",  # trailer present, nonce absent
+    )
+    got, reason, count = capture_kiro_session_id_from_store(
+        cwd, "abcd1234", capture_nonce="cao-nonce-notpresent", sessions_root=root
+    )
+    assert got is None and reason == "capture_unknown"
+
+
+def test_capture_kiro_nonce_falls_back_to_trailer_when_no_nonce(tmp_path):
+    """Backward compat: with NO nonce recorded (legacy row), the per-terminal
+    assign-trailer marker still positively attributes — still never mtime."""
+    cwd = str(tmp_path / "wt")
+    Path(cwd).mkdir()
+    root = tmp_path / "sessions"
+    _write_kiro_session(
+        root,
+        cwd,
+        "sess_legacy-0000-0000-0000-000000000001",
+        marker="[Assigned by terminal abcd1234. …]",
+    )
+    got, reason, count = capture_kiro_session_id_from_store(
+        cwd, "abcd1234", capture_nonce=None, sessions_root=root
+    )
+    assert got == "sess_legacy-0000-0000-0000-000000000001" and reason is None
+
+
 def test_reap_fills_kiro_session_id_and_returns_full_block(db_env):
     """A kiro reap with a captured id writes it into the identity row; the reap
     block reports resume_key=<historical terminal id> + provider_session_id."""

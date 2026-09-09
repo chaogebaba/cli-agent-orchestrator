@@ -686,6 +686,20 @@ def _commit_provider_runtime_identity(
         )
     if not persisted:
         raise RuntimeError("terminal_identity_persist_failed")
+    # F829 D4/D3: attach the captured uuid to the conversation root — completing
+    # a RESUME (verify+publish) when a claim is held, else a FRESH capture with
+    # not-owned-by-another attribution. Best-effort: a failure here must not fail
+    # the terminal's runtime-identity commit.
+    try:
+        from cli_agent_orchestrator.services.conversation_transition import attach_captured_uuid
+
+        attach_captured_uuid(
+            terminal_id,
+            provider_session_id=prepared.session_uuid,
+            artifact_locator=getattr(prepared, "artifact_locator", None),
+        )
+    except Exception:
+        logger.debug("f829 attach_captured_uuid failed", exc_info=True)
 
 
 def _wait_for_session_artifact_sync(
@@ -2820,7 +2834,60 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
-        # F439 (#294) round 5 / BLOCKER 1: the row is now durably published and
+        # F829 A1 (D3 step 4 / verdict B4): mint the FRESH conversation root +
+        # recovery_manifest at production spawn — additive, fresh-spawn ONLY (a
+        # resume re-points an existing root via publish_current_terminal, so
+        # skip when resuming/forking). The per-attempt capture_nonce is minted
+        # here, stored on the manifest, and injected into the worker's first
+        # turn below so a kiro session is positively attributable to THIS
+        # attempt. Best-effort: a mint failure must never fail a spawn.
+        _is_resume_spawn = bool(resume_uuid) or (
+            fork_context is not None and getattr(fork_context, "mode", None) == "resume"
+        )
+        _spawn_capture_nonce: Optional[str] = None
+        if not _is_resume_spawn:
+            try:
+                from cli_agent_orchestrator.clients.database import (
+                    mint_capture_nonce,
+                    mint_spawn_identity,
+                )
+
+                _spawn_capture_nonce = mint_capture_nonce()
+                _wt = _worktree_info_dict if isinstance(_worktree_info_dict, dict) else {}
+                mint_spawn_identity(
+                    identity_key=f"conv_{terminal_id}",
+                    provider=provider,
+                    provider_namespace=None,
+                    agent_profile=agent_profile,
+                    model=model,
+                    reasoning_effort=None,
+                    owner_caller_id=caller_id,
+                    origin_callback_ref=None,
+                    current_terminal_id=terminal_id,
+                    cwd=resolved_working_directory,
+                    worktree_path=_wt.get("worktree_path"),
+                    worktree_branch=_wt.get("expected_branch"),
+                    repo_root=_wt.get("repo_root"),
+                    capture_nonce=_spawn_capture_nonce,
+                    launch_attempt_id=terminal_id,
+                )
+            except Exception:
+                logger.debug("f829 spawn-identity mint skipped for %s", terminal_id, exc_info=True)
+                _spawn_capture_nonce = None
+        # verdict B4: inject the per-attempt nonce into the kiro worker's FIRST
+        # turn (seed/own marker), so the eager + reap selectors positively
+        # attribute the kiro session it writes to THIS attempt. An invisible
+        # trailer line on the first message is enough — it lands verbatim in
+        # kiro's messages.jsonl. Only for a fresh kiro spawn with a message.
+        if (
+            _spawn_capture_nonce
+            and provider == "kiro_cli"
+            and initial_message
+            and not _is_resume_spawn
+        ):
+            initial_message = (
+                f"{initial_message}\n\n<!-- cao-capture-nonce: {_spawn_capture_nonce} -->"
+            )
         # visible in the listing. Retire this create's reservation HERE — before
         # the slow provider-init phase below — in one locked step that also drops
         # this terminal id from ``_cap_publishing_ids``. The row was already
@@ -7342,6 +7409,56 @@ def delete_terminal(
     require_delete_allowed(terminal_id, force=force)
     session_name = root["tmux_session"]
 
+    # F829 D2(a): PLANNED HIBERNATE gate — evaluated BEFORE the teardown intent is
+    # opened so a refusal returns without opening/leaking an intent. On the
+    # default (non-force) path, a conversation with NO validated recoverable
+    # artifact (D6) must NOT be destroyed silently: refuse non-destructively with
+    # a typed result naming provider + reason (additive return fields; existing
+    # readers of terminal_deleted are unaffected), so the caller can choose an
+    # explicit force reap. force=True (explicit reap) always proceeds (D2(b)).
+    from cli_agent_orchestrator.services import conversation_transition as _f829_ct
+
+    _f829_hib_decision = None
+    if not force:
+        try:
+            _f829_hib_decision = _f829_ct.evaluate_planned_hibernate(terminal_id)
+        except Exception:
+            logger.debug("f829 hibernate evaluation failed; proceeding as reap", exc_info=True)
+            _f829_hib_decision = None
+        if _f829_hib_decision is not None and not _f829_hib_decision.allowed:
+            if _f829_hib_decision.identity_key is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import record_conversation_event
+
+                    record_conversation_event(
+                        _f829_hib_decision.identity_key,
+                        "hibernate_refused",
+                        terminal_id=terminal_id,
+                        detail={
+                            "provider": _f829_hib_decision.provider,
+                            "reason": _f829_hib_decision.reason,
+                        },
+                    )
+                except Exception:
+                    logger.debug("f829 hibernate_refused event failed", exc_info=True)
+            return {
+                "reaped": [],
+                "skipped": [
+                    {
+                        "id": terminal_id,
+                        "refused": True,
+                        "kind": "hibernate_refused",
+                        "provider": _f829_hib_decision.provider,
+                        "reason": _f829_hib_decision.reason,
+                        "detail": _f829_hib_decision.detail,
+                        "identity_key": _f829_hib_decision.identity_key,
+                        "hint": "delete_terminal(force=True) reaps and marks unrecoverable",
+                    }
+                ],
+                "uncertain": [],
+                "unattempted": [],
+            }
+
     # D16: Open teardown intent BEFORE any tmux call. Committed immediately.
     from cli_agent_orchestrator.clients.database import SessionLocal
     from cli_agent_orchestrator.services.config_service import ConfigService
@@ -7391,7 +7508,7 @@ def delete_terminal(
 
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     try:
-        return _delete_terminal_inner(
+        _f829_result = _delete_terminal_inner(
             terminal_id=terminal_id,
             session_name=session_name,
             root=root,
@@ -7400,6 +7517,18 @@ def delete_terminal(
             orphan=orphan,
             caller_id=caller_id,
         )
+        # F829 D2 writer: land the conversation-root lifecycle AFTER a successful
+        # reap. Planned hibernate → hibernated (artifact validated above);
+        # explicit reap (force) → abandoned. Best-effort: a lifecycle-write
+        # failure must not turn a completed reap into an error.
+        try:
+            if force:
+                _f829_ct.commit_reap(terminal_id)
+            elif _f829_hib_decision is not None:
+                _f829_ct.commit_hibernate(_f829_hib_decision)
+        except Exception:
+            logger.debug("f829 conversation transition write failed", exc_info=True)
+        return _f829_result
     finally:
         # D16: Close intent in finally — runs on success, failure, exception alike
         if _f218_intent_id is not None:
@@ -7540,15 +7669,51 @@ def _resolve_reap_resume_key(
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return None, bool(supports), reason
         if provider != "kiro_cli":
-            # Non-kiro with a NULL id: nothing to capture; not resumable.
-            return None, False, "provider_session_id_never_captured"
+            # F829 (build-2 B2): a non-kiro provider whose terminal_identity id is
+            # still NULL may nonetheless have captured its id onto the F829
+            # conversation ROOT during the run (claude: the SessionStart hook via
+            # bind_transcript -> attach_captured_uuid; codex normally fills the
+            # identity row at init, but the root is the durable source either
+            # way). Fill the reaped identity row from the root so the worker is
+            # resume-resolvable (get_terminal_identity_by_provider_session_id /
+            # resume_from=<terminal_id>). No store read, no cwd+mtime guess — the
+            # root id is a positively-attributed capture. Only when the provider
+            # actually supports resume.
+            if supports:
+                _ikey = identity.get("identity_key")
+                if _ikey:
+                    from cli_agent_orchestrator.clients.database import (
+                        get_conversation_identity,
+                    )
+
+                    _root = get_conversation_identity(_ikey)
+                    _root_sid = _root.get("provider_session_id") if _root else None
+                    if _root_sid:
+                        return _root_sid, True, "resumable"
+                return None, False, "provider_session_id_never_captured"
+            # Non-kiro that does not support resume: nothing to do.
+            return None, False, f"provider_{provider}_not_resumable"
         if not cwd:
             return None, False, "kiro_cwd_unknown"
         from cli_agent_orchestrator.services.resume_service import (
             capture_kiro_session_id_from_store,
         )
 
-        captured, cap_reason, count = capture_kiro_session_id_from_store(cwd, terminal_id)
+        # verdict B4: prefer this launch attempt's capture_nonce (per-attempt
+        # positive attribution) over the copyable per-terminal assign-trailer.
+        # Load it from the root's recovery_manifest via the identity_key.
+        _nonce = None
+        _ikey = identity.get("identity_key")
+        if _ikey:
+            from cli_agent_orchestrator.clients.database import get_recovery_manifest
+
+            _manifest = get_recovery_manifest(_ikey)
+            if _manifest:
+                _nonce = _manifest.get("capture_nonce")
+
+        captured, cap_reason, count = capture_kiro_session_id_from_store(
+            cwd, terminal_id, capture_nonce=_nonce
+        )
         if captured:
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return captured, bool(supports), reason
