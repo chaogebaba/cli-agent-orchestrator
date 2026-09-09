@@ -38,6 +38,7 @@ import requests
 # WP-ARCH phase 1 (F725 #581) hook points 3, 6, 7 — server decision rows.
 from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import RootAdmission  # F829 A2.3 root admission
 from cli_agent_orchestrator.clients.database import (
     _utcnow,
     claim_deferred_init_failure,
@@ -1776,6 +1777,7 @@ async def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     is_box_hosted: bool = False,
+    root_admission: Optional["RootAdmission"] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -2356,6 +2358,51 @@ async def create_terminal(
 
         terminal_token = _secrets.token_urlsafe(32)
 
+        # F829 A2.3: build the explicit CAO ROOT ADMISSION for this create, minted
+        # BEFORE the locked publication so it (and its capture nonce) commit inside
+        # the terminal-create transaction, right after the identity row.
+        #
+        # "Fresh" = NO admitted existing conversation root, INDEPENDENT of a
+        # provider CLI's resume mode (a codex seed bootstrap returns
+        # ForkContext(mode="resume") yet is a FRESH spawn). So the resume
+        # discriminator is the ADMISSION mode, never fork_context.mode:
+        #   * an explicit link admission (passed by the server-side resume
+        #     orchestration) → this is a true resume; do NOT mint.
+        #   * otherwise → a fresh spawn: mint a root here unless one was already
+        #     supplied. A fresh codex seed carries its seeded uuid so the root is
+        #     never capture_unknown; its namespace is the canonical
+        #     _resolved_codex_home (no trailing slash), recorded authoritatively.
+        _is_resume_spawn = root_admission is not None and root_admission.mode == "link"
+        _spawn_capture_nonce: Optional[str] = None
+        if root_admission is None and not _is_resume_spawn:
+            from cli_agent_orchestrator.clients.database import mint_capture_nonce
+
+            _spawn_capture_nonce = mint_capture_nonce()
+            _seed_uuid = resume_uuid if provider == "codex" else None
+            _seed_namespace: Optional[str] = None
+            if _seed_uuid is not None:
+                try:
+                    from cli_agent_orchestrator.providers.codex import _resolved_codex_home
+
+                    _seed_namespace = str(_resolved_codex_home(terminal_id)).rstrip("/")
+                except Exception:
+                    _seed_namespace = None
+            root_admission = RootAdmission(
+                mode="mint",
+                identity_key=f"conv_{terminal_id}",
+                provider=provider,
+                provider_namespace=_seed_namespace,
+                provider_session_id=_seed_uuid,
+                model=model,
+                reasoning_effort=None,
+                owner_caller_id=caller_id,
+                origin_callback_ref=None,
+                capture_nonce=_spawn_capture_nonce,
+                launch_attempt_id=terminal_id,
+            )
+        elif root_admission is not None and root_admission.mode == "mint":
+            _spawn_capture_nonce = root_admission.capture_nonce
+
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock is per session NAME, so it must be taken on the SAME string the
         # tmux create and the registry row use, or a create and a teardown of
@@ -2603,6 +2650,7 @@ async def create_terminal(
                                         worktree_info=_worktree_info_dict,
                                         working_directory=resolved_working_directory,
                                         auth_token=terminal_token,
+                                        root_admission=root_admission,
                                         **init_fields,
                                     )
                                 else:
@@ -2632,6 +2680,7 @@ async def create_terminal(
                                         worktree_info=_worktree_info_dict,
                                         working_directory=resolved_working_directory,
                                         auth_token=terminal_token,
+                                        root_admission=root_admission,
                                         **init_fields,
                                     )
                             else:
@@ -2662,6 +2711,7 @@ async def create_terminal(
                                             worktree_info=_worktree_info_dict,
                                             working_directory=resolved_working_directory,
                                             auth_token=terminal_token,
+                                            root_admission=root_admission,
                                             **init_fields,
                                         )
                                     else:
@@ -2690,6 +2740,7 @@ async def create_terminal(
                                             worktree_info=_worktree_info_dict,
                                             working_directory=resolved_working_directory,
                                             auth_token=terminal_token,
+                                            root_admission=root_admission,
                                             **init_fields,
                                         )
                                 else:
@@ -2717,6 +2768,7 @@ async def create_terminal(
                                             worktree_info=_worktree_info_dict,
                                             working_directory=resolved_working_directory,
                                             auth_token=terminal_token,
+                                            root_admission=root_admission,
                                             **init_fields,
                                         )
                                     else:
@@ -2744,6 +2796,7 @@ async def create_terminal(
                                             worktree_info=_worktree_info_dict,
                                             working_directory=resolved_working_directory,
                                             auth_token=terminal_token,
+                                            root_admission=root_admission,
                                             **init_fields,
                                         )
                 except Exception as exc:
@@ -2759,6 +2812,18 @@ async def create_terminal(
                         _created_window_name,
                         created_session=_created_session,
                     )
+                    # F829 A2.3/A2.5: a root-admission refusal must reach the
+                    # caller as its typed identity error (session_identity_conflict
+                    # / principal refusal), NOT be masked as "db_publish_failed".
+                    # The rollback above already ran, so no partial row survives
+                    # (abort/compensate). Re-raise the typed exception unwrapped.
+                    from cli_agent_orchestrator.clients.database import (
+                        PrincipalRefused,
+                        SeededSessionConflict,
+                    )
+
+                    if isinstance(exc, (PrincipalRefused, SeededSessionConflict)):
+                        raise
                     if lease_token is not None:
                         raise RuntimeError("db_publish_failed") from exc
                     raise
@@ -2834,46 +2899,15 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
-        # F829 A1 (D3 step 4 / verdict B4): mint the FRESH conversation root +
-        # recovery_manifest at production spawn — additive, fresh-spawn ONLY (a
-        # resume re-points an existing root via publish_current_terminal, so
-        # skip when resuming/forking). The per-attempt capture_nonce is minted
-        # here, stored on the manifest, and injected into the worker's first
-        # turn below so a kiro session is positively attributable to THIS
-        # attempt. Best-effort: a mint failure must never fail a spawn.
-        _is_resume_spawn = bool(resume_uuid) or (
-            fork_context is not None and getattr(fork_context, "mode", None) == "resume"
-        )
-        _spawn_capture_nonce: Optional[str] = None
-        if not _is_resume_spawn:
-            try:
-                from cli_agent_orchestrator.clients.database import (
-                    mint_capture_nonce,
-                    mint_spawn_identity,
-                )
-
-                _spawn_capture_nonce = mint_capture_nonce()
-                _wt = _worktree_info_dict if isinstance(_worktree_info_dict, dict) else {}
-                mint_spawn_identity(
-                    identity_key=f"conv_{terminal_id}",
-                    provider=provider,
-                    provider_namespace=None,
-                    agent_profile=agent_profile,
-                    model=model,
-                    reasoning_effort=None,
-                    owner_caller_id=caller_id,
-                    origin_callback_ref=None,
-                    current_terminal_id=terminal_id,
-                    cwd=resolved_working_directory,
-                    worktree_path=_wt.get("worktree_path"),
-                    worktree_branch=_wt.get("expected_branch"),
-                    repo_root=_wt.get("repo_root"),
-                    capture_nonce=_spawn_capture_nonce,
-                    launch_attempt_id=terminal_id,
-                )
-            except Exception:
-                logger.debug("f829 spawn-identity mint skipped for %s", terminal_id, exc_info=True)
-                _spawn_capture_nonce = None
+        # F829 A2.3: the conversation root + recovery_manifest are minted INSIDE
+        # the terminal-create transaction now (via the RootAdmission passed to
+        # the DB writer, above), never here post-publication — the old
+        # best-effort mint that swallowed failures is removed (astra memo item 2;
+        # F631: no best-effort identity writes). ``_spawn_capture_nonce`` and
+        # ``_is_resume_spawn`` were computed BEFORE the locked publication so the
+        # nonce is stored on the manifest in that same transaction; it is reused
+        # below only to inject the kiro first-turn marker.
+        #
         # verdict B4: inject the per-attempt nonce into the kiro worker's FIRST
         # turn (seed/own marker), so the eager + reap selectors positively
         # attribute the kiro session it writes to THIS attempt. An invisible
@@ -7646,11 +7680,26 @@ def _resolve_reap_resume_key(
         provider = (identity.get("provider") or "") if identity else ""
         cwd = identity.get("cwd") or (metadata.get("working_directory") if metadata else None)
         supports = provider_supports_resume(provider) if provider else False
+
+        def _root_link_intact() -> bool:
+            # A2.4: never advertise resumable:true without root/link integrity —
+            # the terminal_identity row must be LINKED to a conversation root that
+            # actually exists. A dangling link (identity_key set but no root) or a
+            # missing link is honestly non-resumable.
+            _ikey = identity.get("identity_key") if identity else None
+            if not _ikey:
+                return False
+            from cli_agent_orchestrator.clients.database import get_conversation_identity
+
+            return get_conversation_identity(_ikey) is not None
+
         if force:
             # Abandon: the caller is discarding the checkout; not resumable.
             return None, False, "abandoned_force_delete"
         existing_id = identity.get("provider_session_id")
         if existing_id:
+            if supports and not _root_link_intact():
+                return None, False, "identity_root_link_missing"
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return None, bool(supports), reason
         if provider != "kiro_cli":
@@ -7700,6 +7749,8 @@ def _resolve_reap_resume_key(
             cwd, terminal_id, capture_nonce=_nonce
         )
         if captured:
+            if supports and not _root_link_intact():
+                return captured, False, "identity_root_link_missing"
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return captured, bool(supports), reason
         return None, False, f"capture_unknown_candidates_{count}"
