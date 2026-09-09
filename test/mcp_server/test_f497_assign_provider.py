@@ -99,11 +99,18 @@ def test_d7_uninstalled_legacy_name_passthrough_clean_store(monkeypatch):
 
 
 def test_d7_position_plus_provider_spawns_composed(monkeypatch):
-    """A position name + an allowed provider resolves and spawns (composed cell).
+    """A position name + an allowed, CERTIFIED provider resolves and spawns the
+    composed cell.
 
     F786 D2b: the effective spawn name is ``<position>-<provider>``, so the
     composed cell spawns as ``empirical_reviewer-codex``.
+    F868 #724: an explicit ``provider=`` on a position name is now ALSO
+    certification-checked (no bypass). Here the cell is certified (the routing
+    resolver is stubbed to a PASS resolution) so the spawn proceeds and the
+    result records ``provider_source='explicit'``.
     """
+    from cli_agent_orchestrator.utils import routing
+
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
     captured = {}
 
@@ -111,8 +118,18 @@ def test_d7_position_plus_provider_spawns_composed(monkeypatch):
         captured["agent_profile"] = agent_profile
         return ("worker2", "codex")
 
+    def fake_resolve(position, provider, *, table, positions_dir, clause_table_path=None):
+        # Certified cell → binds the position's own composed name, no fallback.
+        return routing.RoutingResolution(spawn_profile=f"{position}-{provider}", provider=provider)
+
     with (
         _patch_positions({"empirical_reviewer": {"providers": ["codex", "kiro_cli"]}}),
+        patch.object(routing, "load_routing_table", return_value=routing.bindings_to_table([])),
+        patch.object(routing, "resolve_routing_binding", side_effect=fake_resolve),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.write_composed_profile_for_spawn",
+            return_value="/tmp/empirical_reviewer-codex.md",
+        ),
         patch(
             "cli_agent_orchestrator.mcp_server.server._create_terminal", side_effect=fake_create
         ) as create,
@@ -125,6 +142,39 @@ def test_d7_position_plus_provider_spawns_composed(monkeypatch):
     create.assert_called_once()
     # D2b synthesis: <position>-<provider>.
     assert captured["agent_profile"] == "empirical_reviewer-codex"
+    # F868: explicit provider override is recorded once the cell passes cert.
+    assert result["provider_source"] == "explicit"
+
+
+def test_f868_explicit_provider_uncertified_cell_refused(monkeypatch):
+    """F868 #724 (fail-before witness): an explicit ``provider=`` on a position
+    whose cell is NOT certified (the routing resolver raises a cert RoutingError)
+    is refused with the ONE typed E-CELL-UNCERTIFIED, no terminal created. Before
+    the fix this path bypassed the resolver entirely and spawned."""
+    from cli_agent_orchestrator.utils import routing
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
+
+    def fake_resolve(position, provider, *, table, positions_dir, clause_table_path=None):
+        raise routing.RoutingError(
+            f"{routing.E_PROVIDER_UNCERTIFIED}: provider '{provider}' general cell is not PASS",
+            code=routing.E_PROVIDER_UNCERTIFIED,
+        )
+
+    with (
+        _patch_positions({"empirical_reviewer": {"providers": ["codex", "kiro_cli"]}}),
+        patch.object(routing, "load_routing_table", return_value=routing.bindings_to_table([])),
+        patch.object(routing, "resolve_routing_binding", side_effect=fake_resolve),
+        patch("cli_agent_orchestrator.mcp_server.server._create_terminal") as create,
+    ):
+        result = _assign_impl(
+            "empirical_reviewer", "task", working_directory="/repo", provider="codex"
+        )
+
+    assert result["success"] is False
+    assert result["terminal_id"] is None
+    assert "E-CELL-UNCERTIFIED" in result["message"]
+    create.assert_not_called()
 
 
 def test_d7_position_without_provider_hard_fails(monkeypatch):
