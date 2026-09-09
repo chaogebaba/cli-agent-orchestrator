@@ -70,6 +70,7 @@ import re
 import shlex
 import shutil
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -108,6 +109,26 @@ PI_RUNTIME_ROOT = CAO_HOME_DIR / "pi"
 # A Pi composer/editor box rule: a run of box-drawing horizontals (or ASCII
 # dashes as a fallback).  Pi draws two of these around the footer when idle.
 _EDITOR_RULE = re.compile(r"^\s*[─━—-]{20,}\s*$")
+
+
+def _visible_width(s: str) -> int:
+    """Terminal column width of an ANSI-stripped string (East-Asian aware).
+
+    F847 r5 (#703): the composer-width invariant in ``_live_working_spinner``
+    compares the live working row against the widest composer rule in the same
+    frame. Those rows carry wide glyphs (the braille spinner is narrow, but pane
+    content and box glyphs are not uniformly one column), so ``len`` is wrong —
+    a fullwidth/wide code point occupies two terminal columns. Count W/F East-
+    Asian-width code points as 2 and everything else as 1; combining marks (which
+    render zero-width) are treated as 0 so they do not inflate the width.
+    """
+    width = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
 
 # The braille spinner frames Pi cycles through on its active "Working" rule
 # row.  The ten canonical frames (#703 F847) are ``⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏``; we anchor on
@@ -167,7 +188,22 @@ _RULE_RUN = r"[─━—\-]{2,}"
 # match, while a live working row — whatever content precedes it — ends on the
 # border rule. This also admits the one-``─`` narrow-width branch
 # (custom-editor.js:46-47) that the r3 ``_RULE_RUN{2,}`` tail rejected.
-_WORKING_TAIL = r"[^\n]*?[─━—\-]+[ \t]*$"
+#
+# F847 r5 (#703) — the CLOSING run is BOX DRAWING ONLY (``[─━]``: no ASCII
+# hyphen, no em dash), Opus r4 EMPIRICAL-GATE-NO. The r4 tail's closing class
+# ``[─━—\-]+`` admitted the ASCII ``-`` and the em dash, so any transcript row
+# that merely opened with the spinner chrome and happened to END on a dash
+# ("run with --", a soft-wrapped "rule-", a markdown table rule, and the r2
+# adversary with a box rule appended) classified as a live working row — 9 of 10
+# dash-ending adversaries fired PROCESSING, the r1/r2 overmatch class re-opened.
+# The LEADING ``_RULE_RUN`` still admits ASCII/em dashes for tolerance (pi's
+# composer never leads with them, but a stray one there is harmless); accepting
+# them at the row END is what caused the false positives. The composer top
+# border is drawn from ``─``/``━`` box-drawing runs, so the closing class is
+# exactly those two. The load-bearing half of the r4 amendment is the
+# full-composer-width check in ``_live_working_spinner`` below (a quoted spinner
+# row in transcript is short); box-only closing is the belt to its braces.
+_WORKING_TAIL = r"[^\n]*?[─━]+[ \t]*$"
 _WORKING_ROW = re.compile(
     # rule-leading: ── ⠧ Working …<closing rule> — a leading box rule, the braille
     # glyph, ``Working``, then any content ending on the closing composer rule.
@@ -585,10 +621,20 @@ class PiCliProvider(BaseProvider):
         2. Strip trailing whitespace-only padding (pi pads the pane bottom).
         3. Only the last ``_LIVE_TAIL_ROWS`` rows — the live status region — are
            eligible; a spinner further up is stale transcript.
-        4. A row in that window is the live spinner only if it matches the
-           whole-row ``_WORKING_ROW`` anchor (a braille/marker + ``Working`` with
-           a box rule on the same row), never bare prose that merely says
-           "Working".
+        4. A row in that window is a working-row CANDIDATE only if it matches the
+           whole-row ``_WORKING_ROW`` anchor (a braille glyph + ``Working`` with a
+           leading box rule and a box-drawing closing rule), never bare prose.
+        5. F847 r5 (#703): a candidate is the LIVE working row only if it spans
+           the FULL composer width. The live working row IS the composer TOP
+           BORDER, so ``renderTopBorder`` sizes its trailing rule from ``width``:
+           a label or message shortens the rule and the total width is invariant
+           (measured 424/424 live pi 0.85.1 frames + all 40 overflow frames — the
+           working row's visible width equals the widest composer rule in the same
+           frame). A quoted spinner row pasted into transcript is SHORT, so this
+           rejects the dash-ending transcript adversaries the box-only closing
+           class alone still let through (Opus r4 EMPIRICAL-GATE-NO). When no
+           composer rule is visible there is no width evidence, so a candidate is
+           accepted rather than narrowed away.
         """
         lines = clean.splitlines()
         # 1) drop fenced rows (quoted spinner is not live)
@@ -607,7 +653,16 @@ class PiCliProvider(BaseProvider):
         # 3) bottom-of-viewport window only
         tail = unfenced[-_LIVE_TAIL_ROWS:]
         # 4) whole-row spinner anchor within the live window
-        return any(_WORKING_ROW.match(row) for row in tail)
+        hits = [row for row in tail if _WORKING_ROW.match(row)]
+        if not hits:
+            return False
+        # 5) full-composer-width invariant: the live working row spans the pane.
+        rules = [row for row in unfenced if _EDITOR_RULE.match(row)]
+        if not rules:
+            # No composer rule visible → no width evidence; do not narrow.
+            return True
+        composer_width = max(_visible_width(row) for row in rules)
+        return any(_visible_width(row) == composer_width for row in hits)
 
     @staticmethod
     def _has_idle_chrome(clean: str) -> bool:

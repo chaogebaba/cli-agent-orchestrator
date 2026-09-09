@@ -20,12 +20,15 @@ import pytest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.pi_cli import (
+    _EDITOR_RULE,
     _FOOTER_CONTEXT,
     _PI_MCP_TIMEOUT_MS_FLOOR,
+    _WORKING_ROW,
     PI_BINARY,
     PI_RUNTIME_ROOT,
     PiCliProvider,
     _resolve_pi_mcp_timeout_ms,
+    _visible_width,
 )
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -34,6 +37,22 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def _fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _working_row(glyph: str = "⠴", width: int = 120, *, message: str = "Working") -> str:
+    """Build a live pi working top-border row of EXACTLY ``width`` columns.
+
+    F847 r5 (#703): the live working row IS the composer top border, so it spans
+    the composer width — ``_live_working_spinner`` enforces that invariant. A
+    synthetic ``── ⠴ Working ───`` row must therefore be padded on its trailing
+    box rule to match the composer rules in the same frame, exactly as
+    ``renderTopBorder`` sizes the rule from ``width``. Returns
+    ``── <glyph> <message> <closing ─ run>`` whose visible width == ``width``.
+    """
+    lead = f"── {glyph} {message} "
+    fill = width - _visible_width(lead)
+    assert fill >= 1, f"width {width} too small for {lead!r}"
+    return lead + ("─" * fill)
 
 
 # ─── Registration ──────────────────────────────────────────────────────────────
@@ -334,7 +353,9 @@ class TestStatusDetection:
     def test_processing_takes_priority_over_idle_chrome(self, _native) -> None:
         """A frame with BOTH old idle chrome and a new Working spinner → PROCESSING."""
         provider = self._provider(dispatched=True)
-        buffer = _fixture("pi_idle.txt") + "\n── \u283f Working ──────────────────\n"
+        # pi_idle.txt's composer rules are 200 cols; the live working row spans
+        # the composer, so build it at 200 (F847 r5 width invariant).
+        buffer = _fixture("pi_idle.txt") + "\n" + _working_row("\u283f", 200) + "\n"
         assert provider.get_status(buffer) == TerminalStatus.PROCESSING
 
     def test_native_status_wins_when_present(self) -> None:
@@ -439,7 +460,7 @@ class TestFalseIdleWorkingSpinner:
                 " (timeout 1200s)",
                 " Elapsed 102.2s",
                 "",
-                f"── ⠴ Working {_RULE}",
+                _working_row("⠴", 120),
                 " ",
                 _RULE,
                 "/data/cao-scratch/worktrees/cli-agent-orchestrator/pane (cao/pane)",
@@ -463,18 +484,44 @@ class TestFalseIdleWorkingSpinner:
     # asserted "nothing but whitespace/optional-rule follows Working" and regressed
     # every one of these live rows from PROCESSING to UNKNOWN, re-opening the #703
     # false-idle from the other side (status_monitor latches the prior status on a
-    # detected UNKNOWN). The r4 tail pins on the CLOSING border rule, so a row that
-    # ENDS on the rule stays PROCESSING however much real content precedes it. Each
-    # fixture is source-derived from the real working-1.txt capture (only the
-    # message+tail substituted; ANSI/chrome preserved) — see the .json sidecars.
+    # detected UNKNOWN). The tail pins on the CLOSING border rule, so a row that
+    # ENDS on the rule stays PROCESSING however much real content precedes it —
+    # and (F847 r5) the row must span the full composer width, which the fixtures
+    # below satisfy. The overflow fixture is a GENUINE live capture; the other two
+    # are geometry-correct derivations (width 191 == working-1.txt) — see the
+    # .json sidecars.
     _OVERFLOW_FIXTURES = (
-        # custom-editor.js:37-40 — hidden-line overflow label inside the rule run.
+        # custom-editor.js:37-40 — hidden-line overflow label inside the rule run;
+        # GENUINE live capture (capture3/frames/q_001.txt), composer width 100.
         "working-overflow-queued",
-        # interactive-mode.js:1768 — "Working (esc to interrupt)".
+        # interactive-mode.js:1768 — "Working (esc to interrupt)" (derived, w=191).
         "working-esc-interrupt",
-        # interactive-mode.js:1906 — extension setWorkingMessage("Working on tool call").
+        # interactive-mode.js:1906 — "Working on tool call" (derived, w=191).
         "working-on-tool-call",
     )
+
+    def test_pi_working_fixture_rows_are_composer_width(self) -> None:
+        """#703 r5 (Opus r4 Blocker 2): every pi WORKING fixture's working row
+        must span the full composer width — the live working row IS the composer
+        top border, so ``renderTopBorder`` sizes its trailing rule from ``width``
+        and the total is invariant. The r4 fixtures were 19-25 columns short (rows
+        pi cannot draw); this asserts none is hand-shortened. No live-box turn: it
+        reads the committed corpus."""
+        for name in ("working-1", *self._OVERFLOW_FIXTURES):
+            clean = strip_terminal_escapes(
+                (FIXTURES / "status_truth" / "pi_cli" / f"{name}.txt").read_text(encoding="utf-8")
+            )
+            rows = clean.splitlines()
+            work_rows = [r for r in rows if _WORKING_ROW.match(r)]
+            rule_rows = [r for r in rows if _EDITOR_RULE.match(r)]
+            assert work_rows, f"{name}: no working row found"
+            assert rule_rows, f"{name}: no composer rule found"
+            composer_width = max(_visible_width(r) for r in rule_rows)
+            for wr in work_rows:
+                assert _visible_width(wr) == composer_width, (
+                    f"{name}: working row width {_visible_width(wr)} != composer width "
+                    f"{composer_width} — a row pi cannot draw (hand-shortened fixture)"
+                )
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_live_border_content_before_closing_rule_is_processing(self, _native) -> None:
@@ -578,6 +625,73 @@ class TestFalseIdleWorkingSpinner:
 
     _RULE = "─" * 120
     _FOOTER = "↑48k ↓8.4k R731k CH98.8% $0.017 3.0%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+
+    # ── #703 r5: dash-ending transcript adversaries (Opus r4 EMPIRICAL-GATE-NO) ──
+    # The r4 closing class ``[─━—\-]+`` admitted the ASCII hyphen and em dash and
+    # a run of ONE, so any transcript row that opened with the spinner chrome and
+    # happened to END on a dash classified as a live working row — 9 of these 10
+    # fired PROCESSING on the r4 head. The last is the r2 verdict's own adversary
+    # with a box rule appended: it ends on a real ``─`` run, so the box-drawing-
+    # only closing class alone still accepts it — only the full-composer-width
+    # check rejects it (the quoted row is short). Each is placed in the live
+    # bottom-of-viewport tail with real 120-col composer rules below it; each must
+    # classify transcript (COMPLETED). This battery is what kills BOTH the widen-
+    # the-closing-class mutant and the drop-the-width-check mutant.
+    _DASH_ADVERSARIES = (
+        "── ⠦ Working ── see --- below",
+        "── ⠦ Working ── -",
+        "── ⠧ Working ── quoted in the report ---",
+        "── ⠦ Working ── was quoted in the previous answer —",
+        "── ⠹ Working ── and then the summary, options: -",
+        "── ⠸ Working ── | overmatch | ------",
+        "── ⠏ Working ── run with --",
+        "── ⠋ Working ── the model finished the summary ─",
+        "── ⠙ Working ── the overmatching classifier is rule-",
+        "── ⠦ Working ── was quoted in the previous answer. ──────",
+    )
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_dash_ending_transcript_adversaries_do_not_fire(self, _native) -> None:
+        """All ten of the r4 verdict's dash-ending transcript rows classify
+        transcript (COMPLETED), not PROCESSING. Kills the widen-closing-class
+        mutant (the ASCII/em-dash-ending rows) and, via the appended-box-rule
+        row, the drop-the-width-check mutant."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        for adv in self._DASH_ADVERSARIES:
+            buffer = "\n".join(
+                [
+                    " prior transcript line",
+                    adv,
+                    "",
+                    self._RULE,
+                    " ",
+                    self._RULE,
+                    self._FOOTER,
+                ]
+            )
+            assert (
+                provider.get_status(buffer) == TerminalStatus.COMPLETED
+            ), f"dash-ending adversary fired PROCESSING (overmatch): {adv!r}"
+
+    @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
+    def test_full_width_ascii_or_em_dash_tail_is_transcript(self, _native) -> None:
+        """A transcript row that OPENS with the spinner chrome, is padded to the
+        FULL composer width (so the width check alone cannot reject it), but ENDS
+        in ASCII hyphens or em dashes rather than box drawing → transcript. This
+        is the case that DISTINGUISHES the box-drawing-only closing class from the
+        wider ``[─━—\\-]`` one, so it is the witness that kills the widen-closing-
+        class mutant (Opus r4: that mutant SURVIVED with no committed test)."""
+        provider = self._provider(dispatched=True, processing_seen=True)
+        for label, dash in (("ascii-hyphen", "-"), ("em-dash", "—")):
+            lead = f"── ⠦ Working ── ends in {label} "
+            row = lead + dash * (120 - _visible_width(lead))
+            assert _visible_width(row) == 120, f"{label}: build error"
+            buffer = "\n".join(
+                [" prior transcript line", row, "", self._RULE, " ", self._RULE, self._FOOTER]
+            )
+            assert (
+                provider.get_status(buffer) == TerminalStatus.COMPLETED
+            ), f"{label}-tailed full-width row fired PROCESSING (closing class too wide)"
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_braille_working_transcript_prose_does_not_fire(self, _native) -> None:
@@ -778,8 +892,9 @@ class TestErrorNotSticky:
 
     def _capped_then_working(self) -> str:
         """After a tmux nudge the pane resumes real work: the stale 429 banner is
-        still in scrollback, but a live ``Working`` spinner now runs."""
-        return self._capped_at_composer() + "\n── ⠧ Working ──────────────────\n"
+        still in scrollback, but a live ``Working`` spinner now runs. The spinner
+        row spans the composer width (F847 r5 invariant)."""
+        return self._capped_at_composer() + "\n" + _working_row("⠧", 120) + "\n"
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_capped_banner_at_composer_is_idle_not_error(self, _native) -> None:

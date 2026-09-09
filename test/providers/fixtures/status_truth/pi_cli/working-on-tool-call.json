@@ -1,7 +1,8 @@
 {
   "provider": "pi_cli",
   "state": "working",
-  "source": "source-derived from working-1.txt: only the working-row message+tail was substituted, preserving the real capture's verbatim ANSI colouring, composer chrome, footer and byte structure.",
-  "derivation": "pi 0.85.1 interactive-mode.js:1906 setWorkingMessage('Working on tool call'), extension-set — callable by any loaded extension, and CAO launches pi with --mcp-config (extensions on): '── \u2839 Working on tool call \u2500\u2500\u2500\u2500'.",
-  "notes": "Opus r3 EMPIRICAL-GATE-NO: the r3 '$'-tail regressed this live row from PROCESSING to UNKNOWN. r4 closing-rule tail must classify it PROCESSING (raw + ANSI-stripped)."
+  "source": "derived",
+  "derivation": "derived from working-1.txt: the working row's message was set to 'Working on tool call' (pi 0.85.1 interactive-mode.js:1906 setWorkingMessage, extension-set; CAO launches pi with --mcp-config so extensions are on) and the trailing box-rule run shortened by exactly the columns the message adds, so the row's total visible width stays 191 == working-1.txt's composer width. ANSI colouring, composer chrome and footer are preserved.",
+  "geometry": "composer width 191; working row visible width 191 (equal, per test_pi_working_fixture_rows_are_composer_width).",
+  "notes": "Opus r4 EMPIRICAL-GATE-NO Blocker 2: the r4 version was 25 columns short (a row pi cannot draw). Regenerated at correct geometry. Must classify PROCESSING raw + ANSI-stripped. This shape could not be triggered live, so a geometry-correct derived fixture is legitimate here."
 }
