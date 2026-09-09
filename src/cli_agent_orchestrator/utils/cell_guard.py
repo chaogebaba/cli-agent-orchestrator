@@ -134,6 +134,12 @@ def _classify_cell(
         split_effective_name,
     )
 
+    # A non-str / empty name carries no cell (e.g. an operator-launched terminal
+    # with agent_profile=None). Guard the type here so classification never
+    # raises on a legacy/None name.
+    if not isinstance(agent_profile, str) or not agent_profile:
+        return None
+
     # Bare position file → cell keyed on the resolved provider.
     if _position_exists(agent_profile):
         if provider:
