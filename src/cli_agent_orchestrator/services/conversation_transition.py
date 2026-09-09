@@ -89,19 +89,17 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
 
     root = _root_for_terminal(terminal_id)
     if root is None:
-        # A2.4 (astra Q4): a terminal with no canonical root — or a dangling
-        # link — has no honest recovery promise. Refuse the PLANNED hibernate
-        # INTACT (resumable:false) with a typed ``identity_missing`` reason,
-        # BEFORE any destructive cleanup, so the caller may choose an explicit
-        # ``force`` reap (which proceeds with the same diagnosis and no recovery
-        # promise). Post-A2 every fresh spawn mints a root, so this is the
-        # missing/dangling-identity case, not the normal path.
-        return HibernateDecision(
-            allowed=False,
-            lifecycle=None,
-            reason="identity_missing",
-            detail="no canonical conversation root/link for this terminal",
-        )
+        # BOUNDARY (supervisor ruling, Option A scoped): admission —
+        # prepare→claim→RootAdmission and the ``identity_missing`` /
+        # ``resume_not_admitted`` refusals — applies ONLY to a
+        # ``fork_context mode=resume`` request (the resume seam). A COLD reap /
+        # planned hibernate NEVER enters admission, so a terminal with no F829
+        # canonical root has NO hibernate contract to enforce here: let the
+        # ordinary reap proceed and set no conversation lifecycle (pre-A2
+        # behaviour, so the F631 cold-path cascade reporting is unchanged). The
+        # missing-root refusal is emitted at the resume entrance only
+        # (resume_service._prepare_resume_via_identity → resume_not_admitted).
+        return HibernateDecision(allowed=True, lifecycle=None)
 
     # A capture_unknown root (kiro/codex pre-capture) has no recoverable identity
     # yet — refuse under the same shape with the capture_unknown reason, without
