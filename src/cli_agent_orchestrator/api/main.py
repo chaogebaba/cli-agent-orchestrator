@@ -61,6 +61,8 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     TRANSCRIPT_HOOK_BINDING_SOURCES,
+    PrincipalRefused,
+    SeededSessionConflict,
     SessionLocal,
     TerminalModel,
     adopt_mailbox_rows_at_startup,
@@ -4408,18 +4410,6 @@ async def delete_session(
         )
 
 
-def _f829_root_admission_refusal_types() -> Tuple[type, ...]:
-    from cli_agent_orchestrator.clients.database import (
-        PrincipalRefused,
-        SeededSessionConflict,
-    )
-
-    return (PrincipalRefused, SeededSessionConflict)
-
-
-_F829_ROOT_ADMISSION_REFUSALS = _f829_root_admission_refusal_types()
-
-
 def _f829_verify_caller_binding(request: Request, caller_id: Optional[str]) -> None:
     """F829 A2.1: bind the resume caller to its X-CAO-Terminal-Token.
 
@@ -4837,13 +4827,11 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
-    except _F829_ROOT_ADMISSION_REFUSALS as _f829_exc:
+    except (PrincipalRefused, SeededSessionConflict) as _f829_exc:
         # F829 A2.3: a root-admission refusal from the create transaction
         # (a fresh seeded-uuid collision, or an unresolvable owner principal)
         # is a typed IDENTITY refusal, not a 500. The create's own
         # abort/compensate already unwound the row.
-        from cli_agent_orchestrator.clients.database import SeededSessionConflict
-
         if isinstance(_f829_exc, SeededSessionConflict):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

@@ -261,6 +261,7 @@ class _LegacyCreateTerminalPublisher(Protocol):
         init_started_at: Optional[datetime] = None,
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
+        root_admission: Any = None,
     ) -> Dict[str, Any]: ...
 
 
@@ -282,6 +283,7 @@ class _LegacyWarmTerminalPublisher(Protocol):
         init_started_at: Optional[datetime] = None,
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
+        root_admission: Any = None,
     ) -> Dict[str, Any]: ...
 
 
