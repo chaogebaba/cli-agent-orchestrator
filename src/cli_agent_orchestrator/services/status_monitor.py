@@ -2282,9 +2282,7 @@ class StatusMonitor:
                 except Exception:
                     error_obs = None
                 if error_obs is not None:
-                    fresh = self._rederive_from_pane_sample(
-                        terminal_id, error_obs.filtered_tail
-                    )
+                    fresh = self._rederive_from_pane_sample(terminal_id, error_obs.filtered_tail)
                     if fresh is TerminalStatus.PROCESSING:
                         return TerminalStatus.PROCESSING, "fresh_capture_working"
                     if fresh in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
