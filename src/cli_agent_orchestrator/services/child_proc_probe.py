@@ -154,24 +154,6 @@ def _ttl_s() -> float:
         return _DEFAULT_TTL_S
 
 
-def _shell_comms() -> frozenset[str]:
-    from cli_agent_orchestrator.services.config_service import ConfigService
-
-    try:
-        raw = ConfigService.get("liveness.child_proc_shell_comms", None)
-    except Exception:
-        raw = None
-    if isinstance(raw, str):
-        parts = [p.strip() for p in raw.split(",") if p.strip()]
-        if parts:
-            return frozenset(parts)
-    if isinstance(raw, (list, tuple)):
-        parts = [str(p).strip() for p in raw if str(p).strip()]
-        if parts:
-            return frozenset(parts)
-    return frozenset(_DEFAULT_SHELL_COMMS)
-
-
 def _comm_set(key: str, default: Tuple[str, ...]) -> frozenset[str]:
     """Read a comma/list-valued comm set from config, falling back to ``default``."""
     from cli_agent_orchestrator.services.config_service import ConfigService
@@ -189,6 +171,10 @@ def _comm_set(key: str, default: Tuple[str, ...]) -> frozenset[str]:
         if parts:
             return frozenset(parts)
     return frozenset(default)
+
+
+def _shell_comms() -> frozenset[str]:
+    return _comm_set("liveness.child_proc_shell_comms", _DEFAULT_SHELL_COMMS)
 
 
 def _helper_comms() -> frozenset[str]:
