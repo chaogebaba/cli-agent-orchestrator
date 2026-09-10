@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 116;
+const COMMAND_COUNT: usize = 117;
 
 /// What the TUI does with a command.
 ///
@@ -251,6 +251,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::IdentityAttach,
     CommandId::IdentityClaim,
     CommandId::IdentityRelease,
+    CommandId::IdentityBackfillOwners,
     CommandId::ProvidersCapabilities,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
@@ -596,6 +597,8 @@ pub enum CommandId {
     IdentityClaim,
     /// `cao identity release`
     IdentityRelease,
+    /// `cao identity backfill-owners`
+    IdentityBackfillOwners,
     /// `cao providers capabilities`
     ProvidersCapabilities,
     /// `cao terminal hibernated`
@@ -1313,6 +1316,16 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "identity_key", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: F829 A2.5 owner-authorised recovery op, not a launcher action
+        },
+        CommandId::IdentityBackfillOwners => Command {
+            id: CommandId::IdentityBackfillOwners,
+            parent: Some("identity"),
+            leaf_name: "backfill-owners",
+            summary: "Re-run the provenance-checked owner backfill (operator recovery entry point).",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: F829 A2.2 operator recovery op, not a launcher action
         },
 
         CommandId::ProvidersCapabilities => Command {
@@ -2110,6 +2123,7 @@ mod tests {
                     CommandId::IdentityAttach => CommandId::IdentityAttach,
                     CommandId::IdentityClaim => CommandId::IdentityClaim,
                     CommandId::IdentityRelease => CommandId::IdentityRelease,
+                    CommandId::IdentityBackfillOwners => CommandId::IdentityBackfillOwners,
                     CommandId::ProvidersCapabilities => CommandId::ProvidersCapabilities,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
@@ -2231,6 +2245,7 @@ mod tests {
                 CommandId::IdentityAttach,
                 CommandId::IdentityClaim,
                 CommandId::IdentityRelease,
+                CommandId::IdentityBackfillOwners,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
