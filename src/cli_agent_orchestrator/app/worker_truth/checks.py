@@ -218,7 +218,7 @@ def bad_transition_check(event: WorkerEvent) -> CheckOutcome | None:
 
 
 class PaneDisagreementCheck:
-    """``DIAG-PANE-DISAGREE``: shadow ≠ the pane's reading for over one heartbeat.
+    """``DIAG-PANE-DISAGREE``: projection ≠ the pane's reading for over a heartbeat.
 
     Durational, so it reads the projection and the pane's classifications together
     and is driven by the projector after each fold and by the sweep every
@@ -298,7 +298,8 @@ class PaneDisagreementCheck:
             terminal_id=terminal_id,
             dedupe_key=f"{projection.state.value}|{raw}",
             detail=(
-                f"shadow {projection.state.value} vs pane {raw} " f"for {age.total_seconds():.0f}s"
+                f"projected {projection.state.value} vs pane {raw} "
+                f"for {age.total_seconds():.0f}s"
             ),
             sample_event_id=sample.event_id,
         )
@@ -317,10 +318,10 @@ class PaneDisagreementCheck:
         consecutive classifications that carry the same mapped state and take the
         earliest.
 
-        The shadow side bounds it too.  A classification that predates the
-        current shadow ``state`` was not disagreeing with THIS state, so the onset
-        is the later of the two: the run's first classification, or the moment the
-        shadow arrived where it now is.
+        The projection bounds it too.  A classification that predates the current
+        projected ``state`` was not disagreeing with THIS state, so the onset is
+        the later of the two: the run's first classification, or the moment the
+        projection arrived where it now is.
         """
         first = rows[-1]
         for row in reversed(rows[:-1]):

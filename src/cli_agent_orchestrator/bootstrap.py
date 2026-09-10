@@ -13,7 +13,7 @@ Two rules the rest of phase 1 leans on:
 * **The migrator runs at EVERY boot**, whatever the switch says.  The DDL is
   additive and, with ingestion off, inert.  Running it unconditionally makes
   turning the switch on a one-variable change rather than a migration event —
-  which matters because the AC10 agreement session has to be startable against a
+  which matters because the AC10 agreement report has to be readable against a
   server that is already running.
 * **Nothing else runs unless ``CAO_WORKER_TRUTH_INGEST=1``.**  No producer, no
   projector, no sweep, no retention task.  AC11's "no behaviour change with the
@@ -46,7 +46,6 @@ from cli_agent_orchestrator.adapters.store.retention import RetentionTask
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
 from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
-from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 from cli_agent_orchestrator.app.delivery.tick import DeliveryTick
 from cli_agent_orchestrator.app.delivery.wake import WakeService
 from cli_agent_orchestrator.app.diag.report import DiagSources
@@ -78,11 +77,13 @@ from cli_agent_orchestrator.core.status_cutover import (
     parse_status_switch,
     resolve_status_switch,
 )
+from cli_agent_orchestrator.core.switches import Rejected
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DELIVERY_ENV_VAR",
+    "delivery_health_component",
     "INGEST_ENV_VAR",
     "STATUS_ENV_VAR",
     "STATUS_PROVIDERS_ENV_VAR",
@@ -126,28 +127,48 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     return source.get(INGEST_ENV_VAR) == "1"
 
 
-def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition:
+def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition | Rejected:
     """The REQUESTED position, before D9's guard resolves it.
 
-    Requested, not effective: the guard can demote ``off`` or ``shadow`` to
-    ``drain`` over a non-empty queue, and promote ``drain`` to ``shadow`` over an
-    empty one.  The effective position is on the runtime, and a caller that wants
-    to know what the server is actually doing must read it there.
+    Requested, not effective: the guard can demote ``off`` to ``drain`` over a
+    non-empty queue, and resolve ``drain`` back to ``off`` over an empty one.  The
+    effective position is on the runtime, and a caller that wants to know what the
+    server is actually doing must read it there.
+
+    A RETIRED position (#738) is not a position at all: the answer is
+    :class:`~core.switches.Rejected`, and the delivery subsystem does not start.
     """
     source = os.environ if env is None else env
     return parse_switch(source.get(DELIVERY_ENV_VAR))
 
 
-def status_position(env: dict[str, str] | None = None) -> StatusPosition:
+def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
     """The REQUESTED status-cutover position, before D9's guard resolves it.
 
     Requested, not effective, for the same reason :func:`delivery_position` says
-    so: the guard demotes ``shadow`` and ``on`` to ``off`` when ingestion is off,
-    and ``on`` to ``shadow`` over an empty allowlist.  The effective position is
-    on the runtime.
+    so: the guard demotes ``on`` to ``off`` when ingestion is off or the allowlist
+    is empty.  The effective position is on the runtime.  A retired position
+    (#738) answers :class:`~core.switches.Rejected` and arms nothing.
     """
     source = os.environ if env is None else env
     return parse_status_switch(source.get(STATUS_ENV_VAR))
+
+
+def delivery_health_component() -> str:
+    """One string for ``/health``'s ``components.delivery``.
+
+    An operator whose drop-in still says ``shadow`` learns it from the running
+    server rather than from a log line they have to go looking for: the boot's
+    ERROR scrolls past, this does not.  ``rejected/#738`` is deliberately short —
+    the reason is in the log, and a health payload is a status board, not an
+    explanation.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.delivery is None:
+        return "off"
+    if isinstance(runtime.delivery, Rejected):
+        return "rejected/#738"
+    return runtime.delivery.position.value
 
 
 @dataclass
@@ -175,7 +196,7 @@ class WorkerTruthRuntime:
     #: Present whatever the ingestion switch says: the two are independent, and
     #: a queue that only ran when worker-truth ingestion happened to be on would
     #: be a coupling neither blueprint asks for.
-    delivery: GuardOutcome | None = None
+    delivery: GuardOutcome | Rejected | None = None
     queue_store: QueueStore | None = None
     #: The status cutover's RESOLVED position (phase 2, D9) and the guard's
     #: reasoning.  Present whatever the ingestion switch says, because the guard's
@@ -219,11 +240,18 @@ def _start_delivery(
     clock: Clock,
     *,
     env: dict[str, str] | None = None,
-) -> tuple[GuardOutcome, QueueStore | None, DeliveryTick | None]:
+) -> tuple[GuardOutcome | Rejected, QueueStore | None, DeliveryTick | None]:
     """Resolve ``CAO_DELIVERY_QUEUE`` through D9's guard and arm the hooks.
 
     Never raises.  Three things happen, in this order and for this reason:
 
+    0. **A retired position is refused before anything else.**  ``shadow`` was a
+       shipped position and #738 removed the mode, so an operator carrying it in a
+       drop-in gets a loud ERROR naming the value and the line to type, and the
+       delivery subsystem does NOT start.  It is refused rather than coerced to
+       ``off`` because coercion would run a deployment in a position nobody
+       requested while its configuration still claimed otherwise.  The refusal
+       costs the subsystem, never the server: the boot continues.
     1. **The requested position is read once**, from the process environment,
        which makes it a deployment decision rather than something that can flip
        mid-session.
@@ -238,21 +266,22 @@ def _start_delivery(
        the ``finding`` table is created by step 0 of every migration and the
        guard's notice belongs to phase 3, not to phase 1.
 
-    ``shadow``, ``drain`` and ``on`` all arm the hooks, and they arm different
-    things.  ``shadow`` writes observational rows and nothing serves them.
-    ``on`` writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.
-    ``drain`` accepts NO new queue rows while the tick finishes delivering the
-    ones already there, which is the only way back out of ``on`` that does not
-    orphan them (§6).  ``off`` arms nothing, and there is no code path from a
-    hook to the queue that does not pass the install guard in the wiring module.
-
-    The write-through flip's FIRST act is the shadow sweep: a shadow row the
-    mirror writer never resolved is still ``ready`` with no terminal state, and
-    although ``claim``'s ``mode`` filter already makes it unclaimable, a durable
-    row with no ending is the shape this phase exists to remove.  The sweep and
-    the filter are independent — either alone prevents the delivery.
+    ``drain`` and ``on`` arm the hooks, and they arm different things.  ``on``
+    writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.  ``drain``
+    accepts NO new queue rows while the tick finishes delivering the ones already
+    there, which is the only way back out of ``on`` that does not orphan them
+    (§6).  ``off`` arms nothing, and there is no code path from a hook to the
+    queue that does not pass the install guard in the wiring module.
     """
     requested = delivery_position(env)
+    if isinstance(requested, Rejected):
+        logger.error(
+            "delivery queue NOT started: %s (%s=%s)",
+            requested.detail,
+            DELIVERY_ENV_VAR,
+            requested.value,
+        )
+        return requested, None, None
     try:
         store: QueueStore = SqliteQueueStore(pool, clock=clock)
         occupancy = store.occupancy()
@@ -288,20 +317,11 @@ def _start_delivery(
     if outcome.position is SwitchPosition.OFF:
         return outcome, store, None
 
-    if outcome.position is SwitchPosition.ON:
-        try:
-            swept = store.sweep_shadow(now=clock.now())
-            if swept:
-                logger.info("delivery flip swept %d unresolved shadow rows to superseded", swept)
-        except Exception:  # noqa: BLE001 — a sweep that fails must not block boot
-            logger.warning("delivery flip: the shadow sweep failed", exc_info=True)
-
     delivery_wiring.install_delivery(
         delivery_wiring.DeliveryRuntime(
             store=store,
             clock=clock,
             position=outcome.position,
-            mirror=MirrorWriter(store, clock),
         )
     )
     logger.info("delivery queue armed in %s mode (%s)", outcome.position.value, DELIVERY_ENV_VAR)
@@ -379,15 +399,32 @@ def _resolve_status_cutover(
     drove any of them, so the finding is asserted here — a boot per demoting cell
     — which is cheaper as a startup test than as a live session case.
 
-    Sub-phase 2a implements ``off`` and ``shadow`` only: the feed is D1's and
-    lands in 2b.  A boot that resolves to ``on`` therefore gets a loud warning and
-    NO publisher, rather than being quietly reinterpreted as ``shadow`` — the
-    shape ``_start_delivery`` uses above, and for its reason: an operator who
-    asked for the feed and silently got a shadow run would believe consumers were
-    reading the projection when they were not.
+    Sub-phase 2a implements ``off`` only, now that ``shadow`` is retired (#738):
+    the publisher is D1's feed and lands in 2b.  A boot that resolves to ``on``
+    therefore gets a loud warning and NO publisher, rather than being quietly
+    reinterpreted as something that runs — the shape ``_start_delivery`` uses
+    above, and for its reason: an operator who asked for the feed and silently got
+    a different mode would believe consumers were reading the projection when they
+    were not.
+
+    A REQUESTED ``shadow`` is refused outright, exactly as ``_start_delivery``
+    refuses it, and resolves to ``off`` with one ERROR line naming the fix.
     """
     source = os.environ if env is None else env
-    requested = parse_status_switch(source.get(STATUS_ENV_VAR))
+    requested_or_rejected = parse_status_switch(source.get(STATUS_ENV_VAR))
+    if isinstance(requested_or_rejected, Rejected):
+        logger.error(
+            "status cutover NOT armed: %s (%s=%s)",
+            requested_or_rejected.detail,
+            STATUS_ENV_VAR,
+            requested_or_rejected.value,
+        )
+        return StatusGuardOutcome(
+            requested=StatusPosition.OFF,
+            position=StatusPosition.OFF,
+            providers=parse_providers(source.get(STATUS_PROVIDERS_ENV_VAR)),
+        )
+    requested = requested_or_rejected
     providers = parse_providers(source.get(STATUS_PROVIDERS_ENV_VAR))
     outcome = resolve_status_switch(requested, ingest_enabled=enabled, providers=providers)
 
@@ -418,12 +455,10 @@ def _resolve_status_cutover(
         logger.warning(
             "%s resolved to on, which sub-phase 2a does not implement: the "
             "projection is NOT being published and every consumer still reads the "
-            "pane path. Set %s=shadow, or unset it, until sub-phase 2b ships.",
+            "pane path. Unset %s until sub-phase 2b ships.",
             STATUS_ENV_VAR,
             STATUS_ENV_VAR,
         )
-    elif outcome.position is StatusPosition.SHADOW:
-        logger.info("status cutover armed in SHADOW mode (%s)", STATUS_ENV_VAR)
     return outcome
 
 

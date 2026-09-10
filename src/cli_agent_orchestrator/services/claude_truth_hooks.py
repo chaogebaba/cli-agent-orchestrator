@@ -14,10 +14,11 @@ handlers reach the producer through this shim, which is legacy and may therefore
 import the new tree.  That is not an invention: it is the pattern the fork has
 used twice already for exactly this reason.  Lane C put the diag CLI's new-tree
 imports in ``cli/commands/diag.py`` and left ``cli/main.py`` importing only that
-module; WP-ARCH phase 3a put five delivery hook points behind
-``services/delivery_mirror.py`` for the same purpose, so that "the contact surface
-a reviewer has to read stays at one file instead of spreading across the two
-largest legacy packages".  This is the third application, and the AC11 set grows
+module; WP-ARCH phase 3a put its delivery hook points behind one bridge module
+for the same purpose, so that "the contact surface a reviewer has to read stays at
+one file instead of spreading across the two largest legacy packages" (that
+bridge went with shadow-live mode in #738; the pattern did not).  This is the
+third application, and the AC11 set grows
 by one file as §5 says it must — ``services/claude_truth_hooks.py`` rather than
 ``api/main.py``.
 

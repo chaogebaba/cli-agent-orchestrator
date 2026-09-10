@@ -32,11 +32,9 @@ import click
 
 from cli_agent_orchestrator.app.diag.report import (
     DiagSources,
-    delivery_agreement_payload,
     findings_payload,
     message_payload,
     render_agreement,
-    render_delivery_agreement,
     render_findings,
     render_message,
     render_timeline,
@@ -155,8 +153,7 @@ def diag(ctx: click.Context, why_event_id: str | None, db_path: str | None, as_j
     cao diag <msg-id>               one message's queue row, attempts and events
     cao diag --why <event-id>       the evidence chain behind one decision
     cao diag findings               open invariant findings
-    cao diag agreement              the shadow projection vs the legacy status
-    cao diag delivery               the shadow queue vs the legacy inbox (AC-3a)
+    cao diag agreement              the state projection vs the legacy status
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -254,7 +251,7 @@ def diag_findings(state: str, code_value: str | None, db_path: str | None, as_js
 @click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def diag_agreement(session: str | None, db_path: str | None, as_json: bool) -> None:
-    """Compare the shadow projection against the legacy published status (AC10)."""
+    """Compare the state projection against the legacy published status (AC10)."""
     from cli_agent_orchestrator.bootstrap import build_terminal_scope
 
     now = datetime.now(UTC)
@@ -314,37 +311,4 @@ def diag_agreement(session: str | None, db_path: str | None, as_json: bool) -> N
         # A non-zero exit so a script cannot mistake an INVALID report for a
         # passing one.  AC10 makes this report the phase gate; a gate that exits
         # 0 on "no evidence" is not a gate.
-        raise SystemExit(2)
-
-
-@diag.command("delivery")
-@click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
-def diag_delivery(db_path: str | None, as_json: bool) -> None:
-    """Compare the shadow delivery queue against the legacy inbox (AC-3a).
-
-    Exits non-zero on an INVALID report, for the reason the phase-1 agreement
-    command does: this report is the sub-phase's acceptance record, and a gate
-    that exits 0 on "no evidence" is not a gate.  With the switch off there are
-    no rows to compare, so the off arm cannot read as a pass here either.
-    """
-    from cli_agent_orchestrator.app.delivery.agreement import build_delivery_agreement
-    from cli_agent_orchestrator.bootstrap import build_legacy_inbox_status
-
-    now = datetime.now(UTC)
-    sources = _sources(db_path)
-    queue = sources.queue
-    if queue is None:  # pragma: no cover — the composition root always supplies one
-        raise click.ClickException("no delivery queue store was opened")
-
-    rows = []
-    reader = getattr(queue, "all_rows", None)
-    rows = list(reader()) if reader is not None else []
-    report = build_delivery_agreement(rows, build_legacy_inbox_status(db_path), generated_at=now)
-    _emit(
-        delivery_agreement_payload(report, now=now),
-        render_delivery_agreement(report, now=now),
-        as_json,
-    )
-    if not report.valid:
         raise SystemExit(2)

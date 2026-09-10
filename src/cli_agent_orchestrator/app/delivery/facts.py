@@ -1,31 +1,24 @@
-"""What legacy tells the shadow queue, as values (WP-ARCH phase 3a).
+"""What legacy tells the queue, as values (WP-ARCH phase 3).
 
 ``app`` may not import legacy, so it cannot read the inbox table, the attempt
-table or the mailbox row.  Every fact the mirror writer needs therefore arrives
-as one of the values below, assembled on the legacy side and handed in.  That is
-the same shape phase 1 used — a legacy hook builds an ``EventDraft`` and calls
-``emit`` — and it buys the same two things: the new tree stays testable with no
-database, and the comparison cannot be rigged, because this package has no way
-to look at the other side's answer.
+table or the mailbox row.  The one fact the write-through needs therefore arrives
+as the value below, assembled on the legacy side and handed in.  That is the same
+shape phase 1 used — a legacy hook builds an ``EventDraft`` and calls ``emit`` —
+and it buys the new tree staying testable with no database.
 
-The vocabularies here are LEGACY's, deliberately unmapped.  Mapping happens once,
-in :mod:`~app.delivery.mirror`, where each cell is argued.  Translating at the
-collection site instead would scatter the argument across ``services/`` and
-``clients/``, which is where the fork's existing delivery logic already lives in
-six places that disagree.
+Sub-phase 3a passed four more facts this way, for the observational mirror that
+compared the queue against legacy without serving anything.  That mode is retired
+(#738) and they went with it: a flag flip is accepted by a grok-box live round
+now, not by a dark deployment writing copies beside the real traffic.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 __all__ = [
-    "LegacyAttempt",
     "LegacyEnqueue",
-    "LegacyOutcome",
-    "LegacySeatWake",
-    "LegacyVeto",
 ]
 
 
@@ -64,92 +57,3 @@ class LegacyEnqueue:
     barrier_id: int | None = None
     barrier_member_key: str | None = None
     enqueue_generation: int | None = None
-
-
-@dataclass(frozen=True)
-class LegacyAttempt:
-    """One row of ``inbox_delivery_attempt``, as legacy settled it.
-
-    ``ordinal`` is the attempt's position in the row's own history, oldest
-    first.  It becomes the shadow attempt's ``claim_id``, which needs saying
-    because it looks like a type pun and is not: a shadow row is never leased, so
-    no real claim ever issues a token for it, and the ordinal is both unique per
-    message and deterministic — which is what makes recording the same legacy
-    attempt twice a no-op rather than a second row.
-
-    ``outcome`` and ``reason`` are legacy's plain strings (``settle_delivery_
-    attempt`` takes ``outcome: str`` with no enum), preserved verbatim so the
-    mapping can be argued in one place and audited from ``detail`` afterwards.
-    """
-
-    ordinal: int
-    outcome: str
-    started_at: datetime
-    carrier: str = "legacy"
-    reason: str | None = None
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class LegacyOutcome:
-    """What became of one inbox row, and how it got there.
-
-    Collected by re-reading the legacy row rather than by trusting the edge that
-    triggered the observation.  Several legacy writers can end a row — the
-    delivered compare-and-set, the expiry sweep, the F578 supersession, three
-    separate cancel sites — and they do not fire in a guaranteed order.  Reading
-    the CURRENT status makes a missed edge self-correcting: the next observation
-    of that row, from any edge, still sees the truth.
-    """
-
-    legacy_message_id: int
-    status: str
-    failure_reason: str | None = None
-    attempts: tuple[LegacyAttempt, ...] = ()
-
-
-@dataclass(frozen=True)
-class LegacySeatWake:
-    """One native seat wake the legacy F136 chain actually emitted (§A1.5).
-
-    Under ``off``, ``shadow`` and ``drain`` the queue does not serve the seat, so
-    the carrier is ``ring_supervisor_doorbell``'s native ring rather than the
-    tick's ``wake_seat``.  I5 asks one query to return a msg_id's full delivery
-    history, and an emission with no ``delivery_attempt`` row is the pane
-    archaeology I5 exists to end: the socket bytes left, and the stored rows said
-    nothing happened — which is #604's unreadability arriving through the
-    amendment written to end it.
-
-    ``legacy_message_id`` is the epoch's high-water inbox row — the same
-    ``max_written_row_id`` the ring is keyed on — so ONE emitted epoch produces
-    exactly one attempt row rather than one per message in it.
-
-    ``at`` is the emission's own instant, not the message's: this fact records
-    what a carrier DID, and the started_at of an attempt is when the attempt
-    started.
-    """
-
-    legacy_message_id: int
-    at: datetime
-    detail: str = ""
-
-
-@dataclass(frozen=True)
-class LegacyVeto:
-    """An injection the legacy path declined before any attempt was opened.
-
-    §7a requires a veto be RECORDED rather than dropped, because a dropped veto
-    is the difference between "we tried and were refused" and "nothing happened",
-    and the second is what made #604 unreadable from the stored rows.
-
-    ``reason`` is one of ``InjectSafetyResult``'s reasons.  ``gate_episode``
-    carries the dialog gate's episode identifier when there was one, which is
-    the fact that distinguishes a genuine dialog hold from a probe that could not
-    be verified.
-    """
-
-    legacy_message_ids: tuple[int, ...]
-    reason: str
-    at: datetime
-    gate_episode: str | None = None
-    context: dict[str, str] = field(default_factory=dict)

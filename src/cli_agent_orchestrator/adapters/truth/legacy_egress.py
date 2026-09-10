@@ -10,7 +10,7 @@ hooked at the on-demand probe path" is one of the phase-1 mutants precisely
 because the two look interchangeable and are not.
 
 What this producer records is **what the fleet and the inbox actually consume**
-(``fleet_service.py:209``).  The agreement report (AC10) compares the shadow
+(``fleet_service.py:209``).  The agreement report (AC10) compares the state
 projection against these rows rather than against the raw classifier output,
 because comparing a projection against its own upstream signal would be
 self-referential — r9 retired that framing.

@@ -236,7 +236,6 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         300.0,
     ),
     # FX191: convergent delivery config paths (D12)
-    "CAO_DELIVERY_PHASE": ("delivery.phase", "str", "shadow"),
     "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
     "CAO_DELIVERY_ESCALATE_AFTER_S": ("delivery.escalate_after_s", "float", 120.0),
     "CAO_DELIVERY_TRACE_RETENTION_H": ("delivery.trace_retention_h", "float", 168.0),
@@ -550,7 +549,6 @@ _ALL_PATHS = sorted(
         "supervisor.watchdog.quiescence_grace_s",
         "supervisor.watchdog.no_progress",
         "supervisor.watchdog.no_progress_grace_s",
-        "delivery.phase",
         "delivery.tick_s",
         "delivery.escalate_after_s",
         "delivery.interrupt_after_s",

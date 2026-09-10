@@ -2333,6 +2333,10 @@ async def health_check():
             "cao": "ok",
             "herdr": _probe("herdr"),
             "claude": _probe("claude"),
+            # #738: ``rejected/#738`` means CAO_DELIVERY_QUEUE names a retired
+            # position (shadow-live mode) and the delivery subsystem did not
+            # start; otherwise the RESOLVED position, or "off".
+            "delivery": bootstrap.delivery_health_component(),
         },
         # F497 AC2: advertise resolver support so `cao install` can refuse
         # composition-bearing (extends:/position:) profiles until the RUNNING

@@ -1,7 +1,13 @@
-"""Shadow projection vs legacy published status (WP-ARCH phase 1, AC10).
+"""State projection vs legacy published status (WP-ARCH phase 1, AC10).
 
-This is the report phase 1 exits on, so its job is to be hard to fool rather than
-to look good.  Three design choices follow from that:
+A DIAGNOSTIC, and only that.  It was once a gate — a rate held over days of a
+dark deployment before the next phase could start — and shadow-live mode is
+retired (#738, user ruling 2026-09-09).  A flag flip is accepted by a grok-box
+live round now, so what this report buys is an operator being able to ask "do the
+two sides agree, and where do they not?" against a running server.
+
+Its job is still to be hard to fool rather than to look good.  Three design
+choices follow from that:
 
 **Both sides come out of ``worker_event``.**  The projected side is the
 projector's own ``status.transition``/``status.recovered`` decision rows; the
@@ -62,7 +68,7 @@ MIN_EVENTS = 200
 MIN_TRANSITIONS = 20
 MIN_LEGACY_PUBLISHES = 20
 
-#: Decision rows that move the shadow state.  ``status.recovered`` is included
+#: Decision rows that move the projected state.  ``status.recovered`` is included
 #: alongside ``status.transition``: it is a state change with a different name,
 #: and leaving it out would credit the projection with a stall it did not have.
 _PROJECTION_KINDS = frozenset({DecisionKind.STATUS_TRANSITION, DecisionKind.STATUS_RECOVERED})
@@ -132,7 +138,7 @@ class TerminalAgreement:
 
 @dataclass(frozen=True)
 class AgreementReport:
-    """The fleet summary AC10 requires attached before phase 2 may start."""
+    """The fleet summary: where the two sides agree, and where they do not."""
 
     valid: bool
     invalid_reasons: list[str]
@@ -176,7 +182,7 @@ def build_agreement_report(
     session: str | None = None,
     generated_at: datetime | None = None,
 ) -> AgreementReport:
-    """Compare the shadow projection against the legacy published status.
+    """Compare the state projection against the legacy published status.
 
     ``session`` filters by the caller-supplied ``scope``.  Asking for a session
     the scope does not describe yields an empty, INVALID report rather than a

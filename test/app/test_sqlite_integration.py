@@ -307,7 +307,7 @@ def test_timestamps_come_back_as_aware_utc(rig: _Rig) -> None:
 
 
 def test_a_projection_written_before_a_restart_is_still_there(rig: _Rig) -> None:
-    """Shadow state is durable, not a cache.  Phase 2's ``status_monitor`` will
+    """The projected state is durable, not a cache.  Phase 2's ``status_monitor`` will
     read it after a bounce, and the agreement session spans one."""
     rig.emit(EventKind.TURN_STARTED)
     rig.pool.close_all()

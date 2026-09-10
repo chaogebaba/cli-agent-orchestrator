@@ -332,8 +332,8 @@ def test_a_pane_republishing_the_same_wrong_status_still_fires(rig: Rig) -> None
     assert findings[0].dedupe_key == "busy|idle"
 
 
-def test_the_onset_never_predates_the_current_shadow_state(rig: Rig) -> None:
-    """A publish older than the shadow state was not disagreeing with THIS state.
+def test_the_onset_never_predates_the_current_projected_state(rig: Rig) -> None:
+    """A publish older than the projected state was not disagreeing with THIS state.
 
     Without that bound, a terminal that had been disagreeing, then agreed, then
     disagreed again would be credited with the whole span and fire immediately.
@@ -344,10 +344,10 @@ def test_the_onset_never_predates_the_current_shadow_state(rig: Rig) -> None:
     for _ in range(6):
         rig.clock.advance(10)
         rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
-        rig.classified(TERMINAL, "idle")  # agrees: shadow is idle too
+        rig.classified(TERMINAL, "idle")  # agrees: the projection is idle too
     assert rig.findings.list_findings(code=FindingCode.DIAG_PANE_DISAGREE) == []
 
-    # The shadow moves to busy.  The disagreement starts NOW, not 60s ago.
+    # The projection moves to busy.  The disagreement starts NOW, not 60s ago.
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
     rig.clock.advance(2)
     rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())

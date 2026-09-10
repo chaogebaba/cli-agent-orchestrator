@@ -61,7 +61,7 @@ _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 # F337 B1 shipped it DARK (False). WP-ARCH 3b / A1.5 flips it to True, and the
 # reason is that removing the paste from every position is only half the job.
 # The seat's composer injection is now role-gated rather than flag-gated, so it
-# is gone under `off`, `shadow`, `drain` and `on` alike. In the three non-`on`
+# is gone under `off`, `drain` and `on` alike. In the two non-`on`
 # positions the queue does not serve the seat, so the only remaining carrier is
 # the F136 chain into ring_supervisor_doorbell — and with this default False
 # that chain emits NOTHING: supervisor.doorbell True passes the outer gate,
@@ -208,7 +208,7 @@ class ResolveResult:
     The demotion lives HERE rather than in the queue's emitter because both
     callers reach this function: the queue's ``wake_seat`` when the delivery
     switch is ``on``, and ``_attempt_native_ring`` in every other position. Put
-    in the emitter, an idle seat under ``off``, ``shadow`` or ``drain`` would
+    in the emitter, an idle seat under ``off`` or ``drain`` would
     still be refused on a timestamp (§A1.5).
     """
 

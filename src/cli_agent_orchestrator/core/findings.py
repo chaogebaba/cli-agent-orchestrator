@@ -30,7 +30,7 @@ class FindingCode(StrEnum):
     ``DIAG_BAD_TRANSITION``   — an ``Anomalous`` cell was applied (AC1/AC6 (d)).
     ``DIAG_GHOST_TRANSITION`` — a decision row cites no evidence, so nothing
                                 explains why the server acted.
-    ``DIAG_LEGACY_DISAGREE``  — the shadow projection and the legacy published
+    ``DIAG_LEGACY_DISAGREE``  — the state projection and the legacy published
                                 status disagreed for longer than one heartbeat.
                                 **Accepted but no longer raised**, from WP-ARCH
                                 phase 2 (D9b): see ``DIAG_PANE_DISAGREE`` below.
@@ -73,7 +73,8 @@ class FindingCode(StrEnum):
                                     and the finding is the notice.
     ``DIAG_BARRIER_OPEN_AT_FLIP`` — a boot requested ``on`` while a callback
                                     barrier was still OPEN, so the flip was held
-                                    at ``shadow`` rather than splitting that
+                                    back — at ``drain`` over an occupied queue,
+                                    else at ``off`` — rather than splitting that
                                     barrier's members across two tables (D9).
     ``DIAG_DELIVERY_TIME_BOUND``  — a row died on a TIME bound rather than an
                                     attempt bound: ``dead_by`` passed, the
