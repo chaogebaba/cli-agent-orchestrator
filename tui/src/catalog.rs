@@ -2252,6 +2252,7 @@ mod tests {
                 CommandId::IdentityAttach,
                 CommandId::IdentityClaim,
                 CommandId::IdentityRelease,
+                CommandId::ProvidersCapabilities,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
