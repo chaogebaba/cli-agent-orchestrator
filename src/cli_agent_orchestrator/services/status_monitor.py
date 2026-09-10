@@ -2171,7 +2171,9 @@ class StatusMonitor:
         call sites already holding it, and several sit outside it). IDEMPOTENT
         BY RE-DERIVATION: a second pass recomputes the same status and the same
         reason given unchanged inputs (AC21). Pure on the read path — it only
-        READS ``question_state`` and ``pane_liveness.peek`` (never captures, D2).
+        READS ``question_state``, ``pane_liveness.peek`` and (on the expired arm
+        alone, F899) ``child_proc_probe.probe``, a TTL-cached /proc read. It
+        never captures a pane (D2).
 
         Precondition (stated ONCE): the rules apply only when ``status is not
         None``; ``None ⇒ (None, None)`` — the none_behavior="none" pass-through
@@ -2190,11 +2192,14 @@ class StatusMonitor:
             pane_hold_expired ⇒ (PROCESSING, "pane_delta"). The "usable sample"
             guard IS the whole no-evidence rule (R3-B1). PROCESSING⇒PROCESSING is
             a status no-op that reproduces the reason.
-        3b. same preconditions but pane_hold_expired ⇒ status UNCHANGED,
-            "pane_delta_expired" (fusion_changed stays False — the caller sets
-            it from the status delta). The expiry is a distinct outcome (R5-S3).
-            With a children/marker veto the clock was cleared, so expiry cannot
-            co-occur (AC-8).
+        3b. same preconditions but pane_hold_expired ⇒ F899 (#751) probes the
+            pane's process tree first: a live tool subprocess ⇒ (PROCESSING,
+            "child_proc_live"); otherwise status UNCHANGED, "pane_delta_expired"
+            (fusion_changed stays False — the caller sets it from the status
+            delta). The expiry is a distinct outcome (R5-S3). With a children/
+            marker veto the clock was cleared, so expiry cannot co-occur (AC-8).
+            The probe never raises: when it cannot answer, this arm is exactly
+            the pre-F899 expiry.
         4. else ⇒ (status, None).
         """
         if status is None:
@@ -2270,6 +2275,30 @@ class StatusMonitor:
                         # outcome — PROCESSING/"pane_delta", or the expired admit.
                         if not observation.pane_hold_expired:
                             return TerminalStatus.PROCESSING, "pane_delta"
+                        # F899 (#751) rule 3b-pre: the pane bound expired, but a
+                        # churning pane is not the only evidence of work. A long
+                        # silent box command (grokfleet/pytest) renders only an
+                        # elapsed-time counter, so the hold clock never resets
+                        # and at 300 s the seat published `idle` with real work
+                        # in flight (observed twice 2026-09-10, since_last_input
+                        # 877 s / 1136 s). Probe the pane's process tree BEFORE
+                        # falling to idle: a live tool subprocess holds the seat
+                        # PROCESSING under a distinct reason. The probe never
+                        # raises and never captures the pane — it reads /proc,
+                        # TTL-cached, and only on this already-rare arm. When it
+                        # cannot answer (no metadata, pid gone, procfs denied)
+                        # `live` is False and the expiry behaves exactly as
+                        # before, reason unchanged.
+                        try:
+                            from cli_agent_orchestrator.services.child_proc_probe import (
+                                child_proc_probe,
+                            )
+
+                            child_probe = child_proc_probe.probe(terminal_id)
+                        except Exception:
+                            child_probe = None
+                        if child_probe is not None and child_probe.live:
+                            return TerminalStatus.PROCESSING, "child_proc_live"
                         # 3b: the bound expired — admit the published status but
                         # tag it so the withhold is explicable (AC22 second arm).
                         return status, "pane_delta_expired"
