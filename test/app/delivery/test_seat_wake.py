@@ -1069,19 +1069,36 @@ def test_a_worker_sender_still_gets_its_dead_letter_notice(harness: Harness) -> 
     assert list(harness.queue.undelivered_ids(WORKER))
 
 
-def test_the_service_sender_rule_has_one_implementation() -> None:
-    """The legacy stall path and the tick must ask the SAME question.
+def test_the_service_sender_rule_is_the_same_rule_on_both_sides_of_the_seam() -> None:
+    """The legacy stall path and the queue tick must ask the SAME question.
 
     They had the same rule and only one of them implemented it, which is how the
     tick came to address 20 live notices to ids the inbox had always refused to
-    route back to.
-    """
-    from cli_agent_orchestrator.core.delivery import is_service_sender
+    route back to (#741 r3).
 
-    for sender in ("watchdog:t1", "message-trace:t1", "cao-bridge", "cao-digest:m", "", None):
-        assert is_service_sender(sender) is True, sender
-    for sender in ("4ec96674", "wrk-p3b01", "codex_general-abc"):
-        assert is_service_sender(sender) is False, sender
+    The tidy fix -- one function imported by both -- is FORBIDDEN here:
+    ``test_only_the_bridge_module_names_the_new_tree`` requires that
+    ``clients/database.py`` never name the new package tree, so that phase 3's
+    attachment points stay readable in one bridge module. The rule is therefore
+    stated twice on purpose, and THIS arm is what stops the two copies drifting:
+    it drives both over one corpus and compares them answer by answer.
+    """
+    from cli_agent_orchestrator.clients.database import _is_service_sender as legacy_rule
+    from cli_agent_orchestrator.core.delivery import is_service_sender as queue_rule
+
+    service = ("watchdog:t1", "message-trace:t1", "cao-bridge", "cao-digest:m", "", None)
+    addressable = ("4ec96674", "wrk-p3b01", "codex_general-abc", "mb_supervisor")
+
+    for sender in service:
+        assert queue_rule(sender) is True, sender
+    for sender in addressable:
+        assert queue_rule(sender) is False, sender
+
+    for sender in (*service, *addressable):
+        assert queue_rule(sender) == legacy_rule(sender), (
+            f"the two copies of the service-sender rule disagree about {sender!r}; "
+            "they are duplicated for the strangler seam, not permitted to drift"
+        )
 
 
 def test_the_wake_line_carries_every_field_a_round_parses(harness: Harness, caplog) -> None:

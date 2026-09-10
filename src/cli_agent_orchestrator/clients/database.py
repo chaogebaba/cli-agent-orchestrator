@@ -9153,6 +9153,36 @@ def expire_pending_rows(row_ids: List[int]) -> int:
     return int(updated)
 
 
+def _is_service_sender(sender_id: Any) -> bool:
+    """Is this sender machinery rather than an addressable party?
+
+    Reserved-sender prefixes mirror those used across the inbox
+    (``message-trace:``, ``cao-*``, ``watchdog:``, ``cao-bridge``); any
+    ``:``-namespaced sender is a service sender, and so is an empty one.
+
+    **Deliberately duplicated.** ``is_service_sender`` in the queue's own pure
+    domain asks the identical question for the tick's dead-letter notice, and
+    the obvious tidy-up — importing that one here — is forbidden by the
+    strangler seam: ``test_only_the_bridge_module_names_the_new_tree`` requires
+    that this module never name the new package tree at all, so that a reviewer
+    asking what phase 3 attached to the legacy tree reads one bridge module
+    instead of grepping the two largest legacy packages. That invariant outranks
+    removing six lines of duplication.
+
+    What the duplication is NOT allowed to be is unwitnessed: the two are pinned
+    to agree over a shared corpus by
+    ``test_the_service_sender_rule_is_the_same_rule_on_both_sides_of_the_seam``
+    (``test/app/delivery/test_seat_wake.py``). #741 r3 exists because these two
+    surfaces had the same rule and only ONE of them implemented it, which is how
+    the tick came to address 20 live notices to ids that can never hold a
+    terminal.
+    """
+    sender = str(sender_id or "")
+    if not sender:
+        return True
+    return ":" in sender or sender.startswith("cao-")
+
+
 def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMessage]:
     """List aged PENDING messages routed straight at a terminal (F524).
 
@@ -9177,8 +9207,6 @@ def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMess
     at-rest convention; the same harmless <=4h over-collection window applies and
     is idempotent downstream (the caller dedupes via a trace event).
     """
-    from cli_agent_orchestrator.core.delivery import is_service_sender
-
     cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
@@ -9196,16 +9224,8 @@ def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMess
         for row in rows:
             # Internal/service senders never receive a stall notice: they are not
             # real supervisor terminals and routing back would be meaningless (or
-            # a loop). Reserved-sender prefixes mirror those used across the inbox
-            # (message-trace:, cao-*, watchdog:, cao-bridge). Any ':'-namespaced
-            # sender is treated as a service sender.
-            #
-            # #741 r3: the rule moved to `core.delivery.is_service_sender` so the
-            # legacy stall path and the queue tick's dead-letter notice ask ONE
-            # question. They had the same rule and only one of them implemented
-            # it, which is how the tick came to address 20 live notices to
-            # `watchdog:`/`message-trace:` ids that can never hold a terminal.
-            if is_service_sender(row.sender_id):
+            # a loop). See :func:`_is_service_sender`.
+            if _is_service_sender(row.sender_id):
                 continue
             result.append(_inbox_message_from_row(row))
         return result
