@@ -103,9 +103,7 @@ class TestDeliveryNudgeUsesThePort:
         from cli_agent_orchestrator.services import delivery_service
 
         backend = MagicMock()
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
         tree = ast.parse(_source_of(delivery_service.attempt_rung2).lstrip())
         senders = {
             ast.unparse(node.func)
@@ -133,9 +131,7 @@ class TestStatusDecorationIsGated:
 
         backend = MagicMock()
         backend.supports_status_decorations.return_value = False
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
         with patch("subprocess.run") as run:
             BoundaryPullService._write_tmux_pending(MagicMock(), "cao-x", 3)
         run.assert_not_called()
@@ -145,9 +141,7 @@ class TestStatusDecorationIsGated:
 
         backend = MagicMock()
         backend.supports_status_decorations.return_value = True
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
         with patch("subprocess.run", return_value=MagicMock(returncode=0)) as run:
             BoundaryPullService._write_tmux_pending(MagicMock(), "cao-x", 3)
         run.assert_called_once()
