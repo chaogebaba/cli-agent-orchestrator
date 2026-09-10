@@ -243,6 +243,31 @@ def _enable_memory_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pre_f747_subsystem_posture(monkeypatch):
+    """F747 (#747): pin the four flipped subsystems to their pre-F747 values.
+
+    Same shape and same reason as ``_enable_memory_in_tests`` above, in the
+    other direction. F747 made native seat delivery, the pull-mode drain, the
+    quiescence watchdog and the MCP Apps surface DEFAULT-ON, because "an opt-in
+    is an option nobody ever uses". That is right for production -- the
+    operator's settings.json already carried all four -- but it means every
+    test server in this suite now starts a reconciler, a watchdog and the apps
+    surface it never used to, and the whole suite slows by two orders of
+    magnitude.
+
+    Tests assert on subsystem BEHAVIOUR, not on shipped posture, so pinning the
+    posture here keeps them testing what they were written to test. The shipped
+    defaults themselves are asserted by
+    ``test/services/test_f747_native_default.py``, which isolates settings and
+    env and therefore does not see this fixture's values.
+    """
+    monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "false")
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
+    monkeypatch.setenv("CAO_SUPERVISOR_WATCHDOG_QUIESCENCE", "false")
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
     from cli_agent_orchestrator.backends import registry
