@@ -802,12 +802,19 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:
             args.extend(["--source", "recent", "--lines", "500"])
-        # Honor strip_escapes via herdr's native --format text (strips ANSI).
-        # The TerminalBackend contract only requires that strip_escapes=True
-        # yields plain text; when False we leave the format unset and take
-        # herdr's default so existing provider output parsing is unchanged.
-        if strip_escapes:
-            args.extend(["--format", "text"])
+        # F900 (#752): honour strip_escapes in BOTH directions. The contract is
+        # symmetric — TmuxClient.get_history adds capture-pane ``-e`` exactly when
+        # strip_escapes is False, i.e. False means "give me the escapes". This used
+        # to set ``--format text`` only for True and otherwise leave the format
+        # unset; herdr's default for ``pane read`` is ALREADY escape-stripped
+        # (measured on herdr 0.9.0, grok-box-006: default and ``--format text``
+        # both yield 0 escape sequences, ``--format ansi`` yields the SGR run),
+        # so strip_escapes=False silently returned plain text on herdr and never
+        # on tmux. draft_guard._read_provider_draft asks for escapes on behalf of
+        # a provider with composer_parse_accepts_escapes (codex, for dim-SGR ghost
+        # text); it got none, its parser returned None, and every codex worker
+        # died "Composer state is unreadable" on its first delivery.
+        args.extend(["--format", "text" if strip_escapes else "ansi"])
 
         result = self._run_herdr(args, check=False)
         if result.returncode != 0:

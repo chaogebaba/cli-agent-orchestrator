@@ -514,8 +514,15 @@ class TestHerdrBackendCommands:
         assert cmd[cmd.index("--format") + 1] == "text"
 
     @patch("subprocess.run")
-    def test_get_history_default_omits_format(self, mock_run, backend):
-        """strip_escapes=False leaves format unset (herdr default preserved)."""
+    def test_get_history_default_requests_ansi(self, mock_run, backend):
+        """F900 (#752): strip_escapes=False must ASK for escapes.
+
+        This previously asserted the opposite — that the format was left unset so
+        herdr's default applied. That default is itself escape-stripped (measured
+        on herdr 0.9.0), so an escapes-wanted read was silently downgraded to
+        plain text, which tmux never does (TmuxClient adds capture-pane ``-e``
+        exactly when strip_escapes is False).
+        """
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
         panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
@@ -530,7 +537,8 @@ class TestHerdrBackendCommands:
         backend.get_history("cao-test", "window-0", tail_lines=50)
 
         cmd = mock_run.call_args_list[-1][0][0]
-        assert "--format" not in cmd
+        assert "--format" in cmd
+        assert cmd[cmd.index("--format") + 1] == "ansi"
 
     @patch("subprocess.run")
     def test_capture_viewport_reads_visible_source_as_text(self, mock_run, backend):
