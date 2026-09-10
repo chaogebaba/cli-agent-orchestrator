@@ -634,3 +634,64 @@ def test_c_an_uncontended_push_is_still_synchronous(tmp_path):
     started = _time.monotonic()
     assert tps._write_inbox_entry(inbox, {"msg_id": "only"}) is True
     assert (_time.monotonic() - started) < tps.INBOX_LOCK_RETRY_PAUSE_S
+
+
+# ---------------------------------------------------------------------------
+# Cache eviction must not scale with the number of terminals ever seen (#747 r4).
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_does_not_scan_the_whole_terminal_cache():
+    """MUTANT: put the __session__ keys back in the shared dict and restore the
+    `for k in list(cache)` scan, and this cost curve bends with cache size.
+
+    28 call sites invalidate on mutation, and the cache has no size eviction, so
+    an O(cache) eviction is a session-length cost curve behind an O(1)-looking
+    dict.
+    """
+    import time as _time
+
+    from cli_agent_orchestrator.clients import database as db_mod
+
+    db_mod.clear_terminal_metadata_cache()
+    try:
+        for i in range(200):
+            db_mod._terminal_metadata_cache[f"t{i}"] = (_time.monotonic(), {"id": i})
+        small = _time.monotonic()
+        for i in range(200):
+            db_mod.invalidate_terminal_metadata_cache(f"t{i}")
+        small_elapsed = _time.monotonic() - small
+
+        for i in range(20000):
+            db_mod._terminal_metadata_cache[f"t{i}"] = (_time.monotonic(), {"id": i})
+        big = _time.monotonic()
+        for i in range(200):
+            db_mod.invalidate_terminal_metadata_cache(f"t{i}")
+        big_elapsed = _time.monotonic() - big
+    finally:
+        db_mod.clear_terminal_metadata_cache()
+
+    # 100x the cache must not mean anything like 100x the eviction cost.
+    assert big_elapsed < (small_elapsed + 0.05) * 10, (
+        f"eviction scaled with cache size: {small_elapsed:.4f}s at 200 entries, "
+        f"{big_elapsed:.4f}s at 20000"
+    )
+
+
+def test_invalidate_still_drops_the_terminal_and_session_entries():
+    """The O(1) split must not change what an invalidation actually evicts."""
+    import time as _time
+
+    from cli_agent_orchestrator.clients import database as db_mod
+
+    db_mod.clear_terminal_metadata_cache()
+    try:
+        db_mod._terminal_metadata_cache["keep"] = (_time.monotonic(), {"id": "keep"})
+        db_mod._terminal_metadata_cache["gone"] = (_time.monotonic(), {"id": "gone"})
+        db_mod._session_metadata_cache["__session__s1"] = (_time.monotonic(), ["x"])
+        db_mod.invalidate_terminal_metadata_cache("gone")
+        assert "gone" not in db_mod._terminal_metadata_cache
+        assert "keep" in db_mod._terminal_metadata_cache
+        assert db_mod._session_metadata_cache == {}
+    finally:
+        db_mod.clear_terminal_metadata_cache()

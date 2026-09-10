@@ -6282,23 +6282,43 @@ def create_terminal_with_warm_intent(
 from threading import Lock as _CacheLock
 
 _terminal_metadata_cache: Dict[str, tuple[float, Any]] = {}
+
+#: F747 (#747): session-scoped entries live in their OWN dict.
+#:
+#: They used to share ``_terminal_metadata_cache`` under a ``__session__``
+#: prefix, which made every eviction O(size of the whole cache): each
+#: ``invalidate_terminal_metadata_cache`` call copied the entire dict with
+#: ``list()`` and scanned it for prefixed keys. The cache has no size eviction,
+#: only per-key and whole-cache clears, so in a long-lived server it grows with
+#: the number of terminals ever seen and EVERY metadata mutation -- there are 28
+#: invalidation call sites in this module -- pays that scan. That is a
+#: session-length cost curve hiding behind an O(1)-looking dict.
+#:
+#: Separated, an invalidation is one pop plus a clear of a dict holding at most
+#: one entry per tmux session. Semantics are identical: a mutation still drops
+#: the terminal's entry and every session-level entry.
+_session_metadata_cache: Dict[str, tuple[float, Any]] = {}
 _terminal_metadata_cache_lock = _CacheLock()
 _TERMINAL_METADATA_TTL_S = 2.0
 
 
 def invalidate_terminal_metadata_cache(terminal_id: str) -> None:
-    """Evict a terminal's cached metadata after a mutation."""
+    """Evict a terminal's cached metadata after a mutation.
+
+    F747 (#747): O(1) in the number of cached TERMINALS. The session-level
+    entries it also has to drop live in their own dict, so this no longer
+    copies and scans the whole terminal cache on every mutation.
+    """
     _terminal_metadata_cache.pop(terminal_id, None)
-    # Also evict session-level entries that may include stale data
-    for k in list(_terminal_metadata_cache):
-        if k.startswith("__session__"):
-            _terminal_metadata_cache.pop(k, None)
+    # Session-level entries may include the row that just changed.
+    _session_metadata_cache.clear()
 
 
 def clear_terminal_metadata_cache() -> None:
     """Clear the entire cache. Called by test fixtures (B2) to prevent cross-test leakage."""
     with _terminal_metadata_cache_lock:
         _terminal_metadata_cache.clear()
+        _session_metadata_cache.clear()
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -7021,7 +7041,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """
     now = time.monotonic()
     cache_key = f"__session__{tmux_session}"
-    entry = _terminal_metadata_cache.get(cache_key)
+    entry = _session_metadata_cache.get(cache_key)
     if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
         return entry[1]
 
@@ -7044,7 +7064,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 # ObjectDeletedError (or similar) instead of crashing the pass
                 logger.debug("list_terminals_by_session: skipping stale row: %s", exc)
                 continue
-    _terminal_metadata_cache[cache_key] = (now, results)
+    _session_metadata_cache[cache_key] = (now, results)
     return results
 
 
