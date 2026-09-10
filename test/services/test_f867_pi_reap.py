@@ -28,7 +28,7 @@ Mutants guarded:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -569,3 +569,142 @@ def test_r3_delayed_create_after_parent_row_vanishes_is_refused(real_sqlite_env,
             )
         )
     assert d.get_terminal_metadata(child) is None
+
+
+def test_caller_row_lifecycle_change_between_check_and_publication_is_refused(
+    real_sqlite_env, monkeypatch
+):
+    """Consistency requires caller-row liveness through publication ordering."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    session = "cao-r4race"
+    parent = "r4parent0"
+    child = "r4child00"
+    d.create_terminal(
+        terminal_id=parent,
+        tmux_session=session,
+        tmux_window=f"win-{parent}",
+        agent_profile="developer",
+        provider="pi_cli",
+    )
+
+    # The production liveness read returns the caller row, and the row is then
+    # deleted before control returns to the publication sequence: exactly the
+    # interval between a check and a later write.
+    real_get = ts.get_terminal_metadata
+    deleted: dict[str, bool] = {"done": False}
+
+    def _get_then_delete(terminal_id: str):
+        meta = real_get(terminal_id)
+        if terminal_id == parent and not deleted["done"]:
+            deleted["done"] = True
+            d.delete_terminal(parent)
+        return meta
+
+    monkeypatch.setattr(ts, "get_terminal_metadata", _get_then_delete)
+
+    # Bounded stubs only — enough to let the normal create path complete and
+    # actually REACH publication (the r2/r3 refusal arms never get this far).
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    backend.create_window.side_effect = lambda _s, window, *a, **k: window
+    backend.supports_event_inbox.return_value = False
+    backend.set_window_parent = None
+    monkeypatch.setattr(ts, "get_backend", lambda: backend)
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
+    _provider = AsyncMock()
+    _provider.initialize.return_value = True
+    _provider.shell_baseline = None
+    monkeypatch.setattr(
+        ts, "provider_manager", MagicMock(create_provider=MagicMock(return_value=_provider))
+    )
+    monkeypatch.setattr(ts, "fifo_manager", MagicMock())
+    monkeypatch.setattr(ts, "_schedule_deferred_init", MagicMock())
+    monkeypatch.setattr(
+        ts,
+        "load_agent_profile",
+        lambda _n: SimpleNamespace(
+            sessionBrief=None,
+            lifecycle=None,
+            contextPolicy=None,
+            name="developer",
+            skills=None,
+            allowedTools=None,
+            role=None,
+            mcpServers=None,
+            engine=None,
+            default_use_worktree=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="E-CALLER-GONE"):
+        asyncio.run(
+            ts.create_terminal(
+                "pi_cli",
+                "developer",
+                session_name=session,
+                new_session=False,
+                caller_id=parent,
+                terminal_id=child,
+            )
+        )
+    assert deleted["done"], "the caller row must have been deleted inside the interval"
+    assert d.get_terminal_metadata(child) is None, "no orphan child row may survive the refusal"
+
+
+def test_r4_caller_check_is_ordered_after_the_child_insert_in_both_writers():
+    """F867 r4 ORDERING SENTINEL — the atomic step must not be split back apart.
+
+    ``test_caller_row_lifecycle_change_between_check_and_publication_is_refused``
+    proves the check exists inside the publication transaction, but it cannot
+    tell a check placed BEFORE the child ``INSERT`` from one placed after: in
+    that test the caller is already gone by either point. The placement is the
+    whole invariant, though — only after the insert does this transaction hold
+    the write lock, and only then is a concurrent delete unable to commit
+    between the check and our commit. Pin the order structurally in both
+    publication writers.
+    """
+    import ast
+    import inspect
+
+    import cli_agent_orchestrator.clients.database as d
+
+    source = inspect.getsource(d)
+    tree = ast.parse(source)
+    writers = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"create_terminal", "create_terminal_with_warm_intent"}
+    }
+    assert set(writers) == {"create_terminal", "create_terminal_with_warm_intent"}
+
+    for name, fn in writers.items():
+        flush_lines = [
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "flush"
+        ]
+        check_lines = [
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_assert_caller_live_in_publication_txn"
+        ]
+        assert flush_lines, f"{name}: no db.flush() found — writer shape changed"
+        assert check_lines, (
+            f"{name}: the atomic caller check is gone; the caller-liveness read and the "
+            "child insert must stay one consistency boundary"
+        )
+        assert min(check_lines) > min(flush_lines), (
+            f"{name}: caller check at line {min(check_lines)} runs BEFORE the child insert "
+            f"flush at line {min(flush_lines)} — that is check-then-write again, and it "
+            "reopens the window an orphan child row slips through"
+        )

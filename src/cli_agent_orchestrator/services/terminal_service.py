@@ -40,6 +40,7 @@ from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import RootAdmission  # F829 A2.3 root admission
 from cli_agent_orchestrator.clients.database import (
+    CallerGone,
     _utcnow,
     claim_deferred_init_failure,
     create_digest_pending_notice,
@@ -262,6 +263,7 @@ class _LegacyCreateTerminalPublisher(Protocol):
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
         root_admission: Any = None,
+        require_live_caller: bool = False,
     ) -> Dict[str, Any]: ...
 
 
@@ -284,6 +286,7 @@ class _LegacyWarmTerminalPublisher(Protocol):
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
         root_admission: Any = None,
+        require_live_caller: bool = False,
     ) -> Dict[str, Any]: ...
 
 
@@ -2657,7 +2660,15 @@ async def create_terminal(
                     # parent to have vanished, and its caller_id is the launcher,
                     # not a co-session terminal, so it is never gated. caller_id is
                     # None for a top-level supervisor/operator create — never gated.
-                    if caller_id and not new_session:
+                    # F867 r4: ONE predicate for both halves — the cheap
+                    # fail-fast probe here and the AUTHORITATIVE in-transaction
+                    # check the publication writers run under the write lock
+                    # (``require_live_caller``, clients/database.py
+                    # ``_assert_caller_live_in_publication_txn``). This probe can
+                    # go stale the instant after it reads; the transactional one
+                    # cannot, which is what makes an orphan child impossible.
+                    _require_live_caller = bool(caller_id) and not new_session
+                    if _require_live_caller and caller_id:
                         from cli_agent_orchestrator.services.teardown_intent_service import (
                             active_teardown_scope_keys,
                         )
@@ -2702,6 +2713,7 @@ async def create_terminal(
                                         agent_profile=agent_profile,
                                         allowed_tools=allowed_tools,
                                         caller_id=caller_id,
+                                        require_live_caller=_require_live_caller,
                                         **(
                                             {"lifecycle": resolved_lifecycle}
                                             if resolved_lifecycle != "ephemeral"
@@ -2731,6 +2743,7 @@ async def create_terminal(
                                         agent_profile=agent_profile,
                                         allowed_tools=allowed_tools,
                                         caller_id=caller_id,
+                                        require_live_caller=_require_live_caller,
                                         **(
                                             {"lifecycle": resolved_lifecycle}
                                             if resolved_lifecycle != "ephemeral"
@@ -2764,6 +2777,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2792,6 +2806,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2822,6 +2837,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2849,6 +2865,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2868,6 +2885,24 @@ async def create_terminal(
                                             root_admission=root_admission,
                                             **init_fields,
                                         )
+                except CallerGone as exc:
+                    # F867 r4: the atomic caller check inside the publication
+                    # transaction refused. That transaction is already rolled
+                    # back (no child row exists anywhere), so this handler owes
+                    # only the same rollback of the NON-database resources every
+                    # other pre-publication failure does, and then the typed
+                    # E-CALLER-GONE surface — identical wording to the fail-fast
+                    # probe above, so a caller cannot tell which half refused.
+                    _release_cap_lock()
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        _created_window_name,
+                        created_session=_created_session,
+                    )
+                    raise RuntimeError(
+                        f"E-CALLER-GONE: caller '{exc.caller_id}' {exc.reason} at publication "
+                        f"of child '{exc.terminal_id}'; refusing to publish an orphan child"
+                    ) from exc
                 except Exception as exc:
                     # The row publication failed (realistically "database is
                     # locked" out of db_create_terminal). Roll back in exact
