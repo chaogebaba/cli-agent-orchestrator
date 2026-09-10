@@ -688,14 +688,18 @@ def attempt_rung2(
             reason=refire_reason,
         )
 
-    # Inject via tmux send-keys
+    # Inject the nudge through the terminal-backend port.
     try:
-        from cli_agent_orchestrator.clients.tmux import tmux_client
+        from cli_agent_orchestrator.backends.registry import get_backend
 
-        # F210 D9: no trailing "\n" — tmux_client.send_keys submits with its own
-        # send-keys Enter, and a newline inside the pasted buffer submits the
-        # pane's current input line by itself.
-        tmux_client.send_keys(target.tmux_session, target.tmux_window, nudge_text)
+        # F893 (#745) bug-family sweep: this reached clients.tmux directly, so
+        # under the herdr backend the nudge rung shelled out to tmux for a pane
+        # that does not exist and every rung-2 delivery silently deferred. The
+        # port's send_keys is the exact equivalent and dispatches per backend.
+        # F210 D9: no trailing "\n" — send_keys submits with its own Enter, and a
+        # newline inside the pasted buffer submits the pane's current input line
+        # by itself.
+        get_backend().send_keys(target.tmux_session, target.tmux_window, nudge_text)
         return LadderResult(
             delivered=True,
             phase="surface",

@@ -8,6 +8,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
+#: F880 (#733): the verdict a backend returns for a launch-health liveness
+#: probe. Deliberately the same three-valued vocabulary ``_provider_child_alive``
+#: already speaks (``True``/``False``/``None``) so the backend answers the exact
+#: question the caller asks and the caller keeps its inconclusive-is-non-fatal
+#: rule: ``"alive"`` == a live provider child, ``"dead"`` == a confirmed-empty
+#: seat (raises ProviderLaunchFailed at the deadline), ``"unknown"`` == the
+#: backend could not tell (procfs missing, no baseline to compare) and the
+#: terminal is NOT failed on that basis.
+LivenessVerdict = Literal["alive", "dead", "unknown"]
+
 
 @dataclass(frozen=True)
 class ScopeProbe:
@@ -501,3 +511,110 @@ class TerminalBackend(ABC):
         Returns None if unsupported — caller falls back to pane content parsing.
         """
         return None
+
+    # --- Launch-health liveness (F880 #733) ---
+
+    def probe_provider_liveness(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        shell_baseline: Optional[str],
+    ) -> LivenessVerdict:
+        """Classify whether a provider child is alive in this window's seat.
+
+        This is the backend-specific half of ``_provider_child_alive`` (F124):
+        the caller owns the backend-agnostic short-circuits (process-less
+        providers, a provider that already confirmed a fixture-child death),
+        and delegates the "is a real provider process running behind this seat"
+        question HERE so a backend answers it with its OWN authority instead of
+        the caller reaching into tmux verbs. F880 (#733): the herdr launch-health
+        failure was exactly this — the shared caller resolved a pane pid via
+        ``tmux list-panes`` and walked procfs, which a herdr workspace has no
+        answer for, so every herdr spawn died ``provider_launch_failed``.
+
+        Returns a three-valued :data:`LivenessVerdict`:
+        - ``"alive"`` — a provider child is confirmed running.
+        - ``"dead"`` — the seat is confirmed empty (bare shell / vanished).
+        - ``"unknown"`` — the backend cannot tell (missing procfs, no baseline
+          to compare a foreground command against); the caller treats this as
+          non-fatal and degrades to the watchdog rather than failing the
+          terminal.
+
+        ``shell_baseline`` is the provider's captured idle-shell command name
+        (e.g. ``"bash"``); a backend that classifies by comparing the live
+        foreground command against it needs the baseline and returns ``"unknown"``
+        when it is absent.
+
+        The default raises so a backend that has not implemented a liveness
+        primitive is a loud programming error, not a silent always-alive.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement probe_provider_liveness()"
+        )
+
+    def supports_status_decorations(self) -> bool:
+        """Whether this backend has tmux-style per-session user options.
+
+        F893 (#745) bug-family sweep: ``boundary_pull_service`` writes the
+        ``@cao_pending`` user option for the tmux status line on every recount.
+        That is a tmux UI affordance with no herdr equivalent, so it is
+        tmux-only BY DESIGN — but under herdr it ran anyway and logged a
+        ``set-option`` failure warning on every message round. Callers of such
+        decorations gate on this instead of shelling out and warning.
+        """
+        return False
+
+    # --- Runtime-identity process root (F893 #745) ---
+
+    def get_pane_process_id(self, session_name: str, window_name: str) -> int:
+        """Return the pid that roots the provider process tree behind this seat.
+
+        This is the process an identity capture may walk descendants of
+        (``capture_codex_uuid`` scans ``/proc/<pid>/fd`` for the rollout file)
+        and whose ``/proc`` start time dates the provider launch
+        (``pane_launch_epoch``). Both consumers only need *a* local pid at or
+        above the provider in the tree, which is why one port method serves
+        backends whose seat model differs:
+
+        - **tmux** returns the window's FIRST pane pid (lowest ``pane_index``,
+          the F545/#401 rule) — the login shell the provider was exec'd into,
+          so the provider is a descendant.
+        - **herdr** owns the child itself and has no CAO-visible pane shell, so
+          it returns the pane's first live foreground process pid, i.e. the
+          provider process directly. ``_descendants`` includes its root, so an
+          fd scan rooted there still finds the provider's own open files.
+
+        F893 (#745): ``_prepare_provider_runtime_identity`` and six sibling
+        sites resolved this pid by calling ``fork_context_service.pane_pid``,
+        which shells out to ``tmux list-panes`` unconditionally. Under the herdr
+        backend that raises ``CalledProcessError`` and fails the F829
+        runtime-identity capture for every ``supports_reauth_rebind`` provider
+        (observed live on grok-box-009 for grok workers). Same class as F880
+        (#733); the fix is the same — ask the backend.
+
+        Raises:
+            TerminalBackendError / TerminalNotFoundError: the seat cannot be
+                resolved or the backend cannot name a process for it. Callers
+                keep whatever failure handling they had for the old tmux
+                ``CalledProcessError``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_pane_process_id()"
+        )
+
+    # --- Backend health (F882 #735) ---
+
+    def backend_health(self) -> str:
+        """Return this backend's live health for ``GET /health``.
+
+        ``"ok"`` when the backend's control plane is reachable; a backend-specific
+        NON-``"ok"`` string (e.g. ``"unavailable"``, ``"socket_closed"``) when it
+        is not. F882 (#735): the health endpoint reported the herdr component
+        ``ok`` from ``shutil.which("herdr")`` alone, so a dead herdr socket still
+        read healthy. A backend that can cheaply probe its control plane
+        overrides this; the default returns ``"ok"`` because a backend with no
+        separate control plane (tmux drives panes through per-call subprocess
+        invocations) has nothing to lose independently of the server process.
+        """
+        return "ok"

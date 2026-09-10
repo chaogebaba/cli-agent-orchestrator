@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     _fire_open_barrier_in_db,
     _maybe_fire_completed_barrier,
     callback_barrier_dispatch_allowed,
+    callback_barrier_dispatch_permission,  # noqa: F401  (F893 seam)
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,

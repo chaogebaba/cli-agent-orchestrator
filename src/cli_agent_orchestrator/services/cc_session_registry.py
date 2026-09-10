@@ -441,10 +441,24 @@ def resolve_target(
     # F545 (#401): resolve the WINDOW'S FIRST pane, never the active pane. A split
     # seat window with a second (consultant) pane focused would otherwise make the
     # active pane's process tree the candidate set and ring the wrong Claude.
+    # F893 (#745): tmux keeps its exact path — `first_pane` gives BOTH the seat
+    # pid and the %N the step-3 cross-check refines on. When that read fails the
+    # way it does on a backend with no tmux at all (herdr: CalledProcessError,
+    # so every supervisor wake refused `pane_pid_failed`), fall back to the
+    # backend port for the process root and drop the %N refinement — step 3 then
+    # takes the same "cannot cross-check" branch a missing window_id already does.
+    seat_pane_id: Optional[str]
     try:
         seat_pane_id, pane_leader = first_pane(tmux_session, tmux_window)
     except (subprocess.CalledProcessError, OSError, ValueError):
-        return ResolveResult(refusal_reason="pane_pid_failed")
+        from cli_agent_orchestrator.backends.base import TerminalBackendError
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        seat_pane_id = None
+        try:
+            pane_leader = get_backend().get_pane_process_id(tmux_session, tmux_window)
+        except (subprocess.CalledProcessError, OSError, ValueError, TerminalBackendError):
+            return ResolveResult(refusal_reason="pane_pid_failed")
 
     descendants = _descendants(pane_leader)
     # Find registry records whose pid is in the FIRST pane's descendant tree.
@@ -462,7 +476,7 @@ def resolve_target(
     # Step 3: cross-check — prefer records whose tmux field matches this pane.
     # F545: compare the seat's FIRST pane %N too, so a record that carries the
     # terminal id but sits on a different pane is filtered out here as well.
-    if window_id is not None:
+    if window_id is not None and seat_pane_id is not None:
         matched = [
             r
             for r in candidate_records

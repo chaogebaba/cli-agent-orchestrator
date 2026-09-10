@@ -494,7 +494,11 @@ class TestAC8NoNewlineInPayload:
             keys
             == "[cao] 3 message(s) waiting (oldest id 42, 41s). Run list_messages to surface them."
         )
-        assert "enter_count" not in kwargs
+        # F893 (#745) sweep: the nudge is injected through the backend port, and
+        # TmuxBackend.send_keys forwards its signature defaults explicitly. AC8 is
+        # about delivery_service not OVERRIDING enter_count, so assert the
+        # effective value is still the default rather than the kwarg's absence.
+        assert kwargs.get("enter_count", 1) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -726,6 +726,7 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::ConfigReconcile => None,
         CommandId::DiagMsg => None,
         CommandId::Fold => None,
+        CommandId::IdentityBackfillOwners => None,
         CommandId::IdentityRelease => None,
         CommandId::LedgerCheck => None,
         CommandId::MailboxDelete => None,

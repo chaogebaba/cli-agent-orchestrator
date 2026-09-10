@@ -894,7 +894,32 @@ class HerdrInboxService:
             )
             return True
         if state == "ready":
-            terminal_service._delete_terminal_core(terminal_id)
+            # F881 (#734): a concurrent settlement/teardown may already hold this
+            # terminal's rebind lease (e.g. the launch-health failure that
+            # triggered this very workspace.closed is settling the same terminal
+            # from the deferred-init path). _delete_terminal_core raises
+            # RuntimeError('rebind_in_progress') in that case. Before F881 that
+            # propagated uncaught out of the lifecycle task, aborting the rest of
+            # the workspace-close routing and leaving siblings half-settled. It
+            # is not an error: another owner is tearing this terminal down, so
+            # log it as a typed, benign outcome and treat this terminal as
+            # handled (True) rather than failing the whole close.
+            try:
+                terminal_service._delete_terminal_core(terminal_id)
+            except RuntimeError as exc:
+                if str(exc) == "rebind_in_progress":
+                    logger.info(
+                        "herdr_workspace_close_delete_deferred terminal=%s "
+                        "reason=rebind_in_progress (teardown owned elsewhere)",
+                        terminal_id,
+                    )
+                    return True
+                logger.error(
+                    "herdr_workspace_close_delete_failed terminal=%s error=%r",
+                    terminal_id,
+                    exc,
+                )
+                return False
             return True
         if state in {"init_failed_notified", "init_failed_caller_gone"}:
             await terminal_service.dispatcher.run(
