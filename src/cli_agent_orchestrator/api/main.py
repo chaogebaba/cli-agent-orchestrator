@@ -2455,7 +2455,7 @@ def _mcp_apps_enabled() -> bool:
     whole surface is consistently default-off.
     """
 
-    return bool(ConfigService.get("apps.enabled", default=False))
+    return bool(ConfigService.get("apps.enabled"))
 
 
 def _require_mcp_apps_enabled() -> None:
@@ -5379,6 +5379,35 @@ async def get_terminal_memory_context(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get memory context: {str(e)}",
         )
+
+
+@app.get("/terminals/{terminal_id}/native-delivery")
+async def get_native_delivery_health(terminal_id: TerminalId) -> Dict[str, Any]:
+    """F747 (#747): is native agent-message delivery healthy for this terminal?
+
+    The seat's legacy fallback surfaces -- the ``CAO callback waiting``
+    task-notification armed by the rewake hook, and the ``[CAO INBOX]`` drain
+    digest -- consult this before surfacing anything. ``healthy: true`` means
+    the native channel is the ONLY surface and the fallback must stay silent;
+    ``healthy: false`` names the reason from the closed set in
+    ``teammate_push_service.NATIVE_FALLBACK_REASONS`` and arms the fallback,
+    logging one rate-limited ``native_fallback_engaged`` WARNING server-side so
+    each engagement is a filed quirk rather than an invisible default.
+    """
+    from cli_agent_orchestrator.services.teammate_push_service import (
+        log_native_fallback_engaged,
+        native_fallback_reason,
+    )
+
+    try:
+        reason = native_fallback_reason(terminal_id)
+    except Exception as e:  # never let a health probe break a hook
+        logger.debug("native_fallback_reason failed for %s: %s", terminal_id, e)
+        return {"terminal_id": terminal_id, "healthy": False, "reason": "probe_failed"}
+    if reason is None:
+        return {"terminal_id": terminal_id, "healthy": True, "reason": None}
+    log_native_fallback_engaged(terminal_id, reason)
+    return {"terminal_id": terminal_id, "healthy": False, "reason": reason}
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)

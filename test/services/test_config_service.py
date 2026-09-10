@@ -168,8 +168,7 @@ class TestGetConfig:
         assert cfg.terminal.herdr_session == "s1"
         assert cfg.server.mcp_request_timeout == 99
         assert cfg.memory.compile_mode == "append"
-        # Untouched sections keep built-in defaults.
-        assert cfg.apps.enabled is False
+        # Untouched sections keep built-in defaults (F747 #747: apps ships on).
         assert cfg.logging.level == "INFO"
 
 

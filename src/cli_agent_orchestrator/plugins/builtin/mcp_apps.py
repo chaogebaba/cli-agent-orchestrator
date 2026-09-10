@@ -35,7 +35,7 @@ def _surface_enabled() -> bool:
     """Return whether the MCP App surface is enabled via ``apps.enabled``
     (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return bool(ConfigService.get("apps.enabled", default=False))
+    return bool(ConfigService.get("apps.enabled"))
 
 
 class McpAppsPlugin(CaoPlugin):

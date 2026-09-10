@@ -1693,54 +1693,43 @@ def _maybe_derive_cc_team_inbox_path(
     metadata: Optional[Dict[str, Any]],
     working_directory: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """F337 gate: derive cc_team_inbox_path only when native wake is enabled.
+    """Derive ``cc_team_inbox_path`` for EVERY claude_code terminal (F747 #747).
 
-    Extracted from create_terminal for testability. Returns the (possibly mutated)
-    metadata dict. The gate requires:
-      - provider == "claude_code"
-      - supervisor.teammate_push == True
-      - supervisor.wake.native == True (the F337 default-dark guard)
-      - metadata is None or doesn't already contain cc_team_inbox_path
+    Formerly the F337 gate: the derivation also required ``supervisor.
+    teammate_push`` AND ``supervisor.wake.native``, which made the native seat
+    channel opt-in TWICE over -- a flag that shipped off, and a metadata field
+    only written while that flag was on. A seat born with the flag off could
+    never be healed into native delivery without a re-create, so every callback
+    fell back to the task-notification surface (#747, seat c244d80b).
+
+    The path is now derived unconditionally for claude_code, because it is a
+    pure function of the terminal's cwd and costs nothing when unused: the
+    FLAGS decide whether we push, the METADATA only records where a push would
+    go. ``working_directory`` falls back to the server's cwd (the launch cwd
+    ``_resolve_working_directory`` would have persisted), so a terminal created
+    without an explicit cwd still gets a usable path instead of ``None``.
+
+    Returns the (possibly mutated) metadata dict; an existing
+    ``cc_team_inbox_path`` is never overwritten.
     """
-    from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-    from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+    if provider != "claude_code":
+        return metadata
+    if metadata is not None and "cc_team_inbox_path" in metadata:
+        return metadata
+    _wd = working_directory or os.getcwd()
+    try:
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            _derive_cc_team_inbox_path,
+        )
 
-    _native_wake_enabled = _CS.get("supervisor.wake.native", default=WAKE_NATIVE_DEFAULT)
-    if (
-        provider == "claude_code"
-        and _CS.get("supervisor.teammate_push", default=False)
-        and _native_wake_enabled
-        and not metadata
-    ):
-        _wd = working_directory or os.getcwd()
-        try:
-            from cli_agent_orchestrator.services.teammate_push_service import (
-                _derive_cc_team_inbox_path,
-            )
-
-            _inbox_path = _derive_cc_team_inbox_path(_wd)
-            if _inbox_path is not None:
-                metadata = {"cc_team_inbox_path": str(_inbox_path)}
-        except Exception:
-            pass
-    elif (
-        provider == "claude_code"
-        and _CS.get("supervisor.teammate_push", default=False)
-        and _native_wake_enabled
-        and metadata is not None
-        and "cc_team_inbox_path" not in metadata
-    ):
-        _wd = working_directory or os.getcwd()
-        try:
-            from cli_agent_orchestrator.services.teammate_push_service import (
-                _derive_cc_team_inbox_path,
-            )
-
-            _inbox_path = _derive_cc_team_inbox_path(_wd)
-            if _inbox_path is not None:
-                metadata["cc_team_inbox_path"] = str(_inbox_path)
-        except Exception:
-            pass
+        _inbox_path = _derive_cc_team_inbox_path(_wd)
+    except Exception:
+        return metadata
+    if _inbox_path is None:
+        return metadata
+    if metadata is None:
+        return {"cc_team_inbox_path": str(_inbox_path)}
+    metadata["cc_team_inbox_path"] = str(_inbox_path)
     return metadata
 
 
@@ -2326,13 +2315,6 @@ async def create_terminal(
             env_vars, terminal_id, plan=persona_plan, incarnation_token=_f138_token
         )
 
-        # WPDT W3 (F152): Derive and set cc_team_inbox_path at pane creation
-        # for claude_code supervisor terminals with teammate_push enabled.
-        # F337: Also require wake.native=true — the cc_team_inbox_path is only
-        # useful when the native channel is active; deriving it when native is
-        # disabled would leave a stale path that split-brain code could use.
-        metadata = _maybe_derive_cc_team_inbox_path(provider, metadata, working_directory)
-
         window_name = generate_window_name(agent_profile, terminal_id)
 
         # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
@@ -2381,6 +2363,13 @@ async def create_terminal(
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
+
+        # WPDT W3 (F152) / F747 (#747): derive cc_team_inbox_path at pane
+        # creation for EVERY claude_code terminal, ungated. Deliberately AFTER
+        # the worktree block: when ``use_worktree`` replaced working_directory
+        # with the isolated checkout, the seat's inbox key must be derived from
+        # the path the pane actually launches in, not the pre-worktree one.
+        metadata = _maybe_derive_cc_team_inbox_path(provider, metadata, resolved_working_directory)
 
         # Step 2: Issue per-terminal auth token (F332). Name normalization and
         # the tmux create + registry publication that follow are the #498

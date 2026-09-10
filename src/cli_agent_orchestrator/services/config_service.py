@@ -155,7 +155,8 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     # F439 (#294): default worker-terminal cap when neither env nor
     # settings.json sets it.
     "orchestrator.max_worker_terminals": 10,
-    "apps.enabled": False,
+    # F747 (#747): shipped default = the value the operator actually runs.
+    "apps.enabled": True,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
     "auth.audience": "",
@@ -177,7 +178,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     # F439 (#294): server-side worker-terminal cap. <=0 disables. env beats
     # settings.json (orchestrator.max_worker_terminals) beats this default 10.
     "CAO_MAX_WORKER_TERMINALS": ("orchestrator.max_worker_terminals", "int", 10),
-    "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
+    "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", True),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
     "CAO_AUTH_AUDIENCE": ("auth.audience", "str", ""),
@@ -200,9 +201,12 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         20,
     ),
     "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
-    "CAO_SUPERVISOR_MAILBOX_PULL": ("supervisor.mailbox_pull", "bool", False),
-    "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", False),
-    "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", True),
+    # F747 (#747): pull-mode drain is the live posture; an opt-in never used.
+    "CAO_SUPERVISOR_MAILBOX_PULL": ("supervisor.mailbox_pull", "bool", True),
+    # F747 (#747): native agent-message delivery is the DEFAULT seat surface.
+    "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", True),
+    # F747 (#747): the seat prompt is never a message tunnel -- ships OFF.
+    "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", False),
     # FX170: native wake config paths (D11)
     # Canonical source is cc_session_registry.WAKE_NATIVE_DEFAULT; duplicated
     # here because the registry dict is evaluated at import-time before service
@@ -222,7 +226,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     # F461: coalesce window for near-simultaneous worker callbacks (seconds)
     "CAO_SUPERVISOR_WAKE_COALESCE_S": ("supervisor.wake.coalesce_s", "float", 5.0),
     # FX181: quiescence watchdog config paths (D7)
-    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE": ("supervisor.watchdog.quiescence", "bool", False),
+    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE": ("supervisor.watchdog.quiescence", "bool", True),
     "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE_GRACE_S": (
         "supervisor.watchdog.quiescence_grace_s",
         "float",
@@ -473,7 +477,19 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     file_value = _get_from_file(path)
     if file_value is not None:
         return file_value
-    return _OWNED_DEFAULTS.get(path, default)
+    if path in _OWNED_DEFAULTS:
+        return _OWNED_DEFAULTS[path]
+    # F747 (#747): the ENV_REGISTRY tuple is the SHIPPED default, not merely
+    # ``cao config list`` decoration. Before this tier existed, a registered
+    # path with no env var and no settings.json entry fell through to whatever
+    # ``default=`` the call site happened to pass -- so
+    # ``supervisor.teammate_push`` read ``None`` (falsy) no matter what the
+    # table declared, and native seat delivery was structurally unreachable
+    # without an operator editing settings.json. Registry beats call-site
+    # default; env and file still beat the registry.
+    if env_name is not None:
+        return ENV_REGISTRY[env_name][2]
+    return default
 
 
 def _set_value(path: str, value: Any) -> Any:

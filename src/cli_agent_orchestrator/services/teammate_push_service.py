@@ -508,6 +508,92 @@ def _should_teammate_push(terminal_id: str) -> bool:
     return _resolve_inbox_path(terminal_id) is not None
 
 
+#: Closed set of reasons the legacy fallback surface may engage (F747 #747).
+NATIVE_FALLBACK_REASONS = (
+    "provider_not_native",
+    "push_disabled_by_operator",
+    "no_inbox_path",
+    "no_native_driver",
+    "native_write_failed",
+)
+
+#: How long a native write failure keeps the fallback armed for a terminal.
+NATIVE_WRITE_FAILURE_TTL_S = 300.0
+
+#: Rate limit for the engagement WARN, matching the inbox reconciler's window.
+NATIVE_FALLBACK_WARN_INTERVAL_S: float = 60.0
+
+#: terminal_id -> monotonic ts of the last failed native write.
+_native_write_failures: Dict[str, float] = {}
+
+#: terminal_id -> monotonic ts of the last engagement WARN.
+_native_fallback_last_warn: Dict[str, float] = {}
+
+
+def record_native_write_failure(terminal_id: str) -> None:
+    """Arm the fallback for ``terminal_id`` after a failed native write."""
+    _native_write_failures[terminal_id] = time.monotonic()
+
+
+def clear_native_write_failure(terminal_id: str) -> None:
+    """Disarm the fallback after a native write succeeds."""
+    _native_write_failures.pop(terminal_id, None)
+
+
+def _has_recent_native_write_failure(terminal_id: str) -> bool:
+    ts = _native_write_failures.get(terminal_id)
+    if ts is None:
+        return False
+    if (time.monotonic() - ts) >= NATIVE_WRITE_FAILURE_TTL_S:
+        _native_write_failures.pop(terminal_id, None)
+        return False
+    return True
+
+
+def log_native_fallback_engaged(terminal_id: str, reason: str) -> bool:
+    """Emit one rate-limited WARNING per fallback engagement. True if emitted."""
+    now_ts = time.monotonic()
+    last = _native_fallback_last_warn.get(terminal_id)
+    if last is not None and (now_ts - last) < NATIVE_FALLBACK_WARN_INTERVAL_S:
+        return False
+    _native_fallback_last_warn[terminal_id] = now_ts
+    logger.warning("native_fallback_engaged terminal=%s reason=%s", terminal_id, reason)
+    return True
+
+
+def native_fallback_reason(terminal_id: str) -> Optional[str]:
+    """Return why the legacy fallback surface may engage, or None when healthy.
+
+    F747 (#747): native agent-message delivery is the default and ONLY seat
+    surface. The task-notification ("CAO callback waiting") + drain-hook digest
+    survive strictly as a net for a terminal whose native channel is VERIFIABLY
+    broken, and every engagement must name which of the closed set below broke.
+    A healthy terminal returns None and the fallback stays silent.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata or metadata.get("provider") != "claude_code":
+        return "provider_not_native"
+    # Resolve BEFORE the flag check: ``_resolve_inbox_path`` self-heals a missing
+    # ``cc_team_inbox_path`` and persists it, and that re-derivation must happen
+    # on read even for a terminal created while the flag was off (ruling 2).
+    inbox_path = _resolve_inbox_path(terminal_id)
+    if not ConfigService.get("supervisor.teammate_push"):
+        # Default is True, so a False here is an explicit operator decision
+        # (settings.json or CAO_W2M_TEAMMATE_PUSH), never a shipped posture.
+        return "push_disabled_by_operator"
+    if inbox_path is None:
+        return "no_inbox_path"
+    if not ConfigService.get("supervisor.mailbox_pull") and not ConfigService.get(
+        "delivery.seat_wake_reconcile"
+    ):
+        # Nothing drives a push: neither the pull-mode reconciler nor the
+        # idle-seat wake reconcile is running, so native writes never happen.
+        return "no_native_driver"
+    if _has_recent_native_write_failure(terminal_id):
+        return "native_write_failed"
+    return None
+
+
 def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
     """Resolve and expand the CC inbox path from terminal metadata.
 
@@ -523,11 +609,17 @@ def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
     if raw:
         return Path(os.path.expanduser(raw))
 
-    # F152 self-heal: derive path from working_directory + provider
+    # F152 self-heal: derive path from working_directory + provider.
+    # F747 (#747): a claude_code terminal whose ``working_directory`` column is
+    # empty (rows predating the #497 backfill, or any create route that never
+    # recorded one) used to dead-end here, which is exactly the state that made
+    # the seat unreachable natively. Fall back to the server's own cwd -- the
+    # same value ``_resolve_working_directory`` would have persisted -- so the
+    # path is always derivable for a claude_code terminal.
     provider = metadata.get("provider")
-    working_dir = metadata.get("working_directory")
-    if not working_dir or provider != "claude_code":
+    if provider != "claude_code":
         return None
+    working_dir = metadata.get("working_directory") or os.getcwd()
 
     derived = _derive_cc_team_inbox_path(working_dir)
     if derived is None:
@@ -749,9 +841,12 @@ def attempt_teammate_push_reported(
     )
     success = _write_inbox_entry(inbox_path, entry)
     if success:
+        # F747 (#747): a good write disarms the fallback for this terminal.
+        clear_native_write_failure(terminal_id)
         return PushOutcome(
             pushed=True, reason="pushed", message_ids=tuple(m.id for m in new_messages)
         )
+    record_native_write_failure(terminal_id)
     return PushOutcome(pushed=False, reason="write_failed", message_ids=ids)
 
 

@@ -193,7 +193,7 @@ def ring_supervisor_doorbell(
         return "skipped_disabled"
 
     # D10 (fx168): outer switch — off means no bell of any kind.
-    if not ConfigService.get("supervisor.doorbell", default=True):
+    if not ConfigService.get("supervisor.doorbell"):
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled reason=flag_off row=%s",
             terminal_id,
