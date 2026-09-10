@@ -1671,6 +1671,9 @@ def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
     """Return a read-only terminal pane tail via cao-server."""
     # F172 input leniency: accept display form.
     terminal_id = _resolve_input_terminal_id(terminal_id)
+    # The MCP cap is a CONTEXT budget, not the transport's ceiling (#742): the
+    # seat pays for every line it peeks, so this stays at 200 while the HTTP
+    # route an out-of-band probe uses now accepts up to MAX_PEEK_TERMINAL_LINES.
     capped_lines = max(1, min(int(lines), 200))
     try:
         response = cao_http.get(

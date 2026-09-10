@@ -11030,6 +11030,38 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
     )
 
 
+def has_pending_legacy_messages(receiver_id: str) -> bool:
+    """Does this receiver hold at least one PENDING row in the LEGACY inbox?
+
+    WP-ARCH 3b, #741: the row-scoped half of D6's mute. At ``on`` the legacy
+    inbox is read-only but it is not EMPTY, and every row still in it is one the
+    queue does NOT own -- ``write_through`` writes a detached model and adds
+    nothing to this table, so a row physically present here has no
+    ``delivery_msg`` counterpart by construction. Two families reach it: rows
+    that predate the flip, which S6 says must "drain through the old path", and
+    the write-through fallbacks a lost ``BEGIN IMMEDIATE`` race produces.
+
+    One indexed existence probe rather than a count: the caller only needs to
+    know whether the legacy carrier still has work, and a count would pay for
+    rows it never reads.
+    """
+    try:
+        with SessionLocal() as db:
+            mailbox_schema = _mailbox_schema_available(db)
+            row = (
+                db.query(InboxModel.id)
+                .filter(
+                    _pending_receiver_predicate(receiver_id, mailbox_schema),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .first()
+            )
+            return row is not None
+    except Exception:  # noqa: BLE001 -- an unanswerable probe must not break delivery
+        logger.debug("pending-legacy probe failed for %s", receiver_id, exc_info=True)
+        return False
+
+
 def get_pending_messages(
     receiver_id: str,
     limit: int = 100,

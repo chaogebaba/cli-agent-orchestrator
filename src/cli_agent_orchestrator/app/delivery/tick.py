@@ -206,18 +206,53 @@ class DeliveryTick:
         )
         digest = self._epoch_for(receiver_id, now, report)
         if digest is None:
+            logger.debug("delivery_wake receiver=%s decision=no_open_epoch", receiver_id)
             return
         if not claimed:
             # Every row is still inside its lease, so this is not a new lease
             # period and I3 forbids a second wake.  Emitting here would also
             # re-send a byte-identical line, which the transport's content window
             # would swallow — a wake reported as sent and never written.
+            logger.debug(
+                "delivery_wake receiver=%s epoch=%s decision=inside_lease",
+                receiver_id,
+                digest.epoch,
+            )
             return
         wake = self._wake.deliver(digest, claimed)
+        self._log_wake(wake, len(claimed))
         report.wakes = (*report.wakes, wake)
         if wake.recordable:
             self._record_attempts(wake, claimed, now)
         self._raise_wake_finding(wake)
+
+    @staticmethod
+    def _log_wake(wake: WakeOutcomeReport, claimed: int) -> None:
+        """One line per emission, and it is load-bearing rather than decorative.
+
+        Every non-emitting outcome this path can take is SILENT otherwise: the
+        carrier returns a refusal string, the attempt row records it, and nothing
+        reaches the log. The first live round under ``on`` found the seat quiet
+        and could not say why, because the only surviving evidence was an
+        ``attempts`` counter that four different outcomes leave at zero (#741).
+        A refusal is therefore logged at WARNING and an emission at INFO, both
+        naming the outcome, the carrier and the detail, so "which of the four"
+        is answered by reading the log rather than by reasoning about the schema.
+        """
+        level = logging.INFO if wake.emitted else logging.WARNING
+        logger.log(
+            level,
+            "delivery_wake receiver=%s epoch=%s carrier=%s outcome=%s emitted=%s "
+            "wake=%s claimed=%d detail=%s",
+            wake.receiver_id,
+            wake.epoch,
+            wake.carrier,
+            wake.outcome.value,
+            wake.emitted,
+            wake.wake_count,
+            claimed,
+            wake.detail or "-",
+        )
 
     def _epoch_for(self, receiver_id: str, now: datetime, report: TickReport) -> SeatDigest | None:
         """The receiver's open epoch, opened or extended to cover what is owed."""

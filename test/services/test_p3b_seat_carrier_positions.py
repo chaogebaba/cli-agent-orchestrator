@@ -883,3 +883,125 @@ def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env: Any) -> N
     )
     assert attempts[0].outcome is AttemptOutcome.DELIVERED
     assert pastes == [], "a supervisor-role receiver is never pasted (K8)"
+
+
+# ---------------------------------------------------------------------------
+# #741 — the mute is ROW-SCOPED, because the read-only inbox is not an EMPTY one.
+#
+# The box live round under `on` found the seat silent and every live queue row
+# dead with attempts=0. Its log carries the mechanism verbatim: three
+# `delivery write-through failed; the caller falls back to the legacy insert`
+# warnings over `sqlite3.OperationalError: database is locked`, raised where the
+# queue's own connection takes BEGIN IMMEDIATE while the caller still holds an
+# open write transaction on the SAME file. The fallback wrote a legacy row, and
+# a terminal-wide mute then left that row with NO carrier at all.
+#
+# These arms fix the SCOPE of the mute, not the lock. The lock is a genuine
+# race that the fallback exists to survive; what may not survive it is silence.
+# ---------------------------------------------------------------------------
+
+
+def _doorbell_decision(terminal_id: str, row_id: int) -> str:
+    """The REAL ``ring_supervisor_doorbell``, driven to its first decision.
+
+    Deliberately not the ``_drive`` harness above: that one patches the doorbell
+    with a recorder, so the module's own mute never runs and an arm written on it
+    would certify a mute it never reached. The K3 surface is the subject here, so
+    it is the thing that has to be called.
+    """
+    from cli_agent_orchestrator.services import doorbell_service
+
+    with patch.object(
+        doorbell_service.ConfigService, "get", side_effect=lambda key, default=None: default
+    ):
+        return doorbell_service.ring_supervisor_doorbell(terminal_id, row_id)
+
+
+def test_a_legacy_row_at_on_keeps_its_carrier(seat_db) -> None:
+    """The `on` arm the position sweep above could not have: a row in the LEGACY
+    inbox while the switch says the queue owns delivery.
+
+    Two surfaces, because one alone would not have caught the round's shape:
+    ``deliver_pending`` is what moves the row, and K3's ring is what wakes the
+    seat about it. Both were muted terminal-wide, so the row had no carrier at
+    all -- which is #604 with a switch in front of it.
+    """
+    with seat_db.begin() as db:
+        _seat(db)
+        row = _callback(db)
+        row_id = int(row.id)
+
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
+        return_value=SwitchPosition.ON,
+    ):
+        skips: list[str] = []
+        service = InboxService()
+        with (
+            patch.object(
+                InboxService, "_log_delivery_skip", side_effect=lambda t, r: skips.append(r)
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
+            patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
+        ):
+            service.deliver_pending(SEAT_TERMINAL)
+        assert "queue_owns_delivery" not in skips, (
+            "a row the queue does not own lost its only carrier at `on`: the legacy "
+            "inbox is read-only from the flip, not empty (#741)"
+        )
+
+        assert (
+            _doorbell_decision(SEAT_TERMINAL, row_id) != "skipped_disabled"
+        ), "K3 stayed muted for a row the tick will never serve"
+
+
+def test_the_mute_still_holds_when_the_queue_owns_everything(seat_db) -> None:
+    """The other direction, and the one that keeps the fix honest.
+
+    With NO legacy row for the receiver the queue owns everything it is owed, so
+    every D6 surface stays quiet -- otherwise this change would have replaced a
+    silent seat with the duplicate family the phase exists to close.
+    """
+    with seat_db.begin() as db:
+        _seat(db)
+
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
+        return_value=SwitchPosition.ON,
+    ):
+        skips: list[str] = []
+        service = InboxService()
+        with (
+            patch.object(
+                InboxService, "_log_delivery_skip", side_effect=lambda t, r: skips.append(r)
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
+            patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
+        ):
+            service.deliver_pending(SEAT_TERMINAL)
+        assert skips == ["queue_owns_delivery"], skips
+        assert _doorbell_decision(SEAT_TERMINAL, 0) == "skipped_disabled"
+
+
+def test_the_predicate_names_which_rows_the_queue_owns(seat_db) -> None:
+    """The predicate itself, so a regression names the cause and not a symptom."""
+    from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
+
+    with seat_db.begin() as db:
+        _seat(db)
+
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
+        return_value=SwitchPosition.ON,
+    ):
+        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is True
+
+        with seat_db.begin() as db:
+            _callback(db)
+        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is False
+
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
+        return_value=SwitchPosition.SHADOW,
+    ):
+        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is False

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_WRITE,
     require_any_scope,
 )
+from cli_agent_orchestrator.services.terminal_service import MAX_PEEK_TERMINAL_LINES
 
 router = APIRouter()
 
@@ -87,7 +88,7 @@ async def get_provider_session_owner(
 @router.get("/terminals/{terminal_id}/peek", response_model=TerminalPeekResponse)
 async def peek_terminal(
     terminal_id: TerminalId,
-    lines: int = Query(default=40, ge=1, le=200),
+    lines: int = Query(default=40, ge=1, le=MAX_PEEK_TERMINAL_LINES),
 ) -> TerminalPeekResponse:
     from cli_agent_orchestrator.api import main as api_main
 

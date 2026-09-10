@@ -23,6 +23,7 @@ a seat where emitters had in fact fired.
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -962,3 +963,42 @@ def test_an_epoch_that_closes_mid_tick_records_no_attempt(harness: Harness) -> N
     assert report.detail == "epoch_closed"
     assert len(harness.queue.attempts_for(row.msg_id)) == before
     assert resolution.live
+
+
+# ------------------------------------------------- #741: the outcome is LOGGED
+
+
+def test_every_wake_outcome_reaches_the_log(harness: Harness, caplog) -> None:
+    """A refusal at WARNING and an emission at INFO, both naming the outcome.
+
+    The first live round under ``on`` found the seat quiet and could not say
+    why, and the reason it could not is here rather than in the round: the
+    carrier's refusal reached an ``delivery_attempt`` row and nothing else, and
+    the ``attempts`` COUNTER four different outcomes leave at zero was the only
+    surviving evidence. So the arm asserts both directions -- a silent success
+    is as useless to the next round as a silent refusal.
+    """
+    caplog.set_level(logging.DEBUG, logger="cli_agent_orchestrator.app.delivery.tick")
+
+    harness.carrier.reason = "socket_unpublished"
+    harness.enqueue("log1")
+    harness.tick.run_once(now=harness.clock.now())
+
+    refusals = [r for r in caplog.records if r.message.startswith("delivery_wake receiver=")]
+    assert refusals, "a refused wake left no line in the log"
+    assert refusals[-1].levelno == logging.WARNING
+    assert "socket_unpublished" in refusals[-1].message
+    assert "emitted=False" in refusals[-1].message
+
+    caplog.clear()
+    harness.carrier.reason = None
+    harness.lease_period()
+    harness.tick.run_once(now=harness.clock.now())
+
+    emissions = [
+        r
+        for r in caplog.records
+        if r.message.startswith("delivery_wake receiver=") and "emitted=True" in r.message
+    ]
+    assert emissions, "an emitted wake left no line in the log either"
+    assert emissions[-1].levelno == logging.INFO

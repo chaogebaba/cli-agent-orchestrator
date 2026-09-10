@@ -53,6 +53,7 @@ __all__ = [
     "NativeSeatCarrier",
     "PaneWorkerInjector",
     "queue_owns_delivery",
+    "queue_owns_receiver_delivery",
 ]
 
 
@@ -227,6 +228,49 @@ def queue_owns_delivery() -> bool:
         return _owns()
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
         return False
+
+
+def queue_owns_receiver_delivery(receiver_id: str | None) -> bool:
+    """Does the queue own EVERY undelivered row for this receiver? (#741)
+
+    The row-scoped mute, and the predicate D6's surfaces must ask instead of
+    :func:`queue_owns_delivery`. The coarse switch answers "is the position
+    ``on``", and 3b wrote every legacy surface against it. That is too coarse in
+    exactly one direction, and it is the direction that loses messages: at ``on``
+    the legacy inbox stops accepting inserts but does not become empty, so a
+    terminal-wide mute strands every row still in it with NO carrier at all --
+    the silent seat this phase exists to remove.
+
+    Two families are stranded by the coarse mute, and both are EVIDENCED rather
+    than hypothesised. Rows that predate the flip are the case S6 names directly
+    ("existing rows drain through the old path"). Write-through fallbacks are the
+    case the box round produced: ``write_through`` opens the queue's own
+    connection and takes ``BEGIN IMMEDIATE`` while the caller still holds an open
+    write transaction on the SAME database file, which cannot resolve and times
+    out as ``database is locked``; the hook then returns ``None`` and its caller
+    writes the legacy row it was designed to fall back to.
+
+    **Un-muting for these rows cannot produce a second carrier over one id.**
+    ``write_through`` returns a DETACHED model and adds nothing to the inbox
+    table, so a row physically present there has no ``delivery_msg`` counterpart.
+    The tick and the legacy chain therefore serve DISJOINT row sets for the same
+    receiver, which is what keeps the single-emitter property a property of the
+    rows rather than of the switch.
+
+    Never raises: an unanswerable probe reports the coarse answer, which is the
+    behaviour before this fix.
+    """
+    if not queue_owns_delivery():
+        return False
+    if not receiver_id:
+        return True
+    try:
+        from cli_agent_orchestrator.clients.database import has_pending_legacy_messages
+
+        return not has_pending_legacy_messages(receiver_id)
+    except Exception:  # pragma: no cover -- an unanswerable probe keeps the mute
+        logger.debug("wp_arch row-scoped mute probe failed for %s", receiver_id, exc_info=True)
+        return True
 
 
 class LegacyReceiverDirectory:
