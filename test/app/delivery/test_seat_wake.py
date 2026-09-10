@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1081,3 +1082,44 @@ def test_the_service_sender_rule_has_one_implementation() -> None:
         assert is_service_sender(sender) is True, sender
     for sender in ("4ec96674", "wrk-p3b01", "codex_general-abc"):
         assert is_service_sender(sender) is False, sender
+
+
+def test_the_wake_line_carries_every_field_a_round_parses(harness: Harness, caplog) -> None:
+    """The log line's SHAPE is load-bearing, so it is pinned field by field.
+
+    The r1 EMPIRICAL memo observed that the arm above asserts the level and the
+    outcome and nothing else. That was a NIT while the line was only read by a
+    human. It stopped being one in r3: the live round's refusal-disposition
+    collector parses `receiver=` out of these lines to classify every
+    `no_terminal` refusal, and that classification is what a flip verdict is now
+    gated on. A field silently renamed or dropped would not fail a test — it
+    would make the next round's acceptance evidence wrong, which is the exact
+    failure mode this whole fix round exists to close.
+    """
+    caplog.set_level(logging.DEBUG, logger="cli_agent_orchestrator.app.delivery.tick")
+
+    harness.carrier.reason = "socket_unpublished"
+    harness.enqueue("shape1")
+    harness.tick.run_once(now=harness.clock.now())
+
+    lines = [r.message for r in caplog.records if r.message.startswith("delivery_wake receiver=")]
+    assert lines, "a refused wake left no line in the log"
+    line = lines[-1]
+
+    fields = dict(
+        part.split("=", 1)
+        for part in line.split()
+        if "=" in part and not part.startswith("delivery_wake")
+    )
+    assert fields["receiver"] == SEAT
+    assert fields["epoch"] == "1"
+    assert fields["carrier"], "carrier must name WHICH surface refused"
+    assert fields["outcome"], "outcome must name the refusal kind, not just emitted=False"
+    assert fields["emitted"] == "False"
+    assert fields["wake"] == "1", "the wake ordinal distinguishes a re-offer from a first try"
+    assert fields["claimed"] == "1"
+    assert fields["detail"] == "socket_unpublished"
+
+    # And `receiver=` must be parseable by the round's own regex, unquoted and
+    # whitespace-free, because that is how the collector reads it.
+    assert re.search(r"receiver=(\S+)", line).group(1) == SEAT
