@@ -38,10 +38,18 @@ AC11_LEGACY_IMPORTERS = {
     # NOT ``adapters``, so the fifth contract (only the composition root names an
     # adapter) still holds.
     "cli/commands/diag.py",
+    # WP-ARCH Amendment A slice 2a adds ONE entry, and it is lane C's
+    # ``cli/commands/diag.py`` pattern applied a fourth time.  ``cao gate show``
+    # lives in a dedicated command module that imports ``app.gate`` (the renderer)
+    # and reaches the read-only gate store through ``bootstrap.py``; ``cli/main.py``
+    # imports only that module (legacy-to-legacy).  It names ``app`` but NOT
+    # ``adapters``, so ``adapters-only-via-composition-root`` still holds, and the
+    # contact surface a reviewer reads stays one command file.
+    "cli/commands/gate.py",
     # WP-ARCH phase 3a (#584) added ONE entry, ``services/delivery_mirror.py``,
     # for the five observational hook points. Shadow-live mode is retired (#738)
-    # and the bridge went with it; the PATTERN did not, and the two entries below
-    # are its later applications.
+    # and the bridge went with it; the PATTERN did not, and the entries above and
+    # below are its later applications.
     # WP-ARCH phase 2a (#583) adds ONE entry, and it is not the file the blueprint
     # named. §5 lists ``api/main.py`` as the seventh, because D3b puts the hook
     # producer's append inside the two shipped route handlers — which is the right

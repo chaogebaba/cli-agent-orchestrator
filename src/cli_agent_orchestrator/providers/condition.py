@@ -566,6 +566,16 @@ _CLAUDE_SUBAGENT_WAIT = re.compile(
 _GROK_BUSY = re.compile(r"Waiting for response", re.IGNORECASE)
 _CLINE_BUSY = re.compile(r"\[thinking\]|\[run_commands\]", re.IGNORECASE)
 
+# F862 (#718): the chatgpt_web runner is a deterministic PROCESS, not a TUI whose
+# chrome carries a natural-language banner. When it hits a typed failure surface
+# (D4) it prints ONE structured marker line to its pane —
+# ``[chatgpt_web] CONDITION <code>[ reset=<hint>]`` — and the classifier below
+# maps the code onto the condition plane. Classifying on this MARKER (not on any
+# assistant text, D4 Do-NOT) keeps detection keyed to chrome/driver state.
+_CHATGPT_WEB_CONDITION = re.compile(
+    r"\[chatgpt_web\]\s+CONDITION\s+(?P<code>[a-z_]+)(?:\s+reset=(?P<reset>[^\n]+))?",
+)
+
 # PROC_EXITED (cline text anchor; the process-state path is handled separately by
 # the provider via pane_current_command == shell_baseline — see D5/precedence 1).
 _CLINE_PROC_EXITED = re.compile(r"\[Command exited with code \d+\]")
@@ -952,6 +962,67 @@ def _classify_waiting_on_subagents(provider: str, brows: List[str]) -> Optional[
     return None
 
 
+# F862 (#718): map the chatgpt_web runner's structured CONDITION marker (D4) onto
+# the condition plane. The runner prints ``[chatgpt_web] CONDITION <code>`` where
+# <code> is a RunnerErrorCode value; this translates the human-gated / cap /
+# net / auth codes into the closed taxonomy. bot_flagged rides DIALOG_BLOCKED
+# with the ``bot_flagged`` subtype so the auto-responder wait branch carries it to
+# WAITING_USER_ANSWER (D4). Codes that map to a plain ERROR TerminalStatus
+# (ui_changed, model_drift, truncated_answer, invalid_verdict, submit_unknown,
+# report_invalid, read_forbidden, egress_forbidden, attachment_identity,
+# upload_unconfirmed, pin_drift, attach_timeout) carry NO condition — they are
+# ordinary ERROR and return None here.
+_CHATGPT_WEB_CODE_MAP: Dict[str, Tuple[ConditionKind, str]] = {
+    "auth_wall": (ConditionKind.AUTH_EXPIRED, "auth_wall"),
+    "captcha": (ConditionKind.DIALOG_BLOCKED, "captcha"),
+    "bot_flagged": (ConditionKind.DIALOG_BLOCKED, "bot_flagged"),
+    "access_denied": (ConditionKind.DIALOG_BLOCKED, "access_denied"),
+    "quota": (ConditionKind.CAPPED, "quota"),
+    "net_interrupted": (ConditionKind.NET_INTERRUPTED, "reconnect_once"),
+    "context_too_large": (ConditionKind.CONTEXT_EXHAUSTED, "bundle_over_limit"),
+    "proc_exited": (ConditionKind.PROC_EXITED, "browser_crash"),
+    # r6 (Amendment C, "Code owed before certification"; NB-2): ``attach_timeout``
+    # is DELIBERATELY ABSENT from this map. r3 shipped it as
+    # ``TRANSIENT_OVERLOAD``/``attach_upload_stall`` on one live operator
+    # observation, but TRANSIENT_OVERLOAD is a kind base D4 never authorises for
+    # this code and it contradicts C2's condition table: the runner fails closed
+    # BEFORE the submit-triggering action, so the attempt is a nothing-sent ERROR
+    # the operator re-dispatches, not a load condition the fleet backs off from.
+    # Absent from the map means ``_classify_chatgpt_web`` returns None and the
+    # code surfaces as plain ``ERROR``/``attach_timeout`` — the D4 mapping this
+    # amendment authorises. Do not re-add a row here without a D4 revision.
+}
+
+
+def _classify_chatgpt_web(provider: str, brows: List[str]) -> Optional[Condition]:
+    """F862 (#718): translate the runner's CONDITION marker into a Condition (D4).
+
+    Classifies on the STRUCTURED marker the runner prints, never on assistant
+    text. Only the human-gated / cap / net / auth / context / proc classes map to
+    a condition; every other typed code is a plain ERROR and returns None."""
+    if provider != "chatgpt_web":
+        return None
+    for row in brows:
+        match = _CHATGPT_WEB_CONDITION.search(row)
+        if not match:
+            continue
+        code = match.group("code")
+        mapped = _CHATGPT_WEB_CODE_MAP.get(code)
+        if mapped is None:
+            return None
+        kind, subtype = mapped
+        reset = match.group("reset")
+        return Condition(
+            kind,
+            provider,
+            subtype,
+            row.strip(),
+            Confidence.HIGH,
+            reset_hint=reset.strip() if reset else None,
+        )
+    return None
+
+
 # The per-kind classifiers, applied then ranked by §2.2 precedence.
 # NOTE: CAPPED and CONTEXT are NOT in this tuple — both are dispatched explicitly
 # in classify_condition. CAPPED so codex can scope the scan to the current
@@ -965,6 +1036,7 @@ _KIND_CLASSIFIERS: Tuple[Callable[[str, List[str]], Optional[Condition]], ...] =
     _classify_transient,
     _classify_busy,
     _classify_waiting_on_subagents,
+    _classify_chatgpt_web,
 )
 
 

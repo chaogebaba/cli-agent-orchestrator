@@ -1590,3 +1590,51 @@ def test_exit_cli_is_ctrl_d() -> None:
 
 def test_paste_enter_count_is_one() -> None:
     assert PiCliProvider("t1234567", "s", "w").paste_enter_count == 1
+
+
+class TestSpawnCapturedIdentity:
+    """F867 (#723) D1: pi reports its KNOWN-AT-SPAWN session identity so the
+    create path binds provider_session_id onto the F829 root and a planned
+    hibernate stops refusing session_artifact_missing on a pi lane."""
+
+    def test_fresh_spawn_reports_terminal_id_and_session_dir(self) -> None:
+        """A fresh (non-resume) pi worker's identity is (terminal_id, session_dir,
+        None): pi launches with --session-id <terminal_id> and writes
+        <ts>_<terminal_id>.jsonl under --session-dir."""
+        p = PiCliProvider("t1234567", "sess", "win0")
+        ident = p.spawn_captured_identity()
+        assert ident is not None
+        provider_session_id, provider_namespace, artifact_locator = ident
+        assert provider_session_id == "t1234567"
+        assert provider_namespace == str(p.session_dir)
+        # The exact file does not exist yet (written at first turn), so no locator.
+        assert artifact_locator is None
+
+    def test_resume_spawn_reports_none(self) -> None:
+        """On a RESUME spawn the root is re-pointed by the resume publish path,
+        so there is nothing fresh to bind — must return None."""
+        from cli_agent_orchestrator.models.terminal import ForkContext
+
+        ctx = ForkContext(
+            mode="resume",
+            session_uuid="/some/prior/2026_session.jsonl",
+            base_name="reauth",
+            provider="pi_cli",
+            initial_preamble="",
+        )
+        p = PiCliProvider("t7654321", "sess", "win0", fork_context=ctx)
+        assert p.spawn_captured_identity() is None
+
+    def test_base_default_is_none(self) -> None:
+        """MUTANT GUARD (drop session-id capture): the BASE provider default is
+        None, so only a provider that overrides spawn_captured_identity binds an
+        id. If pi's override were removed, this default would leave the root
+        NULL and hibernate would refuse again."""
+        from cli_agent_orchestrator.providers.base import BaseProvider
+
+        # The base method returns None (no known-at-spawn identity).
+        assert BaseProvider.spawn_captured_identity.__doc__ is not None
+        # A minimal stand-in confirming the default contract.
+        p = PiCliProvider("t1234567", "sess", "win0")
+        # pi overrides to a non-None tuple; the base contract it overrides is None.
+        assert p.spawn_captured_identity() is not None

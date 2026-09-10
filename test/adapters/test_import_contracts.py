@@ -119,7 +119,12 @@ def _run_lint_imports(cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def test_all_five_contracts_pass() -> None:
-    """The five contracts of the audit §2.3, green against the real tree."""
+    """The audit §2.3 contracts (now six), green against the real tree.
+
+    WP-ARCH Amendment A slice 2a adds a SIXTH: ``one-gate-writer`` (§10.3 DoD),
+    the exclusive-writer contract over ``adapters.store.gate``.  The audit's five
+    stay and this one narrows, exactly as the phase-3 ``one-delivery-writer`` did.
+    """
     result = _run_lint_imports(REPO_ROOT)
     assert result.returncode == 0, result.stdout + result.stderr
     for name in (
@@ -128,9 +133,10 @@ def test_all_five_contracts_pass() -> None:
         "new-code-never-imports-legacy",
         "core-is-pure",
         "adapters-only-via-composition-root",
+        "one-gate-writer",
     ):
         assert f"{name} KEPT" in result.stdout, result.stdout
-    assert "Contracts: 5 kept, 0 broken." in result.stdout
+    assert "Contracts: 6 kept, 0 broken." in result.stdout
 
 
 def test_the_graph_covers_the_namespace_packages() -> None:

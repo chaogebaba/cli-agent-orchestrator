@@ -109,6 +109,16 @@ otel = [
 fleet = [
     "textual>=8,<9",
 ]
+# F862 (#718): the ChatGPT-web findings lane's browser data plane. Optional so a
+# server-only or non-findings install carries neither Playwright nor cloakbrowser
+# (D13: the runner imports them lazily; the pure logic is import-safe without
+# them). cloakbrowser ships the pinned patched Chromium via its `patchright`
+# extra — the lane is headful-only on that patched build (D5); stock Chromium was
+# bot-flagged on chatgpt.com. Pinned to the versions the runner was built against.
+chatgpt_web = [
+    "cloakbrowser[patchright]>=0.3.28,<0.4",
+    "playwright>=1.40,<2",
+]
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
@@ -568,6 +578,56 @@ name = "core-is-pure"
 type = "forbidden"
 source_modules = ["cli_agent_orchestrator.core"]
 forbidden_modules = ["sqlite3", "sqlalchemy", "libtmux", "fastapi", "httpx"]
+
+# WP-ARCH Amendment A slice 2a (§10.3 DoD): the gate commands are the EXCLUSIVE writer
+# of the gate store. "Architecture direction and exclusive writer ownership are two
+# checks, not one" (P7): new-code-never-imports-legacy above keeps app.gate off the
+# legacy tree; this keeps every module BUT the composition root off adapters.store.gate.
+# Source list is E with cli_agent_orchestrator.app replaced by its non-gate subpackages
+# (app.gate reaches the store through its own port, filled by bootstrap.py, which is the
+# sanctioned writer and is deliberately absent from this list — that absence IS the
+# exception, exactly as one-delivery-writer and adapters-only-via-composition-root use it).
+[[tool.importlinter.contracts]]
+name = "one-gate-writer"
+type = "forbidden"
+source_modules = [
+    "cli_agent_orchestrator.adapters",
+    "cli_agent_orchestrator.api",
+    "cli_agent_orchestrator.app.delivery",
+    "cli_agent_orchestrator.app.diag",
+    "cli_agent_orchestrator.app.worker_truth",
+    "cli_agent_orchestrator.backends",
+    "cli_agent_orchestrator.cli",
+    "cli_agent_orchestrator.clients",
+    "cli_agent_orchestrator.constants",
+    "cli_agent_orchestrator.core",
+    "cli_agent_orchestrator.ext_apps",
+    "cli_agent_orchestrator.graph",
+    "cli_agent_orchestrator.hooks",
+    "cli_agent_orchestrator.kernel",
+    "cli_agent_orchestrator.mcp_server",
+    "cli_agent_orchestrator.models",
+    "cli_agent_orchestrator.ops_mcp_server",
+    "cli_agent_orchestrator.plugins",
+    "cli_agent_orchestrator.providers",
+    "cli_agent_orchestrator.sandbox_bootstrap",
+    "cli_agent_orchestrator.schemas",
+    "cli_agent_orchestrator.security",
+    "cli_agent_orchestrator.services",
+    "cli_agent_orchestrator.sim",
+    "cli_agent_orchestrator.skills",
+    "cli_agent_orchestrator.telemetry",
+    "cli_agent_orchestrator.transcript_scrub",
+    "cli_agent_orchestrator.tui",
+    "cli_agent_orchestrator.utils",
+]
+forbidden_modules = ["cli_agent_orchestrator.adapters.store.gate"]
+# DIRECT imports only, exactly as adapters-only-via-composition-root sets it: the rule
+# is "no module but the composition root may NAME the gate store". Every edge module
+# reaches bootstrap.py transitively the moment api/main.py wires it, and bootstrap.py IS
+# the sanctioned writer, so without this the contract would forbid the very indirection
+# it exists to mandate.
+allow_indirect_imports = "true"
 
 # Adapters are named in exactly one place: cli_agent_orchestrator/bootstrap.py, which builds
 # them and hands them to app as core.ports Protocols. bootstrap.py is deliberately absent

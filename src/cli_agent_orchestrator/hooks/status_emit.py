@@ -16,23 +16,42 @@ Contract, in order (D3, gate SHOULD-2/SHOULD-5, NIT-1):
    first** — tmp file in the SAME directory, then ``os.replace`` — because the
    300 ms debounce and in-flight cancellation make write-then-exit mandatory:
    a process that printed before it wrote could be cancelled between the two.
-4. Print exactly ONE line ``<model> · <effort>`` — regardless of the write's
-   outcome (NIT-1: a failed sidecar write degrades the fleet marker, it must
-   never blank the user's pane). The line is CONSTANT while the selection is
-   constant (SHOULD-5): no clock, counter, age or spinner, so Claude's
-   ``wait_until_input_ready`` byte-identical stability check still settles.
+4. CHAIN the user's own statusline (F894 #746): read ``statusLine.command``
+   from ``~/.claude/settings.json`` and, when it is a ``type: "command"``
+   entry, run it with the SAME stdin JSON and print its stdout verbatim. The
+   per-terminal ``--settings`` overlay makes CAO's ``statusLine`` win over the
+   user's, so without this chain the user's bar is silently REPLACED in every
+   CAO pane rather than augmented.
+5. Otherwise print exactly ONE line ``<model> · <effort>`` — regardless of the
+   write's outcome (NIT-1: a failed sidecar write degrades the fleet marker, it
+   must never blank the user's pane). The constant line is also the fallback
+   whenever the user command is absent, unreadable, times out, exits non-zero
+   or prints nothing.
 
-Imports are stdlib + ``json`` ONLY (AC5): the whole steady-state budget is one
+Imports are stdlib + ``json`` ONLY (AC5): CAO's own steady-state budget is one
 subprocess per Claude terminal per ``refreshInterval``, runtime ≤ 50 ms, no
-network. It deliberately does NOT import ``cli_agent_orchestrator.constants``
-(that would drag the package import chain into the 50 ms budget); the home dir
-is resolved from the same env var / default that ``constants`` uses, inline.
+network. The chained user command is an ADDITIONAL subprocess whose cost is the
+user's own (capped at ``_USER_TIMEOUT_S`` = 1 s, after which the constant line
+is printed instead). It deliberately does NOT import
+``cli_agent_orchestrator.constants`` (that would drag the package import chain
+into the 50 ms budget); the home dir is resolved from the same env var /
+default that ``constants`` uses, inline.
+
+SHOULD-5 stability, with the chain: CAO's own line is constant by construction,
+and a user statusline is *expected* to be stable while the session is idle. A
+user script that prints a clock, a counter or any per-refresh-changing token
+makes the pane bytes change on every ``refreshInterval`` and so breaks Claude's
+``wait_until_input_ready`` byte-identical stability check — that is the user's
+script to fix. ``observe.claude_statusline = false`` in
+``CAO_HOME_DIR/settings.json`` remains the escape hatch: it drops the overlay
+entirely, restoring the user's bar (and dropping the fleet model/effort marker).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -42,6 +61,12 @@ _SEP = " \u00b7 "
 # What the printed line shows for an absent field (N2: non-thinking model has no
 # effort.level). Kept a single glyph so the line stays short and constant.
 _UNKNOWN = "-"
+# Wall-clock cap on the chained user statusline command (F894). The emitter is
+# re-run every ``refreshInterval`` (1500 ms), so a slower script must not stack.
+_USER_TIMEOUT_S = 1.0
+# Recursion guard: a user ``statusLine.command`` naming this very module would
+# re-enter the emitter on every refresh. Treated as "no user command".
+_SELF_MODULE = "cli_agent_orchestrator.hooks.status_emit"
 
 
 def _home_dir() -> Path:
@@ -148,6 +173,70 @@ def _write_sidecar(
         return False
 
 
+def _user_settings_path() -> Path:
+    """``~/.claude/settings.json`` — the user's own Claude settings file."""
+    return Path.home() / ".claude" / "settings.json"
+
+
+def _user_statusline_command() -> str | None:
+    """The user's own ``statusLine.command``, or None (F894 #746).
+
+    None whenever the file is missing/unreadable/not JSON, ``statusLine`` is
+    absent or not an object, ``type`` is not ``"command"``, ``command`` is not a
+    non-empty string, or the command names this module (recursion guard).
+    """
+    try:
+        raw = _user_settings_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        settings = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(settings, dict):
+        return None
+    entry = settings.get("statusLine")
+    if not isinstance(entry, dict) or entry.get("type") != "command":
+        return None
+    command = entry.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if _SELF_MODULE in command:
+        return None
+    return command
+
+
+def _run_user_statusline(command: str, raw_stdin: str) -> str | None:
+    """Run the user's statusline command on the same stdin JSON.
+
+    Returns its stdout with ONE trailing newline stripped (multi-line output is
+    preserved as-is), or None on timeout, non-zero exit, empty output or a spawn
+    failure — the caller then prints the constant line. stderr is captured and
+    discarded: it must never reach stdout, which is the pane's status text.
+    The pane environment is passed through untouched (no ``env=`` override), so
+    the user's script sees exactly what a plain Claude terminal gives it.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            input=raw_stdin,
+            capture_output=True,
+            text=True,
+            timeout=_USER_TIMEOUT_S,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout
+    if not out.strip():
+        return None
+    if out.endswith("\n"):
+        out = out[:-1]
+    return out
+
+
 def _line(model: str | None, effort: str | None) -> str:
     """The single CONSTANT status line (SHOULD-5): ``<model> · <effort>``."""
     return f"{model or _UNKNOWN}{_SEP}{effort or _UNKNOWN}"
@@ -175,9 +264,16 @@ def main() -> int:
     if terminal_id:
         _write_sidecar(_home_dir(), terminal_id, model, effort, session_id)
 
-    # Print exactly one line, unconditionally. ``print`` adds the trailing
-    # newline Claude expects for a single-line status.
-    sys.stdout.write(_line(model, effort) + "\n")
+    # Then CHAIN the user's own statusline (F894 #746) and print ITS output,
+    # falling back to CAO's constant line when there is none or it fails. Either
+    # way exactly one write happens, unconditionally: the pane is never blanked.
+    rendered: str | None = None
+    command = _user_statusline_command()
+    if command is not None:
+        rendered = _run_user_statusline(command, raw)
+    if rendered is None:
+        rendered = _line(model, effort)
+    sys.stdout.write(rendered + "\n")
     return 0
 
 

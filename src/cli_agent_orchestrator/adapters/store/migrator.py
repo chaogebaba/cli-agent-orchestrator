@@ -265,6 +265,222 @@ CREATE TABLE IF NOT EXISTS seat_digest (
 """
 
 # ---------------------------------------------------------------------------
+# WP-ARCH Amendment A, slice 2a — the gate record (blueprint §10.2).
+#
+# Added to THIS migrator rather than a second one, for the reason phase 3 gave:
+# a second migrator is how one schema comes to have two authorities.  Every
+# statement is ``CREATE TABLE IF NOT EXISTS`` so a second boot is a no-op, and
+# the DDL is additive and, with nothing in the live supervisor loop calling the
+# gate service (shadow mode, §10.7), entirely inert — the tables exist and
+# nothing writes them until a caller does.
+#
+# The column set is §10.2's, field for field.  Field names match the value
+# types in ``core/gate.py`` so the adapter is a straight row<->model map, and
+# the two verification hashes are SEPARATE columns (``subject_sha``,
+# ``report_bytes_sha``) because AC-A8 verifies each against its own authority.
+# ``owner_conversation``/``owner_epoch`` fence the supervisor conversation (P2);
+# ``row_version`` is optimistic concurrency; ``generation`` is the staleness
+# test.  The question tables are the ROWS only — the question primitive and its
+# MCP tools are slice 2b (§10.3) — but ``claim_ownership`` (2a) rewrites the
+# PENDING/ESCALATED rows, so the table and its index must exist now.
+# ---------------------------------------------------------------------------
+
+_GATE_RUN_DDL = """
+CREATE TABLE IF NOT EXISTS gate_run (
+  run_id              TEXT PRIMARY KEY,
+  wp                  TEXT NOT NULL,
+  lane                TEXT NOT NULL,
+  workflow_source_sha TEXT NOT NULL DEFAULT '',
+  input_sha           TEXT NOT NULL DEFAULT '',
+  owner_conversation  TEXT NOT NULL,
+  owner_epoch         INTEGER NOT NULL,
+  max_rounds          INTEGER NOT NULL,
+  row_version         INTEGER NOT NULL DEFAULT 1,
+  state               TEXT NOT NULL DEFAULT 'open',
+  created_at          TEXT NOT NULL)
+"""
+
+# ``build_inputs`` and ``review_snapshot`` are JSON-serialised ArtifactManifests:
+# a manifest is a versioned value the round is identified by, not a set of columns
+# to query on, so it is stored whole and the artifact sha is computed from it on
+# read.  ``review_snapshot`` is NULL until the freeze (P1) — a change to the
+# reviewed bytes after the freeze opens a SUCCESSOR round, never a re-freeze, so
+# the column moves NULL -> value exactly once.
+_GATE_ROUND_DDL = """
+CREATE TABLE IF NOT EXISTS gate_round (
+  round_id             TEXT PRIMARY KEY,
+  run_id               TEXT NOT NULL,
+  round_no             INTEGER NOT NULL,
+  predecessor_round_id TEXT,
+  build_inputs         TEXT NOT NULL,
+  review_snapshot      TEXT,
+  execution_target     TEXT NOT NULL,
+  test_command         TEXT NOT NULL DEFAULT '',
+  evidence_tier        TEXT NOT NULL DEFAULT '',
+  fixture_corpus_sha   TEXT,
+  fixture_frame_count  INTEGER,
+  subject_sha          TEXT,
+  report_bytes_sha     TEXT,
+  verdict_report_sha   TEXT,
+  state                TEXT NOT NULL DEFAULT 'open',
+  generation           INTEGER NOT NULL DEFAULT 0,
+  row_version          INTEGER NOT NULL DEFAULT 1,
+  created_at           TEXT NOT NULL,
+  closed_at            TEXT,
+  UNIQUE(run_id, round_no))
+"""
+
+# An independent assignment aggregate (P1): ``round_id`` is NULLABLE so a non-gate
+# lane's assignment uses the same row with no synthetic round.  ``pins`` is a JSON
+# array of pin refs.  A terminal runs several assignments and an assignment
+# outlives an incarnation, so nothing here is keyed on a terminal id.
+_GATE_DISPATCH_DDL = """
+CREATE TABLE IF NOT EXISTS gate_dispatch (
+  dispatch_id          TEXT PRIMARY KEY,
+  round_id             TEXT,
+  role                 TEXT NOT NULL,
+  position             TEXT NOT NULL,
+  routing_revision     TEXT NOT NULL DEFAULT '',
+  conversation_id      TEXT,
+  terminal_incarnation TEXT,
+  request_id           TEXT NOT NULL,
+  effect_id            TEXT,
+  pins                 TEXT NOT NULL DEFAULT '[]',
+  brief_blob_sha       TEXT NOT NULL DEFAULT '',
+  state                TEXT NOT NULL DEFAULT 'prepared',
+  outcome              TEXT)
+"""
+
+# Intent BEFORE the operation (P1); the adapter dedups on ``effect_id`` — the
+# PRIMARY KEY is the dedup.  A crash between recording the intent and the operation
+# settling is repaired from this row, not re-attempted.
+_GATE_EFFECT_INTENT_DDL = """
+CREATE TABLE IF NOT EXISTS gate_effect_intent (
+  effect_id    TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL,
+  round_id     TEXT,
+  dispatch_id  TEXT,
+  approval_ref TEXT,
+  requested_at TEXT NOT NULL)
+"""
+
+# The result is keyed on the intent's ``effect_id`` (one result per intent).
+# ``settled_at`` is NULL while the outcome is UNCERTAIN and unreconciled (R30).
+_GATE_EFFECT_RESULT_DDL = """
+CREATE TABLE IF NOT EXISTS gate_effect_result (
+  effect_id    TEXT PRIMARY KEY,
+  outcome      TEXT NOT NULL,
+  evidence_ref TEXT NOT NULL DEFAULT '',
+  settled_at   TEXT)
+"""
+
+# ``statement`` is immutable once raised; identity travels round to round (AC-A2).
+# A finding is OPEN until a disposition row names its killer.
+_GATE_OPEN_FINDING_DDL = """
+CREATE TABLE IF NOT EXISTS gate_open_finding (
+  finding_id      TEXT PRIMARY KEY,
+  raised_in_round TEXT NOT NULL,
+  run_id          TEXT NOT NULL,
+  severity        TEXT NOT NULL,
+  statement       TEXT NOT NULL,
+  created_at      TEXT NOT NULL)
+"""
+
+# Appended, never overwritten (P7): FIXED carries killer test/mutant AT the
+# reviewed revision, WITHDRAWN an actor and reason.  ``seq`` orders the appends
+# for one finding.  The service validates the evidence before a row lands here.
+_GATE_DISPOSITION_DDL = """
+CREATE TABLE IF NOT EXISTS gate_disposition (
+  finding_id            TEXT NOT NULL,
+  seq                   INTEGER NOT NULL,
+  kind                  TEXT NOT NULL,
+  reviewed_artifact_sha TEXT NOT NULL DEFAULT '',
+  killer_test           TEXT,
+  killer_mutant         TEXT,
+  actor                 TEXT,
+  reason                TEXT,
+  at                    TEXT NOT NULL,
+  PRIMARY KEY (finding_id, seq))
+"""
+
+# Revision-bound consumer coverage (AC-A9): ``consumers`` and ``unresolved_dynamic``
+# are JSON arrays.  Bound to a round AND to the reviewed artifact sha, so it is not
+# a standalone completeness claim.  One coverage per round.
+_GATE_CONSUMER_COVERAGE_DDL = """
+CREATE TABLE IF NOT EXISTS gate_consumer_coverage (
+  round_id              TEXT PRIMARY KEY,
+  xref_sha              TEXT NOT NULL,
+  reviewed_artifact_sha TEXT NOT NULL,
+  consumers             TEXT NOT NULL DEFAULT '[]',
+  unresolved_dynamic    TEXT NOT NULL DEFAULT '[]')
+"""
+
+# The question store (§10.2, P2) — ROWS ONLY in 2a.  The question primitive
+# (``ask_supervisor``) and its wait adapters are 2b; ``claim_ownership`` (2a)
+# rewrites the PENDING/ESCALATED rows, so the table and the partial unique index
+# that enforces "one open question per dispatch" must exist now.
+_ROUND_QUESTION_DDL = """
+CREATE TABLE IF NOT EXISTS round_question (
+  question_id        TEXT PRIMARY KEY,
+  dispatch_id        TEXT NOT NULL,
+  round_id           TEXT,
+  client_request_id  TEXT NOT NULL,
+  owner_conversation TEXT NOT NULL,
+  owner_epoch        INTEGER NOT NULL,
+  continuation_kind  TEXT NOT NULL,
+  continuation_ref   TEXT NOT NULL,
+  asked_at           TEXT NOT NULL,
+  expires_at         TEXT NOT NULL,
+  question           TEXT NOT NULL,
+  options_json       TEXT NOT NULL DEFAULT '[]',
+  answer_schema      TEXT,
+  default_policy     TEXT,
+  blocking           INTEGER NOT NULL,
+  state              TEXT NOT NULL CHECK (state IN ('PENDING','ESCALATED','ANSWERED','EXPIRED')),
+  answer_event_id    TEXT,
+  consumed_at        TEXT,
+  user_prompt_id     TEXT,
+  row_version        INTEGER NOT NULL DEFAULT 1)
+"""
+
+# Append-only, one row per submitted answer; retries return the recorded row.
+_QUESTION_ANSWER_DDL = """
+CREATE TABLE IF NOT EXISTS question_answer (
+  answer_event_id   TEXT PRIMARY KEY,
+  question_id       TEXT NOT NULL,
+  answer            TEXT NOT NULL,
+  answered_by       TEXT NOT NULL,
+  answered_at       TEXT NOT NULL,
+  client_request_id TEXT NOT NULL)
+"""
+
+# Committed WITH the answer; consumption is a separate record, so ANSWERED is not
+# proof of receipt (P2).
+_ANSWER_DELIVERY_INTENT_DDL = """
+CREATE TABLE IF NOT EXISTS answer_delivery_intent (
+  answer_event_id TEXT PRIMARY KEY,
+  state           TEXT NOT NULL CHECK (state IN ('PENDING','SENT','CONSUMED','FAILED')),
+  settled_at      TEXT)
+"""
+
+# Append-only; one row per ACCEPTED claim (DESIGN r2 non-blocking 1).  Identical
+# retries by ``client_request_id`` return this row.
+_OWNERSHIP_TRANSFER_DDL = """
+CREATE TABLE IF NOT EXISTS ownership_transfer (
+  transfer_id         TEXT PRIMARY KEY,
+  prior_conversation  TEXT NOT NULL,
+  prior_epoch         INTEGER NOT NULL,
+  new_conversation    TEXT NOT NULL,
+  new_epoch           INTEGER NOT NULL,
+  run_id              TEXT,
+  runs_rewritten      INTEGER NOT NULL,
+  questions_rewritten INTEGER NOT NULL,
+  claimed_by          TEXT NOT NULL,
+  claimed_at          TEXT NOT NULL,
+  client_request_id   TEXT NOT NULL UNIQUE)
+"""
+
+# ---------------------------------------------------------------------------
 # Additive columns, applied idempotently AFTER the create steps.
 #
 # ``CREATE TABLE IF NOT EXISTS`` is a no-op against a table 3a already created,
@@ -358,6 +574,67 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
             "ON seat_digest(receiver_id, epoch) WHERE consumed_at IS NULL",
         ),
     ),
+    # -- WP-ARCH Amendment A, slice 2a: the gate record (§10.2) ------------
+    ("gate_run", (_GATE_RUN_DDL,)),
+    ("gate_round", (_GATE_ROUND_DDL,)),
+    (
+        "gate_round_indexes",
+        (
+            # ``rounds_for_run`` and ``cao gate show`` list a run's rounds in
+            # order; the round projection joins on run_id.
+            "CREATE INDEX IF NOT EXISTS ix_gate_round_run "
+            "ON gate_round(run_id, round_no)",
+        ),
+    ),
+    ("gate_dispatch", (_GATE_DISPATCH_DDL,)),
+    (
+        "gate_dispatch_indexes",
+        (
+            # The round projection joins dispatches by round; partial because a
+            # non-gate dispatch carries no round.
+            "CREATE INDEX IF NOT EXISTS ix_gate_dispatch_round "
+            "ON gate_dispatch(round_id) WHERE round_id IS NOT NULL",
+        ),
+    ),
+    ("gate_effect_intent", (_GATE_EFFECT_INTENT_DDL,)),
+    (
+        "gate_effect_intent_indexes",
+        (
+            "CREATE INDEX IF NOT EXISTS ix_gate_effect_intent_round "
+            "ON gate_effect_intent(round_id) WHERE round_id IS NOT NULL",
+        ),
+    ),
+    ("gate_effect_result", (_GATE_EFFECT_RESULT_DDL,)),
+    ("gate_open_finding", (_GATE_OPEN_FINDING_DDL,)),
+    (
+        "gate_open_finding_indexes",
+        (
+            # ``open_findings_for_run`` scans a run's findings to carry the still
+            # open ones into the next brief (AC-A2).
+            "CREATE INDEX IF NOT EXISTS ix_gate_open_finding_run "
+            "ON gate_open_finding(run_id)",
+        ),
+    ),
+    ("gate_disposition", (_GATE_DISPOSITION_DDL,)),
+    ("gate_consumer_coverage", (_GATE_CONSUMER_COVERAGE_DDL,)),
+    ("round_question", (_ROUND_QUESTION_DDL,)),
+    (
+        "round_question_indexes",
+        (
+            # AC-A10's "one open question per dispatch": ESCALATED still blocks and
+            # holds the open slot, so both states are in the partial index.
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_question_open "
+            "ON round_question(dispatch_id) WHERE state IN ('PENDING','ESCALATED')",
+            # ``claim_ownership`` (2a) rewrites PENDING/ESCALATED rows by owner
+            # conversation; without this the rewrite scans the whole table.
+            "CREATE INDEX IF NOT EXISTS ix_question_owner "
+            "ON round_question(owner_conversation) "
+            "WHERE state IN ('PENDING','ESCALATED')",
+        ),
+    ),
+    ("question_answer", (_QUESTION_ANSWER_DDL,)),
+    ("answer_delivery_intent", (_ANSWER_DELIVERY_INTENT_DDL,)),
+    ("ownership_transfer", (_OWNERSHIP_TRANSFER_DDL,)),
 )
 
 

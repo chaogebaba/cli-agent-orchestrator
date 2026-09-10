@@ -4983,6 +4983,55 @@ class PrincipalRefused(Exception):
         self.result = result
 
 
+class CallerGone(Exception):
+    """F867 (#723) r4: the child's caller vanished (or entered teardown) at the
+    instant the child row was written.
+
+    Raised from INSIDE the child-publication transaction, after the child INSERT
+    has taken the write lock, so the caller check and the child insertion are one
+    consistency boundary: a delete that commits before the INSERT is seen here,
+    and a delete that arrives after it cannot commit until this transaction ends.
+    Raising aborts that transaction, so no orphan child row can survive the
+    refusal. ``reason`` is ``missing`` or ``under_teardown``; the create path
+    reshapes it into the typed ``E-CALLER-GONE`` surface callers already know.
+    """
+
+    def __init__(self, caller_id: str, terminal_id: str, reason: str) -> None:
+        self.caller_id = caller_id
+        self.terminal_id = terminal_id
+        self.reason = reason
+        super().__init__(f"caller '{caller_id}' {reason} at publication of child '{terminal_id}'")
+
+
+def _assert_caller_live_in_publication_txn(
+    db: Any, *, caller_id: Optional[str], terminal_id: str, tmux_session: str
+) -> None:
+    """F867 r4: the caller-liveness half of the atomic publication step.
+
+    MUST be called only AFTER the child ``INSERT`` has been flushed on ``db``.
+    That ordering is the whole point: the flush leaves this transaction holding
+    the write lock, so no concurrent ``delete_terminal`` can commit between this
+    read and our commit, and any delete that committed earlier is already
+    visible. Checking before the insert would restore the very check-then-write
+    window this closes.
+    """
+    if not caller_id:
+        return
+    row = db.query(TerminalModel.id).filter(TerminalModel.id == caller_id).first()
+    if row is None:
+        raise CallerGone(caller_id, terminal_id, "missing")
+    # Teardown intent is recorded BEFORE the row is deleted, so a caller that is
+    # still row-present but already tearing down would otherwise publish a child
+    # that is orphaned moments later. Read it inside the same critical section.
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        active_teardown_scope_keys,
+    )
+
+    teardown_keys = active_teardown_scope_keys()
+    if caller_id in teardown_keys or tmux_session in teardown_keys:
+        raise CallerGone(caller_id, terminal_id, "under_teardown")
+
+
 class SeededSessionConflict(Exception):
     """F829 A2.3 (AC-A2.11): a fresh seeded uuid already binds another root.
 
@@ -5635,14 +5684,29 @@ def publish_current_terminal(
         )
 
 
-def set_conversation_lifecycle(identity_key: str, lifecycle: str) -> None:
-    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach)."""
+def set_conversation_lifecycle(
+    identity_key: str,
+    lifecycle: str,
+    *,
+    artifact_locator: Optional[str] = None,
+) -> None:
+    """F829: set a root's lifecycle (D2 transitions, D6 expiry, D8 detach).
+
+    F867 (#723) r2 R2-1: when ``artifact_locator`` is supplied it is persisted
+    onto the root in the SAME transaction as the lifecycle write, so a hibernate
+    commit lands the discovered recoverable-artifact path atomically with the
+    ``hibernated`` lifecycle. A ``None`` locator leaves the stored value intact
+    (never blanks a previously-bound locator).
+    """
     with SessionLocal.begin() as db:
+        _fields: Dict[Any, Any] = {
+            ConversationIdentityModel.lifecycle: lifecycle,
+            ConversationIdentityModel.updated_at: _utcnow(),
+        }
+        if artifact_locator is not None:
+            _fields[ConversationIdentityModel.artifact_locator] = artifact_locator
         db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).update(
-            {
-                ConversationIdentityModel.lifecycle: lifecycle,
-                ConversationIdentityModel.updated_at: _utcnow(),
-            },
+            _fields,
             synchronize_session=False,
         )
 
@@ -5828,8 +5892,14 @@ def create_terminal(
     resolved_model: Optional[str] = None,
     auth_token: Optional[str] = None,
     root_admission: Optional["RootAdmission"] = None,
+    require_live_caller: bool = False,
 ) -> Dict[str, Any]:
-    """Create terminal metadata record."""
+    """Create terminal metadata record.
+
+    ``require_live_caller`` (F867 r4) makes the caller-liveness check part of THIS
+    transaction: an existing-session child create asks for it, and the child row
+    is written only if its caller row is still there when the write lock is held.
+    """
     import json as _json
 
     with SessionLocal() as db:
@@ -5866,6 +5936,17 @@ def create_terminal(
             synchronize_session=False,
         )
         db.refresh(terminal)
+        # F867 (#723) r4: ONE consistency boundary. The child INSERT above is
+        # flushed, so this transaction holds the write lock; checking the caller
+        # HERE (not before the insert) means no delete can slip between the check
+        # and the publish, and a refusal aborts this transaction, leaving no row.
+        if require_live_caller:
+            _assert_caller_live_in_publication_txn(
+                db,
+                caller_id=caller_id,
+                terminal_id=terminal_id,
+                tmux_session=tmux_session,
+            )
         # F631 §3: identity row in the SAME transaction as the terminals row.
         _register_terminal_identity(
             db,
@@ -6018,8 +6099,13 @@ def create_terminal_with_warm_intent(
     resolved_model: Optional[str] = None,
     auth_token: Optional[str] = None,
     root_admission: Optional["RootAdmission"] = None,
+    require_live_caller: bool = False,
 ) -> Dict[str, Any]:
-    """Publish terminal metadata and a fork-only warm intent together."""
+    """Publish terminal metadata and a fork-only warm intent together.
+
+    ``require_live_caller`` (F867 r4): same atomic caller check as
+    ``create_terminal`` — see ``_assert_caller_live_in_publication_txn``.
+    """
     import json as _json
     import uuid
 
@@ -6055,6 +6141,17 @@ def create_terminal_with_warm_intent(
             synchronize_session=False,
         )
         db.refresh(terminal)
+        # F867 (#723) r4: ONE consistency boundary. The child INSERT above is
+        # flushed, so this transaction holds the write lock; checking the caller
+        # HERE (not before the insert) means no delete can slip between the check
+        # and the publish, and a refusal aborts this transaction, leaving no row.
+        if require_live_caller:
+            _assert_caller_live_in_publication_txn(
+                db,
+                caller_id=caller_id,
+                terminal_id=terminal_id,
+                tmux_session=tmux_session,
+            )
         # F631 §3: identity row in the SAME transaction as the terminals row.
         # This writer never receives a provider_session_id (the warm-fork path
         # captures it later), so the row starts with a NULL resume key.
