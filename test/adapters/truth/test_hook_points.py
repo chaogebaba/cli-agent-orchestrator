@@ -38,6 +38,14 @@ AC11_LEGACY_IMPORTERS = {
     # NOT ``adapters``, so the fifth contract (only the composition root names an
     # adapter) still holds.
     "cli/commands/diag.py",
+    # WP-ARCH Amendment A slice 2a adds ONE entry, and it is lane C's
+    # ``cli/commands/diag.py`` pattern applied a fourth time.  ``cao gate show``
+    # lives in a dedicated command module that imports ``app.gate`` (the renderer)
+    # and reaches the read-only gate store through ``bootstrap.py``; ``cli/main.py``
+    # imports only that module (legacy-to-legacy).  It names ``app`` but NOT
+    # ``adapters``, so ``adapters-only-via-composition-root`` still holds, and the
+    # contact surface a reviewer reads stays one command file.
+    "cli/commands/gate.py",
     # WP-ARCH phase 3a (#584) adds ONE entry. The five delivery hook points sit in
     # ``clients/database.py``, ``services/mailbox_service.py`` and
     # ``services/inbox_service.py``, but each is a legacy-to-legacy call into

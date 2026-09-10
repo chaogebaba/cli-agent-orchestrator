@@ -87,8 +87,10 @@ __all__ = [
     "STATUS_ENV_VAR",
     "STATUS_PROVIDERS_ENV_VAR",
     "WorkerTruthRuntime",
+    "build_gate_service",
     "build_legacy_inbox_status",
     "build_readonly_diag_stores",
+    "build_readonly_gate_store",
     "build_terminal_scope",
     "current_runtime",
     "delivery_position",
@@ -707,3 +709,53 @@ def build_legacy_inbox_status(db_path: str | Path | None = None) -> dict[int, st
         return {}
     finally:
         pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Gate record wiring (WP-ARCH Amendment A, slice 2a).
+#
+# The gate store is a SEPARATE adapter, named only here, exactly as the queue
+# and event log are.  Slice 2a is SHADOW: the migrator (which runs at every boot)
+# creates the gate tables, but nothing in the live supervisor loop calls the gate
+# service — there is no routing.toml change and no hook change.  So this module
+# offers two builders and calls neither at boot; a caller (the CLI, or 2c's
+# workflow shim) asks for a service or a read-only store when it needs one, and
+# until then the gate tables sit inert beside the delivery ones.
+# ---------------------------------------------------------------------------
+
+
+def build_gate_service(db_path: str | Path | None = None, *, clock: Clock | None = None) -> object:
+    """A read/write :class:`GateRoundService` over the LIVE database.
+
+    Returns ``object`` in the annotation to keep ``core.ports`` the only vocabulary
+    this module's signature imposes on callers; the concrete type is
+    ``app.gate.service.GateRoundService`` and a caller that wants the methods
+    imports that type for its own annotation.  Built on demand rather than at boot
+    because slice 2a is shadow — the service exists to be called by the CLI and by
+    2c's workflow shim, not by the supervisor loop.
+    """
+    from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
+    from cli_agent_orchestrator.app.gate.service import GateRoundService
+
+    resolved_clock: Clock = clock if clock is not None else SystemClock()
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ConnectionPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    store = SqliteGateStore(pool, clock=resolved_clock)
+    return GateRoundService(store, clock=resolved_clock)
+
+
+def build_readonly_gate_store(db_path: str | Path | None = None) -> object:
+    """A read-only :class:`SqliteGateStore` for ``cao gate show``.
+
+    The same store class the server writes with, over a ``mode=ro`` connection
+    (WAL permits the concurrent reader), so ``cao gate show`` can never take a
+    write lock on the live coordination database.  Returns ``object`` for the same
+    reason :func:`build_gate_service` does; the CLI imports the concrete type for
+    its own annotation.  A second, read-only reimplementation of the gate SELECTs
+    would be free to disagree with the writer about what a row means.
+    """
+    from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
+
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    return SqliteGateStore(pool, clock=SystemClock())
