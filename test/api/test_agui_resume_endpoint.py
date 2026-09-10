@@ -64,7 +64,7 @@ class TestSurfaceGate:
 
     def test_404_when_disabled(self, monkeypatch):
         monkeypatch.setenv("CAO_AGUI_ENABLED", "false")
-        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
         resp = client.post(
             "/agui/v1/interrupts/some-id/resume",
             json={"decision": "approve"},

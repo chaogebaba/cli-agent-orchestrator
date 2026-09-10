@@ -120,7 +120,7 @@ class _FakeBridge:
 def test_run_404_when_agui_disabled(monkeypatch):
     """POST /agui/v1/run returns 404 when AG-UI surface is disabled."""
     monkeypatch.setenv("CAO_AGUI_ENABLED", "false")
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
 
     resp = client.post("/agui/v1/run", json=_minimal_body())
     assert resp.status_code == 404
