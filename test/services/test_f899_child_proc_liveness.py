@@ -542,7 +542,10 @@ def test_r2_empty_sample_yields_no_verdict(quiescent_error, install_provider):
 # ── r2 ruling 3: pi_cli startup-error precondition ─────────────────────────
 
 
-def _pi_provider(monkeypatch, *, init_state, initialized):
+def _bare_pi(initialized):
+    """A PiCliProvider with only what get_status touches. __init__ is skipped on
+    purpose (it builds runtime dirs); the native-status probe is stubbed off so
+    the buffer path under test is the one that runs."""
     from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
 
     provider = PiCliProvider.__new__(PiCliProvider)
@@ -550,9 +553,24 @@ def _pi_provider(monkeypatch, *, init_state, initialized):
     provider._initialized = initialized
     provider._tui_processing_seen = False
     provider._task_dispatched = False
+    provider._resolve_native_status = lambda _buffer: None  # type: ignore[method-assign]
+    return provider
+
+
+def _pi_provider(monkeypatch, *, init_state, initialized):
+    provider = _bare_pi(initialized)
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.get_terminal_metadata",
         lambda _tid: {"init_state": init_state},
+    )
+    return provider
+
+
+def _pi_provider_db_down(monkeypatch, *, initialized):
+    provider = _bare_pi(initialized)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
     )
     return provider
 
@@ -575,32 +593,12 @@ def test_r3_launch_window_still_classifies_a_genuine_startup_failure(monkeypatch
 
 def test_r3_initialized_flag_alone_closes_the_launch_window(monkeypatch):
     """_initialized is sufficient even when the row is unreadable."""
-    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
-
-    provider = PiCliProvider.__new__(PiCliProvider)
-    provider.terminal_id = "t1"
-    provider._initialized = True
-    provider._tui_processing_seen = False
-    provider._task_dispatched = False
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
-    )
+    provider = _pi_provider_db_down(monkeypatch, initialized=True)
     assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
 
 
 def test_r3_unreadable_row_and_uninitialized_still_classifies_error(monkeypatch):
     """Fail-closed the other way: no evidence the launch window closed ⇒ the
     banner keeps its ERROR meaning, exactly as before r2."""
-    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
-
-    provider = PiCliProvider.__new__(PiCliProvider)
-    provider.terminal_id = "t1"
-    provider._initialized = False
-    provider._tui_processing_seen = False
-    provider._task_dispatched = False
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
-    )
+    provider = _pi_provider_db_down(monkeypatch, initialized=False)
     assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.ERROR
