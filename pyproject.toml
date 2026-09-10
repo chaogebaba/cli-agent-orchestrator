@@ -109,6 +109,16 @@ otel = [
 fleet = [
     "textual>=8,<9",
 ]
+# F862 (#718): the ChatGPT-web findings lane's browser data plane. Optional so a
+# server-only or non-findings install carries neither Playwright nor cloakbrowser
+# (D13: the runner imports them lazily; the pure logic is import-safe without
+# them). cloakbrowser ships the pinned patched Chromium via its `patchright`
+# extra — the lane is headful-only on that patched build (D5); stock Chromium was
+# bot-flagged on chatgpt.com. Pinned to the versions the runner was built against.
+chatgpt_web = [
+    "cloakbrowser[patchright]>=0.3.28,<0.4",
+    "playwright>=1.40,<2",
+]
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"

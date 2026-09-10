@@ -67,6 +67,20 @@ _VALID_CLASSES = (CLASS_ROUTING, CLASS_EXPLICIT, CLASS_RESUME, CLASS_LEGACY)
 # forged class can never enter the ``legacy`` (or any weaker) passthrough.
 E_CELL_CLASS_FORGED = "E-CELL-CLASS-FORGED"
 
+# F862 (#718) D14 r6 — the findings-only provider's own typed refusal, raised
+# ONLY by :func:`_guard_findings_only_provider` below. It is deliberately a
+# DISTINCT code from ``E-CELL-UNCERTIFIED``: r5 measured that F868's refusal and
+# F862's shared the operator-facing prefix ``"Assignment refused (no spawn): "``,
+# so a test asserting on that prefix passed with the D14 check DELETED — F868's
+# refusal masked it. Every D14 assertion matches THIS code, never the prefix, so
+# a mutant that removes the check below is killed by an unambiguous signal.
+E_CHATGPT_WEB_GATE_FORBIDDEN = "E-CHATGPT-WEB-GATE-FORBIDDEN"
+
+# The provider whose cell admission is unconditional (D14). Kept as a literal
+# rather than importing ProviderType so this module stays a pure library over
+# routing.toml + the position stores (see the module docstring).
+_FINDINGS_ONLY_PROVIDER = "chatgpt_web"
+
 
 class CellClassForged(Exception):
     """A caller-supplied ``cell_request_class`` disagreed with the class the
@@ -188,6 +202,80 @@ def _classify_cell(
     return None
 
 
+def _guard_findings_only_provider(
+    position: str,
+    provider: str,
+    positions_dir: Path,
+    rt_path: Path,
+) -> None:
+    """F862 (#718) D14 r6 — the UNCONDITIONAL cell check for ``chatgpt_web``.
+
+    D14: "make the cell check unconditional for this provider at the dispatch
+    guard". r3 to r5 implemented that client-side in ``mcp_server._assign_impl``,
+    which left two holes r5 measured on grok-box-005:
+
+    * the RESUME arm was dead. ``origin/main``'s F829 A2.1 moved resume
+      resolution to the server, so the client-side ``_resume_prepared`` marker
+      carries no provider and the check was skipped on every ``resume_from``;
+    * the EXPLICIT arm was redundant, fully masked by F868's own refusal.
+
+    Moving the check HERE — inside the one choke point every create path funnels
+    through, ``terminal_service.create_terminal`` — fixes both: the resume create
+    reaches this function with a real provider, and the refusal carries its own
+    typed code so it is distinguishable from F868's.
+
+    The rule this enforces, which is STRICTLY STRONGER than F868's D5 asymmetry
+    and applies to EVERY request class: this provider never runs an uncertified
+    or unresolvable cell. F870's routing/resume concession — a non-PASS NON-gate
+    cell may spawn the position's own composition with an uncertified marker — is
+    withdrawn for this provider alone. A findings lane whose product is a claim
+    about pinned bytes must not launch a browser on a cell nobody certified.
+
+    Per D14 this is a per-provider tightening, never a global routing rewrite:
+    the function returns immediately for every other provider, so no other
+    provider's admission changes by a single branch.
+    """
+    from cli_agent_orchestrator.utils.routing import (
+        RoutingError,
+        load_routing_table,
+        resolve_routing_binding,
+    )
+
+    if provider != _FINDINGS_ONLY_PROVIDER:
+        return
+
+    def _refuse(detail: str) -> CellGuardRefused:
+        cells = _certified_cells(position, positions_dir)
+        cells_txt = ", ".join(cells) if cells else "none"
+        return CellGuardRefused(
+            E_CHATGPT_WEB_GATE_FORBIDDEN,
+            (
+                f"{E_CHATGPT_WEB_GATE_FORBIDDEN}: provider "
+                f"'{_FINDINGS_ONLY_PROVIDER}' may only run a CERTIFIED cell of "
+                f"position '{position}' (certified cells: {cells_txt}); this is "
+                f"unconditional on every create path including resume (F862 D14). "
+                f"{detail}"
+            ),
+        )
+
+    try:
+        res = resolve_routing_binding(
+            position,
+            provider,
+            table=load_routing_table(rt_path),
+            positions_dir=positions_dir,
+        )
+    except RoutingError as exc:
+        # Includes the uncertified/stale GATE refusal at routing.py:415-421 —
+        # which is what a design_findings cell hits under D15 — and every
+        # provider-cert / row-clause stage before it.
+        raise _refuse(str(exc)) from exc
+
+    if res.uncertified_cell:
+        # F870's own-composition concession, withdrawn for this provider.
+        raise _refuse(f"cell outcome={res.fallback_cell} is not certified")
+
+
 def guard_cell_admission(
     agent_profile: str,
     provider: Optional[str],
@@ -243,6 +331,13 @@ def guard_cell_admission(
         )
 
     rt_path = routing_toml_path_override or routing_toml_path()
+
+    # F862 (#718) D14 r6 — the findings-only provider's UNCONDITIONAL check runs
+    # BEFORE the class-dependent admission below, so no request class (routing,
+    # explicit, resume, or a fail-closed unknown) can reach the F870 concession
+    # with an uncertified cell. No-op for every other provider.
+    _guard_findings_only_provider(position, cell_provider, pos_dir, rt_path)
+
     try:
         table = load_routing_table(rt_path)
         res: RoutingResolution = resolve_routing_binding(

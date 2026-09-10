@@ -18,5 +18,11 @@ class ProviderType(str, Enum):
     CLINE_CLI = "cline_cli"
     PI_CLI = "pi_cli"
     MINIMAX_CODE = "mcode"
+    # F862 (#718): ChatGPT-web findings lane. A thin lifecycle/status provider
+    # over the chatgpt_web_runner deterministic browser runner (D2/D13). Drives
+    # the user's real chatgpt.com Plus web session via cloakbrowser + Playwright;
+    # NEVER the OpenAI API. Certified only for the design_findings + general
+    # cells (D11); refused on every gate position (D14 backstop).
+    CHATGPT_WEB = "chatgpt_web"
     # Credentials-free mock provider for tests/CI (no real CLI binary).
     MOCK_CLI = "mock_cli"
