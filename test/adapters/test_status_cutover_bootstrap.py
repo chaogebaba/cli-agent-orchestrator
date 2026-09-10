@@ -98,7 +98,7 @@ async def test_on_with_an_empty_allowlist_demotes_to_off_and_files_the_notice(
 
 
 async def test_a_retired_position_is_refused_and_arms_nothing(
-    db_path: Path, clock: FakeClock
+    db_path: Path, clock: FakeClock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """#738, at the composition root: ``shadow`` is not a cutover position.
 
@@ -107,12 +107,20 @@ async def test_a_retired_position_is_refused_and_arms_nothing(
     demotion, and reporting it as one would tell an operator the guard resolved
     something it declined to resolve.  The ERROR line carries the fix.
 
-    MUTANT: accept ``shadow`` again and ``runtime.status.position`` is
-    ``StatusPosition.SHADOW``, which this fails on.
+    The ERROR line is asserted, not merely mentioned, because it is the ONLY
+    thing that distinguishes a refusal from the unknown-value default at this
+    layer: both land on ``off`` with no finding, so a build that dropped the
+    refusal and let ``shadow`` fall through would satisfy every other assertion
+    here while telling the operator nothing.
+
+    MUTANTS, both killed here: re-admit ``shadow`` to :class:`StatusPosition` and
+    the enum assertion fails; empty ``RETIRED_STATUS_VALUES`` so the value
+    silently defaults and the ERROR line is gone.
     """
-    runtime = await bootstrap.start_worker_truth(
-        db_path=db_path, clock=clock, env={**_ON, "CAO_WORKER_TRUTH_STATUS": "shadow"}
-    )
+    with caplog.at_level("ERROR", logger="cli_agent_orchestrator.bootstrap"):
+        runtime = await bootstrap.start_worker_truth(
+            db_path=db_path, clock=clock, env={**_ON, "CAO_WORKER_TRUTH_STATUS": "shadow"}
+        )
 
     assert runtime.status is not None
     assert runtime.status.position is StatusPosition.OFF
@@ -120,6 +128,15 @@ async def test_a_retired_position_is_refused_and_arms_nothing(
     assert not runtime.status.demoted
     assert _guard_findings(runtime, clock) == []
     assert {position.value for position in StatusPosition} == {"off", "on"}
+
+    refusals = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "ERROR" and "status cutover NOT armed" in record.getMessage()
+    ]
+    assert len(refusals) == 1, caplog.text
+    assert "#738" in refusals[0]
+    assert "CAO_WORKER_TRUTH_STATUS=off|on" in refusals[0]
 
 
 async def test_a_repeated_bad_boot_leaves_one_row_with_a_count(
