@@ -320,9 +320,7 @@ def _live_work(pane_pid: int, input_epoch: Optional[float] = None) -> ChildProbe
         pid, depth, parent_is_work = queue.pop(0)
         is_work = False
         if depth > base_depth:
-            is_work = (
-                parent_is_work or comms.get(pid, "") in shells or _exec_target(pid)
-            )
+            is_work = parent_is_work or comms.get(pid, "") in shells or _exec_target(pid)
             if is_work:
                 live = True
                 if len(work_comms) < COMM_CAP:

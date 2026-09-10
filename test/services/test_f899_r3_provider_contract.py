@@ -73,7 +73,9 @@ def probe_at(monkeypatch, tmp_path):
 
     def _make(tree, *, pane_pid=100, last_active=_LAST_INPUT):
         counter["n"] += 1
-        monkeypatch.setattr(fcs, "_PROC_ROOT", _write_tree(tmp_path, tree, name=f"proc{counter['n']}"))
+        monkeypatch.setattr(
+            fcs, "_PROC_ROOT", _write_tree(tmp_path, tree, name=f"proc{counter['n']}")
+        )
         monkeypatch.setattr(fcs, "pane_pid", lambda _s, _w: pane_pid)
         metadata = {"tmux_session": "s", "tmux_window": "w"}
         if last_active is not None:
@@ -266,9 +268,7 @@ def _codex_provider():
         "cli_agent_orchestrator.providers.codex.resolve_provider_binary", return_value="codex"
     ):
         CodexProvider._supports_hook_trust_bypass.cache_clear()
-        with patch.object(
-            CodexProvider, "_supports_hook_trust_bypass", staticmethod(lambda: True)
-        ):
+        with patch.object(CodexProvider, "_supports_hook_trust_bypass", staticmethod(lambda: True)):
             return CodexProvider("test1234", "test-session", "window-0")
 
 
@@ -349,12 +349,27 @@ def _pi_screens():
 def _cases():
     pi_working, pi_ready = _pi_screens()
     return [
-        ("codex", _codex_provider, "\n".join(_CODEX_WORKING), "\n".join(_CODEX_READY),
-         TerminalStatus.COMPLETED),
-        ("grok", _grok_provider, "\n".join(_GROK_WORKING), "\n".join(_GROK_READY),
-         TerminalStatus.IDLE),
-        ("claude_code", _claude_provider, "\n".join(_CLAUDE_WORKING), "\n".join(_CLAUDE_READY),
-         TerminalStatus.IDLE),
+        (
+            "codex",
+            _codex_provider,
+            "\n".join(_CODEX_WORKING),
+            "\n".join(_CODEX_READY),
+            TerminalStatus.COMPLETED,
+        ),
+        (
+            "grok",
+            _grok_provider,
+            "\n".join(_GROK_WORKING),
+            "\n".join(_GROK_READY),
+            TerminalStatus.IDLE,
+        ),
+        (
+            "claude_code",
+            _claude_provider,
+            "\n".join(_CLAUDE_WORKING),
+            "\n".join(_CLAUDE_READY),
+            TerminalStatus.IDLE,
+        ),
         # pi's ready fixture parses COMPLETED once a task has been dispatched
         # (its own unit test reads IDLE only with _task_dispatched False); both
         # are ready verdicts and fuse_status admits either.
@@ -424,9 +439,7 @@ def _install(monkeypatch, sm, provider, probe):
         "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
         lambda _tid: provider,
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe)
 
 
 @pytest.mark.parametrize("label,factory,working,ready,ready_status", _cases(), ids=_ids())
@@ -546,9 +559,7 @@ def test_r3_clear_terminal_evicts_both_new_caches(monkeypatch, probe_at):
     sm = StatusMonitor()
     _, working = _pair("pi")
     probe = probe_at(working)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe)
 
     probe.probe("t1")
     sm._rederive_from_pane_sample("t1", "")
@@ -572,9 +583,7 @@ def test_r3_unregister_evicts_both_new_caches(monkeypatch, probe_at):
     sm = StatusMonitor()
     _, working = _pair("pi")
     probe = probe_at(working)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", probe)
 
     probe.probe("t2")
     sm._rederive_from_pane_sample("t2", "")
