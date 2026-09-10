@@ -147,7 +147,7 @@ def test_ac1_flag_off_gate_still_holds_the_row_by_role(scratch_db, monkeypatch):
     False (the flag did not silently flip), and the row is held PENDING for the
     seat to drain rather than settled by the gate.
     """
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -652,7 +652,7 @@ def test_p0_hotfix_supervisor_row_pushes_when_receiver_idle(scratch_db, monkeypa
     instead of returning early at the gate. This restores push delivery for
     supervisor callbacks."""
     # Ensure the flag is off (absent env → default, or explicitly empty).
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -715,7 +715,7 @@ def test_p0_hotfix_list_messages_since_utc_returns_row_created_now(scratch_db, m
     supervisor passes) returns a row created "now" (UTC). The stored created_at
     is written timezone-aware UTC and the since filter is normalized to
     aware-UTC, so the comparison is correct."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)

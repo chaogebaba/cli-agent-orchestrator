@@ -470,10 +470,18 @@ def _seat_meta_and_flags(monkeypatch):
     ring reaches the _mark_socket_delivered call site."""
     monkeypatch.setattr(_dbs, "_queue_owns_delivery", lambda: False)
     monkeypatch.setattr(_dbs, "_is_row_still_pending", lambda row_id: True)
+    # F747 (#747): this stub returns the CALL SITE's default, which stood in for
+    # the shipped default only while ring_supervisor_doorbell passed
+    # ``default=True``. supervisor.doorbell now ships OFF and the call site no
+    # longer restates a default, so the stub answered None and the ring was
+    # skipped before it could reach _mark_socket_delivered. This test is about
+    # the ring, so it says which posture it needs.
     monkeypatch.setattr(
         _dbs.ConfigService,
         "get",
-        staticmethod(lambda key, default=None: default),
+        staticmethod(
+            lambda key, default=None: True if key == "supervisor.doorbell" else default
+        ),
         raising=False,
     )
 

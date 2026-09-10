@@ -836,7 +836,9 @@ def _seat_wake_attempts(store: Any, msg_id: str) -> list[Any]:
     return [a for a in store.attempts_for(msg_id) if a.carrier == CARRIER_SEAT_WAKE]
 
 
-def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env: Any) -> None:
+def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(
+    flip_env: Any, monkeypatch: Any
+) -> None:
     """One emitted epoch, one socket write, one `delivery_attempt` row, no paste.
 
     All four are asserted together on purpose. Counting the row alone would pass
@@ -846,6 +848,13 @@ def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(flip_env: Any) -> N
     """
     from cli_agent_orchestrator.clients.database import _create_inbox_message_unfenced
     from cli_agent_orchestrator.core.delivery import AttemptOutcome
+
+    # F747 (#747): this case drives the REAL ring_supervisor_doorbell (see
+    # _drive_shadow_production), and supervisor.doorbell now SHIPS OFF, so the
+    # ring returns skipped_disabled and writes nothing. The test is about the
+    # doorbell's production chain, so it states the posture it needs rather than
+    # inheriting a shipped default that has since flipped.
+    monkeypatch.setenv("CAO_SUPERVISOR_DOORBELL", "true")
 
     sessions, store, install = flip_env
     with sessions.begin() as db:
