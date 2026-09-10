@@ -658,8 +658,12 @@ def _derive_cc_team_inbox_path(working_directory: str) -> Optional[Path]:
     try:
         cwd_key = re.sub(r"[^A-Za-z0-9]", "-", working_directory)
         inbox_path = Path.home() / ".claude" / "projects" / cwd_key / "team-lead.json"
-        # Ensure parent directory exists (W3: "mkdir included")
-        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        # F747 (#747): derivation is a PURE function of the cwd -- no mkdir.
+        # W3's "mkdir included" was safe while this ran only for a seat whose
+        # flag was already on; F747 derives for every claude_code terminal, so a
+        # filesystem side effect here would fire on every terminal create and
+        # every health probe. ``_write_inbox_entry`` already creates the parent
+        # directory before it writes, which is the only place it is needed.
         return inbox_path
     except Exception:
         return None
