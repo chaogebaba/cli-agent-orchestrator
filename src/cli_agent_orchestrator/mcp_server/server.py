@@ -107,6 +107,18 @@ def _mcp_timeout() -> float:
     return float(get_server_settings()["mcp_request_timeout"])
 
 
+def _f862_strip_provider_suffix(name: Optional[str]) -> str:
+    """F862 (#718) D14: derive the position from a composed profile name.
+
+    Accepts ``<position>-chatgpt_web`` (composed spawn name) or a bare
+    ``<position>`` and returns the position segment, so the D14 refusal guard can
+    resolve the routing cell on every dispatch path (AC-3)."""
+    if not name:
+        return ""
+    suffix = f"-{ProviderType.CHATGPT_WEB.value}"
+    return name[: -len(suffix)] if name.endswith(suffix) else name
+
+
 def _api_headers() -> dict[str, str]:
     bearer = get_local_bearer()
     return {"Authorization": f"Bearer {bearer}"} if bearer else {}
@@ -2842,6 +2854,74 @@ def _assign_impl(
                     # the mutable store between guard and create). _resolved_provider
                     # stays None (legacy passthrough) so no position machinery fires.
                     _f838_checked_provider = _checked
+        # F862 (#718) D14 r6 — the findings-only EARLY refusal for chatgpt_web.
+        #
+        # The AUTHORITATIVE D14 check is SERVER-SIDE, in the one choke point every
+        # create path funnels through: ``cell_guard._guard_findings_only_provider``,
+        # reached from ``terminal_service.create_terminal``. r5 measured why the
+        # client-side placement could not be the control (report r5 §5): the
+        # resume arm was dead once F829 A2.1 moved resume resolution to the
+        # server (``_resume_prepared`` carries no provider, so the check was
+        # skipped on every ``resume_from``), and the explicit arm was fully
+        # masked by F868's refusal.
+        #
+        # What survives here is an EARLY refusal only: it saves the round trip on
+        # the two client-side shapes where the provider IS known, and it emits the
+        # SAME typed ``E-CHATGPT-WEB-GATE-FORBIDDEN`` code as the server-side
+        # check by calling the same function — never a second refusal
+        # implementation. Deleting this block changes latency, not admission; the
+        # server-side mutants in test_f862_d14_server_side_cell_guard.py are what
+        # guard the property.
+        #
+        # The resume branch is deliberately absent: there is no provider to check
+        # at this point, and pretending otherwise is exactly the r5 blocker.
+        _f862_position = None
+        _f862_provider = None
+        if _resume_prepared:
+            pass  # server-side only (see above)
+        elif _routing_driven:
+            # Routing-driven (provider omitted): the position is _routing_position
+            # and the provider came from the routing binding.
+            _f862_provider = _resolved_provider
+            _f862_position = _routing_position
+        else:
+            # Explicit-provider path: provider was supplied by the caller and
+            # agent_profile still names the position. resolve_assignment_target
+            # rewrote agent_profile to the composed <position>-<provider> name, so
+            # strip the suffix back to the position.
+            _f862_provider = _resolved_provider or _f838_checked_provider or provider
+            _f862_position = _f862_strip_provider_suffix(agent_profile)
+        from cli_agent_orchestrator.utils.agent_profiles import (
+            _position_exists as _f862_position_exists,
+        )
+
+        if (
+            _f862_provider == ProviderType.CHATGPT_WEB.value
+            and _f862_position
+            and _f862_position_exists(_f862_position)
+        ):
+            from cli_agent_orchestrator.constants import positions_store_dir as _f862_positions_dir
+            from cli_agent_orchestrator.constants import routing_toml_path as _f862_routing_path
+            from cli_agent_orchestrator.utils.cell_guard import CellGuardRefused as _F862Refused
+            from cli_agent_orchestrator.utils.cell_guard import (
+                _guard_findings_only_provider as _f862_guard,
+            )
+
+            try:
+                _f862_guard(
+                    _f862_position,
+                    _f862_provider,
+                    _f862_positions_dir(),
+                    _f862_routing_path(),
+                )
+            except _F862Refused as exc:
+                # Refused before any terminal creation / browser launch (AC-3).
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "message": f"Assignment refused (no spawn): {exc.message}",
+                }
+
         if not _resume_prepared and _position_assign and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (

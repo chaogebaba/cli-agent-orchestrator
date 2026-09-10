@@ -40,6 +40,7 @@ from cli_agent_orchestrator.adapters.truth import server_decisions as _wt_server
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import RootAdmission  # F829 A2.3 root admission
 from cli_agent_orchestrator.clients.database import (
+    CallerGone,
     _utcnow,
     claim_deferred_init_failure,
     create_digest_pending_notice,
@@ -262,6 +263,7 @@ class _LegacyCreateTerminalPublisher(Protocol):
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
         root_admission: Any = None,
+        require_live_caller: bool = False,
     ) -> Dict[str, Any]: ...
 
 
@@ -284,6 +286,7 @@ class _LegacyWarmTerminalPublisher(Protocol):
         init_owner_epoch: Optional[str] = None,
         init_deadline_s: Optional[float] = None,
         root_admission: Any = None,
+        require_live_caller: bool = False,
     ) -> Dict[str, Any]: ...
 
 
@@ -2643,6 +2646,52 @@ async def create_terminal(
                     # F129: Pass authority_files through to the DB publication function
                     if authority_files:
                         init_fields["authority_files"] = authority_files
+                    # F867 (#723) r2 R2-2 (verdict §2): FAIL-CLOSED caller
+                    # revalidation immediately before publication. Terminal-scoped
+                    # force delete no longer conflicts with an unrelated sibling's
+                    # session SHARED lease (the r1 fix), but that also means an
+                    # ADMITTED same-session create whose parent was force-deleted
+                    # between admission and here could otherwise publish a child
+                    # pointing at a dead caller_id. So, still under the lifecycle
+                    # lock and BEFORE the row is made visible, re-check that a
+                    # child create's captured caller still exists AND is not under
+                    # teardown; refuse (typed E-CALLER-GONE) otherwise. The refusal
+                    # leaves NO row and unwinds through the same rollback/lease
+                    # release path as any other pre-publication failure (the outer
+                    # except releases the cap lock + lifecycle/uuid leases and
+                    # rolls back the backend resource).
+                    #
+                    # Scoped to an EXISTING-session child create (``not
+                    # new_session``): that is the admission→publication window the
+                    # verdict names. A new-session launch has no same-session
+                    # parent to have vanished, and its caller_id is the launcher,
+                    # not a co-session terminal, so it is never gated. caller_id is
+                    # None for a top-level supervisor/operator create — never gated.
+                    # F867 r4: ONE predicate for both halves — the cheap
+                    # fail-fast probe here and the AUTHORITATIVE in-transaction
+                    # check the publication writers run under the write lock
+                    # (``require_live_caller``, clients/database.py
+                    # ``_assert_caller_live_in_publication_txn``). This probe can
+                    # go stale the instant after it reads; the transactional one
+                    # cannot, which is what makes an orphan child impossible.
+                    _require_live_caller = bool(caller_id) and not new_session
+                    if _require_live_caller and caller_id:
+                        from cli_agent_orchestrator.services.teardown_intent_service import (
+                            active_teardown_scope_keys,
+                        )
+
+                        _caller_meta = get_terminal_metadata(caller_id)
+                        _teardown_keys = active_teardown_scope_keys()
+                        _caller_gone = _caller_meta is None
+                        _caller_tearing_down = (
+                            caller_id in _teardown_keys or session_name in _teardown_keys
+                        )
+                        if _caller_gone or _caller_tearing_down:
+                            _why = "missing" if _caller_gone else "under_teardown"
+                            raise RuntimeError(
+                                f"E-CALLER-GONE: caller '{caller_id}' {_why} at publication "
+                                f"of child '{terminal_id}'; refusing to publish an orphan child"
+                            )
                     # F439 (#294) round 5 / BLOCKER 1: mark this create's terminal id as a
                     # reserved-but-publishing slot BEFORE the row is made visible below.
                     # From this instant the row — the moment it appears in the listing —
@@ -2671,6 +2720,7 @@ async def create_terminal(
                                         agent_profile=agent_profile,
                                         allowed_tools=allowed_tools,
                                         caller_id=caller_id,
+                                        require_live_caller=_require_live_caller,
                                         **(
                                             {"lifecycle": resolved_lifecycle}
                                             if resolved_lifecycle != "ephemeral"
@@ -2700,6 +2750,7 @@ async def create_terminal(
                                         agent_profile=agent_profile,
                                         allowed_tools=allowed_tools,
                                         caller_id=caller_id,
+                                        require_live_caller=_require_live_caller,
                                         **(
                                             {"lifecycle": resolved_lifecycle}
                                             if resolved_lifecycle != "ephemeral"
@@ -2733,6 +2784,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2761,6 +2813,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2791,6 +2844,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2818,6 +2872,7 @@ async def create_terminal(
                                             agent_profile,
                                             allowed_tools,
                                             caller_id=caller_id,
+                                            require_live_caller=_require_live_caller,
                                             **(
                                                 {"lifecycle": resolved_lifecycle}
                                                 if resolved_lifecycle != "ephemeral"
@@ -2837,6 +2892,24 @@ async def create_terminal(
                                             root_admission=root_admission,
                                             **init_fields,
                                         )
+                except CallerGone as exc:
+                    # F867 r4: the atomic caller check inside the publication
+                    # transaction refused. That transaction is already rolled
+                    # back (no child row exists anywhere), so this handler owes
+                    # only the same rollback of the NON-database resources every
+                    # other pre-publication failure does, and then the typed
+                    # E-CALLER-GONE surface — identical wording to the fail-fast
+                    # probe above, so a caller cannot tell which half refused.
+                    _release_cap_lock()
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        _created_window_name,
+                        created_session=_created_session,
+                    )
+                    raise RuntimeError(
+                        f"E-CALLER-GONE: caller '{exc.caller_id}' {exc.reason} at publication "
+                        f"of child '{exc.terminal_id}'; refusing to publish an orphan child"
+                    ) from exc
                 except Exception as exc:
                     # The row publication failed (realistically "database is
                     # locked" out of db_create_terminal). Roll back in exact
@@ -2850,6 +2923,12 @@ async def create_terminal(
                         _created_window_name,
                         created_session=_created_session,
                     )
+                    # F867 (#723) r2 R2-2: preserve the typed caller-gone refusal
+                    # verbatim (do NOT reshape it into db_publish_failed) so the
+                    # caller sees E-CALLER-GONE and knows the create was refused
+                    # because its parent vanished, not that the DB write failed.
+                    if str(exc).startswith("E-CALLER-GONE"):
+                        raise
                     # F829 A2.3/A2.5: a root-admission refusal must reach the
                     # caller as its typed identity error (session_identity_conflict
                     # / principal refusal), NOT be masked as "db_publish_failed".
@@ -3090,6 +3169,111 @@ async def create_terminal(
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
             engine = (resolved_engine,)
+
+        # F867 (#723) D1: bind a provider's KNOWN-AT-SPAWN session identity onto
+        # the fresh F829 root. For a provider whose id is deterministic before
+        # the first turn (pi_cli launches with --session-id <terminal_id>), this
+        # fills provider_session_id so a later planned hibernate resolves the
+        # artifact instead of refusing session_artifact_missing on a pi lane that
+        # never captured an id. Fresh spawns only (a resume re-points an existing
+        # root via the resume publish path, and spawn_captured_identity returns
+        # None there). Best-effort and non-raising: the artifact's VALIDITY is
+        # still decided later by resolve_artifact (MISSING before the first
+        # completed turn — correctly unrecoverable, D8 — VALID after), so binding
+        # here never fabricates recoverability.
+        if not _is_resume_spawn:
+            # F867 (#723) r2 (verdict §4): a provider that DECLARES resume/capture
+            # must not SILENTLY degrade if its known-at-spawn identity fails to
+            # bind (hook raises, malformed return, attach_captured_uuid raises or
+            # reports a non-success status, or a bound-uniqueness conflict). A
+            # silent debug-only "bind nothing and continue" leaves the lane
+            # advertised as capture/resume-capable while re-creating the null-id
+            # hibernate refusal. So for such a provider we WARN and record a typed
+            # ``capture_bind_failed`` event on the F829 root (observable telemetry
+            # naming the reason); a provider that declares neither is unaffected.
+            _declares_capture_or_resume = False
+            try:
+                _decl = getattr(provider_instance, "declared_capabilities", None)
+                _declares_capture_or_resume = bool(
+                    isinstance(_decl, dict) and (_decl.get("capture") or _decl.get("resume"))
+                )
+            except Exception:
+                _declares_capture_or_resume = False
+
+            _spawn_ident = None
+            _bind_failure_reason: Optional[str] = None
+            try:
+                _spawn_ident = provider_instance.spawn_captured_identity()
+            except Exception:
+                _bind_failure_reason = "spawn_captured_identity_raised"
+                logger.debug(
+                    "f867 spawn_captured_identity raised for %s", terminal_id, exc_info=True
+                )
+            # Only a well-formed (provider_session_id, namespace, locator) triple
+            # whose id is a non-empty str is bound. A provider that returns None
+            # (the base default) or any other shape — including a test double's
+            # MagicMock — is ignored, never unpacked blindly.
+            _well_formed = (
+                isinstance(_spawn_ident, tuple)
+                and len(_spawn_ident) == 3
+                and isinstance(_spawn_ident[0], str)
+                and bool(_spawn_ident[0])
+            )
+            if _well_formed:
+                _psid, _pns, _ploc = _spawn_ident  # type: ignore[misc]
+                try:
+                    from cli_agent_orchestrator.services.conversation_transition import (
+                        attach_captured_uuid,
+                    )
+
+                    _bind = attach_captured_uuid(
+                        terminal_id,
+                        provider_session_id=_psid,
+                        provider=provider,
+                        provider_namespace=_pns,
+                        artifact_locator=_ploc,
+                    )
+                    _bind_status = (_bind or {}).get("status")
+                    if _bind_status not in ("captured", "resume_published", "no_root"):
+                        _bind_failure_reason = f"bind_{_bind_status or 'unknown'}"
+                except Exception:
+                    _bind_failure_reason = "attach_captured_uuid_raised"
+                    logger.debug(
+                        "f867 spawn-identity bind raised for %s", terminal_id, exc_info=True
+                    )
+            elif _spawn_ident is not None and _bind_failure_reason is None:
+                # A non-None but malformed return from a provider that opted in.
+                _bind_failure_reason = "spawn_identity_malformed"
+
+            # Non-silent degradation ONLY for a provider that declared the
+            # capability; a None return from a non-capturing provider is normal
+            # and never a failure.
+            if _bind_failure_reason is not None and _declares_capture_or_resume:
+                logger.warning(
+                    "f867 capture bind FAILED for %s (provider=%s declares capture/resume): "
+                    "%s — lane will not be resumable via a captured spawn identity",
+                    terminal_id,
+                    provider,
+                    _bind_failure_reason,
+                    exc_info=True,
+                )
+                try:
+                    from cli_agent_orchestrator.clients.database import (
+                        record_conversation_event,
+                    )
+
+                    record_conversation_event(
+                        f"conv_{terminal_id}",
+                        "capture_bind_failed",
+                        terminal_id=terminal_id,
+                        detail={"provider": provider, "reason": _bind_failure_reason},
+                    )
+                except Exception:
+                    logger.debug(
+                        "f867 capture_bind_failed event write skipped for %s",
+                        terminal_id,
+                        exc_info=True,
+                    )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -6596,6 +6780,37 @@ def send_input(
 
         status_monitor.bind_dispatch_provider(terminal_id, provider)
         dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
+        # F862 (#718) r3: a provider that owns its dispatch drives the task
+        # out-of-band (chatgpt_web hands it to its pane runner) — the task is
+        # NEVER pasted into the shell as a command (r2 gate Blocker 1). This runs
+        # inside the dispatch transaction so a failure aborts coherently.
+        #
+        # r6: the opt-in is ``is True``, never truthiness. ``handles_own_dispatch``
+        # is a declared ``bool`` class attribute on ProviderBase (base.py:712), so
+        # a real provider always answers True or False. Truthiness let ANY object
+        # that merely HAS the attribute opt in — most consequentially a
+        # ``MagicMock`` provider double, whose auto-created attribute is a truthy
+        # Mock, so every mock-provider send_input test silently took the
+        # provider-owned branch and never reached the backend paste (r5 finding:
+        # 33 tests across test_terminal_service_full / test_plugin_event_emission /
+        # test_f435_send_seam_verify / test_f138_r11_rebind_exit_deadlock /
+        # test_kiro_engine_phase0 / test_inbox_service /
+        # test_orchestration_instrumentation). Identity against True also refuses a
+        # provider that returns a truthy non-bool, which is never a valid opt-in.
+        if provider is not None and getattr(provider, "handles_own_dispatch", False) is True:
+            try:
+                provider.dispatch_task(message)
+            except BaseException:
+                status_monitor.abort_dispatch(dispatch_txn)
+                raise
+            else:
+                status_monitor.commit_dispatch(dispatch_txn)
+                provider.mark_input_received()
+            if preserved_draft is not None:
+                preserved_draft.restore(backend)
+            update_last_active(terminal_id)
+            logger.info(f"Dispatched task to provider-owned runner: {terminal_id}")
+            return True
         try:
             if provider:
                 provider.pre_paste_gate()
@@ -7458,18 +7673,7 @@ def delete_terminal(
     caller_id: str | None = None,
 ) -> dict[str, Any]:
     """Cascade-delete a terminal's managed descendant tree."""
-    from cli_agent_orchestrator.services.rebind_lease import (
-        acquire_rebind_lease,
-        release_rebind_lease,
-    )
-    from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_exclusive,
-        release_session_lifecycle_lease,
-    )
-    from cli_agent_orchestrator.services.terminal_guard_service import (
-        TerminalProtectionError,
-        require_delete_allowed,
-    )
+    from cli_agent_orchestrator.services.terminal_guard_service import require_delete_allowed
 
     root = get_terminal_metadata(terminal_id)
     if root is None:
@@ -7823,8 +8027,8 @@ def _delete_terminal_inner(
         release_rebind_lease,
     )
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_exclusive_blocking,
-        release_session_lifecycle_lease,
+        acquire_session_lifecycle_terminal_exclusive_blocking,
+        release_session_lifecycle_terminal_exclusive,
     )
     from cli_agent_orchestrator.services.terminal_guard_service import (
         TerminalProtectionError,
@@ -7834,22 +8038,85 @@ def _delete_terminal_inner(
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
 
-    # F513 (#368): the exclusive lifecycle lease is session-scoped, so a
-    # delete of THIS terminal is transiently blocked whenever an UNRELATED
-    # terminal on the same session holds a shared lease — most commonly a
-    # concurrent create's deferred-init background task, which holds it for
-    # the whole of provider.initialize(). That contention is normally
-    # short-lived, so wait a bounded interval before surfacing the 409 rather
-    # than failing instantly. Configurable; defaults to a few seconds, which
-    # covers ordinary sibling-create churn without letting a genuinely wedged
-    # init (up to the F509 watchdog) pin the delete indefinitely.
+    # F867 (#723) D2: the teardown lease is now TERMINAL-scoped, not
+    # session-scoped. The prior session-wide exclusive failed whenever ANY
+    # unrelated sibling on the same session held a shared lease — most commonly a
+    # concurrent create still inside its window-create/worktree/publish window —
+    # so on a continuously-dispatching supervisor a completed idle lane could not
+    # be force-reaped and 409'd resume_in_progress (issue #723: seven pi-lite
+    # lanes, plus a codex lane, all unreapable until a server bounce with no
+    # concurrent creates). A terminal-scoped exclusive is NOT blocked by shared
+    # leases held for OTHER terminals; it still mutually excludes a full session
+    # teardown and a duplicate delete of this same terminal. The per-terminal
+    # rebind lease (below) and the resume-claim reconcile (next) preserve the
+    # "a resume of THIS terminal in flight still 409s" invariant. The bounded
+    # wait now only covers a concurrent session close or a sibling delete of the
+    # same id, both short-lived.
     from cli_agent_orchestrator.services.config_service import ConfigService
 
     _lease_wait_s = float(ConfigService.get("delete.lifecycle_lease_wait_s", 5.0))
-    lifecycle_lease = acquire_session_lifecycle_exclusive_blocking(
-        session_name, timeout_s=_lease_wait_s
+    lifecycle_lease = acquire_session_lifecycle_terminal_exclusive_blocking(
+        session_name, terminal_id, timeout_s=_lease_wait_s
     )
     if lifecycle_lease is None:
+        raise RuntimeError("resume_in_progress")
+
+    # F867 (#723) D2: reconcile any STALE resume CAS claim on the way — an
+    # interrupted resume/detach could leave a claim that outlives its worker
+    # (bounded only by resume.claim_ttl_s = 600s), which is the DB-side sibling
+    # of the lease contention above. Reconciling here (best-effort, non-raising)
+    # means a force reap clears the stale claim rather than waiting out the TTL.
+    # A GENUINELY live resume of THIS terminal is NOT reconciled away — its claim
+    # is younger than the TTL and its provider-session lease is still held, so
+    # the resume-in-flight guard just below still refuses the delete.
+    try:
+        from cli_agent_orchestrator.services.conversation_reconcile import (
+            reconcile_stale_claims,
+        )
+
+        reconcile_stale_claims()
+    except Exception:
+        logger.debug("f867 stale-claim reconcile skipped for %s", terminal_id, exc_info=True)
+
+    # F867 (#723) D2: keep the gate's purpose — while THIS terminal is being
+    # RESUMED or REBOUND in place, the delete must be FULLY blocked and do
+    # nothing (the pre-#723 session-wide exclusive gave this for free; the
+    # terminal-scoped lease must reassert it explicitly). Two in-flight signals,
+    # both per-terminal:
+    #   * a rebind of THIS terminal holds its rebind lease, and
+    #   * a resume of THIS terminal holds its provider-session uuid lease.
+    # Checked HERE — right after the terminal-exclusive acquire and BEFORE any
+    # quiesce/teardown-intent/cascade work — so a racing rebind/resume 409s
+    # cleanly (resume_in_progress) without the delete disturbing the in-flight
+    # operation. The stale-claim reconcile above ensures only a LIVE resume
+    # (lease still held) blocks. The uuid is read from the terminal metadata row
+    # when present, else the F829 conversation root (D1 fills the root for pi
+    # even when the metadata column is not mirrored).
+    from cli_agent_orchestrator.services.provider_session_lease import (
+        provider_session_lease_held,
+    )
+    from cli_agent_orchestrator.services.rebind_lease import rebind_lease_held
+
+    _this_uuid = root.get("provider_session_id")
+    if not _this_uuid:
+        try:
+            from cli_agent_orchestrator.clients.database import (
+                get_conversation_identity,
+                get_terminal_identity,
+            )
+
+            _ti = get_terminal_identity(terminal_id)
+            _ikey = _ti.get("identity_key") if _ti else None
+            if _ikey:
+                _croot = get_conversation_identity(_ikey)
+                _this_uuid = _croot.get("provider_session_id") if _croot else None
+        except Exception:
+            logger.debug("f867 resume-guard uuid lookup failed for %s", terminal_id, exc_info=True)
+    _resume_in_flight = rebind_lease_held(terminal_id) or (
+        isinstance(_this_uuid, str) and bool(_this_uuid) and provider_session_lease_held(_this_uuid)
+    )
+    if _resume_in_flight:
+        release_session_lifecycle_terminal_exclusive(lifecycle_lease)
         raise RuntimeError("resume_in_progress")
     # F716 (#571) r2: declared out here so the lease's own `finally` also
     # releases the cascade's child intents, whatever exits the block.
@@ -7961,7 +8228,7 @@ def _delete_terminal_inner(
         try:
             _close_cascade_teardown_intents(_cascade_intent_ids, _cascade_marked)
         finally:
-            release_session_lifecycle_lease(lifecycle_lease)
+            release_session_lifecycle_terminal_exclusive(lifecycle_lease)
 
 
 def _quiesce_cascade_subtree_pre_plan(

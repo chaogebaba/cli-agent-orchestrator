@@ -240,6 +240,25 @@ class BaseProvider(ABC):
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         raise NotImplementedError
 
+    def spawn_captured_identity(self) -> "tuple[str, Optional[str], Optional[str]] | None":
+        """F867 (#723): the provider's session identity KNOWN AT SPAWN, if any.
+
+        For a provider whose session id is deterministic and known before the
+        first turn (pi_cli sets ``--session-id <terminal_id>``), returning it
+        here lets ``create_terminal`` bind it onto the F829 conversation root at
+        spawn — WITHOUT the synchronous artifact validation that
+        ``supports_reauth_rebind`` would force at init (a fresh spawn has no
+        recoverable transcript yet, so validating at init would spuriously fail;
+        the artifact's validity is decided later by ``resolve_artifact`` at
+        hibernate time — MISSING before the first completed turn, VALID after).
+
+        Returns ``(provider_session_id, provider_namespace, artifact_locator)``,
+        any of the last two ``None``, or ``None`` when the provider has no
+        known-at-spawn identity (the default) or is resuming an existing root.
+        Must NOT raise: a failure degrades to "no spawn identity captured".
+        """
+        return None
+
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         return None
 
@@ -702,6 +721,25 @@ class BaseProvider(ABC):
 
         The default implementation is a no-op (always allows the paste).
         """
+
+    # F862 (#718) r3: provider-owned dispatch. When a provider returns True from
+    # ``handles_own_dispatch``, terminal_service.send_input routes the orchestrated
+    # task to ``dispatch_task`` INSTEAD of pasting it into the pane shell (the r2
+    # gate's Blocker 1: a bare-shell paste ran no runner). The provider then drives
+    # its own out-of-band execution (chatgpt_web writes a task file its pane runner
+    # consumes) and the task text NEVER reaches the shell as a command.
+    handles_own_dispatch: bool = False
+
+    def dispatch_task(self, message: str) -> None:
+        """Provider-owned delivery of an orchestrated task (F862 r3).
+
+        Called by ``send_input`` only when ``handles_own_dispatch`` is True.
+        Default raises so a provider that opts in without implementing it fails
+        loudly rather than silently dropping the task.
+        """
+        raise NotImplementedError(
+            "provider opted into handles_own_dispatch but has no dispatch_task"
+        )
 
     def capture_submission_baseline(
         self,

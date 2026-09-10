@@ -37,6 +37,7 @@ from test.services.test_f636_shim_spawn_path import (  # noqa: F401
     _spawn_seam,
     clean_shim_env,
     nested_fork,
+    registered_supervisor,
 )
 from unittest.mock import patch
 
@@ -131,7 +132,9 @@ class TestWiringThroughTheRealSpawnPath:
     """Layer 2 — the AC21 arm, through ``create_terminal``'s worker branch."""
 
     @pytest.mark.asyncio
-    async def test_box_hosted_worker_spawn_is_not_shimmed(self, nested_fork, clean_shim_env):
+    async def test_box_hosted_worker_spawn_is_not_shimmed(
+        self, nested_fork, clean_shim_env, registered_supervisor
+    ):
         """MUTANT SENTINEL (drop the ``is_box_hosted`` kwarg from the
         ``maybe_shim_env`` call in ``create_terminal``). A box dev lane created
         via the terminals route — the assign path, the only one that sets
@@ -147,7 +150,7 @@ class TestWiringThroughTheRealSpawnPath:
 
     @pytest.mark.asyncio
     async def test_laptop_worker_spawn_in_the_same_repo_still_denied(
-        self, nested_fork, clean_shim_env
+        self, nested_fork, clean_shim_env, registered_supervisor
     ):
         """CONTRAST, and the other half of AC21: the same worker, same repo,
         same session — only the host differs. A laptop worker still leads with

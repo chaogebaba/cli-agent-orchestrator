@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.chatgpt_web import ChatGptWebProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.cline_cli import ClineCliProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -46,6 +47,7 @@ PROVIDER_CLASSES = {
     ProviderType.CLINE_CLI.value: ClineCliProvider,
     ProviderType.PI_CLI.value: PiCliProvider,
     ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
+    ProviderType.CHATGPT_WEB.value: ChatGptWebProvider,
     ProviderType.MOCK_CLI.value: MockCliProvider,
 }
 
@@ -287,6 +289,17 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                )
+            elif provider_type == ProviderType.CHATGPT_WEB.value:
+                provider = ChatGptWebProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                    fork_context=fork_context,
                 )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:

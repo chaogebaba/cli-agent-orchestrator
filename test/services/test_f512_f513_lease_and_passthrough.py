@@ -303,21 +303,27 @@ def test_blocking_acquire_does_not_hold_guard_while_waiting() -> None:
 
 
 def test_delete_inner_waits_then_raises_on_persistent_contention() -> None:
-    """F513 integration-shape: _delete_terminal_inner surfaces
+    """F513/F867 integration-shape: _delete_terminal_inner surfaces
     resume_in_progress only AFTER the bounded wait, and passes the configured
-    timeout into the blocking acquire."""
+    timeout into the TERMINAL-scoped blocking acquire (#723 D2: the teardown
+    lease is now per-terminal, so unrelated sibling shared leases no longer
+    block it; persistent contention here is a concurrent session close or a
+    duplicate delete of the same id)."""
     import cli_agent_orchestrator.services.terminal_service as ts
 
-    captured: dict[str, float] = {}
+    captured: dict[str, object] = {}
 
-    def _fake_blocking(session_name: str, *, timeout_s: float, poll_interval_s: float = 0.25):
+    def _fake_blocking(
+        session_name: str, terminal_id: str, *, timeout_s: float, poll_interval_s: float = 0.25
+    ):
         captured["timeout_s"] = timeout_s
+        captured["terminal_id"] = terminal_id
         return None  # simulate persistent contention
 
     with (
         patch(
             "cli_agent_orchestrator.services.session_lifecycle_lease."
-            "acquire_session_lifecycle_exclusive_blocking",
+            "acquire_session_lifecycle_terminal_exclusive_blocking",
             side_effect=_fake_blocking,
         ),
         patch.object(ts, "_quiesce_cascade_subtree_pre_plan"),
@@ -338,3 +344,4 @@ def test_delete_inner_waits_then_raises_on_persistent_contention() -> None:
             )
 
     assert captured["timeout_s"] == 3.0
+    assert captured["terminal_id"] == "abcd1234"

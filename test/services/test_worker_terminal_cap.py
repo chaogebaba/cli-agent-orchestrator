@@ -52,6 +52,15 @@ def _row(tid: str, profile: str = "developer", caller_id: str | None = SUPERVISO
 
 
 @pytest.fixture
+def registered_supervisor(register_caller):
+    """F867 r3: the tests below drive the REAL create path, whose fail-closed
+    pre-publication revalidation looks the caller up in the database. Their
+    fleet lives in an in-memory row list, so SUPERVISOR must also exist as a
+    real row or every child publish is refused ``E-CALLER-GONE``."""
+    return register_caller(SUPERVISOR, session_name=SESSION)
+
+
+@pytest.fixture
 def patch_session(monkeypatch):
     """Patch the live-state sources the counter reads: the session row list and
     per-terminal live status. Returns a setter the tests use to define the fleet.
@@ -427,7 +436,9 @@ class TestConcurrentAdmission:
     """F439 round 2 / BLOCKER 1: concurrent creates must not oversubscribe."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_cap_minus_one_admits_exactly_one(self, tmp_path):
+    async def test_concurrent_cap_minus_one_admits_exactly_one(
+        self, tmp_path, registered_supervisor
+    ):
         """cap 2, one existing worker, N concurrent SAME-LOOP real creates →
         exactly ONE success and N-1 TerminalCapExceeded; the fleet grows by one.
 
@@ -491,7 +502,7 @@ class TestConcurrentAdmission:
             assert e.cap == 2
 
     @pytest.mark.asyncio
-    async def test_concurrent_under_cap_all_admitted(self, tmp_path):
+    async def test_concurrent_under_cap_all_admitted(self, tmp_path, registered_supervisor):
         """cap 10, no existing workers, 4 concurrent creates → all 4 admitted,
         fleet grows by 4 (the lock serializes but never falsely refuses)."""
         published = []
@@ -509,7 +520,7 @@ class TestConcurrentAdmission:
         assert all(not isinstance(r, BaseException) for r in results), results
         assert len(published) == 4
 
-    def test_thread_based_race_admits_exactly_one(self, tmp_path):
+    def test_thread_based_race_admits_exactly_one(self, tmp_path, registered_supervisor):
         """Mirror the gate's harness EXACTLY: 4 THREADS, each its own event loop,
         a threading.Barrier in the count dependency so all four observe the same
         pre-create snapshot. This is the scenario an asyncio.Lock CANNOT close
@@ -662,7 +673,9 @@ class TestConcurrentAdmission:
         # No orphans: exactly one new row beyond the pre-existing worker.
         assert len(published) == 2
 
-    def test_thread_race_barrier_inside_listing_admits_exactly_one(self, tmp_path):
+    def test_thread_race_barrier_inside_listing_admits_exactly_one(
+        self, tmp_path, registered_supervisor
+    ):
         """F439 round 3 / BLOCKER regression: the barrier lives INSIDE the count's
         ``list_terminals_by_session`` callout — the exact shape of the mandatory
         round-1 gate probe. All four threads MUST reach that barrier concurrently,
@@ -1087,7 +1100,7 @@ class TestR5LedgerAuthoritativeAdmission:
         assert _peek_admitted() == 2
         _reset_cap_session(session)
 
-    def test_reserve_then_publish_failure_releases_unit(self, tmp_path):
+    def test_reserve_then_publish_failure_releases_unit(self, tmp_path, registered_supervisor):
         """req 2: a reserve whose publication throws AFTER the row is inserted and
         AFTER _mark_publishing must not strand a double unit — the next admission
         sees exactly the rows that really exist."""
@@ -1468,7 +1481,9 @@ class TestR8DoubleCancelCapOwnership:
         _reset_cap_session(session)
 
     @pytest.mark.asyncio
-    async def test_double_cancel_no_two_live_backends_under_cap_1(self, tmp_path):
+    async def test_double_cancel_no_two_live_backends_under_cap_1(
+        self, tmp_path, registered_supervisor
+    ):
         """No ordering yields two live backends under cap 1. The peer's backend
         creation must not start until worker 1's is destroyed."""
         session = "cao-r8-nooverlap"
