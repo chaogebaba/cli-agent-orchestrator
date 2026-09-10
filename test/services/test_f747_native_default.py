@@ -499,3 +499,37 @@ def test_non_hook_claims_are_never_gated(monkeypatch):
     monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: None)
     _run(api_main.list_messages_endpoint(to="c244d80b", claim="mcp", _scopes=[SCOPE_WRITE]))
     assert seen == ["mcp"]
+
+
+# ---------------------------------------------------------------------------
+# The push path must not get more expensive the more it is used (#747 r3).
+# ---------------------------------------------------------------------------
+
+
+def test_inbox_file_is_capped(tmp_path):
+    """MUTANT: drop the trim and the file grows without bound, so every push
+    re-reads and re-serialises a longer array -- O(M**2) over M pushes."""
+    inbox = tmp_path / "team-lead.json"
+    for i in range(tps.INBOX_ENTRIES_CAP + 25):
+        assert tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i}) is True
+    entries = json.loads(inbox.read_text(encoding="utf-8"))
+    assert len(entries) == tps.INBOX_ENTRIES_CAP
+
+
+def test_trim_drops_oldest_and_keeps_newest(tmp_path):
+    """Trimming is oldest-first: the newest entry is always still there."""
+    inbox = tmp_path / "team-lead.json"
+    for i in range(tps.INBOX_ENTRIES_CAP + 10):
+        tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
+    entries = json.loads(inbox.read_text(encoding="utf-8"))
+    ids = [e["msg_id"] for e in entries]
+    assert ids[-1] == f"m{tps.INBOX_ENTRIES_CAP + 9}"
+    assert "m0" not in ids
+
+
+def test_under_the_cap_nothing_is_dropped(tmp_path):
+    inbox = tmp_path / "team-lead.json"
+    for i in range(5):
+        tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
+    entries = json.loads(inbox.read_text(encoding="utf-8"))
+    assert [e["msg_id"] for e in entries] == ["m0", "m1", "m2", "m3", "m4"]

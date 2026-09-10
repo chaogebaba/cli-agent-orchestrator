@@ -508,6 +508,24 @@ def _should_teammate_push(terminal_id: str) -> bool:
     return _resolve_inbox_path(terminal_id) is not None
 
 
+#: F747 (#747): most entries retained in a CC team inbox file.
+#:
+#: ``_write_inbox_entry`` reads the whole JSON array, scans it for the F175
+#: msg_id dedup, appends, and re-serialises ALL of it under the lock. That is
+#: O(entries) per push, so M pushes to one inbox cost O(M**2) and the file grows
+#: without bound. It never bit while the push was opt-in; F747 turns it on by
+#: default, and every claude_code terminal sharing a project directory shares
+#: one file, so the cost became the dominant term (measured: a two-directory
+#: test scope went from 211s to not finishing at all).
+#:
+#: The file is a NOTIFICATION carrier, not the system of record -- the inbox
+#: table is, and ``consumed_through_id`` tracks what the seat has taken.
+#: Trimming drops only the OLDEST entries, the ones already surfaced; anything
+#: still unconsumed is re-delivered from the DB by the reconciler or, failing
+#: that, by the fallback surface under its typed reason.
+INBOX_ENTRIES_CAP = 200
+
+
 #: Closed set of reasons the legacy fallback surface may engage (F747 #747).
 NATIVE_FALLBACK_REASONS = (
     "provider_not_native",
@@ -766,6 +784,10 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
 
         entries_before = len(entries_list)
         entries_list.append(entry)
+        # F747 (#747): bound the file so the NEXT push is not more expensive
+        # than this one. Oldest-first, and only ever above the cap.
+        if len(entries_list) > INBOX_ENTRIES_CAP:
+            entries_list = entries_list[-INBOX_ENTRIES_CAP:]
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
             payload = json.dumps(entries_list, indent=2)
@@ -791,7 +813,7 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
             op="append_legacy",
             inbox_path=inbox_path,
             entries_before=entries_before,
-            entries_after=entries_before + 1,
+            entries_after=min(entries_before + 1, INBOX_ENTRIES_CAP),
             msg_ids_added=[entry_msg_id] if entry_msg_id else [],
             msg_ids_removed=[],
             size_before=size_before,
