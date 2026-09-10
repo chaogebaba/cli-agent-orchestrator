@@ -13,6 +13,7 @@ from cli_agent_orchestrator.cli.commands.diag import diag
 from cli_agent_orchestrator.cli.commands.doctor import doctor
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fold import fold
+from cli_agent_orchestrator.cli.commands.gate import gate
 from cli_agent_orchestrator.cli.commands.identity import identity
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
@@ -83,6 +84,7 @@ cli.add_command(verify)
 cli.add_command(ledger)
 # WP-ARCH phase 1 (F725 #581), AC11 hook point 4 — the only line this file gains.
 cli.add_command(diag)
+cli.add_command(gate)  # WP-ARCH Amendment A slice 2a: read-only gate run view
 cli.add_command(update)
 cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 cli.add_command(auto_answers)  # F530: whitelist auto-responder diagnostics
