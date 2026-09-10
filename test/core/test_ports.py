@@ -128,7 +128,15 @@ def test_check_runner_surface() -> None:
 
 
 def test_later_phase_ports_exist_as_stubs() -> None:
-    """Phases 3, 4 and 5 have their shape reserved so the contracts are final now."""
+    """Phases 4 and 5 have their shape reserved so the contracts are final now.
+
+    ``GateStore`` is no longer a stub: WP-ARCH Amendment A slice 2a fills it with
+    the gate-record surface (§10.2), so ``start_run`` is replaced by the real
+    commands.  ``QueueStore`` (phase 3) and ``ProviderAdapter`` (phase 5) are
+    unchanged here.
+    """
     assert "enqueue" in dir(ports.QueueStore)
-    assert "start_run" in dir(ports.GateStore)
+    assert {"open_run", "open_round", "project_round", "claim_ownership"} <= set(
+        dir(ports.GateStore)
+    )
     assert {"name", "structured_events", "event_source"} <= set(dir(ports.ProviderAdapter))

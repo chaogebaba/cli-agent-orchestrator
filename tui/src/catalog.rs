@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 116;
+const COMMAND_COUNT: usize = 117;
 
 /// What the TUI does with a command.
 ///
@@ -271,6 +271,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
+    CommandId::GateShow,
     CommandId::DiagAgreement,
     CommandId::DiagDelivery,
     CommandId::DiagFindings,
@@ -513,6 +514,10 @@ pub enum CommandId {
     // `cao config reconcile`
     /// `cao config reconcile`
     ConfigReconcile,
+
+    // `cao gate *` — WP-ARCH Amendment A slice 2a
+    /// `cao gate show`
+    GateShow,
 
     // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics, plus
     // phase 3a (F728 #584) delivery-queue diagnostics.
@@ -1537,6 +1542,16 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::GateShow => Command {
+            id: CommandId::GateShow,
+            parent: Some("gate"),
+            leaf_name: "show",
+            summary: "Show a run and its rounds, projected from rows (read-only).",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
         CommandId::Fold => Command {
             id: CommandId::Fold,
             parent: None,
@@ -1956,17 +1971,22 @@ mod tests {
     /// `agreement`} — all HIDE, per the mandated default for a command nobody has reviewed for
     /// in-pane use, and a diagnostic that prints a wide table is a poor fit for the pane anyway →
     /// **24/18/65 = 107**.
+    ///
+    /// Then later fork-only/HIDE registrations (providers capabilities, identity release, diag
+    /// delivery, config reconcile, fold, redeploy, suite, sandbox/seam/session lifecycle, verify,
+    /// and WP-ARCH Amendment A slice 2a's `cao gate show`, all HIDE) brought the table to
+    /// **24/18/75 = 117**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_sixtyfive() {
+    fn the_policy_distribution_is_twentyfour_eighteen_seventyfive() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 65, "expected 65 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 75, "expected 75 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            107,
-            "the three policy counts must account for all 107 leaf commands of the Click tree"
+            117,
+            "the three policy counts must account for all 117 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1976,8 +1996,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            107,
-            "DISPLAY_ORDER must list 107 DISTINCT commands; a duplicate would let one command go \
+            117,
+            "DISPLAY_ORDER must list 117 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -2130,6 +2150,7 @@ mod tests {
                     CommandId::BarrierStatus => CommandId::BarrierStatus,
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
+                    CommandId::GateShow => CommandId::GateShow,
                     CommandId::DiagAgreement => CommandId::DiagAgreement,
                     CommandId::DiagDelivery => CommandId::DiagDelivery,
                     CommandId::DiagFindings => CommandId::DiagFindings,
@@ -2231,6 +2252,7 @@ mod tests {
                 CommandId::IdentityAttach,
                 CommandId::IdentityClaim,
                 CommandId::IdentityRelease,
+                CommandId::ProvidersCapabilities,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
@@ -2250,6 +2272,7 @@ mod tests {
                 CommandId::BarrierStatus,
                 CommandId::BaseRegister,
                 CommandId::ConfigReconcile,
+                CommandId::GateShow,
                 CommandId::DiagAgreement,
                 CommandId::DiagDelivery,
                 CommandId::DiagFindings,
