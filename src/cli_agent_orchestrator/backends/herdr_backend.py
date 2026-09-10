@@ -573,6 +573,62 @@ class HerdrBackend(TerminalBackend):
         logger.info(f"Created herdr tab in workspace {session_name}")
         return window_name
 
+    def window_liveness(self, session_name: str, window_name: str) -> str:
+        """Classify a window as ``live`` / ``gone`` / ``error``.
+
+        Same family as F893 (#745) and F900 (#752): this is a port method herdr
+        never implemented, so it inherited ``base.py``'s fail-closed default of
+        ``"error"`` — and callers read ``"error"`` as "might still be alive".
+        ``_acquire_resume_leases`` (terminal_service.py) treats any prior owner of
+        the resume uuid whose window reads ``live`` OR ``error`` as a conflict, so
+        under herdr EVERY resume of a hibernated terminal failed
+        ``500 owner_conflict`` (observed live on grok-box-006: H4 hibernate
+        succeeded, the resume that should have followed it did not).
+
+        Resolution mirrors ``_resolve_pane_id_from_window`` but keeps the two
+        failure kinds apart, which is the whole point of the three-valued answer:
+
+        - the workspace label is absent            -> ``"gone"``
+        - the workspace is there but has no such tab -> ``"gone"``
+        - herdr itself could not answer (CLI/socket/parse failure) -> ``"error"``
+        - the tab is present                        -> ``"live"``
+
+        ``_resolve_workspace_id`` caches its answer, so a workspace that has just
+        been closed is re-read rather than trusted from cache when the lookup
+        misses; the cache only ever holds resolved ids.
+        """
+        try:
+            result = self._run_herdr(["workspace", "list"], check=False)
+            if result.returncode != 0:
+                return "error"
+            data = self._parse_herdr_json(result.stdout)
+            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
+        except (json.JSONDecodeError, TerminalBackendError, AttributeError, TypeError):
+            return "error"
+        workspace_id = None
+        for workspace in workspaces or []:
+            if isinstance(workspace, dict) and workspace.get("label") == session_name:
+                workspace_id = str(workspace.get("workspace_id", ""))
+                break
+        if not workspace_id:
+            # The workspace itself is gone — so is every window in it.
+            return "gone"
+
+        try:
+            result = self._run_herdr(["tab", "list"], check=False)
+            if result.returncode != 0:
+                return "error"
+            data = self._parse_herdr_json(result.stdout)
+            tabs = data.get("tabs", []) if isinstance(data, dict) else data
+        except (json.JSONDecodeError, TerminalBackendError, AttributeError, TypeError):
+            return "error"
+        for tab in tabs or []:
+            if not isinstance(tab, dict):
+                continue
+            if tab.get("workspace_id") == workspace_id and tab.get("label") == window_name:
+                return "live"
+        return "gone"
+
     def _tabs_in_workspace(self, workspace_id: str) -> list[str]:
         """Return the tab_ids currently in ``workspace_id`` (F881 #734).
 
