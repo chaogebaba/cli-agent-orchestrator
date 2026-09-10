@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cli_agent_orchestrator.providers.condition import (
     Condition,
     ConditionDelivery,
@@ -308,3 +310,214 @@ def test_fleet_response_condition_none_when_absent(monkeypatch) -> None:
     fleet = fs.build_fleet("sess-f611b")
     rows = {r["id"]: r for r in fleet["terminals"]}
     assert rows[tid]["condition"] is None
+
+
+# ── #700/#701 r2: the PI provider's condition OPT-IN is wired end-to-end ────────
+#
+# The codex EMPIRICAL-GATE-NO found the #700/#701 wiring gap: every existing arm
+# above drives the seam with a `_FakeProvider("codex")` (a fake key-based stand-
+# in) or calls the module `classify_condition(...)` directly, so NONE asserts the
+# Pi provider's own `condition_provider_key = "pi_cli"` opt-in. The ledger's OWN
+# mutant (M6: `condition_provider_key` → None) therefore SURVIVED. This arm
+# instantiates a REAL `PiCliProvider` and drives its verbatim 429 pane through
+# the production `_classify_and_deliver_condition` seam; it goes RED when the
+# opt-in is None (BaseProvider.classify_condition returns None → zero surfaces).
+
+# The verbatim ClinePass 429 banner from the live pi panes (issue #700/#701).
+_PI_BANNER = (
+    'Error: 429: {"code":"INFERENCE_CAP_ERROR","message":"Error 429: You have '
+    "reached your 5-hour Clinepass limit. The limit resets in 1h 29m, please try "
+    'again later."}'
+)
+_PI_RETRY_FAILED = (
+    'Error: Retry failed after 3 attempts: 429: {"code":"INFERENCE_CAP_ERROR",'
+    '"message":"Error 429: You have reached your 5-hour Clinepass limit. The '
+    'limit resets in 1h 29m, please try again later."}'
+)
+
+
+def _pi_capped_pane() -> str:
+    """A live pi capped pane: the 429 banner storm above the idle composer."""
+    rule = "─" * 120
+    footer = "↑26k ↓172 R3.9k CH97.6% $0.002 0.4%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+    return "\n".join(
+        [
+            " Call the probe tool. Then say DONE.",
+            "",
+            _PI_BANNER,
+            _PI_BANNER,
+            _PI_RETRY_FAILED,
+            "",
+            rule,
+            " ",
+            rule,
+            "/data/scratch/probe",
+            footer,
+        ]
+    )
+
+
+def test_pi_cli_condition_wiring_delivers_capped_once() -> None:
+    """A REAL PiCliProvider driven through the status-monitor transition seam
+    delivers exactly one CAPPED event to the fleet field, the supervisor inbox,
+    and the CLI projection — because it opts in via
+    ``condition_provider_key = "pi_cli"``. This arm turns RED when that opt-in is
+    None (the ledger's SURVIVED M6 mutant): BaseProvider.classify_condition then
+    returns None and no surface fires."""
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    sm = StatusMonitor()
+    tid = "9a9a9a9a"
+    delivery, rec = _recording_delivery()
+    sm._condition_delivery = delivery
+    sm._buffer_epochs[tid] = 1
+
+    # A REAL provider instance (not a fake key stand-in) — its own class-level
+    # condition_provider_key is what routes the pane to the CAPPED classifier.
+    provider = PiCliProvider(tid, "sess", "win0")
+    assert (
+        type(provider).condition_provider_key == "pi_cli"
+    ), "precondition: pi opts into the F611 seam; the M6 mutant sets this None"
+
+    sm._classify_and_deliver_condition(tid, provider, _pi_capped_pane())
+
+    assert rec["fleet"] == [(tid, "CAPPED")], "fleet condition field must be set for pi"
+    assert rec["inbox"] == [(tid, "CAPPED")], "exactly one supervisor inbox push for pi"
+    assert rec["cli"] == [(tid, "CAPPED")], "exactly one CLI/bus projection for pi"
+
+
+# ── #700/#701 r3: the PRODUCTION inbox sink writes a real seat inbox ROW ───────
+#
+# The codex r2 EMPIRICAL-GATE-NO on #700/#701: the r2 arm above proves the
+# fan-out with a RECORDING delivery (a tuple recorder) — it never drives the
+# classified event through the PRODUCTION inbox sink
+# (``StatusMonitor._condition_inbox_sink``) to a real supervisor SEAT inbox row.
+# The adjudication brief explicitly requires an arm that reaches
+# ``create_inbox_message`` with real caller metadata and reads back exactly one
+# ``[CONDITION]`` row (sender = worker, receiver = seat) in an isolated DB. This
+# fixture + arm are that.
+
+
+@pytest.fixture
+def isolated_inbox_db(tmp_path, monkeypatch):
+    """Route the whole DB layer to a fresh, initialized per-test SQLite file.
+
+    ``_condition_inbox_sink`` resolves the caller via ``get_terminal_metadata``
+    and writes with ``create_inbox_message`` — both use the module-level
+    ``database.SessionLocal``. Swapping it here (mirroring the top-level
+    ``isolated_memory_db`` fixture) gives a real, isolated inbox table the arm
+    can query, without touching the suite DB or any production database. The
+    metadata TTL cache is cleared on both edges so a prior test's row cannot leak
+    in and this test's rows cannot leak out.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'cao-inbox.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    database.Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database,
+        "SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+    database.clear_terminal_metadata_cache()
+    try:
+        yield engine
+    finally:
+        database.clear_terminal_metadata_cache()
+        engine.dispose()
+
+
+def test_pi_cli_condition_wiring_writes_one_seat_inbox_row(isolated_inbox_db) -> None:
+    """#700/#701 r3 (codex r2 EMPIRICAL-GATE-NO): a REAL PiCliProvider 429 pane
+    driven through classify → the PRODUCTION ``_condition_inbox_sink`` (with the
+    worker's real recorded ``caller_id`` metadata) writes EXACTLY ONE real
+    ``create_inbox_message`` ``[CONDITION]`` row — sender = worker, receiver =
+    seat — in an isolated fixture DB. This is the committed seat-row wiring arm
+    the r2 recording-delivery arm lacked.
+
+    Kills the stage-A ledger's SURVIVED M6 mutant
+    (``PiCliProvider.condition_provider_key`` → None): classify then returns None,
+    the sink is handed None, ``create_inbox_message`` is never called, and the
+    row-count assertion below goes RED (0 rows)."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.clients.database import InboxModel
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    worker = "worker70"
+    seat = "seat7000"
+    # Real terminal rows: the supervisor seat and the worker whose caller_id is
+    # that seat — this is the metadata the production sink reads to route.
+    database.create_terminal(seat, "sess", "w-seat", "claude_code", agent_profile="supervisor")
+    database.create_terminal(
+        worker, "sess", "w-work", "pi_cli", agent_profile="dev", caller_id=seat
+    )
+
+    sm = StatusMonitor()
+    sm._buffer_epochs[worker] = 1
+    # The ONE delivery seam, wired to the PRODUCTION inbox sink (not a recorder).
+    # Fleet/CLI sinks are benign no-ops: this arm is specifically the seat inbox
+    # row, which only ``_condition_inbox_sink`` can produce.
+    delivery = ConditionDelivery(
+        fleet_sink=lambda tid_, label_: None,
+        inbox_sink=sm._condition_inbox_sink,
+        cli_sink=lambda tid_, cond_, label_: None,
+    )
+    sm._condition_delivery = delivery
+
+    provider = PiCliProvider(worker, "sess", "w-work")
+    assert (
+        type(provider).condition_provider_key == "pi_cli"
+    ), "precondition: pi opts into the F611 seam; the M6 mutant sets this None"
+
+    sm._classify_and_deliver_condition(worker, provider, _pi_capped_pane())
+
+    # Exactly ONE real inbox row, routed worker → seat, carrying the typed event.
+    with database.SessionLocal() as db:
+        rows = db.query(InboxModel).all()
+        assert len(rows) == 1, f"expected exactly one [CONDITION] seat inbox row, got {len(rows)}"
+        row = rows[0]
+        assert row.sender_id == worker, "sender must be the worker terminal"
+        assert row.receiver_id == seat, "receiver must be the supervisor seat"
+        assert row.message.startswith(
+            f"[CONDITION] terminal={worker} kind=CAPPED provider=pi_cli"
+        ), f"row body must be the typed CAPPED condition event, got: {row.message[:80]!r}"
+
+
+def test_pi_cli_condition_wiring_read_back_by_getter() -> None:
+    """The live fleet field the seam sets for a real PiCliProvider is read back by
+    ``get_condition`` (the getter terminal_service.get_terminal uses). A second,
+    non-capped pane transition clears it — proving it is the live field, not a
+    latched artifact."""
+    from cli_agent_orchestrator.providers.condition import ConditionDelivery
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    sm = StatusMonitor()
+    tid = "9b9b9b9b"
+    sm._buffer_epochs[tid] = 1
+    delivery = ConditionDelivery(
+        fleet_sink=sm._condition_fleet_sink,
+        inbox_sink=lambda tid_, cond_: None,
+        cli_sink=lambda tid_, cond_, label_: None,
+    )
+    sm._condition_delivery = delivery
+
+    provider = PiCliProvider(tid, "sess", "win0")
+    sm._classify_and_deliver_condition(tid, provider, _pi_capped_pane())
+    assert sm.get_condition(tid) == "CAPPED"
+
+    # A clean composer pane (no 429 banner) → no condition → field cleared.
+    sm._buffer_epochs[tid] = 2
+    rule = "─" * 120
+    footer = "↑1k ↓1k R1k CH1% $0.001 0.1%/1.0M (auto)   cline-pass/glm-5.3-flash • high"
+    clean_pane = "\n".join([" All done.", "", rule, " ", rule, footer])
+    sm._classify_and_deliver_condition(tid, provider, clean_pane)
+    assert sm.get_condition(tid) is None

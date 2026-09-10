@@ -1,0 +1,18 @@
+
+
+ [38;2;255;255;0mWarning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys
+[39m [38;2;255;255;0mon` to ~/.tmux.conf and restart tmux.[39m
+
+[48;2;52;53;65m
+ [38;2;212;212;212mhello there[39m
+
+
+[38;2;80;80;80m[49m── ⠋[39m [38;2;80;80;80mWorking ─────────────────────────────── ↑ 15 more ─────────────────────────────────────────────
+[39mqueue the next question about the long paragraph queue the next question about the long paragraph
+queue the next question about the long paragraph queue the next question about the long paragraph
+queue the next question about the long paragraph queue the next question about the long paragraph
+queue the next question about the long paragraph queue the next question about the long paragraph
+queue the next question about the long paragraph queue the next question about the long paragraph[7m [0m
+[38;2;80;80;80m────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;2;102;102;102m/data/cao-scratch/gate-700-703-r3/capture3/pi-cwd[39m
+[38;2;102;102;102m0.0%/128k (auto)                                                                         stall-model

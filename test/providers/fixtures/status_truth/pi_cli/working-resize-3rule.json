@@ -1,0 +1,8 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "live-capture",
+  "capture": "copied byte-identical from /data/cao-scratch/gate-700-703-r3/capture/frames/frame_00040_turn1resize.txt (sha256 d4ae5b1a38fa66ffc3eb6a580c59a23ab3a45a1077a3c18e2ca8c5a02ab672a9), a genuine transient pi 0.85.1 TUI frame captured mid terminal-resize.",
+  "geometry": "composer width 100. Below the last working row this frame carries THREE box rules but only ONE is full-width (100 cols); the other two are narrow resize artifacts (20 cols). It is the ONLY archived frame where the any-width and full-width readings of _has_complete_composer_below differ.",
+  "role": "PORTABLE anti-over-narrowing guard (Opus r6 EMPIRICAL-GATE-NO): asserts PROCESSING unconditionally in the repo. It is RED under the mutant that drops the `_visible_width(r) == composer_width` full-width qualifier from _has_complete_composer_below (any-width count = 3 >= 2 + footer would disqualify the live working row), and GREEN with the qualifier (full-width count = 1 < 2). See test_committed_resize_frames_are_processing."
+}

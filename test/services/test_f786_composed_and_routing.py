@@ -196,6 +196,13 @@ class TestAC8SeamWitness:
     """
 
     def test_assign_impl_materialises_composed_profile_through_seam(self, cao_home, monkeypatch):
+        # F868 #724 — a position-name assign (routing-driven OR explicit
+        # provider=) now runs the cell-certification gate before the D8 writer.
+        # Certify general (provider gate) + the dev cell for kiro_cli at their
+        # CURRENT shas, and bind dev→kiro_cli in a routing.toml, so this
+        # seam-witness reaches the writer instead of being refused
+        # E-CELL-UNCERTIFIED. Uses the f497 helpers (they hash the actual files).
+        from test.mcp_server.test_f497_routing_d9 import _certify, _write
         from unittest.mock import MagicMock, patch
 
         from cli_agent_orchestrator.constants import composed_store_dir
@@ -204,6 +211,30 @@ class TestAC8SeamWitness:
             compose_position_profile_for_spawn,
             load_agent_profile,
         )
+
+        positions = cao_home / "agent-store" / "positions"
+        # The fixture omits a clause table; the cert gate + resolver need one.
+        # Give dev/general EMPTY required sets so the row-clause check trivially
+        # passes and cell certification is what gates.
+        _write(
+            positions / "_clauses.toml",
+            '[clauses.callback-contract]\nmarker = "<!-- clause:callback-contract -->"\n\n'
+            "[required]\ngeneral = []\ndev = []\n\n"
+            "[budget]\ngeneral = 2500\ndev = 6000\noverlay = 1200\ncomposed_slack = 500\n",
+        )
+        _certify(positions, "general", "kiro_cli", "PASS")
+        _certify(positions, "dev", "kiro_cli", "PASS")
+        rt = cao_home / "routing.toml"
+        _write(
+            rt,
+            """\
+            [[binding]]
+            position = "dev"
+            provider = "kiro_cli"
+            kind = "cao"
+            """,
+        )
+        monkeypatch.setenv("CAO_ROUTING_TOML", str(rt))
 
         # A CAO_TERMINAL_ID is required so _assign_impl / _create_terminal take
         # the existing-session branch (the only branch that stubs cleanly and

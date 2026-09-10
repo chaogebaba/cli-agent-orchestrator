@@ -1,13 +1,15 @@
-"""F613 #469 + F786 D11 — general-fallback name derivation + provider threading.
+"""F613 #469 + F786 D11 + F870 #726 — non-gate cell composition + provider threading.
 
 F613's original fix resolved the non-gate general fallback through a flat-store
 alias-stub scan (``_find_alias_for_cell``) and raised ``E-ALIAS-MISSING`` when no
-stub existed. F786 D11 REPLACES that scan: the fallback now DERIVES the composed
-name ``general-<provider>`` purely, and the D8 writer materialises it — there is
-no stub scan and no E-ALIAS-MISSING path. The provider's ``general`` PASS row
-(checked first) is what gates the provider. The Bug-2 provider-threading
-behaviour (``_assign_impl`` passes ``_resolved_provider`` to ``_create_terminal``)
-is unchanged and still covered below.
+stub existed. F786 D11 replaced that scan with a pure ``general-<provider>``
+derivation. F870 #726 then DELETES the cross-position general substitution
+entirely: a non-PASS non-gate cell now binds the position's OWN
+``<position>-<provider>`` composition (``uncertified_cell=True``), never
+``general-<provider>``. The provider's ``general`` PASS row (checked first) still
+gates the provider. The Bug-2 provider-threading behaviour (``_assign_impl``
+passes ``_resolved_provider`` to ``_create_terminal``) is unchanged and still
+covered below.
 """
 
 import textwrap
@@ -44,9 +46,12 @@ def _routing_fallback_env(tmp_path, monkeypatch, provider):
 
 
 @pytest.mark.parametrize("provider", ["cline_cli", "kiro_cli", "grok_cli", "codex"])
-def test_general_fallback_derives_general_hyphen_provider(tmp_path, monkeypatch, provider):
-    """D11: the non-gate general fallback binds the DERIVED composed name
-    ``general-<provider>`` — no installed alias stub, no <provider>_general."""
+def test_non_gate_uncertified_uses_own_composition(tmp_path, monkeypatch, provider):
+    """F870 #726 — a non-PASS NON-gate cell binds the position's OWN composed
+    name ``<position>-<provider>`` (here ``dev-<provider>``). F786 D11's
+    cross-position ``general-<provider>`` substitution is DELETED: a non-gate
+    uncertified cell never silently runs as ``general``. ``uncertified_cell`` is
+    set and ``fallback_profile`` names the SAME-position composition."""
     from cli_agent_orchestrator.utils import routing
 
     positions = _routing_fallback_env(tmp_path, monkeypatch, provider)
@@ -54,8 +59,10 @@ def test_general_fallback_derives_general_hyphen_provider(tmp_path, monkeypatch,
         [routing.Binding(position="dev", provider=provider, kind="cao")]
     )
     res = routing.resolve_routing_binding("dev", provider, table=table, positions_dir=positions)
-    assert res.spawn_profile == f"general-{provider}"
-    assert res.fallback_profile == f"general-{provider}"
+    assert res.spawn_profile == f"dev-{provider}"
+    assert res.spawn_profile != f"general-{provider}"
+    assert res.fallback_profile == f"dev-{provider}"
+    assert res.uncertified_cell is True
     assert res.spawn_profile != f"{provider}_general"
 
 

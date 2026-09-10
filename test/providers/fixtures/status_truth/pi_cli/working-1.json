@@ -1,0 +1,7 @@
+{
+  "provider": "pi_cli",
+  "state": "working",
+  "source": "copied byte-exact from /data/cao-scratch/quirk-samples/pi-false-idle-6ea8560f-185803.txt (issue #703 / F847 attachment)",
+  "captured_at": "2026-09-08T18:58:03Z (live pane capture at incident time)",
+  "notes": "F847 #703 false-idle: the fleet server reported 'idle' while this pane shows a live '── \u2834 Working ──' braille spinner row with a long-running shell tool above it ('Elapsed 102.2s', '(timeout 1200s)'). The spinner row is the ground truth (working); the tool-output block above must NOT flip it to idle. Regression anchor for the get_status spinner-first ordering."
+}

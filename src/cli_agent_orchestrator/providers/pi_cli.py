@@ -70,6 +70,7 @@ import re
 import shlex
 import shutil
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -109,14 +110,185 @@ PI_RUNTIME_ROOT = CAO_HOME_DIR / "pi"
 # dashes as a fallback).  Pi draws two of these around the footer when idle.
 _EDITOR_RULE = re.compile(r"^\s*[─━—-]{20,}\s*$")
 
-# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────".
-# The braille spinner glyph varies frame to frame, so we anchor on "Working"
-# flanked by rule characters rather than on the spinner itself.
-_WORKING = re.compile(r"[─━—-]{2,}\s*\S?\s*Working\b", re.IGNORECASE)
+
+def _visible_width(s: str) -> int:
+    """Terminal column width of an ANSI-stripped string (East-Asian aware).
+
+    F847 r5 (#703): the composer-width invariant in ``_live_working_spinner``
+    compares the live working row against the widest composer rule in the same
+    frame. Those rows carry wide glyphs (the braille spinner is narrow, but pane
+    content and box glyphs are not uniformly one column), so ``len`` is wrong —
+    a fullwidth/wide code point occupies two terminal columns. Count W/F East-
+    Asian-width code points as 2 and everything else as 1; combining marks (which
+    render zero-width) are treated as 0 so they do not inflate the width.
+    """
+    width = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+# The braille spinner frames Pi cycles through on its active "Working" rule
+# row.  The ten canonical frames (#703 F847) are ``⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏``; we anchor on
+# the full braille-patterns Unicode block (U+2800–U+28FF) so every frame — and
+# the wider ``⠿``-style glyphs Pi has been observed to draw (#700/#701 corpus) —
+# counts, while ordinary ASCII prose that merely says "Working" does not.
+_BRAILLE_SPINNER = r"\u2800-\u28ff"
+
+# The active spinner line while Pi is working, e.g. "── ⠧ Working ──────".  This
+# is a WHOLE ROW the TUI draws — a Pi box rule (``──…`` run) LEADING a braille
+# spinner glyph adjacent to ``Working``, the row then ending on the composer's
+# closing border rule (see ``_WORKING_TAIL`` below).  The spinner glyph varies
+# frame to frame, so all frames in the braille block are accepted.  The row is
+# always RULE-LEADING: a live capture of pi 0.85.1 (#703 r3) found zero
+# spinner-first frames, and ``CustomEditor.renderTopBorder`` prepends a rule on
+# every branch while ``WorkingStatusIndicator.renderInBorder`` returns the
+# glyph+message with no rule of its own — the r2 "spinner-first" alternative was
+# removed in r3.
+#
+# F847 r2 (#703): the match is BRAILLE-ONLY and requires a same-row box rule, for
+# two reasons the r1 shape got wrong (codex EMPIRICAL-GATE-NO):
+#   1. r1's first alternative made the rule OPTIONAL, so bare
+#      ``⠦ Working on the summary now`` PROSE fired PROCESSING. Requiring a
+#      same-row rule fixes that overmatch.
+#   2. r1 also carried permissive ``\S? Working`` NON-braille alternatives, so a
+#      stray non-spinner glyph matched and — worse — those alternatives MASKED
+#      the braille class entirely (narrowing the braille set to one glyph still
+#      matched via ``\S?``, so the ledger's glyph mutant would survive). Every
+#      real pi spinner in the capture corpus uses a braille frame, so the
+#      non-braille alternatives are dropped: the braille class is now the sole
+#      gate on which glyphs count as a live spinner.
+# Positional scoping to the live bottom-of-viewport status region (and
+# fence-dropping) is done by ``_live_working_spinner`` (r1's whole-buffer
+# ``.search`` overmatched a fenced quote and a stale spinner 40 rows above the
+# composer).
+_RULE_RUN = r"[─━—\-]{2,}"
+# F847 r4 (#703) — the tail is pinned on the CLOSING BORDER RULE, not on ``$``
+# after whitespace/optional-rule (Opus r3 EMPIRICAL-GATE-NO). The r3 tail
+# ``[ \t]*(?:_RULE_RUN[ \t]*)?$`` asserted "the ONLY thing a live row may carry
+# to end-of-line is whitespace and an optional box-rule run" — a descriptive
+# absolute that pi 0.85.1's own composer border code contradicts on three live
+# paths (all regressed 40/40 live frames from PROCESSING to UNKNOWN on the r3
+# head, re-opening the #703 false-idle harm from the other side).
+#
+# What holds across every live draw is that the row IS the composer TOP BORDER
+# and therefore ENDS on the border rule — NOT that nothing follows ``Working``.
+# Pi draws real content between the message and that closing rule:
+#   ── ⠧ Working ─────────────           (the plain turn/resize frame)
+#   ── ⠧ Working ─── ↑ 15 more ───────   (custom-editor.js:37-40 overflow label,
+#      drawn whenever the composer holds hidden lines while a turn runs — an
+#      operator typing the next message mid-turn is ordinary behaviour)
+#   ── ⠧ Working (esc to interrupt) ───  (interactive-mode.js:1768)
+#   ── ⠹ Working on tool call ────────   (interactive-mode.js:1906, extension-set;
+#      CAO launches pi with --mcp-config, so extensions are on)
+# So the tail is pinned on the CLOSING rule instead of on "whitespace only":
+# a transcript row ends in a word or punctuation and still fails the whole-row
+# match, while a live working row — whatever content precedes it — ends on the
+# border rule. This also admits the one-``─`` narrow-width branch
+# (custom-editor.js:46-47) that the r3 ``_RULE_RUN{2,}`` tail rejected.
+#
+# F847 r5 (#703) — the CLOSING run is BOX DRAWING ONLY (``[─━]``: no ASCII
+# hyphen, no em dash), Opus r4 EMPIRICAL-GATE-NO. The r4 tail's closing class
+# ``[─━—\-]+`` admitted the ASCII ``-`` and the em dash, so any transcript row
+# that merely opened with the spinner chrome and happened to END on a dash
+# ("run with --", a soft-wrapped "rule-", a markdown table rule, and the r2
+# adversary with a box rule appended) classified as a live working row — 9 of 10
+# dash-ending adversaries fired PROCESSING, the r1/r2 overmatch class re-opened.
+# The LEADING ``_RULE_RUN`` still admits ASCII/em dashes for tolerance (pi's
+# composer never leads with them, but a stray one there is harmless); accepting
+# them at the row END is what caused the false positives. The composer top
+# border is drawn from ``─``/``━`` box-drawing runs, so the closing class is
+# exactly those two. The load-bearing half of the r4 amendment is the
+# full-composer-width check in ``_live_working_spinner`` below (a quoted spinner
+# row in transcript is short); box-only closing is the belt to its braces.
+_WORKING_TAIL = r"[^\n]*?[─━]+[ \t]*$"
+_WORKING_ROW = re.compile(
+    # rule-leading: ── ⠧ Working …<closing rule> — a leading box rule, the braille
+    # glyph, ``Working``, then any content ending on the closing composer rule.
+    r"^[ \t]*" + _RULE_RUN + r"[ \t]*[" + _BRAILLE_SPINNER + r"][ \t]*Working\b" + _WORKING_TAIL,
+    re.IGNORECASE | re.MULTILINE,
+)
+# Backwards-compatible module alias: ``_WORKING`` is referenced by the r1 tests
+# and by ``_has_idle_chrome``/``extract_last_message_from_script`` as a cheap
+# "does this pane show a working spinner at all" predicate. It now points at the
+# whole-row anchor; positional/fence scoping is applied only in get_status via
+# ``_live_working_spinner``.
+_WORKING = _WORKING_ROW
+
+# How many trailing (non-blank-stripped) rows count as Pi's LIVE status region.
+# Pi's live working spinner sits in the composer box at the bottom of the
+# viewport, directly above the footer/context readout; a spinner glyph far above
+# that region is stale transcript, not the live state (#703 overmatch). 12 rows
+# comfortably covers the composer box + footer + MCP line while excluding a
+# spinner scrolled tens of rows up.
+_LIVE_TAIL_ROWS = 12
 
 # The footer context/budget readout, e.g. "0.3%/1.0M (auto)" or "?/1.0M".
 # Presence of this plus two rules is Pi's idle/completed chrome.
 _FOOTER_CONTEXT = re.compile(r"(?:\d+(?:\.\d+)?%|\?)/\d+(?:\.\d+)?[kKmM]?\b")
+
+
+def _current_composer_width(unfenced: list[str]) -> int | None:
+    """Width, in terminal columns, of the CURRENT (bottom-most) composer's rule.
+
+    F847 r9 (#703) — codex r8 EMPIRICAL-GATE-NO. This is the SINGLE, structural
+    derivation of the current composer width; both the full-width candidate
+    qualifier and the composer-below check consume it and NOTHING reads a global
+    maximum any more.
+
+    The blocker it closes: r5-r8 sized the composer from
+    ``max(_visible_width(row) for row in <every editor rule in the buffer>)`` —
+    the GLOBAL maximum over the whole accumulated rolling buffer. Pi's documented
+    input is an accumulated raw pipe-pane buffer whose escape cleanup turns
+    redraws into separate logical rows, so a STALE WIDER rule from an OLD frame
+    coexists ABOVE the current composer. That stale 120-column rule fixed the
+    global maximum at 120; a GENUINE live 100-column working row (whose width IS
+    its own composer's) then failed ``_visible_width(row) == composer_width`` and
+    was dropped from ``candidates`` entirely, so the idle-chrome fallback read the
+    working pane as COMPLETED — a false, delivery-eligible status on a busy pane
+    (ADV-stale-wider-live-candidate). Windowing the maximum to the live tail does
+    NOT fix it: the stale rule can sit close enough to fall inside the tail.
+
+    The structural truth the current composer is anchored by: the live working
+    row IS the current composer's TOP border, and the current composer's rules are
+    the ones drawn BELOW it (its editor body's bottom rule, just above the
+    footer). Stale/old-frame rules sit ABOVE the live working row, in transcript.
+    So the current composer width is:
+
+    - the MAXIMUM editor-rule width among the rules positioned strictly BELOW the
+      bottom-most ``_WORKING_ROW`` match. "Below the live working row" excludes
+      the stale wider rule (it is above) and an old composer's rule pair (also
+      above), while a transient RESIZE double-draw's narrow artifact rows are
+      NARROWER than the real rule they bracket, so the max still lands on the real
+      composer rule (the committed ``working-resize-3rule`` frame: rules 20, 100,
+      20 below the working row → 100, not 20 — the live working row stays a valid
+      full-width candidate and classifies PROCESSING);
+    - else — when no editor rule is drawn below the bottom-most working row (the
+      composer is drawn ABOVE the candidate, e.g. a short quoted-spinner adversary
+      at the very bottom) — the maximum editor-rule width within the LIVE TAIL
+      window. This is still local to the current viewport, never the whole
+      buffer;
+    - ``None`` when no editor rule is visible at all (no width evidence).
+    """
+    working_idxs = [i for i, row in enumerate(unfenced) if _WORKING_ROW.match(row)]
+    if working_idxs:
+        last_working = working_idxs[-1]
+        below = [
+            _visible_width(row) for row in unfenced[last_working + 1 :] if _EDITOR_RULE.match(row)
+        ]
+        if below:
+            return max(below)
+    # No rule below the live working row → the composer is above the candidate;
+    # size it from the tail window (still local to the current viewport).
+    tail_widths = [
+        _visible_width(row) for row in unfenced[-_LIVE_TAIL_ROWS:] if _EDITOR_RULE.match(row)
+    ]
+    if tail_widths:
+        return max(tail_widths)
+    return None
+
 
 # Startup / authorization / crash banners that mean the launch never reached a
 # usable prompt.  Kept narrow so ordinary agent output mentioning "error" is not
@@ -148,6 +320,13 @@ class PiCliProvider(BaseProvider):
     # get_status(), which is line-oriented and safe on a rendered snapshot (the
     # same detector _resolve_buffer already runs on a live pane read).
     supports_direct_status_probe: bool = True
+
+    # F843 (#700): opt into the F611 condition classifier so pi's ClinePass 429
+    # INFERENCE_CAP_ERROR banner is detected as a CAPPED condition and the ONE
+    # [CONDITION] notice reaches the supervisor seat (the same delivery seam
+    # codex's usage_limit_hard uses). SEPARATE from get_status/fusion — a
+    # condition is never a TerminalStatus member (D1).
+    condition_provider_key = "pi_cli"
 
     # F829 A1 (D10): pi is PARTIAL (D9) — it RECOVERS after a COMPLETED turn (the
     # transcript is written atomically at turn end), so resume/artifact are
@@ -486,6 +665,200 @@ class PiCliProvider(BaseProvider):
         return self._read_pane()
 
     @staticmethod
+    def _live_working_spinner(clean: str) -> bool:
+        """Return whether the LIVE bottom-of-viewport status region shows Pi's
+        working spinner row.
+
+        F847 r2 (#703): the r1 code matched ``_WORKING`` anywhere in the whole
+        cleaned buffer, which overmatched (a) a fenced/quoted spinner row a human
+        pasted, and (b) a stale spinner scrolled tens of rows above the current
+        composer. Pi's genuine live spinner is a WHOLE ROW drawn in the composer
+        box at the bottom of the viewport, directly above the footer. So the
+        match is scoped, with the SAME discipline as the #693 footer classifier
+        (position-anchored, fence-excluded, whole-row):
+
+        1. Drop rows inside a Markdown code fence (a pasted/quoted spinner is
+           transcript, never the live row — mirrors ``condition._pi_live_rows``).
+        2. Strip trailing whitespace-only padding (pi pads the pane bottom).
+        3. Only the last ``_LIVE_TAIL_ROWS`` rows — the live status region — are
+           eligible; a spinner further up is stale transcript.
+        4. A row in that window is a working-row CANDIDATE only if it matches the
+           whole-row ``_WORKING_ROW`` anchor (a braille glyph + ``Working`` with a
+           leading box rule and a box-drawing closing rule), never bare prose.
+        5. F847 r5 (#703): a candidate is the LIVE working row only if it spans
+           the FULL composer width. The live working row IS the composer TOP
+           BORDER, so ``renderTopBorder`` sizes its trailing rule from ``width``:
+           a label or message shortens the rule and the total width is invariant
+           (measured 424/424 live pi 0.85.1 frames + all 40 overflow frames — the
+           working row's visible width equals the widest composer rule in the same
+           frame). A quoted spinner row pasted into transcript is SHORT, so this
+           rejects the dash-ending transcript adversaries the box-only closing
+           class alone still let through (Opus r4 EMPIRICAL-GATE-NO). When no
+           composer rule is visible there is no width evidence, so a candidate is
+           accepted rather than narrowed away.
+        6. F847 r6 (#703): width equality is NECESSARY but not SUFFICIENT. A
+           logical transcript row one column longer than the composer WRAPS: its
+           first physical row is exactly composer-wide and, if it ends on a box
+           char, matches ``_WORKING_ROW`` at the full width — a manufactured
+           full-width transcript row (codex r5 EMPIRICAL-GATE-NO). The structural
+           invariant that separates it: the live working row IS the composer TOP
+           border, so there is only ONE composer and the working row belongs to
+           the BOTTOM-most one — there is never a COMPLETE idle composer (a
+           self-consistent same-width rule PAIR AND a footer) drawn ENTIRELY BELOW
+           the live working row. The wrapped transcript row, by contrast, sits
+           above the genuine idle composer, so a complete composer follows it.
+           Measured on the archive: 0 of 424 live frames have a complete composer
+           below their last working row (422 have exactly one rule after, one
+           transient resize frame has three rules whose two extra rows are a
+           narrow artifact pair bracketing the real rule — a resize double-draw,
+           not a composer box — one has zero), so this rejects the wrap without a
+           single false negative. A candidate with a complete composer below it is
+           disqualified.
+
+           F847 r8 (#703): the "complete idle composer below" test is a
+           self-consistent same-width rule pair + footer, NOT two rules matching
+           the GLOBAL maximum editor-rule width. A stale wider rule left in the
+           accumulated buffer used to poison that maximum and hide the current
+           composer's own (narrower) rule pair; see ``_has_complete_composer_below``.
+
+           F847 r9 (#703): codex r8 EMPIRICAL-GATE-NO. r8 removed the global
+           maximum from the below-check but left it powering the full-width
+           CANDIDATE qualifier in step 5, so the SAME stale wider rule could still
+           drop a genuine narrower live working row from ``candidates`` and yield
+           a false COMPLETED (ADV-stale-wider-live-candidate). The global maximum
+           is now DELETED: the current composer width comes from the single
+           structural ``_current_composer_width`` helper (the max editor-rule width
+           BELOW the live working row, else the tail-window max), which BOTH the
+           candidate qualifier and the composer-below structure consume. No
+           consumer reads the whole-buffer maximum any more.
+
+           F847 r10 (#703): codex r9 EMPIRICAL-GATE-NO item 1. r9 wired the
+           structural width into the candidate qualifier but left the
+           composer-below check width-AGNOSTIC, so an adjacent narrow RESIZE
+           redraw pair (two 20-column artifacts) below a genuine 100-column live
+           working row was accepted as a complete idle composer and produced a
+           false COMPLETED (ADV-adjacent-narrow-resize-pair). Both consumers now
+           consume the ONE derived ``composer_width``: the below-check requires the
+           idle-composer rule PAIR to equal it, so only the current composer's own
+           width counts as its box.
+        """
+        lines = clean.splitlines()
+        # 1) drop fenced rows (quoted spinner is not live)
+        unfenced: list[str] = []
+        in_fence = False
+        for row in lines:
+            if row.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            unfenced.append(row)
+        # 2) strip trailing blank padding so the tail lands on real chrome
+        while unfenced and not unfenced[-1].strip():
+            unfenced.pop()
+        # 3) bottom-of-viewport window only
+        tail = unfenced[-_LIVE_TAIL_ROWS:]
+        # 4) whole-row spinner anchor within the live window
+        if not any(_WORKING_ROW.match(row) for row in tail):
+            return False
+        # 5) full-composer-width invariant: the live working row spans the pane.
+        # F847 r9 (#703): the composer width is derived STRUCTURALLY from the
+        # current (bottom-most) composer via the single ``_current_composer_width``
+        # helper — the max editor-rule width BELOW the live working row, else the
+        # tail-window max. It is NO LONGER the global maximum over every rule in
+        # the accumulated buffer, so a STALE WIDER rule left in scrollback can no
+        # longer poison the width and drop a genuine narrower live working row from
+        # ``candidates`` (codex r8 EMPIRICAL-GATE-NO: ADV-stale-wider-live-
+        # candidate). Both this candidate filter and the composer-below check
+        # consume the current composer's structure; nothing reads the global max.
+        composer_width = _current_composer_width(unfenced)
+        if composer_width is None:
+            # No composer rule visible → no width evidence; do not narrow.
+            return True
+        # Candidate positions in the FULL unfenced buffer (not just the tail), so
+        # step 6 can inspect what is drawn BELOW each candidate.
+        tail_start = len(unfenced) - len(tail)
+        candidates = [
+            idx
+            for idx, row in enumerate(unfenced)
+            if idx >= tail_start
+            and _WORKING_ROW.match(row)
+            and _visible_width(row) == composer_width
+        ]
+        if not candidates:
+            return False
+
+        # 6) composer-structure check: a candidate is the live TOP BORDER only if
+        # it is NOT sitting above a COMPLETE idle composer (a wrapped full-width
+        # transcript row does). "Complete idle composer below" = a SELF-CONSISTENT
+        # composer box (a pair of editor rules of EQUAL width to EACH OTHER, with
+        # a footer) drawn strictly after the candidate.
+        #
+        # F847 r8 (#703) — codex r7 EMPIRICAL-GATE-NO. The r6/r7 test counted the
+        # below rules against ``composer_width``, the MAXIMUM editor-rule width in
+        # the WHOLE unfenced rolling buffer. Pi's documented input is an
+        # accumulated raw pipe-pane buffer whose escape cleanup turns redraws into
+        # separate logical rows, so a STALE wider rule from an OLD frame can
+        # coexist above the current composer. Such a stale 120-column rule fixes
+        # ``composer_width`` at 120; the current idle composer's own two 100-column
+        # rules then no longer equal ``composer_width`` and are NOT counted, so a
+        # 120-column wrapped-transcript candidate above a COMPLETE 100-column idle
+        # composer read PROCESSING (ADV-stale-wider-rule). Deleting only the stale
+        # rule flipped it to COMPLETED.
+        #
+        # The fix DECOUPLES this check from the poisoned global width: a complete
+        # composer below is a pair of editor rules of EQUAL width to EACH OTHER
+        # (whatever that width is) plus a footer. The pair is required to be CLEAN
+        # — no editor rule WIDER than the pair sandwiched between its two members —
+        # which distinguishes a genuine composer box (its two rules bracket the
+        # editor body; nothing wider sits between them) from a transient RESIZE
+        # double-draw, where a wider rule is redrawn BETWEEN two narrow artifact
+        # rows (the committed ``working-resize-3rule`` frame: two 20-column
+        # artifacts bracketing the real 100-column rule — NOT a composer, so the
+        # live working row there stays PROCESSING). This keeps the full-width
+        # candidate qualifier (``_visible_width(row) == composer_width`` above)
+        # intact for the resize fixtures.
+        #
+        # F847 r9 (#703): ``composer_width`` above is the CURRENT composer's width
+        # from ``_current_composer_width`` (structural), NOT the whole-buffer
+        # maximum — see step 5.
+        #
+        # F847 r10 (#703) — codex r9 EMPIRICAL-GATE-NO item 1. The frozen repair
+        # contract requires BOTH consumers — the full-width candidate qualifier
+        # (step 5) AND this complete-composer-below check — to consume the ONE
+        # derived current ``composer_width``. r9 left this check width-AGNOSTIC (it
+        # matched a same-width pair at ANY width), which is a hole: a genuine live
+        # 100-column working row whose current composer draws TWO adjacent 20-column
+        # RESIZE redraw artifacts (plus the single real 100-column bottom rule and a
+        # footer) below it had that 20/20 artifact pair accepted as a "complete idle
+        # composer", so the live working row was disqualified and the pane read a
+        # false COMPLETED (ADV-adjacent-narrow-resize-pair). The pair is therefore
+        # required to equal the derived ``composer_width``: only a rule pair at the
+        # CURRENT composer's own width counts as its idle-composer box. The 20/20
+        # artifact pair (20 != 100) no longer qualifies, so the live working row
+        # stays PROCESSING; the r7/r8 stale-wider and two-composer COMPLETED
+        # contracts keep their genuine width-``composer_width`` idle pair below the
+        # wrap candidate and remain COMPLETED. The "nothing WIDER than the pair
+        # sandwiched between its members" cleanliness clause is retained (it still
+        # separates a genuine box from a resize double-draw at the composer width
+        # itself, e.g. the committed ``working-resize-3rule`` frame).
+        def _clean_same_width_rule_pair_below(idx: int) -> bool:
+            rule_widths = [_visible_width(r) for r in unfenced[idx + 1 :] if _EDITOR_RULE.match(r)]
+            for i in range(len(rule_widths)):
+                for j in range(i + 1, len(rule_widths)):
+                    if rule_widths[i] == rule_widths[j] == composer_width and all(
+                        rule_widths[k] <= rule_widths[i] for k in range(i + 1, j)
+                    ):
+                        return True
+            return False
+
+        def _has_complete_composer_below(idx: int) -> bool:
+            has_footer = any(_FOOTER_CONTEXT.search(r) for r in unfenced[idx + 1 :])
+            return _clean_same_width_rule_pair_below(idx) and has_footer
+
+        return any(not _has_complete_composer_below(idx) for idx in candidates)
+
+    @staticmethod
     def _has_idle_chrome(clean: str) -> bool:
         """Return whether the stripped buffer shows Pi's idle/completed chrome.
 
@@ -499,7 +872,7 @@ class PiCliProvider(BaseProvider):
         so we STRIP trailing blank/whitespace-only lines BEFORE taking the tail
         window. Blank lines interspersed within the chrome are preserved.
         """
-        if _WORKING.search(clean):
+        if PiCliProvider._live_working_spinner(clean):
             return False
         lines = clean.splitlines()
         # Drop trailing whitespace-only lines (pi's bottom padding) so the tail
@@ -522,6 +895,19 @@ class PiCliProvider(BaseProvider):
                 otherwise                                 → IDLE
           - startup/authorization error banner    → ERROR
           - no recognizable chrome yet            → UNKNOWN (pre-init/transient)
+
+        F844 (#701): status is RE-DERIVED from the live pane every poll and an
+        ``error`` verdict is NOT sticky. A RUNTIME error banner (notably the
+        ClinePass 429 ``Error: 429: {…}`` / ``Error: Retry failed after 3
+        attempts`` lines — see #700, which classifies it as a CAPPED *condition*,
+        not a status) scrolls into the rolling buffer and stays there while the
+        pane keeps working. So the live liveness of the pane — a ``Working``
+        spinner (PROCESSING) or the idle composer chrome (IDLE/COMPLETED) — is
+        decided BEFORE the error-banner scan, and the ERROR verdict is reserved
+        for a genuine launch failure: pi never reached a usable frame (no idle
+        chrome AND no working spinner). Once pi has drawn its TUI, an ``Error:``
+        line is transcript, never a terminal ERROR — so a nudged worker that
+        resumes real work re-derives PROCESSING/IDLE instead of latching error.
         """
         native = self._resolve_native_status(buffer)
         if native is not None:
@@ -534,17 +920,31 @@ class PiCliProvider(BaseProvider):
         if not clean.strip():
             return TerminalStatus.UNKNOWN
 
-        if _WORKING.search(clean):
+        # Live liveness first (F844 #701): a working spinner or the idle composer
+        # chrome re-derives the true state every poll, so a runtime error banner
+        # left in scrollback (the 429 cap, #700) can never latch a sticky ERROR
+        # over a pane that is in fact working or waiting at its composer. The
+        # ``⠴ Working`` spinner row (F847 #703) is matched only in the LIVE
+        # bottom-of-viewport status region (whole-row anchor, fence-excluded —
+        # ``_live_working_spinner``) and BEFORE the idle/composer chrome, so a
+        # long-running tool's ``Elapsed``/``(timeout Ns)`` block printed above the
+        # spinner cannot flip a working pane to a false IDLE (the delivery-
+        # eligible state), while a quoted/fenced or stale-far-above spinner glyph
+        # in transcript can no longer flip an idle pane to a false PROCESSING.
+        if self._live_working_spinner(clean):
             self._tui_processing_seen = True
             return TerminalStatus.PROCESSING
-
-        if _STARTUP_ERROR.search(clean):
-            return TerminalStatus.ERROR
 
         if self._has_idle_chrome(clean):
             if self._task_dispatched and self._tui_processing_seen:
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
+
+        # No live TUI chrome AND no spinner: pi never reached (or has lost) a
+        # usable frame — a genuine startup/authorization failure. Only here does
+        # the error banner mean a terminal ERROR.
+        if _STARTUP_ERROR.search(clean):
+            return TerminalStatus.ERROR
 
         return TerminalStatus.UNKNOWN
 
@@ -562,7 +962,7 @@ class PiCliProvider(BaseProvider):
         the initial banner).
         """
         clean = strip_terminal_escapes(script_output)
-        if _WORKING.search(clean):
+        if self._live_working_spinner(clean):
             raise ValueError("No completed Pi response found while Pi is working")
 
         lines = clean.splitlines()

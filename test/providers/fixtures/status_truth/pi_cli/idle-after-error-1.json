@@ -1,0 +1,7 @@
+{
+  "provider": "pi_cli",
+  "state": "idle",
+  "source": "copied byte-exact from /data/cao-scratch/quirk-samples/pi-false-error-0afb9acc-194924.txt (issue #703 verdict cross-check / F844 #701 mirror)",
+  "captured_at": "2026-09-08T19:49:24Z (live pane capture)",
+  "notes": "F844 #701 / #703 r2 item 2b: the pane transcript carries several 'Error:' lines (a pydantic send_message validation error echoed into scrollback) but ends in pi's idle composer chrome (two box rules + '%/1.0M (auto)' footer + MCP line). It MUST classify IDLE (not a sticky ERROR): the runtime error banner is transcript once pi has drawn its TUI. With a dispatched task + a prior processing frame it reads COMPLETED (also quiescent), never ERROR. Confirms the #701 not-sticky-error contract on a second real capture."
+}
