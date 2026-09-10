@@ -496,3 +496,76 @@ def test_r2_2_delayed_create_after_parent_force_delete_is_refused(real_sqlite_en
         )
     # No child row was published.
     assert d.get_terminal_metadata(child) is None
+
+
+def test_r3_delayed_create_after_parent_row_vanishes_is_refused(real_sqlite_env, monkeypatch):
+    """F867 r3 MUTANT SENTINEL for the DB read itself.
+
+    ``test_r2_2_delayed_create_after_parent_force_delete_is_refused`` marks the
+    parent under teardown as well as deleting it, so the teardown-scope clause
+    alone refuses it: a mutant that fabricates the caller metadata instead of
+    reading it (``_caller_meta = {"id": caller_id}``) survives that test. Here
+    the parent row simply VANISHES with no teardown intent recorded, so the
+    ONLY thing that can refuse the publish is the real
+    ``get_terminal_metadata`` lookup returning ``None`` — and the refusal must
+    say ``missing``, not ``under_teardown``.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    session = "cao-r3gone"
+    parent = "r3parent0"
+    child = "r3child00"
+    d.create_terminal(
+        terminal_id=parent,
+        tmux_session=session,
+        tmux_window=f"win-{parent}",
+        agent_profile="developer",
+        provider="pi_cli",
+    )
+    # Row removed, NO teardown intent recorded — the metadata read is the only
+    # remaining signal that the caller is gone.
+    d.delete_terminal(parent)
+
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        active_teardown_scope_keys,
+    )
+
+    keys = active_teardown_scope_keys()
+    assert parent not in keys and session not in keys, (
+        "this arm must NOT rely on the teardown clause; got teardown keys=" f"{sorted(keys)!r}"
+    )
+
+    monkeypatch.setattr(ts, "get_backend", lambda: MagicMock())
+    monkeypatch.setattr(
+        ts,
+        "load_agent_profile",
+        lambda _n: SimpleNamespace(
+            sessionBrief=None,
+            lifecycle=None,
+            contextPolicy=None,
+            name="developer",
+            skills=None,
+            allowedTools=None,
+            role=None,
+            mcpServers=None,
+            engine=None,
+            default_use_worktree=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"E-CALLER-GONE: caller 'r3parent0' missing"):
+        asyncio.run(
+            ts.create_terminal(
+                "pi_cli",
+                "developer",
+                session_name=session,
+                new_session=False,
+                caller_id=parent,
+                terminal_id=child,
+            )
+        )
+    assert d.get_terminal_metadata(child) is None
