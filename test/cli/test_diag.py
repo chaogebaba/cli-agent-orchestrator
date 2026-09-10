@@ -294,20 +294,36 @@ def test_both_disagreement_codes_print_across_the_cutover_boundary(
 def test_the_agreement_subcommand_no_longer_exists(db: Path) -> None:
     """#738: the AC10 agreement report is GONE, not hidden.
 
-    It compared the state projection against the legacy published status over a
-    dark deployment, which is the machinery shadow-live mode was — so it went
-    with the mode rather than staying on as a diagnostic. Asserted at the CLI
-    because that is the surface an operator still carrying the command in a
-    script or a runbook will hit, and Click's answer to an unknown subcommand is
-    the one that tells them.
+    It held a rate over days of a dark deployment before the next phase could
+    start, which is the machinery shadow-live mode WAS — so it went with the
+    mode rather than staying on as a diagnostic.
 
-    MUTANT: re-register `diag agreement` and this fails on the exit code, then on
-    the absence of the name in the group's help.
+    Asserted against the group's registry and its help text rather than an exit
+    code, because ``cao diag`` reads a bare argument as a TERMINAL ID (see
+    ``test_a_bare_terminal_id_needs_no_subcommand``). ``cao diag agreement``
+    therefore exits 0 reporting an unknown terminal, and an exit-code assertion
+    here would pass no matter what — it would be testing the terminal-id path.
+
+    MUTANT: re-register `diag agreement` and both assertions fail.
+    """
+    assert "agreement" not in diag.commands
+
+    listed = _run(db, "--help").output
+    assert "agreement" not in listed, listed
+
+
+def test_a_stale_agreement_invocation_is_read_as_a_terminal_id(db: Path) -> None:
+    """What an operator whose runbook still says ``cao diag agreement`` sees.
+
+    Not an error: the bare-argument shape swallows it and reports that no such
+    terminal exists. Asserted so the behaviour is a known consequence of the
+    removal rather than a surprise in a bug report — the message names the
+    argument, so it is at least self-explaining.
     """
     result = _run(db, "agreement")
 
-    assert result.exit_code != 0
-    assert "agreement" not in _run(db, "--help").output
+    assert result.exit_code == 0
+    assert "agreement" in result.output
 
 
 # ----------------------------------------------------------------- since parser

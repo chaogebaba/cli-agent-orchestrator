@@ -285,11 +285,23 @@ def test_a_bulk_read_returns_both_sides_from_the_real_store(rig: _Rig) -> None:
 
     rows = rig.events.read()
 
-    assert len(rows) == 3 * 30 * 4
     legacy = [row for row in rows if row.kind is EventKind.STATUS_LEGACY_PUBLISHED]
+    projected = [row for row in rows if row.decision is DecisionKind.STATUS_TRANSITION]
+
+    # Both sides, at volume, for every terminal. Counted per side rather than as
+    # one total: the rig also folds, so the log carries transition rows the loop
+    # never appends, and a total would silently absorb one side going missing.
     assert len(legacy) == 3 * 30 * 2
-    assert {row.terminal_id for row in rows} == {"t0", "t1", "t2"}
-    assert [row.seq for row in rows] == sorted(row.seq for row in rows)
+    assert len(projected) == 3 * 30 * 2
+    assert {row.terminal_id for row in legacy} == {"t0", "t1", "t2"}
+    assert {row.terminal_id for row in projected} == {"t0", "t1", "t2"}
+    # A fleet-wide read orders by ``ingested_at``, not by ``seq`` — ``seq`` is
+    # per terminal, so the fleet view interleaves three sequences. Monotonicity
+    # is therefore asserted WITHIN a terminal, which is where it is promised.
+    assert [row.ingested_at for row in rows] == sorted(row.ingested_at for row in rows)
+    for terminal in ("t0", "t1", "t2"):
+        seqs = [row.seq for row in rows if row.terminal_id == terminal]
+        assert seqs == sorted(seqs)
 
 
 def test_findings_render_from_the_real_store(rig: _Rig) -> None:
