@@ -3839,7 +3839,10 @@ class InboxService:
                     # F747 (#747): the line now NAMES why native delivery is
                     # unusable for this terminal, because the legacy fallback
                     # surface engaging at all is a filed quirk, not a posture.
-                    tid = mb.current_terminal_id
+                    # F747 (#747) r6: SQLAlchemy types this Column[str]; the typed
+                    # reason helper takes a plain str, so narrow once here rather
+                    # than casting at each use.
+                    tid = str(mb.current_terminal_id)
                     now_ts = time.monotonic()
                     last = _fx158_gate5_last_warn.get(tid)
                     if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:

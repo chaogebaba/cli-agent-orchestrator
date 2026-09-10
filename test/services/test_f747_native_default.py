@@ -671,10 +671,14 @@ def test_invalidate_does_not_scan_the_whole_terminal_cache():
     finally:
         db_mod.clear_terminal_metadata_cache()
 
-    # 100x the cache must not mean anything like 100x the eviction cost.
-    assert big_elapsed < (small_elapsed + 0.05) * 10, (
+    # An ABSOLUTE bound, not a ratio. 200 evictions against a 20k-entry cache
+    # are ~0.2 ms when eviction is O(1). Restoring the prefix scan makes each
+    # one copy the whole dict with list(), which is ~100 ms for the same 200 --
+    # a ratio bound wide enough to absorb timing noise would not catch that, so
+    # the bound is stated in absolute terms.
+    assert big_elapsed < 0.05, (
         f"eviction scaled with cache size: {small_elapsed:.4f}s at 200 entries, "
-        f"{big_elapsed:.4f}s at 20000"
+        f"{big_elapsed:.4f}s at 20000 (budget 0.05s)"
     )
 
 
