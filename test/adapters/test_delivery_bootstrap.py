@@ -19,6 +19,7 @@ Three switch criteria live here:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from test.adapters.conftest import TEST_BUSY_TIMEOUT_MS, FakeClock
@@ -174,6 +175,54 @@ async def test_a_retired_position_refuses_the_subsystem_and_not_the_boot(
     await bootstrap.shutdown_worker_truth()
 
 
+async def test_the_refusal_logs_exactly_one_error_carrying_the_literal_fix(
+    db_path: Path, clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refusal must TELL the operator what to type (#738, gate r1 H2).
+
+    The parallel of ``test_a_retired_position_is_refused_and_arms_nothing`` on the
+    status side, and it exists because the delivery side did not have it. The
+    Stage B adjudication mutated this call site from ``requested.detail`` to
+    ``requested.reason`` — which keeps the typed ``Rejected``, the non-start, the
+    disarmed hooks, the ``rejected/#738`` health component and the untouched
+    queue, and only drops ``set CAO_DELIVERY_QUEUE=off|drain|on`` from the one
+    message an operator ever sees — and all 68 shipped tests in this file and
+    ``test/core/test_delivery.py`` stayed green. That is the gap.
+
+    Asserting ``Rejected.hint`` at the parser boundary is NOT this: the hint can
+    be perfect while the composition root logs something that omits it. What is
+    pinned here is the LOG LINE, at the composition root, in the rejected state:
+
+    * exactly ONE ``delivery queue NOT started`` ERROR — a boot that logged the
+      refusal twice would train an operator to skim it, and one that logged none
+      leaves them with a subsystem that is simply absent;
+    * it names ``#738``, so the reason is findable;
+    * it carries the literal ``set CAO_DELIVERY_QUEUE=off|drain|on`` — a literal
+      to paste, never a description of one. This is the load-bearing clause: the
+      laptop's own drop-in still selects ``shadow``, so this message is the
+      instruction that unblocks the next redeploy.
+
+    MUTANT (the gate's, replayed): ``requested.detail`` -> ``requested.reason``
+    at ``bootstrap.py`` in ``_start_delivery``. The message keeps ``#738`` and
+    fails on the literal-fix assertion.
+    """
+    with caplog.at_level("ERROR", logger="cli_agent_orchestrator.bootstrap"):
+        runtime = await boot(db_path, "shadow", clock)
+
+    assert isinstance(runtime.delivery, Rejected)
+
+    refusals = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "ERROR" and "delivery queue NOT started" in record.getMessage()
+    ]
+    assert len(refusals) == 1, caplog.text
+    assert "#738" in refusals[0]
+    assert "set CAO_DELIVERY_QUEUE=off|drain|on" in refusals[0]
+
+    await bootstrap.shutdown_worker_truth()
+
+
 async def test_the_refusal_leaves_a_leftover_queue_alone(db_path: Path, clock: FakeClock) -> None:
     """A refused boot resolves NOTHING, so it cannot drain or orphan rows.
 
@@ -312,3 +361,47 @@ async def test_the_delivery_switch_is_independent_of_the_ingestion_switch(
     assert runtime.delivery is not None and runtime.delivery.position is SwitchPosition.ON
     assert wiring.queue_enabled() is True
     await bootstrap.shutdown_worker_truth()
+
+
+# ------------------------------------------------------ #738 the word itself
+
+
+async def test_no_live_subsystem_in_bootstrap_calls_itself_shadow() -> None:
+    """The retirement is audited by grep, so the WORD is part of the contract.
+
+    Gate r1 H4c: WP-ARCH slice 2a's gate wiring described itself as "SHADOW"
+    meaning "built, but the supervisor loop does not call it". That is a real and
+    useful state, and it is NOT the mode #738 retired — which was new machinery
+    running beside the real path, writing observational copies of live traffic.
+    Nothing was broken by the wording. What it broke was the AUDIT: the retirement
+    of shadow-live mode is checked by sweeping for the word, and a second,
+    innocent meaning in the composition root makes that sweep report a survivor
+    that is not one, every time, forever.
+
+    So the word is reserved. ``bootstrap.py`` may name ``shadow`` only where it
+    RETIRES it — the refusal path and prose that says the mode is gone — and a
+    subsystem that is merely uncalled says so in those words.
+
+    MUTANT: describe any inert subsystem here as "shadow" again and this fails,
+    naming the line.
+    """
+    source = Path(bootstrap.__file__).read_text(encoding="utf-8")
+
+    # The pattern is a subsystem LABELLING ITSELF with the retired mode's name —
+    # "slice 2a is SHADOW", "because slice 2a is shadow". Matched narrowly on
+    # purpose: this module must go on naming ``shadow`` freely in the refusal
+    # path ("a REQUESTED ``shadow`` is refused", "an operator whose drop-in still
+    # says ``shadow``"), and a keyword blocklist wide enough to catch the label
+    # would catch those too and be turned off within a round.
+    label = re.compile(r"\bis\s+(?:a\s+)?shadow\b", re.IGNORECASE)
+
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(source.splitlines(), start=1)
+        if label.search(line)
+    ]
+
+    assert not offenders, (
+        "bootstrap.py describes a subsystem as 'shadow'; if it is merely not "
+        "wired to the supervisor loop, say that instead (#738):\n" + "\n".join(offenders)
+    )

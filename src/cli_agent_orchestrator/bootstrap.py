@@ -682,12 +682,18 @@ def build_readonly_diag_stores(db_path: str | Path | None = None) -> DiagSources
 # Gate record wiring (WP-ARCH Amendment A, slice 2a).
 #
 # The gate store is a SEPARATE adapter, named only here, exactly as the queue
-# and event log are.  Slice 2a is SHADOW: the migrator (which runs at every boot)
-# creates the gate tables, but nothing in the live supervisor loop calls the gate
-# service — there is no routing.toml change and no hook change.  So this module
-# offers two builders and calls neither at boot; a caller (the CLI, or 2c's
-# workflow shim) asks for a service or a read-only store when it needs one, and
-# until then the gate tables sit inert beside the delivery ones.
+# and event log are.  Slice 2a is BUILT BUT SUPERVISOR-UNWIRED: the migrator
+# (which runs at every boot) creates the gate tables, but nothing in the live
+# supervisor loop calls the gate service — there is no routing.toml change and no
+# hook change.  So this module offers two builders and calls neither at boot; a
+# caller (the CLI, or 2c's workflow shim) asks for a service or a read-only store
+# when it needs one, and until then the gate tables sit inert beside the delivery
+# ones.
+#
+# Deliberately NOT called "shadow" (#738).  That word named a mode this build
+# retired — new machinery running beside the real path and writing observational
+# copies — and reusing it for "exists but nobody calls it" would make the
+# retirement unauditable by grep, which is how the retirement is checked.
 # ---------------------------------------------------------------------------
 
 
@@ -698,8 +704,8 @@ def build_gate_service(db_path: str | Path | None = None, *, clock: Clock | None
     this module's signature imposes on callers; the concrete type is
     ``app.gate.service.GateRoundService`` and a caller that wants the methods
     imports that type for its own annotation.  Built on demand rather than at boot
-    because slice 2a is shadow — the service exists to be called by the CLI and by
-    2c's workflow shim, not by the supervisor loop.
+    because slice 2a is supervisor-unwired — the service exists to be called by the
+    CLI and by 2c's workflow shim, not by the supervisor loop.
     """
     from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
     from cli_agent_orchestrator.app.gate.service import GateRoundService
