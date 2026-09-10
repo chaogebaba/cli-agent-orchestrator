@@ -371,8 +371,13 @@ def test_reachability_egress_guard_installed_and_calls_enforce(monkeypatch) -> N
     # Make the Transport's submit fail fast so we don't need a full turn — the
     # egress route is installed BEFORE navigation, so it is reached regardless.
     class _FakeTransport:
-        def __init__(self, page):
+        def __init__(self, page, owned_conversation_id=None, intent_log=None):
+            # r6: production passes the durable SEND_INTENT log positionally-by-
+            # keyword; the double must accept the real signature or it hides a
+            # wiring break behind a TypeError.
             self.page = page
+            self.owned_conversation_id = owned_conversation_id
+            self.intent_log = intent_log
 
         def arm_send_observer(self):
             pass
