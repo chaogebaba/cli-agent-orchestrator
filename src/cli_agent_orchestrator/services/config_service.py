@@ -283,6 +283,23 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "str",
         "bash,sh,zsh,fish,dash,ksh,ash",
     ),
+    # r3 repair 1: the exec'd-tool arm. A tool call whose command begins with
+    # ``exec`` leaves no shell on the branch, so shell ancestry alone misses it.
+    # The arm counts a non-shell descendant started at or after the terminal's
+    # last input; the slack absorbs the write latency between input dispatch and
+    # the fork, and the helper list names the measured persistent stdio helpers
+    # (helper BINARIES, never provider names) that a lazy spawn would otherwise
+    # place after the input.
+    "CAO_LIVENESS_CHILD_PROC_INPUT_SLACK_S": (
+        "liveness.child_proc_input_slack_s",
+        "float",
+        2.0,
+    ),
+    "CAO_LIVENESS_CHILD_PROC_HELPER_COMMS": (
+        "liveness.child_proc_helper_comms",
+        "str",
+        "cao-mcp-server,node_repl,codex-code-mode",
+    ),
     "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
     "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
     "CAO_ALARM_DEGRADED_DISPLAY_MESSAGE": ("alarm.degraded_display_message", "bool", True),

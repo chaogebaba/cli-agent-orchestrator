@@ -601,3 +601,43 @@ def test_r3_clear_terminal_never_raises_when_the_probe_explodes(monkeypatch):
         "cli_agent_orchestrator.services.child_proc_probe.child_proc_probe", exploding
     )
     StatusMonitor().clear_terminal("t3")
+
+
+# ── R1 tail: the two new config keys are real knobs, not constants ─────────
+
+
+@pytest.fixture
+def config_override(monkeypatch):
+    """Override specific ConfigService keys, passing everything else through."""
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    real = ConfigService.get
+
+    def _apply(overrides):
+        def fake(path, default=None):
+            if path in overrides:
+                return overrides[path]
+            return real(path, default)
+
+        monkeypatch.setattr(ConfigService, "get", staticmethod(fake))
+
+    return _apply
+
+
+def test_r3_helper_comms_are_configurable(probe_at, config_override):
+    """A site with its own persistent stdio helper can name it, instead of
+    living with a seat pinned working."""
+    tree = dict(_CODEX_IDLE_TREE)
+    tree[108] = ("site-helper", 103, _AFTER_INPUT)
+    assert probe_at(tree).probe("t1").live is True  # not a known helper
+    config_override({"liveness.child_proc_helper_comms": "site-helper"})
+    assert probe_at(tree).probe("t2").live is False
+
+
+def test_r3_input_slack_is_configurable(probe_at, config_override):
+    """The slack widens the window a process may predate the input by."""
+    tree = dict(_CODEX_IDLE_TREE)
+    tree[108] = ("pytest", 103, _LAST_INPUT - 30.0)
+    assert probe_at(tree).probe("t1").live is False  # 30 s > the 2 s default
+    config_override({"liveness.child_proc_input_slack_s": 60.0})
+    assert probe_at(tree).probe("t2").live is True
