@@ -361,3 +361,126 @@ def test_session_start_always_sends_a_cwd():
     persists its own cwd for a seat launched without --cwd."""
     src = Path("src/cli_agent_orchestrator/cli/commands/session.py").read_text(encoding="utf-8")
     assert 'params["working_directory"] = working_directory or os.getcwd()' in src
+
+
+# ---------------------------------------------------------------------------
+# The starvation the flag and the path never explained (#747 follow-up).
+#
+# Observed live: teammate_push=true, cc_team_inbox_path present on the seat, and
+# cao-server STILL wrote nothing to team-lead.json for messages 5644-5647; the
+# legacy "CAO callback waiting" wake fired instead. The mailbox indirection is
+# not the culprit -- a row addressed to a mailbox id resolves to the seat and
+# keeps the mailbox as logical_receiver_id, which is exactly what the pull-mode
+# reconciler selects on. The culprit is the FALLBACK SURFACE ITSELF: the drain
+# hook fires on every turn edge, claims and acks the rows inside the
+# reconciler's grace window, and the native push's send-time recount against
+# consumed_through_id then finds every message already consumed.
+# ---------------------------------------------------------------------------
+
+
+def test_mailbox_addressed_row_keeps_the_mailbox_as_logical_receiver():
+    """The mb_ indirection does NOT bypass the reconciler's selection axis."""
+    import inspect
+
+    from cli_agent_orchestrator.clients import database as db_mod
+
+    src = inspect.getsource(db_mod.resolve_inbox_receiver)
+    # receiver cache becomes the terminal; the mailbox id becomes logical.
+    assert "mailbox.current_terminal_id" in src
+    assert "cast(str, mailbox.id)" in src
+
+
+def test_push_reports_consumed_when_the_hook_already_acked(monkeypatch, tmp_path):
+    """The exact live failure: nothing is written and the reason is `consumed`."""
+    _healthy_terminal(monkeypatch, tmp_path)
+    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: 5647)
+    wrote: list = []
+    monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: wrote.append(p) or True)
+
+    class _Msg:
+        id = 5644
+        sender_id = "w1"
+        message = "callback"
+        logical_receiver_id = "mb_d176ebe0"
+
+    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    assert out.pushed is False and out.reason == "consumed"
+    assert wrote == []
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def test_hook_claim_is_suppressed_while_native_is_healthy(monkeypatch):
+    """MUTANT (#747 follow-up): drop the server-side gate and the drain hook
+    keeps claiming + acking inside the grace window, so the native push always
+    recounts to `consumed` and the seat never gets an agent message."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.security.auth import SCOPE_WRITE
+
+    called: list = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.mailbox_service.list_messages",
+        lambda *a, **k: called.append(a) or {"items": [{"id": 1}]},
+    )
+    monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: None)
+
+    out = _run(api_main.list_messages_endpoint(to="c244d80b", claim="hook", _scopes=[SCOPE_WRITE]))
+    assert out == {"items": [], "next_after_id": None, "has_more": False}
+    assert called == [], "the hook must not claim while native owns the seat"
+
+
+def test_hook_claim_passes_through_when_native_is_broken(monkeypatch):
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.security.auth import SCOPE_WRITE
+
+    called: list = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.mailbox_service.list_messages",
+        lambda *a, **k: called.append(k.get("claim")) or {"items": [{"id": 1}]},
+    )
+    monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: "no_inbox_path")
+
+    out = _run(api_main.list_messages_endpoint(to="c244d80b", claim="hook", _scopes=[SCOPE_WRITE]))
+    assert out["items"] == [{"id": 1}]
+    assert called == ["hook"]
+
+
+def test_hook_claim_gate_resolves_a_mailbox_address(monkeypatch):
+    """The drain may address the mailbox; the gate must probe the SEAT."""
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.security.auth import SCOPE_WRITE
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_current_mailbox_terminal",
+        lambda mbid: "c244d80b",
+    )
+    probed: list = []
+    monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: probed.append(tid) or None)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.mailbox_service.list_messages",
+        lambda *a, **k: {"items": [{"id": 1}]},
+    )
+
+    out = _run(
+        api_main.list_messages_endpoint(to="mb_d176ebe0", claim="hook", _scopes=[SCOPE_WRITE])
+    )
+    assert probed == ["c244d80b"]
+    assert out["items"] == []
+
+
+def test_non_hook_claims_are_never_gated(monkeypatch):
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.security.auth import SCOPE_WRITE
+
+    seen: list = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.mailbox_service.list_messages",
+        lambda *a, **k: seen.append(k.get("claim")) or {"items": []},
+    )
+    monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: None)
+    _run(api_main.list_messages_endpoint(to="c244d80b", claim="mcp", _scopes=[SCOPE_WRITE]))
+    assert seen == ["mcp"]

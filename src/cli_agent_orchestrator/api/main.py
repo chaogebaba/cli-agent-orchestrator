@@ -9479,6 +9479,40 @@ async def list_messages_endpoint(
                         "message": "--claim requires write or admin scope",
                     },
                 )
+            # F747 (#747): the hook claim is the fallback surface's ONLY read,
+            # and it is what was STARVING native delivery. The seat's drain hook
+            # fires on every turn edge; it claimed and acked the rows inside the
+            # reconciler's grace window, so by the time the native push ran, the
+            # send-time recount against ``consumed_through_id`` found every
+            # message already consumed and wrote nothing. The seat therefore saw
+            # the legacy task-notification even with ``teammate_push`` on and a
+            # valid ``cc_team_inbox_path`` -- the flag and the path were never
+            # the whole story.
+            #
+            # Suppressing the claim SERVER-SIDE (not only in the hook) is
+            # deliberate: the hook is baked into a seat's settings overlay at
+            # creation, so a client-side gate alone cannot reach a seat that is
+            # already running. This gate takes effect on the next request.
+            if claim == "hook":
+                _seat = to
+                if _seat.startswith("mb_"):
+                    from cli_agent_orchestrator.clients.database import (
+                        get_current_mailbox_terminal,
+                    )
+
+                    _seat = get_current_mailbox_terminal(to) or to
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    native_fallback_reason,
+                )
+
+                try:
+                    _reason = native_fallback_reason(_seat)
+                except Exception as e:  # never let the probe break a drain
+                    logger.debug("native_fallback_reason failed for %s: %s", _seat, e)
+                    _reason = "probe_failed"
+                if _reason is None:
+                    logger.debug("native_owns_seat terminal=%s hook_claim_suppressed", _seat)
+                    return {"items": [], "next_after_id": None, "has_more": False}
             kwargs["claim"] = claim
         return await asyncio.to_thread(list_messages, to, **kwargs)
     except MailboxDomainError as exc:
