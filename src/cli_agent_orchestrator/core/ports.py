@@ -100,8 +100,8 @@ class EventStore(Protocol):
     ) -> list[WorkerEvent]:
         """Read rows in ``(terminal_id, seq)`` order, oldest first.
 
-        ``terminal_id=None`` reads the whole fleet, which is what the agreement
-        report (AC10) and ``cao diag --session`` need.
+        ``terminal_id=None`` reads the whole fleet, which is what
+        ``cao diag --session`` needs.
         """
         ...
 

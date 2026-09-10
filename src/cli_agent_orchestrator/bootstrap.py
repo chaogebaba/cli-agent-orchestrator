@@ -13,7 +13,7 @@ Two rules the rest of phase 1 leans on:
 * **The migrator runs at EVERY boot**, whatever the switch says.  The DDL is
   additive and, with ingestion off, inert.  Running it unconditionally makes
   turning the switch on a one-variable change rather than a migration event —
-  which matters because the AC10 agreement report has to be readable against a
+  which matters because the phase-1 diagnostics have to be readable against a
   server that is already running.
 * **Nothing else runs unless ``CAO_WORKER_TRUTH_INGEST=1``.**  No producer, no
   projector, no sweep, no retention task.  AC11's "no behaviour change with the
@@ -49,7 +49,6 @@ from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
 from cli_agent_orchestrator.app.delivery.tick import DeliveryTick
 from cli_agent_orchestrator.app.delivery.wake import WakeService
 from cli_agent_orchestrator.app.diag.report import DiagSources
-from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
     PaneDisagreementCheck,
@@ -90,7 +89,6 @@ __all__ = [
     "WorkerTruthRuntime",
     "build_legacy_inbox_status",
     "build_readonly_diag_stores",
-    "build_terminal_scope",
     "current_runtime",
     "delivery_position",
     "ingest_enabled",
@@ -576,8 +574,8 @@ async def start_worker_truth(
         # the ``StateFolder`` port, so ``emit`` folds every appended event. At
         # phase 1's anchor this line passed everything but the projector, so the
         # local was dropped and ``Projector.project`` had no call site anywhere —
-        # the fold that writes ``status.transition`` never ran, and AC-2a's
-        # agreement report compares exactly those rows. The field is typed on the
+        # the fold that writes ``status.transition`` never ran, and those rows
+        # are the only proof the projector runs at all. The field is typed on the
         # Protocol, so nothing under ``adapters/`` names ``Projector``; this is
         # the one module allowed to know both halves.
         truth_wiring.install_producers(
@@ -677,41 +675,6 @@ def build_readonly_diag_stores(db_path: str | Path | None = None) -> DiagSources
         findings=SqliteFindingStore(pool, clock=SystemClock()),
         queue=SqliteQueueStore(pool, clock=SystemClock()),
     )
-
-
-def build_terminal_scope(db_path: str | Path | None = None) -> dict[str, TerminalFacts]:
-    """Session and provider per terminal, from the legacy ``terminals`` table.
-
-    The agreement report (AC10) needs to scope by session and to know which
-    terminals are codex, and neither fact is in the event log — ``tmux_session``
-    and ``provider`` live on the legacy row.  Read here rather than in ``app``
-    for the usual reason: this is the module allowed to know about both halves.
-
-    Raw SQL rather than the SQLAlchemy model, because the model would pull the
-    fork's whole ``clients.database`` import graph into a read-only CLI path, and
-    because this connection is deliberately read-only while that module's engine
-    is not.
-
-    Returns an empty mapping when the table cannot be read.  A missing scope
-    degrades the report to fleet-wide with codex detected from the producer
-    column, which is a worse report but a real one; raising here would mean the
-    agreement command failed on a database that is otherwise perfectly readable.
-    """
-    path = Path(db_path) if db_path is not None else _default_db_path()
-    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
-    try:
-        rows = pool.connection().execute("SELECT id, tmux_session, provider FROM terminals")
-        return {
-            row["id"]: TerminalFacts(
-                session=row["tmux_session"] or "", provider=row["provider"] or ""
-            )
-            for row in rows
-        }
-    except Exception:  # noqa: BLE001 — a missing scope degrades the report, never fails it
-        logger.warning("could not read the legacy terminals table for diag scope", exc_info=True)
-        return {}
-    finally:
-        pool.close_all()
 
 
 def build_legacy_inbox_status(db_path: str | Path | None = None) -> dict[int, str]:

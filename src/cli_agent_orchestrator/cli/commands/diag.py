@@ -34,7 +34,6 @@ from cli_agent_orchestrator.app.diag.report import (
     DiagSources,
     findings_payload,
     message_payload,
-    render_agreement,
     render_findings,
     render_message,
     render_timeline,
@@ -42,7 +41,6 @@ from cli_agent_orchestrator.app.diag.report import (
     timeline_payload,
     why_payload,
 )
-from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.core.events import AnyKind, parse_kind
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ids import is_ulid
@@ -153,7 +151,6 @@ def diag(ctx: click.Context, why_event_id: str | None, db_path: str | None, as_j
     cao diag <msg-id>               one message's queue row, attempts and events
     cao diag --why <event-id>       the evidence chain behind one decision
     cao diag findings               open invariant findings
-    cao diag agreement              the state projection vs the legacy status
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -246,69 +243,3 @@ def diag_findings(state: str, code_value: str | None, db_path: str | None, as_js
     )
 
 
-@diag.command("agreement")
-@click.option("--session", default=None, help="Restrict to one tmux session.")
-@click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
-def diag_agreement(session: str | None, db_path: str | None, as_json: bool) -> None:
-    """Compare the state projection against the legacy published status (AC10)."""
-    from cli_agent_orchestrator.bootstrap import build_terminal_scope
-
-    now = datetime.now(UTC)
-    sources = _sources(db_path)
-    report = build_agreement_report(
-        sources.events.read(),
-        scope=build_terminal_scope(db_path),
-        session=session,
-        generated_at=now,
-    )
-    payload = {
-        "valid": report.valid,
-        "invalid_reasons": report.invalid_reasons,
-        "generated_at": now.isoformat(),
-        "totals": {
-            "terminals": len(report.terminals),
-            "codex_terminals": report.codex_terminals,
-            "events": report.total_events,
-            "transitions": report.total_transitions,
-            "legacy_publishes": report.total_legacy_publishes,
-            "comparisons": report.total_comparisons,
-            "agreements": report.total_agreements,
-            "agreement_rate": report.fleet_agreement_rate,
-        },
-        "classifications": report.classification_counts(),
-        "terminals": [
-            {
-                "terminal_id": terminal.terminal_id,
-                "session": terminal.session,
-                "provider": terminal.provider,
-                "is_codex": terminal.is_codex,
-                "events": terminal.events,
-                "transitions": terminal.transitions,
-                "legacy_publishes": terminal.legacy_publishes,
-                "comparisons": terminal.comparisons,
-                "agreements": terminal.agreements,
-                "agreement_rate": terminal.agreement_rate,
-                "disagreements": [
-                    {
-                        "projected": d.projected.value,
-                        "legacy": d.legacy.value,
-                        "started_at": d.started_at.isoformat(),
-                        "ended_at": d.ended_at.isoformat() if d.ended_at else None,
-                        "duration_s": d.duration_s,
-                        "classification": d.classification,
-                        "opened_by": d.opened_by,
-                        "sample_event_id": d.sample_event_id,
-                    }
-                    for d in terminal.disagreements
-                ],
-            }
-            for terminal in report.terminals
-        ],
-    }
-    _emit(payload, render_agreement(report), as_json)
-    if not report.valid:
-        # A non-zero exit so a script cannot mistake an INVALID report for a
-        # passing one.  AC10 makes this report the phase gate; a gate that exits
-        # 0 on "no evidence" is not a gate.
-        raise SystemExit(2)

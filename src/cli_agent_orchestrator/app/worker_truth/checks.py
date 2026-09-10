@@ -289,7 +289,7 @@ class PaneDisagreementCheck:
         age = self._clock.now() - onset
         # Ordinary lag is not a finding.  The two sides are fed by producers on
         # different clocks and can never move in the same instant; firing on that
-        # would bury the disagreements the agreement report (AC10) counts.
+        # would bury the disagreements that actually matter under lag.
         if age <= timedelta(seconds=PANE_HEARTBEAT_S):
             return False
 

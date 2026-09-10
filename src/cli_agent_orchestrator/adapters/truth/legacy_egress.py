@@ -10,10 +10,10 @@ hooked at the on-demand probe path" is one of the phase-1 mutants precisely
 because the two look interchangeable and are not.
 
 What this producer records is **what the fleet and the inbox actually consume**
-(``fleet_service.py:209``).  The agreement report (AC10) compares the state
-projection against these rows rather than against the raw classifier output,
-because comparing a projection against its own upstream signal would be
-self-referential — r9 retired that framing.
+(``fleet_service.py:209``).  Any comparison of the state projection is made
+against THESE rows rather than against the raw classifier output, because
+comparing a projection against its own upstream signal would be self-referential
+— r9 retired that framing, and it outlived the AC10 report that first needed it.
 
 Confidence is ``derived``, always.  The pane classifier is a first-class
 fallback and never a deprecated one, but it is not authoritative for a terminal
@@ -23,7 +23,7 @@ Two edges, tracked separately and deliberately so:
 
 * the **publish edge** is the ``(latched_status, origin)`` pair (B9).  A hundred
   identical publishes are one row; that is what keeps the write rate off the
-  single SQLite writer during the AC10 session.
+  single SQLite writer on a busy fleet.
 * the **condition edge** is the fleet condition label crossing into ``CAPPED``.
   It is tracked apart from the publish edge because a cap can be detected while
   the latched status and origin are unchanged, and folding the condition into the
@@ -81,10 +81,13 @@ def fed_by(origin: str) -> str:
     data", Envoy's mirrored responses "are always ignored" — is that the candidate
     stays causally inert with respect to the control, and D1 ends that.
 
-    So every publish names its feeder, and the agreement classifier drops the ones
-    the projection fed.  In sub-phase 2a there is no such publisher yet and this
-    always answers ``pane``; the field lands now anyway, because D5 must be
-    written BEFORE D1 or the report 2b's gate rests on is self-confirming.
+    So every publish names its feeder.  Its one reader, the AC10 agreement
+    classifier, went with shadow-live mode (#738), so today the field is written
+    and read by nothing.  It stays anyway, and deliberately: D5 must be written
+    BEFORE D1 or the first publisher of the projection would already have made
+    every comparison downstream self-confirming, and stamping provenance is
+    cheaper than reconstructing it afterwards.  In sub-phase 2a there is no such
+    publisher yet and this always answers ``pane``.
     """
     return PROJECTION_ORIGIN if origin == PROJECTION_ORIGIN else Producer.PANE.value
 

@@ -4,8 +4,8 @@ Runs at EVERY boot, whatever ``CAO_WORKER_TRUTH_INGEST`` says.  The DDL is
 purely additive and, with ingestion off, entirely inert: three new tables and
 four indexes that nothing reads.  Running it unconditionally is what makes
 turning the switch on a one-variable change rather than a migration event, which
-matters because the agreement session (AC10) has to be startable on a server
-that is already up.
+matters because the phase-1 diagnostics have to be startable on a server that
+is already up.
 
 Two ordering rules, both from AC5 (N6):
 

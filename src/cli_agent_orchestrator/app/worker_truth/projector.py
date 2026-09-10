@@ -4,8 +4,9 @@ The projector is the only writer of ``worker_state_shadow`` and, in phase 1, the
 projection has no readers in ``services/``.  That is what makes AC11's "no
 behaviour change with the switch ON" true by construction rather than by
 assertion: the projector can be wrong for a whole session and nothing downstream
-notices.  What measures it is the agreement report (AC10) and, for a flag flip, a
-grok-box live round (#738).
+notices.  What surfaces it is the ``DIAG-LEGACY-DISAGREE`` check and, for a flag
+flip, a grok-box live round (#738) — which is the whole acceptance now that the
+AC10 agreement report has gone with shadow-live mode.
 
 Four rules carry the design, and each is a named method below rather than a
 branch inside one loop, because the gate has to be able to point at them:

@@ -17,9 +17,11 @@ to it?*  Everything on the page earns its place against that.
   with the same sequence for exactly this reason (audit §4.2); splitting them
   back apart in the renderer would undo it.
 * **The footer names the last legacy disagreement.**  When the projection and the
-  legacy status differ, that difference is usually the bug — and it is the thing
-  the agreement report (AC10) counts in bulk, so the single-worker view shows the
-  most recent instance with the rows that produced it.
+  legacy status differ, that difference is usually the bug, so the single-worker
+  view shows the most recent instance with the rows that produced it.  The bulk,
+  per-interval version of this was the AC10 agreement report, which went with
+  shadow-live mode (#738); this footer is what remains, and it is enough for a
+  "what is wrong now" tool.
 
 ``--json`` emits the same content as data.  Both come from one pair of builder
 functions so the text view can never drift from the machine-readable one.
@@ -31,7 +33,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from cli_agent_orchestrator.app.worker_truth.agreement import AgreementReport
 from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
 from cli_agent_orchestrator.core.events import AnyKind, EventKind, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
@@ -43,7 +44,6 @@ __all__ = [
     "INGEST_OFF_NOTE",
     "findings_payload",
     "message_payload",
-    "render_agreement",
     "render_message",
     "render_findings",
     "render_timeline",
@@ -190,9 +190,10 @@ def _last_disagreement(
 
     Compared against the CURRENT projected state rather than replaying the
     projection, because the single-worker view is a "what is wrong now" tool.
-    The historical, per-interval version of this comparison is the agreement
-    report, and duplicating its algorithm here would give an operator two numbers
-    that could disagree.
+    The historical, per-interval version of this comparison was the agreement
+    report, retired with shadow-live mode (#738).  This stayed deliberately
+    pointwise rather than growing into its replacement: an operator asking "what
+    is wrong now" is not asking for a rate.
     """
     if state is None:
         return None
@@ -496,78 +497,6 @@ def render_findings(
         )
         if finding.sample_event_id:
             lines.append(f"{'':<24} {'':>6}  sample {finding.sample_event_id}")
-    return "\n".join(lines)
-
-
-# -------------------------------------------------------------------- agreement
-
-
-def render_agreement(report: AgreementReport) -> str:
-    """The AC10 report as text.
-
-    Validity is the first line, before any number, so a report that did not meet
-    the content floor cannot be quoted out of context as a result.
-    """
-    lines: list[str] = []
-    if report.valid:
-        lines.append("AGREEMENT REPORT — VALID (content floor met)")
-    else:
-        lines.append("AGREEMENT REPORT — INVALID, no conclusion may be drawn")
-        for reason in report.invalid_reasons:
-            lines.append(f"  ! {reason}")
-
-    rate = report.fleet_agreement_rate
-    lines.append(
-        f"  terminals={len(report.terminals)} (codex {report.codex_terminals})  "
-        f"events={report.total_events}  transitions={report.total_transitions}  "
-        f"legacy_publishes={report.total_legacy_publishes}"
-    )
-    # The pointwise rate counts ordinary lag as disagreement, because the two
-    # sides are written by different producers and can never move in the same
-    # instant.  Labelled rather than adjusted: an unlabelled 55% would read as a
-    # broken projection, and a silently lag-corrected number would hide the very
-    # thing the classifier below exists to expose.
-    lines.append(
-        "  pointwise agreement (lag counts against it): "
-        + ("no comparable points" if rate is None else f"{rate:.1%} of {report.total_comparisons}")
-    )
-    counts = report.classification_counts()
-    lines.append(
-        f"  disagreements: projection_early={counts['projection_early']}  "
-        f"legacy_early={counts['legacy_early']}  genuine={counts['genuine']}"
-    )
-    lines.append(
-        "  the number that matters is genuine — the other two are one side "
-        "arriving first and the other catching up"
-    )
-
-    lines.append("")
-    lines.append(
-        f"{'terminal':<16} {'provider':<12} {'rate':>7} {'cmp':>6} {'trans':>6} "
-        f"{'legacy':>7}  disagreements"
-    )
-    lines.append(_SEPARATOR)
-    for terminal in report.terminals:
-        terminal_rate = terminal.agreement_rate
-        rate_text = "n/a" if terminal_rate is None else f"{terminal_rate:.1%}"
-        lines.append(
-            f"{terminal.terminal_id:<16} {(terminal.provider or '-'):<12} {rate_text:>7} "
-            f"{terminal.comparisons:>6} {terminal.transitions:>6} "
-            f"{terminal.legacy_publishes:>7}  {len(terminal.disagreements)}"
-        )
-
-    genuine = [d for d in report.disagreements if d.classification == "genuine"]
-    if genuine:
-        lines.append("")
-        lines.append("genuine disagreements (neither side was merely early):")
-        for disagreement in genuine:
-            duration = disagreement.duration_s
-            span = "unresolved" if duration is None else f"{duration:.1f}s"
-            lines.append(
-                f"  {disagreement.terminal_id:<16} projected {disagreement.projected.value} vs "
-                f"legacy {disagreement.legacy.value}  {span}  "
-                f"opened_by={disagreement.opened_by}  {disagreement.sample_event_id}"
-            )
     return "\n".join(lines)
 
 
