@@ -557,48 +557,46 @@ def _bare_pi(initialized):
     return provider
 
 
-def _pi_provider(monkeypatch, *, init_state, initialized):
-    provider = _bare_pi(initialized)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-        lambda _tid: {"init_state": init_state},
-    )
-    return provider
-
-
-def _pi_provider_db_down(monkeypatch, *, initialized):
-    provider = _bare_pi(initialized)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
-    )
-    return provider
-
-
 _STALE_ERROR_FRAME = "some transcript\nError: 429: {rate limited}\nmore transcript\n"
 
 
-def test_r3_ready_terminal_never_publishes_error_from_an_old_banner(monkeypatch):
-    """A ready pi terminal whose buffer went quiet must fall to UNKNOWN, not
-    ERROR — the F808 cached-UNKNOWN self-heal then re-derives from a capture."""
-    provider = _pi_provider(monkeypatch, init_state="ready", initialized=False)
-    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
+def test_r3_ready_terminal_never_publishes_error_from_an_old_banner():
+    """The way that matters: a READY pi terminal whose buffer went quiet must
+    fall to UNKNOWN, not ERROR. UNKNOWN is what the F808 cached-UNKNOWN self-heal
+    re-derives from a real capture, and what fuse_status refuses to lower."""
+    assert _bare_pi(True).get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
 
 
-def test_r3_launch_window_still_classifies_a_genuine_startup_failure(monkeypatch):
-    """Inside the launch window the same banner is still a real launch failure."""
-    provider = _pi_provider(monkeypatch, init_state="init_pending", initialized=False)
-    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.ERROR
+def test_r3_uninitialized_terminal_is_unknown_not_error():
+    """The other way: inside the launch window get_status returns UNKNOWN before
+    it ever looks at a banner — which is why the branch that used to sit at the
+    bottom of get_status could only ever fire on a READY terminal, i.e. exactly
+    when it must not. get_status is not the launch-failure detector."""
+    assert _bare_pi(False).get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
 
 
-def test_r3_initialized_flag_alone_closes_the_launch_window(monkeypatch):
-    """_initialized is sufficient even when the row is unreadable."""
-    provider = _pi_provider_db_down(monkeypatch, initialized=True)
-    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
+def test_r3_launch_failures_are_still_caught_by_the_launch_poller():
+    """The real launch-window detector is untouched: initialize() polls the pane
+    against _STARTUP_ERROR and raises before _initialized is ever set."""
+    import inspect
+
+    from cli_agent_orchestrator.providers import pi_cli
+
+    assert pi_cli._STARTUP_ERROR.search(_STALE_ERROR_FRAME)
+    src = inspect.getsource(pi_cli.PiCliProvider.initialize)
+    assert "_STARTUP_ERROR.search(clean)" in src
+    assert "raise RuntimeError" in src
 
 
-def test_r3_unreadable_row_and_uninitialized_still_classifies_error(monkeypatch):
-    """Fail-closed the other way: no evidence the launch window closed ⇒ the
-    banner keeps its ERROR meaning, exactly as before r2."""
-    provider = _pi_provider_db_down(monkeypatch, initialized=False)
-    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.ERROR
+def test_r3_get_status_can_no_longer_return_error_from_any_buffer():
+    """Whole-branch guard: no buffer shape drives get_status to ERROR any more."""
+    provider = _bare_pi(True)
+    for frame in (
+        _STALE_ERROR_FRAME,
+        "Fatal: everything is broken\n",
+        "Traceback (most recent call last):\n  File x\n",
+        "pi: error: bad flag\n",
+        "",
+        "   \n",
+    ):
+        assert provider.get_status(frame) is not TerminalStatus.ERROR

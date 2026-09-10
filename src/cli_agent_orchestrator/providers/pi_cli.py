@@ -26,7 +26,8 @@ Architecture
       → PROCESSING;
     - the idle chrome (two ``────`` rules + a ``…%/…(auto)`` footer, no
       "Working") → COMPLETED if a task was dispatched, else IDLE;
-    - a startup/authorization error banner → ERROR.
+    - a startup/authorization error banner during LAUNCH → initialize() raises
+      (F899 r2: get_status itself never returns ERROR from the buffer).
 
 * **MCP** (``send_message`` callbacks): Pi has native MCP support via the
   ``pi-mcp-adapter`` package (already listed in ``~/.pi/agent/settings.json``),
@@ -893,7 +894,9 @@ class PiCliProvider(BaseProvider):
           - idle chrome (rules + footer, no spinner):
                 task dispatched + a processing frame seen → COMPLETED
                 otherwise                                 → IDLE
-          - startup/authorization error banner    → ERROR
+          - neither chrome nor spinner            → UNKNOWN (F899 r2: never
+            ERROR — a launch failure is raised by initialize(), and a quiet
+            buffer on a ready terminal is not one)
           - no recognizable chrome yet            → UNKNOWN (pre-init/transient)
 
         F844 (#701): status is RE-DERIVED from the live pane every poll and an
@@ -940,41 +943,29 @@ class PiCliProvider(BaseProvider):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
-        # No live TUI chrome AND no spinner: pi never reached (or has lost) a
-        # usable frame. F899 (#751) r2 ruling 3: that is a genuine startup
-        # failure ONLY inside the launch window. Past it, the same banner is a
-        # #700 runtime line left in a buffer that stopped advancing — the third
-        # 2026-09-10 sample, where two ready pi lanes published ERROR while their
-        # panes rendered the live Working spinner, because the rolling buffer had
-        # gone quiet and its last frame carried neither chrome nor spinner but did
-        # carry an old `Error:` line. A ready terminal must never reach ERROR from
-        # a stale frame; it falls to UNKNOWN, which the F808 (#665) cached-UNKNOWN
+        # No live TUI chrome AND no spinner. F899 (#751) r2 ruling 3: this can
+        # NO LONGER mean a launch failure, and the error-banner scan that used to
+        # sit here is gone.
+        #
+        # The scan was unreachable in the only sense that mattered and harmful in
+        # the other. Reachable only past `if not self._initialized: return
+        # UNKNOWN` above — that is, only on a terminal that HAS rendered a usable
+        # frame, so "pi never reached a usable frame" was false by construction
+        # every time it fired. What it actually caught was the third 2026-09-10
+        # sample: two ready pi lanes published ERROR while their panes rendered
+        # the live Working spinner, because the rolling buffer had gone quiet and
+        # its last frame carried neither chrome nor spinner but did carry an old
+        # `Error:` line (the #700 ClinePass 429 banner).
+        #
+        # A genuine launch failure is still caught, and always was, by
+        # `initialize()`: it polls the pane against the same _STARTUP_ERROR and
+        # raises RuntimeError before `_initialized` is ever set. That is the one
+        # place inside the launch window, and it is untouched.
+        #
+        # A quiet buffer now falls to UNKNOWN, which the F808 (#665) cached-UNKNOWN
         # self-heal re-derives from a real capture (pi opts in via
-        # supports_direct_status_probe).
-        if not self._past_launch_window() and _STARTUP_ERROR.search(clean):
-            return TerminalStatus.ERROR
-
+        # supports_direct_status_probe), and which fuse_status will not lower.
         return TerminalStatus.UNKNOWN
-
-    def _past_launch_window(self) -> bool:
-        """Whether this terminal has ever reached a usable frame (F899 r2).
-
-        Two sources, either of which means the launch window is over:
-        ``self._initialized`` (set when ``initialize`` saw pi's idle chrome) and
-        the terminal row's ``init_state == "ready"``. The DB check is what keeps
-        the gate correct across a ``cao-server`` bounce, which rebuilds providers
-        with ``_initialized`` False against terminals that are long since ready.
-        NEVER raises — an unreadable row degrades to the in-process flag alone.
-        """
-        if self._initialized:
-            return True
-        try:
-            from cli_agent_orchestrator.clients.database import get_terminal_metadata
-
-            metadata = get_terminal_metadata(self.terminal_id)
-        except Exception:
-            return False
-        return bool(metadata) and metadata.get("init_state") == "ready"
 
     def classify_injection_hazard(self, rows: list[str]) -> str | None:
         """Regular-TUI Pi has no blocking modal that would eat pasted task text."""
