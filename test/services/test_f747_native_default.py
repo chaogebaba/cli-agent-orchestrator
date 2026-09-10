@@ -535,13 +535,12 @@ def test_under_the_cap_nothing_is_dropped(tmp_path):
     assert [e["msg_id"] for e in entries] == ["m0", "m1", "m2", "m3", "m4"]
 
 
-def test_contended_lock_is_transient_not_a_broken_channel(monkeypatch, tmp_path):
-    """MUTANT: return False instead of None on a contended lock and a transient
-    race arms the write-failure ledger, so the fallback surface engages on a
-    healthy seat -- exactly what ruling 3 forbids."""
+def test_contended_push_is_transient_not_a_broken_channel(monkeypatch, tmp_path):
+    """A contended lock must not be conflated with a failed write."""
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
-    monkeypatch.setattr(tps, "_acquire_lockfile_deadline", lambda p, d: None)
+    monkeypatch.setattr(tps, "_try_acquire_lockfile", lambda p: None)
+    tps._inbox_contended_logged.clear()
 
     class _Msg:
         id = 9
@@ -550,10 +549,88 @@ def test_contended_lock_is_transient_not_a_broken_channel(monkeypatch, tmp_path)
         logical_receiver_id = "mb1"
 
     out = tps.attempt_teammate_push_reported("t1", [_Msg()])
-    assert out.pushed is False and out.reason == "lock_contended"
+    assert out.pushed is False and out.reason == "inbox_contended"
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_lock_wait_is_short(tmp_path):
-    """The wait is a bounded courtesy, not a second of blocking per push."""
-    assert tps.INBOX_LOCK_WAIT_S <= 0.25
+def test_contended_row_is_logged_once_not_once_per_tick(caplog):
+    """The reconciler retries a contended row every tick; the log must not."""
+    import logging
+
+    tps._inbox_contended_logged.clear()
+    caplog.set_level(logging.INFO, logger=tps.logger.name)
+    for _ in range(5):
+        tps._log_inbox_contended_once("t1", (7,))
+    lines = [r.getMessage() for r in caplog.records if "inbox_contended" in r.getMessage()]
+    assert len(lines) == 1
+    assert "rows=7" in lines[0]
+
+
+# --- the three probes the r3 ruling names ------------------------------------
+
+
+def test_a_one_push_lands_the_other_is_contended_and_left_for_the_reconciler(tmp_path):
+    """(a) Two concurrent pushes to one inbox: one lands, one is contended.
+
+    The contended one writes NOTHING, which is what leaves its row PENDING for
+    the reconciler's next tick to carry.
+    """
+    inbox = tmp_path / "team-lead.json"
+    lock = Path(str(inbox.resolve()) + ".lock")
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+
+    first = tps._write_inbox_entry(inbox, {"msg_id": "a", "n": 1})
+    assert first is True
+
+    # Hold the lock exactly as a concurrent writer would.
+    import os as _os
+
+    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
+    try:
+        second = tps._write_inbox_entry(inbox, {"msg_id": "b", "n": 2})
+    finally:
+        _os.close(held)
+        lock.unlink(missing_ok=True)
+
+    assert second is None, "a contended push reports contention, not success or failure"
+    assert [e["msg_id"] for e in json.loads(inbox.read_text())] == ["a"]
+
+    # The reconciler's next tick carries it, and then it lands.
+    assert tps._write_inbox_entry(inbox, {"msg_id": "b", "n": 2}) is True
+    assert [e["msg_id"] for e in json.loads(inbox.read_text())] == ["a", "b"]
+
+
+def test_b_a_contended_push_never_blocks(tmp_path):
+    """(b) MUTANT: restore the 1s blocking acquire and this wall-clock bound fails.
+
+    Two attempts plus one short pause, so the whole contended path is bounded by
+    a small multiple of the retry pause -- never the second it used to cost.
+    """
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(inbox.resolve()) + ".lock")
+    import os as _os
+    import time as _time
+
+    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
+    try:
+        started = _time.monotonic()
+        assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is None
+        elapsed = _time.monotonic() - started
+    finally:
+        _os.close(held)
+        lock.unlink(missing_ok=True)
+
+    budget = tps.INBOX_LOCK_RETRY_PAUSE_S * 4 + 0.2
+    assert elapsed < budget, f"contended push took {elapsed:.3f}s, budget {budget:.3f}s"
+
+
+def test_c_an_uncontended_push_is_still_synchronous(tmp_path):
+    """The ruling keeps the fast path fast: no pause when nothing contends."""
+    import time as _time
+
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    started = _time.monotonic()
+    assert tps._write_inbox_entry(inbox, {"msg_id": "only"}) is True
+    assert (_time.monotonic() - started) < tps.INBOX_LOCK_RETRY_PAUSE_S

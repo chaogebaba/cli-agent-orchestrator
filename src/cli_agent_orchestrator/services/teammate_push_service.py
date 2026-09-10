@@ -398,6 +398,42 @@ def _fsync_dir(dir_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _try_acquire_lockfile(lock_path: Path) -> Optional[int]:
+    """One non-blocking attempt at the lockfile (F747 #747). fd, or None.
+
+    Deliberately NOT ``_acquire_lockfile_deadline(path, now)``: that helper
+    checks its deadline BEFORE the first attempt, so a deadline of `now` never
+    tries at all and every push reports contention. This makes exactly one
+    O_CREAT|O_EXCL attempt, and reclaims a stale lock the same way the deadline
+    helper does so a crashed writer cannot wedge the inbox forever.
+    """
+    try:
+        return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        logger.debug("f747_trylock_error: %s", e)
+        return None
+    # Present: reclaim only if stale, and verify we own what we opened (TOCTOU).
+    try:
+        if (time.time() - os.stat(str(lock_path)).st_mtime) <= _LOCK_STALE_SECONDS:
+            return None
+        os.unlink(str(lock_path))
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except (FileNotFoundError, FileExistsError, OSError):
+        return None
+    try:
+        fd_stat = os.fstat(fd)
+        path_stat = os.stat(str(lock_path))
+        if fd_stat.st_ino != path_stat.st_ino or fd_stat.st_dev != path_stat.st_dev:
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def _acquire_lockfile_deadline(lock_path: Path, deadline_mono: float | None) -> Optional[int]:
     """Acquire lockfile with optional monotonic deadline.
 
@@ -525,17 +561,19 @@ def _should_teammate_push(terminal_id: str) -> bool:
 #: that, by the fallback surface under its typed reason.
 INBOX_ENTRIES_CAP = 200
 
-#: F747 (#747): how long a push waits for the inbox lockfile before giving up.
+#: F747 (#747): a contended push NEVER blocks.
 #:
-#: Was a flat 1.0s. ``cc_team_inbox_path`` is a pure function of the terminal's
-#: cwd, so every claude_code terminal in one project directory contends on one
-#: lock; with the push now default-on, a contended push paid up to a full second
-#: EACH. Waiting is also pointless here: the row stays PENDING and the
-#: reconciler re-pushes on its next tick, so giving up fast loses nothing and
-#: costs nothing. A contended lock is transient and is NOT a broken native
-#: channel -- it returns ``lock_contended``, which deliberately does not arm the
-#: fallback surface the way ``write_failed`` does.
-INBOX_LOCK_WAIT_S = 0.15
+#: ``cc_team_inbox_path`` is a pure function of the terminal's cwd, so every
+#: claude_code terminal in one project directory contends on ONE lockfile. The
+#: old flat 1.0s wait meant a contended push paid up to a full second, and with
+#: the push default-on that became the dominant cost.
+#:
+#: The acquire is now a TRY-LOCK: one attempt, one retry after a short pause,
+#: then give up. Giving up is safe and is the design, not a loss: the row stays
+#: PENDING and the reconciler's next tick carries it, so delivery under
+#: contention is eventually-consistent while an UNCONTENDED push stays
+#: synchronous and immediate.
+INBOX_LOCK_RETRY_PAUSE_S = 0.05
 
 
 #: Closed set of reasons the legacy fallback surface may engage (F747 #747).
@@ -589,6 +627,33 @@ def log_native_fallback_engaged(terminal_id: str, reason: str) -> bool:
     _native_fallback_last_warn[terminal_id] = now_ts
     logger.warning("native_fallback_engaged terminal=%s reason=%s", terminal_id, reason)
     return True
+
+
+#: Row ids already reported as contended, so the log carries one line per row.
+_inbox_contended_logged: set = set()
+
+#: Bound on the above, so a long-lived server cannot grow it without limit.
+_INBOX_CONTENDED_LOG_CAP = 4096
+
+
+def _log_inbox_contended_once(terminal_id: str, message_ids: tuple) -> None:
+    """Log a contended push once per ROW (F747 #747).
+
+    Per row, not per attempt: the reconciler retries a contended row every tick,
+    and one line per attempt would turn a busy inbox into a log flood while
+    saying nothing new. The first sighting is the one that carries information.
+    """
+    fresh = [m for m in message_ids if m not in _inbox_contended_logged]
+    if not fresh:
+        return
+    if len(_inbox_contended_logged) > _INBOX_CONTENDED_LOG_CAP:
+        _inbox_contended_logged.clear()
+    _inbox_contended_logged.update(fresh)
+    logger.info(
+        "inbox_contended terminal=%s rows=%s (left for the reconciler)",
+        terminal_id,
+        ",".join(str(m) for m in fresh),
+    )
 
 
 def native_fallback_reason(terminal_id: str) -> Optional[str]:
@@ -766,13 +831,15 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> Optional[bool
         return False
     # F656: "before" stat taken before lock acquisition (never in-lock).
     size_before, mtime_before = _stat_size_mtime(inbox_path)
-    fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + INBOX_LOCK_WAIT_S)
+    # F747 (#747): try-lock, one retry, never a blocking wait.
+    fd = _try_acquire_lockfile(lock_path)
     if fd is None:
-        # F747 (#747): None (not False) means CONTENDED, not failed -- the
-        # caller must not treat a transient lock as a broken native channel.
-        logger.debug(
-            "teammate_push: inbox lock %s contended; leaving it to the reconciler", lock_path
-        )
+        time.sleep(INBOX_LOCK_RETRY_PAUSE_S)
+        fd = _try_acquire_lockfile(lock_path)
+    if fd is None:
+        # None (not False) means CONTENDED, not failed. The caller must not
+        # treat a transient lock as a broken native channel, and the row is
+        # left for the reconciler rather than waited on.
         return None
     emit_data: "bytes | str | None" = None
     entries_before = 0
@@ -863,7 +930,7 @@ class PushOutcome:
 
     pushed: bool
     # closed set: empty_batch, no_inbox_path, already_notified, consumed,
-    # write_failed, lock_contended, pushed
+    # write_failed, inbox_contended, pushed
     reason: str
     message_ids: tuple  # diagnostic only (N1)
 
@@ -900,10 +967,12 @@ def attempt_teammate_push_reported(
     )
     success = _write_inbox_entry(inbox_path, entry)
     if success is None:
-        # Contended, not broken: the row stays PENDING and the reconciler
-        # re-pushes next tick. Deliberately does NOT arm the write-failure
-        # ledger, so the fallback surface stays silent for a transient race.
-        return PushOutcome(pushed=False, reason="lock_contended", message_ids=ids)
+        # Contended, not broken: the row stays PENDING and the reconciler's next
+        # tick carries it. Deliberately does NOT arm the write-failure ledger,
+        # so the fallback surface stays silent for a transient race. Logged once
+        # per row, so a busy inbox cannot flood the log.
+        _log_inbox_contended_once(terminal_id, ids)
+        return PushOutcome(pushed=False, reason="inbox_contended", message_ids=ids)
     if success:
         # F747 (#747): a good write disarms the fallback for this terminal.
         clear_native_write_failure(terminal_id)
