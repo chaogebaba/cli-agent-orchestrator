@@ -1937,7 +1937,7 @@ mod tests {
     /// would look like if it had it.
     ///
     /// **Four assertions rather than one summed check**, also deliberately: a single
-    /// `in_app + handoff + hidden == 107` stays green when a command moves from IN-APP to HIDE,
+    /// `in_app + handoff + hidden == 117` stays green when a command moves from IN-APP to HIDE,
     /// because the total is conserved. Reclassification is exactly the change most likely to
     /// happen by accident, so each policy is pinned separately and the failure names *which* one
     /// moved.
@@ -1969,17 +1969,22 @@ mod tests {
     /// `agreement`} — all HIDE, per the mandated default for a command nobody has reviewed for
     /// in-pane use, and a diagnostic that prints a wide table is a poor fit for the pane anyway →
     /// **24/18/65 = 107**.
+    ///
+    /// F865 r4: nine further fork ops (agents status, barrier/base, config reconcile, diag
+    /// delivery/msg, ledger, mailbox, messages, sandbox, seam, session lifecycle, suite, verify,
+    /// providers capabilities) reached the CLI and catalog classified HIDE, plus `identity
+    /// backfill-owners` (F829 A2.2) — all HIDE by the mandated default → **24/18/75 = 117**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_sixtyfive() {
+    fn the_policy_distribution_is_twentyfour_eighteen_seventyfive() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 65, "expected 65 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 75, "expected 75 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            107,
-            "the three policy counts must account for all 107 leaf commands of the Click tree"
+            117,
+            "the three policy counts must account for all 117 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1989,8 +1994,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            107,
-            "DISPLAY_ORDER must list 107 DISTINCT commands; a duplicate would let one command go \
+            117,
+            "DISPLAY_ORDER must list 117 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -2246,6 +2251,7 @@ mod tests {
                 CommandId::IdentityClaim,
                 CommandId::IdentityRelease,
                 CommandId::IdentityBackfillOwners,
+                CommandId::ProvidersCapabilities,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
