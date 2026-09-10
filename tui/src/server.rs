@@ -715,6 +715,46 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::DiagFindings => None,
         CommandId::DiagTerminal => None,
         CommandId::DiagWhy => None,
+
+        CommandId::DiagWhy => None,
+
+        // F865 r4: catalog rows added without a server-route arm kept this exhaustive match
+        // from compiling. Every command below is classified HIDE in `catalog.rs`, so the TUI
+        // never offers it; per the WorkflowApprove convention above these arms are
+        // deliberately `None` — exhaustiveness only, never a real binding.
+        CommandId::AgentsStatus => None,
+        CommandId::AutoAnswersTest => None,
+        CommandId::BarrierCancel => None,
+        CommandId::BarrierStatus => None,
+        CommandId::BaseRegister => None,
+        CommandId::ConfigReconcile => None,
+        CommandId::DiagDelivery => None,
+        CommandId::DiagMsg => None,
+        CommandId::Fold => None,
+        CommandId::IdentityBackfillOwners => None,
+        CommandId::IdentityRelease => None,
+        CommandId::LedgerCheck => None,
+        CommandId::MailboxDelete => None,
+        CommandId::MailboxList => None,
+        CommandId::MessagesAck => None,
+        CommandId::MessagesList => None,
+        CommandId::MessagesTrace => None,
+        CommandId::ProvidersCapabilities => None,
+        CommandId::Redeploy => None,
+        CommandId::SandboxDown => None,
+        CommandId::SandboxStatus => None,
+        CommandId::SandboxUp => None,
+        CommandId::SeamReset => None,
+        CommandId::SeamRollback => None,
+        CommandId::SeamStatus => None,
+        CommandId::SessionClose => None,
+        CommandId::SessionManifest => None,
+        CommandId::SessionRecover => None,
+        CommandId::SessionStart => None,
+        CommandId::Suite => None,
+        CommandId::VerifyDeploy => None,
+        CommandId::VerifyIdentity => None,
+        CommandId::VerifyManifest => None,
     }
 }
 
