@@ -104,6 +104,15 @@ def nested_fork(tmp_path: Path) -> dict[str, Path]:
 
 
 @pytest.fixture
+def registered_supervisor(register_caller):
+    """F867 r3: these arms drive the REAL create path, whose fail-closed
+    pre-publication revalidation looks the caller up in the database. SUPERVISOR
+    is only a literal here, so it must also exist as a real row or the spawn is
+    refused ``E-CALLER-GONE`` before the shim compose is ever reached."""
+    return register_caller(SUPERVISOR, session_name="cao-shim")
+
+
+@pytest.fixture
 def clean_shim_env(monkeypatch):
     """LAPTOP_OK unset and a deterministic base PATH so the shim decision and
     the composed value are both reproducible (``maybe_shim_env`` reads both
@@ -198,7 +207,7 @@ def _lease_patches():
 
 @pytest.mark.asyncio
 async def test_worker_spawn_on_nested_fork_gets_shim_prepended(
-    nested_fork, clean_shim_env
+    nested_fork, clean_shim_env, registered_supervisor
 ):
     """MUTANT SENTINEL. A real worker spawn (existing session + caller_id) with
     cwd inside the fork must receive the fork's ``scripts/laptop-shims`` at the
@@ -228,7 +237,7 @@ async def test_worker_spawn_on_nested_fork_gets_shim_prepended(
 
 @pytest.mark.asyncio
 async def test_worker_spawn_with_all_frozen_fleet_is_not_shimmed(
-    nested_fork, clean_shim_env
+    nested_fork, clean_shim_env, registered_supervisor
 ):
     """Same worker create_window path, no active offload target. When the
     root's ``boxes.tsv`` has NO active row (an all-frozen or box-hosted fleet:

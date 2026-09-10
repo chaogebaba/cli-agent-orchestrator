@@ -195,6 +195,12 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         "cli/commands/doctor.py",
         "services/teammate_push_service.py",
     }
+    # F894 (#746): hooks/status_emit.py runs INSIDE the Claude pane as its
+    # statusLine command, so Path.home() there is the pane's own HOME — the
+    # injected sandbox home for a sandboxed pane, the native one otherwise.
+    # Reading that pane's ~/.claude/settings.json to chain the user's statusline
+    # is the intended semantic, not a native-home leak.
+    pane_local_home_allowed = {"hooks/status_emit.py"}
     for path in SOURCE.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert '"/.codex/sessions/"' not in text
@@ -205,7 +211,7 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         ):
             continue
         relative = path.relative_to(SOURCE).as_posix()
-        assert relative in allowed | grok_binary_config_allowed, (
+        assert relative in allowed | grok_binary_config_allowed | pane_local_home_allowed, (
             f"{relative} has a native-home literal but is not in the allowed set"
         )
 

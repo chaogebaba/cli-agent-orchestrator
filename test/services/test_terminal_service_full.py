@@ -343,6 +343,10 @@ class TestCreateTerminal:
             ["fs_read"],
             auth_token=ANY,
             caller_id=None,
+            # F867 r4: the publication call now carries the atomic caller-check
+            # flag. A new-session launch has no same-session parent, so it is
+            # False here — the gated case is an existing-session child create.
+            require_live_caller=False,
             engine="v2",
             group=None,
             metadata=None,

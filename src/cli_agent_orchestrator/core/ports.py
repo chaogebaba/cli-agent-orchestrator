@@ -41,6 +41,23 @@ from cli_agent_orchestrator.core.delivery import (
 )
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
+from cli_agent_orchestrator.core.gate import (
+    ArtifactManifest,
+    ClaimOwnershipResult,
+    ConsumerCoverage,
+    Dispatch,
+    Disposition,
+    EffectIntent,
+    EffectResult,
+    ExecutionTarget,
+    GateRound,
+    GateRun,
+    OpenFinding,
+    RoundProjection,
+    RoundState,
+    RunState,
+    Severity,
+)
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 
 __all__ = [
@@ -652,9 +669,131 @@ class PaneInjector(Protocol):
 
 @runtime_checkable
 class GateStore(Protocol):
-    """Gate run state machine — PHASE 4 stub (audit §3.3)."""
+    """The transactional gate-record store (WP-ARCH Amendment A, slice 2a; §10.2).
 
-    def start_run(self, *args: object, **kwargs: object) -> object: ...
+    Filled by ``adapters/store/gate.py`` and wired in ``bootstrap.py``, this is the
+    EXCLUSIVE writer surface for the gate rows: ``one-gate-writer`` (§10.3 DoD)
+    forbids every module but the composition root from naming
+    ``adapters.store.gate``, and ``app.gate.GateRoundService`` reaches the store
+    only through this Protocol.  Every mutator is one transaction in the adapter;
+    every read is a plain SELECT.  Phase 4's stub (``start_run``) is replaced by
+    the full surface Amendment A's records-and-rendering increment needs.
+    """
+
+    # -- run and round lifecycle -------------------------------------------
+
+    def open_run(
+        self,
+        *,
+        wp: str,
+        lane: str,
+        owner_conversation: str,
+        owner_epoch: int,
+        max_rounds: int,
+        workflow_source_sha: str = "",
+        input_sha: str = "",
+    ) -> GateRun:
+        """Mint a ``run_id`` and insert an OPEN run.  ``max_rounds`` 0 is refused."""
+        ...
+
+    def open_round(
+        self,
+        *,
+        run_id: str,
+        build_inputs: ArtifactManifest,
+        execution_target: ExecutionTarget,
+        predecessor_round_id: str | None = None,
+        test_command: str = "",
+        evidence_tier: str = "",
+        generation: int = 0,
+    ) -> GateRound:
+        """Insert an OPEN round with its build inputs frozen (before the builder)."""
+        ...
+
+    def freeze_review_snapshot(
+        self, round_id: str, snapshot: ArtifactManifest, *, expected_row_version: int
+    ) -> GateRound:
+        """Freeze the review snapshot and move OPEN -> BUILT; refuses a stale version."""
+        ...
+
+    def transition_round(
+        self, round_id: str, target: RoundState, *, expected_row_version: int, now: datetime
+    ) -> GateRound:
+        """Move a round to ``target`` if the transition is legal and the version fresh."""
+        ...
+
+    def transition_run(
+        self, run_id: str, target: RunState, *, expected_row_version: int
+    ) -> GateRun:
+        """Move a run to ``target`` if the transition is legal and the version fresh."""
+        ...
+
+    def set_round_report(
+        self,
+        round_id: str,
+        *,
+        subject_sha: str,
+        report_bytes_sha: str,
+        verdict_report_sha: str,
+        expected_row_version: int,
+    ) -> GateRound:
+        """Record the two verification hashes and the verdict report on the round."""
+        ...
+
+    def record_dispatch(self, dispatch: Dispatch) -> Dispatch:
+        """Insert or update one dispatch aggregate (nullable round id for non-gate)."""
+        ...
+
+    def record_effect_intent(self, intent: EffectIntent) -> EffectIntent:
+        """Insert one effect intent, idempotent on ``effect_id`` (the dedup key)."""
+        ...
+
+    def record_effect_result(self, result: EffectResult) -> EffectResult:
+        """Insert or update the result for a recorded intent, keyed on ``effect_id``."""
+        ...
+
+    def raise_finding(
+        self, *, raised_in_round: str, severity: Severity, statement: str
+    ) -> OpenFinding:
+        """Raise a finding whose identity travels round to round (immutable statement)."""
+        ...
+
+    def append_disposition(self, finding_id: str, disposition: Disposition) -> OpenFinding:
+        """Append a validated disposition (FIXED/WITHDRAWN), closing the finding."""
+        ...
+
+    def set_consumer_coverage(self, round_id: str, coverage: ConsumerCoverage) -> None:
+        """Bind revision-bound consumer coverage to a round (AC-A9)."""
+        ...
+
+    def claim_ownership(
+        self,
+        *,
+        prior_conversation: str,
+        new_conversation: str,
+        new_epoch: int,
+        run_id: str | None = None,
+        client_request_id: str,
+        claimed_by: str,
+    ) -> ClaimOwnershipResult:
+        """Transfer ownership monotonically in the epoch (P2, DESIGN r2 C1, AC-A12)."""
+        ...
+
+    def get_run(self, run_id: str) -> GateRun | None: ...
+
+    def get_round(self, round_id: str) -> GateRound | None: ...
+
+    def project_round(self, round_id: str) -> RoundProjection | None:
+        """Assemble a whole round from rows — the zero-markdown re-projection (AC-A1)."""
+        ...
+
+    def rounds_for_run(self, run_id: str) -> list[GateRound]:
+        """Every round of a run, in ``round_no`` order — the ``cao gate show`` body."""
+        ...
+
+    def open_findings_for_run(self, run_id: str) -> list[OpenFinding]:
+        """The run's still-open findings, for the next round's brief (AC-A2)."""
+        ...
 
 
 @runtime_checkable
