@@ -749,9 +749,11 @@ class FifoManager:
                 from cli_agent_orchestrator.backends.registry import get_backend
 
                 backend = get_backend()
+                # str() coercion: these locals are read off an ORM row, and the
+                # PORT's signature is stricter than TmuxBackend's override was.
                 scope_probe = backend.session_scope_probe(
-                    session_name,
-                    window_name=window_name,
+                    str(session_name),
+                    window_name=str(window_name),
                     samples=samples,
                     timeout_s=timeout_s,
                 )
