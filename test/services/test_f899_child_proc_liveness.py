@@ -374,3 +374,233 @@ def test_error_gate_never_outranks_the_question_marker(monkeypatch, quiescent_er
     status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
     assert status is TerminalStatus.WAITING_USER_ANSWER
     assert reason == "question_marker"
+
+
+# ── r2: fresh pane-sample re-derivation on both lowering arms ───────────────
+#
+# The thinking-only worker is the case the child-proc probe cannot see: its tree
+# is zsh -> pi -> cao-mcp-server (no tool subprocess) while its pane renders the
+# live spinner. Both lowering arms must consult the fresh pane sample.
+
+
+class _SnapshotProvider:
+    """Minimal provider with the direct-probe opt-in the routing requires."""
+
+    supports_direct_status_probe = True
+    supports_screen_detection = False
+    supports_stale_capture_selfheal = True
+
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.calls = 0
+
+    def get_status(self, text):
+        self.calls += 1
+        return self.verdict
+
+
+class _RawStreamProvider(_SnapshotProvider):
+    """Neither opt-in flag — must never be fed a rendered snapshot."""
+
+    supports_direct_status_probe = False
+    supports_screen_detection = False
+
+
+@pytest.fixture
+def install_provider(monkeypatch):
+    def _install(provider):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            lambda _tid: provider,
+        )
+        return provider
+
+    return _install
+
+
+def _seed_sample(monitor, terminal_id, tail):
+    """Put a usable, non-stale pane sample in the sampler peek() reads."""
+    import cli_agent_orchestrator.services.pane_liveness as pl
+
+    pane = pl.pane_liveness
+    with pane._lock:
+        state = pane._state.setdefault(terminal_id, pl._PaneState())
+        state.fp = "fp"
+        state.filtered_tail = tail
+        state.sampled_at = pane._clock()
+        state.last_change_monotonic = pane._clock()
+    return pane
+
+
+def test_r2_thinking_only_worker_holds_processing_on_the_idle_arm(
+    monkeypatch, expired_hold, probe_at, install_provider
+):
+    """(4a) tree zsh->pi->cao-mcp-server, fresh sample shows the spinner."""
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))  # no live descendant
+    _seed_sample(expired_hold, "t1", "── Working ──")
+    install_provider(_SnapshotProvider(TerminalStatus.PROCESSING))
+    status, reason = expired_hold.fuse_status("t1", TerminalStatus.IDLE)
+    assert status is TerminalStatus.PROCESSING
+    assert reason == "fresh_capture_working"
+
+
+def test_r2_thinking_only_worker_holds_processing_on_the_error_arm(
+    monkeypatch, quiescent_error, probe_at, install_provider
+):
+    """(4a) same tree and sample, but the published status is ERROR."""
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))
+    _seed_sample(quiescent_error, "t1", "── Working ──")
+    install_provider(_SnapshotProvider(TerminalStatus.PROCESSING))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.PROCESSING
+    assert reason == "fresh_capture_working"
+
+
+def test_r2_stale_buffer_error_with_fresh_idle_becomes_idle(
+    monkeypatch, quiescent_error, probe_at, install_provider
+):
+    """(4b) the fresh sample parses idle — admit THAT, never the stale ERROR."""
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))
+    _seed_sample(quiescent_error, "t1", "idle composer chrome")
+    install_provider(_SnapshotProvider(TerminalStatus.IDLE))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.IDLE
+    assert reason == "fresh_capture_idle"
+
+
+def test_r2_fresh_sample_still_error_keeps_error(
+    monkeypatch, quiescent_error, probe_at, install_provider
+):
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))
+    _seed_sample(quiescent_error, "t1", "Error: launch failed")
+    install_provider(_SnapshotProvider(TerminalStatus.ERROR))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.ERROR
+    assert reason is None
+
+
+def test_r2_fresh_idle_verdict_does_not_change_the_idle_arm(
+    monkeypatch, expired_hold, probe_at, install_provider
+):
+    """On the idle arm only the RAISE is taken — an idle verdict agrees with the
+    admit that was already going to happen, so the reason stays the expiry one."""
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))
+    _seed_sample(expired_hold, "t1", "idle composer chrome")
+    install_provider(_SnapshotProvider(TerminalStatus.IDLE))
+    status, reason = expired_hold.fuse_status("t1", TerminalStatus.IDLE)
+    assert status is TerminalStatus.IDLE
+    assert reason == "pane_delta_expired"
+
+
+def test_r2_rate_limit_respected_no_second_detector_call_inside_3s(
+    monkeypatch, quiescent_error, install_provider
+):
+    """(4d) the 3 s limit is honoured — a second pass inside the window does not
+    re-run the detector, and re-derivation returns None (no new evidence)."""
+    _seed_sample(quiescent_error, "t1", "── Working ──")
+    provider = install_provider(_SnapshotProvider(TerminalStatus.PROCESSING))
+    assert (
+        quiescent_error._rederive_from_pane_sample("t1", "── Working ──", now=100.0)
+        is TerminalStatus.PROCESSING
+    )
+    assert provider.calls == 1
+    assert quiescent_error._rederive_from_pane_sample("t1", "── Working ──", now=101.0) is None
+    assert provider.calls == 1  # inside the 3 s window
+    assert (
+        quiescent_error._rederive_from_pane_sample("t1", "── Working ──", now=104.0)
+        is TerminalStatus.PROCESSING
+    )
+    assert provider.calls == 2
+
+
+def test_r2_raw_stream_provider_is_never_fed_a_rendered_sample(
+    monkeypatch, quiescent_error, install_provider
+):
+    """Routing is shared with the #558 path: neither opt-in flag ⇒ no verdict."""
+    provider = install_provider(_RawStreamProvider(TerminalStatus.PROCESSING))
+    assert quiescent_error._rederive_from_pane_sample("t1", "── Working ──") is None
+    assert provider.calls == 0
+
+
+def test_r2_rederive_never_raises(monkeypatch, quiescent_error, install_provider):
+    exploding = _SnapshotProvider(TerminalStatus.PROCESSING)
+
+    def boom(_text):
+        raise RuntimeError("detector blew up")
+
+    exploding.get_status = boom  # type: ignore[method-assign]
+    install_provider(exploding)
+    assert quiescent_error._rederive_from_pane_sample("t1", "tail") is None
+
+
+def test_r2_empty_sample_yields_no_verdict(quiescent_error, install_provider):
+    provider = install_provider(_SnapshotProvider(TerminalStatus.PROCESSING))
+    assert quiescent_error._rederive_from_pane_sample("t1", "") is None
+    assert provider.calls == 0
+
+
+# ── r2 ruling 3: pi_cli startup-error precondition ─────────────────────────
+
+
+def _pi_provider(monkeypatch, *, init_state, initialized):
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+
+    provider = PiCliProvider.__new__(PiCliProvider)
+    provider.terminal_id = "t1"
+    provider._initialized = initialized
+    provider._tui_processing_seen = False
+    provider._task_dispatched = False
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _tid: {"init_state": init_state},
+    )
+    return provider
+
+
+_STALE_ERROR_FRAME = "some transcript\nError: 429: {rate limited}\nmore transcript\n"
+
+
+def test_r3_ready_terminal_never_publishes_error_from_an_old_banner(monkeypatch):
+    """A ready pi terminal whose buffer went quiet must fall to UNKNOWN, not
+    ERROR — the F808 cached-UNKNOWN self-heal then re-derives from a capture."""
+    provider = _pi_provider(monkeypatch, init_state="ready", initialized=False)
+    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
+
+
+def test_r3_launch_window_still_classifies_a_genuine_startup_failure(monkeypatch):
+    """Inside the launch window the same banner is still a real launch failure."""
+    provider = _pi_provider(monkeypatch, init_state="init_pending", initialized=False)
+    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.ERROR
+
+
+def test_r3_initialized_flag_alone_closes_the_launch_window(monkeypatch):
+    """_initialized is sufficient even when the row is unreadable."""
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+
+    provider = PiCliProvider.__new__(PiCliProvider)
+    provider.terminal_id = "t1"
+    provider._initialized = True
+    provider._tui_processing_seen = False
+    provider._task_dispatched = False
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.UNKNOWN
+
+
+def test_r3_unreadable_row_and_uninitialized_still_classifies_error(monkeypatch):
+    """Fail-closed the other way: no evidence the launch window closed ⇒ the
+    banner keeps its ERROR meaning, exactly as before r2."""
+    from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+
+    provider = PiCliProvider.__new__(PiCliProvider)
+    provider.terminal_id = "t1"
+    provider._initialized = False
+    provider._tui_processing_seen = False
+    provider._task_dispatched = False
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _tid: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    assert provider.get_status(_STALE_ERROR_FRAME) is TerminalStatus.ERROR

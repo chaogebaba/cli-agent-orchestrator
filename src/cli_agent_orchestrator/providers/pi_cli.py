@@ -941,12 +941,40 @@ class PiCliProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         # No live TUI chrome AND no spinner: pi never reached (or has lost) a
-        # usable frame — a genuine startup/authorization failure. Only here does
-        # the error banner mean a terminal ERROR.
-        if _STARTUP_ERROR.search(clean):
+        # usable frame. F899 (#751) r2 ruling 3: that is a genuine startup
+        # failure ONLY inside the launch window. Past it, the same banner is a
+        # #700 runtime line left in a buffer that stopped advancing — the third
+        # 2026-09-10 sample, where two ready pi lanes published ERROR while their
+        # panes rendered the live Working spinner, because the rolling buffer had
+        # gone quiet and its last frame carried neither chrome nor spinner but did
+        # carry an old `Error:` line. A ready terminal must never reach ERROR from
+        # a stale frame; it falls to UNKNOWN, which the F808 (#665) cached-UNKNOWN
+        # self-heal re-derives from a real capture (pi opts in via
+        # supports_direct_status_probe).
+        if not self._past_launch_window() and _STARTUP_ERROR.search(clean):
             return TerminalStatus.ERROR
 
         return TerminalStatus.UNKNOWN
+
+    def _past_launch_window(self) -> bool:
+        """Whether this terminal has ever reached a usable frame (F899 r2).
+
+        Two sources, either of which means the launch window is over:
+        ``self._initialized`` (set when ``initialize`` saw pi's idle chrome) and
+        the terminal row's ``init_state == "ready"``. The DB check is what keeps
+        the gate correct across a ``cao-server`` bounce, which rebuilds providers
+        with ``_initialized`` False against terminals that are long since ready.
+        NEVER raises — an unreadable row degrades to the in-process flag alone.
+        """
+        if self._initialized:
+            return True
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(self.terminal_id)
+        except Exception:
+            return False
+        return bool(metadata) and metadata.get("init_state") == "ready"
 
     def classify_injection_hazard(self, rows: list[str]) -> str | None:
         """Regular-TUI Pi has no blocking modal that would eat pasted task text."""
