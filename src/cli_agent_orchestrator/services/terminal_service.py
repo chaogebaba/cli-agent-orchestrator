@@ -1779,6 +1779,7 @@ async def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     is_box_hosted: bool = False,
+    cell_request_class: str = "explicit",
     root_admission: Optional["RootAdmission"] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
@@ -1838,10 +1839,18 @@ async def create_terminal(
             value is sourced from the laptop-side host catalog and rides the
             create route, because this decision executes inside the BOX
             server. Default False = laptop behaviour, unchanged.
+        cell_request_class: F868/F870 r2 (D4/D5). How the caller selected this
+            (position, provider) cell — one of "routing" (bare position, no
+            explicit provider), "explicit" (operator named the cell: bare
+            position + provider=, or a composed <position>-<provider> literal),
+            "resume" (routing-equivalent continuation of a prior spawn), or
+            "legacy" (a non-position name; no cell, no check). Selects the D5
+            certification asymmetry inside the choke point. Defaults to
+            "explicit" (the strictest arm) so an unclassified create fails
+            closed.
 
     Returns:
         Terminal object with all metadata populated
-
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TerminalLimitError: If the node's tracked-terminal cap (CAO_MAX_TERMINALS /
@@ -1865,6 +1874,26 @@ async def create_terminal(
             )
 
     require_provider_admitted(provider)
+    # F868 #724 + F870 #726 r2 (D4) — the SINGLE cell-certification choke point.
+    # EVERY create path funnels through this function (assign → POST
+    # /sessions/{s}/terminals; handoff → /terminals/run-step → run_agent_step;
+    # POST /sessions & /sessions/start → session_service.create_session; the
+    # resume path), so running the guard HERE — before any resource (worktree,
+    # tmux window, DB row, provider process) is allocated — closes the codex r1
+    # bypasses B2/B3/B4 with one call. ``cell_request_class`` (D5) is threaded
+    # from the entry point; it defaults to "explicit" (the strictest arm) so a
+    # caller that forgets to classify fails CLOSED rather than open. A legacy
+    # (non-position) name is a no-op passthrough. Removing this call from any one
+    # path is killed by that path's committed test.
+    from cli_agent_orchestrator.utils.cell_guard import CellGuardRefused, guard_cell_admission
+
+    try:
+        guard_cell_admission(agent_profile, provider, request_class=cell_request_class)
+    except CellGuardRefused as _refusal:
+        # Surface as a ValueError carrying the typed code so the HTTP layer
+        # renders a 4xx with the same E-CELL-UNCERTIFIED / E-COMPOSITION-MISSING
+        # code the MCP envelope uses. No terminal was created (fail-closed).
+        raise ValueError(str(_refusal)) from _refusal
     # F439 (#294): enforce the worker-terminal cap BEFORE any resource is
     # created — no tmux window, no DB row, no worktree, no provider init — so a
     # refusal is atomic and leaves nothing to unwind (mirrors the authority-pin

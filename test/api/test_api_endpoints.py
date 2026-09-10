@@ -385,6 +385,9 @@ class TestCreateSession:
             # box-hosted, so the F620 shim decision is unchanged.
             terminal_id=None,
             is_box_hosted=False,
+            # F868/F870 r2 (D4/D5): 'developer' is a legacy (non-position) name,
+            # so the route classifies it LEGACY (no cell, no certification check).
+            cell_request_class="legacy",
         )
 
     def test_memory_manager_sidecar_carries_caller_id(self, client):
