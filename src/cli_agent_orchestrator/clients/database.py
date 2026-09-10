@@ -9177,6 +9177,8 @@ def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMess
     at-rest convention; the same harmless <=4h over-collection window applies and
     is idempotent downstream (the caller dedupes via a trace event).
     """
+    from cli_agent_orchestrator.core.delivery import is_service_sender
+
     cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
@@ -9192,13 +9194,18 @@ def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMess
         )
         result: List[InboxMessage] = []
         for row in rows:
-            sender = str(row.sender_id or "")
             # Internal/service senders never receive a stall notice: they are not
             # real supervisor terminals and routing back would be meaningless (or
             # a loop). Reserved-sender prefixes mirror those used across the inbox
             # (message-trace:, cao-*, watchdog:, cao-bridge). Any ':'-namespaced
             # sender is treated as a service sender.
-            if not sender or ":" in sender or sender.startswith("cao-"):
+            #
+            # #741 r3: the rule moved to `core.delivery.is_service_sender` so the
+            # legacy stall path and the queue tick's dead-letter notice ask ONE
+            # question. They had the same rule and only one of them implemented
+            # it, which is how the tick came to address 20 live notices to
+            # `watchdog:`/`message-trace:` ids that can never hold a terminal.
+            if is_service_sender(row.sender_id):
                 continue
             result.append(_inbox_message_from_row(row))
         return result

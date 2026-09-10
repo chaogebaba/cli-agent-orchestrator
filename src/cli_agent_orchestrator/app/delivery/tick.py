@@ -55,6 +55,7 @@ from cli_agent_orchestrator.core.delivery import (
     QueueMode,
     SeatDigest,
     SwitchPosition,
+    is_service_sender,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import (
@@ -335,13 +336,32 @@ class DeliveryTick:
                 dedupe_key=row.msg_id,
                 detail=f"reason={row.reason.value} attempts={row.attempts}",
             )
-        if row.is_notice or not row.sender_id:
+        if row.is_notice or is_service_sender(row.sender_id):
             # D14: a dead-letter notice is never itself dead-lettered into
             # another notice.  The flagged row records the finding ALONE and
             # enqueues nothing, so the chain is one notice deep BY CONSTRUCTION
             # rather than by rate — the rate argument bounds a loop only by how
             # long receivers keep disappearing, and the second-order notice tells
             # a reader nothing the first did not.
+            #
+            # #741 r3: the empty-sender case widened to every SERVICE sender.
+            # The docstring's justification above — "the sender of a
+            # supervisor-bound callback is a WORKER, whose composer is not
+            # killed" — is TRUE of workers and false of `watchdog:<terminal>`,
+            # `message-trace:<terminal>` and the `cao-` writers. Those ids own no
+            # terminal and no mailbox, so the notice could never be carried; it
+            # was claimed, refused `no_terminal`, and re-woken every lease period
+            # because a refusal does not terminate the row. The r2d live round
+            # produced 20 such refusals across three service ids, and they are
+            # what made its remaining 40 unreadable as acceptance evidence.
+            #
+            # The finding above still fires, so the death is not silenced — only
+            # the undeliverable notice is not written.
+            logger.debug(
+                "delivery: no sender notice for %s — sender=%s is not addressable",
+                row.msg_id,
+                row.sender_id or "<empty>",
+            )
             return
         try:
             self._store.enqueue(

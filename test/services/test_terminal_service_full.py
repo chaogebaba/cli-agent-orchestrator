@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services import terminal_service as terminal_service_module
 from cli_agent_orchestrator.services.terminal_service import (
+    MAX_PEEK_TERMINAL_LINES,
     OutputMode,
     TerminalInputBlockedError,
     _deferred_init_tasks,
@@ -21,7 +22,6 @@ from cli_agent_orchestrator.services.terminal_service import (
     _delete_terminal_core as delete_terminal,
 )
 from cli_agent_orchestrator.services.terminal_service import (
-    MAX_PEEK_TERMINAL_LINES,
     _schedule_deferred_init,
     create_terminal,
     get_output,

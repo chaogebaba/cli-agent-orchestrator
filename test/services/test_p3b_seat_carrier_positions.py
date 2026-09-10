@@ -24,6 +24,7 @@ doorbell shut. The seat was neither pasted nor woken.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1005,3 +1006,155 @@ def test_the_predicate_names_which_rows_the_queue_owns(seat_db) -> None:
         return_value=SwitchPosition.SHADOW,
     ):
         assert queue_owns_receiver_delivery(SEAT_TERMINAL) is False
+
+
+# ---------------------------------------------------------------------------
+# #741 r3 — the POSITIVE carrier arms for K2 and K6.
+#
+# The r1 EMPIRICAL adjudication ruled the existing `on` coverage a SHOULD-level
+# hole: `test_a_legacy_row_at_on_keeps_its_carrier` drives `deliver_pending` and
+# K3, and `test_the_predicate_names_which_rows_the_queue_owns` drives the
+# predicate in isolation, but NOTHING put a pending legacy row at `on` through
+# K2's `write_supervisor_callback_notification` or K6's per-mailbox reconcile.
+# Those two call sites are where #741 moved the mute from a module-wide return
+# to a receiver-scoped question, so a regression that reverts either one to the
+# coarse `queue_owns_delivery()` would have been invisible: the predicate would
+# still be correct and the row would still have no carrier.
+#
+# Both arms therefore call the REAL public entry point and assert an EMISSION,
+# in the same spirit as the file's opening note — an arm that checks only for
+# the absence of a mute certifies nothing about whether anything was carried.
+# ---------------------------------------------------------------------------
+
+
+def test_a_legacy_row_at_on_keeps_the_k2_content_carrier(flip_env, tmp_path) -> None:
+    """K2's writer must WRITE for a row the queue does not own.
+
+    `write_supervisor_callback_notification` is the single public native
+    callback writer, and 3b muted it terminal-wide on `queue_owns_delivery()`.
+    At `on` the legacy inbox stops accepting inserts but does not become empty,
+    so that mute stranded every row still in it: K2 returned
+    `skipped/queue_owns_delivery` and the durable native entry was never
+    written. The assertion is on the written FILE, not merely on the return
+    kind, because a writer that reports success and leaves no entry is the same
+    silent seat with a friendlier log line.
+    """
+    from cli_agent_orchestrator.clients.database import _inbox_message_from_row
+    from cli_agent_orchestrator.services.teammate_push_service import (
+        write_supervisor_callback_notification,
+    )
+
+    sessions, _store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+        row = _callback(db)
+        message = _inbox_message_from_row(row)
+
+    inbox_path = tmp_path / "k2-native-inbox.json"
+
+    install(SwitchPosition.ON)
+    result = write_supervisor_callback_notification(
+        inbox_path=inbox_path,
+        mailbox_id="mb_p3b_sup",
+        message=message,
+    )
+
+    assert result.reason != "queue_owns_delivery", (
+        "K2 was muted for a row the queue does not own: the legacy inbox is "
+        "read-only from the flip, not empty, so this row's only content "
+        "carrier just refused it (#741)"
+    )
+    assert result.kind == "written", result
+    assert inbox_path.exists(), "K2 reported a carry and wrote no durable entry"
+
+    entries = json.loads(inbox_path.read_text())
+    assert len(entries) == 1, entries
+
+
+def test_k2_stays_muted_when_the_queue_owns_every_row(flip_env, tmp_path) -> None:
+    """The other direction: with no legacy row, K2 must stay silent.
+
+    Without this arm the repair above would be satisfied by deleting the mute,
+    which restores the duplicate-carrier family (#506) this phase closes.
+    """
+    from datetime import timezone
+
+    from cli_agent_orchestrator.models.inbox import InboxMessage, OrchestrationType
+    from cli_agent_orchestrator.services.teammate_push_service import (
+        write_supervisor_callback_notification,
+    )
+
+    sessions, _store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+
+    # A message the QUEUE holds: shaped like a delivered row, absent from the
+    # legacy inbox, which is exactly the disjointness the predicate relies on.
+    message = InboxMessage(
+        id=9001,
+        sender_id=WORKER_TERMINAL,
+        receiver_id=SEAT_TERMINAL,
+        message="QUEUE_OWNED",
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
+        status=MessageStatus.PENDING,
+        created_at=datetime.now(timezone.utc),
+    )
+    inbox_path = tmp_path / "k2-muted-inbox.json"
+
+    install(SwitchPosition.ON)
+    result = write_supervisor_callback_notification(
+        inbox_path=inbox_path,
+        mailbox_id="mb_p3b_sup",
+        message=message,
+    )
+
+    assert result.kind == "skipped"
+    assert result.reason == "queue_owns_delivery"
+    assert not inbox_path.exists(), "the muted writer still produced a second carrier"
+
+
+def test_a_legacy_row_at_on_keeps_the_k6_reconcile_carrier(flip_env, monkeypatch) -> None:
+    """K6's per-mailbox reconcile must still wake a seat holding a legacy row.
+
+    #741 moved this mute from a sweep-wide `return []` into the per-mailbox
+    loop. `test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery`
+    covers the muted direction only, so a regression that restored the sweep-wide
+    return would pass every shipped test while leaving an idle seat unwoken for
+    rows the tick will never serve — #604 with a switch in front of it.
+    """
+    from cli_agent_orchestrator.services import seat_wake_reconcile
+    from cli_agent_orchestrator.services.teammate_push_service import PushOutcome
+
+    pushes: list[tuple[str, tuple[int, ...]]] = []
+
+    def _record(terminal_id, messages, *, mailbox_id=""):
+        ids = tuple(int(m.id) for m in messages)
+        pushes.append((terminal_id, ids))
+        return PushOutcome(pushed=True, reason="pushed", message_ids=ids)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.teammate_push_service." "attempt_teammate_push_reported",
+        _record,
+    )
+
+    sessions, _store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+        row = _callback(db)
+        row_id = int(row.id)
+
+    # Past the 90 s default grace window, which is what the reconcile adopts.
+    later = datetime.now() + timedelta(seconds=600)
+
+    install(SwitchPosition.ON)
+    decisions = seat_wake_reconcile.reconcile_seat_wakes(now=later)
+
+    assert decisions, (
+        "K6 skipped the whole mailbox at `on` while a pending legacy row sat in "
+        "it: the row's tick counterpart does not exist, so nothing else will "
+        "wake this seat (#741)"
+    )
+    decision = decisions[0]
+    assert decision.terminal_id == SEAT_TERMINAL
+    assert decision.outcome == "woken", decision
+    assert pushes == [(SEAT_TERMINAL, (row_id,))], pushes

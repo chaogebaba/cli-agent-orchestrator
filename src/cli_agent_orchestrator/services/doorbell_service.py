@@ -305,9 +305,7 @@ def ring_supervisor_doorbell(
         # emit failure never changes the delivery decision below.
         if native_refusal == "socket_unpublished":
             try:
-                transport_ejection_service.emit_native_unreachable(
-                    terminal_id, "fallback"
-                )
+                transport_ejection_service.emit_native_unreachable(terminal_id, "fallback")
             except Exception:
                 pass
         logger.info(

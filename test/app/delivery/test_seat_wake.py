@@ -1002,3 +1002,82 @@ def test_every_wake_outcome_reaches_the_log(harness: Harness, caplog) -> None:
     ]
     assert emissions, "an emitted wake left no line in the log either"
     assert emissions[-1].levelno == logging.INFO
+
+
+# ---------------------------------------------------------------------------
+# #741 r3 — the dead-letter notice must be ADDRESSABLE.
+#
+# The r1 EMPIRICAL adjudication could not read the r2d live round as acceptance
+# because 20 of its 60 `no_terminal` refusals named service ids rather than the
+# dead probe worker: 10 `receiver=message-trace:4ec96674`, 5
+# `receiver=watchdog:4ec96674`, 5 `receiver=watchdog:ae282428`. Traced to their
+# producer, all 20 are this method: `_announce_death` addressed the notice to
+# `row.sender_id` unconditionally, and the watchdog auto-resume and message-trace
+# writers set `sender_id` to a namespace that owns no terminal and no mailbox.
+#
+# The refusal does not terminate the row, so each notice was re-woken every lease
+# period — `wake=1` through `wake=5` per id in the retained logs, which is where
+# 4 ids x 5 wakes = 20 comes from. This is a real defect the queue introduced,
+# not probe noise, and the arms below are what stop it coming back.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "service_sender",
+    ["watchdog:4ec96674", "message-trace:4ec96674", "cao-bridge", "cao-digest:mb_x"],
+)
+def test_a_service_sender_gets_no_dead_letter_notice(harness: Harness, service_sender: str) -> None:
+    """A notice nobody can receive is not a quieter failure — it is a louder one.
+
+    Addressed to a service namespace the notice is claimed, refused
+    `no_terminal`, and re-offered forever, so it manufactures delivery traffic
+    that looks exactly like real loss. The finding still fires, so the death is
+    recorded; only the undeliverable notice is not written.
+    """
+    row = harness.enqueue("svc", sender=service_sender)
+    harness.clock.advance(seconds=DELIVERY_MAX_LIFETIME_S + 1)
+    report = harness.tick.run_once(now=harness.clock.now())
+
+    dead = harness.queue.dead_letter(row.msg_id)
+    assert dead is not None and dead.reason is DeadReason.MAX_LIFETIME
+    assert harness.findings.of(
+        FindingCode.DIAG_DELIVERY_TIME_BOUND
+    ), "the death must still be recorded — this fix silences the notice, not the finding"
+
+    assert report.notices_enqueued == 0, (
+        f"a dead-letter notice was addressed to {service_sender!r}, which owns no "
+        "terminal and no mailbox: it can only ever refuse `no_terminal` and be "
+        "re-woken every lease period (#741)"
+    )
+    assert not list(harness.queue.undelivered_ids(service_sender))
+
+
+def test_a_worker_sender_still_gets_its_dead_letter_notice(harness: Harness) -> None:
+    """The direction that keeps the repair honest.
+
+    §13d's escalation is the whole reason the notice exists, and a fix that
+    suppressed it for real senders would replace a visible line in a live pane
+    with a row in a table nobody is watching.
+    """
+    row = harness.enqueue("wrk", sender=WORKER)
+    harness.clock.advance(seconds=DELIVERY_MAX_LIFETIME_S + 1)
+    report = harness.tick.run_once(now=harness.clock.now())
+
+    assert harness.queue.dead_letter(row.msg_id) is not None
+    assert report.notices_enqueued == 1
+    assert list(harness.queue.undelivered_ids(WORKER))
+
+
+def test_the_service_sender_rule_has_one_implementation() -> None:
+    """The legacy stall path and the tick must ask the SAME question.
+
+    They had the same rule and only one of them implemented it, which is how the
+    tick came to address 20 live notices to ids the inbox had always refused to
+    route back to.
+    """
+    from cli_agent_orchestrator.core.delivery import is_service_sender
+
+    for sender in ("watchdog:t1", "message-trace:t1", "cao-bridge", "cao-digest:m", "", None):
+        assert is_service_sender(sender) is True, sender
+    for sender in ("4ec96674", "wrk-p3b01", "codex_general-abc"):
+        assert is_service_sender(sender) is False, sender
