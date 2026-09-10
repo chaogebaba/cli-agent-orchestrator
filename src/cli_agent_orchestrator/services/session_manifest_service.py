@@ -114,11 +114,16 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None, _n
             started_at = auth_mtime = None
             auth_staleness = "unknown"
             try:
+                from cli_agent_orchestrator.backends.registry import get_backend
                 from cli_agent_orchestrator.providers.manager import provider_manager
-                from cli_agent_orchestrator.services.fork_context_service import pane_pid
 
                 provider = provider_manager.get_provider(item["id"])
-                pid = pane_pid(item["tmux_session"], item["tmux_window"])
+                # F893 (#745): backend port, not tmux list-panes — under herdr the
+                # old pane_pid() raised and this whole block degraded silently to
+                # started_at=None / auth_staleness="unknown" on every manifest.
+                pid = get_backend().get_pane_process_id(
+                    item["tmux_session"], item["tmux_window"]
+                )
                 started_at = provider.provider_process_started_at(pid)
                 auth_path = provider.auth_state_path()
                 if auth_path and auth_path.is_file():

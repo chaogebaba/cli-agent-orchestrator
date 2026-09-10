@@ -2324,6 +2324,17 @@ async def health_check():
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
+    # F882 (#735): the herdr component reflects real control-plane liveness via
+    # the backend port, not merely ``shutil.which("herdr")`` (which reported
+    # ``ok`` across a dead herdr socket — A3 in the live report). The tmux
+    # backend has no separate control plane and returns ``"ok"``; the ``claude``
+    # component stays a binary-presence probe.
+    try:
+        herdr_component = backend.backend_health() if backend_name == "herdr" else _probe("herdr")
+    except Exception:
+        logger.exception("backend_health probe failed during /health")
+        herdr_component = "unavailable"
+
     payload = {
         "status": "ok",
         "service": "cli-agent-orchestrator",
@@ -2331,7 +2342,7 @@ async def health_check():
         "ws_monitor": bool(ConfigService.get("supervisor.wake.ws_monitor", default=False)),
         "components": {
             "cao": "ok",
-            "herdr": _probe("herdr"),
+            "herdr": herdr_component,
             "claude": _probe("claude"),
         },
         # F497 AC2: advertise resolver support so `cao install` can refuse

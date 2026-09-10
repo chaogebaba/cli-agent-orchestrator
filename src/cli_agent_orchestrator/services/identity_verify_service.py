@@ -119,13 +119,16 @@ def read_parent(pid: int) -> tuple[int | None, str]:
 
 
 def _window_is_live(session_name: str, window_name: str) -> bool:
-    result = subprocess.run(
-        tmux_argv("list-panes", "-t", f"{session_name}:{window_name}", "-F", "#{pane_id}"),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0
+    """F893 (#745) bug-family sweep: ask the configured backend, not tmux.
+
+    This shelled out to ``tmux list-panes`` for every scanned row, so under the
+    herdr backend the identity scan reported every live seat's window dead. The
+    port's ``window_liveness`` answers the same question per backend; "live" is
+    the only affirmative, matching the old ``rc == 0``.
+    """
+    from cli_agent_orchestrator.backends.registry import get_backend
+
+    return get_backend().window_liveness(session_name, window_name) == "live"
 
 
 def _normalize_endpoint(endpoint: str) -> str:
@@ -246,6 +249,11 @@ def diagnose_own_terminal(
     ``no_pane``. Positive outcomes are cached for 60s keyed by ``own_id``.
     """
 
+    # F893 (#745) bug-family sweep — this function stays tmux-only BY DESIGN and
+    # is unreachable under another backend: it starts from the caller's own
+    # $TMUX_PANE (%N), which only a tmux-hosted process has. Without it the
+    # function short-circuits to "no_pane" before _resolve_pane_window's
+    # display-message or TmuxBackend()._pane_pids can shell out.
     try:
         pane_id = os.environ["TMUX_PANE"]
     except KeyError:
@@ -331,7 +339,11 @@ def scan_identity(
         key=lambda process: process.pid,
     )
     if pane_reader is None:
-        pane_reader = TmuxBackend().read_pane_identity
+        # F893 (#745) bug-family sweep: the configured backend, not a
+        # hard-coded TmuxBackend() — read_pane_identity is on the port.
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        pane_reader = get_backend().read_pane_identity
 
     rows: list[dict[str, Any]] = []
     out_of_scope: list[dict[str, Any]] = []
