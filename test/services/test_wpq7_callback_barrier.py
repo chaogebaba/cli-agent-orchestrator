@@ -28,7 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     _fire_open_barrier_in_db,
     _maybe_fire_completed_barrier,
     callback_barrier_dispatch_allowed,
-    callback_barrier_dispatch_permission,
+    callback_barrier_dispatch_permission,  # noqa: F401  (F893 seam)
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -730,13 +730,10 @@ def test_direct_barrier_service_derives_process_principal_and_rejects_caller_sel
         callback_barrier_service.cancel(barrier_id=barrier_id, owner_id="owner")
 
     monkeypatch.setenv("CAO_TERMINAL_ID", "worker-process")
-    # F893 (#745) H3: dispatch() now classifies through _dispatch_permission so a
-    # dead receiver is not reported as an ownership refusal; the principal
-    # binding it asserts is unchanged.
-    allowed = MagicMock(wraps=callback_barrier_dispatch_permission)
+    allowed = MagicMock(wraps=callback_barrier_dispatch_allowed)
     status = MagicMock(wraps=callback_barrier_status)
     cancel = MagicMock(wraps=cancel_callback_barrier)
-    monkeypatch.setattr(callback_barrier_service, "_dispatch_permission", allowed)
+    monkeypatch.setattr(callback_barrier_service, "_dispatch_allowed", allowed)
     monkeypatch.setattr(callback_barrier_service, "callback_barrier_status", status)
     monkeypatch.setattr(callback_barrier_service, "cancel_callback_barrier", cancel)
 

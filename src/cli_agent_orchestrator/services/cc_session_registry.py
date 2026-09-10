@@ -441,23 +441,24 @@ def resolve_target(
     # F545 (#401): resolve the WINDOW'S FIRST pane, never the active pane. A split
     # seat window with a second (consultant) pane focused would otherwise make the
     # active pane's process tree the candidate set and ring the wrong Claude.
-    # F893 (#745): the process root comes from the backend port — under herdr
-    # `tmux list-panes` raised and every wake refused `pane_pid_failed`. The
-    # tmux %N (used only to REFINE the cross-check in step 3) stays a tmux read
-    # and degrades to None on a backend that has no pane ids, which turns step 3
-    # into the same "cannot cross-check" branch a missing window_id already takes.
-    from cli_agent_orchestrator.backends.base import TerminalBackendError
-    from cli_agent_orchestrator.backends.registry import get_backend
-
-    try:
-        pane_leader = get_backend().get_pane_process_id(tmux_session, tmux_window)
-    except (subprocess.CalledProcessError, OSError, ValueError, TerminalBackendError):
-        return ResolveResult(refusal_reason="pane_pid_failed")
+    # F893 (#745): tmux keeps its exact path — `first_pane` gives BOTH the seat
+    # pid and the %N the step-3 cross-check refines on. When that read fails the
+    # way it does on a backend with no tmux at all (herdr: CalledProcessError,
+    # so every supervisor wake refused `pane_pid_failed`), fall back to the
+    # backend port for the process root and drop the %N refinement — step 3 then
+    # takes the same "cannot cross-check" branch a missing window_id already does.
     seat_pane_id: Optional[str]
     try:
-        seat_pane_id = first_pane(tmux_session, tmux_window)[0]
+        seat_pane_id, pane_leader = first_pane(tmux_session, tmux_window)
     except (subprocess.CalledProcessError, OSError, ValueError):
+        from cli_agent_orchestrator.backends.base import TerminalBackendError
+        from cli_agent_orchestrator.backends.registry import get_backend
+
         seat_pane_id = None
+        try:
+            pane_leader = get_backend().get_pane_process_id(tmux_session, tmux_window)
+        except (subprocess.CalledProcessError, OSError, ValueError, TerminalBackendError):
+            return ResolveResult(refusal_reason="pane_pid_failed")
 
     descendants = _descendants(pane_leader)
     # Find registry records whose pid is in the FIRST pane's descendant tree.

@@ -1509,7 +1509,12 @@ def _send_barrier_to_inbox(
 
 def _barrier_dispatch_is_supervisor_owned(receiver_id: str) -> bool:
     """Fail closed unless the process terminal owns the receiver."""
-    return _barrier_dispatch_permission(receiver_id) == "allowed"
+    try:
+        from cli_agent_orchestrator.services import callback_barrier_service
+
+        return callback_barrier_service.dispatch_allowed(receiver_id)
+    except Exception:
+        return False
 
 
 def _barrier_dispatch_permission(receiver_id: str) -> str:
@@ -3899,16 +3904,18 @@ def _send_message_impl(
             }
 
         if barrier is not None:
-            _barrier_permission = _barrier_dispatch_permission(receiver_id)
-            if _barrier_permission == "receiver_unresolvable":
-                return {
-                    "success": False,
-                    "error": (
-                        f"callback barrier receiver {receiver_id} is not addressable "
-                        "(terminal deleted or unknown) — not an ownership refusal"
-                    ),
-                }
-            if _barrier_permission != "allowed":
+            if not _barrier_dispatch_is_supervisor_owned(receiver_id):
+                # The boolean stays the gate; the classification only words the
+                # refusal, so a receiver that is simply GONE is not reported as
+                # an ownership violation (F893 #745 H3).
+                if _barrier_dispatch_permission(receiver_id) == "receiver_unresolvable":
+                    return {
+                        "success": False,
+                        "error": (
+                            f"callback barrier receiver {receiver_id} is not addressable "
+                            "(terminal deleted or unknown) — not an ownership refusal"
+                        ),
+                    }
                 return {
                     "success": False,
                     "error": "callback barriers require supervisor ownership of the receiver",

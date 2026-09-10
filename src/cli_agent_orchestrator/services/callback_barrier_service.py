@@ -33,6 +33,14 @@ def dispatch_allowed(receiver_id: str) -> bool:
     return _dispatch_allowed(_terminal_principal(), receiver_id)
 
 
+def _dispatch_permission_safe(sender_id: str, receiver_id: str) -> str:
+    """Classify, failing closed to ``"not_owned"`` — a wording aid, never a gate."""
+    try:
+        return _dispatch_permission(sender_id, receiver_id)
+    except Exception:  # pragma: no cover - diagnostic only
+        return "not_owned"
+
+
 def dispatch_permission(receiver_id: str) -> str:
     """Classify the process terminal's barrier permission on ``receiver_id``.
 
@@ -58,13 +66,14 @@ def dispatch(
     # longer exists is NOT an ownership failure, and reporting it as one
     # misdirected a whole live round on grok-box-009 (two of three members
     # dispatched fine from this very sender; the third had died a step earlier).
-    permission = _dispatch_permission(sender_id, receiver_id)
-    if permission == "receiver_unresolvable":
-        raise ValueError(
-            f"callback barrier receiver {receiver_id} is not addressable "
-            "(terminal deleted or unknown) — not an ownership refusal"
-        )
-    if permission != "allowed":
+    if not _dispatch_allowed(sender_id, receiver_id):
+        # The BOOLEAN stays the gate (unchanged seam and unchanged security
+        # posture); the classification is consulted only to word the refusal.
+        if _dispatch_permission_safe(sender_id, receiver_id) == "receiver_unresolvable":
+            raise ValueError(
+                f"callback barrier receiver {receiver_id} is not addressable "
+                "(terminal deleted or unknown) — not an ownership refusal"
+            )
         raise ValueError("callback barriers require supervisor ownership of the receiver")
     dispatch_barrier = {
         "label": barrier,
