@@ -48,7 +48,10 @@ Key flags (verified via ``pi --help``, pi 0.85.1, live-probed 2026-09-07):
   --thinking <level>       : reasoning effort (off|minimal|low|medium|high|xhigh|max)
   --no-approve, -na        : do not trust project-local files / auto-approve run
   --no-context-files, -nc  : do not auto-load AGENTS.md / CLAUDE.md
-  --session-id <id>        : exact project session id (created if missing)
+  --session-id <id>        : exact project session id — created if missing, but
+                             SILENTLY RE-ATTACHED (whole transcript replayed) when
+                             a session with that id already exists in --session-dir
+                             (live-probed 2026-09-10, F908 #760)
   --session-dir <dir>      : session storage/lookup directory
   --append-system-prompt <text|file> : append system prompt (file path accepted)
   --mcp-config <path>      : MCP config override (pi-mcp-adapter flag; requires
@@ -513,6 +516,46 @@ class PiCliProvider(BaseProvider):
         )
         return self.mcp_config_path
 
+    def _purge_stale_sessions(self) -> None:
+        """F908 (#760): empty this terminal's session dir before a COLD spawn.
+
+        ``--session-id <id>`` re-attaches an existing session with that id
+        instead of minting a fresh one (live-probed 2026-09-10), so a runtime
+        dir that outlived its terminal makes a cold worker continue a dead
+        task.  Deleting the per-terminal ``*.jsonl`` transcripts is what makes
+        "cold spawn == new session" true.  No-op when the operator sets
+        ``[pi_cli] fresh_session_on_spawn = false``, and on a resume spawn
+        (never called from that arm).
+        """
+        if not _resolve_pi_fresh_session_on_spawn():
+            logger.info(
+                "pi worker %s: fresh_session_on_spawn=false — keeping %s as-is",
+                self.terminal_id,
+                self.session_dir,
+            )
+            return
+        sd = self.session_dir
+        # Guard: only ever inside PI_RUNTIME_ROOT/<our terminal id>/sessions.
+        if not (sd.parent.parent == PI_RUNTIME_ROOT and sd.parent.name == self.terminal_id):
+            return
+        if not sd.is_dir():
+            return
+        for stale in sorted(sd.glob("*.jsonl")):
+            try:
+                stale.unlink()
+                logger.info(
+                    "pi worker %s: purged stale session transcript %s",
+                    self.terminal_id,
+                    stale,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "pi worker %s: failed to purge stale session %s: %s",
+                    self.terminal_id,
+                    stale,
+                    exc,
+                )
+
     def _build_pi_command(self) -> str:
         """Build Pi's explicit, shell-safe regular-TUI launch command."""
         profile = self._load_profile()
@@ -550,6 +593,9 @@ class PiCliProvider(BaseProvider):
         if _pi_resume_path:
             command_parts.extend(["--session", str(_pi_resume_path)])
         else:
+            # F908 (#760): cold spawn — guarantee pi cannot re-attach a
+            # transcript left behind under this terminal's session dir.
+            self._purge_stale_sessions()
             command_parts.extend(
                 [
                     "--session-id",
@@ -1058,3 +1104,35 @@ def _resolve_pi_mcp_timeout_ms() -> int:
     if value < _PI_MCP_TIMEOUT_MS_FLOOR:
         value = _PI_MCP_TIMEOUT_MS_FLOOR
     return value
+
+
+# F908 (#760): a COLD spawn must never continue a prior transcript.  pi's
+# ``--session-id <id>`` is documented "creating it if missing" — live-probed
+# 2026-09-10, it SILENTLY RE-ATTACHES an existing session with that id under
+# ``--session-dir`` and replays its whole transcript.  Our session dir is
+# per-terminal, so this only bites when a runtime dir outlives its terminal
+# (``cleanup`` skipped on a crash/server bounce — eight stale dirs were found
+# under ``$CAO_HOME/pi`` on 2026-09-10) or when a pane relaunches pi with the
+# same terminal id.  Purging the per-terminal session dir at cold spawn closes
+# that door while keeping F867's spawn-known session identity (terminal id).
+# Operator escape hatch: ``[pi_cli] fresh_session_on_spawn = false``.
+_PI_FRESH_SESSION_ON_SPAWN_DEFAULT = True
+
+
+def _resolve_pi_fresh_session_on_spawn() -> bool:
+    """Resolve ``[pi_cli] fresh_session_on_spawn`` from providers.toml (default True)."""
+    try:
+        raw = get_provider_defaults("pi_cli").get("fresh_session_on_spawn")
+    except Exception:
+        raw = None
+    if raw is None:
+        return _PI_FRESH_SESSION_ON_SPAWN_DEFAULT
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token in ("true", "1", "yes", "on"):
+            return True
+        if token in ("false", "0", "no", "off"):
+            return False
+    return _PI_FRESH_SESSION_ON_SPAWN_DEFAULT

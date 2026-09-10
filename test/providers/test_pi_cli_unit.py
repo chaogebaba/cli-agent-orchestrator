@@ -27,6 +27,7 @@ from cli_agent_orchestrator.providers.pi_cli import (
     PI_BINARY,
     PI_RUNTIME_ROOT,
     PiCliProvider,
+    _resolve_pi_fresh_session_on_spawn,
     _resolve_pi_mcp_timeout_ms,
     _visible_width,
 )
@@ -1638,3 +1639,117 @@ class TestSpawnCapturedIdentity:
         p = PiCliProvider("t1234567", "sess", "win0")
         # pi overrides to a non-None tuple; the base contract it overrides is None.
         assert p.spawn_captured_identity() is not None
+
+
+# ─── F908 (#760): cold spawn must start a NEW session ───────────────────────────
+
+
+class TestFreshSessionOnSpawn:
+    """F908 (#760). pi's ``--session-id <id>`` is documented "creating it if
+    missing" but SILENTLY RE-ATTACHES an existing session with that id under
+    ``--session-dir`` and replays its whole transcript (live-probed 2026-09-10:
+    two runs with the same id/dir, the second recalled a token only the first
+    was told). A runtime dir that outlives its terminal therefore makes a COLD
+    worker continue a dead task. The cold arm purges the per-terminal session
+    dir; the resume arm must never be touched."""
+
+    def _cold(self, root: Path, tid: str = "t1234567") -> PiCliProvider:
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider(tid, "sess", "win0")
+        return p
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_cold_spawn_purges_stale_transcript(self, mock_defaults, tmp_path) -> None:
+        mock_defaults.return_value = {}
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", tmp_path):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            p.session_dir.mkdir(parents=True, exist_ok=True)
+            stale = p.session_dir / "2026-09-10T13-03-05-169Z_t1234567.jsonl"
+            stale.write_text('{"type":"session"}\n', encoding="utf-8")
+            parts = shlex.split(p._build_pi_command())
+        assert not stale.exists(), "cold spawn left a prior transcript pi would re-attach"
+        assert "--session-id" in parts and parts[parts.index("--session-id") + 1] == "t1234567"
+        assert "--session-dir" in parts
+        assert "--session" not in parts
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_knob_false_keeps_todays_behaviour(self, mock_defaults, tmp_path) -> None:
+        """MUTANT GUARD (knob ignored): with fresh_session_on_spawn = false the
+        stale transcript survives and the argv is byte-identical to today's."""
+        mock_defaults.return_value = {"fresh_session_on_spawn": False}
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", tmp_path):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            p.session_dir.mkdir(parents=True, exist_ok=True)
+            stale = p.session_dir / "2026-09-10T13-03-05-169Z_t1234567.jsonl"
+            stale.write_text('{"type":"session"}\n', encoding="utf-8")
+            parts = shlex.split(p._build_pi_command())
+        assert stale.exists(), "knob=false must preserve pi's re-attach behaviour"
+        assert "--session-id" in parts and "--session-dir" in parts
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_resume_spawn_carries_session_path_and_never_purges(
+        self, mock_defaults, tmp_path
+    ) -> None:
+        """A resume spawn re-attaches on purpose: --session <path>, no
+        --session-id, and nothing under the session dir is deleted."""
+        from cli_agent_orchestrator.models.terminal import ForkContext
+
+        mock_defaults.return_value = {}
+        prior = tmp_path / "prior.jsonl"
+        prior.write_text('{"type":"session"}\n', encoding="utf-8")
+        ctx = ForkContext(
+            mode="resume",
+            session_uuid=str(prior),
+            base_name="reauth",
+            provider="pi_cli",
+            initial_preamble="",
+            session_artifact_path=str(prior),
+        )
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", tmp_path):
+            p = PiCliProvider("t7654321", "sess", "win0", fork_context=ctx)
+            p.session_dir.mkdir(parents=True, exist_ok=True)
+            keep = p.session_dir / "2026-09-09T00-00-00-000Z_t7654321.jsonl"
+            keep.write_text('{"type":"session"}\n', encoding="utf-8")
+            parts = shlex.split(p._build_pi_command())
+        assert "--session" in parts and parts[parts.index("--session") + 1] == str(prior)
+        assert "--session-id" not in parts
+        assert keep.exists(), "resume spawn must never purge the session dir"
+
+    def test_purge_guard_refuses_paths_outside_our_runtime_dir(self, tmp_path) -> None:
+        """MUTANT GUARD (drop the containment guard): a session_dir that is not
+        PI_RUNTIME_ROOT/<our terminal id>/sessions is never touched."""
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", tmp_path):
+            p = PiCliProvider("t1234567", "sess", "win0")
+        foreign = tmp_path / "somewhere-else"
+        foreign.mkdir(parents=True, exist_ok=True)
+        victim = foreign / "other.jsonl"
+        victim.write_text("x", encoding="utf-8")
+        p.session_dir = foreign
+        with patch(
+            "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults", return_value={}
+        ):
+            p._purge_stale_sessions()
+        assert victim.exists()
+
+
+class TestFreshSessionKnob:
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_default_true(self, mock_defaults) -> None:
+        mock_defaults.return_value = {}
+        assert _resolve_pi_fresh_session_on_spawn() is True
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_explicit_false(self, mock_defaults) -> None:
+        mock_defaults.return_value = {"fresh_session_on_spawn": False}
+        assert _resolve_pi_fresh_session_on_spawn() is False
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_string_false_is_honoured(self, mock_defaults) -> None:
+        mock_defaults.return_value = {"fresh_session_on_spawn": "false"}
+        assert _resolve_pi_fresh_session_on_spawn() is False
+
+    @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
+    def test_garbage_falls_back_to_default(self, mock_defaults) -> None:
+        """A typo can never silently disable the guard."""
+        mock_defaults.return_value = {"fresh_session_on_spawn": "maybe"}
+        assert _resolve_pi_fresh_session_on_spawn() is True
