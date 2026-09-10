@@ -284,7 +284,7 @@ class TestAC2TerminalState:
         call_count = [0]
         original_drive = None
 
-        def mock_drive(db, obl, now, esc, phase):
+        def mock_drive(db, obl, now, esc):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("simulated failure")

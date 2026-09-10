@@ -338,9 +338,7 @@ def flip_env(tmp_path, monkeypatch):
     store = SqliteQueueStore(pool, clock=clock)
 
     def install(position: SwitchPosition) -> None:
-        wiring.install_delivery(
-            wiring.DeliveryRuntime(store=store, clock=clock, position=position)
-        )
+        wiring.install_delivery(wiring.DeliveryRuntime(store=store, clock=clock, position=position))
 
     yield sessions, store, install
     wiring.reset_delivery()
@@ -550,12 +548,16 @@ def test_the_seat_drains_the_queue_at_on_and_the_ack_closes_the_epoch(flip_env) 
     listed = list_messages("mb_p3b_sup")
     assert [item["id"] for item in listed["items"]] == [message_id]
     assert listed["items"][0]["message"] == "FLIP_PROBE"
-    assert listed["items"][0]["msg_id"], "a listed row names its queue id for cao diag"
+    msg_id = listed["items"][0]["msg_id"]
+    assert msg_id, "a listed row names its queue id for cao diag"
 
     result = ack_messages(SEAT_TERMINAL, message_id)
     assert result["consumed_through_id"] == message_id
 
-    settled = store.get_by_legacy_id(message_id)
+    # Read by the queue id the listing itself carried. The legacy-id lookup this
+    # used to go through was the mirror's join key and went with it (#738); the
+    # id a seat is handed is the one a reader has.
+    settled = store.get(msg_id)
     assert settled is not None and settled.state is MsgState.DELIVERED
     closed = store.digest_at("mb_p3b_sup", digest.epoch)
     assert closed is not None and closed.consumed_via == "mcp_ack"
