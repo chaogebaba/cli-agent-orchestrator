@@ -468,7 +468,7 @@ def _socket_delivered_traces(sessions, row_id: int) -> int:
 def _seat_meta_and_flags(monkeypatch):
     """Satisfy ring_supervisor_doorbell's pre-ring guards so a successful native
     ring reaches the _mark_socket_delivered call site."""
-    monkeypatch.setattr(_dbs, "_queue_owns_delivery", lambda: False)
+    monkeypatch.setattr(_dbs, "_queue_owns_delivery", lambda *_a, **_k: False)
     monkeypatch.setattr(_dbs, "_is_row_still_pending", lambda row_id: True)
     monkeypatch.setattr(
         _dbs.ConfigService,

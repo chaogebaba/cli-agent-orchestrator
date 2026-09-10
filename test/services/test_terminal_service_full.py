@@ -21,6 +21,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _delete_terminal_core as delete_terminal,
 )
 from cli_agent_orchestrator.services.terminal_service import (
+    MAX_PEEK_TERMINAL_LINES,
     _schedule_deferred_init,
     create_terminal,
     get_output,
@@ -2282,12 +2283,12 @@ class TestPeekTerminal:
         }
         mock_backend.get_history.return_value = "tail"
 
-        assert peek_terminal("test1234", lines=999) == "tail"
+        assert peek_terminal("test1234", lines=99_999) == "tail"
 
         mock_backend.get_history.assert_called_once_with(
             "cao-session",
             "developer-abcd",
-            tail_lines=200,
+            tail_lines=MAX_PEEK_TERMINAL_LINES,
             strip_escapes=True,
         )
 
