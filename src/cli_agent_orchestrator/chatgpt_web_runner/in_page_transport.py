@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
     DeliveryState,
@@ -165,6 +165,10 @@ def _newest_user_msg_id(conv: dict[str, Any]) -> str:
     return best
 
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+
+
 class Transport:
     """Drives one page: type, attach, submit, observe, read. Owner-scoped.
 
@@ -173,10 +177,21 @@ class Transport:
     ``poll_gate.evaluate_gate`` — this class only FETCHES, never JUDGES (D6).
     """
 
-    def __init__(self, page: Any, owned_conversation_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        page: Any,
+        owned_conversation_id: Optional[str] = None,
+        intent_log: Optional["SendIntentLog"] = None,
+    ) -> None:
         self.page = page
         self.owned_conversation_id = owned_conversation_id
         self.saw_send = False
+        # F862 (#718) D7/D16 r6: the durable send-intent record for THIS attempt.
+        # ``submit_and_confirm`` refuses to press Enter without one, so a crash
+        # between intent and dispatch is resolvable on restart. Optional only so
+        # the offline DOM tests can drive the transport without a filesystem;
+        # ``run_production_review`` always supplies it.
+        self.intent_log: Optional["SendIntentLog"] = intent_log
         # The REAL backend conversation id, learned from a page-owned
         # /backend-api/conversation/<uuid> response (NOT the /c/WEB:<uuid> route
         # id — F862 r2: they differ; the route uuid 404s on the backend).
@@ -385,7 +400,17 @@ class Transport:
         import time as _time
 
         deadline = _time.monotonic() + timeout_s
+        started = _time.monotonic()
         last: dict[str, Any] = {}
+        # r6 (Amendment C owed-code row 5; AC-9, D8 readiness predicate) — the
+        # RE-PROBE. The send-enabled gate above rests on ONE live operator
+        # observation plus the r3 stall-DOM artifact, which is an anecdote, not a
+        # calibration. Every upload now records its full signal TRAJECTORY, so a
+        # run produces a probe sample instead of a claim: at what elapsed time
+        # each signal flipped, and — the discriminating fact the gate turns on —
+        # whether ``send_enabled`` was ever true WHILE ``spinning`` was still
+        # true. Three such samples replace the single observation.
+        trajectory: list[dict[str, Any]] = []
         while _time.monotonic() < deadline:
             last = await self.page.evaluate(
                 "() => {\n"
@@ -398,6 +423,14 @@ class Transport:
                 "  return {spinning, send_present, send_enabled};\n"
                 "}"
             )
+            trajectory.append(
+                {
+                    "t": round(_time.monotonic() - started, 2),
+                    "spinning": bool(last.get("spinning")),
+                    "send_present": bool(last.get("send_present")),
+                    "send_enabled": bool(last.get("send_enabled")),
+                }
+            )
             # Send-enabled is the authoritative upload-complete signal; a lingering
             # page-global spinner must NOT veto an enabled send button.
             if last.get("send_enabled"):
@@ -405,10 +438,12 @@ class Transport:
                     "chatgpt_web upload complete: send enabled (spinner=%s)",
                     last.get("spinning"),
                 )
+                self._record_readiness_probe(filename, trajectory, outcome="complete")
                 return
             await self.page.wait_for_timeout(1000)
         # Timed out waiting for upload-complete — record the DOM state and emit a
         # typed condition (never hang).
+        self._record_readiness_probe(filename, trajectory, outcome="attach_timeout")
         self._record_stall_dom("attach_timeout", filename, last)
         raise RunnerError(
             RunnerErrorCode.ATTACH_TIMEOUT,
@@ -416,6 +451,70 @@ class Transport:
             f"within {int(timeout_s)}s; last DOM state {last}",
             delivery_state=DeliveryState.NOTHING_SENT,
         )
+
+    @staticmethod
+    def summarize_readiness_probe(trajectory: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Reduce a readiness trajectory to the facts the D8 predicate rests on.
+
+        Pure, so the offline fixture tests assert the same reduction the live
+        probe records. The load-bearing field is
+        ``send_enabled_while_spinning``: r3 gated on "spinner gone AND send
+        enabled" and produced a false ``attach_timeout`` because unrelated page
+        chrome keeps a spinner node mounted. If that field is true in a sample,
+        the spinner is proven to be a bad veto for THAT sample; if it is false
+        across every sample, the r3 conjunction was never actually contradicted
+        and the gate should be revisited.
+        """
+        first_enabled = next((s for s in trajectory if s.get("send_enabled")), None)
+        spin_gone = next((s for s in trajectory if not s.get("spinning")), None)
+        return {
+            "samples": len(trajectory),
+            "send_enabled_at": (first_enabled or {}).get("t"),
+            "spinner_gone_at": (spin_gone or {}).get("t"),
+            "send_enabled_while_spinning": bool(
+                first_enabled is not None and first_enabled.get("spinning")
+            ),
+            "spinner_still_up_at_completion": bool(trajectory and trajectory[-1].get("spinning")),
+        }
+
+    def _record_readiness_probe(
+        self, filename: str, trajectory: List[Dict[str, Any]], *, outcome: str
+    ) -> None:
+        """Write ONE re-probe sample for the send-enabled upload-complete gate.
+
+        Amendment C owes "a probe arm re-calibrating the send-enabled
+        upload-complete gate"; this is that arm's recorder. Non-secret by
+        construction — it holds boolean composer chrome signals, elapsed times
+        and the filename, never page text, never a token. Best-effort: a probe
+        that cannot be written must never fail an upload that succeeded.
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+        from pathlib import Path as _Path
+
+        try:
+            out_dir = (
+                _Path(
+                    _os.environ.get("CAO_ARTIFACTS_DIR")
+                    or "/data/cao-scratch/worker-scratch/f862-build"
+                )
+                / "readiness-probe"
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            sample = {
+                "outcome": outcome,
+                "filename": filename,
+                "recorded_at": int(_time.time()),
+                "summary": self.summarize_readiness_probe(trajectory),
+                "trajectory": trajectory,
+            }
+            (out_dir / f"readiness-{int(_time.time() * 1000)}.json").write_text(
+                _json.dumps(sample, indent=2), encoding="utf-8"
+            )
+            logger.info("chatgpt_web readiness probe recorded: %s", sample["summary"])
+        except Exception:  # pragma: no cover - diagnostics are best-effort
+            pass
 
     def _record_stall_dom(self, reason: str, filename: str, state: dict[str, Any]) -> None:
         """Best-effort: write a DOM/state excerpt for a stalled attach to the
@@ -460,6 +559,54 @@ class Transport:
         result = await self.page.evaluate(script)
         return result if isinstance(result, dict) else {"httpStatus": 0, "ok": False, "body": None}
 
+    # ── D7/D16 send-intent custody ───────────────────────────────────────
+
+    def _dispatch_submit_action(self) -> None:
+        """Persist DISPATCHED before the submit-triggering action (D7/D16).
+
+        A transport with no intent log is an OFFLINE DOM test double; production
+        always has one (``run_production_review`` opens the attempt). Refusing
+        here when one is attached but already dispatched is what makes the AC-20
+        crash / disconnect / invoked-error mutants fail loudly instead of sending
+        twice.
+        """
+        if self.intent_log is None:
+            return
+        self.intent_log.record_submit_dispatch()
+
+    def _recover_and_redispatch(self, composer_text: str) -> bool:
+        """Spend the ONE recovery to re-press Enter, or refuse (D7/D16).
+
+        ``composer_text`` is the demonstrated-non-dispatch evidence: the composer
+        still holds the prompt, so the app did not send. Returns True when the
+        caller may press Enter again, False when the budget (or the deadline) is
+        spent — in which case the caller must NOT press.
+        """
+        if self.intent_log is None:
+            return True
+        from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentViolation
+
+        try:
+            self.intent_log.demonstrate_non_dispatch(
+                f"composer still holds {len(composer_text)} chars after Enter"
+            )
+            self.intent_log.record_submit_dispatch()
+        except SendIntentViolation as exc:
+            logger.info("chatgpt_web submit recovery refused (D7/D16): %s", exc)
+            return False
+        return True
+
+    def _observe_send(self) -> None:
+        """Record a correlated send (D7/D16, AC-20 counters). No-op offline."""
+        if self.intent_log is None:
+            return
+        from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentViolation
+
+        try:
+            self.intent_log.record_send_observed()
+        except SendIntentViolation as exc:  # pragma: no cover - defensive
+            logger.warning("chatgpt_web send-observation not recorded: %s", exc)
+
     async def submit_and_confirm(self, timeout_s: float = 30.0) -> "SubmitOutcome":
         """Press Enter, then run the four-way submit-confirm window (D7).
 
@@ -475,6 +622,14 @@ class Transport:
         )
 
         users_before = await self.page.locator(SEL_USER_TURN).count()
+
+        # F862 (#718) D7/D16 r6 — the submit-triggering action is gated on the
+        # durable intent record. ``record_submit_dispatch`` persists (and
+        # fsyncs) DISPATCHED BEFORE the keypress, so a crash on the very next
+        # instruction leaves an attempt that recovery resolves by READING, never
+        # by resending. It also raises if this attempt already dispatched, which
+        # is the invariant "after that dispatch, never repeat the submit action".
+        self._dispatch_submit_action()
         await self.page.locator(SEL_COMPOSER).first.press("Enter")
         deadline = _time.monotonic() + timeout_s
         conv_id: Optional[str] = self.owned_conversation_id
@@ -491,12 +646,21 @@ class Transport:
                 delivered = True
                 break
             # With an attachment, a single early Enter can be ignored while the
-            # upload finalizes server-side (the composer keeps its text). Re-press
-            # Enter every ~4s WHILE the composer still holds the prompt — this is
-            # still the nothing-sent state (safe to retry, D7), never a resend of
-            # a delivered turn.
+            # upload finalizes server-side (the composer keeps its text).
+            #
+            # r6 (D7/D16): this re-press is a RECOVERY, and the budget is ONE.
+            # Before r6 the loop re-pressed every ~4s for the whole window, so a
+            # slow-but-successful send could take several Enters — repeating the
+            # submit action after it had already been dispatched, which D7/D16
+            # forbids outright. The composer still holding the prompt is the
+            # "demonstrated non-dispatch" the rule requires, so it is passed as
+            # the evidence; when the single recovery is already spent
+            # ``_recover_and_redispatch`` returns False and the loop simply waits
+            # out the deadline and classifies, rather than pressing again.
             composer_now = (await self.page.locator(SEL_COMPOSER).first.inner_text()).strip()
             if composer_now and (_time.monotonic() - last_enter) >= 4.0:
+                if not self._recover_and_redispatch(composer_now):
+                    continue
                 await self.page.locator(SEL_COMPOSER).first.press("Enter")
                 last_enter = _time.monotonic()
         # The REAL backend id (learned from a page-owned conversation GET) is
@@ -526,6 +690,11 @@ class Transport:
             deadline_exhausted=not delivered,
         )
         state = classify_delivery(obs)
+        # r6 (AC-20, NB-6): count the OBSERVED send against the dispatched
+        # submit actions. Acceptance later fails if the two disagree, which is
+        # how a hidden duplicate submission is caught.
+        if state is DeliveryState.DELIVERED:
+            self._observe_send()
         self.owned_conversation_id = resolved
         return SubmitOutcome(delivery_state=state, conversation_id=resolved)
 

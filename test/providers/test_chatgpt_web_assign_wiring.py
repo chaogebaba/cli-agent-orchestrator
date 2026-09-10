@@ -19,6 +19,7 @@ asserts that behaviour by simulating the mutant with a monkeypatch.
 
 from __future__ import annotations
 
+import inspect
 import textwrap
 from pathlib import Path
 
@@ -203,12 +204,18 @@ def _call(srv, **kw):
 
 
 def _assert_d14_refusal(res: dict) -> None:
-    """Assert the refusal came from the D14 guard specifically (not a downstream
-    stub failure) — the guard returns 'Assignment refused (no spawn): ...' with a
-    routing/cell error code. This is what the ledger mutant must break."""
+    """Assert the refusal came from the D14 check specifically.
+
+    r6: matched on the TYPED CODE ``E-CHATGPT-WEB-GATE-FORBIDDEN``, never on the
+    ``"Assignment refused (no spawn)"`` prefix. r5 measured that F868's own
+    refusal carries the identical prefix, so a prefix assertion passed with the
+    D14 check DELETED — the explicit arm's coverage was an illusion.
+    """
+    from cli_agent_orchestrator.utils.cell_guard import E_CHATGPT_WEB_GATE_FORBIDDEN
+
     assert res["success"] is False and res["terminal_id"] is None
     msg = res["message"]
-    assert "Assignment refused (no spawn)" in msg, f"not a D14 refusal: {msg!r}"
+    assert E_CHATGPT_WEB_GATE_FORBIDDEN in msg, f"not a D14 refusal: {msg!r}"
 
 
 # --- routing-driven (provider omitted) ------------------------------------------
@@ -238,30 +245,30 @@ def test_ac3_explicit_provider_gate_refused(wired_server, monkeypatch) -> None:
 
 
 # --- resume-prepared ------------------------------------------------------------
-def test_ac3_resume_prepared_gate_refused(wired_server, monkeypatch) -> None:
-    srv, created, launched = wired_server
-    # Force the resume-prepared branch: patch prepare_resume where _assign_impl
-    # imports it (resume_service), returning a prepared dict naming the gate
-    # position + chatgpt_web.
-    from cli_agent_orchestrator.services import resume_service as _rs
+def test_ac3_resume_is_guarded_server_side_not_here(monkeypatch) -> None:
+    """r6: the resume arm of D14 lives SERVER-SIDE and is asserted there.
 
-    def _fake_prepare(*a, **k):
-        return {
-            "provider": "chatgpt_web",
-            "agent_profile": "design_reviewer",
-            "working_directory": None,
-            "forked_from_info": None,
-            "authority_files": None,
-            "fork_context": None,
-            "admission": None,
-            "via_identity": False,
-            "known_pins": None,
-        }
+    ``origin/main``'s F829 A2.1 made the client-side resume marker a bare
+    ``{via_server, resume_from, resumed_from}`` dict with NO provider, so this
+    layer cannot know what provider a ``resume_from`` will land on. r5 shipped an
+    arm here that read ``_resume_prepared.get("provider")`` and therefore skipped
+    the check on every resume — the r5 BLOCKER.
 
-    monkeypatch.setattr(_rs, "prepare_resume", _fake_prepare, raising=False)
-    res = _call(srv, agent_profile="design_reviewer", resume_from="deadbeef")
-    _assert_d14_refusal(res)
-    assert created == [] and launched == []
+    This test pins the SHAPE that made the old arm impossible, so a future edit
+    that re-adds a client-side resume check has to confront it. The behavioural
+    coverage is
+    ``test/utils/test_f862_d14_server_side_cell_guard.py::test_d14_uncertified_gate_cell_refused_on_every_path[resume]``
+    plus its deletion mutant.
+    """
+    from cli_agent_orchestrator.mcp_server import server as srv
+
+    src = inspect.getsource(srv._assign_impl)
+    marker = src[src.index("_resume_prepared = {") :][:400]
+    assert '"via_server": True' in marker
+    assert '"provider"' not in marker, (
+        "the resume marker regained a provider field — the client-side D14 arm "
+        "could be revived, but only WITH a test that proves it fires"
+    )
 
 
 # --- allow-list: a CERTIFIED design_findings is NOT refused by the guard --------

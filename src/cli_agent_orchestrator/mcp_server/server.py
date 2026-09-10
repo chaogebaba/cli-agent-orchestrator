@@ -2839,32 +2839,31 @@ def _assign_impl(
                     # the mutable store between guard and create). _resolved_provider
                     # stays None (legacy passthrough) so no position machinery fires.
                     _f838_checked_provider = _checked
-        # F862 (#718) D14 — findings-only enforcement for the chatgpt_web
-        # provider. r5 merge-forward: KEEP-BOTH with the F868 #724 position/cell
-        # certification guard that follows. The fork's ordering is retained
-        # (F862 → F868): F862 fires ONLY for provider == chatgpt_web, so every
-        # other provider still reaches F868 unchanged, while a chatgpt_web
-        # dispatch keeps the D14-specific "Assignment refused (no spawn)"
-        # verdict that AC-3 asserts. The brief's proposed reverse order
-        # (F868 → F862) was measured on grok-box-005 and REGRESSES AC-3: F868's
-        # routing-driven branch returns "Assignment failed: E-PROVIDER-UNCERTIFIED"
-        # first and the D14 guard is never reached
-        # (test_ac3_routing_driven_gate_refused fails). See report r5 §4.
-        # This block stays at function scope (outside the F868 ``if``) so it is
-        # UNCONDITIONAL across all three reachable dispatch paths
-        # (AC-3): routing-driven (provider omitted), explicit-provider (which sets
-        # _routing_driven False at :2635 and would otherwise skip the check), and
-        # the resume-prepared branch. The fork-wide skip is tracked separately as
-        # issue #724; F862 closes it only for THIS provider and does not wait on
-        # it. resolve_routing_binding is reused verbatim (never a second refusal
-        # implementation): it refuses an uncertified/stale GATE cell and allows a
-        # certified design_findings/general cell, so a gate position + chatgpt_web
-        # is refused before any terminal is created, while design_findings is not.
+        # F862 (#718) D14 r6 — the findings-only EARLY refusal for chatgpt_web.
+        #
+        # The AUTHORITATIVE D14 check is SERVER-SIDE, in the one choke point every
+        # create path funnels through: ``cell_guard._guard_findings_only_provider``,
+        # reached from ``terminal_service.create_terminal``. r5 measured why the
+        # client-side placement could not be the control (report r5 §5): the
+        # resume arm was dead once F829 A2.1 moved resume resolution to the
+        # server (``_resume_prepared`` carries no provider, so the check was
+        # skipped on every ``resume_from``), and the explicit arm was fully
+        # masked by F868's refusal.
+        #
+        # What survives here is an EARLY refusal only: it saves the round trip on
+        # the two client-side shapes where the provider IS known, and it emits the
+        # SAME typed ``E-CHATGPT-WEB-GATE-FORBIDDEN`` code as the server-side
+        # check by calling the same function — never a second refusal
+        # implementation. Deleting this block changes latency, not admission; the
+        # server-side mutants in test_f862_d14_server_side_cell_guard.py are what
+        # guard the property.
+        #
+        # The resume branch is deliberately absent: there is no provider to check
+        # at this point, and pretending otherwise is exactly the r5 blocker.
         _f862_position = None
         _f862_provider = None
         if _resume_prepared:
-            _f862_provider = _resume_prepared.get("provider")
-            _f862_position = _f862_strip_provider_suffix(agent_profile)
+            pass  # server-side only (see above)
         elif _routing_driven:
             # Routing-driven (provider omitted): the position is _routing_position
             # and the provider came from the routing binding.
@@ -2874,11 +2873,7 @@ def _assign_impl(
             # Explicit-provider path: provider was supplied by the caller and
             # agent_profile still names the position. resolve_assignment_target
             # rewrote agent_profile to the composed <position>-<provider> name, so
-            # strip the suffix back to the position. The provider is the resolved
-            # value, else the F838-checked value, else the raw explicit arg — this
-            # LAST fallback is the r2-gate mutant target (AC-3): without it the
-            # explicit chatgpt_web dispatch resolves no provider and skips the
-            # guard entirely.
+            # strip the suffix back to the position.
             _f862_provider = _resolved_provider or _f838_checked_provider or provider
             _f862_position = _f862_strip_provider_suffix(agent_profile)
         from cli_agent_orchestrator.utils.agent_profiles import (
@@ -2892,25 +2887,24 @@ def _assign_impl(
         ):
             from cli_agent_orchestrator.constants import positions_store_dir as _f862_positions_dir
             from cli_agent_orchestrator.constants import routing_toml_path as _f862_routing_path
-            from cli_agent_orchestrator.utils.routing import RoutingError as _F862RoutingError
-            from cli_agent_orchestrator.utils.routing import load_routing_table as _f862_load_rt
-            from cli_agent_orchestrator.utils.routing import (
-                resolve_routing_binding as _f862_resolve,
+            from cli_agent_orchestrator.utils.cell_guard import CellGuardRefused as _F862Refused
+            from cli_agent_orchestrator.utils.cell_guard import (
+                _guard_findings_only_provider as _f862_guard,
             )
 
             try:
-                _f862_resolve(
+                _f862_guard(
                     _f862_position,
                     _f862_provider,
-                    table=_f862_load_rt(_f862_routing_path()),
-                    positions_dir=_f862_positions_dir(),
+                    _f862_positions_dir(),
+                    _f862_routing_path(),
                 )
-            except _F862RoutingError as exc:
+            except _F862Refused as exc:
                 # Refused before any terminal creation / browser launch (AC-3).
                 return {
                     "success": False,
                     "terminal_id": None,
-                    "message": f"Assignment refused (no spawn): {exc}",
+                    "message": f"Assignment refused (no spawn): {exc.message}",
                 }
 
         if not _resume_prepared and _position_assign and _resolved_provider:

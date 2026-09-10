@@ -768,15 +768,31 @@ def test_condition_net_interrupted_and_context_and_proc() -> None:
     )
 
 
-def test_condition_attach_timeout_maps_to_transient_overload() -> None:
-    # r3 (user live observation): the attachment upload never reached the
-    # upload-complete state; the runner fails closed with attach_timeout and the
-    # condition plane surfaces it as a TRANSIENT_OVERLOAD (a fresh re-dispatch may
-    # succeed), NOT a hard human-gate.
-    cond = classify_condition("[chatgpt_web] CONDITION attach_timeout", "chatgpt_web")
-    assert cond is not None
-    assert cond.kind is ConditionKind.TRANSIENT_OVERLOAD
-    assert cond.subtype == "attach_upload_stall"
+def test_condition_attach_timeout_is_plain_error_not_a_condition() -> None:
+    """r6 (Amendment C owed-code row 4; NB-2): ``attach_timeout`` carries NO
+    condition.
+
+    r3 shipped it as ``TRANSIENT_OVERLOAD``/``attach_upload_stall`` off a single
+    live operator observation. TRANSIENT_OVERLOAD is a kind base D4 never
+    authorises for this code and it contradicts C2's condition table: the runner
+    fails closed BEFORE the submit-triggering action, so the attempt is a
+    nothing-sent ``ERROR``/``attach_timeout`` the operator re-dispatches, not a
+    load signal the fleet backs off from. ``classify_condition`` returning None is
+    exactly what makes the pane a plain ERROR.
+    """
+    assert classify_condition("[chatgpt_web] CONDITION attach_timeout", "chatgpt_web") is None
+
+
+def test_condition_attach_timeout_is_never_transient_overload() -> None:
+    """Mutation guard for the row above: re-adding ANY mapping for
+    ``attach_timeout`` — the r3 TRANSIENT_OVERLOAD row most of all — must fail
+    here, so the remap cannot silently regress."""
+    from cli_agent_orchestrator.providers.condition import _CHATGPT_WEB_CODE_MAP
+
+    assert "attach_timeout" not in _CHATGPT_WEB_CODE_MAP
+    assert not any(
+        subtype == "attach_upload_stall" for _kind, subtype in _CHATGPT_WEB_CODE_MAP.values()
+    )
 
 
 def test_condition_marker_only_for_chatgpt_web_provider() -> None:

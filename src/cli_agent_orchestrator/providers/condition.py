@@ -970,8 +970,8 @@ def _classify_waiting_on_subagents(provider: str, brows: List[str]) -> Optional[
 # WAITING_USER_ANSWER (D4). Codes that map to a plain ERROR TerminalStatus
 # (ui_changed, model_drift, truncated_answer, invalid_verdict, submit_unknown,
 # report_invalid, read_forbidden, egress_forbidden, attachment_identity,
-# upload_unconfirmed, pin_drift) carry NO condition — they are ordinary ERROR and
-# return None here.
+# upload_unconfirmed, pin_drift, attach_timeout) carry NO condition — they are
+# ordinary ERROR and return None here.
 _CHATGPT_WEB_CODE_MAP: Dict[str, Tuple[ConditionKind, str]] = {
     "auth_wall": (ConditionKind.AUTH_EXPIRED, "auth_wall"),
     "captcha": (ConditionKind.DIALOG_BLOCKED, "captcha"),
@@ -981,12 +981,16 @@ _CHATGPT_WEB_CODE_MAP: Dict[str, Tuple[ConditionKind, str]] = {
     "net_interrupted": (ConditionKind.NET_INTERRUPTED, "reconnect_once"),
     "context_too_large": (ConditionKind.CONTEXT_EXHAUSTED, "bundle_over_limit"),
     "proc_exited": (ConditionKind.PROC_EXITED, "browser_crash"),
-    # r3 (user live observation): the attachment upload never reached the
-    # upload-complete state (spinner gone + send enabled) within the bound. A
-    # transient upload stall — the runner failed closed BEFORE Enter
-    # (nothing-sent), so a fresh re-dispatch may succeed; surface it as a
-    # transient overload rather than a hard human-gate.
-    "attach_timeout": (ConditionKind.TRANSIENT_OVERLOAD, "attach_upload_stall"),
+    # r6 (Amendment C, "Code owed before certification"; NB-2): ``attach_timeout``
+    # is DELIBERATELY ABSENT from this map. r3 shipped it as
+    # ``TRANSIENT_OVERLOAD``/``attach_upload_stall`` on one live operator
+    # observation, but TRANSIENT_OVERLOAD is a kind base D4 never authorises for
+    # this code and it contradicts C2's condition table: the runner fails closed
+    # BEFORE the submit-triggering action, so the attempt is a nothing-sent ERROR
+    # the operator re-dispatches, not a load condition the fleet backs off from.
+    # Absent from the map means ``_classify_chatgpt_web`` returns None and the
+    # code surfaces as plain ``ERROR``/``attach_timeout`` — the D4 mapping this
+    # amendment authorises. Do not re-add a row here without a D4 revision.
 }
 
 

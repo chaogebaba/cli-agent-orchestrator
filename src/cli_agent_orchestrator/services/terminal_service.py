@@ -6597,7 +6597,20 @@ def send_input(
         # out-of-band (chatgpt_web hands it to its pane runner) — the task is
         # NEVER pasted into the shell as a command (r2 gate Blocker 1). This runs
         # inside the dispatch transaction so a failure aborts coherently.
-        if provider is not None and getattr(provider, "handles_own_dispatch", False):
+        #
+        # r6: the opt-in is ``is True``, never truthiness. ``handles_own_dispatch``
+        # is a declared ``bool`` class attribute on ProviderBase (base.py:712), so
+        # a real provider always answers True or False. Truthiness let ANY object
+        # that merely HAS the attribute opt in — most consequentially a
+        # ``MagicMock`` provider double, whose auto-created attribute is a truthy
+        # Mock, so every mock-provider send_input test silently took the
+        # provider-owned branch and never reached the backend paste (r5 finding:
+        # 33 tests across test_terminal_service_full / test_plugin_event_emission /
+        # test_f435_send_seam_verify / test_f138_r11_rebind_exit_deadlock /
+        # test_kiro_engine_phase0 / test_inbox_service /
+        # test_orchestration_instrumentation). Identity against True also refuses a
+        # provider that returns a truthy non-bool, which is never a valid opt-in.
+        if provider is not None and getattr(provider, "handles_own_dispatch", False) is True:
             try:
                 provider.dispatch_task(message)
             except BaseException:

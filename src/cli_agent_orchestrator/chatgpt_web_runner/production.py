@@ -44,6 +44,13 @@ from cli_agent_orchestrator.chatgpt_web_runner.poll_gate import AcceptedAnswer
 logger = logging.getLogger(__name__)
 
 
+#: D7/D16: the "original attempt deadline" the single recovery must fall inside.
+#: Generous relative to the 40s submit-confirm window and the 420s poll bound —
+#: it exists to stop a recovery being spent hours later by a restarted process,
+#: not to compete with the per-phase timeouts.
+_ATTEMPT_DEADLINE_S = 1800.0
+
+
 def _verify_pin_real(file_path: str) -> bool:
     """Real start/before-publication pin check as the WORKER (D2/AC-1/AC-2).
 
@@ -162,6 +169,27 @@ def run_production_review(
     # the composer-side reference) so the envelope carries it (D8/AC-9).
     _observed_attachment: dict[str, Any] = {}
 
+    # F862 (#718) D7/D16 r6 — open the DURABLE send-intent record for this
+    # attempt BEFORE any browser work. Amendment C's owed-code row 1: at
+    # 14256c1e delivery state was in-memory only, so a crash between intent and
+    # dispatch could not be resolved. The record is fsynced to the attempt dir
+    # and its counters survive a restart; the transport refuses to press Enter
+    # without it, and refuses a SECOND press after one (D7/D16).
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+
+    _attempt_dir = (
+        Path(os.environ.get("CAO_ARTIFACTS_DIR") or "/data/cao-scratch/worker-scratch/f862-build")
+        / "attempts"
+        / run_id
+    )
+    _intent_log = SendIntentLog(_attempt_dir)
+    _intent_log.open_attempt(
+        run_id=run_id,
+        attempt_id=run_id,
+        prompt_sha=sha256_text(task_text),
+        deadline_at=time.time() + _ATTEMPT_DEADLINE_S,
+    )
+
     def _default_browser_turn() -> AcceptedAnswer:
         # Append the terminal sentinel instruction with THIS run's id + bundle
         # sha so the gate's strip_sentinel finds exactly one terminal
@@ -180,6 +208,7 @@ def run_production_review(
                 run_id=run_id,
                 bundle_sha=bundle_sha,
                 observed_holder=_observed_attachment,
+                intent_log=_intent_log,
             )
         )
 
@@ -233,6 +262,7 @@ async def _drive_browser(
     run_id: str,
     bundle_sha: str,
     observed_holder: Optional[dict[str, Any]] = None,
+    intent_log: Optional[Any] = None,
 ) -> AcceptedAnswer:
     """The real browser turn: launch, egress-guard, (attach), submit, poll (D3/D6).
 
@@ -275,7 +305,7 @@ async def _drive_browser(
     except Exception:  # pragma: no cover - routing optional
         pass
 
-    transport = Transport(page)
+    transport = Transport(page, intent_log=intent_log)
     transport.arm_send_observer()
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
     await page.locator(SEL_COMPOSER).first.wait_for(state="visible", timeout=20000)
