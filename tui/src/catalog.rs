@@ -2150,6 +2150,7 @@ mod tests {
                     CommandId::BarrierStatus => CommandId::BarrierStatus,
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
+                    CommandId::GateShow => CommandId::GateShow,
                     CommandId::DiagAgreement => CommandId::DiagAgreement,
                     CommandId::DiagDelivery => CommandId::DiagDelivery,
                     CommandId::DiagFindings => CommandId::DiagFindings,
