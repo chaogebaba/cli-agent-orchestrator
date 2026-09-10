@@ -2559,9 +2559,25 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            # F899 r3 repair 3: the re-derivation rate-limit clock is per-terminal
+            # state like every map above it, so it goes with them. Left behind, a
+            # deleted terminal keeps a process-lifetime entry, and an id reused
+            # inside the 3 s window would have its first re-derivation skipped.
+            self._last_rederive_check.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
+        # F899 r3 repair 3: the child-process probe's TTL cache is the second
+        # per-terminal map this feature introduced. Evicted OUTSIDE the monitor
+        # lock — the probe owns its own lock and must never be entered under
+        # ours — and defensively, because clear_terminal is a teardown path that
+        # must not raise.
+        try:
+            from cli_agent_orchestrator.services.child_proc_probe import child_proc_probe
+
+            child_proc_probe.forget(terminal_id)
+        except Exception:
+            logger.debug("clear_terminal [%s]: child_proc_probe evict failed", terminal_id)
 
     def unregister(self, terminal_id: str) -> None:
         """Unregister a terminal from monitoring (called on delete).
