@@ -158,6 +158,18 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     # F747 (#747): shipped default = the value the operator actually runs.
     "apps.enabled": True,
     "apps.static_dir": None,
+    # F747 (#747): the shipped default has to live HERE, not only in the
+    # ENV_REGISTRY tuple. ``_get_value`` consults this dict and then falls
+    # through to the CALL SITE's ``default=``; the registry tuple backs the env
+    # tier and ``cao config list`` only. So a supervisor.* key absent from this
+    # dict resolved to whatever a caller passed -- ``supervisor.teammate_push``
+    # read None (falsy) no matter what the table declared, which is why native
+    # seat delivery was unreachable without an operator editing settings.json.
+    # Keep each value identical to its ENV_REGISTRY tuple (asserted by test).
+    "supervisor.teammate_push": True,
+    "supervisor.mailbox_pull": True,
+    "supervisor.watchdog.quiescence": True,
+    "supervisor.doorbell": False,
     "auth.jwks_uri": "",
     "auth.audience": "",
     "auth.issuer": "",
@@ -477,19 +489,7 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     file_value = _get_from_file(path)
     if file_value is not None:
         return file_value
-    if path in _OWNED_DEFAULTS:
-        return _OWNED_DEFAULTS[path]
-    # F747 (#747): the ENV_REGISTRY tuple is the SHIPPED default, not merely
-    # ``cao config list`` decoration. Before this tier existed, a registered
-    # path with no env var and no settings.json entry fell through to whatever
-    # ``default=`` the call site happened to pass -- so
-    # ``supervisor.teammate_push`` read ``None`` (falsy) no matter what the
-    # table declared, and native seat delivery was structurally unreachable
-    # without an operator editing settings.json. Registry beats call-site
-    # default; env and file still beat the registry.
-    if env_name is not None:
-        return ENV_REGISTRY[env_name][2]
-    return default
+    return _OWNED_DEFAULTS.get(path, default)
 
 
 def _set_value(path: str, value: Any) -> Any:

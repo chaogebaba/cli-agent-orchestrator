@@ -64,32 +64,47 @@ def test_doorbell_defaults_false():
     assert ConfigService.get("supervisor.doorbell") is False
 
 
+def test_memory_stays_off():
+    assert ConfigService.get("memory.enabled") is False
+
+
 @pytest.mark.parametrize(
-    "path",
+    "env_name,expected",
     [
-        "memory.enabled",
-        "supervisor.wake.ws_monitor",
+        ("CAO_SUPERVISOR_WAKE_WS_MONITOR", False),
+        ("CAO_DELIVERY_PHASE", "shadow"),
+        ("CAO_WORKER_TRUTH_INGEST", None),
     ],
 )
-def test_deliberately_off_keys_stay_off(path):
-    assert ConfigService.get(path) is False
+def test_untouched_keys_keep_their_table_value(env_name, expected):
+    """ws_monitor stays ship-dark and F883 owns delivery.phase.
+
+    Asserted against the table rather than ``get()``: these paths are not in
+    ``_OWNED_DEFAULTS``, so their RESOLUTION is unchanged by this batch and
+    reading them through ``get()`` would test the pre-existing fall-through,
+    not the shipped default.
+    """
+    if env_name not in cs.ENV_REGISTRY:
+        pytest.skip(f"{env_name} is not a registry path")
+    assert cs.ENV_REGISTRY[env_name][2] == expected
 
 
-def test_delivery_phase_untouched():
-    """F883 owns delivery.phase; this batch must not move it."""
-    assert ConfigService.get("delivery.phase") == "shadow"
+def test_shipped_default_beats_call_site_default():
+    """The shipped default wins over whatever a call site happens to pass.
 
-
-def test_registry_default_beats_call_site_default():
-    """The ENV_REGISTRY tuple is the shipped default, not decoration.
-
-    MUTANT (ruling 4): drop the ENV_REGISTRY tier from ``_get_value`` and a
-    registered path with no env and no file entry falls back to the caller's
-    ``default=``, which is how ``supervisor.teammate_push`` read falsy no matter
-    what the table declared.
+    MUTANT (ruling 4): drop the flipped keys from ``_OWNED_DEFAULTS`` and
+    ``_get_value`` falls through to the caller's ``default=``, which is how
+    ``supervisor.teammate_push`` read falsy no matter what the table declared.
     """
     assert ConfigService.get("supervisor.teammate_push", default=False) is True
     assert ConfigService.get("supervisor.doorbell", default=True) is False
+
+
+@pytest.mark.parametrize("path", FLIPPED_ON + ["supervisor.doorbell"])
+def test_owned_default_agrees_with_the_env_registry_tuple(path):
+    """The two tables must not drift: get() reads one, `cao config list` the other."""
+    env_name = cs._PATH_TO_ENV[path]
+    assert cs._OWNED_DEFAULTS[path] is cs.ENV_REGISTRY[env_name][2]
 
 
 def test_file_and_env_still_beat_the_registry_default(monkeypatch, _isolated_settings):
