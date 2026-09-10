@@ -72,6 +72,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import time
 import unicodedata
 from pathlib import Path
@@ -526,6 +527,12 @@ class PiCliProvider(BaseProvider):
         "cold spawn == new session" true.  No-op when the operator sets
         ``[pi_cli] fresh_session_on_spawn = false``, and on a resume spawn
         (never called from that arm).
+
+        Containment is enforced in three layers so this can never reach another
+        terminal's transcripts: the path must lexically BE
+        ``PI_RUNTIME_ROOT/<terminal id>/sessions``; it must still resolve there
+        after symlinks; and the enumeration/unlinks run through a no-follow
+        directory fd so nothing swapped in afterwards can redirect them.
         """
         if not _resolve_pi_fresh_session_on_spawn():
             logger.info(
@@ -535,26 +542,58 @@ class PiCliProvider(BaseProvider):
             )
             return
         sd = self.session_dir
-        # Guard: only ever inside PI_RUNTIME_ROOT/<our terminal id>/sessions.
-        if not (sd.parent.parent == PI_RUNTIME_ROOT and sd.parent.name == self.terminal_id):
+        # Guard 1 (physical containment): a symlinked ``sessions`` leaf, or a
+        # symlinked terminal dir, aliases ANOTHER terminal's transcripts —
+        # ``is_dir()`` and ``glob()`` both follow directory symlinks, so r1's
+        # lexical-only check happily deleted them (EMPIRICAL-GATE-NO, H4).
+        # Resolve both sides and require the real paths to agree.  A purely
+        # lexical ``sd == PI_RUNTIME_ROOT/<tid>/sessions`` check is deliberately
+        # NOT kept alongside this: it is unkillable dead code, since any path
+        # that resolves here IS this directory (r2 mutant M12).
+        try:
+            resolved_root = PI_RUNTIME_ROOT.resolve(strict=True)
+            resolved_sd = sd.resolve(strict=True)
+        except OSError:
             return
-        if not sd.is_dir():
+        if resolved_sd != resolved_root / self.terminal_id / "sessions":
             return
-        for stale in sorted(sd.glob("*.jsonl")):
-            try:
-                stale.unlink()
-                logger.info(
-                    "pi worker %s: purged stale session transcript %s",
-                    self.terminal_id,
-                    stale,
-                )
-            except OSError as exc:
-                logger.warning(
-                    "pi worker %s: failed to purge stale session %s: %s",
-                    self.terminal_id,
-                    stale,
-                    exc,
-                )
+        # Guard 2 (no TOCTOU): enumerate and unlink through a no-follow
+        # directory fd, so a symlink swapped in between the checks above and
+        # the unlinks below cannot redirect a single deletion. ``O_NOFOLLOW``
+        # refuses to open the dir at all if the final component became a
+        # symlink; ``unlink(dir_fd=...)`` never resolves through one.
+        try:
+            dir_fd = os.open(str(sd), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            logger.warning("pi worker %s: refusing to purge %s: %s", self.terminal_id, sd, exc)
+            return
+        try:
+            for name in sorted(os.listdir(dir_fd)):
+                if not name.endswith(".jsonl"):
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    # A symlinked *.jsonl points outside our ownership; leave it.
+                    continue
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                    logger.info(
+                        "pi worker %s: purged stale session transcript %s",
+                        self.terminal_id,
+                        sd / name,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "pi worker %s: failed to purge stale session %s: %s",
+                        self.terminal_id,
+                        sd / name,
+                        exc,
+                    )
+        finally:
+            os.close(dir_fd)
 
     def _build_pi_command(self) -> str:
         """Build Pi's explicit, shell-safe regular-TUI launch command."""

@@ -1647,11 +1647,16 @@ class TestSpawnCapturedIdentity:
 class TestFreshSessionOnSpawn:
     """F908 (#760). pi's ``--session-id <id>`` is documented "creating it if
     missing" but SILENTLY RE-ATTACHES an existing session with that id under
-    ``--session-dir`` and replays its whole transcript (live-probed 2026-09-10:
-    two runs with the same id/dir, the second recalled a token only the first
-    was told). A runtime dir that outlives its terminal therefore makes a COLD
-    worker continue a dead task. The cold arm purges the per-terminal session
-    dir; the resume arm must never be touched."""
+    ``--session-dir`` and replays its whole transcript. A runtime dir that
+    outlives its terminal therefore makes a COLD worker continue a dead task.
+    The cold arm purges the per-terminal session dir; the resume arm must never
+    be touched.
+
+    The re-attach premise is an EXTERNAL contract of the pi binary, so it is not
+    asserted in prose here: ``test_pi_exact_session_id_reattaches_same_cwd_and_dir``
+    below runs the installed pi twice and FAILS if pi ever becomes create-only
+    (r1 EMPIRICAL-GATE-NO, H3). These mock-only tests pin CAO's side.
+    """
 
     def _cold(self, root: Path, tid: str = "t1234567") -> PiCliProvider:
         with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
@@ -1715,6 +1720,148 @@ class TestFreshSessionOnSpawn:
         assert "--session-id" not in parts
         assert keep.exists(), "resume spawn must never purge the session dir"
 
+    @pytest.mark.parametrize("alias", ["sessions-leaf", "terminal-parent"])
+    def test_purge_guard_refuses_symlink_to_foreign_terminal(self, tmp_path, alias) -> None:
+        """r1 EMPIRICAL-GATE-NO H4: the lexical guard passed while the path
+        physically pointed at ANOTHER terminal's transcripts, because
+        ``is_dir()`` and ``glob()`` both follow directory symlinks. Two aliases
+        defeat it — a symlinked ``sessions`` leaf and a symlinked terminal dir.
+        The foreign transcript must survive both."""
+        root = tmp_path / "pi"
+        other = root / "t-other" / "sessions"
+        other.mkdir(parents=True)
+        foreign = other / "2026-09-09T00-00-00-000Z_t-other.jsonl"
+        foreign.write_text('{"type":"session","id":"t-other"}\n', encoding="utf-8")
+
+        if alias == "sessions-leaf":
+            # PI_RUNTIME_ROOT/t-own/sessions -> PI_RUNTIME_ROOT/t-other/sessions
+            (root / "t-own").mkdir(parents=True)
+            (root / "t-own" / "sessions").symlink_to(other, target_is_directory=True)
+        else:
+            # PI_RUNTIME_ROOT/t-own -> PI_RUNTIME_ROOT/t-other (whole terminal dir)
+            (root / "t-own").symlink_to(root / "t-other", target_is_directory=True)
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t-own", "sess", "win0")
+            assert p.session_dir == root / "t-own" / "sessions"
+            with patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={},
+            ):
+                p._purge_stale_sessions()
+        assert foreign.exists(), f"{alias} alias let purge delete another terminal's transcript"
+
+    def test_purge_refuses_a_leaf_swapped_for_a_symlink_after_the_check(self, tmp_path) -> None:
+        """MUTANT GUARD (drop ``O_NOFOLLOW``): the resolve() check is
+        check-then-use. This races it — the session dir passes the check and is
+        THEN replaced by a symlink to another terminal's dir, exactly what a
+        concurrent filesystem mutation does. Opening no-follow turns that into a
+        refusal (ELOOP) instead of a foreign deletion."""
+        import os as _os
+
+        root = tmp_path / "pi"
+        ours = root / "t1234567" / "sessions"
+        ours.mkdir(parents=True)
+        (ours / "2026-09-10T00-00-00-000Z_t1234567.jsonl").write_text("y", encoding="utf-8")
+        foreign_dir = root / "t-other" / "sessions"
+        foreign_dir.mkdir(parents=True)
+        foreign = foreign_dir / "2026-09-09T00-00-00-000Z_t-other.jsonl"
+        foreign.write_text("x", encoding="utf-8")
+
+        real_resolve = Path.resolve
+        swapped = []
+
+        def racing_resolve(self, strict=False):  # type: ignore[no-untyped-def]
+            out = real_resolve(self, strict=strict)
+            if self == ours and not swapped:
+                swapped.append(True)
+                # The check has just passed; now lose the race.
+                _os.rename(str(ours), str(root / "t1234567" / "sessions.moved"))
+                (root / "t1234567" / "sessions").symlink_to(foreign_dir, target_is_directory=True)
+            return out
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            with (
+                patch(
+                    "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                    return_value={},
+                ),
+                patch.object(Path, "resolve", racing_resolve),
+            ):
+                p._purge_stale_sessions()
+        assert swapped, "the race never fired — test is not exercising the window"
+        assert foreign.exists(), "purge followed a symlink swapped in after the check"
+
+    def test_unlink_uses_the_open_dir_fd_not_the_path(self, tmp_path) -> None:
+        """MUTANT GUARD (``os.unlink(str(sd / name))`` instead of
+        ``os.unlink(name, dir_fd=dir_fd)``): the directory is swapped for a
+        symlink AFTER the fd is open and the listing taken. A path-form unlink
+        re-resolves and deletes the foreign file of the same name; the fd form
+        stays bound to the directory we validated."""
+        import os as _os
+
+        root = tmp_path / "pi"
+        ours = root / "t1234567" / "sessions"
+        ours.mkdir(parents=True)
+        name = "2026-09-10T00-00-00-000Z_t1234567.jsonl"
+        (ours / name).write_text("ours", encoding="utf-8")
+        foreign_dir = root / "t-other" / "sessions"
+        foreign_dir.mkdir(parents=True)
+        foreign = foreign_dir / name
+        foreign.write_text("theirs", encoding="utf-8")
+
+        real_listdir = _os.listdir
+        swapped = []
+
+        def racing_listdir(fd):  # type: ignore[no-untyped-def]
+            out = real_listdir(fd)
+            if not swapped:
+                swapped.append(True)
+                _os.rename(str(ours), str(root / "t1234567" / "sessions.moved"))
+                (root / "t1234567" / "sessions").symlink_to(foreign_dir, target_is_directory=True)
+            return out
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            with (
+                patch(
+                    "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                    return_value={},
+                ),
+                patch.object(_os, "listdir", racing_listdir),
+            ):
+                p._purge_stale_sessions()
+        assert swapped, "the race never fired — test is not exercising the window"
+        assert foreign.exists(), "path-form unlink followed the swapped-in symlink"
+        assert not (
+            root / "t1234567" / "sessions.moved" / name
+        ).exists(), "our own transcript should still have been purged through the open fd"
+
+    def test_symlinked_transcript_inside_our_dir_is_not_followed(self, tmp_path) -> None:
+        """MUTANT GUARD (drop the S_ISREG check): a ``*.jsonl`` symlink planted
+        in our own dir must not delete its target. Only regular files we own go."""
+        root = tmp_path / "pi"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "someone-elses.jsonl"
+        target.write_text("x", encoding="utf-8")
+        sd = root / "t1234567" / "sessions"
+        sd.mkdir(parents=True)
+        (sd / "link.jsonl").symlink_to(target)
+        ours = sd / "2026-09-10T00-00-00-000Z_t1234567.jsonl"
+        ours.write_text("y", encoding="utf-8")
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            with patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={},
+            ):
+                p._purge_stale_sessions()
+        assert target.exists(), "purge followed a symlinked transcript out of our dir"
+        assert (sd / "link.jsonl").is_symlink(), "the symlink itself is not ours to remove"
+        assert not ours.exists(), "our own regular transcript must still be purged"
+
     def test_purge_guard_refuses_paths_outside_our_runtime_dir(self, tmp_path) -> None:
         """MUTANT GUARD (drop the containment guard): a session_dir that is not
         PI_RUNTIME_ROOT/<our terminal id>/sessions is never touched."""
@@ -1753,3 +1900,131 @@ class TestFreshSessionKnob:
         """A typo can never silently disable the guard."""
         mock_defaults.return_value = {"fresh_session_on_spawn": "maybe"}
         assert _resolve_pi_fresh_session_on_spawn() is True
+
+    @pytest.mark.parametrize("value", [True, "true", "TRUE", " True ", "1", "yes", "on"])
+    def test_all_true_spellings_are_honoured(self, value) -> None:
+        """MUTANT GUARD (r1 M6 survivor): the accepted-true tuple is
+        ``("true", "1", "yes", "on")`` and the parse lowercases and strips.
+
+        The default is ALSO True, so a naive ``is True`` assertion cannot tell
+        "recognized as true" from "fell through to the default" — which is
+        exactly why narrowing the tuple to ``("true",)`` survived every r1 test.
+        Invert the default for the duration so only genuine recognition passes.
+        """
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={"fresh_session_on_spawn": value},
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.pi_cli." "_PI_FRESH_SESSION_ON_SPAWN_DEFAULT",
+                False,
+            ),
+        ):
+            assert _resolve_pi_fresh_session_on_spawn() is True
+
+    @pytest.mark.parametrize("value", [False, "false", "FALSE", " off ", "0", "no", "off"])
+    def test_all_false_spellings_are_honoured(self, value) -> None:
+        """MUTANT GUARD: narrowing the accepted-false tuple silently re-arms the
+        purge for an operator who typed a legal TOML-ish spelling of false."""
+        with patch(
+            "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+            return_value={"fresh_session_on_spawn": value},
+        ):
+            assert _resolve_pi_fresh_session_on_spawn() is False
+
+    def test_loader_exception_falls_back_to_default_true(self) -> None:
+        """MUTANT GUARD: a providers.toml the loader cannot read must not
+        silently disable the guard."""
+        with patch(
+            "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+            side_effect=RuntimeError("providers.toml unreadable"),
+        ):
+            assert _resolve_pi_fresh_session_on_spawn() is True
+
+
+# ─── F908 (#760) repair 3: the EXTERNAL pi contract this fix exists for ─────────
+
+
+@pytest.mark.live
+@pytest.mark.slow
+class TestPiSessionIdExternalContract:
+    """r1 EMPIRICAL-GATE-NO H3: every other F908 test mocks config and touches
+    inert files, so all of them would keep passing if pi changed
+    ``--session-id`` from re-attach to create-only — and the purge would then be
+    dead weight deleting live transcripts for no reason. This runs the installed
+    pi twice, one cwd / one id / one session dir, and fails loudly if the
+    premise stops holding.
+
+    Opt-in: ``live`` + ``slow`` (deselected by the usual
+    ``-m "not e2e and not slow"``), because it spends real model tokens.
+    """
+
+    SUPPORTED_PI = "0.85.1"
+    TOKEN = "ZORBLAX-7741"
+
+    def _run(self, cwd: Path, session_dir: Path, prompt: str) -> str:
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                PI_BINARY,
+                "--tui-mode",
+                "regular",
+                "--no-approve",
+                "--no-context-files",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-tools",
+                "--session-id",
+                "f908contract",
+                "--session-dir",
+                str(session_dir),
+                "-p",
+                prompt,
+            ],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return proc.stdout + proc.stderr
+
+    def test_pi_exact_session_id_reattaches_same_cwd_and_dir(self, tmp_path) -> None:
+        import subprocess
+
+        if not Path(PI_BINARY).exists():
+            pytest.skip(f"pi not installed at {PI_BINARY}")
+        version = subprocess.run(
+            [PI_BINARY, "--version"], capture_output=True, text=True, timeout=60
+        ).stdout.strip()
+
+        cwd = tmp_path / "work"
+        cwd.mkdir()
+        sd = tmp_path / "sessions"
+        sd.mkdir()
+
+        first = self._run(cwd, sd, f"Remember this magic token: {self.TOKEN}. Reply only OK.")
+        created = sorted(sd.glob("*.jsonl"))
+        assert len(created) == 1, f"first run wrote {len(created)} session files: {first[-500:]}"
+
+        second = self._run(
+            cwd, sd, "What magic token were you told to remember? One word, or NONE."
+        )
+        after = sorted(sd.glob("*.jsonl"))
+
+        reattached = after == created and self.TOKEN in second
+        if not reattached:
+            pytest.fail(
+                "F908 PREMISE BROKEN — pi "
+                f"{version} no longer re-attaches by exact --session-id "
+                f"(supported at build time: {self.SUPPORTED_PI}).\n"
+                f"session files before={[f.name for f in created]} "
+                f"after={[f.name for f in after]}\n"
+                "If pi is now create-only, _purge_stale_sessions is dead weight that "
+                "deletes live transcripts: re-open F908 #760 before shipping this pi.\n"
+                f"second-run output tail: {second[-500:]}"
+            )
+        # Witness for the ledger: no new file, and the prior transcript's token recalled.
+        assert after == created
+        assert self.TOKEN in second
