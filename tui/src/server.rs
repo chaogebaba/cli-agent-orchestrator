@@ -715,11 +715,10 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::DiagFindings => None,
         CommandId::DiagTerminal => None,
         CommandId::DiagWhy => None,
-
-        // F865 r4: catalog rows added without a server-route arm kept this exhaustive match
-        // from compiling. Every command below is classified HIDE in `catalog.rs`, so the TUI
-        // never offers it; per the WorkflowApprove convention above these arms are
-        // deliberately `None` — exhaustiveness only, never a real binding.
+        // HIDE: fork-only / ops commands left unclassified by the mandated default
+        // (project.md). The TUI never routes them; these arms exist only because the match is
+        // exhaustive on purpose. (WP-ARCH 2a r2, per the F865 r4 registration recipe)
+        CommandId::GateShow => None,
         CommandId::AgentsStatus => None,
         CommandId::AutoAnswersTest => None,
         CommandId::BarrierCancel => None,

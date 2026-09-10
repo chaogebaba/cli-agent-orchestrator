@@ -203,7 +203,7 @@ class TestF167SiblingAndSubtreeQuiesce:
         def mock_pre_plan(*args, **kwargs):
             events.append("quiesce")
 
-        def mock_acquire(session_name):
+        def mock_acquire(session_name, terminal_id):
             events.append("lease_acquired")
             return "lease"
 
@@ -215,11 +215,11 @@ class TestF167SiblingAndSubtreeQuiesce:
             lambda tid, force=False: None,
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
+            "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_terminal_exclusive",
             mock_acquire,
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.session_lifecycle_lease.release_session_lifecycle_lease",
+            "cli_agent_orchestrator.services.session_lifecycle_lease.release_session_lifecycle_terminal_exclusive",
             lambda _l: None,
         )
         monkeypatch.setattr(terminal_service, "has_deferred_init", lambda tid: False)

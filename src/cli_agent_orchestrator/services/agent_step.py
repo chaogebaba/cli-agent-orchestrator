@@ -359,6 +359,7 @@ async def run_agent_step(
     model: Optional[str] = None,
     use_worktree: Optional[bool] = None,
     task_label: Optional[str] = None,
+    cell_request_class: str = "routing",
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -582,6 +583,7 @@ async def run_agent_step(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            cell_request_class=cell_request_class,
         )
         terminal_id = terminal.id
 

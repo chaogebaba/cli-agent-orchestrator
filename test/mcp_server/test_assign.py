@@ -84,6 +84,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "claude_code",
                 "agent_profile": "reviewer",
+                "cell_request_class": "explicit",
                 "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
@@ -128,6 +129,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "reviewer",
+                "cell_request_class": "explicit",
                 "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
@@ -254,6 +256,7 @@ class TestCreateTerminalProviderResolution:
                 "provider": "codex",
                 "agent_profile": "reviewer",
                 "session_name": "cao-new-session",
+                "cell_request_class": "explicit",
                 "model": "gpt-5.1-codex",
             },
             json={
@@ -295,6 +298,7 @@ class TestCreateTerminalProviderResolution:
                 "provider": "codex",
                 "agent_profile": "reviewer",
                 "session_name": "cao-new-session",
+                "cell_request_class": "explicit",
             },
             json={"initial_message": "Review the current change"},
             timeout=_mcp_timeout(),
