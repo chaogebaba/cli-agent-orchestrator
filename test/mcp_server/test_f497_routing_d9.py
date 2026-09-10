@@ -291,12 +291,15 @@ def test_d12b_missing_required_row_fails_closed(tmp_path):
     assert "no [required] row" in str(ei.value)
 
 
-def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch):
-    """A non-PASS NON-gate cell substitutes the DERIVED composed general name
-    ``general-<provider>`` (F786 D11) with a fallback_profile + a fallback_cell
-    for the [COLD-FALLBACK position=] field. The flat-store stub scan and the
-    E-ALIAS-MISSING path are gone: the name is derived purely and the D8 writer
-    (invoked by the caller at the server seam) materialises it."""
+def test_ac18_non_gate_non_pass_cell_uses_own_composition(tmp_path, monkeypatch):
+    """F870 #726 — a non-PASS NON-gate cell now spawns its OWN
+    ``<position>-<provider>`` composition (SAME position), NOT the deleted
+    cross-position ``general-<provider>`` substitution. ``uncertified_cell`` is
+    set and ``fallback_position`` / ``fallback_cell`` feed the operator preamble;
+    ``fallback_profile`` names the SAME-position composed profile.
+
+    MUTANT: restore the cross-position substitution (spawn_profile='general-'+p)
+    → this test fails on the ``dev-codex`` / not-``general-codex`` assertions."""
     positions = _build_store(tmp_path)
     monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path))
     # Add a non-gate position 'dev' that carries only the worker clauses, and a
@@ -314,13 +317,15 @@ def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch
         + "dev = 6000\n",
     )
     _certify(positions, "general", "codex", "PASS")
-    # dev cell is UNCERTIFIED (no row) → non-gate fallback.
+    # dev cell is UNCERTIFIED (no row) → non-gate: OWN composition, no fallback.
     table = routing.bindings_to_table(
         [routing.Binding(position="dev", provider="codex", kind="cao")]
     )
     res = routing.resolve_routing_binding("dev", "codex", table=table, positions_dir=positions)
-    assert res.spawn_profile == "general-codex"
-    assert res.fallback_profile == "general-codex"
+    assert res.spawn_profile == "dev-codex"
+    assert res.spawn_profile != "general-codex"
+    assert res.uncertified_cell is True
+    assert res.fallback_profile == "dev-codex"
     assert res.fallback_position == "dev"
     assert res.fallback_cell == "UNCERTIFIED"
 
@@ -330,10 +335,12 @@ def test_ac18_non_gate_non_pass_cell_falls_back_to_general(tmp_path, monkeypatch
 # --------------------------------------------------------------------------
 
 
-def test_ac18_assign_non_gate_fallback_preamble(tmp_path, monkeypatch):
-    """A routing-driven (bare position, no provider=) non-PASS non-gate cell
-    spawns <provider>_general, result carries fallback_profile, and the worker
-    message preamble has exactly one [COLD-FALLBACK position=dev cell=... line."""
+def test_ac18_assign_non_gate_uses_own_composition_preamble(tmp_path, monkeypatch):
+    """F870 #726 — a routing-driven (bare position, no provider=) non-PASS
+    non-gate cell spawns the position's OWN ``dev-codex`` composition (NOT
+    ``general-codex``); the result carries fallback_profile=dev-codex and the
+    worker message preamble has exactly one [COLD-FALLBACK position=dev cell=…]
+    line noting the cell is uncertified."""
     from unittest.mock import patch
 
     home = tmp_path / "cao-home"
@@ -385,7 +392,8 @@ def test_ac18_assign_non_gate_fallback_preamble(tmp_path, monkeypatch):
         result = _assign_impl("dev", "task", working_directory="/repo")
 
     assert result["success"] is True
-    assert result.get("fallback_profile") == "general-codex"
-    assert captured["agent_profile"] == "general-codex"
+    assert result.get("fallback_profile") == "dev-codex"
+    assert captured["agent_profile"] == "dev-codex"
+    assert captured["agent_profile"] != "general-codex"
     assert captured["message"].count("[COLD-FALLBACK") == 1
     assert "[COLD-FALLBACK position=dev cell=UNCERTIFIED]" in captured["message"]

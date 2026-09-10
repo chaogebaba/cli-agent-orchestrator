@@ -218,6 +218,7 @@ async def create_session(
     metadata: Optional[Dict[str, Any]] = None,
     terminal_id: str | None = None,
     is_box_hosted: bool = False,
+    cell_request_class: str = "explicit",
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -296,6 +297,7 @@ async def create_session(
         metadata=metadata,
         terminal_id=terminal_id,
         is_box_hosted=is_box_hosted,
+        cell_request_class=cell_request_class,
     )
     # F360 (#215): the terminal id is now allocated and fully registered. Any
     # exception from here on unwinds that registration (deregister + monitor

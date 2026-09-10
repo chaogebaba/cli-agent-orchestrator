@@ -34,12 +34,16 @@ Assign-time resolution (D9/D12, AC18):
      ``never-edit-artifact-branch``.
   3. CELL certification. When the bound (position, provider) cell's AC15 row is
      not ``PASS``:
-       * NON-GATE position → substitute ``<provider>_general`` as the spawn
-         profile (D12), BEFORE D10's cold-path degradation; the assign result
-         carries ``fallback_profile`` and a ``[COLD-FALLBACK position=<pos>
-         cell=<outcome>]`` preamble field is owed.
-       * GATE position → REFUSAL, no spawn (general is non-gate; an uncertified
-         gate cell is a refusal, not a substitution).
+       * NON-GATE position → spawn the position's OWN composed profile
+         ``<position>-<provider>`` (F870 #726). The cross-position
+         ``general-<provider>`` substitution is DELETED — a non-PASS non-gate
+         cell never silently runs as another position. ``uncertified_cell`` + a
+         ``[COLD-FALLBACK position=<pos> cell=<outcome>]`` preamble field surface
+         that the cell is not smoke-certified; the server seam refuses
+         ``E-COMPOSITION-MISSING`` (naming the composed profile) when the D8
+         writer cannot materialise it.
+       * GATE position → REFUSAL, no spawn (an uncertified gate cell is a
+         refusal, never a substitution).
 
 This module is a PURE library over a routing.toml path + the on-disk position
 stores; the assign wiring in ``mcp_server/server.py`` calls
@@ -64,6 +68,18 @@ else:  # pragma: no cover
 # The D7 codes live in ``utils.agent_profiles``; these two are D9-specific.
 E_PROVIDER_UNCERTIFIED = "E-PROVIDER-UNCERTIFIED"
 E_ROW_CLAUSES_MISSING = "E-ROW-CLAUSES-MISSING"
+# F868 #724 — an explicit ``provider=`` override on a position-name assign names
+# a SPECIFIC cell; if that cell is not certified PASS (or the provider is not in
+# the position allowlist) the operator override is refused, never silently
+# downgraded to general. ONE typed code carries position + provider + the
+# certified cells so the operator can pick a bindable cell.
+E_CELL_UNCERTIFIED = "E-CELL-UNCERTIFIED"
+# F870 #726 — a position-name assign resolved to its OWN ``<position>-<provider>``
+# composition that cannot be materialised (bad overlay, provider not in the
+# position allowlist) is refused NAMING the composed profile it looked for —
+# never silently substituting another position's profile (the deleted
+# cross-position ``general-<provider>`` fallback).
+E_COMPOSITION_MISSING = "E-COMPOSITION-MISSING"
 # F613 #469: the non-gate general fallback resolves the installed alias stub for
 # (general, provider) — its stem is ``<short>_general`` (e.g. ``cline_general``),
 # NOT the raw ``<provider>_general`` f-string (``cline_cli_general``), which is
@@ -276,6 +292,29 @@ def cell_certified(
     return False, "UNCERTIFIED"
 
 
+def certified_cells_for_position(position: str, positions_dir: Path) -> List[str]:
+    """The providers whose (position, provider) cell is certified PASS at the
+    CURRENT sha pair — the operator-facing candidate list for a refused cell
+    (F868 #724 ``E-CELL-UNCERTIFIED``). Returns sorted provider names; empty when
+    no cell is certified. Never raises: an unreadable/absent position yields ``[]``.
+    """
+    import frontmatter
+
+    pos_path = positions_dir / f"{position}.md"
+    if not pos_path.exists():
+        return []
+    try:
+        parsed = frontmatter.loads(pos_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    providers = {
+        str(row["provider"])
+        for row in (parsed.metadata.get("certification") or [])
+        if isinstance(row, dict) and row.get("provider")
+    }
+    return sorted(p for p in providers if cell_certified(position, p, positions_dir)[0])
+
+
 def _compose_cell_body(position: str, provider: str, positions_dir: Path) -> str:
     """Compose the (position, provider) persona BODY from a given store dir.
 
@@ -325,10 +364,19 @@ def _present_clause_ids(position: str, provider: str, positions_dir: Path) -> Li
 class RoutingResolution:
     """Outcome of ``resolve_routing_binding`` for a bound (position, provider).
 
-    ``spawn_profile`` is the position (normal) or ``general-<provider>`` (D11
-    fallback). ``fallback_profile`` is non-None only on the general substitution
-    path (mirrored into the assign result). ``fallback_position`` / ``fallback_cell``
-    feed the ``[COLD-FALLBACK position=<pos> cell=<outcome>]`` preamble fields.
+    ``spawn_profile`` is ALWAYS the position's OWN composed cell
+    ``<position>-<provider>`` (F786 D2c). F870 #726 DELETES the cross-position
+    ``general-<provider>`` substitution a non-PASS non-gate cell used to make:
+    a non-PASS non-gate cell now spawns its OWN composition, and the server seam
+    refuses ``E-COMPOSITION-MISSING`` (naming that composed profile) if it cannot
+    be materialised — never another position's profile.
+
+    ``uncertified_cell`` is True when the cell's AC15 row is not PASS (the
+    non-gate arm that used to cross-substitute): the spawn is the SAME position's
+    composition, and ``fallback_position`` / ``fallback_cell`` still feed the
+    operator-visible ``[COLD-FALLBACK position=<pos> cell=<outcome>]`` preamble.
+    ``fallback_profile`` is retained for the assign-result field but now names
+    the SAME-position composed profile (never a cross-position substitute).
     """
 
     spawn_profile: str
@@ -336,6 +384,7 @@ class RoutingResolution:
     fallback_profile: Optional[str] = None
     fallback_position: Optional[str] = None
     fallback_cell: Optional[str] = None
+    uncertified_cell: bool = False
 
 
 def resolve_routing_binding(
@@ -353,11 +402,13 @@ def resolve_routing_binding(
          else ``E-PROVIDER-UNCERTIFIED`` (every row of that provider refused).
       2. Row clause satisfaction: ``[required].<position>`` ⊆ present, else
          ``E-ROW-CLAUSES-MISSING`` naming the missing ids.
-      3. Cell certification: a non-PASS NON-gate cell substitutes
-         ``<provider>_general`` (D12); a non-PASS GATE cell is a refusal.
+      3. Cell certification: a non-PASS GATE cell is a refusal; a non-PASS
+         NON-gate cell spawns its OWN ``<position>-<provider>`` composition
+         (F870 #726 — the cross-position ``general-<provider>`` substitution is
+         deleted) with ``uncertified_cell=True``.
 
     Raises ``RoutingError`` (with ``.code``) on refusal; returns a
-    ``RoutingResolution`` on a bindable or fallback-substituted cell.
+    ``RoutingResolution`` on a bindable or same-position uncertified cell.
     """
     # (1) PROVIDER certification first — the general cell gates the whole provider.
     gen_pass, _gen_outcome = cell_certified(GENERAL_POSITION, provider, positions_dir)
@@ -396,22 +447,20 @@ def resolve_routing_binding(
         )
 
     # (3) CELL certification.
+    from cli_agent_orchestrator.utils.agent_profiles import (
+        _synthesise_position_profile_name,
+    )
+
     cell_pass, cell_outcome = cell_certified(position, provider, positions_dir)
+    own_cell = _synthesise_position_profile_name(position, provider)
     if cell_pass:
         # F786 D2c — a certified cell resolves to the effective composed name
         # ``<position>-<provider>`` (was the bare position), which the D8 writer
         # materialises and the spawn loads. The bare-position emission is gone,
         # which is why the flat ``secretary.md`` becomes dead (D3 deletes it).
-        from cli_agent_orchestrator.utils.agent_profiles import (
-            _synthesise_position_profile_name,
-        )
+        return RoutingResolution(spawn_profile=own_cell, provider=provider)
 
-        return RoutingResolution(
-            spawn_profile=_synthesise_position_profile_name(position, provider),
-            provider=provider,
-        )
-
-    # Non-PASS cell: gate → refusal, non-gate → general substitution (D12).
+    # Non-PASS cell: gate → refusal (a gate cell is never spawned uncertified).
     if _is_gate_position(position, positions_dir, clause_table_path):
         raise RoutingError(
             f"{E_ROW_CLAUSES_MISSING}: gate cell ({position}, {provider}) is not "
@@ -419,21 +468,24 @@ def resolve_routing_binding(
             f"general — refusing (no spawn)",
             code=E_ROW_CLAUSES_MISSING,
         )
-    # F786 D11 — the non-gate general fallback DERIVES the effective composed
-    # name ``general-<provider>`` purely (no flat-store stub scan; the
-    # _find_alias_for_cell scan and its E-ALIAS-MISSING refusal are deleted).
-    # The provider's ``general`` cell PASS row (checked as step (1) above) is
-    # what still gates the provider, so a provider that reaches here always has
-    # a composable general cell. The caller at the server seam invokes the D8
-    # writer for this returned name before spawning, so the composed file exists
-    # when load runs. ``routing.py`` performs no filesystem writes.
-    from cli_agent_orchestrator.utils.agent_profiles import _synthesise_position_profile_name
 
-    fallback = _synthesise_position_profile_name(GENERAL_POSITION, provider)
+    # F870 #726 — a non-PASS NON-gate cell spawns its OWN composed profile
+    # ``<position>-<provider>`` (SAME position), NOT the deleted cross-position
+    # ``general-<provider>`` substitution that silently ran ``assign("dev")`` as
+    # the general overlay. The provider itself is certified (step 1), the row
+    # clauses are satisfied (step 2), and the composition is materialisable by
+    # the D8 writer the server seam invokes; only its AC15 smoke row is not PASS.
+    # We surface that via ``uncertified_cell`` + the ``fallback_position`` /
+    # ``fallback_cell`` preamble fields so the operator sees the cell is not
+    # smoke-certified, but the worker still runs under its OWN position's persona.
+    # If the server seam's D8 writer cannot materialise ``own_cell`` (bad overlay,
+    # provider not in the allowlist), it refuses ``E-COMPOSITION-MISSING`` — it
+    # never substitutes another position's profile.
     return RoutingResolution(
-        spawn_profile=fallback,
+        spawn_profile=own_cell,
         provider=provider,
-        fallback_profile=fallback,
+        fallback_profile=own_cell,
         fallback_position=position,
         fallback_cell=cell_outcome,
+        uncertified_cell=True,
     )
