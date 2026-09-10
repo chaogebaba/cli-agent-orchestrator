@@ -608,12 +608,15 @@ _RESUME_TOKEN_TO_MISSING = {
     "session_artifact_unavailable": "artifact",
     "session_artifact_invalid": "artifact",
     "session_identity_mismatch": "artifact",
-    "session_identity_conflict": "artifact",
+    "session_identity_conflict": "identity",
+    "resume_not_admitted": "identity",
 }
 
 _RESUME_TOKEN_RETRYABLE = {
     "session_resume_in_progress": True,
     "session_artifact_unavailable": True,
+    "session_identity_conflict": False,
+    "resume_not_admitted": False,
 }
 
 
@@ -761,15 +764,17 @@ def _prepare_resume_via_identity(
     requested_working_directory: Optional[str],
     caller_principal: Optional[str],
     inherit_pins: bool,
-) -> Optional[dict[str, Any]]:
-    """A1 D3: resolve through the conversation ROOT + recovery MANIFEST, authorize
-    against ``owner_principal``, and return the enriched prepared dict — or None
-    when there is NO F829 root for ``resume_from`` (the caller then falls back to
-    the hot-fix terminal_identity path).
+) -> dict[str, Any]:
+    """A2.3 (was A1 D3): resolve through the conversation ROOT + recovery
+    MANIFEST, authorize against ``owner_principal``, and return the enriched
+    prepared dict. There is NO fallback path anymore — a handle with no admitted
+    root raises ``ResumeRefused`` (``missing=identity reason=resume_not_admitted``),
+    never returns None.
 
     On an authorization/classify/artifact refusal raises ``ResumeRefused`` with
-    the mapped ``missing`` category and ``identity_key`` populated (D3 six-category
-    envelope). The CAS CLAIM is NOT taken here — it is taken at spawn time by the
+    the mapped ``missing`` category. An UNAUTHORIZED (ownership) refusal carries
+    NO identity_key or foreign detail; an authorized state/artifact refusal keeps
+    its key. The CAS CLAIM is NOT taken here — it is taken at spawn time by the
     server entrance (claim_resume_admission), preserving the existing claim seam.
     """
     from cli_agent_orchestrator.clients.database import (
@@ -793,19 +798,35 @@ def _prepare_resume_via_identity(
             reason=token,
         )
     if root is None:
-        return None  # no F829 root — fall back to the hot-fix path
+        # A2.3 (bypass 2 closed): NO admitted existing conversation root for this
+        # handle. There is no unauthorized terminal_identity fallback anymore —
+        # refuse rather than resume through an unowned, unclaimed path. The
+        # refusal names NO identity_key (there is none) and no foreign detail.
+        raise ResumeRefused(
+            missing="identity",
+            how=(
+                "no resumable conversation is admitted for this handle; "
+                "re-dispatch cold, or pass an identity_key you own"
+            ),
+            reason="resume_not_admitted",
+            retryable=False,
+        )
 
     identity_key = root["identity_key"]
     # AUTHORIZE + CLASSIFY (owner_principal; resumable set {hibernated,detached}).
     admission = authorize_and_classify_resume(root, caller_principal)
     if not admission.ok:
         token = admission.error or "resume_not_owner"
+        # A2.3: an UNAUTHORIZED caller (ownership refusal) learns no foreign
+        # identity_key or path — the envelope carries the reason only. An
+        # AUTHORIZED caller hitting a state/artifact refusal keeps its key.
+        _leak_key = None if token == "resume_not_owner" else identity_key
         raise ResumeRefused(
             missing=_RESUME_TOKEN_TO_MISSING.get(token, "identity"),
             how=_resume_how_for_token(token, identity_key),
             reason=token,
             retryable=_RESUME_TOKEN_RETRYABLE.get(token, False),
-            identity_key=identity_key,
+            identity_key=_leak_key,
         )
 
     provider = root["provider"]
@@ -916,86 +937,19 @@ def prepare_resume(
     requires the caller to pass equivalent explicit ``authority_files`` (checked
     in the assign handler); otherwise this refuses with missing="profile".
     """
-    from cli_agent_orchestrator.clients.database import get_frozen_pins
-    from cli_agent_orchestrator.models.terminal import ForkContext
+    from cli_agent_orchestrator.models.terminal import ForkContext  # noqa: F401 (spec re-export)
 
-    # A1 D3: resolve through the conversation ROOT + recovery MANIFEST first,
-    # authorizing against owner_principal and building a ResumeLaunchSpec that
-    # carries the correct per-provider arm (codex/kiro fork_context, claude
-    # resume_session_id, pi --session <artifact>). Returns None only when there
-    # is NO F829 root for this handle, in which case we fall back to the hot-fix
-    # terminal_identity path below (backward compatibility for pre-F829 rows).
-    via_identity = _prepare_resume_via_identity(
+    # A2.3 (bypass 2 closed): resolve through the conversation ROOT + recovery
+    # MANIFEST, authorizing against owner_principal and building a
+    # ResumeLaunchSpec that carries the correct per-provider arm. There is NO
+    # unauthorized terminal_identity fallback: ``_prepare_resume_via_identity``
+    # either returns a fully-authorized launch dict or raises ``ResumeRefused``
+    # (a missing root refuses ``resume_not_admitted``). A resume never runs
+    # through an unowned, unclaimed path.
+    return _prepare_resume_via_identity(
         resume_from=resume_from,
         requested_agent_profile=requested_agent_profile,
         requested_working_directory=requested_working_directory,
         caller_principal=caller_principal,
         inherit_pins=inherit_pins,
     )
-    if via_identity is not None:
-        return via_identity
-
-    row = resolve_resume_target(resume_from)
-    provider = row.get("provider")
-    if not provider:
-        raise ResumeRefused(
-            missing="identity",
-            how=f"re-dispatch {resume_from!r} cold — its identity recorded no provider",
-            reason="provider_unrecorded",
-        )
-    # Capability: kiro/codex resume; grok/claude/pi refuse here (r1 #6 / r2 #2).
-    if not provider_supports_resume(provider):
-        raise ResumeRefused(
-            missing="provider_capability",
-            how="not resumable in this build; F829 build 2",
-            reason=f"provider_{provider}_not_resumable",
-        )
-    agent_profile = requested_agent_profile or row.get("agent_profile")
-    if not agent_profile:
-        raise ResumeRefused(
-            missing="profile",
-            how=f"pass agent_profile= for the resumed worker (none recorded for {resume_from!r})",
-            reason="agent_profile_unrecorded",
-        )
-    handle = row.get("source_terminal_id") or row.get("name") or resume_from
-    working_directory = requested_working_directory or _ensure_resume_cwd(
-        row.get("cwd"),
-        row.get("worktree_path"),
-        row.get("worktree_branch"),
-        row.get("worktree_repo_root"),
-        row.get("git_sha"),
-        str(handle),
-    )
-    fork_context = ForkContext(
-        mode="resume",
-        session_uuid=row["session_uuid"],
-        base_name=str(row.get("name") or handle),
-        provider=provider,
-        initial_preamble=(
-            f"[RESUMED] Re-attached to your prior conversation (resumed from "
-            f"{handle}). Continue the task where you left off."
-        ),
-    )
-    known_pins = (
-        get_frozen_pins(str(row["source_terminal_id"])) if row.get("source_terminal_id") else []
-    )
-    authority_files: Optional[list[dict[str, str]]] = None
-    pins_inherited = 0
-    if inherit_pins:
-        authority_files = known_pins or None
-        pins_inherited = len(known_pins)
-    return {
-        "fork_context": fork_context,
-        "provider": provider,
-        "agent_profile": agent_profile,
-        "working_directory": working_directory,
-        "forked_from_info": {
-            "name": str(row.get("name") or handle),
-            "cwd": working_directory,
-            "resumed_from": str(handle),
-            "provider": provider,
-        },
-        "authority_files": authority_files,
-        "pins_inherited": pins_inherited,
-        "known_pins": known_pins,
-    }

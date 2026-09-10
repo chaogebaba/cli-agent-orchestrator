@@ -2064,6 +2064,10 @@ def init_db() -> None:
     # (capability_evidence), no rebuild of anything above — additive. Disjoint
     # from every table above, so registry order is immaterial; appended LAST.
     _migrate_f829_capability_evidence()
+    # F829 A2.2 owner backfill. Rewrites terminal-fallback root owners to their
+    # mailbox where evidence is unique; idempotent and provenance-audited. Runs
+    # AFTER conversation_identity exists; appended LAST.
+    _migrate_f829_a2_owner_backfill()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -3445,6 +3449,141 @@ def _migrate_f829_capability_evidence() -> None:
         logger.debug("f829 capability_evidence migration skipped", exc_info=True)
 
 
+def _migrate_f829_a2_owner_backfill() -> None:
+    """F829 A2.2: versioned, idempotent, provenance-checked owner backfill.
+
+    The F857 incident (#713) left conversation roots whose ``owner_principal`` is
+    a BARE terminal id (the parent-substitution fallback), not the seat's own
+    mailbox. This migration rewrites ONLY those terminal-fallback roots to the
+    correct mailbox, and ONLY when the evidence is unambiguous.
+
+    Selection predicate (POSITIVE, A2.2 / verdict N2):
+      * ``owner_principal`` matches ``^[0-9a-f]{8}$`` (a bare terminal id;
+        mailbox ids are ``mb_``-prefixed), AND
+      * that terminal id has a ``terminal_identity`` incarnation row.
+    Anything else (an explicit non-mailbox owner, an unknown id) is OUTSIDE the
+    predicate and audited ``skipped_ambiguous`` — never rewritten.
+
+    Rewrite rule:
+      * lookup key = the STORED owner terminal (never the requester or the
+        resumed worker), resolved to a mailbox through UNIQUE historical
+        ``mailbox_incarnations`` evidence;
+      * rewrite to that mailbox ONLY when exactly one distinct mailbox exists;
+        zero or >1 → keep the row and audit ``skipped_no_unique_mailbox``;
+      * the UPDATE carries an OLD-OWNER predicate (``WHERE owner_principal=?``)
+        so a concurrent change is never clobbered;
+      * a root with an active ``resume_claim`` is SKIPPED (audited
+        ``skipped_active_claim``) — never mutate an owner mid-resume;
+      * NULL / ambiguous owners are preserved for explicit ``cao identity claim``.
+
+    Idempotent: after a rewrite the owner is ``mb_``-prefixed and no longer
+    matches the bare-id predicate, so a second run selects nothing. Best-effort,
+    logged at debug, never propagated — matching every migrator above. An audit
+    ``conversation_event`` (``owner_backfilled`` / ``owner_backfill_skipped``)
+    records old owner, new owner and the evidence for every considered root.
+    """
+    import re
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    bare = re.compile(r"^[0-9a-f]{8}$")
+    now = _utcnow().isoformat(sep=" ")
+
+    def _audit(conn: Any, key: str, event: str, detail: Dict[str, Any]) -> None:
+        import json as _json
+
+        conn.execute(
+            "INSERT INTO conversation_event (identity_key, event, terminal_id, "
+            "detail, created_at) VALUES (?,?,?,?,?)",
+            (key, event, detail.get("owner_terminal"), _json.dumps(detail), now),
+        )
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            # Guard: the schema must be present (a fresh DB has it; a very old DB
+            # without conversation_identity is skipped rather than erroring).
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                    "('conversation_identity','terminal_identity','mailbox_incarnations')"
+                ).fetchall()
+            }
+            if "conversation_identity" not in tables:
+                return
+            candidates = conn.execute(
+                "SELECT identity_key, owner_principal, resume_claim "
+                "FROM conversation_identity WHERE owner_principal IS NOT NULL"
+            ).fetchall()
+            for key, owner, claim in candidates:
+                if not isinstance(owner, str) or not bare.match(owner):
+                    continue  # not a terminal-fallback owner — leave untouched.
+                if claim is not None:
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfill_skipped",
+                        {"reason": "skipped_active_claim", "owner_terminal": owner},
+                    )
+                    continue
+                # POSITIVE: the stored owner must be a real incarnation.
+                has_incarnation = conn.execute(
+                    "SELECT 1 FROM terminal_identity WHERE terminal_id=? LIMIT 1", (owner,)
+                ).fetchone()
+                if has_incarnation is None:
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfill_skipped",
+                        {"reason": "skipped_ambiguous", "owner_terminal": owner},
+                    )
+                    continue
+                if "mailbox_incarnations" not in tables:
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfill_skipped",
+                        {"reason": "skipped_no_unique_mailbox", "owner_terminal": owner},
+                    )
+                    continue
+                mailboxes = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT mailbox_id FROM mailbox_incarnations WHERE terminal_id=?",
+                        (owner,),
+                    ).fetchall()
+                    if r[0] is not None
+                }
+                if len(mailboxes) != 1:
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfill_skipped",
+                        {
+                            "reason": "skipped_no_unique_mailbox",
+                            "owner_terminal": owner,
+                            "candidates": len(mailboxes),
+                        },
+                    )
+                    continue
+                new_owner = next(iter(mailboxes))
+                # OLD-OWNER predicate: never clobber a concurrent change.
+                conn.execute(
+                    "UPDATE conversation_identity SET owner_principal=?, updated_at=? "
+                    "WHERE identity_key=? AND owner_principal=?",
+                    (new_owner, now, key, owner),
+                )
+                _audit(
+                    conn,
+                    key,
+                    "owner_backfilled",
+                    {"old_owner": owner, "new_owner": new_owner, "owner_terminal": owner},
+                )
+    except Exception:
+        logger.debug("f829 A2 owner backfill migration skipped", exc_info=True)
+
+
 def _restrict_db_file_permissions() -> None:
     """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
 
@@ -4497,6 +4636,84 @@ def _mailbox_id_for_terminal(db: Any, terminal_id: str | None) -> str | None:
     return cast(str, row[0]) if row is not None else None
 
 
+@dataclass(frozen=True)
+class PrincipalResult:
+    """F829 A2.1: the discriminated outcome of resolving a terminal's OWN principal.
+
+    Exactly one of ``principal`` / ``error`` is set:
+
+    * ``ok=True``  → ``principal`` is the terminal's durable owning identity
+      (its own mailbox id, or its bare terminal id when it is a positively known
+      mailbox-less seat).
+    * ``ok=False`` → ``error`` is one of the snake_case A2.1 reasons and
+      ``retryable`` says whether re-issuing the same lookup can ever succeed.
+
+    A ``None`` is NEVER returned to mean "no owner": the four A2.1 states —
+    mailbox-less seat, schema-unavailable, lookup-failed, inconsistent-membership
+    — are distinguished, because a ``None`` caller silently passes an ownership
+    check (bypass 1). ``_mailbox_id_for_terminal`` above collapses states (i),
+    (ii) and (iii) to ``None``; this function splits them, it does not
+    reinterpret them.
+    """
+
+    ok: bool
+    principal: Optional[str] = None
+    error: Optional[str] = None
+    retryable: bool = False
+
+
+def principal_for_terminal(terminal_id: Optional[str], *, db: Any) -> PrincipalResult:
+    """F829 A2.1: resolve a terminal's OWN durable principal, server-side.
+
+    Resolves ``terminal_id``'s own durable mailbox via ``MailboxIncarnationModel``
+    (historical membership, not only the current binding). It NEVER substitutes
+    that terminal's ``caller_mailbox_id`` (its PARENT's identity) — the F857
+    incident (#713) was exactly that parent-substitution.
+
+    Four discriminated outcomes (A2.1):
+
+      (i)   no incarnation row while the mailbox schema is available → a
+            positively-known mailbox-less seat: use its bare terminal id as
+            explicit compatibility identity (``ok=True``).
+      (ii)  ``_mailbox_schema_available(db)`` is False → cannot resolve
+            ownership at all → refuse ``principal_unavailable`` (retryable true).
+      (iii) the lookup raised → refuse ``principal_unavailable`` (retryable true).
+      (iv)  more than one DISTINCT mailbox across this terminal's incarnations →
+            refuse ``principal_inconsistent`` (retryable false). Unreachable
+            through the schema while ``mailbox_incarnations.terminal_id`` is
+            UNIQUE (database.py Index); the guard is defence in depth (AC-A2.9).
+
+    ``mint_spawn_identity`` calls this on ``owner_caller_id`` (the parent that
+    OWNS the new seat), never on the child, so the seat's durable owner is the
+    caller's own mailbox.
+    """
+    if not terminal_id:
+        # No caller at all — never treat as an owner (bypass 1). A missing caller
+        # is a schema-independent refusal.
+        return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+    try:
+        if not _mailbox_schema_available(db):
+            # (ii) cannot tell whether this seat has a mailbox — refuse rather
+            # than guess an identity.
+            return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+        rows = (
+            db.query(MailboxIncarnationModel.mailbox_id)
+            .filter(MailboxIncarnationModel.terminal_id == terminal_id)
+            .all()
+        )
+    except Exception:
+        # (iii) any DB error is retryable and never a silent owner.
+        return PrincipalResult(ok=False, error="principal_unavailable", retryable=True)
+    distinct = {str(r[0]) for r in rows if r[0] is not None}
+    if len(distinct) > 1:
+        # (iv) inconsistent membership — never pick one; not retryable.
+        return PrincipalResult(ok=False, error="principal_inconsistent", retryable=False)
+    if distinct:
+        return PrincipalResult(ok=True, principal=next(iter(distinct)))
+    # (i) no incarnation row, schema present → positively-known mailbox-less seat.
+    return PrincipalResult(ok=True, principal=terminal_id)
+
+
 def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, int | None]:
     """Resolve a logical or historical inbox address inside the caller's transaction."""
     if not _mailbox_schema_available(db):
@@ -4829,6 +5046,123 @@ def record_conversation_event(
         logger.debug("record_conversation_event failed", exc_info=True)
 
 
+class PrincipalRefused(Exception):
+    """F829 A2.1: raised when a seat's OWN principal cannot be resolved.
+
+    Carries the discriminated ``PrincipalResult`` so the create path can abort
+    the terminal-create transaction (F631: no best-effort identity writes) and
+    surface the exact reason/retryable to the caller.
+    """
+
+    def __init__(self, result: "PrincipalResult") -> None:
+        super().__init__(result.error or "principal_unavailable")
+        self.result = result
+
+
+class SeededSessionConflict(Exception):
+    """F829 A2.3 (AC-A2.11): a fresh seeded uuid already binds another root.
+
+    A fresh codex seed spawn mints its root WITH the seeded ``provider_session_id``.
+    If that (provider, namespace, uuid) triple already belongs to a conversation
+    root, the fresh spawn must REFUSE ``session_identity_conflict`` (retryable
+    false) — it never attaches to, inherits from, or re-mints another
+    conversation's root (D4: attach only on an unbound triple; Do NOT list).
+    """
+
+    def __init__(self, identity_key: str, conflicting_identity_key: str) -> None:
+        super().__init__("session_identity_conflict")
+        self.identity_key = identity_key
+        self.conflicting_identity_key = conflicting_identity_key
+
+
+@dataclass(frozen=True)
+class RootAdmission:
+    """F829 A2.3: explicit CAO conversation-root admission for a terminal create.
+
+    Carried into ``create_terminal`` / ``create_terminal_with_warm_intent``
+    SEPARATELY from any seed/provider ForkContext, so "fresh" means "no admitted
+    existing root" independent of a provider's CLI resume mode (a codex seed
+    bootstrap returns ``ForkContext(mode="resume")`` yet is a FRESH spawn).
+
+    Exactly one mode:
+
+    * ``mode="mint"`` — a genuinely fresh spawn: mint root + manifest +
+      incarnation link inside the create transaction, right after
+      ``_register_terminal_identity`` (F631: no best-effort identity writes).
+      ``capture_nonce`` is minted by the caller and stored on the manifest so
+      it can be returned and injected into a kiro worker's first turn.
+    * ``mode="link"`` — a true resume: link this new incarnation's
+      ``terminal_identity`` row to the already-claimed existing ``identity_key``
+      (the root is re-pointed to the new terminal by ``publish_current_terminal``
+      later, after verify). No new root is minted.
+
+    A create with ``admission=None`` mints NO root and links NONE — used only by
+    call sites that are not F829-governed (tests, legacy fixtures).
+    """
+
+    mode: str  # "mint" | "link"
+    identity_key: str
+    provider: Optional[str] = None
+    provider_namespace: Optional[str] = None
+    provider_session_id: Optional[str] = None
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    owner_principal: Optional[str] = None
+    owner_caller_id: Optional[str] = None
+    origin_callback_ref: Optional[str] = None
+    capture_nonce: Optional[str] = None
+    launch_attempt_id: Optional[str] = None
+
+
+def _apply_root_admission(
+    session: Session,
+    *,
+    terminal_id: str,
+    admission: "RootAdmission",
+    agent_profile: Optional[str],
+    cwd: Optional[str],
+    worktree_path: Optional[str],
+    worktree_branch: Optional[str],
+    repo_root: Optional[str],
+) -> None:
+    """F829 A2.3: apply a ``RootAdmission`` inside the terminal-create transaction.
+
+    Called from both create writers immediately after
+    ``_register_terminal_identity`` so the root/manifest/link commit or roll back
+    WITH the ``terminals`` row. Raises (``PrincipalRefused`` /
+    ``SeededSessionConflict``) to ABORT the create — never a best-effort write.
+    """
+    if admission.mode == "mint":
+        mint_spawn_identity(
+            identity_key=admission.identity_key,
+            provider=admission.provider or "",
+            provider_namespace=admission.provider_namespace,
+            provider_session_id=admission.provider_session_id,
+            agent_profile=agent_profile,
+            model=admission.model,
+            reasoning_effort=admission.reasoning_effort,
+            owner_principal=admission.owner_principal,
+            owner_caller_id=admission.owner_caller_id,
+            origin_callback_ref=admission.origin_callback_ref,
+            current_terminal_id=terminal_id,
+            cwd=cwd,
+            worktree_path=worktree_path,
+            worktree_branch=worktree_branch,
+            repo_root=repo_root,
+            capture_nonce=admission.capture_nonce,
+            launch_attempt_id=admission.launch_attempt_id or terminal_id,
+            db=session,
+        )
+    elif admission.mode == "link":
+        # True resume: point THIS incarnation at the claimed existing root.
+        session.query(TerminalIdentityModel).filter_by(terminal_id=terminal_id).update(
+            {TerminalIdentityModel.identity_key: admission.identity_key},
+            synchronize_session=False,
+        )
+    else:  # pragma: no cover — defence in depth
+        raise ValueError(f"unknown root admission mode: {admission.mode!r}")
+
+
 def mint_conversation_identity(
     *,
     identity_key: str,
@@ -4840,22 +5174,43 @@ def mint_conversation_identity(
     owner_principal: Optional[str],
     origin_callback_ref: Optional[str],
     current_terminal_id: Optional[str],
+    provider_session_id: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> None:
     """F829 D1: create a fresh conversation root at spawn (origin=spawn, live).
 
-    Minted BEFORE any provider uuid exists (``provider_session_id`` NULL). If a
+    Minted BEFORE any provider uuid exists (``provider_session_id`` NULL) —
+    EXCEPT a fresh codex seed spawn (A2.3), which passes the seeded
+    ``provider_session_id`` so its root is never ``capture_unknown``. If a
     ``db`` is supplied the root is written in the terminal's own transaction so
-    root + terminal_identity + terminals commit together.
+    root + terminal_identity + terminals commit together. Raises
+    ``SeededSessionConflict`` when a non-NULL ``provider_session_id`` already
+    binds a DIFFERENT root (A2.3 / AC-A2.11).
     """
 
     def _write(session: Session) -> None:
+        # A2.3 (AC-A2.11): a fresh seeded uuid that already binds another root
+        # must REFUSE, never attach/inherit/re-mint. Checked inside the write so
+        # the guard and the insert see one consistent snapshot.
+        if provider_session_id is not None:
+            conflict = (
+                session.query(ConversationIdentityModel.identity_key)
+                .filter(
+                    ConversationIdentityModel.provider == provider,
+                    ConversationIdentityModel.provider_namespace == provider_namespace,
+                    ConversationIdentityModel.provider_session_id == provider_session_id,
+                    ConversationIdentityModel.identity_key != identity_key,
+                )
+                .first()
+            )
+            if conflict is not None:
+                raise SeededSessionConflict(identity_key, str(conflict[0]))
         session.add(
             ConversationIdentityModel(
                 identity_key=identity_key,
                 provider=provider,
                 provider_namespace=provider_namespace,
-                provider_session_id=None,
+                provider_session_id=provider_session_id,
                 agent_profile=agent_profile,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -4904,6 +5259,7 @@ def mint_spawn_identity(
     origin_callback_ref: Optional[str],
     current_terminal_id: str,
     cwd: Optional[str],
+    provider_session_id: Optional[str] = None,
     worktree_path: Optional[str] = None,
     worktree_branch: Optional[str] = None,
     repo_root: Optional[str] = None,
@@ -4924,9 +5280,17 @@ def mint_spawn_identity(
     row commit together. Idempotent on identity_key (a pre-existing root is left
     untouched).
 
-    The durable owner is ``owner_principal`` when given, else the mailbox that
-    owns ``owner_caller_id`` (resolved WITHIN this write's session so no extra
-    metadata read happens on the create path)."""
+    A2.1: the durable owner is ``owner_principal`` when given, else the seat's
+    OWN principal resolved from ``owner_caller_id`` via ``principal_for_terminal``
+    (never its parent's ``caller_mailbox_id``). A refusal there raises
+    ``PrincipalRefused`` so the terminal-create transaction aborts (F631: no
+    best-effort identity writes) — a fresh spawn whose owner cannot be resolved
+    is never published with a bad or absent owner.
+
+    A2.3: ``provider_session_id`` is the seeded codex uuid for a fresh seed spawn
+    (else None); it is carried onto the root so a codex seed root is never
+    ``capture_unknown``, and a triple that already binds another root raises
+    ``SeededSessionConflict`` (AC-A2.11)."""
 
     def _write(session: Session) -> None:
         exists = (
@@ -4938,11 +5302,15 @@ def mint_spawn_identity(
             return
         _owner = owner_principal
         if _owner is None and owner_caller_id is not None:
-            _owner = _mailbox_id_for_terminal(session, owner_caller_id) or owner_caller_id
+            result = principal_for_terminal(owner_caller_id, db=session)
+            if not result.ok:
+                raise PrincipalRefused(result)
+            _owner = result.principal
         mint_conversation_identity(
             identity_key=identity_key,
             provider=provider,
             provider_namespace=provider_namespace,
+            provider_session_id=provider_session_id,
             agent_profile=agent_profile,
             model=model,
             reasoning_effort=reasoning_effort,
@@ -5280,6 +5648,34 @@ def clear_resume_claim(identity_key: str, *, event: Optional[str] = None) -> Non
         record_conversation_event(identity_key, event)
 
 
+def release_resume_claim_owned(identity_key: str, owner_principal: str) -> Dict[str, Any]:
+    """F829 A2.5: owner-guarded release of a LEAKED resume claim (operator recovery).
+
+    Backs ``cao identity release <key> --owner <principal>``. Clears the claim
+    ONLY when ``owner_principal`` matches the root's recorded owner — a recoverer
+    cannot release a claim on a conversation it does not own. Returns a small
+    result dict: ``{released: bool, reason: str}``.
+
+    Distinct from ``clear_resume_claim`` (an internal compensator that runs on
+    the server's own spawn-failure path and takes no owner argument): this is the
+    authorized OPERATOR verb.
+    """
+    with SessionLocal.begin() as db:
+        row = db.query(ConversationIdentityModel).filter_by(identity_key=identity_key).one_or_none()
+        if row is None:
+            return {"released": False, "reason": "unknown_identity"}
+        if row.owner_principal is None or row.owner_principal != owner_principal:
+            return {"released": False, "reason": "not_owner"}
+        if row.resume_claim is None:
+            return {"released": False, "reason": "no_active_claim"}
+        row.resume_claim = None
+        row.resume_claim_at = None
+        row.updated_at = _utcnow()
+        db.flush()
+    record_conversation_event(identity_key, "claim_released_by_owner")
+    return {"released": True, "reason": "released"}
+
+
 def publish_current_terminal(
     identity_key: str,
     *,
@@ -5522,6 +5918,7 @@ def create_terminal(
     authority_files: Optional[List[Dict[str, str]]] = None,
     resolved_model: Optional[str] = None,
     auth_token: Optional[str] = None,
+    root_admission: Optional["RootAdmission"] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -5582,6 +5979,29 @@ def create_terminal(
                 worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
             ),
         )
+        # F829 A2.3: mint the conversation root (or link a resumed one) INSIDE
+        # this transaction, right after the identity row, so root + manifest +
+        # link + terminals commit or roll back together. A refusal
+        # (PrincipalRefused / SeededSessionConflict) aborts the create.
+        if root_admission is not None:
+            _apply_root_admission(
+                db,
+                terminal_id=terminal_id,
+                admission=root_admission,
+                agent_profile=agent_profile,
+                cwd=working_directory,
+                worktree_path=(
+                    worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+                ),
+                worktree_branch=(
+                    worktree_info.get("expected_branch")
+                    if isinstance(worktree_info, dict)
+                    else None
+                ),
+                repo_root=(
+                    worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
+                ),
+            )
         if dispatch_barrier is not None:
             if caller_id is None:
                 raise ValueError("barrier_owner_not_found")
@@ -5688,6 +6108,7 @@ def create_terminal_with_warm_intent(
     authority_files: Optional[List[Dict[str, str]]] = None,
     resolved_model: Optional[str] = None,
     auth_token: Optional[str] = None,
+    root_admission: Optional["RootAdmission"] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -5746,6 +6167,27 @@ def create_terminal_with_warm_intent(
                 worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
             ),
         )
+        # F829 A2.3: mint/link the conversation root INSIDE this transaction (see
+        # create_terminal). A refusal aborts the warm-intent create too.
+        if root_admission is not None:
+            _apply_root_admission(
+                db,
+                terminal_id=terminal_id,
+                admission=root_admission,
+                agent_profile=agent_profile,
+                cwd=working_directory,
+                worktree_path=(
+                    worktree_info.get("worktree_path") if isinstance(worktree_info, dict) else None
+                ),
+                worktree_branch=(
+                    worktree_info.get("expected_branch")
+                    if isinstance(worktree_info, dict)
+                    else None
+                ),
+                repo_root=(
+                    worktree_info.get("repo_root") if isinstance(worktree_info, dict) else None
+                ),
+            )
         if dispatch_barrier is not None:
             if caller_id is None:
                 raise ValueError("barrier_owner_not_found")

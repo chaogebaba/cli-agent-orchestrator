@@ -112,7 +112,7 @@ def test_d3_pi_without_artifact_refuses_missing_artifact(real_sqlite_env):
     assert ei.value.identity_key == "kp2"
 
 
-def test_d3_not_owner_refuses_identity_with_key(real_sqlite_env):
+def test_d3_not_owner_refuses_identity_without_key(real_sqlite_env):
     _mkresumable("ko", "codex", owner="mb_owner", uuid="o-uuid")
     with pytest.raises(ResumeRefused) as ei:
         prepare_resume(
@@ -123,11 +123,11 @@ def test_d3_not_owner_refuses_identity_with_key(real_sqlite_env):
         )
     assert ei.value.missing == "identity"
     assert ei.value.reason == "resume_not_owner"
-    # A1 envelope: an authorized-scope refusal names the identity_key.
-    assert ei.value.identity_key == "ko"
+    # A2.3: an UNAUTHORIZED (ownership) refusal leaks NO foreign identity_key.
+    assert ei.value.identity_key is None
     env = ei.value.as_dict()
     assert env["error"] == "resume_refused" and env["missing"] == "identity"
-    assert env["identity_key"] == "ko"
+    assert "identity_key" not in env or env["identity_key"] is None
 
 
 def test_d3_live_owned_refuses_identity(real_sqlite_env):

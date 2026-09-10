@@ -151,9 +151,16 @@ def _capture_diag(cao_server, tag: str) -> str:
     # tmux windows across sessions (test sessions carry the cao-test- prefix).
     with _c.suppress(Exception):
         lw = subprocess.run(
-            ["tmux", "list-windows", "-a", "-F",
-             "#{session_name}:#{window_name} panes=#{window_panes} active=#{window_active}"],
-            capture_output=True, text=True, timeout=20,
+            [
+                "tmux",
+                "list-windows",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_name} panes=#{window_panes} active=#{window_active}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         lines.append("## tmux list-windows -a\n" + (lw.stdout or "") + (lw.stderr or ""))
         # pane tails for cao-test- windows
@@ -164,7 +171,9 @@ def _capture_diag(cao_server, tag: str) -> str:
             with _c.suppress(Exception):
                 cap = subprocess.run(
                     ["tmux", "capture-pane", "-p", "-t", tgt, "-S", "-120"],
-                    capture_output=True, text=True, timeout=20,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
                 )
                 lines.append(f"## pane {tgt}\n{cap.stdout or ''}")
     # copy the live server.log (before teardown deletes the scratch HOME)
@@ -181,9 +190,15 @@ def _capture_diag(cao_server, tag: str) -> str:
     return out
 
 
-def _create_session_terminal(api: str, provider: str, profile: str, session: str,
-                             model: str | None, cao_server=None,
-                             initial_message: str | None = None) -> tuple[str, str]:
+def _create_session_terminal(
+    api: str,
+    provider: str,
+    profile: str,
+    session: str,
+    model: str | None,
+    cao_server=None,
+    initial_message: str | None = None,
+) -> tuple[str, str]:
     # Real-provider terminal init (tmux spawn + MCP handshake + first system-
     # prompt turn) can take many minutes on a box; supervisor set a 600s create
     # budget + ONE retry. A watchdog thread captures tmux/pane/server.log if a
@@ -219,8 +234,9 @@ def _create_session_terminal(api: str, provider: str, profile: str, session: str
         wd = threading.Thread(target=_wd, daemon=True)
         wd.start()
         try:
-            resp = requests.post(f"{api}/sessions", params=params, json=json_body,
-                                 timeout=_CREATE_TIMEOUT)
+            resp = requests.post(
+                f"{api}/sessions", params=params, json=json_body, timeout=_CREATE_TIMEOUT
+            )
         except requests.exceptions.ReadTimeout as exc:
             last = f"ReadTimeout after {_CREATE_TIMEOUT}s: {exc}"
             _capture_diag(cao_server, f"create-timeout-{provider}-a{attempt}")
@@ -279,7 +295,9 @@ def _wait_capture(cao_server, identity_key: str, timeout: float = 90.0) -> str |
 def _hibernate(api: str, tid: str) -> dict:
     """Planned hibernate = DELETE non-force. Returns the JSON result."""
     resp = requests.delete(f"{api}/terminals/{tid}", timeout=120)
-    assert resp.status_code == 200, f"hibernate(delete non-force) failed: {resp.status_code} {resp.text}"
+    assert (
+        resp.status_code == 200
+    ), f"hibernate(delete non-force) failed: {resp.status_code} {resp.text}"
     return resp.json()
 
 
@@ -292,21 +310,18 @@ def _db(cao_server: CaoServer) -> sqlite3.Connection:
     return conn
 
 
-def _assert_db_resume_shape(cao_server: CaoServer, identity_key: str, *,
-                            provider: str) -> dict:
+def _assert_db_resume_shape(cao_server: CaoServer, identity_key: str, *, provider: str) -> dict:
     """The B2 acceptance proof that the PUBLIC/production path was exercised:
     one root (hibernated), the reaped original incarnation carrying the resume_key,
-    a SECOND (resumed) incarnation carrying the SAME resume_key, and manifest+nonce.
+    a SECOND (resumed) incarnation LINKED to the SAME root's identity_key, and
+    manifest+nonce.
 
-    NOTE (kiro-harness observation, for codex): the resumed worker's
-    terminal_identity row re-attaches the conversation by provider_session_id (the
-    D4 resume_key) but does NOT currently share the ORIGINAL root's identity_key —
-    it is created under its own root by the resumed fresh-spawn. So resume_key
-    continuity is asserted across the incarnations found BY provider_session_id,
-    not by a shared identity_key. Whether the D3 publish should re-link the resumed
-    incarnation onto the original root's identity_key is a separate F829 D1/D3
-    question (flagged, not fixed here); it does not affect the AC1 proof — the
-    resumed worker recalled the planted token verbatim (step 5 above)."""
+    F829 A2 (build-2 r2 SHOULD b) FOLDED: the resumed worker's terminal_identity
+    row now shares the ORIGINAL root's identity_key — the server-side resume
+    admission passes RootAdmission(mode="link") which sets the new incarnation's
+    identity_key to the claimed root INSIDE the create transaction. So AC-A2.6
+    asserts continuity by SHARED identity_key (diag shows the new incarnation
+    under the SAME root), not merely by provider_session_id."""
     conn = _db(cao_server)
     try:
         roots = conn.execute(
@@ -330,9 +345,9 @@ def _assert_db_resume_shape(cao_server: CaoServer, identity_key: str, *,
             orig[0]["provider_session_id"] if orig else None
         )
         assert resume_key, "root/original incarnation carries no captured resume_key"
-        assert any(r["lifecycle"] == "reaped" for r in orig), (
-            f"original incarnation must be reaped (hibernated), got {[dict(r) for r in orig]}"
-        )
+        assert any(
+            r["lifecycle"] == "reaped" for r in orig
+        ), f"original incarnation must be reaped (hibernated), got {[dict(r) for r in orig]}"
 
         # The RESUMED incarnation: a DISTINCT terminal_identity row carrying the
         # SAME resume_key (resume_key continuity — the conversation was re-attached
@@ -348,6 +363,12 @@ def _assert_db_resume_shape(cao_server: CaoServer, identity_key: str, *,
             f"expected a SECOND (resumed) incarnation carrying the resume_key "
             f"{resume_key!r}, found only the original(s) {orig_ids}: "
             f"{[dict(r) for r in by_key]}"
+        )
+        # A2 SHOULD (b): the resumed incarnation is LINKED to the SAME root —
+        # diag shows it under identity_key, not under a fresh second root.
+        assert all(r["identity_key"] == identity_key for r in resumed), (
+            f"resumed incarnation must share the original root identity_key "
+            f"{identity_key!r}: {[dict(r) for r in resumed]}"
         )
 
         man = conn.execute(
@@ -383,7 +404,10 @@ def _plant_foreign_kiro_candidate(cwd: str, home_dir: Path) -> str | None:
     prompt = "Say only the word OTHER."
     subprocess.run(
         ["kiro-cli", "--v3", "chat", "--no-interactive", "--trust-all-tools", prompt],
-        cwd=cwd, capture_output=True, text=True, timeout=120,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     time.sleep(1.0)
     h = hashlib.sha256(str(cwd).encode()).hexdigest()[:16]
@@ -408,9 +432,14 @@ def _quota_banner_hit(text: str) -> str | None:
 # --- the arm ----------------------------------------------------------------
 
 
-def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = "developer",
-                           *, kiro_two_candidate: bool = False,
-                           artifacts_dir: Path) -> dict:
+def _run_public_resume_arm(
+    cao_server: CaoServer,
+    provider: str,
+    profile: str = "developer",
+    *,
+    kiro_two_candidate: bool = False,
+    artifacts_dir: Path,
+) -> dict:
     api = _api(cao_server)
     token = f"F829-{provider.upper()}-{uuid.uuid4().hex[:6]}"
     session = f"f829-{provider}-{uuid.uuid4().hex[:6]}"
@@ -437,11 +466,14 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         # that first turn — the nonce then lands in the kiro session and the
         # nonce-gated capture (B4) can attribute it. (For claude/codex/pi the
         # initial_message is just the plant turn; capture is via their own path.)
-        plant_msg = (
-            f"Remember this exact token for later: {token}. Reply with just: ACK {token}"
-        )
+        plant_msg = f"Remember this exact token for later: {token}. Reply with just: ACK {token}"
         worker_id, _ = _create_session_terminal(
-            api, provider, profile, f"{session}-w", model, cao_server=cao_server,
+            api,
+            provider,
+            profile,
+            f"{session}-w",
+            model,
+            cao_server=cao_server,
             initial_message=plant_msg,
         )
         st = _wait_ready_api(api, worker_id)
@@ -461,8 +493,12 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         banner = _quota_banner_hit(plant)
         if banner:
             rec("QUOTA", f"banner fragment seen at PLANT: {banner!r}")
-            return {"status": "quota_blocked", "stage": "plant", "banner": banner,
-                    "transcript": transcript}
+            return {
+                "status": "quota_blocked",
+                "stage": "plant",
+                "banner": banner,
+                "transcript": transcript,
+            }
 
         # kiro-only: plant a SECOND same-cwd candidate (newer mtime, foreign).
         foreign = None
@@ -512,16 +548,20 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         # one truth — no ad-hoc second connection), and CAO_ENDPOINT at the
         # subprocess so the HTTP create lands there.
         import importlib
+
         import cli_agent_orchestrator.clients.database as _dbm
 
-        _saved = {k: os.environ.get(k) for k in ("HOME", "CAO_HOME_DIR", "CAO_ENDPOINT",
-                                                  "CAO_TERMINAL_ID")}
+        _saved = {
+            k: os.environ.get(k)
+            for k in ("HOME", "CAO_HOME_DIR", "CAO_ENDPOINT", "CAO_TERMINAL_ID")
+        }
         os.environ["HOME"] = str(cao_server.home_dir)
         os.environ.pop("CAO_HOME_DIR", None)  # constants derives from HOME when unset
         os.environ["CAO_ENDPOINT"] = api
         os.environ["CAO_TERMINAL_ID"] = supervisor_id
         # Rebind SessionLocal/engine to the subprocess DB the module's own way.
         import cli_agent_orchestrator.constants as _const
+
         importlib.reload(_const)
         importlib.reload(_dbm)
 
@@ -536,14 +576,20 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         _owner = _rootrow.get("owner_principal") if _rootrow else _owner_principal
 
         from cli_agent_orchestrator.mcp_server import server as _srv
+
         importlib.reload(_srv)
 
         from unittest.mock import patch as _patch
+
         resume_handle = captured_sid or worker_id
-        assign_kwargs = dict(agent_profile=profile, message=(
-            f"What exact token did I ask you to remember earlier? "
-            f"Reply with ONLY that token."
-        ), resume_from=resume_handle)
+        assign_kwargs = dict(
+            agent_profile=profile,
+            message=(
+                f"What exact token did I ask you to remember earlier? "
+                f"Reply with ONLY that token."
+            ),
+            resume_from=resume_handle,
+        )
         if model:
             assign_kwargs["model"] = model
         try:
@@ -555,9 +601,26 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        rec("ASSIGN_RESUME_FROM", f"resume_from={resume_handle!r} -> " + str({k: res.get(k) for k in
-            ("success", "terminal_id", "resumed_from", "worktree", "pins_inherited",
-             "resume_line", "error", "reason", "missing")}))
+        rec(
+            "ASSIGN_RESUME_FROM",
+            f"resume_from={resume_handle!r} -> "
+            + str(
+                {
+                    k: res.get(k)
+                    for k in (
+                        "success",
+                        "terminal_id",
+                        "resumed_from",
+                        "worktree",
+                        "pins_inherited",
+                        "resume_line",
+                        "error",
+                        "reason",
+                        "missing",
+                    )
+                }
+            ),
+        )
         if not res.get("success"):
             # DECISIVE DIAGNOSTIC: dump the post-hibernate DB rows so we see
             # exactly which link is NULL (terminal_identity row present? its
@@ -566,15 +629,18 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             try:
                 ti = conn.execute(
                     "SELECT terminal_id, identity_key, provider_session_id, lifecycle "
-                    "FROM terminal_identity WHERE terminal_id = ?", (worker_id,),
+                    "FROM terminal_identity WHERE terminal_id = ?",
+                    (worker_id,),
                 ).fetchone()
                 by_uuid = conn.execute(
                     "SELECT terminal_id, lifecycle FROM terminal_identity "
-                    "WHERE provider_session_id = ?", (captured_sid,),
+                    "WHERE provider_session_id = ?",
+                    (captured_sid,),
                 ).fetchall()
                 root = conn.execute(
                     "SELECT identity_key, provider_session_id, lifecycle FROM "
-                    "conversation_identity WHERE identity_key = ?", (identity_key,),
+                    "conversation_identity WHERE identity_key = ?",
+                    (identity_key,),
                 ).fetchone()
                 all_ti = conn.execute(
                     "SELECT terminal_id, identity_key, provider_session_id, lifecycle "
@@ -582,9 +648,12 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
                 ).fetchall()
             finally:
                 conn.close()
-            rec("DB_DIAG", f"worker_id={worker_id} captured_sid={captured_sid}\n"
+            rec(
+                "DB_DIAG",
+                f"worker_id={worker_id} captured_sid={captured_sid}\n"
                 f"terminal_identity[worker]={ti}\nby_uuid={by_uuid}\nroot={root}\n"
-                f"ALL terminal_identity={all_ti}")
+                f"ALL terminal_identity={all_ti}",
+            )
             print("\n===F829 DB_DIAG===", flush=True)
             print(f"worker_id={worker_id} captured_sid={captured_sid}", flush=True)
             print(f"terminal_identity[worker]={ti}", flush=True)
@@ -595,7 +664,8 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             _capture_diag(cao_server, f"resume-refused-{provider}")
             _DIAG_DIR.mkdir(parents=True, exist_ok=True)
             (_DIAG_DIR / f"{provider}-resume-refused-diag.txt").write_text(
-                "\n".join(transcript), encoding="utf-8")
+                "\n".join(transcript), encoding="utf-8"
+            )
         assert res.get("success") is True, f"public resume seam failed: {res}"
         resumed_id = res["terminal_id"]
         assert res.get("resumed_from") in (worker_id, identity_key, captured_sid)
@@ -608,24 +678,32 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
             _capture_diag(cao_server, f"resumed-not-ready-{provider}")
             # also copy the subprocess server.log so we see if the resumed
             # claude --resume worker errored in provider init (vs never created).
-            import contextlib as _c2, shutil as _sh2
+            import contextlib as _c2
+            import shutil as _sh2
+
             with _c2.suppress(Exception):
                 _DIAG_DIR.mkdir(parents=True, exist_ok=True)
                 _sh2.copy2(cao_server.log_path, _DIAG_DIR / f"{provider}-resumed-server.log")
             rec("RESUMED_NOT_READY", f"resumed_id={resumed_id} status={_rst}")
             (_DIAG_DIR / f"{provider}-resumed-notready-diag.txt").write_text(
-                "\n".join(transcript), encoding="utf-8")
+                "\n".join(transcript), encoding="utf-8"
+            )
         assert _rst in _READY, f"resumed worker not ready (status={_rst})"
         recall = _drive_turn(
-            api, resumed_id,
+            api,
+            resumed_id,
             "What exact token did I ask you to remember earlier? Reply with ONLY that token.",
         )
         rec("RECALL", recall[-1500:])
         banner = _quota_banner_hit(recall)
         if banner:
             rec("QUOTA", f"banner fragment seen at RECALL: {banner!r}")
-            return {"status": "quota_blocked", "stage": "recall", "banner": banner,
-                    "transcript": transcript}
+            return {
+                "status": "quota_blocked",
+                "stage": "recall",
+                "banner": banner,
+                "transcript": transcript,
+            }
 
         assert token in recall, (
             f"token {token} NOT recalled after public-seam resume; recall tail:\n"
@@ -641,10 +719,15 @@ def _run_public_resume_arm(cao_server: CaoServer, provider: str, profile: str = 
         tpath = artifacts_dir / f"{provider}-arm-transcript.txt"
         tpath.write_text("\n".join(transcript), encoding="utf-8")
 
-        return {"status": "green", "identity_key": identity_key,
-                "resumed_id": resumed_id, "worker_id": worker_id,
-                "shape": shape, "transcript_path": str(tpath),
-                "kiro_foreign": foreign}
+        return {
+            "status": "green",
+            "identity_key": identity_key,
+            "resumed_id": resumed_id,
+            "worker_id": worker_id,
+            "shape": shape,
+            "transcript_path": str(tpath),
+            "kiro_foreign": foreign,
+        }
     finally:
         # If we did not reach a clean green/quota return, snapshot diagnostics
         # (server.log + tmux + panes) before teardown wipes the scratch HOME.

@@ -89,8 +89,16 @@ def evaluate_planned_hibernate(terminal_id: str) -> HibernateDecision:
 
     root = _root_for_terminal(terminal_id)
     if root is None:
-        # No F829 identity → no hibernate contract to enforce; let the ordinary
-        # reap proceed and set no conversation lifecycle.
+        # BOUNDARY (supervisor ruling, Option A scoped): admission —
+        # prepare→claim→RootAdmission and the ``identity_missing`` /
+        # ``resume_not_admitted`` refusals — applies ONLY to a
+        # ``fork_context mode=resume`` request (the resume seam). A COLD reap /
+        # planned hibernate NEVER enters admission, so a terminal with no F829
+        # canonical root has NO hibernate contract to enforce here: let the
+        # ordinary reap proceed and set no conversation lifecycle (pre-A2
+        # behaviour, so the F631 cold-path cascade reporting is unchanged). The
+        # missing-root refusal is emitted at the resume entrance only
+        # (resume_service._prepare_resume_via_identity → resume_not_admitted).
         return HibernateDecision(allowed=True, lifecycle=None)
 
     # A capture_unknown root (kiro/codex pre-capture) has no recoverable identity
@@ -236,8 +244,12 @@ def authorize_and_classify_resume(
 
     key = root["identity_key"]
     owner = root.get("owner_principal")
-    # AUTHORIZE. A NULL owner is NOT open season — it requires an explicit claim.
-    if owner is None or (caller_principal is not None and owner != caller_principal):
+    # AUTHORIZE (A2.2, bypass 1 closed). Refuse when the caller is MISSING, the
+    # owner is MISSING, or they differ. Previously a ``None`` caller_principal
+    # silently passed any non-NULL owner (`caller_principal is not None and …`)
+    # — a request that could not identify itself was authorized. A NULL owner is
+    # also NOT open season: it requires an explicit `cao identity claim`.
+    if caller_principal is None or owner is None or owner != caller_principal:
         return ResumeAdmission(ok=False, identity_key=key, error="resume_not_owner")
 
     # CLASSIFY.

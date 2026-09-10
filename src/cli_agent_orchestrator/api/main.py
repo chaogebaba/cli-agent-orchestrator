@@ -61,6 +61,8 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     TRANSCRIPT_HOOK_BINDING_SOURCES,
+    PrincipalRefused,
+    SeededSessionConflict,
     SessionLocal,
     TerminalModel,
     adopt_mailbox_rows_at_startup,
@@ -217,6 +219,9 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.cell_guard import CellClassForged
+from cli_agent_orchestrator.utils.cell_guard import classify_request as cell_guard_classify_request
+from cli_agent_orchestrator.utils.cell_guard import reconcile_request_class as cell_guard_reconcile
 from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -395,6 +400,16 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
     fork_context: Optional[ForkContext] = None
     refresh_base_name: Optional[str] = None
+    # F829 A2.1: a SEMANTIC RESUME handle. When present the server (not the
+    # client) runs prepare→authorize→claim→create: it resolves the handle to a
+    # conversation root, binds the caller by X-CAO-Terminal-Token, authorizes
+    # ownership, takes the CAS claim, and links the new incarnation to the
+    # claimed root. The MCP shim forwards this handle + overrides + its own
+    # token and does NO client-side resolution/authorization (the deleted MCP
+    # caller-principal shim). ``resume_inherit_pins`` mirrors the
+    # tool default (True).
+    resume_from: Optional[str] = None
+    resume_inherit_pins: bool = True
     authority_files: Optional[List[Dict[str, str]]] = Field(
         default=None,
         description=(
@@ -3792,6 +3807,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
+    cell_request_class: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3882,6 +3898,23 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        # F868/F870 r2 (D4/D5): classify how this operator-facing create selected
+        # its (position, provider) cell so the shared choke point in
+        # create_terminal enforces the right certification asymmetry. A bare
+        # position + provider= (or a composed literal) is EXPLICIT; a bare
+        # position with no provider is ROUTING; a legacy name is untouched.
+        # F868 r4 (codex Stage B r2 EMPIRICAL-NO): the class is DERIVED here from
+        # the request shape and is NOT a value the caller may assert. The trusted
+        # MCP _create_terminal client already classified identically, so its
+        # ``cell_request_class`` query value is accepted only when it AGREES with
+        # the server-derived class; a disagreement (e.g. a POSITION name labelled
+        # ``legacy`` to skip certification) is a typed refusal with zero spawn.
+        _cell_class = cell_guard_reconcile(
+            agent_profile,
+            provider_supplied=provider is not None,
+            supplied_class=cell_request_class,
+        )
+
         create_kwargs: Dict[str, Any] = dict(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -3900,6 +3933,7 @@ async def create_session(
             metadata=body.metadata if body else None,
             terminal_id=terminal_id,
             is_box_hosted=is_box_hosted,
+            cell_request_class=_cell_class,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -3948,6 +3982,20 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except CellClassForged as e:
+        # F868 r4: a caller-supplied cell_request_class disagreed with the class
+        # the server derives from the request shape (e.g. a POSITION name sent
+        # with cell_request_class=legacy to skip certification). Refuse with a
+        # typed 403 BEFORE any create — zero spawn, zero claim.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": e.code,
+                "message": e.message,
+                "derived": e.derived,
+                "supplied": e.supplied,
+            },
+        ) from e
     except MailboxDomainError as e:
         raise _mailbox_http_exception(e) from e
     except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as e:
@@ -3994,6 +4042,10 @@ async def start_session_endpoint(
             agent_profile, fallback_provider="kiro_cli"
         )
         require_provider_admitted(resolved_provider)
+        # F868/F870 r2 (D4/D5): classify the operator-facing cell selection.
+        _cell_class = cell_guard_classify_request(
+            agent_profile, provider_supplied=provider is not None
+        )
         result = await session_service.start_session(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -4005,6 +4057,7 @@ async def start_session_endpoint(
             allow_incomplete_brief=allow_incomplete_brief,
             terminal_id=terminal_id,
             is_box_hosted=is_box_hosted,
+            cell_request_class=_cell_class,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -4033,6 +4086,12 @@ async def start_session_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "provider_init_timeout", "message": str(exc)},
         ) from exc
+    except ValueError as exc:
+        # F868/F870 r2 (D4/B3): a cell-guard refusal (E-CELL-UNCERTIFIED /
+        # E-COMPOSITION-MISSING) reaches here as a ValueError carrying the typed
+        # code; surface it as a typed 400 so the operator sees the same code the
+        # MCP envelope uses, with NO terminal created.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except RuntimeError as exc:
         code = str(exc)
         if code in {
@@ -4409,6 +4468,187 @@ async def delete_session(
         )
 
 
+def _f829_verify_caller_binding(request: Request, caller_id: Optional[str]) -> None:
+    """F829 A2.1: bind the resume caller to its X-CAO-Terminal-Token.
+
+    Scope is NEVER identity (api/main.py F707 precedent): a write-scope holder
+    is not thereby the caller it names. The resume request must present the
+    F332 ``X-CAO-Terminal-Token`` of the terminal named by ``caller_id``.
+
+    * no token at all → ``caller_token_missing`` (retryable true), logged as a
+      caller CONFIGURATION fault (an F352 shim that could not read its token),
+      NEVER reported as spoofing.
+    * a token that does not verify ``caller_id`` → ``caller_unverified``
+      (retryable false): the caller named a terminal other than the one its
+      token proves. The operator-bearer bypass is deliberately NOT mirrored.
+    """
+    presented = request.headers.get("x-cao-terminal-token")
+    if not presented:
+        logger.info(
+            "F829 resume: caller_token_missing for caller_id=%s (caller configuration fault)",
+            caller_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": "caller_token_missing",
+                "retryable": True,
+                "how": (
+                    "present the caller terminal's $CAO_TERMINAL_TOKEN as the "
+                    "X-CAO-Terminal-Token header (caller configuration fault)"
+                ),
+                "message": "resume_refused (missing identity): caller_token_missing",
+            },
+        )
+    with SessionLocal() as _db:
+        from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
+
+        ok, _code = verify_sender_token(_db, caller_id or "", presented)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": "caller_unverified",
+                "retryable": False,
+                "how": (
+                    "caller_id names a terminal other than the one its "
+                    "X-CAO-Terminal-Token verifies; a resume caller cannot be "
+                    "spoofed by scope alone"
+                ),
+                "message": "resume_refused (missing identity): caller_unverified",
+            },
+        )
+
+
+async def _f829_admit_resume(
+    *,
+    request: Request,
+    caller_id: Optional[str],
+    resume_handle: str,
+    requested_agent_profile: str,
+    requested_working_directory: Optional[str],
+    inherit_pins: bool,
+    authority_files: Optional[List[Dict[str, str]]],
+) -> Tuple[Any, Optional[str], Dict[str, Any]]:
+    """F829 A2.1: SERVER-SIDE resume admission — prepare → authorize → claim.
+
+    Returns ``(link_admission, claimed_identity_key, overrides)``:
+      * ``link_admission`` — a ``RootAdmission(mode="link", identity_key=…)`` to
+        pass to ``terminal_service.create_terminal`` so the new incarnation is
+        LINKED to the claimed root (no new root minted).
+      * ``claimed_identity_key`` — the key whose CAS claim was taken, so the
+        create handler can compensate it on any post-claim failure (A2.5).
+      * ``overrides`` — provider/agent_profile/working_directory/fork_context/
+        authority_files resolved from the root; these WIN over the client's
+        guesses.
+
+    Every refusal is raised as an ``HTTPException`` whose ``detail`` is the D3
+    six-category envelope, relayed verbatim by the shim. The caller is bound by
+    its token FIRST (A2.1) — a request that cannot prove its caller identity
+    never reaches prepare/authorize.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        RootAdmission,
+        principal_for_terminal,
+    )
+    from cli_agent_orchestrator.services.conversation_transition import (
+        claim_resume_admission,
+    )
+    from cli_agent_orchestrator.services.resume_service import ResumeRefused, prepare_resume
+
+    # (1) BIND the caller by token — scope is never identity.
+    _f829_verify_caller_binding(request, caller_id)
+
+    # (2) Resolve the caller's OWN durable principal server-side (A2.1), the same
+    # derivation mint uses. A refusal here is an identity refusal.
+    with SessionLocal() as _db:
+        principal = principal_for_terminal(caller_id, db=_db)
+    if not principal.ok:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": principal.error or "principal_unavailable",
+                "retryable": principal.retryable,
+                "how": "the caller's own durable principal could not be resolved",
+                "message": (f"resume_refused (missing identity): {principal.error}"),
+            },
+        )
+
+    # (3) PREPARE + AUTHORIZE (owner_principal == caller principal), no claim yet.
+    try:
+        prepared = prepare_resume(
+            resume_from=resume_handle,
+            requested_agent_profile=requested_agent_profile,
+            requested_working_directory=requested_working_directory,
+            inherit_pins=inherit_pins,
+            caller_principal=principal.principal,
+        )
+    except ResumeRefused as refusal:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "resume_refused",
+                **refusal.as_dict(),
+                "message": f"resume_refused (missing {refusal.missing}): {refusal.how}",
+            },
+        )
+
+    # r1 #5: inherit_pins=False while the reaped terminal HAD pins requires the
+    # caller to re-declare equivalent authority_files, else the continuation runs
+    # unpinned. Refuse (missing=profile) — same rule as the old shim.
+    if not inherit_pins and prepared.get("known_pins") and not authority_files:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "resume_refused",
+                "missing": "profile",
+                "reason": "pins_dropped_without_replacement",
+                "retryable": False,
+                "how": (
+                    "the reaped terminal had frozen authority pins; pass "
+                    "resume_inherit_pins=true or equivalent authority_files"
+                ),
+                "message": "resume_refused (missing profile): frozen pins would be dropped",
+            },
+        )
+
+    # (4) CLAIM (CAS) before any spawn effect. A lost CAS spawns nothing.
+    admission = prepared["admission"]
+    claimed = claim_resume_admission(admission, claimant=(caller_id or "unknown"))
+    if not claimed.ok:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": claimed.error or "session_resume_in_progress",
+                "retryable": True,
+                "identity_key": admission.identity_key,
+                "how": (
+                    "another resume of this conversation is in progress; retry "
+                    "once it settles or is reconciled by the claim TTL"
+                ),
+                "message": "resume_refused (missing identity): session_resume_in_progress",
+            },
+        )
+
+    link = RootAdmission(mode="link", identity_key=str(prepared["identity_key"]))
+    overrides: Dict[str, Any] = {
+        "provider": prepared.get("provider"),
+        "agent_profile": prepared.get("agent_profile"),
+        "working_directory": prepared.get("working_directory"),
+        "fork_context": prepared.get("fork_context"),
+        "authority_files": (prepared.get("authority_files") if inherit_pins else authority_files),
+    }
+    return link, str(prepared["identity_key"]), overrides
+
+
 @app.post(
     "/sessions/{session_name}/terminals",
     response_model=Terminal,
@@ -4428,6 +4668,7 @@ async def create_terminal_in_session(
     use_worktree: Optional[bool] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
+    cell_request_class: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4476,6 +4717,13 @@ async def create_terminal_in_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     _admit_supplied_terminal_id(terminal_id)
+    # F868 r4: capture the request shape the CALLER named, before resume
+    # admission overwrites agent_profile/provider from the reaped root. The
+    # server-derived cell class (and the forged-class refusal) is computed from
+    # what the caller actually sent, mirroring the MCP _assign_impl client's own
+    # classification (_resume_override = a position name supplied on resume).
+    _orig_agent_profile = agent_profile
+    _orig_provider_supplied = provider is not None
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -4524,47 +4772,257 @@ async def create_terminal_in_session(
                 )
 
         fork_context = body.fork_context if body else None
-        if fork_context is None:
-            fork_context = await terminal_service.seed_resume_bootstrap(
-                agent_profile, resolved_provider, working_directory or os.getcwd()
+        _resume_handle = body.resume_from if body else None
+        # F829 A2 (r5, codex r4 EMPIRICAL-NO): capture request-field PRESENCE
+        # BEFORE the value above is erased. Pydantic keeps the distinction the
+        # value cannot: an omitted field leaves an empty ``model_fields_set``
+        # ({} → cold create), while an EXPLICIT ``{"resume_from": null}`` puts
+        # "resume_from" IN ``model_fields_set`` even though its value is None.
+        # The route previously erased that distinction here and then classified
+        # on the None value alone, so an explicit null silently degraded into a
+        # cold spawn — the exact D3/AC2 class this amendment refuses.
+        _resume_field_present = bool(body is not None and "resume_from" in body.model_fields_set)
+        _f829_link_admission = None
+        _f829_claimed_key: Optional[str] = None
+        _f829_resume_overrides: Dict[str, Any] = {}
+
+        # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
+        # truthiness. A present-but-blank handle ({"resume_from": ""} or all
+        # whitespace) OR an explicitly present null ({"resume_from": null},
+        # r5) is an EXPLICIT malformed resume request — it must be a typed
+        # refusal, never silently degrade to a cold create the way an
+        # `if _resume_handle:` truthiness gate would (empty string and None are
+        # both falsy). This invents NO new policy branch (D3): it is the SAME
+        # missing="identity"/resume_refused category the server already emits at
+        # the resume entrance, distinguished only by the `resume_handle_blank`
+        # reason label. A field that is ABSENT (not in model_fields_set) is a
+        # genuine cold create and is left untouched.
+        if _resume_field_present and (_resume_handle is None or not _resume_handle.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": "resume_handle_blank",
+                    "retryable": False,
+                    "how": (
+                        "resume_from was supplied but null/empty/blank; pass a "
+                        "non-empty handle (terminal id or uuid) or omit the "
+                        "field entirely for a cold create"
+                    ),
+                    "message": "resume_refused (missing identity): resume_handle_blank",
+                },
             )
-        result = await terminal_service.create_terminal(
-            provider=resolved_provider,
-            agent_profile=agent_profile,
-            session_name=session_name,
-            new_session=False,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools_list,
-            registry=get_plugin_registry(request),
-            caller_id=caller_id,
-            defer_init=defer_init,
-            initial_message=initial_message,
-            initial_message_orchestration_type=orch_type,
-            park_warm=body.park_warm if body else False,
-            lifecycle=body.lifecycle if body else None,
-            fork_context=fork_context,
-            refresh_base_name=body.refresh_base_name if body else None,
-            dispatch_barrier=(
-                {
-                    "label": body.barrier,
-                    "timeout_seconds": body.barrier_timeout_seconds,
-                    "member_key": body.barrier_member_key,
-                }
-                if body and body.barrier is not None
-                else None
-            ),
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-            authority_files=body.authority_files if body else None,
-            terminal_id=terminal_id,
-            is_box_hosted=is_box_hosted,
-        )
+
+        if _resume_handle:
+            # F829 A2.1: SERVER-SIDE resume admission (prepare→authorize→claim).
+            # The caller is bound by its X-CAO-Terminal-Token, NOT by a
+            # client-asserted principal (the deleted shim). Everything the resume
+            # needs is resolved here from the root; the client's provider/profile/
+            # cwd guesses are overridden by the prepared result.
+            (
+                _f829_link_admission,
+                _f829_claimed_key,
+                _f829_resume_overrides,
+            ) = await _f829_admit_resume(
+                request=request,
+                caller_id=caller_id,
+                resume_handle=_resume_handle,
+                requested_agent_profile=agent_profile,
+                requested_working_directory=working_directory,
+                inherit_pins=(body.resume_inherit_pins if body else True),
+                authority_files=(body.authority_files if body else None),
+            )
+            # Overrides win: provider/profile/cwd/fork_context come from the root.
+            resolved_provider = _f829_resume_overrides.get("provider") or resolved_provider
+            agent_profile = _f829_resume_overrides.get("agent_profile") or agent_profile
+            working_directory = _f829_resume_overrides.get("working_directory") or working_directory
+            fork_context = _f829_resume_overrides.get("fork_context")
+        else:
+            # A2.3: a RAW client-supplied fork_context in resume mode with NO CAO
+            # admission is refused — a resume must go through the admission above,
+            # never straight into create. A seed context (base_name == "seed")
+            # is a FRESH bootstrap, not a resume, and is allowed.
+            if (
+                fork_context is not None
+                and getattr(fork_context, "mode", None) == "resume"
+                and getattr(fork_context, "base_name", None) != "seed"
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "resume_refused",
+                        "missing": "identity",
+                        "reason": "resume_not_admitted",
+                        "retryable": False,
+                        "how": (
+                            "a raw fork_context resume is not admitted; pass "
+                            "resume_from=<handle> so the server authorizes and "
+                            "claims the conversation"
+                        ),
+                        "message": "resume_refused (missing identity): resume_not_admitted",
+                    },
+                )
+            if fork_context is None:
+                fork_context = await terminal_service.seed_resume_bootstrap(
+                    agent_profile, resolved_provider, working_directory or os.getcwd()
+                )
+        # F868 r4 (codex Stage B r2 EMPIRICAL-NO): DERIVE the cell class from the
+        # request shape the caller named and REFUSE a forged override. Before r4
+        # this route passed the caller's ``cell_request_class`` query param to
+        # create_terminal verbatim, so a POSITION name sent with
+        # ``cell_request_class=legacy`` reached the guard's legacy passthrough and
+        # skipped certification (also on a resume create). The class is now a pure
+        # function of (agent_profile shape, provider presence, resume state); the
+        # trusted MCP _assign_impl client already classifies identically, so its
+        # value is accepted only when it AGREES. A disagreement is a typed refusal
+        # raised HERE — after any resume claim is compensated by the except below.
+        _is_resume = bool(_resume_handle)
+        # Reference _position_exists through the module (not a bound import) so
+        # the same runtime store the guard uses is consulted, and so tests that
+        # patch it are honoured. A bare POSITION name supplied on resume is the
+        # caller's EXPLICIT cell choice (mirrors _assign_impl's _resume_override).
+        from cli_agent_orchestrator.utils import agent_profiles as _ap
+
+        _resume_override = _is_resume and _ap._position_exists(_orig_agent_profile)
+        try:
+            _cell_class = cell_guard_reconcile(
+                _orig_agent_profile,
+                provider_supplied=_orig_provider_supplied,
+                is_resume=_is_resume,
+                resume_override=_resume_override,
+                supplied_class=cell_request_class,
+            )
+        except CellClassForged:
+            # Compensate a taken resume claim before surfacing the refusal — a
+            # leaked claim would wedge the conversation until its TTL.
+            if _f829_claimed_key is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import clear_resume_claim
+
+                    clear_resume_claim(_f829_claimed_key, event="resume_failed")
+                except Exception:
+                    logger.warning(
+                        "F868 r4: claim compensation failed for %s",
+                        _f829_claimed_key,
+                        exc_info=True,
+                    )
+            raise
+        try:
+            result = await terminal_service.create_terminal(
+                provider=resolved_provider,
+                agent_profile=agent_profile,
+                session_name=session_name,
+                new_session=False,
+                working_directory=working_directory,
+                allowed_tools=allowed_tools_list,
+                registry=get_plugin_registry(request),
+                caller_id=caller_id,
+                defer_init=defer_init,
+                initial_message=initial_message,
+                initial_message_orchestration_type=orch_type,
+                park_warm=body.park_warm if body else False,
+                lifecycle=body.lifecycle if body else None,
+                fork_context=fork_context,
+                refresh_base_name=body.refresh_base_name if body else None,
+                dispatch_barrier=(
+                    {
+                        "label": body.barrier,
+                        "timeout_seconds": body.barrier_timeout_seconds,
+                        "member_key": body.barrier_member_key,
+                    }
+                    if body and body.barrier is not None
+                    else None
+                ),
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                authority_files=(
+                    _f829_resume_overrides.get("authority_files")
+                    if _resume_handle
+                    else (body.authority_files if body else None)
+                ),
+                terminal_id=terminal_id,
+                is_box_hosted=is_box_hosted,
+                cell_request_class=_cell_class,
+                root_admission=_f829_link_admission,
+            )
+        except BaseException:
+            # F829 A2.5: ANY failure AFTER the resume claim was taken must
+            # COMPENSATE it — a leaked claim would wedge the conversation as
+            # session_resume_in_progress until the TTL. The create's own
+            # abort/compensate unwinds the row; here we release the claim the
+            # admission took. resumed_by is stamped only once the incarnation
+            # exists (publish_current_terminal on the verify path), so a failed
+            # spawn leaves NO claim and NO resumed_by.
+            if _f829_claimed_key is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import clear_resume_claim
+
+                    clear_resume_claim(_f829_claimed_key, event="resume_failed")
+                except Exception:
+                    logger.warning(
+                        "F829 A2.5: claim compensation failed for %s",
+                        _f829_claimed_key,
+                        exc_info=True,
+                    )
+            raise
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except CellClassForged as _forged:
+        # F868 r4: the caller-supplied cell_request_class disagreed with the
+        # server-derived class (e.g. a POSITION name sent with
+        # cell_request_class=legacy, or a forged class on a resume_from create).
+        # Any taken resume claim was already compensated at the raise site.
+        # Typed 403, zero spawn.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": _forged.code,
+                "message": _forged.message,
+                "derived": _forged.derived,
+                "supplied": _forged.supplied,
+            },
+        ) from _forged
+    except (PrincipalRefused, SeededSessionConflict) as _f829_exc:
+        # F829 A2.3: a root-admission refusal from the create transaction
+        # (a fresh seeded-uuid collision, or an unresolvable owner principal)
+        # is a typed IDENTITY refusal, not a 500. The create's own
+        # abort/compensate already unwound the row.
+        if isinstance(_f829_exc, SeededSessionConflict):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "resume_refused",
+                    "missing": "identity",
+                    "reason": "session_identity_conflict",
+                    "retryable": False,
+                    "how": (
+                        "the seeded session id already belongs to another "
+                        "conversation; re-seed a fresh id"
+                    ),
+                    "message": "resume_refused (missing identity): session_identity_conflict",
+                },
+            ) from _f829_exc
+        # PrincipalRefused
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "resume_refused",
+                "missing": "identity",
+                "reason": getattr(_f829_exc, "result", None)
+                and _f829_exc.result.error
+                or "principal_unavailable",
+                "retryable": bool(
+                    getattr(_f829_exc, "result", None) and _f829_exc.result.retryable
+                ),
+                "how": "the seat's own durable principal could not be resolved at mint",
+                "message": "resume_refused (missing identity): principal_refused",
+            },
+        ) from _f829_exc
     except TerminalCapExceeded as e:
         # F439 (#294): the worker-terminal cap refused BEFORE any resource was
         # created. 409 Conflict with the structured E-TERMINAL-CAP detail (code,
@@ -4604,6 +5062,10 @@ async def create_terminal_in_session(
         if str(e).startswith(
             ("invalid_working_directory: ", "invalid_barrier", "barrier_", "ambiguous_barrier")
         ):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        # F868/F870 r2 (D4/B3): a cell-guard refusal is a bad request (typed
+        # code, no resource created), NOT a missing session — 400, not 404.
+        if "E-CELL-UNCERTIFIED" in str(e) or "E-COMPOSITION-MISSING" in str(e):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:

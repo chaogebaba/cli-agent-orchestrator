@@ -174,33 +174,6 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
-def _f829_resolve_caller_principal() -> Optional[str]:
-    """F829 D3: the caller's DURABLE principal for resume authorization.
-
-    The owner_principal stored on a conversation root is the seat's durable
-    mailbox id (the migration set it from ``terminals.caller_mailbox_id``), NOT a
-    disposable terminal id. Resolve THIS caller's mailbox the same way: read the
-    current terminal's metadata over HTTP and return its ``caller_mailbox_id``.
-    Falls back to the terminal id when no mailbox is recorded (a top-level
-    supervisor), and to None when there is no terminal at all. Best-effort: a
-    lookup failure returns None (authorize then treats it as not-owner, which is
-    the safe default — a resume is refused rather than wrongly granted).
-    """
-    terminal_id = _current_terminal_id()
-    if not terminal_id:
-        return None
-    try:
-        resp = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
-        resp.raise_for_status()
-        meta = resp.json()
-        principal = meta.get("caller_mailbox_id")
-        if isinstance(principal, str) and principal:
-            return principal
-        return terminal_id
-    except Exception:
-        return None
-
-
 def _refresh_terminal_token_from_pane() -> Optional[str]:
     """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
 
@@ -773,6 +746,9 @@ def _create_terminal(
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     provider: Optional[str] = None,
+    cell_request_class: str = "explicit",
+    resume_from: Optional[str] = None,
+    resume_inherit_pins: bool = True,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -850,6 +826,11 @@ def _create_terminal(
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
+        # F868/F870 r2 (D4/D5): tell the server-side choke point how this cell
+        # was selected so it applies the right certification asymmetry. assign
+        # already ran the guard client-side (adapter below); the server call is
+        # the shared backstop that also covers direct HTTP.
+        params["cell_request_class"] = cell_request_class
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
@@ -892,12 +873,47 @@ def _create_terminal(
             if authority_files is not None:
                 json_body["authority_files"] = authority_files
 
-        response = cao_http.post(
-            f"/sessions/{session_name}/terminals",
-            params=params,
-            json=json_body,
-            timeout=_mcp_timeout(),
-        )
+        # F829 A2.1 (r3, verdict SHOULD-2): a SEMANTIC RESUME forwards the raw
+        # handle + overrides so the SERVER runs prepare→authorize→claim→create.
+        # This MUST land in the body REGARDLESS of ``defer_init`` — otherwise a
+        # ``defer_init=False`` resume carried no ``resume_from`` and degraded
+        # SILENTLY into a cold create (no handle, no admission, no refusal). The
+        # blueprint A2.1 forwards the handle unconditionally (it is not gated on
+        # any unrelated flag), and D3 forbids inventing a new refusal token, so
+        # we carry it rather than refuse a defer_init=False resume. The shim does
+        # NO client-side resolution/authorization.
+        if resume_from is not None:
+            json_body = json_body or {}
+            json_body["resume_from"] = resume_from
+            json_body["resume_inherit_pins"] = resume_inherit_pins
+
+        # F829 A2.1: bind the caller by its own terminal token so the server can
+        # verify caller_id (verify_sender_token). Sent on the resume path; on the
+        # cold path it is harmless (the create route does not require it). The
+        # token is the terminal's own $CAO_TERMINAL_TOKEN.
+        _f829_headers = None
+        if resume_from is not None:
+            _f829_token = (
+                os.environ.get("CAO_TERMINAL_TOKEN") or _refresh_terminal_token_from_pane()
+            )
+            if _f829_token:
+                _f829_headers = {"X-CAO-Terminal-Token": _f829_token}
+
+        if _f829_headers is not None:
+            response = cao_http.post(
+                f"/sessions/{session_name}/terminals",
+                params=params,
+                json=json_body,
+                headers=_f829_headers,
+                timeout=_mcp_timeout(),
+            )
+        else:
+            response = cao_http.post(
+                f"/sessions/{session_name}/terminals",
+                params=params,
+                json=json_body,
+                timeout=_mcp_timeout(),
+            )
         response.raise_for_status()
         terminal = response.json()
     else:
@@ -922,6 +938,11 @@ def _create_terminal(
             "agent_profile": agent_profile,
             "session_name": session_name,
         }
+        # F868/F870 r2 (D4/D5): carry the caller's cell classification onto the
+        # new-session route too, so a routing-driven assign that lands here (no
+        # CAO_TERMINAL_ID) is not re-classified EXPLICIT from its resolved
+        # composed-literal name.
+        params["cell_request_class"] = cell_request_class
         if working_directory:
             params["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -2480,6 +2501,10 @@ def _assign_impl(
     # (fork/worktree/supervisor cwd) rewrites it — a remote node interprets the
     # path on its own filesystem, where the resolved one does not exist.
     _requested_working_directory = working_directory
+    # F868/F870 r2 (D5c): snapshot the caller's ORIGINAL agent_profile before any
+    # resume/routing resolution overwrites it, so a bare-position override on
+    # resume can be distinguished from an ordinary continuation.
+    _caller_agent_profile = agent_profile
     terminal_id: Optional[str] = None
     # F754 (#611): a brief citing a dead seat id must not spawn a worker that
     # then has nowhere to report. Checked before the profile/provider
@@ -2510,6 +2535,28 @@ def _assign_impl(
             "how": "pass resume_from OR (legacy) fork_from+resume=True, not both",
             "message": "resume_refused: resume_from conflicts with fork_from/resume",
         }
+    # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
+    # truthiness. A present-but-blank handle (resume_from="" or all whitespace)
+    # is an EXPLICIT malformed resume request; the truthiness gate below would
+    # let it fall through to a COLD create (no handle, no admission, no
+    # refusal). Refuse it here with ZERO spawn — the create endpoint below is
+    # never reached. Same missing="identity"/resume_refused category the server
+    # emits (no new D3 policy branch); a wholly ABSENT field (None) stays a
+    # genuine cold create.
+    if resume_from is not None and not resume_from.strip():
+        return {
+            "success": False,
+            "terminal_id": None,
+            "error": "resume_refused",
+            "missing": "identity",
+            "reason": "resume_handle_blank",
+            "retryable": False,
+            "how": (
+                "resume_from was supplied but empty/blank; pass a non-empty "
+                "handle (terminal id or uuid) or omit it for a cold assign"
+            ),
+            "message": "resume_refused: resume_from is empty/blank",
+        }
     if resume_from:
         _resume_handle = resume_from
     elif resume and fork_from:
@@ -2528,75 +2575,19 @@ def _assign_impl(
             "message": "resume_refused: resume=True requires a resume handle",
         }
     if _resume_handle:
-        from cli_agent_orchestrator.services.resume_service import (
-            ResumeRefused,
-            prepare_resume,
-        )
+        # F829 A2.1 (Option A, scoped): the SHIM does NO client-side resolution
+        # or authorization anymore. It marks the assign as a resume and forwards
+        # the raw handle + overrides + its own terminal token to the create
+        # endpoint, where the SERVER runs prepare→authorize→claim→create bound to
+        # the caller's X-CAO-Terminal-Token. The typed refusal envelope (owner,
+        # token, claim, admission) is relayed verbatim by the create POST's
+        # error path below. ``_resume_prepared`` is a lightweight marker only.
+        _resume_prepared = {
+            "via_server": True,
+            "resume_from": _resume_handle,
+            "resumed_from": _resume_handle,
+        }
 
-        try:
-            _resume_prepared = prepare_resume(
-                resume_from=_resume_handle,
-                requested_agent_profile=agent_profile or None,
-                requested_working_directory=working_directory,
-                inherit_pins=inherit_pins,
-                caller_principal=_f829_resolve_caller_principal(),
-            )
-        except ResumeRefused as refusal:
-            return {
-                "success": False,
-                "terminal_id": None,
-                **refusal.as_dict(),
-                "message": f"resume_refused (missing {refusal.missing}): {refusal.how}",
-            }
-        # r1 #5: inherit_pins=False when the reaped terminal HAD frozen pins
-        # requires the caller to re-declare equivalent authority_files; else the
-        # continuation would run unpinned. Refuse with missing="profile".
-        if not inherit_pins and _resume_prepared.get("known_pins") and not authority_files:
-            return {
-                "success": False,
-                "terminal_id": None,
-                "error": "resume_refused",
-                "missing": "profile",
-                "reason": "pins_dropped_without_replacement",
-                "retryable": False,
-                "how": (
-                    "the reaped terminal had frozen authority pins; pass "
-                    "inherit_pins=True or equivalent authority_files= to re-pin"
-                ),
-                "message": "resume_refused (missing profile): frozen pins would be dropped",
-            }
-        # Adopt the resolved profile so downstream logging/labels are correct;
-        # position/routing machinery is skipped entirely below.
-        agent_profile = _resume_prepared["agent_profile"]
-        # F829 A1 (D3 step 4): for an identity-root resume, TAKE THE CAS CLAIM
-        # now — before any spawn effect. A lost CAS (another claimant or a moved
-        # generation) refuses with session_resume_in_progress and spawns nothing.
-        # The claim is held until the resumed worker reports its id, where
-        # attach_captured_uuid runs verify+publish and clears it (D3 steps 6-7);
-        # a dead attempt is reconciled by the claim TTL (D8).
-        if _resume_prepared.get("via_identity"):
-            from cli_agent_orchestrator.services.conversation_transition import (
-                claim_resume_admission,
-            )
-
-            _admission = _resume_prepared["admission"]
-            _claimant = _current_terminal_id() or "unknown"
-            _claimed = claim_resume_admission(_admission, claimant=_claimant)
-            if not _claimed.ok:
-                return {
-                    "success": False,
-                    "terminal_id": None,
-                    "error": "resume_refused",
-                    "missing": "identity",
-                    "reason": _claimed.error or "session_resume_in_progress",
-                    "retryable": True,
-                    "identity_key": _admission.identity_key,
-                    "how": (
-                        "another resume of this conversation is in progress; "
-                        "retry once it settles or is reconciled by the claim TTL"
-                    ),
-                    "message": "resume_refused (missing identity): session_resume_in_progress",
-                }
     # F754 scope add: a legacy provider-named profile must not contradict the
     # routing store. Checked on the ORIGINAL argument, before resolution
     # rewrites a position name into a profile.
@@ -2616,30 +2607,108 @@ def _assign_impl(
         # apply, never the cert/fallback validator. Detect the routing-driven
         # case BEFORE resolution mutates ``agent_profile``.
         from cli_agent_orchestrator.utils.agent_profiles import (
+            E_PROVIDER_NOT_ALLOWED as E_PROVIDER_NOT_ALLOWED_CODE,
+        )
+        from cli_agent_orchestrator.utils.agent_profiles import (
             AssignmentResolutionError,
             _position_exists,
             resolve_assignment_target,
         )
 
         if _resume_prepared:
-            # Resume path: provider comes from the reaped identity; no position
-            # or routing resolution runs. agent_profile is already the resolved
-            # profile from the identity (or the caller's explicit override).
-            _resolved_provider = _resume_prepared["provider"]
+            # Resume path (A2.1 Option A): the SERVER resolves provider + profile
+            # + cwd from the reaped identity and OVERRIDES whatever the shim
+            # sends, so the shim does no position/routing resolution. It forwards
+            # the caller's provider hint (possibly None) unchanged; the create
+            # endpoint replaces it from the root.
+            _resolved_provider = provider
             _routing_driven = False
             _routing_position = None
+            _position_assign = False
+            _provider_source: Optional[str] = None
             _fallback_profile: Optional[str] = None
             _d9_position: Optional[str] = None
             _d9_cell: Optional[str] = None
+            # F868/F870 r2 (D5c): resume is a ROUTING-EQUIVALENT continuation of a
+            # prior spawn — non-gate uncertified allowed with the marker, gate
+            # uncertified refused. A caller-supplied bare-POSITION name on resume
+            # (the caller explicitly named a position, rather than letting the
+            # reaped identity decide the profile) is the caller's EXPLICIT cell
+            # choice and must be PASS-certified. A plain resume (no such override,
+            # or a legacy/composed name) stays routing-equivalent.
+            _resume_override = bool(
+                _caller_agent_profile and _position_exists(_caller_agent_profile)
+            )
+            _cell_request_class = "explicit" if _resume_override else "resume"
+            # Merge (r6): main's F838 (#695) guard-checked provider is initialized
+            # only in the else (non-resume) branch below, but both branches
+            # converge on the shared _create_terminal call whose
+            # ``provider=_resolved_provider or _f838_checked_provider`` reads it.
+            # The resume path re-resolves provider server-side from the reaped
+            # root, so the legacy-alias guard does not apply here; initialize the
+            # carrier to None so the resume path forwards the caller's provider
+            # hint unchanged (provider or None == provider) and never raises
+            # UnboundLocalError.
+            _f838_checked_provider: Optional[str] = None
         else:
-            _routing_driven = provider is None and _position_exists(agent_profile)
-            _routing_position = agent_profile if _routing_driven else None
+            # F868 #724 — a POSITION-name assign is certification-driven whether
+            # the provider comes from routing.toml (``provider is None``) OR is an
+            # explicit operator override (``provider=`` given). The old
+            # ``_routing_driven`` gated the cert/allowlist block on
+            # ``provider is None`` ONLY, so an explicit ``provider=`` on a
+            # position name BYPASSED resolve_routing_binding and every cell check.
+            # ``_position_assign`` captures the position-name case for BOTH; the
+            # explicit-provider narrowing is recorded in ``_provider_source`` and
+            # surfaced in the assign result.
+            _position_assign = _position_exists(agent_profile)
+            _provider_source = "explicit" if (provider is not None and _position_assign) else None
+            _routing_driven = provider is None and _position_assign
+            _routing_position = agent_profile if _position_assign else None
+            # F868/F870 r2 (D5): the class threaded to the server-side choke point
+            # backstop. EXPLICIT when the operator supplied provider= on a
+            # position; ROUTING when a bare position resolves its provider from
+            # routing.toml; LEGACY otherwise (no cell).
+            if _position_assign:
+                _cell_request_class = "explicit" if _provider_source == "explicit" else "routing"
+            else:
+                _cell_request_class = "legacy"
 
             try:
                 agent_profile, _resolved_provider = resolve_assignment_target(
                     agent_profile, provider
                 )
             except AssignmentResolutionError as exc:
+                # F868 #724 r2 (B1): an EXPLICIT position override whose provider
+                # is not in the position allowlist must collapse to the ONE typed
+                # E-CELL-UNCERTIFIED (naming position, provider, certified cells)
+                # — never leak E-PROVIDER-NOT-ALLOWED for a position request. The
+                # allowlist check moves INSIDE the shared choke point, which runs
+                # it after position parsing and returns E-CELL-UNCERTIFIED. Route
+                # ONLY the allowlist rejection through the guard; other resolution
+                # errors (unknown position, needs-provider, retired legacy) keep
+                # their own message.
+                if (
+                    _provider_source == "explicit"
+                    and getattr(exc, "code", None) == E_PROVIDER_NOT_ALLOWED_CODE
+                    and provider is not None
+                ):
+                    from cli_agent_orchestrator.utils.cell_guard import (
+                        CellGuardRefused,
+                        guard_cell_admission,
+                    )
+
+                    try:
+                        guard_cell_admission(
+                            _routing_position or _caller_agent_profile,
+                            provider,
+                            request_class="explicit",
+                        )
+                    except CellGuardRefused as _refusal:
+                        return {
+                            "success": False,
+                            "terminal_id": None,
+                            "message": f"Assignment refused (no spawn): {_refusal.message}",
+                        }
                 return {
                     "success": False,
                     "terminal_id": None,
@@ -2758,13 +2827,44 @@ def _assign_impl(
                     # the mutable store between guard and create). _resolved_provider
                     # stays None (legacy passthrough) so no position machinery fires.
                     _f838_checked_provider = _checked
-        if not _resume_prepared and _routing_driven and _resolved_provider:
+        if not _resume_prepared and _position_assign and _resolved_provider:
             from cli_agent_orchestrator.constants import positions_store_dir, routing_toml_path
             from cli_agent_orchestrator.utils.routing import (
+                E_CELL_UNCERTIFIED,
                 RoutingError,
+                certified_cells_for_position,
                 load_routing_table,
                 resolve_routing_binding,
             )
+
+            # F868 #724 — run the SAME cell-certification path for BOTH the
+            # routing-driven spawn (provider from routing.toml) AND an explicit
+            # ``provider=`` operator override. resolve_routing_binding is called
+            # with the RESOLVED provider as the cell provider either way, so an
+            # explicit provider narrows the candidate cell but never bypasses
+            # provider-cert / row-clause / cell-cert. The routing.toml binding is
+            # NOT overridden silently: an explicit provider differing from the
+            # bound one is allowed only if THAT cell is certified — otherwise the
+            # E-CELL-UNCERTIFIED refusal below fires with no spawn.
+            _pos_dir = positions_store_dir()
+            # _position_assign guarantees _routing_position is set (it is
+            # agent_profile in that branch); narrow it for mypy so the cert
+            # helpers receive a concrete ``str`` (F868 typing parity).
+            assert _routing_position is not None
+
+            def _cell_uncertified_refusal(_detail: str) -> Dict[str, Any]:
+                _cells = certified_cells_for_position(_routing_position, _pos_dir)
+                _cells_txt = ", ".join(_cells) if _cells else "none"
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "message": (
+                        f"Assignment refused (no spawn): {E_CELL_UNCERTIFIED}: "
+                        f"position '{_routing_position}' provider "
+                        f"'{_resolved_provider}' is not a certified cell "
+                        f"(certified cells: {_cells_txt}). {_detail}"
+                    ),
+                }
 
             try:
                 _rt = load_routing_table(routing_toml_path())
@@ -2772,14 +2872,30 @@ def _assign_impl(
                     _routing_position,
                     _resolved_provider,
                     table=_rt,
-                    positions_dir=positions_store_dir(),
+                    positions_dir=_pos_dir,
                 )
             except RoutingError as exc:
+                # F868 #724 — an EXPLICIT provider override that fails any cert
+                # stage (provider-uncertified / row-clause-missing / gate refusal)
+                # collapses to the ONE typed E-CELL-UNCERTIFIED operator code. A
+                # routing-driven spawn keeps the specific D9 code (unchanged).
+                if _provider_source == "explicit":
+                    return _cell_uncertified_refusal(str(exc))
                 return {
                     "success": False,
                     "terminal_id": None,
                     "message": f"Assignment failed: {exc}",
                 }
+
+            # F868 #724 — an EXPLICIT provider override onto a non-PASS NON-gate
+            # cell (resolve_routing_binding now returns uncertified_cell=True and
+            # spawns the position's OWN composition) is ALSO refused: the operator
+            # named a specific cell, and a non-certified cell is never dispatched
+            # under an explicit override. The routing-driven path keeps the D2
+            # same-position uncertified spawn.
+            if _provider_source == "explicit" and _res.uncertified_cell:
+                return _cell_uncertified_refusal(f"cell outcome={_res.fallback_cell}")
+
             agent_profile = _res.spawn_profile
             if _res.fallback_profile:
                 _fallback_profile = _res.fallback_profile
@@ -2787,26 +2903,48 @@ def _assign_impl(
                 _d9_cell = _res.fallback_cell
 
         # F786 (#643) D8 — materialise the composed profile for whatever
-        # effective name resolution produced (position spawn OR D11 general
-        # fallback) BEFORE the spawn loads it, so a position-composed name is
-        # never profile-less. The writer is a no-op for a legacy passthrough
-        # name (nothing to compose). Best-effort: a write failure is not fatal
-        # here because terminal_service fails closed with E-PROFILE-MISSING if
-        # the profile still cannot load (D8), which is the real guarantee.
+        # effective name resolution produced (position spawn OR same-position
+        # uncertified spawn) BEFORE the spawn loads it, so a position-composed
+        # name is never profile-less. The writer is a no-op for a legacy
+        # passthrough name (nothing to compose).
+        #
+        # F870 #726 — for a POSITION-name assign, a composition that cannot be
+        # materialised (writer returns None: bad overlay, provider not in the
+        # position allowlist) is a TYPED refusal E-COMPOSITION-MISSING naming the
+        # composed profile it looked for — NEVER a silent substitute of another
+        # position's profile (the deleted cross-position general fallback). For a
+        # legacy passthrough (``not _position_assign``) the writer's None is
+        # normal (nothing to compose) and stays best-effort as before.
         if _resolved_provider:
-            try:
-                from cli_agent_orchestrator.utils.agent_profiles import (
-                    write_composed_profile_for_spawn,
-                )
+            from cli_agent_orchestrator.utils.agent_profiles import (
+                write_composed_profile_for_spawn,
+            )
 
-                write_composed_profile_for_spawn(agent_profile, _resolved_provider)
+            try:
+                _composed_path = write_composed_profile_for_spawn(agent_profile, _resolved_provider)
             except Exception as exc:
+                _composed_path = None
                 logger.warning(
                     "F786 D8: composed-profile write for '%s' (%s) failed: %s",
                     agent_profile,
                     _resolved_provider,
                     exc,
                 )
+            if _position_assign and _composed_path is None:
+                from cli_agent_orchestrator.utils.routing import E_COMPOSITION_MISSING
+
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "message": (
+                        f"Assignment refused (no spawn): {E_COMPOSITION_MISSING}: "
+                        f"position '{_routing_position}' provider "
+                        f"'{_resolved_provider}' composition '{agent_profile}' "
+                        f"could not be materialised (no composable "
+                        f"<position>-<provider> cell); refusing to substitute "
+                        f"another position's profile"
+                    ),
+                }
 
         fork_context = None
         refresh_base_name = None
@@ -2817,12 +2955,13 @@ def _assign_impl(
         # resume_requires_fork_from raise is gone — resume=True without a handle
         # already returned a typed refusal above.
         if _resume_prepared:
-            fork_context = _resume_prepared["fork_context"]
-            provider = _resume_prepared["provider"]
-            working_directory = _resume_prepared["working_directory"]
-            forked_from_info = _resume_prepared["forked_from_info"]
-            if _resume_prepared["authority_files"] and not authority_files:
-                authority_files = _resume_prepared["authority_files"]
+            # A2.1 Option A: the server resolves the launch spec; the shim sends
+            # NO fork_context (a raw resume fork_context would be refused as
+            # resume_not_admitted) and forwards the raw handle instead. provider/
+            # cwd stay whatever the caller passed; the server overrides both from
+            # the root. forked_from_info is a display stub filled from the handle.
+            fork_context = None
+            forked_from_info = {"resumed_from": _resume_prepared["resume_from"]}
             row = None
             _skip_fork_resolution = True
         else:
@@ -2999,9 +3138,11 @@ def _assign_impl(
             )
         else:
             worker_message = message
-        # F497 D12 — when the D9 resolver substituted <provider>_general for a
-        # non-PASS non-gate cell, fold the position/cell fields into the ONE
-        # [COLD-FALLBACK …] line (D10's base=stale, if it also fired, is already
+        # F870 #726 — when the routing resolver flagged a non-PASS non-gate cell
+        # (uncertified_cell), the spawn is the position's OWN composition (NOT the
+        # deleted cross-position general substitute); fold the position/cell
+        # fields into the ONE [COLD-FALLBACK …] line so the operator sees the cell
+        # is not smoke-certified (D10's base=stale, if it also fired, is already
         # present and this appends without a second bare marker — r11 S1).
         if _fallback_profile:
             assignment_preamble = _cold_fallback_preamble(
@@ -3055,6 +3196,9 @@ def _assign_impl(
             use_worktree=use_worktree,
             authority_files=authority_files,
             provider=_resolved_provider or _f838_checked_provider,
+            cell_request_class=_cell_request_class,
+            resume_from=(_resume_prepared["resume_from"] if _resume_prepared else None),
+            resume_inherit_pins=inherit_pins,
             **create_kwargs,
         )
 
@@ -3093,20 +3237,24 @@ def _assign_impl(
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
                 for af in authority_files
             ]
-        # RESUME HOT-FIX (addendum r1 #8): surface the resume result line.
+        # A2.1: surface the resume result line. The server owns pins/verify; the
+        # shim reports the handle and the new terminal it created.
         if _resume_prepared:
-            _old = _resume_prepared["forked_from_info"]["resumed_from"]
+            _old = _resume_prepared["resume_from"]
             result["resumed_from"] = _old
             result["worktree"] = working_directory
-            result["pins_inherited"] = _resume_prepared.get("pins_inherited", 0)
             result["resume_line"] = (
-                f"resumed from {_old} as {terminal_id} "
-                f"(worktree {working_directory}, pins_inherited "
-                f"{_resume_prepared.get('pins_inherited', 0)})"
+                f"resumed from {_old} as {terminal_id} (worktree {working_directory})"
             )
-        # F497 D12 — surface the general-cell substitution to the operator.
+        # F870 #726 — surface the same-position uncertified-cell notice (never a
+        # cross-position substitution) to the operator.
         if _fallback_profile:
             result["fallback_profile"] = _fallback_profile
+        # F868 #724 — record that the provider was an EXPLICIT operator override
+        # (vs resolved from the routing.toml binding) once the cell has passed the
+        # unconditional certification check above.
+        if _provider_source:
+            result["provider_source"] = _provider_source
         # F483: Write fleet-labels.tsv row (never fails the assign)
         if task_label and terminal_id:
             from cli_agent_orchestrator.services.fleet_labels import upsert_label
@@ -3125,6 +3273,17 @@ def _assign_impl(
                 "error": cap_detail,
                 "message": _render_terminal_cap_message(cap_detail, "Assignment"),
             }
+        # F829 A2.1: relay the SERVER's typed resume-refusal envelope verbatim
+        # (caller_unverified / caller_token_missing / resume_not_owner /
+        # session_resume_in_progress / resume_not_admitted / session_identity_conflict
+        # …). The shim does no authorization; it only forwards the server's verdict.
+        if exc.response is not None:
+            try:
+                _detail = exc.response.json().get("detail")
+            except Exception:
+                _detail = None
+            if isinstance(_detail, dict) and _detail.get("error") == "resume_refused":
+                return {"success": False, "terminal_id": None, **_detail}
         detail = (
             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
         )
