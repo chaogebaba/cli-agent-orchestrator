@@ -310,7 +310,6 @@ def flip_env(tmp_path, monkeypatch):
     from cli_agent_orchestrator.adapters.store.migrator import migrate
     from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
     from cli_agent_orchestrator.app.delivery import wiring
-    from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 
     db_file = tmp_path / "flip.sqlite"
     engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
@@ -340,9 +339,7 @@ def flip_env(tmp_path, monkeypatch):
 
     def install(position: SwitchPosition) -> None:
         wiring.install_delivery(
-            wiring.DeliveryRuntime(
-                store=store, clock=clock, position=position, mirror=MirrorWriter(store, clock)
-            )
+            wiring.DeliveryRuntime(store=store, clock=clock, position=position)
         )
 
     yield sessions, store, install

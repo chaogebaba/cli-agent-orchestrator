@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 116;
+const COMMAND_COUNT: usize = 115;
 
 /// What the TUI does with a command.
 ///
@@ -272,7 +272,6 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
     CommandId::DiagAgreement,
-    CommandId::DiagDelivery,
     CommandId::DiagFindings,
     CommandId::DiagMsg,
     CommandId::DiagTerminal,
@@ -514,12 +513,12 @@ pub enum CommandId {
     /// `cao config reconcile`
     ConfigReconcile,
 
-    // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics, plus
-    // phase 3a (F728 #584) delivery-queue diagnostics.
+    // `cao diag *` — WP-ARCH phase 1 (F725 #581) worker-truth diagnostics.
+    // `cao diag delivery` was a seventh until #738 retired shadow-live mode: it
+    // compared the observational queue against the legacy inbox, and there is no
+    // observational queue any more.
     /// `cao diag agreement`
     DiagAgreement,
-    /// `cao diag delivery`
-    DiagDelivery,
     /// `cao diag findings`
     DiagFindings,
     /// `cao diag msg`
@@ -1557,16 +1556,6 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
-        CommandId::DiagDelivery => Command {
-            id: CommandId::DiagDelivery,
-            parent: Some("diag"),
-            leaf_name: "delivery",
-            summary: "Compare the shadow delivery queue against the legacy inbox (AC-3a).",
-            policy: Policy::Hidden,
-            params: &[],
-            handoff_reason: None,
-            // HIDE: fork-only / ops command; unclassified default (project.md)
-        },
         CommandId::DiagFindings => Command {
             id: CommandId::DiagFindings,
             parent: Some("diag"),
@@ -2131,7 +2120,6 @@ mod tests {
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
                     CommandId::DiagAgreement => CommandId::DiagAgreement,
-                    CommandId::DiagDelivery => CommandId::DiagDelivery,
                     CommandId::DiagFindings => CommandId::DiagFindings,
                     CommandId::DiagMsg => CommandId::DiagMsg,
                     CommandId::DiagTerminal => CommandId::DiagTerminal,
@@ -2251,8 +2239,7 @@ mod tests {
                 CommandId::BaseRegister,
                 CommandId::ConfigReconcile,
                 CommandId::DiagAgreement,
-                CommandId::DiagDelivery,
-                CommandId::DiagFindings,
+                            CommandId::DiagFindings,
                 CommandId::DiagMsg,
                 CommandId::DiagTerminal,
                 CommandId::DiagWhy,
