@@ -241,5 +241,3 @@ def diag_findings(state: str, code_value: str | None, db_path: str | None, as_js
         render_findings(sources, now=datetime.now(UTC), state=wanted, code=code),
         as_json,
     )
-
-
