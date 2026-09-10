@@ -311,3 +311,66 @@ def test_fleet_child_procs_none_when_probe_unavailable(monkeypatch, probe_at):
     _install_probe(monkeypatch, probe)
     probe.probe("t1")
     assert _child_procs("t1") is None
+
+
+# ── the ERROR arm (rule 2b, third sample 2026-09-10) ────────────────────────
+
+
+@pytest.fixture
+def quiescent_error(monkeypatch):
+    """A monitor whose pane sampler has no usable sample (the buffer went quiet),
+    so nothing but rule 2b can act on a provider-published ERROR."""
+    import cli_agent_orchestrator.services.pane_liveness as pl
+    import cli_agent_orchestrator.services.question_state as qs
+
+    clock = _Clock()
+    monkeypatch.setattr(pl, "pane_liveness", PaneLivenessService(_clock=clock))
+    monkeypatch.setattr(qs, "question_state", QuestionStateService(_clock=clock))
+    return StatusMonitor()
+
+
+def test_branch_d_quiescence_error_with_live_child_becomes_processing(
+    monkeypatch, quiescent_error, probe_at
+):
+    """(d) A stale-buffer ERROR over a pane that is running a tool subprocess
+    projects PROCESSING/"child_proc_live", never error."""
+    _install_probe(monkeypatch, probe_at(_WORKING_TREE))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.PROCESSING
+    assert reason == "child_proc_live"
+
+
+def test_branch_d_error_without_live_child_stays_error(monkeypatch, quiescent_error, probe_at):
+    """A genuine launch failure has no tool subprocess — the ERROR must stand."""
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.ERROR
+    assert reason is None
+
+
+def test_branch_d_error_probe_unavailable_stays_error(monkeypatch, quiescent_error, probe_at):
+    _install_probe(monkeypatch, probe_at(_IDLE_TREE, pane_pid=999999))
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.ERROR
+    assert reason is None
+
+
+def test_branch_d_error_probe_raising_stays_error(monkeypatch, quiescent_error):
+    exploding = MagicMock()
+    exploding.probe.side_effect = RuntimeError("boom")
+    _install_probe(monkeypatch, exploding)
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.ERROR
+    assert reason is None
+
+
+def test_error_gate_never_outranks_the_question_marker(monkeypatch, quiescent_error, probe_at):
+    """Rule 2 still wins: an open marker raises ERROR into WAITING even with a
+    live subprocess, so the gate cannot swallow a pending user question."""
+    import cli_agent_orchestrator.services.question_state as qs
+
+    _install_probe(monkeypatch, probe_at(_WORKING_TREE))
+    monkeypatch.setattr(qs.question_state, "is_open", lambda _tid: True)
+    status, reason = quiescent_error.fuse_status("t1", TerminalStatus.ERROR)
+    assert status is TerminalStatus.WAITING_USER_ANSWER
+    assert reason == "question_marker"

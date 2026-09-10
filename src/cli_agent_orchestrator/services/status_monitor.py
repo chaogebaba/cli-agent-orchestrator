@@ -2184,6 +2184,11 @@ class StatusMonitor:
            LOWER out of it — keeps the fusion from fighting the 16 producers and
            specifically auto_responder.force_status (D5).
         2. a question marker is open ⇒ (WAITING_USER_ANSWER, "question_marker").
+        2b. status is ERROR (F899 #751): a live tool subprocess under the pane ⇒
+            (PROCESSING, "child_proc_live") — positive proof of work outranks a
+            stale-buffer ERROR; else (ERROR, None), today's behaviour. Scoped to
+            the PROVIDER-published ERROR: the fleet's own ERROR overrides are
+            applied after this fusion and are untouched.
         3a. status in {IDLE, COMPLETED, PROCESSING}, a usable sample exists,
             unchanged_count < K (eligibility first — a stable pane is never
             tagged, AC4). Then, in order (F568 D12d, R3-B3/B5): children_count>0
@@ -2220,6 +2225,39 @@ class StatusMonitor:
             # Rule 2: a marker raises any other status into WAITING.
             if marker_open:
                 return TerminalStatus.WAITING_USER_ANSWER, "question_marker"
+
+            # Rule 2b (F899 #751, third sample 2026-09-10): a provider-published
+            # ERROR over a pane that is in fact working. The published status is
+            # re-derived from the ROLLING BUFFER, so when a worker goes quiet for
+            # long enough that the buffer stops advancing, a stale frame carrying
+            # neither the working spinner nor the idle composer chrome — but
+            # carrying an old `Error:` line (the ClinePass 429 banner, #700) —
+            # parses as a launch failure and the seat projects `error` while its
+            # pane still renders the live spinner (observed on two pi_cli lanes,
+            # since_last_input 3146 s / 2725 s, both with terminal_error and
+            # recovery_state null, so none of the fleet's own ERROR overrides
+            # fired). A live tool subprocess under the pane is positive proof the
+            # worker is running, so it outranks a stale-buffer ERROR exactly as
+            # it outranks a stale-buffer IDLE at rule 3b.
+            #
+            # Scope is deliberately the PROVIDER-published ERROR only: the fleet
+            # applies its own ERROR overrides (recovery_state, absent window,
+            # failed init) AFTER this fusion, so a genuinely quarantined or dead
+            # terminal still projects `error` regardless of what is running.
+            # A genuine startup failure has no tool subprocess to find, so the
+            # probe returns live=False and the ERROR stands.
+            if status is TerminalStatus.ERROR:
+                try:
+                    from cli_agent_orchestrator.services.child_proc_probe import (
+                        child_proc_probe,
+                    )
+
+                    error_probe = child_proc_probe.probe(terminal_id)
+                except Exception:
+                    error_probe = None
+                if error_probe is not None and error_probe.live:
+                    return TerminalStatus.PROCESSING, "child_proc_live"
+                return status, None
 
             # Rules 3a/3b: pane-delta downgrade, bounded by the hold clock.
             if status in (
