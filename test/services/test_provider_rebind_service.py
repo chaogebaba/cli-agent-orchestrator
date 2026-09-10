@@ -575,7 +575,8 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     monkeypatch.setattr(service.provider_manager, "get_provider", lambda _tid: old)
     monkeypatch.setattr(service.provider_manager, "construct_provider", lambda *_a, **_k: candidate)
     monkeypatch.setattr(service.provider_manager, "commit_provider", lambda *_a, **_k: old)
-    monkeypatch.setattr(service, "pane_pid", lambda *_a: 123)
+    # F893 (#745): the rebind path resolves its pid through the backend port.
+    backend.get_pane_process_id.return_value = 123
     monkeypatch.setattr(service, "pane_launch_epoch", lambda _pid: 1.0)
     monkeypatch.setattr(service, "_launch_context", lambda _meta: None)
     monkeypatch.setattr(

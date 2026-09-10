@@ -633,10 +633,17 @@ def _prepare_provider_runtime_identity(
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise RuntimeError("terminal_metadata_missing")
-    from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
+    from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch
 
-    pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
-    cwd = get_backend().get_pane_working_directory(
+    # F893 (#745): resolve the identity-capture process root through the backend
+    # port. This used fork_context_service.pane_pid → `tmux list-panes`, which
+    # under the herdr backend raised CalledProcessError and failed deferred init
+    # for every supports_reauth_rebind provider (grok, live on grok-box-009).
+    # Same class as F880 (#733); same fix — ask the backend, like the cwd read
+    # on the very next line already does.
+    backend = get_backend()
+    pid = backend.get_pane_process_id(metadata["tmux_session"], metadata["tmux_window"])
+    cwd = backend.get_pane_working_directory(
         metadata["tmux_session"], metadata["tmux_window"]
     )
     if cwd is None:

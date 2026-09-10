@@ -553,6 +553,56 @@ class TerminalBackend(ABC):
             f"{type(self).__name__} does not implement probe_provider_liveness()"
         )
 
+    def supports_status_decorations(self) -> bool:
+        """Whether this backend has tmux-style per-session user options.
+
+        F893 (#745) bug-family sweep: ``boundary_pull_service`` writes the
+        ``@cao_pending`` user option for the tmux status line on every recount.
+        That is a tmux UI affordance with no herdr equivalent, so it is
+        tmux-only BY DESIGN — but under herdr it ran anyway and logged a
+        ``set-option`` failure warning on every message round. Callers of such
+        decorations gate on this instead of shelling out and warning.
+        """
+        return False
+
+    # --- Runtime-identity process root (F893 #745) ---
+
+    def get_pane_process_id(self, session_name: str, window_name: str) -> int:
+        """Return the pid that roots the provider process tree behind this seat.
+
+        This is the process an identity capture may walk descendants of
+        (``capture_codex_uuid`` scans ``/proc/<pid>/fd`` for the rollout file)
+        and whose ``/proc`` start time dates the provider launch
+        (``pane_launch_epoch``). Both consumers only need *a* local pid at or
+        above the provider in the tree, which is why one port method serves
+        backends whose seat model differs:
+
+        - **tmux** returns the window's FIRST pane pid (lowest ``pane_index``,
+          the F545/#401 rule) — the login shell the provider was exec'd into,
+          so the provider is a descendant.
+        - **herdr** owns the child itself and has no CAO-visible pane shell, so
+          it returns the pane's first live foreground process pid, i.e. the
+          provider process directly. ``_descendants`` includes its root, so an
+          fd scan rooted there still finds the provider's own open files.
+
+        F893 (#745): ``_prepare_provider_runtime_identity`` and six sibling
+        sites resolved this pid by calling ``fork_context_service.pane_pid``,
+        which shells out to ``tmux list-panes`` unconditionally. Under the herdr
+        backend that raises ``CalledProcessError`` and fails the F829
+        runtime-identity capture for every ``supports_reauth_rebind`` provider
+        (observed live on grok-box-009 for grok workers). Same class as F880
+        (#733); the fix is the same — ask the backend.
+
+        Raises:
+            TerminalBackendError / TerminalNotFoundError: the seat cannot be
+                resolved or the backend cannot name a process for it. Callers
+                keep whatever failure handling they had for the old tmux
+                ``CalledProcessError``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_pane_process_id()"
+        )
+
     # --- Backend health (F882 #735) ---
 
     def backend_health(self) -> str:

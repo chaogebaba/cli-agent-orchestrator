@@ -1084,6 +1084,50 @@ class HerdrBackend(TerminalBackend):
         # Every foreground process equals the baseline shell → empty seat.
         return "dead"
 
+    def get_pane_process_id(self, session_name: str, window_name: str) -> int:
+        """F893 (#745): herdr's runtime-identity process root.
+
+        herdr owns the provider child; there is no CAO-visible pane shell whose
+        pid could be walked, and ``tmux list-panes`` (what every caller used
+        before this port method existed) has no answer for a herdr workspace —
+        it raised ``CalledProcessError`` and failed the F829 runtime-identity
+        capture for grok workers live on grok-box-009. ``herdr pane
+        process-info`` already reports the pane's live foreground processes with
+        their pids, so the FIRST of them is the provider process itself.
+
+        That is a valid root for both consumers: ``_descendants`` includes its
+        own root, so an fd scan rooted at the provider still sees the provider's
+        open rollout file, and ``pane_launch_epoch`` on the provider pid dates
+        the provider launch more tightly than the shell's would.
+
+        Raises:
+            TerminalNotFoundError: the pane cannot be resolved.
+            TerminalBackendError: herdr could not answer, or the pane reports no
+                foreground process with a usable pid (an empty seat).
+        """
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+
+        result = self._run_herdr(["pane", "process-info", "--pane", pane_id], check=False)
+        if result.returncode != 0:
+            raise TerminalBackendError(
+                f"herdr pane process-info failed for {session_name}:{window_name}: "
+                f"rc={result.returncode} {result.stderr.strip()}"
+            )
+        try:
+            data = self._parse_herdr_json(result.stdout)
+        except json.JSONDecodeError as e:
+            raise TerminalBackendError(
+                f"Failed to parse herdr pane process-info for {session_name}:{window_name}: {e}"
+            ) from e
+        for process in self._foreground_processes(data):
+            pid = process.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                return pid
+        raise TerminalBackendError(
+            f"herdr pane {pane_id} ({session_name}:{window_name}) reports no "
+            "foreground process pid"
+        )
+
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
 

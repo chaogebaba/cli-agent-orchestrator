@@ -292,7 +292,8 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     monkeypatch.setattr(service.provider_manager, "get_provider", lambda _tid: provider)
     monkeypatch.setattr(service.provider_manager, "construct_provider", lambda *_a, **_k: candidate)
     monkeypatch.setattr(service.provider_manager, "commit_provider", lambda *_a, **_k: provider)
-    monkeypatch.setattr(service, "pane_pid", lambda *_a: 123)
+    # F893 (#745): the rebind path resolves its pid through the backend port.
+    backend.get_pane_process_id.return_value = 123
     monkeypatch.setattr(service, "pane_launch_epoch", lambda _pid: 1.0)
     monkeypatch.setattr(service, "_launch_context", lambda _meta: None)
     monkeypatch.setattr(service, "_wait_for_shell_baseline", AsyncMock(return_value="exit_confirmed"))

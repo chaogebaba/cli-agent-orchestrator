@@ -8,6 +8,9 @@ from cli_agent_orchestrator.clients.database import (
     callback_barrier_dispatch_allowed as _dispatch_allowed,
 )
 from cli_agent_orchestrator.clients.database import (
+    callback_barrier_dispatch_permission as _dispatch_permission,
+)
+from cli_agent_orchestrator.clients.database import (
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -30,6 +33,16 @@ def dispatch_allowed(receiver_id: str) -> bool:
     return _dispatch_allowed(_terminal_principal(), receiver_id)
 
 
+def dispatch_permission(receiver_id: str) -> str:
+    """Classify the process terminal's barrier permission on ``receiver_id``.
+
+    ``"allowed"`` / ``"receiver_unresolvable"`` / ``"not_owned"`` — see
+    ``clients.database.callback_barrier_dispatch_permission_in_db``. F893 (#745)
+    H3.
+    """
+    return _dispatch_permission(_terminal_principal(), receiver_id)
+
+
 def dispatch(
     *,
     receiver_id: str,
@@ -41,7 +54,17 @@ def dispatch(
 ) -> dict[str, Any]:
     """Create and best-effort deliver one supervisor-owned barrier dispatch."""
     sender_id = _terminal_principal()
-    if not _dispatch_allowed(sender_id, receiver_id):
+    # F893 (#745) H3: name the condition actually found. A receiver that no
+    # longer exists is NOT an ownership failure, and reporting it as one
+    # misdirected a whole live round on grok-box-009 (two of three members
+    # dispatched fine from this very sender; the third had died a step earlier).
+    permission = _dispatch_permission(sender_id, receiver_id)
+    if permission == "receiver_unresolvable":
+        raise ValueError(
+            f"callback barrier receiver {receiver_id} is not addressable "
+            "(terminal deleted or unknown) — not an ownership refusal"
+        )
+    if permission != "allowed":
         raise ValueError("callback barriers require supervisor ownership of the receiver")
     dispatch_barrier = {
         "label": barrier,

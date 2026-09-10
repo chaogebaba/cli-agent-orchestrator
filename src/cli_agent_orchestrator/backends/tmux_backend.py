@@ -573,6 +573,23 @@ class TmuxBackend(TerminalBackend):
         # current command equals baseline → confirmed empty shell
         return "dead"
 
+    def supports_status_decorations(self) -> bool:
+        """tmux carries per-session user options (``@cao_pending``). F893 (#745)."""
+        return True
+
+    def get_pane_process_id(self, session_name: str, window_name: str) -> int:
+        """F893 (#745): tmux's runtime-identity process root — the window's FIRST
+        pane pid, byte-for-byte the pre-F893 ``fork_context_service.pane_pid``
+        the callers used inline (F545/#401 first-pane rule, not the ACTIVE pane).
+
+        Delegating to that helper rather than re-deriving it keeps the tmux path
+        identical (same argv, same ``check=True`` ``CalledProcessError`` on a
+        dead window) — exactly as ``probe_provider_liveness`` does above.
+        """
+        from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
+
+        return _pane_pid(session_name, window_name)
+
     def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
         return self._client.get_pane_size(session_name, window_name)
 

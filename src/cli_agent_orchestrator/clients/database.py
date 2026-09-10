@@ -4739,23 +4739,58 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, 
     return receiver_id, mailbox_id, cast(int | None, generation)
 
 
+def callback_barrier_dispatch_permission_in_db(
+    db: Any,
+    sender_id: str,
+    receiver_id: str,
+) -> str:
+    """Classify a barrier dispatch in the caller's transaction.
+
+    Returns one of:
+
+    * ``"allowed"`` — the sender owns the receiver's callback route.
+    * ``"receiver_unresolvable"`` — the receiver address does not resolve to a
+      live terminal row at all (deleted, never existed, unknown mailbox).
+    * ``"not_owned"`` — the receiver exists but its callback route belongs to
+      someone else.
+
+    F893 (#745) H3: these three were collapsed into one boolean, so a barrier
+    aimed at a terminal that had ALREADY DIED came back as "callback barriers
+    require supervisor ownership of the receiver". On grok-box-009 that
+    misdiagnosis cost a whole live round: two of three barrier members
+    succeeded from the same sender while the third had 404'd on the send one
+    step earlier, and the refusal text sent the investigation after a
+    non-existent ownership bug instead of the dead worker. A refusal has to
+    name the condition it actually found.
+    """
+    try:
+        receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
+    except ValueError:
+        return "receiver_unresolvable"
+    receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
+    if receiver is None:
+        return "receiver_unresolvable"
+    if receiver.caller_id == sender_id:
+        return "allowed"
+    sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+    if sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id:
+        return "allowed"
+    return "not_owned"
+
+
 def callback_barrier_dispatch_allowed_in_db(
     db: Any,
     sender_id: str,
     receiver_id: str,
 ) -> bool:
     """Return whether sender owns the receiver route in the caller's transaction."""
-    try:
-        receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
-    except ValueError:
-        return False
-    receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
-    if receiver is None:
-        return False
-    if receiver.caller_id == sender_id:
-        return True
-    sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
-    return bool(sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id)
+    return callback_barrier_dispatch_permission_in_db(db, sender_id, receiver_id) == "allowed"
+
+
+def callback_barrier_dispatch_permission(sender_id: str, receiver_id: str) -> str:
+    """Classify a barrier dispatch against the target worker's callback route."""
+    with SessionLocal() as db:
+        return callback_barrier_dispatch_permission_in_db(db, sender_id, receiver_id)
 
 
 def callback_barrier_dispatch_allowed(sender_id: str, receiver_id: str) -> bool:

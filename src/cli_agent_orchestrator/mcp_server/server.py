@@ -1509,12 +1509,22 @@ def _send_barrier_to_inbox(
 
 def _barrier_dispatch_is_supervisor_owned(receiver_id: str) -> bool:
     """Fail closed unless the process terminal owns the receiver."""
+    return _barrier_dispatch_permission(receiver_id) == "allowed"
+
+
+def _barrier_dispatch_permission(receiver_id: str) -> str:
+    """Classify barrier permission, failing closed as ``"not_owned"``.
+
+    F893 (#745) H3: a barrier aimed at an already-dead terminal used to come
+    back as an ownership refusal, which misdirected a live round. The
+    classification separates "the receiver is gone" from "you do not own it".
+    """
     try:
         from cli_agent_orchestrator.services import callback_barrier_service
 
-        return callback_barrier_service.dispatch_allowed(receiver_id)
+        return callback_barrier_service.dispatch_permission(receiver_id)
     except Exception:
-        return False
+        return "not_owned"
 
 
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
@@ -3889,7 +3899,16 @@ def _send_message_impl(
             }
 
         if barrier is not None:
-            if not _barrier_dispatch_is_supervisor_owned(receiver_id):
+            _barrier_permission = _barrier_dispatch_permission(receiver_id)
+            if _barrier_permission == "receiver_unresolvable":
+                return {
+                    "success": False,
+                    "error": (
+                        f"callback barrier receiver {receiver_id} is not addressable "
+                        "(terminal deleted or unknown) — not an ownership refusal"
+                    ),
+                }
+            if _barrier_permission != "allowed":
                 return {
                     "success": False,
                     "error": "callback barriers require supervisor ownership of the receiver",
