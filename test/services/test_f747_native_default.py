@@ -161,22 +161,37 @@ def test_non_claude_code_provider_gets_no_path(monkeypatch):
     assert _maybe_derive_cc_team_inbox_path("codex", None, "/home/x/repo") is None
 
 
-def test_resolve_inbox_path_self_heals_without_working_directory(monkeypatch):
-    """Read-path re-derivation for a row whose working_directory column is empty."""
+def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(monkeypatch):
+    """Read-path re-derivation for a row that has a cwd but no persisted path."""
     monkeypatch.setattr(
         tps,
         "get_terminal_metadata",
-        lambda tid: {"provider": "claude_code", "working_directory": None, "metadata": {}},
+        lambda tid: {
+            "provider": "claude_code",
+            "working_directory": "/home/x/repo",
+            "metadata": {},
+        },
     )
     persisted: dict = {}
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.update_terminal_metadata",
         lambda tid, md: persisted.update(md),
     )
-    monkeypatch.setattr("os.getcwd", lambda: "/srv/fallback")
     path = tps._resolve_inbox_path("t1")
-    assert path is not None and "-srv-fallback" in str(path)
+    assert path is not None and "-home-x-repo" in str(path)
     assert "cc_team_inbox_path" in persisted
+
+
+def test_resolve_inbox_path_never_invents_a_shared_path(monkeypatch):
+    """MUTANT: restore the os.getcwd() fallback and every pathless terminal
+    derives the SAME inbox file, so unrelated seats serialise on one lockfile."""
+    monkeypatch.setattr(
+        tps,
+        "get_terminal_metadata",
+        lambda tid: {"provider": "claude_code", "working_directory": None, "metadata": {}},
+    )
+    assert tps._resolve_inbox_path("t1") is None
+    assert tps._resolve_inbox_path("t2") is None
 
 
 # ---------------------------------------------------------------------------

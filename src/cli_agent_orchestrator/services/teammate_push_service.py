@@ -610,16 +610,23 @@ def _resolve_inbox_path(terminal_id: str, *, persist: bool = True) -> Optional[P
         return Path(os.path.expanduser(raw))
 
     # F152 self-heal: derive path from working_directory + provider.
-    # F747 (#747): a claude_code terminal whose ``working_directory`` column is
-    # empty (rows predating the #497 backfill, or any create route that never
-    # recorded one) used to dead-end here, which is exactly the state that made
-    # the seat unreachable natively. Fall back to the server's own cwd -- the
-    # same value ``_resolve_working_directory`` would have persisted -- so the
-    # path is always derivable for a claude_code terminal.
+    #
+    # F747 (#747) tried an ``os.getcwd()`` fallback here so a row with an empty
+    # ``working_directory`` could still resolve. That was wrong twice over.
+    # Correctness: every terminal without a recorded cwd would derive the SAME
+    # path (the server's cwd), so unrelated seats would share one inbox file and
+    # serialise on its lockfile -- measured as a two-order-of-magnitude suite
+    # slowdown. Design: a terminal with no cwd is precisely the "native cannot
+    # work here" case, and the typed ``no_inbox_path`` reason plus the fallback
+    # surface is the designed answer to it, not an invented shared path.
+    #
+    # Ruling 2 is satisfied at CREATE time instead, where
+    # ``_maybe_derive_cc_team_inbox_path`` receives the already-resolved launch
+    # cwd (never None) for every claude_code terminal.
     provider = metadata.get("provider")
-    if provider != "claude_code":
+    working_dir = metadata.get("working_directory")
+    if not working_dir or provider != "claude_code":
         return None
-    working_dir = metadata.get("working_directory") or os.getcwd()
 
     derived = _derive_cc_team_inbox_path(working_dir)
     if derived is None:
