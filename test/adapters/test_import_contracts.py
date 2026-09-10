@@ -243,7 +243,6 @@ def test_bootstrap_is_the_only_new_module_touching_legacy() -> None:
     assert not offenders, offenders
 
 
-
 # WP-HERDR H1 B3: the single-transport invariant, asserted at the source.
 # ``adapters/herdr/client.py`` is the SOLE herdr socket/JSON-RPC implementation
 # in the tree (blueprint §4 one-client invariant).  Import-linter cannot express
