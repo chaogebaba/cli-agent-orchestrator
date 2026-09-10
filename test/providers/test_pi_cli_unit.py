@@ -336,8 +336,14 @@ class TestStatusDetection:
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_error_startup_banner(self, _native) -> None:
+        """F899 (#751) r2: get_status no longer returns ERROR from any buffer.
+        This provider is `_initialized=True` — a READY terminal — which is the
+        only state the old banner scan could be reached in, and precisely where
+        a stale `Error:` line must not mean a launch failure. Launch failures are
+        raised by initialize(); a frame with neither chrome nor spinner is
+        UNKNOWN, which the F808 cached-UNKNOWN self-heal re-derives."""
         provider = self._provider(dispatched=False)
-        assert provider.get_status(_fixture("pi_error.txt")) == TerminalStatus.ERROR
+        assert provider.get_status(_fixture("pi_error.txt")) == TerminalStatus.UNKNOWN
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
     def test_uninitialized_unknown(self, _native) -> None:
@@ -1502,13 +1508,16 @@ class TestErrorNotSticky:
         [→ composer] yields IDLE. Status re-derives from the live pane each poll.
         """
         provider = self._provider(dispatched=True, processing_seen=False)
-        # 1) Genuine startup failure: no TUI chrome, no spinner → ERROR.
+        # 1) No TUI chrome, no spinner → UNKNOWN. F899 (#751) r2: this provider
+        #    is `_initialized=True`, so this frame was never evidence of a launch
+        #    failure; the old ERROR here is what published `error` over two ready,
+        #    working lanes on 2026-09-10.
         startup_error = (
             "/data/scratch/probe$\n"
             "Error: failed to initialize model catalog: connection refused\n"
             "pi: error: could not start session\n"
         )
-        assert provider.get_status(startup_error) == TerminalStatus.ERROR
+        assert provider.get_status(startup_error) == TerminalStatus.UNKNOWN
         # 2) Nudged and working: the live spinner re-derives PROCESSING (not
         #    sticky ERROR), and latches _tui_processing_seen for the COMPLETED
         #    transition below.
@@ -1520,17 +1529,27 @@ class TestErrorNotSticky:
         assert provider.get_status(self._capped_at_composer()) == TerminalStatus.COMPLETED
 
     @patch.object(PiCliProvider, "_resolve_native_status", return_value=None)
-    def test_genuine_startup_error_still_reads_error(self, _native) -> None:
-        """Guard: the fix must not weaken genuine startup-failure detection — a
-        pane with NO idle chrome and NO spinner but a launch-error banner is
-        still ERROR."""
+    def test_genuine_startup_error_is_caught_by_the_launch_poller_not_get_status(
+        self, _native
+    ) -> None:
+        """F899 (#751) r2 replaces the old guard, which asserted ERROR from a
+        `_initialized=True` provider — a contradiction, since that flag means pi
+        DID reach a usable frame. Genuine startup-failure detection is not
+        weakened: it lives in initialize(), which polls the pane against the same
+        _STARTUP_ERROR and raises before _initialized is ever set. get_status on a
+        ready terminal reads UNKNOWN."""
+        import inspect
+
         provider = self._provider(dispatched=False)
         startup_error = (
             "/data/scratch/probe$\n"
             "Error: failed to initialize model catalog: connection refused\n"
             "pi: error: could not start session\n"
         )
-        assert provider.get_status(startup_error) == TerminalStatus.ERROR
+        assert provider.get_status(startup_error) == TerminalStatus.UNKNOWN
+        launch_src = inspect.getsource(PiCliProvider.initialize)
+        assert "_STARTUP_ERROR.search(clean)" in launch_src
+        assert "raise RuntimeError" in launch_src
 
 
 # ─── Response extraction ────────────────────────────────────────────────────────
