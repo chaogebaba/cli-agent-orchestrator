@@ -573,10 +573,10 @@ def native_fallback_reason(terminal_id: str) -> Optional[str]:
     metadata = get_terminal_metadata(terminal_id)
     if not metadata or metadata.get("provider") != "claude_code":
         return "provider_not_native"
-    # Resolve BEFORE the flag check: ``_resolve_inbox_path`` self-heals a missing
-    # ``cc_team_inbox_path`` and persists it, and that re-derivation must happen
-    # on read even for a terminal created while the flag was off (ruling 2).
-    inbox_path = _resolve_inbox_path(terminal_id)
+    # Resolve BEFORE the flag check so the re-derivation happens on read even
+    # for a terminal created while the flag was off (ruling 2). ``persist=False``
+    # keeps this probe side-effect-free; the push path still persists.
+    inbox_path = _resolve_inbox_path(terminal_id, persist=False)
     if not ConfigService.get("supervisor.teammate_push"):
         # Default is True, so a False here is an explicit operator decision
         # (settings.json or CAO_W2M_TEAMMATE_PUSH), never a shipped posture.
@@ -594,7 +594,7 @@ def native_fallback_reason(terminal_id: str) -> Optional[str]:
     return None
 
 
-def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
+def _resolve_inbox_path(terminal_id: str, *, persist: bool = True) -> Optional[Path]:
     """Resolve and expand the CC inbox path from terminal metadata.
 
     WPDT W3 (F152): Includes lazy-derive self-heal — if cc_team_inbox_path is
@@ -625,7 +625,15 @@ def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
     if derived is None:
         return None
 
-    # Persist to metadata for future calls
+    # Persist to metadata for future calls.
+    # F747 (#747): ``persist=False`` makes this a pure read. The native-delivery
+    # HEALTH PROBE runs on the seat's PostToolUse edge -- once per tool call per
+    # seat -- so letting it write metadata turned a read-only question into a DB
+    # write on the hottest path in the system, serializing every caller behind
+    # the same SQLite lock. The self-heal write belongs on the PUSH path, which
+    # runs on delivery, not on inspection.
+    if not persist:
+        return derived
     try:
         from cli_agent_orchestrator.clients.database import update_terminal_metadata
 

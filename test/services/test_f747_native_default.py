@@ -217,8 +217,25 @@ def test_reason_no_inbox_path(monkeypatch):
     monkeypatch.setattr(
         tps, "get_terminal_metadata", lambda tid: {"provider": "claude_code", "metadata": {}}
     )
-    monkeypatch.setattr(tps, "_resolve_inbox_path", lambda tid: None)
+    monkeypatch.setattr(tps, "_resolve_inbox_path", lambda tid, **kw: None)
     assert tps.native_fallback_reason("t1") == "no_inbox_path"
+
+
+def test_health_probe_never_writes_metadata(monkeypatch, tmp_path):
+    """MUTANT (perf): drop ``persist=False`` and the probe writes the DB on every
+    seat tool call, which serialized the whole suite behind one SQLite lock."""
+    monkeypatch.setattr(
+        tps,
+        "get_terminal_metadata",
+        lambda tid: {"provider": "claude_code", "working_directory": str(tmp_path), "metadata": {}},
+    )
+    writes: list = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.update_terminal_metadata",
+        lambda tid, md: writes.append(tid),
+    )
+    tps.native_fallback_reason("t1")
+    assert writes == []
 
 
 def test_reason_native_write_failed(monkeypatch, tmp_path):
