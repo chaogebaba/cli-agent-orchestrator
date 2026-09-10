@@ -1006,6 +1006,31 @@ class PiCliProvider(BaseProvider):
         """Return the tmux special key that exits Pi (Ctrl-D EOF)."""
         return "C-d"
 
+    def spawn_captured_identity(self) -> "tuple[str, Optional[str], Optional[str]] | None":
+        """F867 (#723): pi's session identity is KNOWN AT SPAWN.
+
+        CAO launches a fresh pi worker with ``--session-id <terminal_id>`` and
+        ``--session-dir <session_dir>`` (see ``_build_pi_command``); pi then
+        writes its transcript ATOMICALLY at the first turn's completion as
+        ``<timestamp>_<terminal_id>.jsonl`` under that dir (live-probed pi
+        0.85.1). So the recoverable identity is deterministic before any turn:
+        the provider_session_id is the terminal id and the namespace is the
+        session dir, which ``session_artifact._resolve_pi`` globs
+        (``**/*_<uuid>.jsonl``) once the file exists. Binding this at spawn is
+        what makes ``provider_session_id`` non-null so a planned hibernate stops
+        refusing ``session_artifact_missing`` on a pi lane that HAS completed a
+        turn (before the first turn the artifact is correctly MISSING —
+        unrecoverable, D8 — and hibernate still refuses, which is right).
+
+        Returns ``None`` on a RESUME spawn: the resumed worker re-attaches a
+        PRIOR session via ``--session <artifact_locator>`` and its root is
+        re-pointed by the resume publish path, so there is nothing fresh to bind.
+        """
+        _fc = self._fork_context
+        if _fc is not None and getattr(_fc, "mode", None) == "resume":
+            return None
+        return (self.terminal_id, str(self.session_dir), None)
+
     def cleanup(self) -> None:
         """Remove the per-worker runtime dir (prompt + MCP config + sessions)."""
         self._initialized = False

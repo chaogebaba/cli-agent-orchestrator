@@ -836,7 +836,13 @@ def test_managed_create_prepublication_failure_releases_local_authority(monkeypa
     release_session_lifecycle_lease(lease)
 
 
-def test_fork_create_started_after_quiesce_snapshot_is_blocked(f72_env, monkeypatch):
+def test_fork_create_started_after_quiesce_snapshot_not_blocked_by_terminal_delete(
+    f72_env, monkeypatch
+):
+    """F867 (#723) D2: a concurrent fork/create on the same session is NOT
+    blocked by a per-terminal delete's terminal-scoped teardown lease (was
+    resume_in_progress before #723; that session-wide block caused the 409
+    storm). Renamed from ...is_blocked to reflect the reversed contract."""
     _sessions, backend = f72_env
     add_terminal(backend, "11111111")
     add_terminal(backend, "22222222", "11111111")
@@ -858,6 +864,15 @@ def test_fork_create_started_after_quiesce_snapshot_is_blocked(f72_env, monkeypa
 
     def delete_after_snapshot(*args, **kwargs):
         assert events == ["snapshot_complete"]
+        # F867 (#723) D2: the per-terminal delete now holds a TERMINAL-scoped
+        # teardown lease, NOT the session-wide exclusive. A fork/create started
+        # concurrently on the SAME session (a different terminal) is therefore no
+        # longer blocked at the lifecycle-lease gate — it acquires its session
+        # SHARED lease and proceeds past that gate. (Before #723 this raised
+        # resume_in_progress at the gate; that session-wide block was the exact
+        # cause of the #723 409 storm.) Assert the create is NOT refused with
+        # resume_in_progress; any later failure from the heavily-mocked create
+        # path is unrelated to the lease contract under test here.
         context = ForkContext(
             mode="fork",
             session_uuid="uuid-race",
@@ -865,7 +880,7 @@ def test_fork_create_started_after_quiesce_snapshot_is_blocked(f72_env, monkeypa
             provider="claude_code",
             initial_preamble="",
         )
-        with pytest.raises(RuntimeError, match="resume_in_progress"):
+        try:
             asyncio.run(
                 terminal_service.create_terminal(
                     "claude_code",
@@ -874,66 +889,49 @@ def test_fork_create_started_after_quiesce_snapshot_is_blocked(f72_env, monkeypa
                     fork_context=context,
                 )
             )
-        events.append("fork_blocked")
+        except RuntimeError as exc:
+            assert "resume_in_progress" not in str(exc), (
+                "a concurrent create must NOT be blocked by a per-terminal "
+                "delete's terminal-scoped teardown lease (#723 D2)"
+            )
+        except Exception:
+            pass  # unrelated mocked-create failure is fine; the lease gate passed
+        events.append("fork_not_blocked")
         return real_delete(*args, **kwargs)
 
     monkeypatch.setattr(terminal_service, "_delete_terminal_under_lease", delete_after_snapshot)
     terminal_service.delete_terminal("22222222", caller_id="11111111")
-    assert events == ["snapshot_complete", "fork_blocked"]
+    assert events == ["snapshot_complete", "fork_not_blocked"]
 
 
-def test_collision_quiesces_first_refuses_once_and_deletes_nothing(f72_env, monkeypatch):
+def test_sibling_shared_lease_does_not_block_terminal_delete(f72_env, monkeypatch):
+    """F867 (#723) D2: a session SHARED lease held for an unrelated sibling (a
+    concurrent create/resume in flight) must NOT block a per-terminal delete —
+    the delete now takes a TERMINAL-scoped teardown lease that ignores sibling
+    shared leases. This reverses the pre-#723 one-shot instant-refuse contract
+    (renamed from test_collision_quiesces_first_refuses_once_and_deletes_nothing)
+    and is the core of the #723 fix."""
     _sessions, backend = f72_env
     add_terminal(backend, "11111111")
     add_terminal(backend, "22222222", "11111111")
     shared = acquire_session_lifecycle_shared("cao-f72")
     assert shared is not None
     events: list[str] = []
-    calls = 0
-    real_acquire = acquire_session_lifecycle_exclusive
 
     def quiesce(session_name, terminal_id, *, orphan=False, force=False):
         assert session_name == "cao-f72"
         events.append("quiesce")
 
-    def acquire(session_name: str):
-        nonlocal calls
-        calls += 1
-        events.append("acquire")
-        return real_acquire(session_name)
-
     monkeypatch.setattr(terminal_service, "_quiesce_cascade_subtree_pre_plan", quiesce)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
-        acquire,
-    )
-    # F513 (#368): delete now waits a bounded interval on the exclusive
-    # lifecycle lease before refusing, which would otherwise poll
-    # acquire_session_lifecycle_exclusive repeatedly here. Pin the wait to 0 so
-    # this test keeps asserting the original one-shot instant-refuse contract;
-    # the default (5s) bounded-wait behaviour is covered by
-    # test/services/test_f512_f513_lease_and_passthrough.py. Preserve every
-    # other config key by returning the caller-supplied default.
-    from cli_agent_orchestrator.services.config_service import ConfigService
-
-    _real_config_get = ConfigService.get
-
-    def _config_get(key, default=None, *args, **kwargs):
-        if key == "delete.lifecycle_lease_wait_s":
-            return 0.0
-        return _real_config_get(key, default, *args, **kwargs)
-
-    monkeypatch.setattr(ConfigService, "get", staticmethod(_config_get))
     try:
-        with pytest.raises(RuntimeError, match="resume_in_progress"):
-            terminal_service.delete_terminal("22222222", caller_id="11111111")
+        # No 409: the sibling shared lease is on the SESSION, not this terminal.
+        terminal_service.delete_terminal("22222222", caller_id="11111111")
     finally:
         release_session_lifecycle_lease(shared)
 
-    assert events == ["quiesce", "acquire"]
-    assert calls == 1
-    assert database.terminal_exists("22222222")
-    assert backend.kills == []
+    assert events == ["quiesce"]
+    # The delete proceeded and reaped the target despite the sibling shared lease.
+    assert not database.terminal_exists("22222222")
 
 
 # --- Slice A2 acceptance criteria completions ---

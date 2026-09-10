@@ -240,6 +240,25 @@ class BaseProvider(ABC):
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         raise NotImplementedError
 
+    def spawn_captured_identity(self) -> "tuple[str, Optional[str], Optional[str]] | None":
+        """F867 (#723): the provider's session identity KNOWN AT SPAWN, if any.
+
+        For a provider whose session id is deterministic and known before the
+        first turn (pi_cli sets ``--session-id <terminal_id>``), returning it
+        here lets ``create_terminal`` bind it onto the F829 conversation root at
+        spawn — WITHOUT the synchronous artifact validation that
+        ``supports_reauth_rebind`` would force at init (a fresh spawn has no
+        recoverable transcript yet, so validating at init would spuriously fail;
+        the artifact's validity is decided later by ``resolve_artifact`` at
+        hibernate time — MISSING before the first completed turn, VALID after).
+
+        Returns ``(provider_session_id, provider_namespace, artifact_locator)``,
+        any of the last two ``None``, or ``None`` when the provider has no
+        known-at-spawn identity (the default) or is resuming an existing root.
+        Must NOT raise: a failure degrades to "no spawn identity captured".
+        """
+        return None
+
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         return None
 

@@ -126,3 +126,42 @@ def real_sqlite_env(tmp_path, monkeypatch):
 
     for cache in _shadow_caches:
         cache.clear()
+
+
+# --- F867 (#723) r3: real caller rows for the pre-publication revalidation ----
+
+
+@pytest.fixture()
+def register_caller(real_sqlite_env):
+    """F867 r3: register a REAL caller terminal row the way production does.
+
+    The fail-closed pre-publication revalidation in ``terminal_service``
+    (``create_terminal`` -> ``get_terminal_metadata(caller_id)``) reads the
+    caller from the database, not from a test's in-memory row list. Suites that
+    drive the real create path with a stubbed ``db_create_terminal`` therefore
+    have to seed their caller through ``database.create_terminal`` — the same
+    write production uses — or every child publish is refused ``E-CALLER-GONE``.
+
+    Layered on ``real_sqlite_env`` so the row lands in a per-test sqlite file and
+    never leaks into another test's fleet. Returns a register function; a test
+    that asserts the refusal itself simply does not register its caller.
+    """
+    from cli_agent_orchestrator.clients import database as db_mod
+
+    def _register(
+        terminal_id: str,
+        *,
+        session_name: str = "cao-test",
+        agent_profile: str = "supervisor",
+        provider: str = "mock_cli",
+    ) -> str:
+        db_mod.create_terminal(
+            terminal_id=terminal_id,
+            tmux_session=session_name,
+            tmux_window=f"{agent_profile}-{terminal_id}",
+            provider=provider,
+            agent_profile=agent_profile,
+        )
+        return terminal_id
+
+    return _register

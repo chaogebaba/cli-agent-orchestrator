@@ -142,14 +142,17 @@ class ResumeRefused(Exception):
 def provider_supports_resume(provider: str) -> bool:
     """Whether ``provider`` can RESUME a prior session (distinct from FORK).
 
-    Addendum r1 #6 / r2 #2: this checks ONLY the explicit ``supports_resume``
-    class flag — it does NOT fall back to ``supports_fork_context``. In this
-    slice ``supports_resume`` is True only for providers with a real, exercised
-    resume input path: codex (resume-mode fork_context) and kiro
-    (``--resume-id sess_<uuid>``). grok/claude/pi declare False here (claude
-    needs resume_session_id threaded through the MCP wrapper; pi needs
-    ``--session <path>`` — both are F829 proper). An unknown provider, or one
-    that never opts in, is not resumable.
+    Addendum r1 #6 / r2 #2: historically this checked ONLY the explicit
+    ``supports_resume`` class flag — codex and kiro. F867 (#723) r2 R2-1b: it now
+    ALSO honours the newer ``declared_capabilities['resume']`` output-contract
+    flag, so a provider that declares resume there (pi_cli) is reported resumable
+    without also having to set the legacy boolean. This closes the r1 mismatch
+    where ``PiCliProvider`` declared resume in ``declared_capabilities`` but a
+    hibernated pi root still reported ``resumable=false,
+    reason=provider_pi_cli_not_resumable``. pi now has a real, exercised resume
+    input path (``--session <jsonl>`` in ``_build_pi_command``, with the JSONL
+    locator persisted onto the root by ``commit_hibernate``). An unknown
+    provider, or one that opts into neither, is not resumable.
     """
     from cli_agent_orchestrator.providers.manager import get_provider_class
 
@@ -157,7 +160,10 @@ def provider_supports_resume(provider: str) -> bool:
         cls = get_provider_class(provider)
     except ValueError:
         return False
-    return bool(getattr(cls, "supports_resume", False))
+    if bool(getattr(cls, "supports_resume", False)):
+        return True
+    declared = getattr(cls, "declared_capabilities", None)
+    return bool(isinstance(declared, dict) and declared.get("resume"))
 
 
 # --------------------------------------------------------------------------
