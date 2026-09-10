@@ -277,7 +277,7 @@ class HerdrBackend(TerminalBackend):
         return cast(dict, data)
 
     @staticmethod
-    def _foreground_processes(parsed: dict) -> list[dict]:
+    def _foreground_processes(parsed: dict[str, object]) -> list[dict[str, object]]:
         """Extract ``foreground_processes`` from a parsed ``pane process-info`` body.
 
         F880 (#733): herdr 0.9.0 (protocol 22) nests the list under
