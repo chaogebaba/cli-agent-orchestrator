@@ -3616,7 +3616,15 @@ def _migrate_f829_a2_owner_backfill() -> Dict[str, int]:
                     tally["skipped"] += 1
                     tally["concurrent"] += 1
     except Exception:
+        # The ENTIRE candidate loop runs inside one `with sqlite3.connect(...)`
+        # context, so leaving it by exception rolls back every owner rewrite and
+        # every audit insert made in this call. The in-memory tally counts
+        # ATTEMPTS, and after a rollback none of them are durable: reporting it
+        # would hand the operator (and `cao identity backfill-owners`) a false
+        # success count for writes that no longer exist. The committed state
+        # after an abort is "nothing happened", so that is what we return.
         logger.debug("f829 A2 owner backfill migration skipped", exc_info=True)
+        return {"backfilled": 0, "skipped": 0, "concurrent": 0}
     return tally
 
 
@@ -3639,6 +3647,10 @@ def run_owner_backfill_operator() -> Dict[str, int]:
     (or the once-at-start migrator) can never be counted here. ``concurrent``
     counts rows whose old-owner CAS lost a race; they are included in
     ``skipped`` and emit no ``owner_backfilled`` event.
+
+    The tally describes COMMITTED state. The whole run is one transaction, so a
+    mid-run failure rolls back every rewrite and audit event made here and the
+    result is ``{0, 0, 0}`` — the counts are never a report of attempts.
     """
     return _migrate_f829_a2_owner_backfill()
 

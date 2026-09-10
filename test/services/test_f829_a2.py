@@ -1444,3 +1444,144 @@ def test_f865_r5_two_operators_do_not_count_each_others_rows(real_sqlite_env):
         events = [e["event"] for e in d.get_conversation_events(key)]
         assert events.count("owner_backfilled") == 1, (key, events)
         assert events.count("owner_backfill_skipped") == 1, (key, events)
+
+
+# --------------------------------------------------------------------------
+# A2.2 / F865 r6 — the tally is TRANSACTION-HONEST.
+#
+# The whole candidate loop runs inside ONE `with sqlite3.connect(...)`, so a
+# failure on a later row rolls back every earlier owner rewrite AND every audit
+# insert. Before r6 the in-memory tally was returned anyway, so the operator
+# (and `cao identity backfill-owners`) reported a durable success count for
+# writes that no longer existed (codex EMPIRICAL-GATE-NO on r3/r5 — the
+# adjudication probe observed `backfilled=1` with zero committed rows).
+#
+# MUTANT MAP (r6):
+# * keep-the-in-memory-tally-on-abort (return `tally` from the except branch)
+#       → test_f865_r6_aborted_transaction_reports_zero_tally
+# * drop-the-reason-from-the-concurrent-skip-detail
+#       → test_f865_r6_concurrent_skip_detail_payload_is_pinned
+# * drop-concurrent-from-the-cli-surface
+#       → test_f865_r6_cli_surfaces_all_three_counters
+# --------------------------------------------------------------------------
+def _fail_on_nth_owner_update(n):
+    """sqlite3.connect factory whose Nth guarded owner UPDATE raises.
+
+    Models a mid-loop fault (disk error, lock timeout) AFTER earlier candidates
+    were already updated and tallied.
+    """
+    import sqlite3
+
+    real_connect = sqlite3.connect
+    state = {"updates": 0}
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith("UPDATE conversation_identity SET owner_principal"):
+                state["updates"] += 1
+                if state["updates"] == n:
+                    raise sqlite3.OperationalError("injected disk I/O error")
+            return super().execute(sql, parameters)
+
+    def connect_with_fault(*args, **kwargs):
+        return real_connect(*args, factory=FailingConnection, **kwargs)
+
+    return connect_with_fault, state
+
+
+def test_f865_r6_aborted_transaction_reports_zero_tally(real_sqlite_env):
+    """A later-row failure rolls the WHOLE call back — so the tally is all zeros.
+
+    Fail-before witness: the operator returned `{'backfilled': 1, ...}` while the
+    database still held both bare-terminal-id owners and zero audit events.
+    """
+    import sqlite3
+
+    import cli_agent_orchestrator.constants as consts
+
+    db_file = real_sqlite_env["db_file"]
+    _seed_backfill_candidate(real_sqlite_env, "conv_first", "1111aaaa", "mb_first")
+    _seed_backfill_candidate(real_sqlite_env, "conv_second", "2222bbbb", "mb_second")
+
+    connect_with_fault, state = _fail_on_nth_owner_update(2)
+    with (
+        patch.object(consts, "DATABASE_FILE", str(db_file)),
+        patch.object(sqlite3, "connect", connect_with_fault),
+    ):
+        tally = d.run_owner_backfill_operator()
+
+    # The fault really fired after the first row was updated and tallied.
+    assert state["updates"] == 2, state
+    # NOTHING committed: both owners are still the bare terminal-id fallback...
+    assert d.get_conversation_identity("conv_first")["owner_principal"] == "1111aaaa"
+    assert d.get_conversation_identity("conv_second")["owner_principal"] == "2222bbbb"
+    # ... and no audit event survived the rollback either.
+    assert d.get_conversation_events("conv_first") == []
+    assert d.get_conversation_events("conv_second") == []
+    # THE POINT: the returned counts describe COMMITTED state, not attempts.
+    assert tally == {"backfilled": 0, "skipped": 0, "concurrent": 0}, tally
+
+
+def test_f865_r6_concurrent_skip_detail_payload_is_pinned(real_sqlite_env):
+    """The `skipped_concurrent` audit detail carries the full typed payload."""
+    import json as _json
+    import sqlite3
+
+    import cli_agent_orchestrator.constants as consts
+
+    db_file = real_sqlite_env["db_file"]
+    _seed_backfill_candidate(real_sqlite_env, "conv_detail", "3333cccc", "mb_detail")
+
+    def steal_the_owner(real_connect):
+        with real_connect(str(db_file)) as other:
+            other.execute(
+                "UPDATE conversation_identity SET owner_principal=? WHERE identity_key=?",
+                ("mb_thief", "conv_detail"),
+            )
+
+    connect_with_race, state = _race_on_first_owner_update(db_file, steal_the_owner)
+    with (
+        patch.object(consts, "DATABASE_FILE", str(db_file)),
+        patch.object(sqlite3, "connect", connect_with_race),
+    ):
+        d.run_owner_backfill_operator()
+    assert state["raced"]
+
+    skips = [
+        e
+        for e in d.get_conversation_events("conv_detail")
+        if e["event"] == "owner_backfill_skipped"
+    ]
+    assert len(skips) == 1, skips
+    detail = _json.loads(skips[0]["detail"])
+    assert detail == {
+        "reason": "skipped_concurrent",
+        "old_owner": "3333cccc",
+        "new_owner": "mb_detail",
+        "owner_terminal": "3333cccc",
+        "rowcount": 0,
+    }, detail
+    assert isinstance(detail["rowcount"], int)
+    # The event row is attributed to the terminal whose ownership was in play.
+    assert skips[0]["terminal_id"] == "3333cccc"
+
+
+def test_f865_r6_cli_surfaces_all_three_counters():
+    """`cao identity backfill-owners` renders (and JSON-emits) all three keys."""
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.identity import identity_backfill_owners
+
+    tally = {"backfilled": 3, "skipped": 2, "concurrent": 1}
+    with patch.object(d, "run_owner_backfill_operator", return_value=dict(tally)):
+        human = CliRunner().invoke(identity_backfill_owners, [])
+        as_json = CliRunner().invoke(identity_backfill_owners, ["--json"])
+
+    assert human.exit_code == 0, human.output
+    assert "backfilled=3" in human.output
+    assert "skipped=2" in human.output
+    assert "concurrent=1" in human.output
+    assert as_json.exit_code == 0, as_json.output
+    assert _json.loads(as_json.output) == tally
