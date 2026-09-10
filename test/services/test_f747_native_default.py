@@ -533,3 +533,27 @@ def test_under_the_cap_nothing_is_dropped(tmp_path):
         tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
     entries = json.loads(inbox.read_text(encoding="utf-8"))
     assert [e["msg_id"] for e in entries] == ["m0", "m1", "m2", "m3", "m4"]
+
+
+def test_contended_lock_is_transient_not_a_broken_channel(monkeypatch, tmp_path):
+    """MUTANT: return False instead of None on a contended lock and a transient
+    race arms the write-failure ledger, so the fallback surface engages on a
+    healthy seat -- exactly what ruling 3 forbids."""
+    _healthy_terminal(monkeypatch, tmp_path)
+    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
+    monkeypatch.setattr(tps, "_acquire_lockfile_deadline", lambda p, d: None)
+
+    class _Msg:
+        id = 9
+        sender_id = "w1"
+        message = "hi"
+        logical_receiver_id = "mb1"
+
+    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    assert out.pushed is False and out.reason == "lock_contended"
+    assert tps.native_fallback_reason("t1") is None
+
+
+def test_lock_wait_is_short(tmp_path):
+    """The wait is a bounded courtesy, not a second of blocking per push."""
+    assert tps.INBOX_LOCK_WAIT_S <= 0.25

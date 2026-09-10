@@ -525,6 +525,18 @@ def _should_teammate_push(terminal_id: str) -> bool:
 #: that, by the fallback surface under its typed reason.
 INBOX_ENTRIES_CAP = 200
 
+#: F747 (#747): how long a push waits for the inbox lockfile before giving up.
+#:
+#: Was a flat 1.0s. ``cc_team_inbox_path`` is a pure function of the terminal's
+#: cwd, so every claude_code terminal in one project directory contends on one
+#: lock; with the push now default-on, a contended push paid up to a full second
+#: EACH. Waiting is also pointless here: the row stays PENDING and the
+#: reconciler re-pushes on its next tick, so giving up fast loses nothing and
+#: costs nothing. A contended lock is transient and is NOT a broken native
+#: channel -- it returns ``lock_contended``, which deliberately does not arm the
+#: fallback surface the way ``write_failed`` does.
+INBOX_LOCK_WAIT_S = 0.15
+
 
 #: Closed set of reasons the legacy fallback surface may engage (F747 #747).
 NATIVE_FALLBACK_REASONS = (
@@ -738,7 +750,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
+def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> Optional[bool]:
     """Write an entry to the CC inbox file under lockfile protection (legacy).
 
     F175: deduplicates by msg_id — if an entry with the same msg_id already
@@ -754,10 +766,14 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
         return False
     # F656: "before" stat taken before lock acquisition (never in-lock).
     size_before, mtime_before = _stat_size_mtime(inbox_path)
-    fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 1.0)
+    fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + INBOX_LOCK_WAIT_S)
     if fd is None:
-        logger.warning(f"teammate_push: failed to acquire lock {lock_path} after retries")
-        return False
+        # F747 (#747): None (not False) means CONTENDED, not failed -- the
+        # caller must not treat a transient lock as a broken native channel.
+        logger.debug(
+            "teammate_push: inbox lock %s contended; leaving it to the reconciler", lock_path
+        )
+        return None
     emit_data: "bytes | str | None" = None
     entries_before = 0
     entry_msg_id = entry.get("msg_id")
@@ -846,7 +862,9 @@ class PushOutcome:
     """Structured result of a teammate push attempt (fx158 D4)."""
 
     pushed: bool
-    reason: str  # closed set: empty_batch, no_inbox_path, already_notified, consumed, write_failed, pushed
+    # closed set: empty_batch, no_inbox_path, already_notified, consumed,
+    # write_failed, lock_contended, pushed
+    reason: str
     message_ids: tuple  # diagnostic only (N1)
 
 
@@ -881,6 +899,11 @@ def attempt_teammate_push_reported(
         worker_name, message_preview, len(new_messages), mailbox_id=_mbid, first_row_id=first_msg.id
     )
     success = _write_inbox_entry(inbox_path, entry)
+    if success is None:
+        # Contended, not broken: the row stays PENDING and the reconciler
+        # re-pushes next tick. Deliberately does NOT arm the write-failure
+        # ledger, so the fallback surface stays silent for a transient race.
+        return PushOutcome(pushed=False, reason="lock_contended", message_ids=ids)
     if success:
         # F747 (#747): a good write disarms the fallback for this terminal.
         clear_native_write_failure(terminal_id)
