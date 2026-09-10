@@ -259,5 +259,6 @@ def identity_backfill_owners(as_json: bool) -> None:
         click.echo(_json.dumps(tally, indent=2))
         return
     click.echo(
-        f"owner backfill complete: backfilled={tally['backfilled']} " f"skipped={tally['skipped']}"
+        f"owner backfill complete: backfilled={tally['backfilled']} "
+        f"skipped={tally['skipped']} concurrent={tally['concurrent']}"
     )

@@ -716,8 +716,6 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::DiagTerminal => None,
         CommandId::DiagWhy => None,
 
-        CommandId::DiagWhy => None,
-
         // F865 r4: catalog rows added without a server-route arm kept this exhaustive match
         // from compiling. Every command below is classified HIDE in `catalog.rs`, so the TUI
         // never offers it; per the WorkflowApprove convention above these arms are

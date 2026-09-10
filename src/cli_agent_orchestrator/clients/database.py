@@ -3449,7 +3449,7 @@ def _migrate_f829_capability_evidence() -> None:
         logger.debug("f829 capability_evidence migration skipped", exc_info=True)
 
 
-def _migrate_f829_a2_owner_backfill() -> None:
+def _migrate_f829_a2_owner_backfill() -> Dict[str, int]:
     """F829 A2.2: versioned, idempotent, provenance-checked owner backfill.
 
     The F857 incident (#713) left conversation roots whose ``owner_principal`` is
@@ -3481,6 +3481,14 @@ def _migrate_f829_a2_owner_backfill() -> None:
     logged at debug, never propagated — matching every migrator above. An audit
     ``conversation_event`` (``owner_backfilled`` / ``owner_backfill_skipped``)
     records old owner, new owner and the evidence for every considered root.
+
+    Returns an INVOCATION-LOCAL tally of the rows THIS call decided:
+    ``{backfilled, skipped, concurrent}``. ``concurrent`` counts rows whose
+    old-owner CAS lost a race (the owner changed between candidate selection and
+    the guarded update); those rows are also counted under ``skipped`` and never
+    emit an ``owner_backfilled`` event. The tally is derived from per-row
+    outcomes, never from a global event-count delta, so two operators running at
+    the same time cannot count each other's rows.
     """
     import re
     import sqlite3
@@ -3489,6 +3497,7 @@ def _migrate_f829_a2_owner_backfill() -> None:
 
     bare = re.compile(r"^[0-9a-f]{8}$")
     now = _utcnow().isoformat(sep=" ")
+    tally: Dict[str, int] = {"backfilled": 0, "skipped": 0, "concurrent": 0}
 
     def _audit(conn: Any, key: str, event: str, detail: Dict[str, Any]) -> None:
         import json as _json
@@ -3511,7 +3520,7 @@ def _migrate_f829_a2_owner_backfill() -> None:
                 ).fetchall()
             }
             if "conversation_identity" not in tables:
-                return
+                return tally
             candidates = conn.execute(
                 "SELECT identity_key, owner_principal, resume_claim "
                 "FROM conversation_identity WHERE owner_principal IS NOT NULL"
@@ -3526,6 +3535,7 @@ def _migrate_f829_a2_owner_backfill() -> None:
                         "owner_backfill_skipped",
                         {"reason": "skipped_active_claim", "owner_terminal": owner},
                     )
+                    tally["skipped"] += 1
                     continue
                 # POSITIVE: the stored owner must be a real incarnation.
                 has_incarnation = conn.execute(
@@ -3538,6 +3548,7 @@ def _migrate_f829_a2_owner_backfill() -> None:
                         "owner_backfill_skipped",
                         {"reason": "skipped_ambiguous", "owner_terminal": owner},
                     )
+                    tally["skipped"] += 1
                     continue
                 if "mailbox_incarnations" not in tables:
                     _audit(
@@ -3546,6 +3557,7 @@ def _migrate_f829_a2_owner_backfill() -> None:
                         "owner_backfill_skipped",
                         {"reason": "skipped_no_unique_mailbox", "owner_terminal": owner},
                     )
+                    tally["skipped"] += 1
                     continue
                 mailboxes = {
                     r[0]
@@ -3566,22 +3578,46 @@ def _migrate_f829_a2_owner_backfill() -> None:
                             "candidates": len(mailboxes),
                         },
                     )
+                    tally["skipped"] += 1
                     continue
                 new_owner = next(iter(mailboxes))
-                # OLD-OWNER predicate: never clobber a concurrent change.
-                conn.execute(
+                # OLD-OWNER predicate: never clobber a concurrent change. The
+                # affected-row count is the ONLY truth about whether this call
+                # rewrote the row: a lost CAS updates nothing, so it must not
+                # claim success.
+                cur = conn.execute(
                     "UPDATE conversation_identity SET owner_principal=?, updated_at=? "
                     "WHERE identity_key=? AND owner_principal=?",
                     (new_owner, now, key, owner),
                 )
-                _audit(
-                    conn,
-                    key,
-                    "owner_backfilled",
-                    {"old_owner": owner, "new_owner": new_owner, "owner_terminal": owner},
-                )
+                if cur.rowcount == 1:
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfilled",
+                        {"old_owner": owner, "new_owner": new_owner, "owner_terminal": owner},
+                    )
+                    tally["backfilled"] += 1
+                else:
+                    # Someone else changed the owner between selection and the
+                    # guarded update. Typed skip, no success event.
+                    _audit(
+                        conn,
+                        key,
+                        "owner_backfill_skipped",
+                        {
+                            "reason": "skipped_concurrent",
+                            "old_owner": owner,
+                            "new_owner": new_owner,
+                            "owner_terminal": owner,
+                            "rowcount": int(cur.rowcount),
+                        },
+                    )
+                    tally["skipped"] += 1
+                    tally["concurrent"] += 1
     except Exception:
         logger.debug("f829 A2 owner backfill migration skipped", exc_info=True)
+    return tally
 
 
 def run_owner_backfill_operator() -> Dict[str, int]:
@@ -3597,32 +3633,14 @@ def run_owner_backfill_operator() -> Dict[str, int]:
     the ONLY sanctioned owner-recovery for such a root — ``cao identity claim``
     has NO owner-override mode.
 
-    Returns a tally read back from the audit trail delta:
-    ``{backfilled, skipped}`` counting the events this run appended.
+    Returns the INVOCATION-LOCAL tally of this run: ``{backfilled, skipped,
+    concurrent}``, built from the per-row outcomes of THIS call. It is NOT a
+    global before/after event-count delta, so a concurrent operator invocation
+    (or the once-at-start migrator) can never be counted here. ``concurrent``
+    counts rows whose old-owner CAS lost a race; they are included in
+    ``skipped`` and emit no ``owner_backfilled`` event.
     """
-    before = _count_owner_backfill_events()
-    _migrate_f829_a2_owner_backfill()
-    after = _count_owner_backfill_events()
-    return {
-        "backfilled": after[0] - before[0],
-        "skipped": after[1] - before[1],
-    }
-
-
-def _count_owner_backfill_events() -> tuple[int, int]:
-    """(owner_backfilled, owner_backfill_skipped) event counts — audit tally."""
-    with SessionLocal() as db:
-        done = (
-            db.query(ConversationEventModel)
-            .filter(ConversationEventModel.event == "owner_backfilled")
-            .count()
-        )
-        skipped = (
-            db.query(ConversationEventModel)
-            .filter(ConversationEventModel.event == "owner_backfill_skipped")
-            .count()
-        )
-        return int(done), int(skipped)
+    return _migrate_f829_a2_owner_backfill()
 
 
 def _restrict_db_file_permissions() -> None:

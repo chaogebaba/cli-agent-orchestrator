@@ -1311,3 +1311,136 @@ async def test_f865_r3_valid_profile_resume_is_unaffected(real_sqlite_env):
         link, claimed_key, overrides = await _admit("conv_r3_ok", None)
     assert claimed_key == "conv_r3_ok"
     assert d.get_conversation_identity("conv_r3_ok")["resume_claim"] is not None
+
+
+# --------------------------------------------------------------------------
+# A2.2 / F865 r5 — the owner backfill is CONCURRENCY-HONEST.
+#
+# The guarded update carries an old-owner predicate, so it never clobbers a
+# concurrent owner. Before r5 the code ignored the affected-row count and
+# unconditionally emitted `owner_backfilled` + counted `backfilled`, so a LOST
+# CAS was reported as a success (codex EMPIRICAL-GATE-NO on r4). The two tests
+# below are the deterministic reproductions of that gate finding.
+#
+# MUTANT MAP (r5):
+# * drop-the-rowcount-check (emit owner_backfilled unconditionally)
+#       → test_f865_r5_lost_cas_is_typed_concurrent_not_success
+# * revert-to-global-event-delta tally
+#       → test_f865_r5_two_operators_do_not_count_each_others_rows
+# --------------------------------------------------------------------------
+def _seed_backfill_candidate(real_sqlite_env, key, terminal_id, mailbox_id):
+    """One eligible terminal-fallback root: bare-id owner, unique mailbox."""
+    with real_sqlite_env["TestSession"]() as db:
+        _seed_incarnation(db, terminal_id)
+        _seed_mailbox(db, mailbox_id, terminal_id)
+        d.mint_conversation_identity(
+            identity_key=key,
+            provider="codex",
+            provider_namespace="ns",
+            agent_profile="dev",
+            model="m",
+            reasoning_effort=None,
+            owner_principal=terminal_id,  # bare terminal-id fallback owner
+            origin_callback_ref=None,
+            current_terminal_id=terminal_id,
+            db=db,
+        )
+        db.commit()
+
+
+def _race_on_first_owner_update(db_file, hook):
+    """sqlite3.connect factory that runs `hook(real_connect)` exactly once, just
+    before the FIRST guarded owner UPDATE issued on that connection."""
+    import sqlite3
+
+    real_connect = sqlite3.connect
+    state = {"raced": False}
+
+    class RacingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if not state["raced"] and sql.startswith(
+                "UPDATE conversation_identity SET owner_principal"
+            ):
+                state["raced"] = True
+                hook(real_connect)
+            return super().execute(sql, parameters)
+
+    def connect_with_race(*args, **kwargs):
+        return real_connect(*args, factory=RacingConnection, **kwargs)
+
+    return connect_with_race, state
+
+
+def test_f865_r5_lost_cas_is_typed_concurrent_not_success(real_sqlite_env):
+    """A lost old-owner CAS is `skipped_concurrent`, never `owner_backfilled`."""
+    import sqlite3
+
+    import cli_agent_orchestrator.constants as consts
+
+    db_file = real_sqlite_env["db_file"]
+    _seed_backfill_candidate(real_sqlite_env, "conv_race", "deadbeef", "mb_target")
+
+    def steal_the_owner(real_connect):
+        with real_connect(str(db_file)) as other:
+            other.execute(
+                "UPDATE conversation_identity SET owner_principal=? WHERE identity_key=?",
+                ("mb_concurrent", "conv_race"),
+            )
+
+    connect_with_race, state = _race_on_first_owner_update(db_file, steal_the_owner)
+    with (
+        patch.object(consts, "DATABASE_FILE", str(db_file)),
+        patch.object(sqlite3, "connect", connect_with_race),
+    ):
+        tally = d.run_owner_backfill_operator()
+
+    assert state["raced"]  # the race really happened
+    # The concurrent owner won and was NOT clobbered.
+    assert d.get_conversation_identity("conv_race")["owner_principal"] == "mb_concurrent"
+    # ... and the tally says so: a typed concurrent skip, no success.
+    assert tally == {"backfilled": 0, "skipped": 1, "concurrent": 1}, tally
+    events = [e["event"] for e in d.get_conversation_events("conv_race")]
+    assert "owner_backfilled" not in events, events
+    assert "owner_backfill_skipped" in events
+
+
+def test_f865_r5_two_operators_do_not_count_each_others_rows(real_sqlite_env):
+    """Two overlapping operator invocations each report only their OWN rows.
+
+    The inner invocation runs (and commits both rewrites) while the outer one is
+    between candidate selection and its first guarded update. The outer then
+    loses the CAS on both rows. A global before/after event-count delta would
+    credit the outer with the inner's two `owner_backfilled` events; an
+    invocation-local tally cannot.
+    """
+    import sqlite3
+
+    import cli_agent_orchestrator.constants as consts
+
+    db_file = real_sqlite_env["db_file"]
+    _seed_backfill_candidate(real_sqlite_env, "conv_a", "deadbeef", "mb_a")
+    _seed_backfill_candidate(real_sqlite_env, "conv_b", "cafebabe", "mb_b")
+    inner: dict = {}
+
+    def run_the_other_operator(real_connect):
+        with patch.object(sqlite3, "connect", real_connect):
+            inner["tally"] = d.run_owner_backfill_operator()
+
+    connect_with_race, state = _race_on_first_owner_update(db_file, run_the_other_operator)
+    with (
+        patch.object(consts, "DATABASE_FILE", str(db_file)),
+        patch.object(sqlite3, "connect", connect_with_race),
+    ):
+        outer = d.run_owner_backfill_operator()
+
+    assert state["raced"]
+    # The inner operator did all the real work — and counted only its own rows.
+    assert inner["tally"] == {"backfilled": 2, "skipped": 0, "concurrent": 0}, inner
+    # The outer lost both CAS attempts and counted NONE of the inner's rows.
+    assert outer == {"backfilled": 0, "skipped": 2, "concurrent": 2}, outer
+    # Both rows were rewritten exactly once, with exactly one success event each.
+    for key, mailbox in (("conv_a", "mb_a"), ("conv_b", "mb_b")):
+        assert d.get_conversation_identity(key)["owner_principal"] == mailbox
+        events = [e["event"] for e in d.get_conversation_events(key)]
+        assert events.count("owner_backfilled") == 1, (key, events)
+        assert events.count("owner_backfill_skipped") == 1, (key, events)
