@@ -20,12 +20,13 @@ Three required repairs, one section each:
       terminal must evict both.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.child_proc_probe import ChildProcProbe, _clock_ticks
+from cli_agent_orchestrator.services.child_proc_probe import ChildProcProbe
 from cli_agent_orchestrator.services.pane_liveness import PaneLivenessService, _CaptureResult
 from cli_agent_orchestrator.services.question_state import QuestionStateService
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
@@ -53,7 +54,7 @@ def _write_tree(tmp_path, tree, *, name="proc"):
     root = tmp_path / name
     root.mkdir(parents=True, exist_ok=True)
     (root / "stat").write_text(f"cpu  0 0 0 0\nbtime {int(_BOOT)}\nprocesses 1\n")
-    hz = _clock_ticks()
+    hz = float(os.sysconf("SC_CLK_TCK") or 100)
     for pid, (comm, ppid, start_epoch) in tree.items():
         d = root / str(pid)
         d.mkdir(exist_ok=True)
