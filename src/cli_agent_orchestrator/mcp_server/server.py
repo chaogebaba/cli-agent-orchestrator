@@ -2553,6 +2553,13 @@ def _assign_impl(
     # (no handle) is refused; resume_from together with fork_from/resume=True is
     # an input conflict. Plain fork_from (no resume) keeps fork semantics.
     _resume_prepared: Optional[Dict[str, Any]] = None
+    # WP-HERDR D9 backend axis. FUNCTION scope on purpose: the routing branch that
+    # resolves these is skipped entirely on the resume path, and the result is
+    # built for both — initialising them beside the other D9 locals left them
+    # unbound for every resume. "tmux" is the answer for every row that does not
+    # opt in, which is every row today.
+    _d9_backend = "tmux"
+    _d9_herdr_certified = False
     _resume_handle: Optional[str] = None
     if resume_from and (fork_from or resume):
         return {
@@ -2749,10 +2756,6 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
-            # WP-HERDR D9 backend axis; "tmux" for every row that does not opt in,
-            # which is every row today.
-            _d9_backend = "tmux"
-            _d9_herdr_certified = False
             # F838 (#695) r2 — the guard-checked provider for a legacy alias,
             # carried INTO _create_terminal so creation never re-resolves from
             # the mutable store between validation and use (codex Blocker 2).
