@@ -35,6 +35,32 @@ yet (D1 lands in 2b), a sourced terminal produces both this row and the egress's
 ``status.legacy_published``, describing one reading at two stages.  That is the
 same shape an UNSOURCED terminal keeps permanently, so nothing here has to change
 when 2b lands — only the egress side goes quiet for sourced terminals.
+
+Sub-phase 2b then moves two DERIVED producers here for the same reason the
+reading itself moved, and they are the whole of D1c's second half and D1f:
+
+* **``usage.capped``** was appended by the egress producer off the same
+  ``get_condition`` read.  The cap is the one thing a rollout can never report,
+  and the capped-lane policy is the consumer that most needs it to survive — so
+  it cannot be allowed to go quiet for exactly the sourced terminals D1
+  suppresses the egress for.  It edge-triggers on the CONDITION crossing into
+  ``CAPPED``, tracked apart from the classification edge because a cap can be
+  detected while the latched status and origin sit still.
+* **``prompt.awaiting`` / ``prompt.answered``** (D1f) edge-trigger on the latched
+  status crossing into and out of ``waiting_user_answer``.  Every provider gets
+  them, and codex is why: it has no dialog hook at all, so with the egress
+  suppressed its ``AWAITING_INPUT`` would have no producer and #386's card would
+  project as a busy terminal.  Both kinds are in the projector's
+  ``DERIVED_ALWAYS_KINDS``, so they apply even while an authoritative source is
+  healthy — which is the point, since the source is the thing that cannot see the
+  card.
+
+Both run BEFORE ``_publish_observation``, so on an unsourced terminal the
+egress's own ``status.legacy_published`` folds immediately after and has the last
+word on the state.  That ordering is what keeps a ``waiting -> idle`` edge — a
+dismissed card rather than an answered one — from leaving the projection on
+``prompt.answered``'s implied ``busy``: the pane's own reading arrives in the
+same call and corrects it, and the two transition rows record what happened.
 """
 
 from __future__ import annotations
@@ -43,7 +69,11 @@ import logging
 import threading
 from typing import Any
 
-from cli_agent_orchestrator.adapters.truth.legacy_egress import as_text, effective_origin
+from cli_agent_orchestrator.adapters.truth.legacy_egress import (
+    CAPPED_CONDITION_LABEL,
+    as_text,
+    effective_origin,
+)
 from cli_agent_orchestrator.adapters.truth.wiring import emit, producer_runtime
 from cli_agent_orchestrator.core.events import (
     Confidence,
@@ -55,6 +85,8 @@ from cli_agent_orchestrator.core.events import (
 )
 
 __all__ = [
+    "AWAITING_STATUS",
+    "UNCLASSIFIED_STATUS",
     "forget",
     "record_pane_classification",
     "reset_edges",
@@ -62,9 +94,34 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: The legacy ``TerminalStatus.WAITING_USER_ANSWER`` value, as a STRING.
+#:
+#: Spelled rather than imported for the reason ``app/worker_truth/mapping.py``
+#: spells its whole vocabulary: ``adapters`` may not import ``models`` under
+#: ``new-code-never-imports-legacy``.  A test on the legacy side of the fence
+#: pins it against the real enum, which is what keeps the spelling honest.
+AWAITING_STATUS = "waiting_user_answer"
+
+#: What is recorded when the classification site is reached with no status at all.
+#:
+#: The 2a producer wrote ``""`` here, and an empty string is the one value
+#: ``legacy_state`` cannot read: it returns ``None``, and ``DIAG-PANE-DISAGREE``
+#: then SKIPS the row rather than comparing it.  A row that silently drops out of
+#: the comparison is worse than a wrong one, because the comparison goes quiet
+#: instead of failing — so the absence is recorded as the legacy vocabulary's own
+#: word for it, which the check can read and disagree with.
+UNCLASSIFIED_STATUS = "unknown"
+
 _lock = threading.Lock()
 #: terminal_id -> the last classified ``(latched_status, origin)`` pair.
 _last_pair: dict[str, tuple[str, str]] = {}
+#: terminal_id -> the last condition label seen at the classification site.
+#:
+#: Tracked APART from the classification pair (B9), and moved here from the
+#: egress producer in 2b: a cap can be detected while the latched status and
+#: origin are unchanged, and folding the condition into the pair would instead
+#: make every condition change re-emit a classification row.
+_last_condition: dict[str, str | None] = {}
 #: terminal_id -> how many classification EDGES this producer has recorded for it.
 #:
 #: This is the ``<seq>`` of ``pane:<terminal_id>#<seq>`` (§5).  It is the
@@ -80,6 +137,7 @@ def reset_edges() -> None:
     """Drop all edge state.  For tests, and for a bootstrap that re-installs."""
     with _lock:
         _last_pair.clear()
+        _last_condition.clear()
         _edge_seq.clear()
 
 
@@ -87,7 +145,46 @@ def forget(terminal_id: str) -> None:
     """Drop one terminal's edge state when it is deleted."""
     with _lock:
         _last_pair.pop(terminal_id, None)
+        _last_condition.pop(terminal_id, None)
         _edge_seq.pop(terminal_id, None)
+
+
+def _read_condition(monitor: Any, terminal_id: str) -> str | None:
+    """The monitor's live condition label, or ``None``.
+
+    Read defensively and never fused: ``get_condition`` is a pure read under the
+    monitor's own re-entrant lock, which is the only kind of read that is safe
+    from inside the locked detection path.  A monitor that raises, or a caller
+    that passed none at all, yields ``None`` — the same answer as "no condition",
+    because a cap that could not be read is not evidence of a cap.
+    """
+    getter = getattr(monitor, "get_condition", None)
+    if not callable(getter):
+        return None
+    try:
+        label = getter(terminal_id)
+    except Exception:
+        return None
+    return label if isinstance(label, str) else None
+
+
+def _prompt_kind(previous: str | None, current: str) -> EventKind | None:
+    """D1f — the dialog edge this classification crosses, if any.
+
+    Edge-triggered on the latched status alone, so a re-render of the same card
+    (the #386 shape: the pane repaints continuously while the card is up) is one
+    ``prompt.awaiting`` and not one per chunk.
+
+    A terminal first seen ALREADY waiting emits ``prompt.awaiting``: the card is
+    up, nobody has recorded it, and the alternative — treating an unknown prior
+    status as "no edge" — would lose the card on every server restart, which is
+    precisely when a worker has been sitting on one unattended.
+    """
+    if current == AWAITING_STATUS:
+        return None if previous == AWAITING_STATUS else EventKind.PROMPT_AWAITING
+    if previous == AWAITING_STATUS:
+        return EventKind.PROMPT_ANSWERED
+    return None
 
 
 def record_pane_classification(
@@ -97,8 +194,10 @@ def record_pane_classification(
     frame_source: Any,
     pass_outcome: Any,
     raw_classification: Any = None,
+    *,
+    monitor: Any = None,
 ) -> None:
-    """D1c — append ``status.pane_classified`` for one classification edge.
+    """D1c/D1f — the three producers that live at the classification site.
 
     Called from inside ``_apply_detection``'s ``finally`` block, beside the
     publish it will one day outlive, with the status monitor's ``_lock`` held.
@@ -106,21 +205,84 @@ def record_pane_classification(
     diagnostic that could raise into the locked detection path would turn a
     diagnosability feature into a status outage, which is the failure mode this
     whole work package exists to end.
+
+    ``monitor`` is the status monitor itself, and it is optional so that the
+    pre-2b call shape stays legal: with no monitor there is no condition to read
+    and the ``usage.capped`` producer simply has nothing to say.
+
+    Three INDEPENDENT edges are computed under one lock and emitted after it:
+    the classification pair, the condition crossing into ``CAPPED``, and the
+    dialog edge.  They are independent in both directions — a cap arrives with
+    the status sitting still, a card arrives with the condition sitting still —
+    so an early return on any one of them would silence the other two.
     """
     runtime = producer_runtime()
     if runtime is None:
         return
     try:
-        status_text = as_text(latched_status) or ""
+        status_text = as_text(latched_status) or UNCLASSIFIED_STATUS
         origin_text = effective_origin(origin, pass_outcome)
         pair = (status_text, origin_text)
+        condition = _read_condition(monitor, terminal_id)
 
         with _lock:
-            if _last_pair.get(terminal_id) == pair:
-                return
-            _last_pair[terminal_id] = pair
-            seq = _edge_seq.get(terminal_id, 0) + 1
-            _edge_seq[terminal_id] = seq
+            previous_pair = _last_pair.get(terminal_id)
+            publish_edge = previous_pair != pair
+            seq = _edge_seq.get(terminal_id, 0)
+            if publish_edge:
+                _last_pair[terminal_id] = pair
+                seq += 1
+                _edge_seq[terminal_id] = seq
+            condition_edge = (
+                condition == CAPPED_CONDITION_LABEL
+                and _last_condition.get(terminal_id) != CAPPED_CONDITION_LABEL
+            )
+            _last_condition[terminal_id] = condition
+
+        previous_status = previous_pair[0] if previous_pair is not None else None
+        prompt_kind = _prompt_kind(previous_status, status_text)
+
+        if not publish_edge and not condition_edge and prompt_kind is None:
+            return
+
+        observed_at = runtime.clock.now()
+        # The ref every row from this edge carries.  Shared on purpose: the
+        # dialog row and the classification row are two readings of ONE pane
+        # observation, and a diag view that could not join them would make "what
+        # did the screen say when the card appeared" unanswerable.
+        ref = source_ref(SourceRefScheme.PANE, terminal_id, seq)
+
+        if condition_edge:
+            emit(
+                EventDraft(
+                    terminal_id=terminal_id,
+                    kind=EventKind.USAGE_CAPPED,
+                    producer=Producer.PANE,
+                    confidence=Confidence.DERIVED,
+                    observed_at=observed_at,
+                    payload={"condition": condition, "latched_status": status_text},
+                )
+            )
+
+        if prompt_kind is not None:
+            emit(
+                EventDraft(
+                    terminal_id=terminal_id,
+                    kind=prompt_kind,
+                    producer=Producer.PANE,
+                    confidence=Confidence.DERIVED,
+                    observed_at=observed_at,
+                    source_ref=ref,
+                    payload={
+                        "latched_status": status_text,
+                        "prior_status": previous_status,
+                        "origin": origin_text,
+                    },
+                )
+            )
+
+        if not publish_edge:
+            return
 
         emit(
             EventDraft(
@@ -128,8 +290,8 @@ def record_pane_classification(
                 kind=EventKind.STATUS_PANE_CLASSIFIED,
                 producer=Producer.PANE,
                 confidence=Confidence.DERIVED,
-                observed_at=runtime.clock.now(),
-                source_ref=source_ref(SourceRefScheme.PANE, terminal_id, seq),
+                observed_at=observed_at,
+                source_ref=ref,
                 payload={
                     # The three fields D1c names.  ``latched_status`` is the
                     # WOULD-BE publish — what the pane path is about to assert,

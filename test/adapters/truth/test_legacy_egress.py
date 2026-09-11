@@ -131,24 +131,12 @@ def test_payload_carries_every_blueprint_field(ingest_on: FakeEventStore) -> Non
     }
 
 
-def test_capped_condition_also_appends_usage_capped(ingest_on: FakeEventStore) -> None:
-    """AC4b: the rollout can never say this, so the pane egress must."""
-    monitor = _Monitor(condition=legacy_egress.CAPPED_CONDITION_LABEL)
-    _publish(monitor)
-    _publish(monitor)  # same pair: no second usage.capped either
-    assert len(ingest_on.of_kind(EventKind.USAGE_CAPPED)) == 1
-
-
-def test_capped_edge_fires_even_when_the_publish_pair_is_unchanged(
-    ingest_on: FakeEventStore,
-) -> None:
-    """A cap can be detected while status and origin sit still."""
-    monitor = _Monitor()
-    _publish(monitor)
-    assert ingest_on.of_kind(EventKind.USAGE_CAPPED) == []
-    monitor._condition = legacy_egress.CAPPED_CONDITION_LABEL
-    _publish(monitor)
-    assert len(ingest_on.of_kind(EventKind.USAGE_CAPPED)) == 1
+# The two capped-edge tests that lived here moved to
+# ``test_pane_classification.py`` with the producer itself (WP-ARCH 2b, D1c):
+# the cap is the one thing a rollout can never report, so it cannot be produced
+# at an egress D1 suppresses for exactly the terminals that have a rollout.  The
+# condition is still READ here and still carried in the publish payload, which
+# ``test_payload_carries_every_blueprint_field`` above pins.
 
 
 def test_a_raising_monitor_never_breaks_the_publish_path(ingest_on: FakeEventStore) -> None:

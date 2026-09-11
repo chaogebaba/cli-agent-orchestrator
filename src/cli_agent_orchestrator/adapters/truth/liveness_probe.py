@@ -128,6 +128,17 @@ class LivenessProbe:
     only for tests that want to bypass the event-log read; production leaves it
     ``None`` and the exit reason comes from the ``teardown.intended`` rows.
 
+    ``list_panes`` is itself OPTIONAL, and the distinction it draws is the one
+    B13 draws one level down.  A failed probe is a statement that the probe RAN
+    and learned nothing, and ``PROBE_FAIL_TICKS`` of those degrade the entire
+    fleet with ``producer_error``.  A backend that cannot enumerate the fleet's
+    panes at all — herdr inherits ``enumerate_windows``'s fail-closed default —
+    has not failed a probe; it has no probe to fail, and reading a missing
+    capability as a fleet-wide outage would degrade every terminal forever on
+    the strength of a feature nobody implemented.  So the composition root
+    leaves the listing unset for such a backend and the probe runs as the
+    sampler's driver alone: less information, never wrong information.
+
     ``sampler_tick`` is WP-ARCH phase 2's §12 seam, and it is here because phase 2
     is the phase that notices a cross-phase defect neither phase owns.  The
     pane-delta sampler that ``fuse_status``'s rules 3a/3b read is driven from
@@ -150,7 +161,7 @@ class LivenessProbe:
     def __init__(
         self,
         *,
-        list_panes: Callable[[], Iterable[PaneRecord]],
+        list_panes: Callable[[], Iterable[PaneRecord]] | None = None,
         fleet: Callable[[], Iterable[TerminalRef]],
         teardown_lookup: Callable[[str], bool] | None = None,
         sampler_tick: Callable[[], None] | None = None,
@@ -199,7 +210,16 @@ class LivenessProbe:
     async def _run(self) -> None:
         while not self._stopping.is_set():
             try:
-                self.probe_once()
+                # OFF the event loop.  One tick shells out to the backend for the
+                # pane listing and then drives the pane-delta sampler across the
+                # whole fleet, both of which are blocking subprocess work: run
+                # inline, a slow tmux or herdr call would stall every request the
+                # server is serving.  ``RetentionTask`` offloads its sweep for the
+                # same reason, and the producers are already called from the
+                # legacy monitor's own threads, so nothing here is loop-affine.
+                await asyncio.to_thread(self.probe_once)
+            except asyncio.CancelledError:
+                raise
             except Exception:  # pragma: no cover - the never-break-the-server rule
                 logger.debug("liveness probe tick failed", exc_info=True)
             await asyncio.sleep(PANE_HEARTBEAT_S)
@@ -212,6 +232,17 @@ class LivenessProbe:
         if runtime is None:
             return
         self._drive_sampler()
+        if self._list_panes is None:
+            # No pane listing on this backend — see the class docstring.  The
+            # sampler drive above still ran, which is the half of the tick that
+            # has nothing to do with tmux.
+            return
+        if not self._safe_fleet():
+            # An empty fleet is not a failed probe either.  A server with no
+            # terminals would otherwise file one ``probe.failed`` row every tick
+            # forever and then declare a fleet-wide ``producer_error`` episode
+            # over a fleet of nobody.
+            return
         try:
             panes: list[PaneRecord] | None
             try:

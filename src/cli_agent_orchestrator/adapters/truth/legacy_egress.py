@@ -19,16 +19,17 @@ Confidence is ``derived``, always.  The pane classifier is a first-class
 fallback and never a deprecated one, but it is not authoritative for a terminal
 whose adapter declares a JSONL source.
 
-Two edges, tracked separately and deliberately so:
+One edge: the ``(latched_status, origin)`` pair (B9).  A hundred identical
+publishes are one row; that is what keeps the write rate off the single SQLite
+writer on a busy fleet.
 
-* the **publish edge** is the ``(latched_status, origin)`` pair (B9).  A hundred
-  identical publishes are one row; that is what keeps the write rate off the
-  single SQLite writer on a busy fleet.
-* the **condition edge** is the fleet condition label crossing into ``CAPPED``.
-  It is tracked apart from the publish edge because a cap can be detected while
-  the latched status and origin are unchanged, and folding the condition into the
-  publish key would instead make every condition change re-publish a status row.
-  B9 names the pair, and this keeps the pair exactly as B9 names it.
+There were TWO until WP-ARCH sub-phase 2b.  The second was the fleet condition
+label crossing into ``CAPPED``, and it moved to the classification site with the
+rest of D1c: the cap is the one thing a rollout can never report, so a producer
+that went quiet for exactly the terminals D1 suppresses this egress for would
+take the capped-lane policy's evidence with it.  The condition is still READ here
+and still recorded in the publish payload — it is part of what the fleet
+consumed at this moment — but it no longer produces an event of its own.
 """
 
 from __future__ import annotations
@@ -95,8 +96,6 @@ def fed_by(origin: str) -> str:
 _lock = threading.Lock()
 #: terminal_id -> the last published ``(latched_status, origin)`` pair.
 _last_pair: dict[str, tuple[str, str]] = {}
-#: terminal_id -> the last condition label seen at the egress.
-_last_condition: dict[str, str | None] = {}
 #: terminal_id -> ``event_id`` of the most recent ``status.legacy_published``.
 #: This is the evidence a ``fleet.override`` decision cites.  When it is absent
 #: the override row is written with ``evidence=None`` on purpose: a decision that
@@ -109,7 +108,6 @@ def reset_edges() -> None:
     """Drop all edge state.  For tests, and for a bootstrap that re-installs."""
     with _lock:
         _last_pair.clear()
-        _last_condition.clear()
         _last_event_id.clear()
 
 
@@ -130,7 +128,6 @@ def forget(terminal_id: str) -> None:
     """Drop one terminal's edge state when it is deleted."""
     with _lock:
         _last_pair.pop(terminal_id, None)
-        _last_condition.pop(terminal_id, None)
         _last_event_id.pop(terminal_id, None)
 
 
@@ -220,52 +217,32 @@ def record_legacy_publish(
             publish_edge = _last_pair.get(terminal_id) != pair
             if publish_edge:
                 _last_pair[terminal_id] = pair
-            condition_edge = (
-                condition == CAPPED_CONDITION_LABEL
-                and _last_condition.get(terminal_id) != CAPPED_CONDITION_LABEL
-            )
-            _last_condition[terminal_id] = condition
 
-        if not publish_edge and not condition_edge:
+        if not publish_edge:
             return
 
-        observed_at = runtime.clock.now()
-
-        if publish_edge:
-            stored = emit(
-                EventDraft(
-                    terminal_id=terminal_id,
-                    kind=EventKind.STATUS_LEGACY_PUBLISHED,
-                    producer=Producer.PANE,
-                    confidence=Confidence.DERIVED,
-                    observed_at=observed_at,
-                    payload={
-                        "latched_status": status_text,
-                        "origin": origin_text,
-                        "frame_source": _as_text(frame_source),
-                        "pass_outcome": _as_text(pass_outcome),
-                        "raw_classification": _as_text(raw_classification),
-                        "fusion_reason": fusion_reason,
-                        "condition": condition,
-                        "fed_by": fed_by(origin_text),
-                    },
-                )
+        stored = emit(
+            EventDraft(
+                terminal_id=terminal_id,
+                kind=EventKind.STATUS_LEGACY_PUBLISHED,
+                producer=Producer.PANE,
+                confidence=Confidence.DERIVED,
+                observed_at=runtime.clock.now(),
+                payload={
+                    "latched_status": status_text,
+                    "origin": origin_text,
+                    "frame_source": _as_text(frame_source),
+                    "pass_outcome": _as_text(pass_outcome),
+                    "raw_classification": _as_text(raw_classification),
+                    "fusion_reason": fusion_reason,
+                    "condition": condition,
+                    "fed_by": fed_by(origin_text),
+                },
             )
-            if stored is not None:
-                with _lock:
-                    _last_event_id[terminal_id] = stored.event_id
-
-        if condition_edge:
-            emit(
-                EventDraft(
-                    terminal_id=terminal_id,
-                    kind=EventKind.USAGE_CAPPED,
-                    producer=Producer.PANE,
-                    confidence=Confidence.DERIVED,
-                    observed_at=observed_at,
-                    payload={"condition": condition, "latched_status": status_text},
-                )
-            )
+        )
+        if stored is not None:
+            with _lock:
+                _last_event_id[terminal_id] = stored.event_id
     except Exception:  # pragma: no cover - the guarantee, not a branch under test
         logger.debug("worker-truth legacy egress hook failed", exc_info=True)
 

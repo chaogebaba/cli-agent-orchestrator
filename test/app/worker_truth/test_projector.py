@@ -538,3 +538,25 @@ def test_the_projection_row_cannot_be_edited_in_place(rig: Rig) -> None:
     moved = dataclasses.replace(row, state=WorkerState.IDLE)
     assert moved.state is WorkerState.IDLE
     assert row.state is WorkerState.BUSY
+
+
+def test_two_producers_of_one_dialog_fold_to_one_transition(rig: Rig) -> None:
+    """AC-2b case 14.  D1f gives every provider a derived dialog producer, and
+    claude_code already has an authoritative hook for the same card — so the
+    common case on that provider is two rows describing one event.
+
+    The fold must make that one transition and one no-op, not two transitions:
+    the second row is the diagonal, which keeps ``since`` and writes nothing.
+    Two transitions would make "how long has this worker been waiting" wrong by
+    however long the second producer lagged the first.
+    """
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)  # the classification site
+    since = rig.states.get(TERMINAL).since
+    rig.emit(TERMINAL, EventKind.PROMPT_AWAITING)  # the provider hook
+
+    assert rig.state_of(TERMINAL) is WorkerState.AWAITING_INPUT
+    awaiting = [row for row in _transitions(rig) if row.payload["to"] == "awaiting_input"]
+    assert len(awaiting) == 1
+    assert rig.states.get(TERMINAL).since == since

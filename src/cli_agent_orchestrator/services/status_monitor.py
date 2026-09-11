@@ -1351,6 +1351,11 @@ class StatusMonitor:
                     "incremental",
                     pass_outcome,
                     raw_classification,
+                    # WP-ARCH phase 2 D1c/D1f: the condition read and the dialog
+                    # edge both live at this site now. `self` is handed over for
+                    # `get_condition` alone — a pure read under this same
+                    # re-entrant lock, exactly as the egress producer takes it.
+                    monitor=self,
                 )
                 try:
                     evidence_kwargs = (

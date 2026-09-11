@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from cli_agent_orchestrator.adapters.store.readonly import ReadOnlyPool
 from cli_agent_orchestrator.adapters.store.retention import RetentionTask
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
+from cli_agent_orchestrator.adapters.truth.liveness_probe import LivenessProbe, PaneRecord
 from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
 from cli_agent_orchestrator.app.delivery.tick import DeliveryTick
 from cli_agent_orchestrator.app.delivery.wake import WakeService
@@ -56,6 +58,7 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
 )
 from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
+from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
 from cli_agent_orchestrator.core.delivery import (
     GuardOutcome,
     QueueOccupancy,
@@ -197,6 +200,11 @@ class WorkerTruthRuntime:
     #: runtime must drop the view with it: a stopped projector leaves marks
     #: behind, and a fleet whose publisher is gone must fall back to the pane.
     health: SourceHealth | None = None
+    #: The two periodic drivers (phase 2, sub-phase 2b).  ``probe`` also owns the
+    #: pane-delta sampler's re-drive (§12), which is why it is started even on a
+    #: backend that cannot list panes for it.
+    probe: LivenessProbe | None = None
+    sweep: ProjectorSweep | None = None
     retention: RetentionTask | None = None
     #: The delivery queue's RESOLVED position (D9), and the guard's reasoning.
     #: Present whatever the ingestion switch says: the two are independent, and
@@ -239,6 +247,142 @@ def _default_busy_timeout_ms() -> int:
     from cli_agent_orchestrator.constants import CAO_DB_BUSY_TIMEOUT_MS
 
     return int(CAO_DB_BUSY_TIMEOUT_MS)
+
+
+# ---------------------------------------------------------------------------
+# The liveness probe's three injected callables (WP-ARCH phase 2, sub-phase 2b).
+#
+# Every one of them names the legacy tree, and that is why they are HERE: the
+# probe lives under ``adapters/`` and may not import ``services``, ``clients`` or
+# ``backends`` at all.  It takes a roster, a pane listing and a sampler tick as
+# plain callables, and this module is the only one allowed to know what fills
+# them.  Each is defensive to the point of dullness — the probe's contract is
+# that it never raises into the server, and a boot that could fail on a backend
+# quirk would take the whole diagnosability feature down with it.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FleetMember:
+    """One row of the terminal roster, in the shape ``TerminalRef`` wants."""
+
+    terminal_id: str
+    tmux_session: str
+    tmux_window: str
+
+
+def _fleet_roster() -> list[_FleetMember]:
+    """Every live terminal, or an empty roster.  Never raises."""
+    try:
+        from cli_agent_orchestrator.clients.database import list_all_terminals
+
+        rows = list_all_terminals()
+    except Exception:
+        logger.debug("worker-truth: terminal roster unavailable", exc_info=True)
+        return []
+    members: list[_FleetMember] = []
+    for row in rows:
+        terminal_id = str(row.get("id") or "")
+        session = str(row.get("tmux_session") or "")
+        window = str(row.get("tmux_window") or "")
+        if terminal_id and session and window:
+            members.append(_FleetMember(terminal_id, session, window))
+    return members
+
+
+def _build_pane_lister() -> Callable[[], list[PaneRecord]] | None:
+    """The fleet's pane listing, or ``None`` when the backend cannot give one.
+
+    ``None`` is not a failure and must not be read as one.  A FAILED probe is a
+    statement that the probe ran and learned nothing, and ``PROBE_FAIL_TICKS`` of
+    those open a fleet-wide ``degraded(producer_error)`` episode; a backend that
+    never implemented ``enumerate_windows`` — herdr inherits ``base.py``'s
+    fail-closed default, the same family as F893/F900 — would trip that on every
+    tick forever and degrade a fleet that is perfectly healthy.  So the
+    capability is decided ONCE, here, by asking whether the backend overrides the
+    port at all, and the probe is handed no listing rather than a broken one.
+
+    When the capability IS there, a session the backend cannot enumerate fails
+    the WHOLE tick rather than marking its terminals absent.  That is B13 at the
+    composition root: an unreadable session says something about the read, not
+    about the workers in it, and ``process.exited`` is a one-way door in the
+    projection.
+    """
+    try:
+        from cli_agent_orchestrator.backends.base import TerminalBackend
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+    except Exception:
+        logger.debug("worker-truth: no backend for the liveness probe", exc_info=True)
+        return None
+
+    if type(backend).enumerate_windows is TerminalBackend.enumerate_windows:
+        logger.info(
+            "worker-truth: %s cannot enumerate windows; the liveness probe will "
+            "drive the pane sampler only",
+            type(backend).__name__,
+        )
+        return None
+
+    def list_panes() -> list[PaneRecord]:
+        from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+        live = _get_backend()
+        records: list[PaneRecord] = []
+        for session in {member.tmux_session for member in _fleet_roster()}:
+            outcome, windows = live.enumerate_windows(session)
+            if outcome != "ok" or windows is None:
+                return []  # the probe learned nothing — never "they are gone"
+            for window in windows:
+                name = window.get("name")
+                if isinstance(name, str) and name:
+                    records.append(PaneRecord(session=session, window=name))
+        return records
+
+    return list_panes
+
+
+def _build_sampler_tick() -> Callable[[], None]:
+    """§12's re-drive: one pane-delta sample per terminal per probe tick.
+
+    ``pane_liveness.observe`` has exactly one driver today, the stalled-callback
+    watchdog's tick, and that module is phase 3's K4 — deleted in 3c.  After that
+    deletion ``fuse_status``'s rules 3a/3b would read a sample nothing refreshes,
+    which by the sampler's own no-evidence rule degrades to ``None`` and silently
+    disables the pane-delta downgrade for every UNSOURCED terminal: the ones I7
+    promises are unaffected.  So the drive moves onto the probe's tick here,
+    BEFORE 3c can delete the only driver.
+
+    The ``peek`` guard is what makes this a hand-off rather than a second
+    sampler.  While the watchdog is alive it samples every 1-5 s, so ``peek``
+    always answers fresh and this tick captures NOTHING — today's behaviour,
+    byte for byte, with no flag to set and no ordering between the two lanes to
+    get right.  When the watchdog goes, ``peek`` starts answering ``None`` and
+    this becomes the driver.  Without the guard both would sample, and the extra
+    call would advance ``unchanged_count`` on a cadence rule 3a reads — a
+    behaviour change in status fusion, delivered by a re-drive whose whole
+    purpose was to avoid one.
+    """
+
+    def tick() -> None:
+        import time
+
+        from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        now = time.monotonic()
+        for member in _fleet_roster():
+            try:
+                if pane_liveness.peek(member.terminal_id, now=now) is not None:
+                    continue
+                pane_liveness.observe(member.terminal_id, now=now, monitor=status_monitor)
+            except Exception:
+                logger.debug(
+                    "worker-truth: pane sample failed for %s", member.terminal_id, exc_info=True
+                )
+
+    return tick
 
 
 def _start_delivery(
@@ -571,6 +715,25 @@ async def start_worker_truth(
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
+        # WP-ARCH sub-phase 2b — the two periodic drivers phase 1 wrote and left
+        # unwired.  Both are started under the INGESTION switch and neither is
+        # gated on the status cutover: they produce rows and move the projection,
+        # which is what the cutover will publish FROM, so they have to have been
+        # running before it can be turned on.
+        #
+        # Separate tasks on purpose.  The probe writes what it saw and the sweep
+        # judges what it did not, and on a backend with no pane listing the probe
+        # has nothing to write while the sweep still has everything to judge —
+        # silence detection is the one thing that keeps working when a backend
+        # goes dark, so it must not be coupled to the backend.
+        sweep = ProjectorSweep(projector)
+        await sweep.start()
+        probe = LivenessProbe(
+            list_panes=_build_pane_lister(),
+            fleet=_fleet_roster,
+            sampler_tick=_build_sampler_tick(),
+        )
+        await probe.start()
         # Arm the phase-1 PRODUCERS.  Until this line runs, the seven legacy hook
         # points are no-ops that cost one module-global lookup; after it, they
         # append.  That is the whole of AC5's enforcement, and it is why the
@@ -631,6 +794,8 @@ async def start_worker_truth(
         sources=sources,
         health=health,
         retention=retention,
+        probe=probe,
+        sweep=sweep,
         delivery=delivery,
         queue_store=queue_store,
         status=status,
@@ -657,6 +822,16 @@ async def shutdown_worker_truth() -> None:
             await runtime.delivery_tick.stop()
         except Exception:  # noqa: BLE001
             logger.warning("delivery tick did not stop cleanly", exc_info=True)
+    if runtime.probe is not None:
+        try:
+            await runtime.probe.stop()
+        except Exception:  # noqa: BLE001
+            logger.warning("worker-truth liveness probe did not stop cleanly", exc_info=True)
+    if runtime.sweep is not None:
+        try:
+            await runtime.sweep.stop()
+        except Exception:  # noqa: BLE001
+            logger.warning("worker-truth projection sweep did not stop cleanly", exc_info=True)
     if runtime.retention is not None:
         try:
             await runtime.retention.stop()
