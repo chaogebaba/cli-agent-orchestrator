@@ -426,3 +426,42 @@ def test_the_adopted_row_reaches_a_terminal_state_when_acked(env) -> None:
     assert (
         queued.state is not MsgState.READY
     ), "the adopted row was never claimed: it is in the queue but nothing served it"
+
+
+def test_adoption_is_a_noop_outside_on(env) -> None:
+    """``drain`` accepts no new queue traffic, and an adopted row is new traffic.
+
+    The adopter is wired for both served positions, so the refusal has to live in
+    ``adopt_legacy_row`` rather than in the wiring — otherwise the same rule sits
+    in two places and they drift. This arm pins the refusal at the position, not
+    at the composition root: the legacy row must still be PENDING afterwards,
+    because a retire without an enqueue is the window in which nothing owns it.
+    """
+    sessions, _store, tick, carrier, _injector, findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX)
+        row_id = int(row.id)
+
+    # The refusal is keyed on the INSTALLED RUNTIME's position, not on a helper
+    # a test could patch beside it — ``adopt_legacy_row`` reads
+    # ``runtime.position`` directly. So the runtime is reinstalled at ``drain``,
+    # which is what the composition root does for that position in production.
+    # (Patching ``wiring.queue_position`` instead leaves the runtime at ``on``
+    # and the row IS adopted — tried, and it is why this note exists.)
+    from cli_agent_orchestrator.app.delivery import wiring as _wiring
+
+    runtime = _wiring._runtime
+    _wiring.install_delivery(
+        _wiring.DeliveryRuntime(
+            store=runtime.store, clock=runtime.clock, position=SwitchPosition.DRAIN
+        )
+    )
+    report = tick.run_once()
+
+    assert report.adopted == ()
+    assert carrier.writes == []
+    assert findings.of(FindingCode.DIAG_LEGACY_ROW_ADOPTED) == []
+    assert (
+        _status(sessions, row_id) == MessageStatus.PENDING.value
+    ), "the row was retired without being enqueued: nothing owns it now"
