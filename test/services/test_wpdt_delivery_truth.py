@@ -257,7 +257,9 @@ class TestAC5W5NativeTierParking:
 # ---------------------------------------------------------------------------
 # Those arms pinned the WebSocket doorbell plane (``services/ws_doorbell.py``),
 # its ``supervisor.wake.ws_monitor`` dark-ship gate, and the root-repo doctrine
-# that told the seat to arm the socket. The plane is deleted: the seat's single
+# that told the seat to arm the socket. All three are deleted, the flag included
+# (``test_f747_native_default.test_ws_monitor_is_not_a_setting_any_more``): the
+# seat's single
 # carrier is the server-side delivery tick (``app/delivery/tick.py`` ->
 # ``services/queue_carrier.NativeSeatCarrier``). The root repo still carries the
 # now-dead ``doctrine/sections/shared/ws-arming.md``,

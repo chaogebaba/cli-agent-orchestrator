@@ -76,22 +76,57 @@ def test_memory_stays_off() -> None:
 @pytest.mark.parametrize(
     "env_name,expected",
     [
-        ("CAO_SUPERVISOR_WAKE_WS_MONITOR", False),
         ("CAO_DELIVERY_PHASE", "shadow"),
         ("CAO_WORKER_TRUTH_INGEST", None),
     ],
 )
 def test_untouched_keys_keep_their_table_value(env_name: str, expected: object) -> None:
-    """ws_monitor stays ship-dark and F883 owns delivery.phase.
+    """F883 owns delivery.phase and this batch does not move it.
 
     Asserted against the table rather than ``get()``: these paths are not in
     ``_OWNED_DEFAULTS``, so their RESOLUTION is unchanged by this batch and
     reading them through ``get()`` would test the pre-existing fall-through,
     not the shipped default.
+
+    ``CAO_SUPERVISOR_WAKE_WS_MONITOR`` was a third row here, pinning the WS
+    doorbell's ship-dark default. WP-ARCH 3c K3b deleted that plane, and a flag
+    that gates nothing is not a posture worth pinning, so the key is gone from
+    the registry entirely -- see ``test_ws_monitor_is_not_a_setting_any_more``.
     """
     if env_name not in cs.ENV_REGISTRY:
         pytest.skip(f"{env_name} is not a registry path")
     assert cs.ENV_REGISTRY[env_name][2] == expected
+
+
+def test_ws_monitor_is_not_a_setting_any_more() -> None:
+    """WP-ARCH 3c K3b: the flag goes with the plane it gated.
+
+    The registry row is what made ``CAO_SUPERVISOR_WAKE_WS_MONITOR`` settable at
+    all, and the dotted path is what a settings.json would carry; a row left
+    behind would advertise a switch that turns nothing on. Asserted on the table
+    rather than through ``get()``, which answers ``None`` for any unknown path
+    and so cannot tell a deleted key from a typo.
+    """
+    assert "CAO_SUPERVISOR_WAKE_WS_MONITOR" not in cs.ENV_REGISTRY
+    assert not [k for k, v in cs.ENV_REGISTRY.items() if v[0] == "supervisor.wake.ws_monitor"]
+
+
+@pytest.mark.parametrize(
+    "env_name,path",
+    [
+        ("CAO_SUPERVISOR_WAKE_MAX_RECORD_AGE_S", "supervisor.wake.max_record_age_s"),
+        ("CAO_SUPERVISOR_WAKE_DEDUPE_WINDOW", "supervisor.wake.dedupe_window"),
+    ],
+)
+def test_the_wake_keys_that_must_survive_are_still_registered(env_name: str, path: str) -> None:
+    """The negative control for the deletion above.
+
+    Both are named in the 3c plan as keys the phase MUST keep resolving, and both
+    sit in the same ``supervisor.wake.*`` block as the deleted one -- so a sweep
+    by prefix rather than by key would take them too.
+    """
+    assert env_name in cs.ENV_REGISTRY
+    assert cs.ENV_REGISTRY[env_name][0] == path
 
 
 def test_shipped_default_beats_call_site_default() -> None:
