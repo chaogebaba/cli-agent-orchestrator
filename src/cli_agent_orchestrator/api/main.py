@@ -23,6 +23,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    NoReturn,
     Optional,
     Sequence,
     Tuple,
@@ -7034,9 +7035,15 @@ class GateAnswerRequest(BaseModel):
     caller_epoch: int = 0
 
 
-def _gate_question_service(db_path: Optional[str] = None) -> Any:
-    """The question service, built on demand by the composition root."""
-    return bootstrap.build_gate_question_service(db_path)
+def _gate_question_service() -> Any:
+    """The question service, built on demand by the composition root.
+
+    Built per call rather than held as a module global: ``api`` is on the
+    ``one-gate-writer`` forbidden list, so the only legal way to a gate store is
+    through ``bootstrap``, and a cached handle would outlive a test that points
+    the composition root somewhere else.
+    """
+    return bootstrap.build_gate_question_service()
 
 
 def _gate_question_payload(question: Any) -> Dict:
@@ -7046,7 +7053,7 @@ def _gate_question_payload(question: Any) -> Dict:
     return dict(question_payload(question))
 
 
-def _raise_gate_question_error(exc: Exception) -> None:
+def _raise_gate_question_error(exc: Exception) -> NoReturn:
     """Translate a domain refusal into ONE status and ONE machine-readable body.
 
     A refusal's ``code`` survives the boundary because the caller branches on it:

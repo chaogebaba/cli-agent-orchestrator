@@ -615,6 +615,14 @@ class SqliteGateStore:
             )
             return record
 
+    def get_dispatch(self, dispatch_id: str) -> Dispatch | None:
+        row = (
+            self._pool.connection()
+            .execute(_DISPATCH_SELECT + " WHERE dispatch_id = ?", (dispatch_id,))
+            .fetchone()
+        )
+        return None if row is None else _row_to_dispatch(row)
+
     def get_question(self, question_id: str) -> RoundQuestion | None:
         row = (
             self._pool.connection()

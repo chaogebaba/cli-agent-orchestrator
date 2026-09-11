@@ -30,6 +30,8 @@ _GATE_TABLES = {
     "question_answer",
     "answer_delivery_intent",
     "ownership_transfer",
+    # Slice B1's addition: the notification intent that commits WITH the ask.
+    "question_notice_intent",
 }
 
 
@@ -72,6 +74,10 @@ def test_migration_up_over_older_schema(tmp_path: Path) -> None:
                 "answer_delivery_intent",
                 "ownership_transfer",
                 "round_question_indexes",
+                # B1's step carries an index ON round_question, so it has to be
+                # stripped with it — left in, the "older schema" pass would try
+                # to index a table this arm has deliberately not created.
+                "question_notice_intent",
             }
         )
         r1, p1 = migrate(path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)

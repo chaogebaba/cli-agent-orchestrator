@@ -93,6 +93,18 @@ def show(run_id: str, db_path: str | None, as_json: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _derived_request_id(*parts: str) -> str:
+    """A deterministic idempotency key, so a repeat of the SAME command is a replay.
+
+    ``hash()`` is randomised per process, so deriving the key that way would give
+    a different id on every invocation and turn a repeated ``cao gate ask`` into
+    a second question the one-open-question index then refuses.
+    """
+    import hashlib
+
+    return "cli-" + hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
 def _question_service(db_path: str) -> Any:
     from cli_agent_orchestrator.bootstrap import build_gate_question_service
 
@@ -198,7 +210,7 @@ def ask(
     as_json: bool,
 ) -> None:
     """Record a durable question and suspend the asking dispatch."""
-    request_id = client_request_id or f"cli-{dispatch_id}-{abs(hash(question)) % (10**12)}"
+    request_id = client_request_id or _derived_request_id(dispatch_id, question)
     if db_path is not None:
         from cli_agent_orchestrator.core.gate import GateError
 
@@ -259,7 +271,7 @@ def answer(
     as_json: bool,
 ) -> None:
     """Answer a durable question by id (refused if settled, expired or superseded)."""
-    request_id = client_request_id or f"cli-{question_id}-{abs(hash(answer_text)) % (10**12)}"
+    request_id = client_request_id or _derived_request_id(question_id, answer_text)
     if db_path is not None:
         from cli_agent_orchestrator.core.gate import GateError
 

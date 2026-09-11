@@ -134,7 +134,7 @@ class GateQuestionService:
             asked_at=now,
             expires_at=expires_at,
         )
-        if position is not None and self._store.open_question_for_dispatch(dispatch_id) is None:
+        if position is not None:
             self._ensure_dispatch(dispatch_id, position=position, round_id=round_id)
 
         record = self._store.ask_question(
@@ -241,7 +241,14 @@ class GateQuestionService:
     # -- internals ---------------------------------------------------------
 
     def _ensure_dispatch(self, dispatch_id: str, *, position: str, round_id: str | None) -> None:
-        if self._store.open_question_for_dispatch(dispatch_id) is not None:
+        """Record an ``OTHER`` dispatch, but ONLY when there is not one already.
+
+        ``record_dispatch`` upserts, so an unguarded call would rewrite a live
+        gate dispatch's role, position and state — turning a BUILDER mid-round
+        into a PREPARED ``OTHER`` because a lane happened to pass ``position``.
+        The existence check is the whole point of this method.
+        """
+        if self._store.get_dispatch(dispatch_id) is not None:
             return
         self._store.record_dispatch(
             Dispatch(

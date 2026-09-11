@@ -860,6 +860,15 @@ class GateStore(Protocol):
         """
         ...
 
+    def get_dispatch(self, dispatch_id: str) -> Dispatch | None:
+        """One dispatch by id, or ``None``.
+
+        A read, not a convenience: ``record_dispatch`` UPSERTS, so a caller that
+        provisions a missing dispatch without checking first would silently
+        rewrite a live gate dispatch's role and state.
+        """
+        ...
+
     def get_question(self, question_id: str) -> RoundQuestion | None: ...
 
     def open_question_for_dispatch(self, dispatch_id: str) -> RoundQuestion | None:
