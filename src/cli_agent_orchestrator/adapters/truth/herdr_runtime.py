@@ -372,6 +372,12 @@ class HerdrRuntimeSource:
         await client.connect()
         await client.check_protocol()
         await client.subscribe(_SUBSCRIPTIONS)
+        logger.debug(
+            "herdr runtime source %s subscribed (herdr_terminal_id=%s pane_id=%s)",
+            self.terminal_id,
+            self._herdr_terminal_id,
+            self._bound_pane_id,
+        )
         # A live subscription IS this source's health, and it is the only thing
         # that keeps the projector muting the pane fallback (§5/§6).  Bump the
         # column immediately on connect and then on a heartbeat, so a worker that
@@ -388,6 +394,19 @@ class HerdrRuntimeSource:
                 if self._stopping.is_set():
                     return
                 self._handle_event(event)
+        except BaseException:
+            # Logged HERE as well as in ``_run`` because the two answer different
+            # questions: ``_run`` records that the stream ended, this records what
+            # the source had bound when it did.  A live round that sees neither
+            # events nor gaps is asking exactly that.
+            logger.debug(
+                "herdr runtime source %s stream ended (herdr_terminal_id=%s pane_id=%s)",
+                self.terminal_id,
+                self._herdr_terminal_id,
+                self._bound_pane_id,
+                exc_info=True,
+            )
+            raise
         finally:
             self._stop_keepalive()
 
@@ -499,6 +518,16 @@ class HerdrRuntimeSource:
         if not isinstance(pane_dict, dict):
             return
         if not self._pane_belongs(pane_dict):
+            logger.debug(
+                "herdr runtime source %s ignored a pane: pane_id=%r terminal_id=%r "
+                "(bound pane_id=%r herdr_terminal_id=%r session=%r)",
+                self.terminal_id,
+                pane_dict.get("pane_id"),
+                pane_dict.get("terminal_id"),
+                self._bound_pane_id,
+                self._herdr_terminal_id,
+                self._bound_session,
+            )
             return
         self._process_pane(pane_dict)
 
@@ -670,6 +699,13 @@ class HerdrRuntimeSource:
             # projector/diag can read; it is NOT a DegradedReason and NOT a state.
             payload["unseen_activity"] = True
             payload["done_hint"] = "herdr_done_is_idle_not_completed"
+        logger.debug(
+            "herdr runtime source %s emitting %s for herdr_status=%s pane=%s",
+            self.terminal_id,
+            kind.value,
+            status,
+            pane_id,
+        )
         emit(
             EventDraft(
                 terminal_id=self.terminal_id,
