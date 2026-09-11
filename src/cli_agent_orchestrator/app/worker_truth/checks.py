@@ -388,10 +388,18 @@ class ProducerDisagreementCheck:
     the status monitor's locked publish path on every status edge.  A standing
     disagreement is the common shape rather than the exotic one (the pane reads
     ``processing`` off a spinner while the rollout has already ended the turn),
-    so the write rate is the cost that matters.  An in-memory episode map holds
-    the open ``(projected, asserted)`` pair per terminal and writes only when it
-    CHANGES; agreement closes the episode, so a disagreement that recurs after
-    the two sides re-converge is a new one and does write again.
+    so the write rate is the cost that matters — a contended ``BEGIN IMMEDIATE``
+    waits up to the busy timeout with the monitor's lock held, and ``get_status``,
+    ``fuse_status`` and ``get_published_status`` all take that lock.
+
+    An in-memory episode map holds the open ``(projected, asserted)`` pair per
+    terminal and writes only when it CHANGES.  Exactly one thing closes an
+    episode: AGREEMENT — the muted event asserting the state the projection is
+    already in.  A kind that asserts no state does not close it, and that is not
+    a nicety: ``status.pane_classified`` asserts none and is emitted immediately
+    before every ``status.legacy_published``, on the same edge and from the same
+    pair, so a guard that closed on it would re-open the episode on every edge
+    and suppress nothing while appearing to.
     """
 
     def __init__(self, finding_store: FindingStore) -> None:
@@ -432,10 +440,19 @@ class ProducerDisagreementCheck:
             # rule changed shape and this check's premise no longer holds.
             return False
         asserted = _asserted_state(event)
-        if asserted is None or asserted is standing:
-            # Agreement — or a kind that asserts nothing — CLOSES the episode, so
-            # the next contradiction is recorded rather than swallowed as a
-            # repeat of one the two sides have since resolved.
+        if asserted is None:
+            # A kind that asserts no state says NOTHING about the episode, and
+            # must not close it.  ``status.pane_classified`` is the case that
+            # makes this load-bearing rather than tidy: the classification site
+            # emits it immediately before every ``status.legacy_published``, on
+            # the same edge and from the same pair, so closing on it would open
+            # the episode again on every single edge — and the guard would
+            # suppress nothing at all while looking like it did.
+            return False
+        if asserted is standing:
+            # Actual AGREEMENT closes the episode, so the next contradiction is
+            # recorded rather than swallowed as a repeat of one the two sides
+            # have since resolved.
             with self._lock:
                 self._open.pop(event.terminal_id, None)
             return False

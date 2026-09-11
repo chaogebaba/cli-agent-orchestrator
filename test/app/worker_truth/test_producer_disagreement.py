@@ -68,8 +68,8 @@ def test_a_standing_disagreement_is_one_finding_with_a_count(rig: Rig) -> None:
     _sourced(rig)
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
 
-    for _ in range(30):
-        rig.legacy(TERMINAL, "processing")
+    for index in range(30):
+        _edge(rig, "processing", origin=f"origin-{index}")
 
     assert len(_findings(rig)) == 1
 
@@ -210,6 +210,23 @@ class _CountingFindings:
         return getattr(self._inner, name)
 
 
+def _edge(rig: Rig, latched: str, origin: str = "incremental") -> None:
+    """One status edge, exactly as production emits it.
+
+    ``_apply_detection``'s ``finally`` block appends ``status.pane_classified``
+    and then ``status.legacy_published`` for the SAME ``(latched_status, origin)``
+    pair, one after the other, inside one lock.  Both are derived and neither is
+    in ``DERIVED_ALWAYS_KINDS``, so for a projected terminal both are muted and
+    both reach this check.
+
+    Driving the check with the publish ALONE is what made the r3 episode guard
+    look like it worked: the classification row asserts no state, and a guard
+    that closed the episode on it re-opened it on every edge.
+    """
+    rig.classified(TERMINAL, latched, origin)
+    rig.legacy(TERMINAL, latched, origin)
+
+
 def _counting(rig: Rig) -> _CountingFindings:
     from cli_agent_orchestrator.app.worker_truth.checks import ProducerDisagreementCheck
 
@@ -232,7 +249,7 @@ def test_a_standing_disagreement_writes_once_not_once_per_edge(rig: Rig) -> None
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
 
     for index in range(20):
-        rig.legacy(TERMINAL, "processing", origin=f"origin-{index}")
+        _edge(rig, "processing", origin=f"origin-{index}")
 
     assert counter.writes == 1
 
@@ -244,9 +261,9 @@ def test_agreement_closes_the_episode_so_a_recurrence_is_recorded(rig: Rig) -> N
     _sourced(rig)
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
 
-    rig.legacy(TERMINAL, "processing")
-    rig.legacy(TERMINAL, "idle")  # agreement: the episode closes
-    rig.legacy(TERMINAL, "processing")  # a new one
+    _edge(rig, "processing")
+    _edge(rig, "idle")  # agreement: the episode closes
+    _edge(rig, "processing")  # a new one
 
     assert counter.writes == 2
 
@@ -256,8 +273,8 @@ def test_a_different_pair_is_a_different_episode(rig: Rig) -> None:
     _sourced(rig)
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
 
-    rig.legacy(TERMINAL, "processing")
-    rig.legacy(TERMINAL, "waiting_user_answer")
+    _edge(rig, "processing")
+    _edge(rig, "waiting_user_answer")
 
     assert counter.writes == 2
 
@@ -271,9 +288,52 @@ def test_the_episode_does_not_survive_the_terminal(rig: Rig) -> None:
     rig.projector._producer_check = check  # type: ignore[attr-defined]
     _sourced(rig)
     rig.emit(TERMINAL, EventKind.TURN_ENDED)
-    rig.legacy(TERMINAL, "processing")
+    _edge(rig, "processing")
 
     check.forget(TERMINAL)
-    rig.legacy(TERMINAL, "processing", origin="probe")
+    _edge(rig, "processing", origin="probe")
 
     assert counter.writes == 2
+
+
+def test_a_classification_row_does_not_re_open_the_episode(rig: Rig) -> None:
+    """The r3 guard's defeat, pinned so it cannot come back.
+
+    ``status.pane_classified`` asserts no state, and production emits one
+    immediately before every ``status.legacy_published`` on the same edge.  A
+    guard that treated "asserts nothing" as "the disagreement is over" therefore
+    re-armed on every single edge and suppressed nothing — while every test that
+    drove the publish alone still passed.
+
+    Asserted as the INTERLEAVING rather than as a count, so the failure mode is
+    named: classified, published, classified, published.
+    """
+    counter = _counting(rig)
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+
+    rig.classified(TERMINAL, "processing")
+    rig.legacy(TERMINAL, "processing")
+    rig.classified(TERMINAL, "processing", origin="probe")
+    rig.legacy(TERMINAL, "processing", origin="probe")
+
+    assert counter.writes == 1
+
+
+def test_only_agreement_closes_the_episode(rig: Rig) -> None:
+    """Stated as the rule rather than as one of its consequences.
+
+    Every muted event is one of three things: it agrees (the episode is over), it
+    contradicts (the episode continues, or a new one starts), or it asserts
+    nothing at all (it is not evidence about the episode either way).
+    """
+    counter = _counting(rig)
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+
+    _edge(rig, "processing")  # contradiction: one write
+    rig.classified(TERMINAL, "processing", origin="probe")  # asserts nothing
+    rig.pane(TERMINAL, EventKind.STATUS_PANE_CLASSIFIED)  # likewise, no payload
+    _edge(rig, "processing", origin="native")  # still the same episode
+
+    assert counter.writes == 1
