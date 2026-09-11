@@ -1,0 +1,58 @@
+# CAO local override for herdr's bundled `pi` agent-detection manifest.
+#
+# Upstream pi.toml (2026.06.10.1) carries exactly ONE rule — `working_literal`,
+# `contains = ["Working..."]` over `whole_recent` — and pi does not render that
+# string. Measured against pi 0.85.1: while a turn is in flight pi redraws its
+# input-box TOP BORDER as
+#
+#     ── ⠴ Working ──────────────────────────────────────────────────────────
+#
+# (a braille spinner glyph, then the bare word `Working`, no ellipsis), and at
+# rest the same border is an unbroken rule. So upstream's rule never fires, no
+# rule ever matches, and herdr falls back to `default_known_agent_idle_fallback`
+# — which means a BUSY pi pane reports `idle`. CAO would deliver into a worker
+# mid-turn.
+#
+# Evidence: /data/claude-scratch/cli-subagents/herdr-fix/captures/lap-pi-*.text.txt
+# (herdr 0.9.0, pi 0.85.1, isolated herdr session on the operator host).
+id = "pi"
+version = "2026.09.11.1"
+min_engine_version = 1
+updated_at = "2026-09-11T00:00:00Z"
+aliases = ["herdr:pi"]
+
+# The turn is in flight: spinner + `Working` inside the composer's top border.
+# Bottom-anchored because the border is REDRAWN IN PLACE — reading it out of
+# `whole_recent` would keep matching a border that has since gone quiet.
+[[rules]]
+id = "cao_composer_border_working"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = ['[\x{2800}-\x{28FF}]\s*Working\b']
+
+# Upstream's rule, kept verbatim: harmless, and a future pi build that does
+# render the literal string stays covered without another override edit.
+[[rules]]
+id = "working_literal"
+state = "working"
+priority = 100
+region = "whole_recent"
+visible_working = true
+contains = ["Working..."]
+
+# At rest: the composer border is present and carries no spinner. This is what
+# upstream has no rule for at all, so every idle reading there is the engine's
+# generic fallback rather than positive evidence — `visible_idle` stays false,
+# and `herdr agent explain` reports `matched_rule: null`.
+[[rules]]
+id = "cao_composer_border_idle"
+state = "idle"
+priority = 50
+region = "bottom_non_empty_lines(8)"
+visible_idle = true
+line_regex = ['^\s*─{20,}\s*$']
+not = [
+  { line_regex = ['[\x{2800}-\x{28FF}]\s*Working\b'] },
+]

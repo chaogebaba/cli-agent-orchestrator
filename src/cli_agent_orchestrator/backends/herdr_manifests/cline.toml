@@ -1,0 +1,74 @@
+# CAO local override for herdr's bundled `cline` agent-detection manifest.
+#
+# Upstream cline.toml (2026.06.10.1) ends with a CATCH-ALL:
+#
+#     [[rules]] id = "default_cline_working" state = "working"
+#     priority = -10  region = "whole_recent"  regex = ['(?s).+']
+#
+# Any non-empty screen is therefore `working`, so a cline pane is pinned at
+# `working` for its whole life and NEVER reports idle — measured on cline 3.0.61
+# against an authenticated session: idle splash, mid-turn and fully settled all
+# report `working` via `default_cline_working`. For CAO that is worse than no
+# status at all: a seat that is never idle is a seat nothing can be delivered to.
+#
+# Replaced with positive evidence on both sides. cline's composer renders
+# `❯ Ask anything...` at rest, and while a turn runs the footer carries a braille
+# spinner together with `(esc to cancel)`.
+#
+# Evidence: /data/claude-scratch/cli-subagents/herdr-fix/captures/lap-cline-*.text.txt
+id = "cline"
+version = "2026.09.11.1"
+min_engine_version = 1
+updated_at = "2026-09-11T00:00:00Z"
+
+# Upstream's approval rule, kept VERBATIM — it is correct and this override
+# replaces the whole manifest, so dropping it would lose blocked detection.
+[[rules]]
+id = "tool_permission"
+state = "blocked"
+priority = 300
+region = "whole_recent"
+visible_blocker = true
+any = [
+  { contains = ["let cline use this tool"] },
+  { contains = ["[act mode]", "execute command?", "yes"] },
+  { contains = ["[act mode]", "use this tool?", "yes"] },
+  { contains = ["[plan mode]", "execute command?", "yes"] },
+  { contains = ["[plan mode]", "use this tool?", "yes"] },
+]
+
+# A turn is in flight. EITHER signal is sufficient, because the two do not
+# overlap in time: measured on cline 3.0.61, `(esc to cancel)` shows early in a
+# turn and the braille spinner rides the streaming output line later, so
+# requiring BOTH left a mid-turn frame matching neither and falling through to
+# the engine's idle fallback — a busy pane reading as idle, the failure this
+# override exists to remove.
+#
+# The composer placeholder is NOT usable as a discriminator here: cline keeps
+# `Ask anything...` visible while it works. The spinner is what moves.
+[[rules]]
+id = "cao_spinner_working"
+state = "working"
+priority = 200
+region = "bottom_non_empty_lines(14)"
+visible_working = true
+any = [
+  { regex = ['[\x{2800}-\x{28FF}]'] },
+  { contains = ["(esc to cancel)"] },
+]
+
+# At rest: the composer placeholder is showing and nothing is interruptible.
+[[rules]]
+id = "cao_composer_idle"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(12)"
+visible_idle = true
+contains = ["Ask anything"]
+not = [
+  { contains = ["(esc to cancel)"] },
+  { regex = ['[\x{2800}-\x{28FF}]'] },
+]
+
+# NOTE: upstream's `default_cline_working` catch-all is deliberately ABSENT.
+# Reinstating it would re-pin every pane at `working`, which is the whole defect.
