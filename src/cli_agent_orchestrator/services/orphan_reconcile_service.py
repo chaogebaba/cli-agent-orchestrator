@@ -534,7 +534,16 @@ def run_reconciliation_attempt_sync(
                     terminal_id=resolved_terminal_id,
                     terminal_generation=resolved_generation,
                     session_name=resolved_session,
-                    session_incarnation="degenerate",
+                    # F218-a D15 (#783): the resolver was imported here but never
+                    # called — the literal "degenerate" was written instead, so a
+                    # job-side tombstone carried no session identity at all and two
+                    # deaths of two different launches of the same name were
+                    # indistinguishable in the forensic record. Now that the
+                    # resolver is total (no row → deterministic adopted key, never
+                    # a raise), call it. ``resolved_session`` is "orphan" when the
+                    # terminal row is already gone, which resolves to a stable key
+                    # of its own rather than a per-call one.
+                    session_incarnation=resolve_session_incarnation(resolved_session, db),
                     scope="unknown",
                     writer="job",
                     incomplete_reason="evidence_age=post_restart",
