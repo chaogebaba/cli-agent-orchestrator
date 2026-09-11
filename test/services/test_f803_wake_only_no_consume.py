@@ -6,7 +6,7 @@ The #640 (F783) defect this pins: consumption was gated on the raw
 is built by ``build_wake_payload`` -> ``normalize_wake_body``, which can carry
 NO body even when the argument is non-None:
 
-  * ``teammate_push=false`` -> the coalescer synthesizes a ``[cao-fleet]`` digest
+  * ``teammate_push=false`` -> the caller synthesizes a ``[cao-fleet]`` digest
     argument, but the seat is woken with ids + a count and NO text; and
   * a ``[CONDITION]``/``[watchdog]`` body collapses to ``None`` under F790.
 
@@ -201,111 +201,10 @@ def _native_socket(monkeypatch, *, write_err, verify=True, socket_path="/x.sock"
 # ── AC(a): ids-only ring → row stays pending, hook_claim wins it ──────────────
 
 
-def _bind_coalescer_to_native_ring(monkeypatch):
-    """Bind a real DoorbellCoalesceService's fire_fn to the REAL
-    _attempt_native_ring, so a coalesced batch flows end-to-end into the single
-    authoritative body_carried consumption decision. Returns the bound service.
-
-    The coalescer's fire_fn signature mirrors ring_supervisor_doorbell
-    (terminal_id, max_row, *, written_count, message_body, sender_display_name,
-    caller_holds_no_delivery_lock); _attempt_native_ring takes only
-    (terminal_id, row_id, *, message_body, sender_display_name), so the adapter
-    drops the transport-only kwargs.
-    """
-    import asyncio
-
-    from cli_agent_orchestrator.services.doorbell_coalesce import DoorbellCoalesceService
-
-    def _fire(terminal_id, max_row, *, message_body=None, sender_display_name=None, **_ignored):
-        return _dbs._attempt_native_ring(
-            terminal_id,
-            max_row,
-            message_body=message_body,
-            sender_display_name=sender_display_name,
-        )
-
-    loop = asyncio.new_event_loop()
-    svc = DoorbellCoalesceService()
-    svc.bind(loop, _fire)
-    # A NON-ZERO window so submit() BUFFERS both intents (coalesce_s=0 would fire
-    # each inline via _fire_single, never reaching _fire_coalesced where the B1
-    # fix lives). The timer is armed on the (un-run) loop and never fires on its
-    # own; the test drains synchronously via flush_all() to force _fire_coalesced.
-    monkeypatch.setattr(type(svc), "_coalesce_s", property(lambda self: 60.0), raising=False)
-    return svc, loop
-
-
-def test_ac_a_coalesced_all_bodyless_batch_stays_pending_hook_wins(db_env, monkeypatch):
-    """B1 (r1 verdict BLOCKER 1): the teammate_push=false coalesced path.
-
-    Two bodyless (ids-only) intents coalesce. The coalescer synthesizes a
-    non-empty `[cao-fleet] N callbacks coalesced:` digest string — but that text
-    is a header + `(row N)` placeholders, NOT real callback text. It MUST be
-    represented as bodyless so the single authoritative body_carried decision in
-    _attempt_native_ring records WAKE_ONLY: the rows stay pending and the hook
-    wins them. Recording native_consumed here (digest counted as a body) was the
-    exact production defect (rows flip to delivered, hook_claim returns [],
-    nothing surfaced).
-
-    This drives the REAL DoorbellCoalesceService end-to-end into the REAL
-    _attempt_native_ring (unlike the prior hand-passed-digest control)."""
-    with db_env() as db:
-        _add_row(db, 305)
-        _add_row(db, 306)
-        db.commit()
-
-    svc, loop = _bind_coalescer_to_native_ring(monkeypatch)
-    try:
-        with _native_socket(monkeypatch, write_err=None, verify=True):
-            # Two bodyless intents for the same seat → buffered, then one
-            # coalesced ring on flush.
-            svc.submit(SEAT, 305, written_count=1, message_body=None, sender_display_name="w1")
-            svc.submit(SEAT, 306, written_count=1, message_body=None, sender_display_name="w2")
-            svc.flush_all()  # force _fire_coalesced synchronously
-    finally:
-        loop.close()
-
-    # The coalesced ring fired against the max row id (306) as an ids-only wake.
-    assert _status(db_env, 306) == MessageStatus.PENDING.value
-    assert _cursor(db_env) == 0
-    assert _emissions(db_env, 306) == {Carrier.NATIVE.value: EmissionOutcome.WAKE_ONLY.value}
-    # The hook WINS the coalesced row — the whole point of B1.
-    with db_env() as db:
-        assert hook_claim_ids(db, candidate_ids=[306]) == [306]
-        db.commit()
-
-
-def test_ac_a_coalesced_batch_with_a_real_body_still_consumes(db_env, monkeypatch):
-    """Control for over-suppression: a coalesced batch where at least one intent
-    carried a real body DOES carry text (the full body is appended into the
-    digest) and is consumed exactly as today — B1 must not suppress a genuine
-    body. Drives the REAL coalescer end-to-end."""
-    with db_env() as db:
-        _add_row(db, 307)
-        _add_row(db, 308)
-        db.commit()
-
-    svc, loop = _bind_coalescer_to_native_ring(monkeypatch)
-    try:
-        with _native_socket(monkeypatch, write_err=None, verify=True):
-            svc.submit(SEAT, 307, written_count=1, message_body=None, sender_display_name="w1")
-            svc.submit(
-                SEAT,
-                308,
-                written_count=1,
-                message_body="real callback text",
-                sender_display_name="w2",
-            )
-            svc.flush_all()  # force _fire_coalesced synchronously
-    finally:
-        loop.close()
-
-    assert _status(db_env, 308) == MessageStatus.DELIVERED.value
-    assert _emissions(db_env, 308) == {Carrier.NATIVE.value: EmissionOutcome.SUCCEEDED.value}
-    # Consumed (row delivered + SUCCEEDED) — the hook does NOT win it.
-    with db_env() as db:
-        assert hook_claim_ids(db, candidate_ids=[308]) == []
-        db.commit()
+# WP-ARCH 3c K3c: the two coalesced end-to-end arms that lived here drove the
+# REAL DoorbellCoalesceService into _attempt_native_ring. The coalescer is
+# deleted (the delivery tick is the seat's single carrier), so the body_carried
+# decision is now pinned only at _attempt_native_ring directly, by the arms below.
 
 
 def test_ac_a_condition_body_collapses_to_ids_only_stays_pending(db_env, monkeypatch):

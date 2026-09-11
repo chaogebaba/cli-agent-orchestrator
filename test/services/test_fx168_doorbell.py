@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -268,65 +268,10 @@ class TestAC6ReplayRowRings:
         result = ring_supervisor_doorbell("term-01", 5, written_count=1)
         assert result == "rang"
 
-    def test_post_delivery_replay_only_outcome_rings(self, mock_gates):
-        """B1/Mutant-5 kill: _f136_post_delivery with replay-only outcome (cursor unchanged) rings.
-
-        A replay-only run has written=1 (a replay row produced a new file entry)
-        but cursor_after == cursor_before (replay rows do NOT advance the forward cursor).
-        The call-site predicate must key on outcome.written, NOT on cursor advance.
-        This test exercises the CALL SITE in inbox_service._f136_post_delivery.
-        """
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-        from cli_agent_orchestrator.services.inbox_service import (
-            CallbackRunOutcome,
-            InboxService,
-            _wake_states,
-            _delivery_seq_guard,
-        )
-
-        # Track coalesce submit calls (F461: _f136_post_delivery now routes
-        # through doorbell_coalesce_service.submit instead of ring directly)
-        submit_calls = []
-
-        def tracking_submit(tid, max_row_id, *, written_count=0, **kwargs):
-            submit_calls.append((tid, max_row_id, written_count))
-
-        # Replay-only outcome: written=1, cursor unchanged, max_written_row_id set
-        replay_outcome = CallbackRunOutcome(
-            selected=1,
-            processed=1,
-            cursor_before=100,
-            cursor_after=100,  # cursor NOT advanced (replay row)
-            replay_selected=1,
-            replay_drained=1,
-            written=1,  # but a new entry WAS written
-            already_present=0,
-            max_written_row_id=42,  # the replay row id
-            reason="ok",
-        )
-
-        # Set up minimal _wake_states so _f136_post_delivery doesn't early-return
-        from cli_agent_orchestrator.services.inbox_service import _WakeState
-
-        with _delivery_seq_guard:
-            _wake_states["term-replay"] = _WakeState()
-
-        svc = InboxService()
-
-        # F461: patch the coalesce service submit instead of ring_supervisor_doorbell
-        with patch(
-            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service.submit",
-            tracking_submit,
-        ):
-            svc._f136_post_delivery("term-replay", replay_outcome)
-
-        # Clean up
-        with _delivery_seq_guard:
-            _wake_states.pop("term-replay", None)
-
-        # Assert coalesce submit was called with correct args
-        assert len(submit_calls) == 1, f"Expected 1 coalesce submit call, got {len(submit_calls)}"
-        assert submit_calls[0] == ("term-replay", 42, 1)
+    # WP-ARCH 3c K3c: ``test_post_delivery_replay_only_outcome_rings`` drove
+    # ``_f136_post_delivery`` into the coalescer. That path no longer rings at
+    # all (the delivery tick owns the seat wake), so the arm has no subject.
+    # ``TestAC15CallSiteInventory`` below now pins the ZERO-ring property instead.
 
 
 # ===========================================================================
@@ -567,38 +512,30 @@ class TestAC14ConfigFlags:
 
 
 class TestAC15CallSiteInventory:
-    """ring_supervisor_doorbell call sites tracked after F461 coalesce refactor."""
+    """WP-ARCH 3c K3b/K3c: inbox_service rings the seat from NOWHERE."""
 
-    def test_three_call_sites_in_inbox_service(self):
-        """Verify that inbox_service.py imports ring_supervisor_doorbell at exactly 1 site.
-
-        F461: both direct call sites (_f136_post_delivery and fx158 reconciler) were
-        replaced with doorbell_coalesce_service.submit. The remaining import is at the
-        coalesce service bind site (passing ring_supervisor_doorbell as the fire_fn).
-        """
+    def test_inbox_service_has_no_seat_ring_call_sites(self):
+        """The seat's single carrier is the delivery tick, so inbox_service must
+        neither import ``ring_supervisor_doorbell`` nor reach the (deleted)
+        coalescer / WS plane. This is the static half of AC-3c: a reintroduced
+        ring here is exactly the duplicate delivery the phase removes."""
         import ast as _ast
-        import cli_agent_orchestrator.services.inbox_service as mod
         import inspect
 
+        import cli_agent_orchestrator.services.inbox_service as mod
+
         source = inspect.getsource(mod)
-        # Count import sites by looking for the identifier in ImportFrom nodes
         tree = _ast.parse(source)
-        import_count = sum(
-            1
+        ring_imports = [
+            node
             for node in _ast.walk(tree)
             if isinstance(node, _ast.ImportFrom)
             and node.module == "cli_agent_orchestrator.services.doorbell_service"
             and any(alias.name == "ring_supervisor_doorbell" for alias in node.names)
-        )
-        # F461: 1 import site (bind in start), 0 direct call sites
-        # The identifier appears as a function reference in the bind call but not as a call
-        assert import_count == 1, f"Expected 1 import site, got {import_count}"
-
-        # F461: doorbell_coalesce_service.submit replaces direct calls
-        coalesce_submit_count = source.count("doorbell_coalesce_service.submit(")
-        assert coalesce_submit_count == 2, (
-            f"Expected 2 coalesce submit sites, got {coalesce_submit_count}"
-        )
+        ]
+        assert ring_imports == [], "inbox_service must not import ring_supervisor_doorbell"
+        assert "doorbell_coalesce" not in source
+        assert "ws_doorbell" not in source
 
 
 # ===========================================================================
@@ -620,8 +557,8 @@ class TestD6FixedNudgeText:
     def test_nudge_text_content_independent(self, mock_gates):
         """No matter what the message content is, the nudge text is always the same."""
         from cli_agent_orchestrator.services.doorbell_service import (
-            ring_supervisor_doorbell,
             DOORBELL_NUDGE_TEXT,
+            ring_supervisor_doorbell,
         )
 
         ring_supervisor_doorbell("term-01", 100, written_count=1)
@@ -677,9 +614,10 @@ class TestD12RateLimitedLog:
 
     def test_warn_rate_limited(self, mock_gates, caplog):
         import logging
+
         from cli_agent_orchestrator.services.doorbell_service import (
-            ring_supervisor_doorbell,
             _last_warn_time,
+            ring_supervisor_doorbell,
         )
 
         # Force an error scenario
@@ -700,15 +638,24 @@ class TestD12RateLimitedLog:
 
 
 class TestFx168ReconcilerRealSqlite:
-    """Reconciler push triggers doorbell (real sqlite fixture)."""
+    """Reconciler push and the seat ring (real sqlite fixture).
 
-    def test_reconciler_push_rings_doorbell(self, real_sqlite_env, monkeypatch):
-        """After a successful reconciler push, ring_supervisor_doorbell is called."""
+    WP-ARCH 3c K3c removed the ride-along ring, so both arms here are now
+    negative: neither a successful nor a suppressed reconciler push rings."""
+
+    def test_reconciler_push_no_longer_rings_the_seat(self, real_sqlite_env, monkeypatch):
+        """WP-ARCH 3c K3c: the reconciler's ride-along ring is DELETED.
+
+        Before 3c a successful reconciler push submitted to the coalescer, which
+        rang the seat — a second carrier for a row the delivery tick already
+        owns. The push itself still happens (the legacy content write); what must
+        not happen is the ring. The same seeding as the old positive arm, with the
+        assertion inverted."""
         env = real_sqlite_env
         TestSession = env["TestSession"]
         from cli_agent_orchestrator.clients.database import (
-            MailboxModel,
             MailboxIncarnationModel,
+            MailboxModel,
         )
         from cli_agent_orchestrator.models.inbox import (
             InboxMessage,
@@ -747,8 +694,9 @@ class TestFx168ReconcilerRealSqlite:
             db.add(term)
 
         # Seed pending inbox row
-        from cli_agent_orchestrator.clients.database import InboxModel
         from datetime import timedelta
+
+        from cli_agent_orchestrator.clients.database import InboxModel
 
         with TestSession.begin() as db:
             row = InboxModel(
@@ -766,18 +714,13 @@ class TestFx168ReconcilerRealSqlite:
         # Patch dependencies
         doorbell_calls = []
 
-        def mock_submit(
-            tid, max_id, *, written_count=0, **kwargs
-        ):
+        def mock_ring(tid, max_id, *, written_count=0, **kwargs):
             doorbell_calls.append((tid, max_id, written_count))
-
-        # F461: reconciler now routes through doorbell_coalesce_service.submit
-        from cli_agent_orchestrator.services.doorbell_coalesce import doorbell_coalesce_service
+            return "rang"
 
         monkeypatch.setattr(
-            doorbell_coalesce_service,
-            "submit",
-            mock_submit,
+            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
+            mock_ring,
         )
 
         # Patch is_supervisor_mailbox_pull_terminal to return True
@@ -840,11 +783,8 @@ class TestFx168ReconcilerRealSqlite:
         svc = InboxService()
         svc.reconcile_pull_mode_notifications()
 
-        # Assert doorbell was called
-        assert len(doorbell_calls) >= 1
-        assert doorbell_calls[0][0] == terminal_id
-        assert doorbell_calls[0][1] == 1  # max message id
-        assert doorbell_calls[0][2] == 1  # written_count
+        # The ride-along ring is gone: the seat is woken by the delivery tick.
+        assert doorbell_calls == [], doorbell_calls
 
     def test_reconciler_suppressed_no_doorbell(self, real_sqlite_env, monkeypatch):
         """Suppressed reconciler push does NOT call doorbell."""
@@ -884,8 +824,9 @@ class TestFx168ReconcilerRealSqlite:
             db.add(term)
 
         # Seed pending inbox row
-        from cli_agent_orchestrator.clients.database import InboxModel
         from datetime import timedelta
+
+        from cli_agent_orchestrator.clients.database import InboxModel
 
         with TestSession.begin() as db:
             row = InboxModel(
@@ -1022,8 +963,8 @@ class TestFix5TmuxFallback:
     def test_tmux_idle_rings_with_source_tmux(self):
         """When native_probe=None + tmux probe IDLE → decision=rang, source=tmux."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
         from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
@@ -1135,8 +1076,8 @@ class TestFix5TmuxFallback:
     def test_herdr_native_preferred_over_tmux(self):
         """When native_probe returns a result, tmux fallback is NOT used."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
         from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,

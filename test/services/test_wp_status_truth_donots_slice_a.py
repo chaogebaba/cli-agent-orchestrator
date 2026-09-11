@@ -4,8 +4,9 @@ These assert the Do-NOTs that are statically checkable on the shipped source:
   * Do-NOT 25 — no D17/D23 write path touches `recovery_state` or a free-form
     top-level metadata key; the children ledger lives ONLY under the reserved
     `cao` namespace via merge_terminal_system_metadata.
-  * Do-NOT 20 — the D22 supervisor drain/ack hooks are composed as
-    `python -m <module>`, never written into `~/.claude` / a `.claude/` path.
+  * Do-NOT 20 — the per-seat hooks are composed as `python -m <module>`, never
+    written into `~/.claude` / a `.claude/` path. (WP-ARCH 3c K1 deleted the D22
+    drain/ack pair; register_inbox + rewake are what the rule now covers.)
   * Do-NOT 21 — D23 does not change default send_message semantics: the new
     fields are optional (default None) on the model and the insert path.
   * Do-NOT 23 — an undeclared provider is `mcp_unverified`, never ERROR.
@@ -55,12 +56,21 @@ def test_d23_insert_path_never_writes_recovery_state():
 
 
 def test_d22_hooks_composed_as_module_not_claude_path():
+    """Do-NOT 20 survives WP-ARCH 3c K1.
+
+    The D22 drain/ack pair is deleted (it was a second seat carrier over one
+    message id). The surviving per-seat hooks — register_inbox, the native
+    carrier's registration edge, and rewake, the residual idle re-arm — must
+    still be composed as ``python -m <module>``, never as a ``.claude`` path.
+    """
     cc = _read("providers/claude_code.py")
-    start = cc.index("drain_command = shlex.join")
+    start = cc.index("register_command = shlex.join")
     end = cc.index("settings = {", start)
     region = cc[start:end]
-    assert "cli_agent_orchestrator.hooks.supervisor_drain" in region
-    assert "cli_agent_orchestrator.hooks.supervisor_ack" in region
+    assert "cli_agent_orchestrator.hooks.register_inbox" in region
+    assert "cli_agent_orchestrator.hooks.rewake" in region
+    assert "cli_agent_orchestrator.hooks.supervisor_drain" not in region
+    assert "cli_agent_orchestrator.hooks.supervisor_ack" not in region
     assert ".claude" not in region
 
 

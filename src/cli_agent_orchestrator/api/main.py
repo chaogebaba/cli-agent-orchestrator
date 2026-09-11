@@ -1968,16 +1968,6 @@ async def lifespan(app: FastAPI):
     # F829 D8: periodic reconciliation of live conversation roots + stale claims.
     conversation_reconcile_task = asyncio.create_task(conversation_reconcile_daemon())
 
-    # F747 (#604): periodic idle-seat wake reconcile. The client-side rewake
-    # watcher is re-armed only by Stop/PostToolUse, which an idle seat cannot
-    # produce, so when it dies mid-idle nothing surfaces later callbacks. This
-    # sweep is the server-side net that does not depend on the seat being awake.
-    from cli_agent_orchestrator.services.seat_wake_reconcile import (
-        seat_wake_reconcile_daemon,
-    )
-
-    seat_wake_reconcile_task = asyncio.create_task(seat_wake_reconcile_daemon())
-
     # F295 AC4: Start grok canonical config watcher
     from cli_agent_orchestrator.services.grok_config_watcher import grok_config_watcher
 
@@ -2097,13 +2087,6 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task
-    except asyncio.CancelledError:
-        pass
-
-    # F747 (#604): stop the idle-seat wake reconcile
-    seat_wake_reconcile_task.cancel()
-    try:
-        await seat_wake_reconcile_task
     except asyncio.CancelledError:
         pass
 
@@ -2385,73 +2368,6 @@ async def health_check():
             }
         )
     return payload
-
-
-# ---------------------------------------------------------------------------
-# WPDT W1: WebSocket doorbell plane for supervisor callback wake
-# ---------------------------------------------------------------------------
-
-
-@app.websocket("/ws/supervisor/{terminal_id}")
-async def ws_supervisor_doorbell(websocket: WebSocket, terminal_id: str):
-    """W1: Advisory doorbell WebSocket for supervisor terminals.
-
-    Pushes a text frame when an inbox row targets this terminal while the
-    connection is live. Auth: same terminal token as X-CAO-Terminal-Token.
-    Returns 503 when supervisor.wake.ws_monitor is False (AC3).
-    """
-    from cli_agent_orchestrator.services.ws_doorbell import (
-        is_ws_monitor_enabled,
-        register_connection,
-        unregister_connection,
-    )
-
-    # AC3: flag gate — 503 when disabled
-    if not is_ws_monitor_enabled():
-        await websocket.close(code=4503, reason="ws_monitor disabled")
-        return
-
-    # Auth: validate terminal token from query param or header
-    token = websocket.query_params.get("token")
-    if not token:
-        auth_header = websocket.headers.get("authorization")
-        if auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header[7:]
-    if not token:
-        token = websocket.headers.get("x-cao-terminal-token")
-
-    if not token:
-        await websocket.close(code=4401, reason="Missing terminal token")
-        return
-
-    # Validate token against stored auth_token (same path as X-CAO-Terminal-Token plane)
-    from cli_agent_orchestrator.clients.database import SessionLocal as _WSSessionLocal
-    from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
-
-    with _WSSessionLocal() as _ws_db:
-        ok, _err_code = verify_sender_token(_ws_db, terminal_id, token)
-    if not ok:
-        reason = (
-            "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
-        )
-        code = 4404 if _err_code == "E-SENDER-UNKNOWN" else 4401
-        await websocket.close(code=code, reason=reason)
-        return
-
-    await websocket.accept()
-
-    # Register this connection for doorbell pushes
-    await register_connection(terminal_id, websocket)
-    try:
-        # Keep alive — wait for client disconnect or server shutdown
-        while True:
-            try:
-                # Consume any client frames (keepalive pings etc); we don't act on them
-                await websocket.receive_text()
-            except WebSocketDisconnect:
-                break
-    finally:
-        await unregister_connection(terminal_id, websocket)
 
 
 def _constant_time_compare(a: str, b: str) -> bool:
@@ -5709,8 +5625,13 @@ async def push_turn_marker(
     return {"success": True, "terminal_id": terminal_id, "kind": body.kind}
 
 
-class InboxDrainRequest(BaseModel):
-    """F543 D22 supervisor drain/ack edge body (overlay-composed hook)."""
+class TerminalHookEdgeRequest(BaseModel):
+    """Body for an overlay-composed per-seat hook edge.
+
+    WP-ARCH 3c K1 deleted the F543 D22 drain/ack edges this model was written
+    for; the sole remaining consumer is the register hook's
+    ``/native-unpublished`` journal edge.
+    """
 
     terminal_id: str
     ts: Optional[str] = None
@@ -5723,23 +5644,23 @@ def _require_caller_is_route_terminal(
     *,
     code: str,
 ) -> None:
-    """F707 (#562): bind the caller of an inbox drain edge to the route terminal.
+    """F707 (#562): bind the caller of a per-seat hook edge to the route terminal.
 
-    Before this guard the drain edges authorized on token SCOPE alone
+    Before this guard these edges authorized on token SCOPE alone
     (``SCOPE_WRITE|SCOPE_ADMIN``): ``body.terminal_id`` had to equal the route,
-    but nothing tied the CALLER to it, so any write-scope holder could drain any
-    terminal's inbox (#562 sweep, 2026-09-02).
+    but nothing tied the CALLER to it, so any write-scope holder could act on any
+    terminal (#562 sweep, 2026-09-02).
 
     The caller identity reused here is the EXISTING per-terminal one — the F332
     ``X-CAO-Terminal-Token`` header, verified against ``TerminalModel.auth_token``
     with ``verify_sender_token`` (constant-time). Every CAO terminal already has
-    the value in its environment as ``$CAO_TERMINAL_TOKEN``, so the drain/ack
-    hooks can present it with no new plumbing, and a worker — which holds only
-    its OWN token — can no longer drain the seat.
+    the value in its environment as ``$CAO_TERMINAL_TOKEN``, so an overlay-composed
+    hook can present it with no new plumbing, and a worker — which holds only its
+    OWN token — cannot speak for the seat.
 
     Deliberately NOT mirrored from the inbox POST path: that endpoint lets a
-    valid operator bearer bypass the terminal-token check. The drain hooks send
-    exactly that bearer, so mirroring the bypass would make this guard vacuous.
+    valid operator bearer bypass the terminal-token check. The hooks send exactly
+    that bearer, so mirroring the bypass would make this guard vacuous.
     The ONLY bypass kept is ``SCOPE_ADMIN`` **while auth is actually enabled** —
     i.e. an IdP-issued admin token. In the default-off posture every caller is
     handed the full scope set (``security/auth.py``), so an unconditional admin
@@ -5757,7 +5678,7 @@ def _require_caller_is_route_terminal(
     if ok:
         return
     logger.warning(
-        "inbox drain edge rejected: caller not bound to route terminal=%s presented=%s",
+        "seat hook edge rejected: caller not bound to route terminal=%s presented=%s",
         terminal_id,
         "absent" if not presented else "mismatch",
     )
@@ -5767,78 +5688,18 @@ def _require_caller_is_route_terminal(
             "code": code,
             "message": (
                 "X-CAO-Terminal-Token must carry the route terminal's own token "
-                "($CAO_TERMINAL_TOKEN inside that terminal). A terminal may drain "
-                "only its own inbox."
+                "($CAO_TERMINAL_TOKEN inside that terminal). A terminal may act "
+                "only for itself."
             ),
             "retryable": False,
         },
     )
 
 
-@app.post("/terminals/{terminal_id}/inbox/drain")
-async def supervisor_drain_endpoint(
-    terminal_id: TerminalId,
-    body: InboxDrainRequest,
-    request: Request,
-    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict[str, Any]:
-    """F543 D22: the overlay-composed supervisor-drain hook's server edge.
-
-    Relocation target for the drain hook (Do-NOT 20: never ~/.claude). The hook
-    fires on the seat's SessionStart; this edge triggers a drain of any PENDING
-    inbox rows for the terminal through the EXISTING delivery seam
-    (``inbox_service.deliver_pending``). The richer F476 wake-cursor drain
-    (D1/D3/D5/D8) is NOT duplicated here (SHOULD-5); when it lands it supersedes
-    this best-effort trigger. Idempotent: deliver_pending only re-delivers rows
-    the IDLE gate accepts. 404 on an unknown terminal.
-    """
-    if get_terminal_metadata(terminal_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
-    if body.terminal_id != terminal_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid_inbox_drain: terminal_id does not match route",
-        )
-    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-CALLER")
-    try:
-        await asyncio.to_thread(
-            inbox_service.deliver_pending, terminal_id, registry=get_plugin_registry(request)
-        )
-    except Exception:
-        logger.debug("d22 supervisor drain best-effort failed", exc_info=True)
-    return {"success": True, "terminal_id": terminal_id, "op": "drain"}
-
-
-@app.post("/terminals/{terminal_id}/inbox/drain-ack")
-async def supervisor_drain_ack_endpoint(
-    terminal_id: TerminalId,
-    body: InboxDrainRequest,
-    request: Request,
-    scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict[str, Any]:
-    """F543 D22: the paired ack edge for the overlay-composed supervisor hooks.
-
-    Location-only relocation (SHOULD-5): the delivered-state cursor semantics are
-    F476's and not duplicated here. This edge is a best-effort, idempotent
-    acknowledgement seam so the ack hook has a real, non-``~/.claude`` target;
-    the F476 wake-cursor commit supersedes it when it lands (debt on #331).
-    """
-    if get_terminal_metadata(terminal_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
-    if body.terminal_id != terminal_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid_inbox_drain_ack: terminal_id does not match route",
-        )
-    _require_caller_is_route_terminal(terminal_id, request, scopes, code="E-DRAIN-ACK-CALLER")
-    logger.debug("d22 supervisor drain-ack terminal=%s", terminal_id)
-    return {"success": True, "terminal_id": terminal_id, "op": "drain-ack"}
-
-
 @app.post("/terminals/{terminal_id}/native-unpublished")
 async def native_unpublished_endpoint(
     terminal_id: TerminalId,
-    body: InboxDrainRequest,
+    body: TerminalHookEdgeRequest,
     request: Request,
     scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
@@ -5852,8 +5713,8 @@ async def native_unpublished_endpoint(
     ``inbox_message_trace_event`` journal (``message_id=0`` — a non-per-message
     condition, the same sentinel ``f219.session_notice`` uses). Best-effort and
     idempotent-enough: the hook throttles, so at most one row lands per window.
-    404 on an unknown terminal; the caller is bound to the route terminal exactly
-    like the drain edges (F707).
+    404 on an unknown terminal; the caller is bound to the route terminal by the
+    shared F707 guard.
     """
     if get_terminal_metadata(terminal_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")

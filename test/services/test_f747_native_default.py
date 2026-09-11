@@ -283,9 +283,10 @@ def test_reason_native_write_failed(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 
 def test_reason_no_native_driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # WP-ARCH 3c K6 deleted the idle-seat wake reconcile, so the pull-mode
+    # reconciler is the only remaining driver of a legacy native push.
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
-    monkeypatch.setenv("CAO_DELIVERY_SEAT_WAKE_RECONCILE", "false")
     assert tps.native_fallback_reason("t1") == "no_native_driver"
 
 
@@ -378,24 +379,6 @@ def test_rewake_hook_fails_open_to_the_fallback(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(rewake.cao_http, "get", _boom)
     assert rewake._native_delivery_healthy("t1", "http://x", {}) is False
-
-
-def test_drain_hook_skips_the_digest_when_native_is_healthy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from cli_agent_orchestrator.hooks import supervisor_drain
-
-    monkeypatch.setattr(
-        supervisor_drain.cao_http, "get", lambda *a, **k: _fake_response({"healthy": True})
-    )
-    assert supervisor_drain._native_delivery_healthy("t1", "http://x", {}) is True
-
-    monkeypatch.setattr(
-        supervisor_drain.cao_http,
-        "get",
-        lambda *a, **k: _fake_response({"healthy": False, "reason": "no_inbox_path"}),
-    )
-    assert supervisor_drain._native_delivery_healthy("t1", "http://x", {}) is False
 
 
 def test_session_start_always_sends_a_cwd() -> None:
