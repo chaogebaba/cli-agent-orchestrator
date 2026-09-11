@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,14 @@ class NativeFetch:
     agent_status: str | None
     status: TerminalStatus | None
     failure_cause: Literal["pane_unresolved", "command_error", "parse_error"] | None
+
+
+#: Windows already warned about an unclassifiable herdr ``agent_status`` (F926
+#: #778).  The FINDING counts every occurrence — that count is the signal — but
+#: the log line is emitted once per seat: ``fetch_native_status`` runs on the
+#: status poll, so a warning per call would bury the log it exists to inform.
+_STATUS_UNKNOWN_WARNED: set[str] = set()
+_STATUS_UNKNOWN_LOCK = threading.Lock()
 
 
 def map_native_status(agent_status: str | None) -> TerminalStatus | None:
@@ -1072,7 +1081,67 @@ class HerdrBackend(TerminalBackend):
             return NativeFetch(None, None, "parse_error")
         if not isinstance(agent_status, str):
             return NativeFetch(None, None, "parse_error")
-        return NativeFetch(agent_status, map_native_status(agent_status), None)
+        status = map_native_status(agent_status)
+        if status is None:
+            self._record_status_unknown(session_name, window_name, pane_id, agent_status)
+        return NativeFetch(agent_status, status, None)
+
+    @staticmethod
+    def _record_status_unknown(
+        session_name: str, window_name: str, pane_id: str, agent_status: str
+    ) -> None:
+        """F926 (#778): count the silent fall-back to pane scraping.
+
+        herdr answered for the pane but could not classify it, so this seat has
+        NO native status and the caller quietly reverts to tmux-style scraping.
+        That fallback is correct — see :meth:`fetch_native_status` on why
+        ``unknown`` must NOT become a ``failure_cause`` (a ``probe_failure`` in
+        the probe meta is a delivery VETO at ``inbox_service``'s safety gate, so
+        typing it would stop every message to exactly the seats this is about) —
+        but being correct is not the same as being visible.
+
+        Measured cause on herdr 0.9.0 (protocol 22): herdr's own bundled
+        agent-detection manifests are uneven.  ``pi.toml`` carries a single rule
+        whose state is ``working``; ``cline.toml`` carries only ``working`` and
+        ``blocked``; ``codex.toml`` carries ``idle`` rules and so resolves.  A
+        pi/cline pane sitting at its prompt therefore matches no rule and herdr
+        reports ``unknown`` forever, which is why the cheap lanes carry no native
+        truth while codex does.  The gap is herdr's, not CAO's, so what CAO owes
+        is a counted row instead of silence.
+
+        Deduplicated per window: the row's ``count`` is how often this seat fell
+        back, and its ``dedupe_key`` is which seat did.  Never raises — the
+        wiring seam swallows, and a missing runtime is simply silent.
+        """
+        try:
+            from cli_agent_orchestrator.adapters.truth.wiring import record_finding
+            from cli_agent_orchestrator.core.findings import FindingCode
+
+            record_finding(
+                FindingCode.DIAG_HERDR_STATUS_UNKNOWN,
+                dedupe_key=window_name,
+                detail=(
+                    f"herdr agent_status={agent_status!r} for pane {pane_id} "
+                    f"(session={session_name}, window={window_name}); no native status, "
+                    f"falling back to pane scraping"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — an observation must never break the poll
+            logger.debug("herdr status-unknown finding could not be recorded", exc_info=True)
+        with _STATUS_UNKNOWN_LOCK:
+            first_for_window = window_name not in _STATUS_UNKNOWN_WARNED
+            if first_for_window:
+                _STATUS_UNKNOWN_WARNED.add(window_name)
+        log = logger.warning if first_for_window else logger.debug
+        log(
+            "herdr_status_unknown session=%s window=%s pane=%s agent_status=%s — "
+            "no native status for this seat; falling back to pane scraping "
+            "(herdr agent-detection manifest gap, F926 #778)",
+            session_name,
+            window_name,
+            pane_id,
+            agent_status,
+        )
 
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Compatibility projection of :meth:`fetch_native_status`."""

@@ -38,6 +38,7 @@ import threading
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.core.events import EventDraft, WorkerEvent
+from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import (
     Clock,
     EventStore,
@@ -49,6 +50,7 @@ from cli_agent_orchestrator.core.ports import (
 __all__ = [
     "ProducerRuntime",
     "emit",
+    "record_finding",
     "install_producers",
     "producer_runtime",
     "producers_installed",
@@ -128,6 +130,49 @@ def producer_runtime() -> ProducerRuntime | None:
 def producers_installed() -> bool:
     """True when a runtime is installed, i.e. producers and hooks are live."""
     return _runtime is not None
+
+
+def record_finding(
+    code: FindingCode,
+    *,
+    terminal_id: str = "",
+    dedupe_key: str = "",
+    detail: str = "",
+) -> None:
+    """Record one DEDUPLICATED finding through the installed store.
+
+    The finding half of :func:`emit`, and it exists for the same reason: a
+    legacy module that meets a condition worth counting must have exactly one
+    path to the phase-1 store, and that path must not be able to break the
+    operation it observes.  ``FindingStore.record`` already folds repeats into a
+    ``count`` on one row, so a hook on a hot path (a per-poll condition, say)
+    writes one row that climbs rather than a row per occurrence — which is the
+    property that makes counting a silent fallback affordable at all.
+
+    Silent when ingestion is off (no runtime, or a runtime wired without a
+    ``FindingStore`` during lane-by-lane bring-up), and never raises
+    ``Exception``: the caller is an observation site, so a diagnostic that threw
+    into it would convert a store fault into a failure of the thing observed.
+    ``BaseException`` is deliberately not swallowed, exactly as in :func:`emit`.
+    """
+    global _failure_count
+    runtime = _runtime
+    if runtime is None or runtime.findings is None:
+        return
+    try:
+        runtime.findings.record(code, terminal_id=terminal_id, dedupe_key=dedupe_key, detail=detail)
+    except Exception:
+        with _lock:
+            _failure_count += 1
+            should_log = _failure_count <= _MAX_LOGGED_FAILURES
+        if should_log:
+            logger.warning(
+                "worker-truth finding record failed for code=%s dedupe_key=%s "
+                "(the observed condition still stands; legacy behaviour is unaffected)",
+                code.value,
+                dedupe_key,
+                exc_info=True,
+            )
 
 
 def emit(draft: EventDraft) -> WorkerEvent | None:
