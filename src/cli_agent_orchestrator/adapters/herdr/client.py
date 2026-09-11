@@ -336,6 +336,63 @@ class HerdrClient:
                     self._event_buffer.append(reply)
                 # else: a stray line for another id — skip; see docstring.
 
+    async def request_once(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Issue one request on its OWN short-lived connection.
+
+        herdr 0.9.0's API socket accepts ``events.subscribe`` only as the FIRST
+        message on a connection: once a plain request has gone down the wire, a
+        later subscribe is answered by resetting the connection.  So a client
+        that means to STREAM must keep its connection clean, and every
+        request/reply it also needs — the protocol read and the snapshot — has to
+        happen somewhere else.
+
+        This is that somewhere else.  It is also what the legacy inbox service
+        did without naming it: it subscribed first on its socket and read the
+        snapshot by shelling out to ``herdr api snapshot``, which is a separate
+        connection by construction.
+
+        The H1 live round on grok-box-002 is what surfaced the rule: with the
+        protocol read on the streaming connection, ``subscribe`` failed with
+        "Connection lost" on every attempt and the source never received an
+        event.
+        """
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(self._socket_path),
+            timeout=self._connect_timeout_s,
+        )
+        try:
+            request_id = self._next_id()
+            payload = (
+                json.dumps({"id": request_id, "method": method, "params": params or {}}).encode()
+                + b"\n"
+            )
+            writer.write(payload)
+            await writer.drain()
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=self._request_timeout_s)
+                if not line:
+                    raise HerdrTransportError("herdr socket closed")
+                text = line.strip()
+                if not text:
+                    continue
+                obj = json.loads(text)
+                if not isinstance(obj, dict):
+                    raise HerdrTransportError(f"herdr sent a non-object line: {obj!r}")
+                if obj.get("id") == request_id:
+                    return _envelope_result(obj)
+                # A one-shot connection carries no subscription, so anything else
+                # on it is noise; keep reading for our reply.
+        except (OSError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            raise HerdrTransportError(f"herdr one-shot request {method} failed: {exc}") from exc
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                logger.debug("herdr one-shot close raced a broken transport", exc_info=True)
+
     async def check_protocol(self) -> dict[str, Any]:
         """Read the live protocol number and refuse one this build does not pin.
 
@@ -380,7 +437,9 @@ class HerdrClient:
         shelling out to that subcommand rather than over the socket, which is why
         the difference went unnoticed until the H1 live round.
         """
-        result = await self.request("session.snapshot")
+        # On its OWN connection: a snapshot request on the streaming connection
+        # would poison a later ``events.subscribe`` (see :meth:`request_once`).
+        result = await self.request_once("session.snapshot")
         snapshot = result.get("snapshot")
         if not isinstance(snapshot, dict):
             raise HerdrTransportError(f"herdr session.snapshot carried no snapshot: {result!r}")
