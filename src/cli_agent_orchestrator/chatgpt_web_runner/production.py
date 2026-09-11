@@ -81,10 +81,15 @@ def _callback_as_worker(message: str) -> None:
     (``X-CAO-Terminal-Token`` from env), mirroring what the ``send_message`` MCP
     tool does with ``receiver_id`` omitted. The caller id comes from
     ``CAO_CALLBACK_TERMINAL_ID`` (recorded caller) — never guessed.
-    """
-    import requests
 
-    endpoint = os.environ.get("CAO_ENDPOINT", "http://127.0.0.1:8990")
+    The callee is THIS node's own cao-server and the bearer is node-local, so the
+    call goes through ``cao_http`` like every other product call to our own API
+    (G7a endpoint guard): it resolves the endpoint at call time
+    (``resolve_endpoint``), fails closed for a sandbox instance with no bound
+    ``CAO_ENDPOINT``, and merges the instance binding into the headers below.
+    """
+    from cli_agent_orchestrator.utils.http import cao_http
+
     token = os.environ.get("CAO_TERMINAL_TOKEN", "")
     sender = os.environ.get("CAO_TERMINAL_ID", "")
     receiver = os.environ.get("CAO_CALLBACK_TERMINAL_ID") or os.environ.get("CAO_CALLER_ID", "")
@@ -95,8 +100,8 @@ def _callback_as_worker(message: str) -> None:
             delivery_state=DeliveryState.DELIVERED,
         )
     headers = {"X-CAO-Terminal-Token": token} if token else {}
-    resp = requests.post(
-        f"{endpoint.rstrip('/')}/terminals/{receiver}/inbox/messages",
+    resp = cao_http.post(
+        f"/terminals/{receiver}/inbox/messages",
         params={"sender_id": sender, "message": message},
         headers=headers,
         timeout=30,
