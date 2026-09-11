@@ -1,6 +1,6 @@
 ---
 name: kiro_reviewer
-description: Kiro CLI (KAS/--v3) EMPIRICAL/diff-gate-capable — runs code, never edits; DESIGN belongs to DESIGN-capable lanes (codex_design_reviewer, kiro_design_reviewer). Routing is set by the user per session and switches by user word — no standing primary; current defaults live in `orchestrator/ROUTING.md`
+description: 'Kiro CLI (KAS/--v3) EMPIRICAL/diff-gate-capable — runs code, never edits; DESIGN belongs to DESIGN-capable lanes (codex_design_reviewer, kiro_design_reviewer). Routing is set by the user per session and switches by user word — no standing primary; current defaults live in `orchestrator/routing.toml`. EMPIRICAL dispatch is tiered — tier test and ledger in `orchestrator/GATE-RULES.md` → "Tiered dispatch"'
 provider: kiro_cli
 role: developer
 default_use_worktree: true
@@ -9,7 +9,7 @@ engine: kas
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: /home/chao/.local/bin/cao-mcp-server
+    command: cao-mcp-server
     args: []
 ---
 

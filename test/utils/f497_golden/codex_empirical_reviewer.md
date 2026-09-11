@@ -1,6 +1,6 @@
 ---
 name: codex_empirical_reviewer
-description: EMPIRICAL/diff-gate-capable (canary-certified 2026-08-24). Routing is set by the user per session and switches by user word — no standing primary; current defaults live in `orchestrator/ROUTING.md`. Runs code, never edits; DESIGN belongs to DESIGN-capable lanes (codex_design_reviewer, kiro_design_reviewer)
+description: 'EMPIRICAL/diff-gate-capable (canary-certified 2026-08-24). Routing is set by the user per session and switches by user word — no standing primary; current defaults live in `orchestrator/routing.toml`. Runs code, never edits; DESIGN belongs to DESIGN-capable lanes (codex_design_reviewer, kiro_design_reviewer); EMPIRICAL dispatch is tiered — tier test and ledger in `orchestrator/GATE-RULES.md` → "Tiered dispatch"'
 provider: codex
 role: developer
 default_use_worktree: true
@@ -14,7 +14,7 @@ contextPolicy:
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: /home/chao/.local/bin/cao-mcp-server
+    command: cao-mcp-server
     args: []
 ---
 
