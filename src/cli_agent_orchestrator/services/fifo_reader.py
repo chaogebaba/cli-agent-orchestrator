@@ -9,7 +9,6 @@ import select
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -789,12 +788,33 @@ class FifoManager:
                     else None
                 )
 
-                # Resolve session incarnation (D15: total, never None)
-                try:
-                    session_incarnation = resolve_session_incarnation(session_name, db)
-                except (ValueError, Exception) as e:
-                    logger.warning("f218_incarnation_resolve_failed: %s", e)
-                    session_incarnation = f"epoch:{int(datetime.now(timezone.utc).timestamp())}"
+                # Resolve session incarnation (D15: TOTAL — never None, never "",
+                # never raises). This call site owns NO fallback of its own, by
+                # design: the bug it used to carry was
+                #
+                #     except (ValueError, Exception) as e:
+                #         session_incarnation = f"epoch:{int(now.timestamp())}"
+                #
+                # a wall-clock reading taken at the moment of failure. Because
+                # the resolver raised on every call in production (it queried a
+                # ``sessions`` table CAO never declared), that branch was the
+                # only branch, and every observation of one death produced a
+                # fresh key — so D5's UNIQUE(session_name, session_incarnation,
+                # cause) never collided and "alarm exactly once" had silently
+                # become "alarm every tick" (mutant M24; measured 2026-09-11 on
+                # the production ledger: 107 rows, 107 distinct incarnations,
+                # over 6 distinct (session_name, cause) pairs).
+                #
+                # Totality is the service's contract, not the caller's problem:
+                # a caller that invents a key when the resolver disappoints it is
+                # exactly how M24 got in. If the resolver ever does raise, the
+                # pipeline's outer handler aborts the mark (D15: "a raise aborts
+                # the mark, which is then retried") — reconciliation is unaffected
+                # because it runs outside this best-effort pipeline (D11).
+                #
+                # str() coercion: session_name is read off an ORM row and is typed
+                # Column[str] — the same coercion the scope probe above does.
+                session_incarnation = resolve_session_incarnation(str(session_name), db)
 
                 tombstone_result = record(
                     db=db,

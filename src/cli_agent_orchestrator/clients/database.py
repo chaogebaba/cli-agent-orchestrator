@@ -612,6 +612,37 @@ class SessionEpochModel(Base):
     last_epoch_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class SessionIncarnationModel(Base):
+    """F218-a D15: the durable per-session row the incarnation is derived from.
+
+    D15 specified "the tmux ``#{session_id}`` (``$7``) captured at session creation
+    and **stored on the session row**", with ``"epoch:" + int(session_row.created_at
+    .timestamp())`` as the fallback. The build shipped the *reader*
+    (``session_degradation_service.resolve_session_incarnation``) against a
+    ``sessions`` table that was never declared, so the primary never existed and
+    every production derivation fell through to a per-call wall-clock key —
+    mutant M24, with D5's ``UNIQUE(session_name, session_incarnation, cause)``
+    dedup silently disabled (measured 2026-09-11: 107 degradation rows carrying
+    107 distinct incarnations over 6 distinct ``(session_name, cause)`` pairs).
+
+    This is that row. One per session *name*; re-minted (``launch_seq + 1``) every
+    time a backend session is created under that name, so two launches of
+    ``cao-claude-orch5`` never share a key even in the same second — which closes
+    the §16 Q1 same-second residual the original ``int(created_at.timestamp())``
+    derivation left open.
+
+    The stored string is authoritative: readers return the column verbatim and
+    never recompute, so the derivation is deterministic by construction (M25).
+    """
+
+    __tablename__ = "session_incarnations"
+    session_name = Column(String, primary_key=True)
+    # D15: NOT NULL and never "" — a NULL/empty key deletes D5's UNIQUE dedup.
+    incarnation = Column(String, nullable=False)
+    launch_seq = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
 class MailboxModel(Base):
     """Durable logical receiver for one session role."""
 
@@ -1992,6 +2023,42 @@ def init_db() -> None:
     # mailbox where evidence is unique; idempotent and provenance-audited. Runs
     # AFTER conversation_identity exists; appended LAST.
     _migrate_f829_a2_owner_backfill()
+    # F218-a D15 repair (#783). ONE brand-new additive table
+    # (session_incarnations) — the "session row" D15 derived the incarnation
+    # from and that the original build never created. No rebuild of anything
+    # above, disjoint from every table, so registry order is immaterial;
+    # appended LAST.
+    _migrate_f218_session_incarnations()
+
+
+def _migrate_f218_session_incarnations() -> None:
+    """F218-a D15 (#783): create ``session_incarnations`` IF NOT EXISTS.
+
+    ONE brand-new additive table, column-for-column identical to
+    ``SessionIncarnationModel``. Nothing is back-filled: a session that already
+    existed when this migration ran has no row, and
+    ``resolve_session_incarnation`` answers for it with the deterministic
+    ``epoch:adopted:<digest>`` key rather than inventing a per-call one. The
+    first relaunch under that name mints a real row. Idempotent; best-effort,
+    logged at debug, never propagated — matching every migrator above.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_incarnations ("
+                "session_name VARCHAR NOT NULL, "
+                "incarnation VARCHAR NOT NULL, "
+                "launch_seq INTEGER NOT NULL DEFAULT 1, "
+                "created_at DATETIME NOT NULL, "
+                "PRIMARY KEY (session_name)"
+                ")"
+            )
+    except Exception:
+        logger.debug("f218 session_incarnations migration skipped", exc_info=True)
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -8325,6 +8392,65 @@ def get_session_epoch(session_name: str) -> Optional[Dict[str, Any]]:
 def delete_session_epoch(session_name: str) -> bool:
     with SessionLocal.begin() as db:
         return db.query(SessionEpochModel).filter_by(session_name=session_name).delete() > 0
+
+
+def mint_session_incarnation(session_name: str) -> str:
+    """F218-a D15: mint a fresh incarnation for a newly created backend session.
+
+    Called once per *backend session creation* from the single choke point in
+    ``terminal_service.create_terminal`` (``new_session=True``). Upserts the
+    session's row with ``launch_seq + 1``, so a relaunch under a name that has
+    been used before is guaranteed a different key — the exact case Do-NOT 11
+    names (``cao-claude-orch5`` was relaunched twice under the same name on
+    2026-08-15, and without a distinct key the second death is silent, M6).
+
+    The returned string is stored verbatim and read back verbatim; readers never
+    recompute it, so the derivation is deterministic across probes (M25). The
+    ``launch_seq`` suffix — not present in D15's original
+    ``"epoch:" + int(created_at.timestamp())`` — is what makes "different across
+    relaunch" hold even for two launches inside the same second.
+    """
+    from sqlalchemy.dialects.sqlite import insert
+
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        statement = (
+            insert(SessionIncarnationModel)
+            .values(
+                session_name=session_name,
+                incarnation=f"epoch:{int(now.timestamp())}:1",
+                launch_seq=1,
+                created_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[SessionIncarnationModel.session_name],
+                set_={
+                    "launch_seq": SessionIncarnationModel.launch_seq + 1,
+                    "incarnation": func.printf(
+                        "epoch:%d:%d",
+                        int(now.timestamp()),
+                        SessionIncarnationModel.launch_seq + 1,
+                    ),
+                    "created_at": now,
+                },
+            )
+            .returning(SessionIncarnationModel.incarnation)
+        )
+        incarnation: str = db.execute(statement).scalar_one()
+        return incarnation
+
+
+def get_session_incarnation(session_name: str) -> Optional[str]:
+    """F218-a D15: read the stored incarnation, or None when no row exists."""
+    with SessionLocal() as db:
+        row = db.query(SessionIncarnationModel).filter_by(session_name=session_name).first()
+        return str(row.incarnation) if row is not None else None
+
+
+def delete_session_incarnation(session_name: str) -> bool:
+    """Drop a session's incarnation row (test/teardown helper)."""
+    with SessionLocal.begin() as db:
+        return db.query(SessionIncarnationModel).filter_by(session_name=session_name).delete() > 0
 
 
 def retire_provider_session(name: str) -> Optional[Dict[str, Any]]:
