@@ -91,6 +91,30 @@ PANE_SAMPLE_S = 5
 #: every window with both files looking correct on their own.
 PANE_LIVENESS_STALENESS_S = 10.0
 
+#: F935 (#787): how long launch health waits for the terminal backend to NAME an
+#: agent in a freshly launched pane before declaring the seat unusable.
+#:
+#: Proving a PROCESS is alive is not the same as proving an AGENT is there. A
+#: wrapper, launcher or runtime that starts and stays up satisfies
+#: ``probe_provider_liveness`` (its foreground process is not the baseline
+#: shell) even when the agent inside it never came up — and a seat the backend
+#: never recognises has no native status, no lifecycle edges, and nothing
+#: delivery can wait on. It looks healthy and stalls forever.
+#:
+#: Measured on herdr 0.9.0 (protocol 22), polling panes once a second from the
+#: moment the launch command was sent:
+#:
+#:     live pane   no agent (0s) -> agent named (1s) -> classified idle (4s)
+#:     crashed     agent NEVER named, indefinitely
+#:     bare shell  agent NEVER named, indefinitely
+#:
+#: The name appears about a second in and the pane classifies by four; absence
+#: is permanent when nothing is alive. 30 s is therefore ~7x the observed
+#: classification time — deliberately generous, because the cost of waiting too
+#: long is a slower failure while the cost of waiting too little is killing a
+#: seat that was merely slow to start (a cold model catalogue, an MCP handshake).
+HERDR_AGENT_DETECT_S = 30.0
+
 #: Source-health horizon in seconds.  An authoritative source is healthy while
 #: its tailer stat-ed the file within this window; ``degraded(no_signal)`` needs
 #: BOTH ``last_probe_at`` and ``last_source_probe_at`` older than it.

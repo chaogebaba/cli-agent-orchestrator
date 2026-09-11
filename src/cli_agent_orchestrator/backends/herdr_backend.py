@@ -60,6 +60,15 @@ _STATUS_UNKNOWN_WARNED_MAX = 1024
 _STATUS_UNKNOWN_LOCK = threading.Lock()
 
 
+#: ``herdr pane get`` could not be read at all (command failed, unparseable).
+#: Distinct from a field that is simply not present, because "cannot ask" is not
+#: an answer and callers must not treat it as a negative.
+_PANE_GET_UNREADABLE = object()
+
+#: herdr answered, and the field was not in the reply.
+_PANE_GET_ABSENT = object()
+
+
 def _seat_key(session_name: str, window_name: str) -> tuple[str, str]:
     """The identity of one worker seat, defined ONCE (N5).
 
@@ -1122,7 +1131,10 @@ class HerdrBackend(TerminalBackend):
         "unknown" maps to None (not ERROR) because a wrapped launch command
         (e.g. ``podman exec`` / ``docker exec``) makes herdr's foreground
         process the wrapper, not the nested agent CLI, so herdr never registers
-        the agent and reports "unknown" indefinitely. None signals
+        the agent and reports "unknown" indefinitely. A provider that launches
+        that way declares ``launch_hides_agent_from_backend`` (providers/base.py)
+        so F935's launch-health gate stands down for it instead of reading this
+        same condition as a dead seat. None signals
         "unknown/unresolvable at the backend level" and lets the caller resolve
         status another way rather than flagging a healthy pane as ERROR.
 
@@ -1134,13 +1146,14 @@ class HerdrBackend(TerminalBackend):
         except TerminalBackendError:
             return NativeFetch(None, None, "pane_unresolved")
 
-        result = self._run_herdr(["pane", "get", pane_id], check=False)
-        if result.returncode != 0:
+        # N5: the ONE reader. `probe_agent_detected` projects `agent` from the
+        # same mapping, so the two cannot drift on how a pane reply is parsed.
+        pane_info = self._pane_get(pane_id)
+        if pane_info is _PANE_GET_UNREADABLE:
             return NativeFetch(None, None, "command_error")
 
         try:
-            data = self._parse_herdr_json(result.stdout)
-            pane_info = data.get("pane", data) if isinstance(data, dict) else data
+            pane_info = cast(Dict[str, object], pane_info)
             agent_status = pane_info.get("agent_status", _AGENT_STATUS_ABSENT)
             # F926 (#778) detection half: herdr names the agent it RECOGNISED in
             # this pane. Its ABSENCE is what separates "no provider process is
@@ -1149,6 +1162,9 @@ class HerdrBackend(TerminalBackend):
             detected_agent = pane_info.get("agent")
         except (json.JSONDecodeError, AttributeError, TypeError):
             return NativeFetch(None, None, "parse_error")
+        # N5: `probe_agent_detected` projects `agent` from the same `_pane_get`
+        # mapping this projects `agent_status` from, so the two cannot disagree
+        # about how a pane reply parses or what "absent" means.
         absent = agent_status is _AGENT_STATUS_ABSENT
         if not absent and not isinstance(agent_status, str):
             # A PRESENT field of the wrong type really is a parse error.
@@ -1299,6 +1315,64 @@ class HerdrBackend(TerminalBackend):
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Compatibility projection of :meth:`fetch_native_status`."""
         return self.fetch_native_status(session_name, window_name).status
+
+    def _pane_get(self, pane_id: str) -> Dict[str, object] | object:
+        """The pane mapping from ``herdr pane get``, or ``_PANE_GET_UNREADABLE``.
+
+        N5: every reader of a pane's herdr state goes through here.
+        ``fetch_native_status`` and ``probe_agent_detected`` were asking the same
+        question with the same argv, the same envelope unwrap and the same
+        exception set, written twice. Two copies of one protocol assumption
+        drift the next time herdr renames a field: one gets fixed and the other
+        quietly answers "absent" forever, which for the launch gate means
+        tearing live seats down.
+
+        Returns the WHOLE mapping rather than one field so both callers project
+        what they need from a single reply — reading two fields must not mean
+        two round trips, and must not let the two see different moments.
+        """
+        result = self._run_herdr(["pane", "get", pane_id], check=False)
+        if result.returncode != 0:
+            return _PANE_GET_UNREADABLE
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            pane_info = data.get("pane", data) if isinstance(data, dict) else data
+            if not isinstance(pane_info, dict):
+                return _PANE_GET_UNREADABLE
+            return cast(Dict[str, object], pane_info)
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return _PANE_GET_UNREADABLE
+
+    def probe_agent_detected(
+        self, session_name: str, window_name: str, *, pane_id: Optional[str] = None
+    ) -> Optional[bool]:
+        """F935 (#787): has herdr named an agent for this pane?
+
+        Reads the same ``pane get`` field :meth:`fetch_native_status` keys its
+        diagnostic on. Measured on herdr 0.9.0: the name appears about a second
+        after the process starts and the pane classifies by four, while a pane
+        with nothing alive in it never gets a name at all.
+
+        ``None`` when herdr could not be asked — an unresolved pane, a failed
+        command, an unparseable reply. A transport fault must not read as "no
+        agent", or a blip during startup would tear down a healthy seat.
+        """
+        if pane_id is None:
+            try:
+                pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+            except TerminalBackendError:
+                return None
+
+        pane_info = self._pane_get(pane_id)
+        if pane_info is _PANE_GET_UNREADABLE:
+            return None
+        agent = cast(Dict[str, object], pane_info).get("agent", _PANE_GET_ABSENT)
+        if agent is _PANE_GET_ABSENT:
+            # herdr answered and named nothing. That is a real negative — and at
+            # t=0 it is also the NORMAL state of a healthy pane, which is why the
+            # caller must not act on a single sample (F935 r2 B1).
+            return False
+        return isinstance(agent, str) and bool(agent)
 
     def probe_provider_liveness(
         self,
