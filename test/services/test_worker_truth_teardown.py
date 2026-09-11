@@ -10,11 +10,11 @@ recycled id would inherit an edge it never crossed and so miss the first real on
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pytest
 
 from cli_agent_orchestrator import bootstrap
+from cli_agent_orchestrator.adapters.clock import SystemClock
+from cli_agent_orchestrator.adapters.store.migrator import MigrationResult
 from cli_agent_orchestrator.adapters.truth import legacy_egress, pane_classification
 from cli_agent_orchestrator.app.worker_truth.checks import ProducerDisagreementCheck
 from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
@@ -23,10 +23,20 @@ from cli_agent_orchestrator.services.terminal_service import forget_worker_truth
 TERMINAL = "term-gone"
 
 
-@dataclass
-class _Runtime:
-    health: SourceHealth | None
-    producer_check: ProducerDisagreementCheck | None = None
+def _Runtime(**fields: object) -> bootstrap.WorkerTruthRuntime:
+    """The REAL runtime, not a stand-in.
+
+    A hand-rolled double drifts: this teardown reaches for whatever
+    per-terminal state the runtime holds, and every slice has added one more —
+    so a double missing the newest field made the cleanup raise and the test
+    fail for a reason that had nothing to do with teardown.
+    """
+    return bootstrap.WorkerTruthRuntime(
+        ingest_enabled=True,
+        migration=MigrationResult(ok=True),
+        clock=SystemClock(),
+        **fields,  # type: ignore[arg-type]
+    )
 
 
 @pytest.fixture(autouse=True)
