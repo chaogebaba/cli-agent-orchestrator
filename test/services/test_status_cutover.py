@@ -345,3 +345,89 @@ def test_the_pane_reading_is_still_recorded_for_a_projected_terminal() -> None:
         monitor._apply_detection(TERMINAL, TerminalStatus.PROCESSING)
 
     assert recorded == [TerminalStatus.PROCESSING]
+
+
+# ------------------------------------------- the announce is edge-gated (B1)
+
+
+def _publish(monitor: StatusMonitor, status: TerminalStatus, event_id: str) -> None:
+    with patch(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata", return_value=_metadata()
+    ):
+        monitor.publish_projection(
+            TERMINAL, status, event_id=event_id, worker_state="", since="2026-09-11T10:00:00+00:00"
+        )
+
+
+def test_two_projection_transitions_onto_one_status_announce_once() -> None:
+    """B1.  ``session.started`` then ``turn.started`` is the ordinary case.
+
+    The projection's vocabulary is wider than the legacy one — ``starting``,
+    ``busy`` and ``capped`` all publish as ``processing`` — so a real transition
+    is routinely NOT a change of published status.  Announcing on every applied
+    fold fires all four consumers twice for one move, and one of them is F611's
+    "one event per terminal transition" seam by name.
+
+    The OBSERVATION still publishes both times: its evidence names a different
+    ``status.transition`` each time, which is the chain ``cao diag --why`` walks.
+    """
+    monitor = _monitor({TERMINAL})
+    observations: list[object] = []
+
+    with (
+        patch.object(monitor, "_announce_published") as announce,
+        patch.object(
+            monitor._receiver_state_store,
+            "publish_observation",
+            lambda observation, **kwargs: observations.append(observation),
+        ),
+    ):
+        _publish(monitor, TerminalStatus.PROCESSING, "01STARTING")  # starting
+        _publish(monitor, TerminalStatus.PROCESSING, "01BUSY")  # busy
+
+    assert announce.call_count == 1
+    assert len(observations) == 2
+    assert [o.projection_evidence.event_id for o in observations] == ["01STARTING", "01BUSY"]
+
+
+def test_a_real_status_change_still_announces() -> None:
+    monitor = _monitor({TERMINAL})
+
+    with patch.object(monitor, "_announce_published") as announce:
+        _publish(monitor, TerminalStatus.PROCESSING, "01BUSY")
+        _publish(monitor, TerminalStatus.IDLE, "01IDLE")
+
+    assert announce.call_count == 2
+
+
+def test_the_first_publish_of_a_terminals_life_announces() -> None:
+    """No previous latch is not "unchanged": nothing has been announced yet."""
+    monitor = _monitor({TERMINAL})
+
+    with patch.object(monitor, "_announce_published") as announce:
+        _publish(monitor, TerminalStatus.IDLE, "01FIRST")
+
+    assert announce.call_count == 1
+
+
+def test_the_pane_path_has_the_same_edge_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rule being matched, asserted rather than assumed.
+
+    One writer replacing another has to keep the edge semantics the replaced
+    writer had, so the projected path is only correct here if the pane path is
+    the same shape — which is what makes this a regression test for both.
+    """
+    monitor = _monitor(set())
+
+    with (
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=_metadata(),
+        ),
+        patch.object(monitor, "_publish_observation"),
+        patch.object(monitor, "_announce_published") as announce,
+    ):
+        monitor._apply_detection(TERMINAL, TerminalStatus.PROCESSING)
+        monitor._apply_detection(TERMINAL, TerminalStatus.PROCESSING)
+
+    assert announce.call_count == 1

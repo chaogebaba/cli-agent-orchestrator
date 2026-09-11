@@ -674,6 +674,15 @@ class Projector:
             reason = DegradedReason.RENDER_UNCERTAIN if target is WorkerState.DEGRADED else None
             return target, reason
 
+        # N3 — why the unmuted ``starting -> busy`` path is not a second writer.
+        #
+        # A derived event applies in full for an UNPROJECTED terminal, so the
+        # pane can drive the projection through the same cells the source does.
+        # That is not two writers of the published status, because the publisher
+        # refuses a terminal ``is_projected`` says no to — and the two are the
+        # same predicate, which is the whole of D1e.  A terminal is projected
+        # only when its provider is on the operator's allowlist AND its source is
+        # registered and healthy; anything else is the pane's, end to end.
         if event.kind is EventKind.PROMPT_ANSWERED:
             # WP-ARCH phase 2, D1f — the RESULTING state wins over the kind.
             #

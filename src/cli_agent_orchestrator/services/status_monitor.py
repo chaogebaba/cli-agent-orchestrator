@@ -2349,7 +2349,21 @@ class StatusMonitor:
         )
         try:
             with self._lock:
+                # The EDGE, read before the latch moves.  The projection's own
+                # vocabulary is wider than the legacy one — ``starting``,
+                # ``busy`` and ``capped`` all publish as ``processing`` — so a
+                # real projection transition is routinely NOT a change of
+                # published status, and ``session.started`` followed by
+                # ``turn.started`` is the ordinary case rather than a corner.
+                previous = self._last_status.get(terminal_id)
                 self._last_status[terminal_id] = status
+                # Cleared HERE rather than at the moment the terminal became
+                # projected, so a pane-derived reason written before the cutover
+                # took over — ``resync_after_drop`` is written outside the fusion
+                # path — is visible on ``get_boundary_observation`` until this
+                # first projected publish.  Bounded by one publish and never
+                # re-created: nothing writes the map for a projected terminal,
+                # because the fusion bypass returns before every rule that would.
                 self._status_fusion_reason.pop(terminal_id, None)
                 self._observe_locked(terminal_id, status)
                 self._publish_observation(
@@ -2367,6 +2381,26 @@ class StatusMonitor:
             except Exception:
                 pass
             return False
+
+        # The OBSERVATION publishes on every fold; the ANNOUNCEMENT does not.
+        #
+        # Those are different facts and the split is the point.  The observation
+        # is a new reading — its evidence names a different ``status.transition``
+        # each time, which is what ``cao diag --why`` walks — so republishing an
+        # unchanged status is not a repeat.  The announcement is a status CHANGE,
+        # and its four consumers are all edge-shaped: the event bus feeds
+        # subscribers watching for a flip, the auto-responder records a published
+        # status, the children-ledger reconcile counts a non-PROCESSING streak,
+        # and the condition classifier is F611's "one event per terminal
+        # transition" seam by name.  Announcing an unchanged status fires each of
+        # them twice for one move.
+        #
+        # This is the pane path's own rule, and deliberately spelled the same
+        # way: ``_apply_detection`` sets ``publish_external`` only on the
+        # ``detected != last`` branch.  One writer replacing another has to keep
+        # the edge semantics the replaced writer had.
+        if previous == status:
+            return True
 
         self._announce_published(terminal_id, status)
         return True
@@ -2461,6 +2495,17 @@ class StatusMonitor:
         # missed call site away from being no guard.
         if self._projected(terminal_id):
             return status, None
+        # Read HERE and again in ``_apply_detection``, at two different instants,
+        # and the pair cannot tear in a way that hurts.  The two orders are:
+        # suppressed-then-unprojected, where this read falls through to the rules
+        # and fuses the projection's last published status exactly as it fuses
+        # the pane's — which is the handover I7 promises; and
+        # unprojected-then-projected, where a fused value is returned one read
+        # before the projection takes over.  Both are one read stale at worst,
+        # which is what a predicate refreshed every ``PANE_HEARTBEAT_S`` can be
+        # by construction.  Holding one answer for the length of a pass would
+        # need a lock around a read path that five call sites reach, one of them
+        # from outside this module.
 
         with self._lock:
             try:

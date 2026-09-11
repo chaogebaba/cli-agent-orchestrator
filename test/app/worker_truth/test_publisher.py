@@ -168,3 +168,104 @@ def test_the_no_signal_sweep_hands_back_rather_than_publishing(rig: Rig) -> None
     assert rig.states.get(TERMINAL).degraded_reason is DegradedReason.NO_SIGNAL
     assert egress.published == []
     assert rig.health.is_projected(TERMINAL) is False
+
+
+# ------------------------------- end to end: fold → publisher → real monitor
+
+
+def _wire_real_monitor(rig: Rig):
+    """The whole chain: the projector's fold, the real egress adapter, a real
+    ``StatusMonitor``.  Returns the monitor and the list its observations land in."""
+    from cli_agent_orchestrator import bootstrap
+    from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+    monitor = StatusMonitor()
+    monitor.enable_projection(rig.health)
+    rig.projector._publisher = StatusPublisher(bootstrap._StatusEgress(), rig.health)  # type: ignore[attr-defined]
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    return monitor
+
+
+def test_two_folds_onto_one_legacy_status_announce_once(rig: Rig) -> None:
+    """B1, driven the whole way, on the pair that actually exhibits it.
+
+    The forward map is lossy for exactly two states: ``starting`` and ``capped``
+    both publish as ``processing``, which ``busy`` also publishes as.  So a real
+    projection transition is routinely NOT a change of published status —
+    ``busy -> capped`` here, a worker hitting a usage cap mid-turn.
+
+    Each fold publishes its own OBSERVATION, because each names a different
+    ``status.transition`` and that chain is what ``cao diag --why`` walks.  Only
+    the first ANNOUNCES, because the four consumers on that path are edge-shaped
+    and one of them is F611's "one event per terminal transition" seam.
+    """
+    from unittest.mock import patch
+
+    monitor = _wire_real_monitor(rig)
+    observations: list[object] = []
+
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"lifecycle_generation": 1, "tmux_window": "w1", "provider": "codex"},
+        ),
+        patch.object(monitor, "_announce_published") as announce,
+        patch.object(
+            monitor._receiver_state_store,
+            "publish_observation",
+            lambda observation, **kwargs: observations.append(observation),
+        ),
+    ):
+        rig.emit(TERMINAL, EventKind.TURN_STARTED)  # -> busy      -> processing
+        rig.pane(TERMINAL, EventKind.USAGE_CAPPED)  # -> capped    -> processing
+
+    assert rig.state_of(TERMINAL) is WorkerState.CAPPED
+    assert announce.call_count == 1
+    assert [o.latched_status.value for o in observations] == ["processing", "processing"]
+    # Two observations, two DIFFERENT causes: the republish is a new reading,
+    # not a repeat of the first.
+    event_ids = [o.projection_evidence.event_id for o in observations]
+    assert len(set(event_ids)) == 2
+    assert all(rig.events.get(event_id) is not None for event_id in event_ids)
+
+
+def test_the_named_session_started_sequence_needs_an_exit_first(rig: Rig) -> None:
+    """The sequence the review named, and the correction it needs.
+
+    ``session.started -> turn.started`` collapses onto one legacy status, but on
+    a FRESH terminal the first of the two is the diagonal: the projector starts
+    every unseen terminal at ``starting`` (every state is reachable from it), so
+    ``session.started`` applies nothing and publishes nothing.  The pair is only
+    reachable after an exit — ``exited -> starting`` is the table's one respawn
+    cell — which is also the only way it occurs in production.
+
+    Three folds, three observations, and TWO announcements: ``error`` then
+    ``processing``, with the second ``processing`` silent.
+    """
+    from unittest.mock import patch
+
+    monitor = _wire_real_monitor(rig)
+    observations: list[object] = []
+
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"lifecycle_generation": 1, "tmux_window": "w1", "provider": "codex"},
+        ),
+        patch.object(monitor, "_announce_published") as announce,
+        patch.object(
+            monitor._receiver_state_store,
+            "publish_observation",
+            lambda observation, **kwargs: observations.append(observation),
+        ),
+    ):
+        rig.pane(TERMINAL, EventKind.PROCESS_EXITED)  # -> exited   -> error
+        rig.emit(TERMINAL, EventKind.SESSION_STARTED)  # -> starting -> processing
+        rig.emit(TERMINAL, EventKind.TURN_STARTED)  # -> busy     -> processing
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+    assert [o.latched_status.value for o in observations] == ["error", "processing", "processing"]
+    assert announce.call_count == 2

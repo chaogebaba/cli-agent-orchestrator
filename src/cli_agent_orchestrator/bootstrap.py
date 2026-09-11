@@ -992,14 +992,6 @@ async def start_worker_truth(
         # are the only proof the projector runs at all. The field is typed on the
         # Protocol, so nothing under ``adapters/`` names ``Projector``; this is
         # the one module allowed to know both halves.
-        if cutover_on:
-            # D1e — the monitor learns the predicate LAST, after every producer
-            # and driver is armed.  Before this line the pane path is the only
-            # publisher and behaves exactly as it does with the switch off; after
-            # it, a projected terminal's pane publish is suppressed and the
-            # projection's is live.  Wiring it earlier would open a window in
-            # which the pane was suppressed and nothing had replaced it.
-            _enable_projection(health)
         truth_wiring.install_producers(
             truth_wiring.ProducerRuntime(
                 store=event_store,
@@ -1009,6 +1001,18 @@ async def start_worker_truth(
                 folder=projector,
             )
         )
+        if cutover_on:
+            # D1e — the monitor learns the predicate LAST, after the producers
+            # are armed, and the ORDER is the whole content of this line.
+            #
+            # ``install_producers`` above is what turns the seven legacy hooks
+            # from no-ops into appends; until it runs, no event reaches the
+            # projector and the projection therefore publishes nothing.  Handing
+            # the monitor the predicate before that would open a window in which
+            # a terminal read as projected — so its pane publish was suppressed —
+            # while the producer that was meant to replace it had not started.
+            # A status outage, measured in whatever the boot takes.
+            _enable_projection(health)
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either
         logger.error("worker-truth bootstrap failed to wire adapters: %r", exc)
         truth_wiring.reset_producers()
