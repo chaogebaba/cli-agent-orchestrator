@@ -646,9 +646,7 @@ def _prepare_provider_runtime_identity(
     # on the very next line already does.
     backend = get_backend()
     pid = backend.get_pane_process_id(metadata["tmux_session"], metadata["tmux_window"])
-    cwd = backend.get_pane_working_directory(
-        metadata["tmux_session"], metadata["tmux_window"]
-    )
+    cwd = backend.get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
     if cwd is None:
         # F26 D5: a deleted/unavailable pane cwd must fail through this site's
         # own failure channel (a recognized _PERSIST_FAILURE_CODES code), never
