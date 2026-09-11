@@ -47,7 +47,23 @@ Handler = Callable[["FakeHerdrServer", dict[str, Any]], Awaitable[None]]
 
 
 class FakeHerdrServer:
-    """A scriptable herdr socket server for one connection.
+    """A scriptable herdr socket server, correct across MULTIPLE connections.
+
+    It used to serve one connection and keep a single ``_writer``, which every
+    reply went to.  That is wrong now that the client opens a second, short-lived
+    connection for each request/reply (``HerdrClient.request_once``, forced by
+    herdr 0.9.0 accepting a subscription only as a connection's first message):
+    the second connection clobbered ``_writer``, so the STREAMING connection's
+    next reply was written to a socket its client was not reading, and the client
+    waited forever.  Under ``-n 2`` that surfaced as a worker parked in
+    ``asyncio.run`` and an xdist run stuck at 99% — the tests themselves passed
+    when run alone, because the clobber is a race.
+
+    So: replies go to the connection the request ARRIVED on, and every
+    connection's handler task and writer is tracked so teardown closes them all
+    (a handler left parked on ``readline`` is what kept the interpreter alive).
+    ``push_stream`` writes to the FIRST connection — the one a test subscribed on
+    — for the cases that need an unsolicited event to reach the event stream.
 
     ``on_request`` is called for every JSON-RPC line the client sends; the
     handler writes whatever replies/pushes the test wants via :meth:`reply`,
@@ -61,8 +77,13 @@ class FakeHerdrServer:
     def __init__(self, socket_path: str) -> None:
         self._socket_path = socket_path
         self._server: asyncio.AbstractServer | None = None
+        #: The connection the request being handled arrived on.  ``reply`` /
+        #: ``error`` / ``push`` target it, which is what every handler means.
         self._writer: asyncio.StreamWriter | None = None
-        self._serve_task: asyncio.Task[None] | None = None
+        #: The FIRST connection — the streaming one in every test that subscribes.
+        self._stream_writer: asyncio.StreamWriter | None = None
+        self._writers: list[asyncio.StreamWriter] = []
+        self._serve_tasks: list[asyncio.Task[None]] = []
         self.requests: list[dict[str, Any]] = []
         self.on_request: Handler = FakeHerdrServer._default_handler
 
@@ -76,25 +97,32 @@ class FakeHerdrServer:
         # connection handler returns, and ``_serve`` is parked on ``readline()``
         # — so a plain ``close()``/``wait_closed()`` hangs the test.  Cancel the
         # handler and close the writer, THEN close the server.
-        if self._serve_task is not None:
-            self._serve_task.cancel()
+        for task in self._serve_tasks:
+            task.cancel()
             try:
-                await self._serve_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._serve_task = None
-        if self._writer is not None:
+        self._serve_tasks.clear()
+        for writer in self._writers:
             try:
-                self._writer.close()
+                writer.close()
             except Exception:
                 pass
+        self._writers.clear()
+        self._writer = None
+        self._stream_writer = None
         if self._server is not None:
             self._server.close()
             self._server = None
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._writer = writer
-        self._serve_task = asyncio.current_task()
+        self._writers.append(writer)
+        if self._stream_writer is None:
+            self._stream_writer = writer
+        task = asyncio.current_task()
+        if task is not None:
+            self._serve_tasks.append(task)
         while True:
             line = await reader.readline()
             if not line:
@@ -104,6 +132,9 @@ class FakeHerdrServer:
                 continue
             request = json.loads(text)
             self.requests.append(request)
+            # Per REQUEST, not per connection: a handler's ``reply`` must reach
+            # the client that asked, even while another connection is open.
+            self._writer = writer
             await self.on_request(self, request)
 
     async def reply(self, request_id: str, result: dict[str, Any]) -> None:
@@ -113,11 +144,31 @@ class FakeHerdrServer:
         await self._write({"id": request_id, "error": {"code": code, "message": message}})
 
     async def push(self, event: dict[str, Any]) -> None:
+        """Push an unsolicited event on the connection being handled."""
         await self._write(event)
 
+    async def push_stream(self, event: dict[str, Any]) -> None:
+        """Push on the FIRST connection — the one the client subscribed on.
+
+        A handler running for a ``request_once`` connection has to name the
+        stream explicitly; ``push`` would send the event to a socket the client
+        is about to close and never read.
+        """
+        writer = self._stream_writer
+        if writer is None:
+            return
+        writer.write(json.dumps(event).encode() + b"\n")
+        await writer.drain()
+
     async def close_connection(self) -> None:
+        """Drop the connection being handled."""
         if self._writer is not None:
             self._writer.close()
+
+    async def close_stream(self) -> None:
+        """Drop the FIRST connection — the one the client is streaming on."""
+        if self._stream_writer is not None:
+            self._stream_writer.close()
 
     async def _write(self, obj: dict[str, Any]) -> None:
         assert self._writer is not None
@@ -279,9 +330,12 @@ async def test_event_between_subscribe_and_snapshot_is_delivered_once_in_order(
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
         elif method == "session.snapshot":
             await server.reply(request_id, {"snapshot": _snapshot_body()})
-            # A live event that arrives AFTER the snapshot.
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.close_connection()
+            # A live event that arrives AFTER the snapshot, ON THE STREAM. The
+            # snapshot now travels on its own short-lived connection
+            # (``request_once``), so an event meant for the subscriber has to
+            # name the stream rather than reply-channel.
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_stream()
         else:
             await server.reply(request_id, {})
 
