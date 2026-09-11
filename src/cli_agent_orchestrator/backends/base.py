@@ -505,6 +505,23 @@ class TerminalBackend(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support get_pane_id()")
 
+    def invalidate_pane(
+        self, terminal_id: str, session_name: str = "", window_name: str = ""
+    ) -> None:
+        """Drop every cached answer this backend holds for one terminal's pane.
+
+        A caller that has just PROVEN a pane id wrong (the herdr inbox
+        reconcile, which finds a pane id dead while its tab label is still
+        live) must be able to force the next :meth:`get_pane_id` to re-resolve
+        against the live server. Before F930 that caller reached into
+        ``backend._pane_cache`` directly, which worked only because the other
+        cache in front of it never hit; naming the operation makes the
+        invalidation a contract instead of a coincidence.
+
+        Default is a no-op: a backend with no pane caches has nothing to drop.
+        """
+        return None
+
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Query native agent status if the backend has agent awareness.
 
@@ -599,9 +616,7 @@ class TerminalBackend(ABC):
                 keep whatever failure handling they had for the old tmux
                 ``CalledProcessError``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement get_pane_process_id()"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not implement get_pane_process_id()")
 
     # --- Backend health (F882 #735) ---
 

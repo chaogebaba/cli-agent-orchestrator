@@ -42,15 +42,59 @@ class NativeFetch:
     failure_cause: Literal["pane_unresolved", "command_error", "parse_error"] | None
 
 
-#: Windows already warned about an unclassifiable herdr ``agent_status`` (F926
+#: Sentinel for "the pane response carried no ``agent_status`` field at all",
+#: which is protocol drift and NOT herdr reporting the string "unknown" (N1).
+_AGENT_STATUS_ABSENT = object()
+
+#: Seats already warned about an unclassifiable herdr ``agent_status`` (F926
 #: #778).  The FINDING counts every occurrence — that count is the signal — but
 #: the log line is emitted once per seat: ``fetch_native_status`` runs on the
 #: status poll, so a warning per call would bury the log it exists to inform.
-_STATUS_UNKNOWN_WARNED: set[str] = set()
+#:
+#: Keyed by (session, window) so two sessions reusing a window name each get
+#: their own line, and bounded: a process that outlives thousands of seats
+#: clears the set rather than growing it without end. Clearing costs at most one
+#: repeated warning per live seat, which is the cheaper of the two mistakes.
+_STATUS_UNKNOWN_WARNED: set[tuple[str, str]] = set()
+_STATUS_UNKNOWN_WARNED_MAX = 1024
 _STATUS_UNKNOWN_LOCK = threading.Lock()
 
 
+def _seat_key(session_name: str, window_name: str) -> tuple[str, str]:
+    """The identity of one worker seat, defined ONCE (N5).
+
+    The warn-once set and the finding's dedupe identity must agree on what "the
+    same seat" means, or the log would fall silent for a seat whose finding
+    count is still climbing. Both go through here.
+    """
+    return (session_name, window_name)
+
+
+def _terminal_id_from_window(window_name: str) -> str:
+    """Recover the CAO terminal id a window name carries, or ``""``.
+
+    ``utils.terminal.generate_window_name`` composes ``{profile}-{terminal_id}``
+    and documents that the visible suffix IS the terminal id (fx155), so the
+    last dash-segment is the id whenever it has the minted shape. Profiles may
+    themselves contain dashes (``developer-opus``), which is why this splits on
+    the LAST dash rather than the first.
+
+    Returns ``""`` — never a guess — when the suffix is not an 8-hex id. That
+    covers the legacy ``{profile}-{uuid4[:4]}`` form from the no-id branch of
+    ``generate_window_name`` and any hand-made window name, and an empty string
+    is exactly what a fleet-wide finding row wants: SQLite treats NULLs as
+    distinct inside a UNIQUE index, so the store's dedupe contract is written in
+    terms of ``""``.
+    """
+    from cli_agent_orchestrator.utils.terminal import is_raw_terminal_id
+
+    suffix = window_name.rsplit("-", 1)[-1]
+    return suffix if is_raw_terminal_id(suffix) else ""
+
+
 def map_native_status(agent_status: str | None) -> TerminalStatus | None:
+    if agent_status is None:
+        return None
     return {
         "working": TerminalStatus.PROCESSING,
         "blocked": TerminalStatus.WAITING_USER_ANSWER,
@@ -169,7 +213,24 @@ def _redact_env_values(args: List[str]) -> List[str]:
 # Cache TTL for pane_id resolution (seconds).
 # Used by get_pane_id() (fast-path, reads the cache populated at create time) and
 # _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
-# herdr renumbers panes on deletion, so it resolves the pane fresh every call.
+# it resolves the pane fresh every call.
+#
+# That used to be justified as "herdr renumbers panes on deletion", which
+# contradicted _PANE_ID_MAP_TTL's "stable except across a full server restart"
+# a few lines below. MEASURED on herdr 0.9.0 (protocol 22, grok-box-010) — four
+# tabs in one workspace, then close the middle one:
+#
+#     BEFORE  w1:p1 tab-1   w1:p2 tab-a   w1:p3 tab-b   w1:p4 tab-c
+#     close   w1:t2 (tab-a)
+#     AFTER   w1:p1 tab-1                 w1:p3 tab-b   w1:p4 tab-c
+#
+# Surviving panes KEEP their ids and the closed id is retired, not reused
+# (herdr's own skill file: "Closed tab and pane IDs are not reused"). So the
+# second comment is the true one: a pane id changes only when the pane is MOVED
+# to another workspace (which mints a new workspace-qualified id) or when the
+# server restarts. A pane id can still go DEAD while its tab label lives, which
+# is the case the inbox reconcile repairs — but a live pane's id does not shift
+# under a sibling's deletion.
 _PANE_CACHE_TTL = 5.0
 _PROVIDER_AGENT_MARKERS = {
     "claude_code": "claude",
@@ -216,9 +277,13 @@ class HerdrBackend(TerminalBackend):
         self._herdr_session = herdr_session
         # Resolution cache: terminal_id → (pane_id, timestamp)
         self._pane_cache: Dict[str, tuple[str, float]] = {}
-        # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
-        # Public IDs are stable except across a full herdr server restart.
-        self._pane_id_map: Dict[str, str] = {}
+        # Durable map: (session_name, window_name) → pane_id, rebuilt from
+        # `api snapshot`. Public IDs are stable except across a full herdr
+        # server restart. Keyed on the labels CAO itself writes at create time
+        # (workspace label = CAO session, tab label = CAO window) because those
+        # are the ONLY CAO-controlled identifiers the snapshot carries — see
+        # _refresh_pane_id_map.
+        self._pane_id_map: Dict[tuple[str, str], str] = {}
         # Timestamp of the last successful map rebuild; bounds map staleness
         # against a herdr restart via _PANE_ID_MAP_TTL (0.0 => never built).
         self._pane_id_map_ts: float = 0.0
@@ -1076,63 +1141,103 @@ class HerdrBackend(TerminalBackend):
         try:
             data = self._parse_herdr_json(result.stdout)
             pane_info = data.get("pane", data) if isinstance(data, dict) else data
-            agent_status = pane_info.get("agent_status", "unknown")
+            agent_status = pane_info.get("agent_status", _AGENT_STATUS_ABSENT)
         except (json.JSONDecodeError, AttributeError, TypeError):
             return NativeFetch(None, None, "parse_error")
-        if not isinstance(agent_status, str):
+        absent = agent_status is _AGENT_STATUS_ABSENT
+        if not absent and not isinstance(agent_status, str):
+            # A PRESENT field of the wrong type really is a parse error.
             return NativeFetch(None, None, "parse_error")
-        status = map_native_status(agent_status)
+        # N1: a pane response that omits ``agent_status`` entirely is protocol
+        # drift, not herdr answering "unknown" — the finding says which, so the
+        # diagnostic added to distinguish these conditions actually does.
+        #
+        # It is deliberately NOT reported as ``parse_error``: a failure_cause
+        # becomes ``probe_failure`` in the probe meta and inbox_service treats
+        # that key as a delivery VETO, so typing a missing field would stop
+        # every message to that seat the moment herdr renamed a JSON key. The
+        # fallback to pane scraping is the right behaviour either way; only the
+        # explanation differs.
+        reported: str | None = None if absent else cast(str, agent_status)
+        status = None if absent else map_native_status(reported)
         if status is None:
-            self._record_status_unknown(session_name, window_name, pane_id, agent_status)
-        return NativeFetch(agent_status, status, None)
+            self._record_status_unknown(session_name, window_name, pane_id, reported, absent=absent)
+        return NativeFetch(reported, status, None)
 
     @staticmethod
     def _record_status_unknown(
-        session_name: str, window_name: str, pane_id: str, agent_status: str
+        session_name: str,
+        window_name: str,
+        pane_id: str,
+        agent_status: str | None,
+        *,
+        absent: bool = False,
     ) -> None:
         """F926 (#778): count the silent fall-back to pane scraping.
 
-        herdr answered for the pane but could not classify it, so this seat has
-        NO native status and the caller quietly reverts to tmux-style scraping.
-        That fallback is correct — see :meth:`fetch_native_status` on why
-        ``unknown`` must NOT become a ``failure_cause`` (a ``probe_failure`` in
-        the probe meta is a delivery VETO at ``inbox_service``'s safety gate, so
-        typing it would stop every message to exactly the seats this is about) —
-        but being correct is not the same as being visible.
+        herdr answered for the pane but CAO has no native status for it, so the
+        caller quietly reverts to tmux-style scraping. That fallback is correct
+        — see :meth:`fetch_native_status` on why this must NOT become a
+        ``failure_cause`` (a ``probe_failure`` in the probe meta is a delivery
+        VETO at ``inbox_service``'s safety gate, so typing it would stop every
+        message to exactly the seats this is about) — but being correct is not
+        the same as being visible.
 
         Measured cause on herdr 0.9.0 (protocol 22): herdr's own bundled
-        agent-detection manifests are uneven.  ``pi.toml`` carries a single rule
+        agent-detection manifests are uneven. ``pi.toml`` carries a single rule
         whose state is ``working``; ``cline.toml`` carries only ``working`` and
-        ``blocked``; ``codex.toml`` carries ``idle`` rules and so resolves.  A
+        ``blocked``; ``codex.toml`` carries ``idle`` rules and so resolves. A
         pi/cline pane sitting at its prompt therefore matches no rule and herdr
-        reports ``unknown`` forever, which is why the cheap lanes carry no native
-        truth while codex does.  The gap is herdr's, not CAO's, so what CAO owes
-        is a counted row instead of silence.
+        reports ``unknown`` forever, which is why the cheap lanes carry no
+        native truth while codex does. The gap is herdr's, not CAO's, so what
+        CAO owes is a counted row instead of silence.
 
-        Deduplicated per window: the row's ``count`` is how often this seat fell
-        back, and its ``dedupe_key`` is which seat did.  Never raises — the
-        wiring seam swallows, and a missing runtime is simply silent.
+        ``absent`` separates the two conditions this diagnostic exists to tell
+        apart: herdr SAYING ``unknown`` (the manifest gap) versus the pane
+        response carrying no ``agent_status`` field at all (protocol drift).
+
+        Deduplicated per seat: the row's ``count`` is how often this seat fell
+        back, and its ``dedupe_key`` is which seat did. ``terminal_id`` is the
+        window name's own suffix — ``generate_window_name`` makes the visible
+        suffix the terminal id — so the row joins to the event and state tables
+        instead of leaving a blank column in ``cao diag findings``. Never raises:
+        the wiring seam swallows, and a missing runtime is simply silent.
         """
+        terminal_id = _terminal_id_from_window(window_name)
         try:
             from cli_agent_orchestrator.adapters.truth.wiring import record_finding
             from cli_agent_orchestrator.core.findings import FindingCode
 
+            observed = (
+                "no agent_status field in the pane response"
+                if absent
+                else f"herdr agent_status={agent_status!r}"
+            )
             record_finding(
                 FindingCode.DIAG_HERDR_STATUS_UNKNOWN,
-                dedupe_key=window_name,
+                terminal_id=terminal_id,
+                # N5: the finding's dedupe identity and the warn-once set's key
+                # are the SAME seat. The store already scopes a row by
+                # (code, terminal_id, dedupe_key) and terminal_id carries the
+                # session-unique id, so the window alone is the right dedupe_key
+                # here — _seat_key names the pairing the log side needs.
+                dedupe_key=_seat_key(session_name, window_name)[1],
                 detail=(
-                    f"herdr agent_status={agent_status!r} for pane {pane_id} "
-                    f"(session={session_name}, window={window_name}); no native status, "
-                    f"falling back to pane scraping"
+                    f"{observed} for pane {pane_id} (session={session_name}, "
+                    f"window={window_name}); no native status, falling back to "
+                    f"pane scraping"
                 ),
             )
         except Exception:  # noqa: BLE001 — an observation must never break the poll
             logger.debug("herdr status-unknown finding could not be recorded", exc_info=True)
+        seat = _seat_key(session_name, window_name)
         with _STATUS_UNKNOWN_LOCK:
-            first_for_window = window_name not in _STATUS_UNKNOWN_WARNED
-            if first_for_window:
-                _STATUS_UNKNOWN_WARNED.add(window_name)
-        log = logger.warning if first_for_window else logger.debug
+            first_for_seat = seat not in _STATUS_UNKNOWN_WARNED
+            if first_for_seat:
+                if len(_STATUS_UNKNOWN_WARNED) >= _STATUS_UNKNOWN_WARNED_MAX:
+                    _STATUS_UNKNOWN_WARNED.clear()
+                _STATUS_UNKNOWN_WARNED.add(seat)
+        log = logger.warning if first_for_seat else logger.debug
         log(
             "herdr_status_unknown session=%s window=%s pane=%s agent_status=%s — "
             "no native status for this seat; falling back to pane scraping "
@@ -1140,7 +1245,7 @@ class HerdrBackend(TerminalBackend):
             session_name,
             window_name,
             pane_id,
-            agent_status,
+            "<absent>" if absent else agent_status,
         )
 
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
@@ -1288,21 +1393,29 @@ class HerdrBackend(TerminalBackend):
         # Durable map (rebuilt from api snapshot). Trust a hit only while the map
         # is fresh; herdr IDs are stable except across a server restart, which
         # this TTL bounds — a stale entry expires and the next lookup refreshes.
-        if (
-            time.time() - self._pane_id_map_ts
-        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
-            return self._pane_id_map[terminal_id]
-        # Map is stale (or a miss). Rebuild, then trust it ONLY if the rebuild
-        # succeeded — _refresh_pane_id_map leaves the timestamp untouched on
-        # failure, so re-check freshness here. Without this re-gate a failed
-        # refresh would return the very entry we just judged expired, defeating
-        # the self-healing this TTL exists to provide (fall through to the
-        # label-based fallback instead).
-        self._refresh_pane_id_map()
-        if (
-            time.time() - self._pane_id_map_ts
-        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
-            return self._pane_id_map[terminal_id]
+        # The map is keyed by the (session, window) labels CAO writes, so a
+        # caller supplying neither cannot be answered from it. Gating on that
+        # stops such a caller paying an `api snapshot` per call to rebuild a map
+        # whose key it does not hold — it would miss either way.
+        map_key = (session_name, window_name)
+        if session_name and window_name:
+            if (
+                time.time() - self._pane_id_map_ts
+            ) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
+                return self._pane_id_map[map_key]
+            # Map is stale (or a miss). Rebuild, then trust it ONLY if the
+            # rebuild succeeded — _refresh_pane_id_map leaves the timestamp
+            # untouched on failure, so re-check freshness here. Without this
+            # re-gate a failed refresh would return the very entry we just
+            # judged expired, defeating the self-healing this TTL exists to
+            # provide (fall through to the label-based fallback instead). It is
+            # also what makes invalidate_pane's zeroed stamp hold when the
+            # server is unreachable.
+            self._refresh_pane_id_map()
+            if (
+                time.time() - self._pane_id_map_ts
+            ) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
+                return self._pane_id_map[map_key]
 
         # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
@@ -1319,6 +1432,33 @@ class HerdrBackend(TerminalBackend):
             return self._resolve_pane_id_from_window(session_name, window_name)
 
         raise TerminalNotFoundError(terminal_id)
+
+    def invalidate_pane(
+        self, terminal_id: str, session_name: str = "", window_name: str = ""
+    ) -> None:
+        """Force the next :meth:`get_pane_id` to re-resolve against herdr.
+
+        F930 (#782) made ``_pane_id_map`` authoritative for the first time — it
+        had never once been hit before — and it sits IN FRONT of
+        ``_pane_cache``. The herdr inbox reconcile invalidates a pane it has
+        just proven dead by dropping the cache entry; with a live map in front
+        of that cache the drop would no longer change the answer, and
+        ``get_pane_id`` could hand back the very id the caller proved wrong. The
+        reconcile would then "re-map" a terminal onto its own stale pane, count
+        it repaired, and leave the routing table pointing at a pane id that is
+        no longer that terminal's.
+
+        So invalidation clears BOTH layers and the map's freshness stamp with
+        them. Zeroing ``_pane_id_map_ts`` is what carries the guarantee when the
+        caller cannot name the (session, window) key — and, because a failed
+        refresh deliberately leaves map and stamp untouched, it is also what
+        makes a refresh that cannot reach the server fall through to the live
+        label walk instead of answering from stale memory.
+        """
+        self._pane_cache.pop(terminal_id, None)
+        if session_name and window_name:
+            self._pane_id_map.pop((session_name, window_name), None)
+        self._pane_id_map_ts = 0.0
 
     def _refresh_pane_id_map(self) -> None:
         """Rebuild terminal_id -> pane_id from a live `api snapshot`.
@@ -1342,11 +1482,48 @@ class HerdrBackend(TerminalBackend):
             snapshot = data.get("snapshot", data)
             if not isinstance(snapshot, dict):
                 return
-            self._pane_id_map = {
-                p["terminal_id"]: p["pane_id"]
-                for p in snapshot.get("panes", [])
-                if p.get("terminal_id") and p.get("pane_id")
+            # F930 (#782): key on the labels CAO writes, not on herdr's own
+            # ``terminal_id``. A snapshot pane's ``terminal_id`` is HERDR's
+            # terminal handle (``term_65b3308e082471``), never CAO's terminal
+            # uuid (``919751d7``), so a map built from it could not be hit by
+            # ``get_pane_id``'s CAO-keyed lookup even once: every call missed,
+            # paid a full ``api snapshot`` subprocess, missed again and fell
+            # through to the legacy label walk. The durable map was dead weight
+            # that made every resolution SLOWER than having no map at all.
+            #
+            # The snapshot does carry CAO identity, one level up: CAO creates
+            # each workspace labelled with its session name and each tab
+            # labelled with its window name (``create_window`` passes
+            # ``--label window_name``), and a pane names its ``tab_id``. Joining
+            # panes → tabs → workspaces on those ids recovers exactly the
+            # (session, window) pair callers ask with.
+            #
+            # The key is the PAIR, not the window alone: a snapshot spans every
+            # workspace on the server, so two CAO sessions on one herdr server
+            # would otherwise collide on a shared window name.
+            workspace_labels = {
+                w["workspace_id"]: w["label"]
+                for w in snapshot.get("workspaces", [])
+                if w.get("workspace_id") and w.get("label")
             }
+            tabs = {
+                t["tab_id"]: (workspace_labels.get(t.get("workspace_id", "")), t["label"])
+                for t in snapshot.get("tabs", [])
+                if t.get("tab_id") and t.get("label")
+            }
+            rebuilt: Dict[tuple[str, str], str] = {}
+            for pane in snapshot.get("panes", []):
+                if not pane.get("pane_id"):
+                    continue
+                session_label, window_label = tabs.get(pane.get("tab_id", ""), (None, None))
+                if session_label and window_label:
+                    # FIRST pane wins, matching _resolve_pane_id_from_window
+                    # (which returns the tab's first pane). CAO makes one pane
+                    # per tab today so the two agree trivially — but a user
+                    # splitting a pane inside a CAO workspace must not make the
+                    # two resolution paths disagree by snapshot order.
+                    rebuilt.setdefault((session_label, window_label), pane["pane_id"])
+            self._pane_id_map = rebuilt
             self._pane_id_map_ts = time.time()
         except (
             TerminalBackendError,
@@ -1677,10 +1854,23 @@ class HerdrBackend(TerminalBackend):
     def _resolve_pane_id_from_window(self, session_name: str, window_name: str) -> str:
         """Resolve a pane_id given session_name and window_name.
 
-        Performs a fresh herdr workspace + tab + pane lookup on every call. Pane
-        IDs are not stable across deletions — herdr renumbers remaining panes
-        when any pane in the workspace is removed, so a cached pane_id would go
-        stale and cause pane_not_found errors for live terminals. workspace_id
+        Performs a fresh herdr workspace + tab + pane lookup on every call. A
+        pane_id can go DEAD while its tab label lives — the pane was closed and
+        re-created, or moved to another workspace (which mints a new
+        workspace-qualified id), or the server restarted — so a cached pane_id
+        would cause pane_not_found errors for live terminals.
+
+        It is NOT that herdr renumbers siblings. Measured on herdr 0.9.0
+        (protocol 22, grok-box-010), four tabs in one workspace, closing the
+        middle one:
+
+            BEFORE  w1:p1 tab-1   w1:p2 tab-a   w1:p3 tab-b   w1:p4 tab-c
+            AFTER   w1:p1 tab-1                 w1:p3 tab-b   w1:p4 tab-c
+
+        Surviving panes keep their ids and the closed id is retired, not reused
+        (herdr's skill file: "Closed tab and pane IDs are not reused"). The
+        conclusion — resolve live, never cache a pane_id here — is unchanged;
+        only the reason it was written down was wrong. workspace_id
         resolution is cached with a short TTL inside _resolve_workspace_id as a
         latency optimization; the chain is otherwise resolved live.
 
