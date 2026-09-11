@@ -355,6 +355,35 @@ class _JWKSServer:
 _PROVIDER_BINARIES = {"kiro_cli": "kiro-cli", "claude_code": "claude", "codex": "codex"}
 
 
+# F993 (#841): the ONLY signals that may downgrade a failed POST /sessions to a
+# skip. Each can mean just one thing: the provider binary is not on this host.
+# Everything else — including "initialization timed out" and any message that
+# merely names the provider — is a real failure and must surface as one.
+#
+# The fixture previously skipped on any 5xx whose body contained the provider
+# name, which is essentially every provider-related 500, so a server defect
+# reported green. The genuine host-capability gates run pre-flight instead
+# (--run-live and shutil.which), placed there because a 5xx skip is too late
+# once a real CLI has begun its login flow.
+_HOST_CANNOT_RUN_MARKERS = (
+    "not installed",
+    "command not found",
+    "no such file or directory",
+)
+
+
+def provider_missing_from_host(status_code: int, body: str) -> bool:
+    """True only when a failed session create means the binary is absent here.
+
+    Deliberately narrow: a provider that starts but never reaches idle
+    ("initialization timed out") is a defect, not a host fact, and must fail.
+    """
+    if status_code < 500:
+        return False
+    lowered = body.lower()
+    return any(marker in lowered for marker in _HOST_CANNOT_RUN_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # Core spawn helper (exposed for self-tests)
 # ---------------------------------------------------------------------------
@@ -701,26 +730,30 @@ def cao_terminal(
         },
     )
     if resp.status_code not in (200, 201):
-        # Provider boot is fragile — CLI may be installed but unauthenticated,
-        # rate-limited, or slow to TUI-init. Treat any 5xx that names the
-        # provider as a skip, not a fixture-contract failure. The integration
-        # tests own provider responsiveness.
+        # F993 (#841): this used to skip on any 5xx whose body named the
+        # provider, which is essentially every provider-related 500 — the four
+        # specific markers were decoration and a real server defect reported
+        # green. The genuine host-capability cases are already handled ABOVE,
+        # before the request is sent: the --run-live gate and the shutil.which
+        # probe, placed pre-flight precisely because (as the comment there
+        # says) a 5xx skip is too late once a real CLI has begun its login
+        # flow. So only signals that can ONLY mean "this host cannot run the
+        # binary" skip here; everything else fails.
+        #
+        # "initialization timed out" is deliberately NOT in this set. A
+        # provider that starts but never reaches idle is a real failure — it is
+        # the F933 class, where fuse_status held a quiescent terminal at
+        # PROCESSING for ~11s against a 15s budget. That was caught only
+        # because the test that hit it does not use this fixture.
         body = resp.text
-        if resp.status_code >= 500 and any(
-            marker in body.lower()
-            for marker in (
-                "initialization timed out",
-                "not installed",
-                "not found",
-                "command not found",
-                provider.lower(),
-            )
-        ):
+        if provider_missing_from_host(resp.status_code, body):
             pytest.skip(
-                f"provider {provider!r} not usable on this host "
+                f"provider {provider!r} is not installed on this host "
                 f"(HTTP {resp.status_code}): {body[:200]}"
             )
-        raise RuntimeError(f"POST /sessions failed: {resp.status_code} {body}")
+        raise RuntimeError(
+            f"POST /sessions failed for provider {provider!r}: HTTP {resp.status_code} {body}"
+        )
     data = resp.json()
     terminal_id = data["id"]
     actual_session = data["session_name"]
