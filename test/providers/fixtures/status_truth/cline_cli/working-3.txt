@@ -1,0 +1,50 @@
+
+ ❯ Run the shell command: echo hi — then reply with exactly: ANSWER done
+
+ ▶ Thinking: The user wants me to run `echo hi` and then reply with exactly "ANSWER done". Let me run the command.
+
+ * run_commands(echo hi)
+   ⎿ hi
+
+ * ANSWER done
+
+ ❯ Run this shell command exactly once: sleep 25; echo finished — then reply with exactly: ANSWER done
+
+ ▶ Thinking: The user wants me to run the command exactly once, then reply with exactly "ANSWER done".
+
+ ⠇ run_commands(sleep 25; echo finished)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Ask anything...
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ClinePass: DeepSeek V4 Pro (high) ██████ (5,841)                                                                                                                                    ○ Plan ● Act (Tab)
+ cline-cap
+ ⏵⏵ Auto-approve all enabled (Shift+Tab)

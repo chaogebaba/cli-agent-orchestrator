@@ -1,0 +1,8 @@
+{
+  "provider": "cline_cli",
+  "state": "idle",
+  "source": "tmux -L f581cap capture-pane -p (200x50) of the same cline 3.0.61 TUI as working-3.txt, ~40s earlier, after its first turn completed. Capture-only.",
+  "captured_at": "2026-09-11T23:06:00Z",
+  "cline_version": "3.0.61",
+  "notes": "Post-turn pane: the tool row '* run_commands(echo hi)', its '⎿ hi' result and the '* ANSWER done' reply, then the composer box and the ClinePass footer. The seat's turn is over. Its bottom chrome is byte-identical in kind to working-3.txt's, which is why 'the chrome is the newest row' cannot mean idle on cline 3.0.61. Note also the tool-row RENDERING: 3.0.61 writes '* run_commands(args)' / '⠇ run_commands(args)', not the '[run_commands] …' of the 2026-08-29 ClinePass captures."
+}

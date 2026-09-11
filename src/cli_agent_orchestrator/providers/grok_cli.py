@@ -94,9 +94,64 @@ COMPOSER_PROMPT_PATTERN = r"^\s*(?:│\s*)?❯(?:\s|$)"
 # Grok's collapsed tool-result expander: "... (N more lines, press Enter to view)"
 # rendered above the idle prompt after tool invocations.
 GROK_COLLAPSED_EXPANDER_PATTERN = r"\.\.\.\s*\(\d+ more lines?,\s*press Enter to view\)"
+# F581 D16 (grok leg, #438): busy-marker veto hook for rule 3a — same contract as
+# claude_code's ``rule3a_busy_marker`` and the kiro/codex legs. The grok TUI's
+# provable "the agent's own turn is live" marker is the spinner status row
+# (``⠦ Waiting for response… 0.7s … [stop]`` / ``⠙ Thinking`` / ``◆ Responding``),
+# which is exactly ``PROCESSING_PATTERN`` — the same rows ``get_status`` already
+# trusts for PROCESSING, so the marker cannot disagree with the status detector.
+GROK_BUSY_MARKER_PATTERN = re.compile(PROCESSING_PATTERN, re.MULTILINE)
+# The idle composer: grok redraws a rounded box whose bottom rule carries the
+# model/approval chrome (``╰── Grok 4.5 (high) · always-approve ─╯``) around the
+# ``❯`` prompt row. BOTH halves are required so a box-drawing table quoted in
+# agent output cannot fake an idle verdict. Proven present in every
+# ``test/providers/fixtures/status_truth/grok_cli/idle-*.txt`` (idle-3 is a
+# post-turn pane, idle-2 a raw alt-screen capture) and absent from the panes
+# where no TUI is up (``error-1``, the device-login wait).
+GROK_COMPOSER_BOX_PATTERN = re.compile(r"╰─{2,}[^\n]*─╯")
+GROK_COMPOSER_PROMPT_ROW = re.compile(r"^\s*(?:│\s*)?❯", re.MULTILINE)
+# Position anchor, mirroring get_status's last_processing/last_completed
+# ordering: a spinner row ABOVE the turn's completion row is prior-turn
+# scrollback, not live work.
+#
+# NOTE (#438): this is NOT ``COMPLETION_PATTERN`` reused. That pattern requires a
+# trailing period ("Worked for 4.9s."), and no captured grok pane has one — every
+# completion row in the corpus reads "Worked for 4.9s" / "Worked for 2.0s"
+# (``fixtures/status_truth/grok_cli/idle-3.txt:11``,
+# ``fixtures/grok_cli_second_turn.txt:7``,
+# ``fixtures/grok_cli_completed.txt:11``). So the marker anchors on the form the
+# panes actually emit, with the period optional; touching COMPLETION_PATTERN
+# itself would move get_status and is out of this fix's scope.
+GROK_COMPLETION_ROW_PATTERN = re.compile(
+    r"^\s*(?:Turn completed in [\d.]+s\.?|Worked for [\d.]+s\.?)\s*$", re.MULTILINE
+)
+
 EMPTY_DRAFT_PLACEHOLDERS = {
     "",
 }
+
+
+def grok_busy_marker_live(text: str) -> bool | None:
+    """F581 D16 (#438): is the grok seat's own TUI activity marker live?
+
+    Truth table (same as D12d / claude_code / kiro / codex):
+      * ``True``  — the spinner status row (``PROCESSING_PATTERN``) is present.
+      * ``False`` — no busy marker BUT the idle composer box is drawn (the
+        seat's own turn is over): rule 3a admits the published status instead of
+        holding it at PROCESSING on pane delta alone.
+      * ``None``  — no identifiable grok TUI: legacy rule 3a applies unchanged.
+
+    Operates on the plain (escape-stripped) pane string; no second capture.
+    """
+    clean = strip_terminal_escapes(text)
+    busy_at = max((m.start() for m in GROK_BUSY_MARKER_PATTERN.finditer(clean)), default=-1)
+    done_at = max((m.start() for m in GROK_COMPLETION_ROW_PATTERN.finditer(clean)), default=-1)
+    if busy_at > done_at:
+        return True
+    if GROK_COMPOSER_BOX_PATTERN.search(clean) and GROK_COMPOSER_PROMPT_ROW.search(clean):
+        return False
+    return None
+
 
 # F655 (#510): grok CLI 1.0.13 writes these seed artifacts into the per-session
 # directory at session-create time (~1s after launch), independent of whether a
@@ -442,6 +497,16 @@ class GrokCliProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def rule3a_busy_marker(self, snapshot: str) -> bool | None:
+        """F581 D16 (grok leg, #438): is the grok TUI's own activity marker live?
+
+        Delegates to the shared pure helper ``grok_busy_marker_live``. Same
+        contract as claude_code / kiro / codex: True on the spinner status row,
+        False when only the idle composer box is drawn, None on a pane with no
+        identifiable grok TUI.
+        """
+        return grok_busy_marker_live(snapshot)
 
     def get_status(self, output: str) -> TerminalStatus:
         """Detect Grok status from the raw tmux pipe-pane byte stream."""
@@ -895,9 +960,7 @@ class GrokCliProvider(BaseProvider):
                 from cli_agent_orchestrator.backends.registry import get_backend
 
                 # F893 (#745): backend port, not tmux list-panes.
-                our_pane = get_backend().get_pane_process_id(
-                    self.session_name, self.window_name
-                )
+                our_pane = get_backend().get_pane_process_id(self.session_name, self.window_name)
                 if our_pane:
                     parent = proc.parent()
                     # Walk ancestry up to 10 levels

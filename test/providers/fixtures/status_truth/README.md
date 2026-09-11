@@ -18,10 +18,11 @@ idle), `waiting_user_answer` (dialog), `error`. Providers: `codex`,
 | codex         | 4 ✅ | 1 ✅    | 0 ❌       | 3 ✅                | 3 ✅  | 1       |
 | kiro_cli      | 2 ✅ | 2 ✅    | 0 ❌*      | 2 ✅                | 5 ✅  | 1       |
 | claude_code   | 4 ✅ | 5 ✅    | 2 ✅       | 2 ✅                | 0 ❌  | 0       |
-| cline_cli     | 1 ✅ | 2 ✅    | 0 ❌       | 0 ❌                | 0 ❌  | 0       |
+| cline_cli     | 2 ✅ | 3 ✅    | 0 ❌       | 0 ❌                | 0 ❌  | 0       |
 | grok_cli      | 3 ✅ | 1 ✅    | 0 ❌       | 3 ✅                | 1 ✅  | 0       |
 
-**21/25 cells filled.** Missing cells (no real capture exists as of
+**21/25 cells filled.** (cline_cli idle/working each gained one 2026-09-11
+capture from cline 3.0.61 — see source 6 below.) Missing cells (no real capture exists as of
 2026-08-29):
 
 - `codex/delegating`, `grok_cli/delegating`, `cline_cli/delegating` — no
@@ -68,6 +69,17 @@ wedge) and `kiro_cli/unknown-1` (completed-handoff transcript).
    Provider per fleet API at capture time; pane state observed in the
    bytes. `cline_dev-e15bef55` (window 5) vanished mid-capture — not
    collected.
+
+6. F581 #438 (2026-09-11): `cline_cli/working-3.txt` and `cline_cli/idle-2.txt`,
+   `tmux -L f581cap capture-pane -p` (200x50) of a **cline 3.0.61** TUI launched
+   on the laptop by the fix lane and driven with two typed prompts (capture-only,
+   no CAO). They are a PAIR: the same pane mid-turn (live braille-spinner tool
+   row) and post-turn, both ending in the same ClinePass composer chrome. That
+   pair is why cline has no `rule3a_busy_marker` — 3.0.61 pins the composer to
+   the bottom in every state, so "the chrome is the newest row" cannot mean idle.
+   They also record 3.0.61's tool-row rendering (`* run_commands(args)` /
+   `⠇ run_commands(args)`), which differs from the `[run_commands] …` of the
+   2026-08-29 ClinePass captures in `working-1/-2`.
 
 ## Status-truth discrepancies observed live (noted in sidecars)
 

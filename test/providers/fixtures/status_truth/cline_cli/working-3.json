@@ -1,0 +1,8 @@
+{
+  "provider": "cline_cli",
+  "state": "working",
+  "source": "tmux -L f581cap capture-pane -p (200x50) of a cline 3.0.61 TUI launched by the F581 #438 fix lane on the LAPTOP, 2026-09-11T23:07Z. Capture-only; the pane was driven by two tmux send-keys prompts typed by the lane, no CAO involvement.",
+  "captured_at": "2026-09-11T23:07:00Z",
+  "cline_version": "3.0.61",
+  "notes": "THE FALSIFIER for a chrome-based idle rule. The seat is provably WORKING: row 15 is the live braille-spinner tool row '⠇ run_commands(sleep 25; echo finished)', captured ~22s into a 25s sleep. Yet the ClinePass composer box and footer ('❯ Ask anything...', 'ClinePass: DeepSeek V4 Pro (high)', '○ Plan ● Act (Tab)', '⏵⏵ Auto-approve all enabled') are redrawn BELOW it, so the chrome is the newest content on a working pane — exactly as it is on the idle pane idle-2.txt. cline 3.0.61 pins the composer to the bottom in every state; the 2026-08-29 ClinePass captures (working-1/-2) are scrollback with no chrome at all. Pair with idle-2.txt: the only difference is the spinner."
+}

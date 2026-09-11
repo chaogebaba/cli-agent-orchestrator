@@ -4,8 +4,9 @@ Same contract as claude_code's D12d spinner veto. The kiro busy markers are the
 footer ghost text (``Kiro is working`` / ``Thinking...``) and the spinner status
 line (``◐ N tasks remaining · …``), proven from the LIVE byte-exact panes under
 ``test/providers/fixtures/busy_marker/kiro_cli/`` (see the sibling .json
-provenance). grok/cline keep the BaseProvider default None (no corpus, no
-override) this WP.
+provenance). grok got its own leg in F581 #438 — see
+``test_grok_busy_marker.py``, which also records why cline did NOT get one;
+``BaseProvider`` keeps the no-signal default for every provider without a leg.
 """
 
 from pathlib import Path
