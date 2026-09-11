@@ -250,12 +250,26 @@ def test_fleet_row_drops_a_stale_busy_on_an_idle_seat(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(fs, "get_backend", lambda: _Backend())
 
-    class _Observation:
-        status = TerminalStatus.IDLE
-        fusion_changed = False
-        fusion_reason = None
+    # fx751 AC-7: build_fleet now reads the accepted observation via
+    # overlaid_observation, which folds the condition in and calls the (here
+    # monkeypatched) get_boundary_observation internally. The base observation
+    # must be a real BoundaryObservation so the fold's dataclasses.replace works
+    # — the F752 intent (no `idle [BUSY]` row reaches the TUI) is unchanged.
+    from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
-    monkeypatch.setattr(fs.status_monitor, "get_boundary_observation", lambda _tid: _Observation())
+    _obs = BoundaryObservation(
+        observation_epoch="ep-f752",
+        status=TerminalStatus.IDLE,
+        status_gen=0,
+        input_gen=0,
+        seq=0,
+        last_non_ready_seq=None,
+        last_ready_seq=None,
+        fusion_reason=None,
+        fusion_changed=False,
+    )
+
+    monkeypatch.setattr(fs.status_monitor, "get_boundary_observation", lambda _tid: _obs)
     monkeypatch.setattr(fs, "_compute_init_health", lambda _row, _now: "ok")
     status_monitor._condition_fleet_sink(tid, "BUSY")
     try:
