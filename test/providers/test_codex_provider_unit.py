@@ -149,6 +149,7 @@ class TestCodexProviderInitialization:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false",
         )
         mock_wait_status.assert_called_once()
@@ -244,6 +245,7 @@ class TestCodexBuildCommand:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false"
         )
 
@@ -266,6 +268,39 @@ class TestCodexBuildCommand:
         assert "features.multi_agent=false" in argv
         assert argv.index("features.multi_agent=false") < argv.index(
             "check_for_update_on_startup=false"
+        )
+
+    def test_build_command_disables_tui_animations(self):
+        """F922 (#774): the animated composer shimmer reads as activity.
+
+        CAO must turn the TUI animation off in the launch argv itself, so the
+        fix holds regardless of the user's ``~/.codex/config.toml``.
+
+        Mutant: dropping the ``-c tui.animations=false`` append fails here.
+        """
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        argv = shlex.split(provider._build_codex_command())
+
+        assert "tui.animations=false" in argv
+        # Emitted as a -c override pair, not a bare positional arg.
+        assert argv[argv.index("tui.animations=false") - 1] == "-c"
+        # Sits with the other CAO-owned overrides, before any fork/resume UUID.
+        assert argv.index("features.multi_agent=false") < argv.index("tui.animations=false")
+
+    def test_resume_command_disables_tui_animations(self):
+        """F922 (#774): the resume path is where the false-BUSY shimmer bit.
+
+        ``codex resume`` reuses the same override block, so the flag must be
+        present there too (and still ahead of the trailing session UUID).
+        """
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        argv = provider.build_resume_command("01a036a4-94bb-79d1-a26a-6907752b34eb")
+
+        assert argv[0] == "codex"
+        assert argv[1] == "resume"
+        assert "tui.animations=false" in argv
+        assert argv.index("tui.animations=false") < argv.index(
+            "01a036a4-94bb-79d1-a26a-6907752b34eb"
         )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -561,6 +596,7 @@ class TestCodexBuildCommand:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false"
         )
         assert "developer_instructions" not in command
@@ -581,6 +617,7 @@ class TestCodexBuildCommand:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false"
         )
 
@@ -1234,6 +1271,7 @@ class TestCodexProviderCodexConfig:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false"
         )
 
@@ -1254,6 +1292,7 @@ class TestCodexProviderCodexConfig:
             "codex --yolo --no-alt-screen --disable shell_snapshot"
             " --dangerously-bypass-hook-trust"
             " -c features.multi_agent=false"
+            " -c tui.animations=false"
             " -c check_for_update_on_startup=false"
         )
 
