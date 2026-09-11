@@ -176,30 +176,40 @@ def test_ac5a_migrated_two_samples_confirm_idle_via_reducer(mock_backend, _wire_
 @patch("cli_agent_orchestrator.backends.registry.get_backend")
 def test_b1_real_pi_derive_status_governs_fleet_projection(mock_backend, _wire_singletons):
     """B1 (verdict M1): drive the REAL PiCliProvider.derive_status(sample,
-    context) through the monitor fusion path and assert the reducer's output is
-    what the published/fused status carries — not a helper. A raw frame with
-    pi's live working spinner reduces to PROCESSING."""
-    import cli_agent_orchestrator.services.fleet_service as fs
+    context) through the monitor fusion path with a REAL captured working frame,
+    and assert the reducer's output is what the fused observation carries — not a
+    helper. The frame (fixture working-1.txt) is one pi classifies as PROCESSING;
+    the fused status MUST be PROCESSING/fx751_working and the boundary
+    observation MUST carry it. Catches an apply_verdict_to_sample no-op (which
+    would drop the facts → UNKNOWN)."""
+    import pathlib
+
     from cli_agent_orchestrator.providers.pi_cli import PiCliProvider
+    from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
     mock_backend.return_value = MagicMock()
     pane, _q, _clock = _wire_singletons
     sm = StatusMonitor()
     sm._last_status["t1"] = TerminalStatus.COMPLETED
+    sm._observation_seq["t1"] = 1
 
-    # a real pi worker instance; only the frame classifier is exercised
     provider = PiCliProvider.__new__(PiCliProvider)
     provider.terminal_id = "t1"
     provider._task_dispatched = True
     provider._tui_processing_seen = False
 
-    # frame that pi's classifier reads as PROCESSING (live working spinner). Use
-    # the provider's own classifier to derive the expected verdict so the test
-    # is not brittle to the exact spinner glyph rendering.
-    working_frame = "some output\n" + "\u28fd Working (3s)\n"
-    expected = provider._classify_verdict(working_frame)
+    fixture = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "providers"
+        / "fixtures"
+        / "status_truth"
+        / "pi_cli"
+        / "working-1.txt"
+    )
+    working_frame = strip_terminal_escapes(fixture.read_text())
+    # sanity: the real classifier reads this frame as PROCESSING
+    assert provider._classify_verdict(working_frame) is TerminalStatus.PROCESSING
 
-    # seed a pane sample whose filtered_tail IS that frame
     def fake_capture(_tid):
         return _CaptureResult(
             fingerprint="fp-working",
@@ -220,14 +230,13 @@ def test_b1_real_pi_derive_status_governs_fleet_projection(mock_backend, _wire_s
         return_value=provider,
     ):
         status, reason = sm.fuse_status("t1", TerminalStatus.COMPLETED)
-        # the fused status carried by the fleet projection is the reducer's
         obs = sm.get_boundary_observation("t1")
 
-    # the real provider classified the frame; the reducer's projection governs
-    if expected is TerminalStatus.PROCESSING:
-        assert status is TerminalStatus.PROCESSING
-        assert reason == "fx751_working"
-    assert obs.status is status
+    # the REAL provider classified the real frame; the reducer's projection is
+    # what governs the fused observation (unconditional — no expected-branch).
+    assert status is TerminalStatus.PROCESSING
+    assert reason == "fx751_working"
+    assert obs.status is TerminalStatus.PROCESSING
 
 
 @patch("cli_agent_orchestrator.backends.registry.get_backend")
