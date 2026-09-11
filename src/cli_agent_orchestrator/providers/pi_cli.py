@@ -49,7 +49,10 @@ Key flags (verified via ``pi --help``, pi 0.85.1, live-probed 2026-09-07):
   --thinking <level>       : reasoning effort (off|minimal|low|medium|high|xhigh|max)
   --no-approve, -na        : do not trust project-local files / auto-approve run
   --no-context-files, -nc  : do not auto-load AGENTS.md / CLAUDE.md
-  --session-id <id>        : exact project session id (created if missing)
+  --session-id <id>        : exact project session id — created if missing, but
+                             SILENTLY RE-ATTACHED (whole transcript replayed) when
+                             a session with that id already exists in --session-dir
+                             (live-probed 2026-09-10, F908 #760)
   --session-dir <dir>      : session storage/lookup directory
   --append-system-prompt <text|file> : append system prompt (file path accepted)
   --mcp-config <path>      : MCP config override (pi-mcp-adapter flag; requires
@@ -70,6 +73,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import time
 import unicodedata
 from pathlib import Path
@@ -101,6 +105,33 @@ PI_BINARY = str(Path.home() / ".bun" / "bin" / "pi")
 # and the F797 lesson).  One subdirectory per terminal holds the transient
 # system-prompt and MCP-config files.
 PI_RUNTIME_ROOT = CAO_HOME_DIR / "pi"
+
+
+def _open_nofollow_chain(base: Path, parts: tuple[str, ...]) -> int:
+    """Open ``base/*parts`` as a directory fd, refusing a symlink at EVERY component.
+
+    F908 (#760) r3. ``O_NOFOLLOW`` guards only the FINAL component of a path, so
+    ``os.open("<root>/<tid>/sessions", ...|O_NOFOLLOW)`` still follows a ``<tid>``
+    that was swapped for a symlink after an earlier check — the window a real
+    concurrent racer exploited 3 times in 8627 attempts (EMPIRICAL-GATE-NO r2).
+    Walking from a fd on ``base`` and opening each component ``O_NOFOLLOW``
+    relative to the previous fd leaves no component re-resolved from a path, so
+    the race turns into an ``OSError`` instead of a foreign directory.
+
+    Raises ``OSError`` (``ELOOP`` for a symlinked component) rather than
+    returning a fd the caller must re-validate. The caller owns the fd.
+    """
+    fd = os.open(str(base), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
 
 # ─── Status detection ─────────────────────────────────────────────────────────
 # All patterns run against ``strip_terminal_escapes(buffer)`` output, which
@@ -514,6 +545,84 @@ class PiCliProvider(BaseProvider):
         )
         return self.mcp_config_path
 
+    def _purge_stale_sessions(self) -> None:
+        """F908 (#760): empty this terminal's session dir before a COLD spawn.
+
+        ``--session-id <id>`` re-attaches an existing session with that id
+        instead of minting a fresh one (live-probed 2026-09-10), so a runtime
+        dir that outlived its terminal makes a cold worker continue a dead
+        task.  Deleting the per-terminal ``*.jsonl`` transcripts is what makes
+        "cold spawn == new session" true.  No-op when the operator sets
+        ``[pi_cli] fresh_session_on_spawn = false``, and on a resume spawn
+        (never called from that arm).
+
+        Containment: the configured ``session_dir`` must lexically be
+        ``PI_RUNTIME_ROOT/<terminal id>/sessions``, and the directory is then
+        opened by walking that path one component at a time from
+        ``PI_RUNTIME_ROOT``, every component no-follow.  Enumeration, stat and
+        unlink all go through that fd.  There is therefore no path re-resolution
+        after the check, at any component, so a concurrent rename of the
+        terminal dir or the sessions leaf makes the open fail rather than
+        redirect a deletion.  Only regular ``*.jsonl`` files are removed.
+        """
+        if not _resolve_pi_fresh_session_on_spawn():
+            logger.info(
+                "pi worker %s: fresh_session_on_spawn=false — keeping %s as-is",
+                self.terminal_id,
+                self.session_dir,
+            )
+            return
+        sd = self.session_dir
+        # Guard 1 (ownership): the configured dir must lexically BE ours. This
+        # is live, killable code — the walk below derives its path from
+        # ``terminal_id``, never from ``sd``, so this check is the only thing
+        # tying the directory we open to the one the provider was configured
+        # with.  ``test_purge_guard_refuses_paths_outside_our_runtime_dir``
+        # kills its deletion.
+        if sd != PI_RUNTIME_ROOT / self.terminal_id / "sessions":
+            return
+        # Guard 2 (no TOCTOU at ANY component): ``O_NOFOLLOW`` constrains only
+        # the FINAL component, so opening the whole path in one call still
+        # follows a terminal dir swapped for a symlink after any prior check —
+        # a real concurrent racer deleted another terminal's transcripts 3
+        # times in 8627 attempts against that shape (EMPIRICAL-GATE-NO r2, H4).
+        # Walking component-by-component from a fd on PI_RUNTIME_ROOT removes
+        # the window: every component is opened no-follow.
+        try:
+            dir_fd = _open_nofollow_chain(PI_RUNTIME_ROOT, (self.terminal_id, "sessions"))
+        except OSError as exc:
+            logger.warning("pi worker %s: refusing to purge %s: %s", self.terminal_id, sd, exc)
+            return
+        try:
+            for name in sorted(os.listdir(dir_fd)):
+                if not name.endswith(".jsonl"):
+                    # Only pi transcripts are ours to delete; anything else an
+                    # operator or another tool left here survives.
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    # A symlinked *.jsonl points outside our ownership; leave it.
+                    continue
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                    logger.info(
+                        "pi worker %s: purged stale session transcript %s",
+                        self.terminal_id,
+                        sd / name,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "pi worker %s: failed to purge stale session %s: %s",
+                        self.terminal_id,
+                        sd / name,
+                        exc,
+                    )
+        finally:
+            os.close(dir_fd)
+
     def _build_pi_command(self) -> str:
         """Build Pi's explicit, shell-safe regular-TUI launch command."""
         profile = self._load_profile()
@@ -551,6 +660,9 @@ class PiCliProvider(BaseProvider):
         if _pi_resume_path:
             command_parts.extend(["--session", str(_pi_resume_path)])
         else:
+            # F908 (#760): cold spawn — guarantee pi cannot re-attach a
+            # transcript left behind under this terminal's session dir.
+            self._purge_stale_sessions()
             command_parts.extend(
                 [
                     "--session-id",
@@ -1077,3 +1189,44 @@ def _resolve_pi_mcp_timeout_ms() -> int:
     if value < _PI_MCP_TIMEOUT_MS_FLOOR:
         value = _PI_MCP_TIMEOUT_MS_FLOOR
     return value
+
+
+# F908 (#760): a COLD spawn must never continue a prior transcript.  pi's
+# ``--session-id <id>`` is documented "creating it if missing" — live-probed
+# 2026-09-10, it SILENTLY RE-ATTACHES an existing session with that id under
+# ``--session-dir`` and replays its whole transcript.  Our session dir is
+# per-terminal, so this only bites when a runtime dir outlives its terminal
+# (``cleanup`` skipped on a crash/server bounce — eight stale dirs were found
+# under ``$CAO_HOME/pi`` on 2026-09-10) or when a pane relaunches pi with the
+# same terminal id.  Purging the per-terminal session dir at cold spawn closes
+# that door while keeping F867's spawn-known session identity (terminal id).
+# Operator escape hatch: ``[pi_cli] fresh_session_on_spawn = false``.
+_PI_FRESH_SESSION_ON_SPAWN_DEFAULT = True
+
+
+def _resolve_pi_fresh_session_on_spawn() -> bool:
+    """Resolve ``[pi_cli] fresh_session_on_spawn`` from providers.toml (default True)."""
+    try:
+        raw = get_provider_defaults("pi_cli").get("fresh_session_on_spawn")
+    except Exception:
+        raw = None
+    if raw is None:
+        return _PI_FRESH_SESSION_ON_SPAWN_DEFAULT
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token in ("true", "1", "yes", "on"):
+            return True
+        if token in ("false", "0", "no", "off"):
+            return False
+    # r2 H4 NIT: an unrecognised value falls back to the default (deliberately —
+    # a typo must never silently DISABLE a correctness fix), but say so, or the
+    # operator can only infer their typo from behaviour.
+    logger.warning(
+        "providers.toml [pi_cli] fresh_session_on_spawn=%r is not a recognised "
+        "boolean; falling back to %s",
+        raw,
+        _PI_FRESH_SESSION_ON_SPAWN_DEFAULT,
+    )
+    return _PI_FRESH_SESSION_ON_SPAWN_DEFAULT
