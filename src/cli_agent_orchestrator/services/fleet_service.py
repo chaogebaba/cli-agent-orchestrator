@@ -211,6 +211,40 @@ def _child_procs(terminal_id: str) -> list[str] | None:
     return list(result.comms)
 
 
+def _status_since(terminal_id: str) -> str | None:
+    """WP-ARCH phase 2, D11 — when a PROJECTED terminal entered its status.
+
+    ``None`` unless the projection is this terminal's publisher of record, which
+    is the same predicate the cutover's every other site asks (D1e).  I5 states
+    the property as an equality AND a null: it equals
+    ``worker_state_shadow.since`` for a projected terminal and is null for an
+    unsourced one, and a run where it is non-null for an unsourced terminal fails
+    the criterion — that would be a reconstruction wearing the projection's name.
+
+    A read of the projection row, and it is affordable HERE for the reason D1e
+    forbids it on ``get_status``: a fleet row is built when an operator or the
+    TUI asks, not on the poll path every status consumer rides.  Never raises;
+    the fleet renders without it rather than not at all.
+    """
+    try:
+        from cli_agent_orchestrator import bootstrap as _wt_bootstrap
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if not status_monitor.is_projected(terminal_id):
+            return None
+        runtime = _wt_bootstrap.current_runtime()
+        states = None if runtime is None else runtime.state_store
+        if states is None:
+            return None
+        projection = states.get(terminal_id)
+        if projection is None:
+            return None
+        return projection.since.isoformat()
+    except Exception:
+        logger.debug("status_since unavailable for %s", terminal_id, exc_info=True)
+        return None
+
+
 def _children_count_from_row(row: dict[str, Any]) -> int:
     """F568 D12a/D12c + F579 D17: length of the children ledger on the fleet row.
 
@@ -504,6 +538,16 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 # (F702) in `COND`, and appended to the status cell; distinct
                 # from `status`.
                 "condition": condition,
+                # WP-ARCH phase 2, D11 (I5): when the PROJECTION owns this
+                # terminal's status, the moment it entered that state — read
+                # from ``worker_state_shadow.since``, which is the only durable
+                # record of it.  ``None`` for every unsourced terminal, and that
+                # null is the point rather than a gap: the pane path has no such
+                # moment to report, and a reconstruction from ``last_active`` or
+                # from the fleet's own polling would be a guess wearing the
+                # projection's name.  Additive sibling key, like ``condition``
+                # and ``fusion_reason``; never derived from or feeding fusion.
+                "status_since": _status_since(row["id"]),
                 # F506 §8: rendered by the `cao-fleet` TUI's new columns (F702)
                 # — `*` is set when fusion_changed is True (the fused status
                 # differs from the provider-published one); fusion_reason shows

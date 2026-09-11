@@ -551,6 +551,22 @@ class _StatusEgress:
         )
 
 
+def _reclassify_condition(terminal_id: str) -> None:
+    """D8's sweep leg, reaching the legacy classifier.  Never raises.
+
+    Here rather than under ``app/`` for the reason every legacy-facing callable
+    in this module is: ``app`` may not import ``services``.  The monitor decides
+    for itself whether it owns the terminal — an unsourced one keeps F611's
+    transition driver untouched (I7) — so this is a pure hand-off.
+    """
+    try:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.reclassify_condition(terminal_id)
+    except Exception:
+        logger.debug("worker-truth: condition re-drive failed", exc_info=True)
+
+
 def _enable_projection(view: object) -> None:
     """Hand D1e's predicate to the legacy status monitor.  Never raises."""
     try:
@@ -958,6 +974,10 @@ async def start_worker_truth(
             # implementation of the precedence rule.
             producer_check=producer_check,
             publisher=publisher,
+            # D8 — the sweep leg of the condition label.  Wired only with the
+            # cutover on: with it off the label keeps its single F611 driver,
+            # which is what "no behaviour change" means for an unsourced fleet.
+            reclassify=_reclassify_condition if cutover_on else None,
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
