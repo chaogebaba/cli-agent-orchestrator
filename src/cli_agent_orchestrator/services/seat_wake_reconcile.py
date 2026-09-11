@@ -272,14 +272,20 @@ def _reconcile_one(mailbox: Any, cutoff: datetime) -> SeatWakeDecision:
     )
 
 
-def _queue_owns_delivery() -> bool:
-    """Is sub-phase 3b's write-through position live? (D6/D11's muting of K6.)"""
-    try:
-        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+def _queue_owns_delivery(terminal_id: str | None = None) -> bool:
+    """Does the queue own this seat's undelivered rows? (D6/D11's muting of K6.)
 
-        return queue_owns_delivery()
+    ROW-SCOPED since #741, and here the scope is what makes the mute correct
+    rather than merely narrower: this sweep drives the LEGACY inbox, so a seat
+    still holding legacy rows at ``on`` is a seat the tick will never wake, and
+    muting the sweep for it is the silent seat again.
+    """
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
+
+        return queue_owns_receiver_delivery(terminal_id)
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
-        return False
+        return True
 
 
 def reconcile_seat_wakes(*, now: Optional[datetime] = None) -> list[SeatWakeDecision]:
@@ -300,8 +306,11 @@ def reconcile_seat_wakes(*, now: Optional[datetime] = None) -> list[SeatWakeDeci
     # legacy inbox. Left running at `on` it is a second wake emitter over rows
     # the tick already owns, which is the emitter count case 17 forbids.
     # 3b mutes it; 3c deletes it with the rest of D6.
-    if _queue_owns_delivery():
-        return []
+    #
+    # #741: the mute moved INTO the per-mailbox loop below. A sweep-wide return
+    # muted seats whose rows the tick does not own, and the emitter count case 17
+    # forbids is per ROW, not per sweep: the two carriers here serve disjoint row
+    # sets, because a row in the legacy inbox has no ``delivery_msg`` counterpart.
 
     from cli_agent_orchestrator.clients.database import MailboxModel, SessionLocal
 
@@ -332,6 +341,8 @@ def reconcile_seat_wakes(*, now: Optional[datetime] = None) -> list[SeatWakeDeci
             consumed_through_id=int(snapshot["consumed_through_id"] or 0),
             wake_notified_id=int(snapshot["wake_notified_id"] or 0),
         )
+        if _queue_owns_delivery(holder.current_terminal_id):
+            continue
         try:
             decision = _reconcile_one(holder, cutoff)
         except Exception:

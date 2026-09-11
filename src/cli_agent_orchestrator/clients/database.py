@@ -9244,6 +9244,38 @@ def expire_pending_rows(row_ids: List[int]) -> int:
     return int(updated)
 
 
+def _is_service_sender(sender_id: Any) -> bool:
+    """Is this sender machinery rather than an addressable party?
+
+    Reserved-sender prefixes mirror those used across the inbox
+    (``message-trace:``, ``cao-*``, ``watchdog:``, ``cao-bridge``); any
+    ``:``-namespaced sender is a service sender, and so is an empty one.
+
+    **Deliberately duplicated.** ``is_service_sender`` in the queue's own pure
+    domain asks the identical question for the tick's dead-letter notice, and
+    the obvious tidy-up — importing that one here — is forbidden by the
+    strangler seam: a legacy module may name the new package tree only from the
+    AC11 allowlist, and this file is not on it
+    (``test_legacy_files_importing_new_packages_stay_within_the_ac11_allowlist``).
+    The point of that allowlist is that a reviewer asking what the new
+    architecture attached to the legacy tree reads a short enumerated list
+    instead of grepping the two largest legacy packages. It outranks removing
+    six lines of duplication.
+
+    What the duplication is NOT allowed to be is unwitnessed: the two are pinned
+    to agree over a shared corpus by
+    ``test_the_service_sender_rule_is_the_same_rule_on_both_sides_of_the_seam``
+    (``test/app/delivery/test_seat_wake.py``). #741 r3 exists because these two
+    surfaces had the same rule and only ONE of them implemented it, which is how
+    the tick came to address 20 live notices to ids that can never hold a
+    terminal.
+    """
+    sender = str(sender_id or "")
+    if not sender:
+        return True
+    return ":" in sender or sender.startswith("cao-")
+
+
 def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMessage]:
     """List aged PENDING messages routed straight at a terminal (F524).
 
@@ -9283,13 +9315,10 @@ def list_stalled_direct_pending_messages(min_age_seconds: int) -> List[InboxMess
         )
         result: List[InboxMessage] = []
         for row in rows:
-            sender = str(row.sender_id or "")
             # Internal/service senders never receive a stall notice: they are not
             # real supervisor terminals and routing back would be meaningless (or
-            # a loop). Reserved-sender prefixes mirror those used across the inbox
-            # (message-trace:, cao-*, watchdog:, cao-bridge). Any ':'-namespaced
-            # sender is treated as a service sender.
-            if not sender or ":" in sender or sender.startswith("cao-"):
+            # a loop). See :func:`_is_service_sender`.
+            if _is_service_sender(row.sender_id):
                 continue
             result.append(_inbox_message_from_row(row))
         return result
@@ -11189,6 +11218,38 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
         ),
         current_logical_receiver,
     )
+
+
+def has_pending_legacy_messages(receiver_id: str) -> bool:
+    """Does this receiver hold at least one PENDING row in the LEGACY inbox?
+
+    WP-ARCH 3b, #741: the row-scoped half of D6's mute. At ``on`` the legacy
+    inbox is read-only but it is not EMPTY, and every row still in it is one the
+    queue does NOT own -- ``write_through`` writes a detached model and adds
+    nothing to this table, so a row physically present here has no
+    ``delivery_msg`` counterpart by construction. Two families reach it: rows
+    that predate the flip, which S6 says must "drain through the old path", and
+    the write-through fallbacks a lost ``BEGIN IMMEDIATE`` race produces.
+
+    One indexed existence probe rather than a count: the caller only needs to
+    know whether the legacy carrier still has work, and a count would pay for
+    rows it never reads.
+    """
+    try:
+        with SessionLocal() as db:
+            mailbox_schema = _mailbox_schema_available(db)
+            row = (
+                db.query(InboxModel.id)
+                .filter(
+                    _pending_receiver_predicate(receiver_id, mailbox_schema),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .first()
+            )
+            return row is not None
+    except Exception:  # noqa: BLE001 -- an unanswerable probe must not break delivery
+        logger.debug("pending-legacy probe failed for %s", receiver_id, exc_info=True)
+        return False
 
 
 def get_pending_messages(

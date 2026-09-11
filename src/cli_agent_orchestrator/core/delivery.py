@@ -840,6 +840,36 @@ def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> Guar
     return GuardOutcome(requested=requested, position=requested, context=context)
 
 
+def is_service_sender(sender_id: str | None) -> bool:
+    """Is this sender a SERVICE namespace rather than an addressable party?
+
+    The inbox has always reserved ``:``-namespaced and ``cao-`` senders for
+    machinery that writes rows but never reads them: ``watchdog:<terminal>``,
+    ``message-trace:<terminal>``, ``cao-bridge``, the digest writers. The legacy
+    stall-notice path already refuses to route back to one
+    (``clients/database.py``, the reserved-prefix filter), for the reason this
+    predicate now carries in one place: those ids have no terminal and no
+    mailbox, so a message addressed to them is undeliverable BY CONSTRUCTION.
+
+    #741 r3, from the r2d live round: the tick's dead-letter notice was
+    addressed to ``row.sender_id`` unconditionally. Twenty of that round's sixty
+    ``no_terminal`` refusals were notices addressed to ``watchdog:4ec96674``,
+    ``watchdog:ae282428`` and ``message-trace:4ec96674`` -- and because a
+    refusal does not terminate the row, each one came back every lease period
+    (``wake=1`` through ``wake=5`` in the retained logs). That is not a failed
+    delivery to a dead worker; it is delivery traffic that was never addressable,
+    and it is exactly the ambiguity that made the round unreadable as acceptance
+    evidence.
+
+    An empty sender is a service sender too: the tick's own notices set
+    ``sender_id=""``, and a notice about a notice is what D14 forbids.
+    """
+    sender = str(sender_id or "")
+    if not sender:
+        return True
+    return ":" in sender or sender.startswith("cao-")
+
+
 def compute_dead_by(
     *,
     created_at: datetime,
