@@ -16,7 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ===========================================================================
 # Fixtures
 # ===========================================================================
@@ -165,9 +164,7 @@ class TestF216NullSocketPathParsing:
 class TestF216SocketUnpublishedGate:
     """Ring refuses before any socket.connect when socket path is empty."""
 
-    def test_ring_returns_socket_unpublished_on_null_path(
-        self, sessions_dir, proc_root
-    ):
+    def test_ring_returns_socket_unpublished_on_null_path(self, sessions_dir, proc_root):
         """_attempt_native_ring returns 'socket_unpublished' for null socket path.
 
         Revert-sensitive: without the gate, the code would call sock.connect("")
@@ -214,9 +211,7 @@ class TestF216SocketUnpublishedGate:
         # CRITICAL: zero socket.connect() attempts
         mock_socket.return_value.connect.assert_not_called()
 
-    def test_ring_returns_socket_unpublished_on_empty_string_path(
-        self, sessions_dir, proc_root
-    ):
+    def test_ring_returns_socket_unpublished_on_empty_string_path(self, sessions_dir, proc_root):
         """Explicit empty string also triggers socket_unpublished gate."""
         _make_record_json(sessions_dir, 600, messaging_socket_path="")
         _make_proc_entry(proc_root, 400, ppid=1, starttime=88888)
@@ -335,3 +330,34 @@ class TestF216SocketUnpublishedGate:
         assert result_null_socket == "socket_unpublished"
         assert result_bad_version == "version_out_of_band"
         assert result_null_socket != result_bad_version
+
+
+# ===========================================================================
+# Test: a non-object registry DOCUMENT is skipped, not raised (F216 #55)
+# ===========================================================================
+
+
+class TestF216NonObjectDocument:
+    """The parse surface survives an externally-written non-object JSON file.
+
+    Revert-sensitive: without the ``isinstance(data, dict)`` guard the minimum
+    -field membership test raises TypeError out of ``read_registry`` and every
+    caller on the delivery path dies over one bad file.
+    """
+
+    @pytest.mark.parametrize("payload", ["null", '"a string"', "42", "[1, 2, 3]", "true"])
+    def test_non_object_document_is_skipped(self, sessions_dir, payload):
+        (sessions_dir / "900.json").write_text(payload)
+        from cli_agent_orchestrator.services.cc_session_registry import read_registry
+
+        assert read_registry(sessions_dir) == []
+
+    def test_valid_record_survives_a_null_sibling(self, sessions_dir):
+        """One poisoned file must not erase the healthy records beside it."""
+        (sessions_dir / "901.json").write_text("null")
+        _make_record_json(sessions_dir, 902, messaging_socket_path="/run/user/1000/cc.sock")
+        from cli_agent_orchestrator.services.cc_session_registry import read_registry
+
+        records = read_registry(sessions_dir)
+        assert [r.pid for r in records] == [902]
+        assert records[0].messaging_socket_path == "/run/user/1000/cc.sock"
