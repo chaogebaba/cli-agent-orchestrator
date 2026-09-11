@@ -113,48 +113,121 @@ def _enclosing_functions(tree: ast.AST) -> dict:
     return owner
 
 
-@pytest.mark.slow  # F254 D19: exceeds unit budget
-def test_endpoint_ast_guard_is_closed() -> None:
-    request_methods = {"get", "post", "put", "patch", "delete", "request"}
+_REQUEST_METHODS = {"get", "post", "put", "patch", "delete", "request"}
+
+#: Files permitted to build a raw ``tmux`` argv — the command builder itself and
+#: the two bootstrap/readopt paths that run before the backend exists.
+_RAW_TMUX_ALLOWED = {"utils/tmux_command.py", "sandbox_bootstrap.py", "services/readopt_service.py"}
+
+#: Findings of the single whole-tree scan, memoized. The two guards below are
+#: both whole-tree static scans over ``src/``; run independently they parsed the
+#: entire package twice. This does ONE pass and caches the (tiny) findings, so
+#: whichever guard runs first pays the parse and the other is free.
+#:
+#: The trees themselves are deliberately NOT cached: retaining them costs ~240 MB
+#: of live AST for the rest of the session, which trips ``test/plugins/rss_guard.py``
+#: (200 MB per-test VmRSS delta). Each tree is dropped as soon as its file is
+#: scanned, so peak RSS matches the old one-file-at-a-time behaviour.
+#:
+#: MUTATION SAFETY: nothing here hands a tree to a caller, so
+#: ``test_each_legacy_tmux_site_mutation_is_killed`` — which rewrites a tree with
+#: a ``NodeTransformer`` — cannot mutate anything a guard later reads. It parses
+#: its own single file directly.
+_SCAN_FINDINGS: dict[str, list[Any]] | None = None
+
+
+def _scan_findings() -> dict[str, list[Any]]:
+    """Parse every file under ``src/`` once; return both guards' violations.
+
+    ONE ``ast.walk`` per file serves both guards. ``_enclosing_functions`` — a
+    full recursive pass that ids every node — is built lazily, only for the
+    handful of files that actually contain a ``requests.<verb>`` call, because
+    that is the only finding needing an owner name.
+    """
+    global _SCAN_FINDINGS
+    if _SCAN_FINDINGS is not None:
+        return _SCAN_FINDINGS
+    endpoint: list[Any] = []
+    raw_tmux: list[str] = []
     for path in _python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         relative = path.relative_to(REPO).as_posix()
-        owner = _enclosing_functions(tree)
+        tmux_relative = path.relative_to(SOURCE).as_posix()
+        tmux_guarded = tmux_relative not in _RAW_TMUX_ALLOWED
+        owner: dict[Any, Any] | None = None
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                assert not any(alias.name == "API_BASE_URL" for alias in node.names), relative
+                if any(alias.name == "API_BASE_URL" for alias in node.names):
+                    endpoint.append(f"API_BASE_URL imported in {relative}")
+                continue
             if isinstance(node, ast.Name):
-                if node.id == "API_BASE_URL":
-                    assert relative.endswith("constants.py") and isinstance(
-                        node.ctx, ast.Store
-                    ), relative
-            if isinstance(node, ast.Constant) and node.value == 9889:
-                assert relative.endswith("utils/http.py"), relative
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                if node.id == "API_BASE_URL" and not (
+                    relative.endswith("constants.py") and isinstance(node.ctx, ast.Store)
+                ):
+                    endpoint.append(f"API_BASE_URL referenced in {relative}")
                 continue
-            if not isinstance(node.func.value, ast.Name) or node.func.value.id != "requests":
+            if isinstance(node, ast.Constant):
+                if node.value == 9889 and not relative.endswith("utils/http.py"):
+                    endpoint.append(f"port literal 9889 in {relative}:{node.lineno}")
                 continue
-            if node.func.attr not in request_methods or relative.endswith("utils/http.py"):
+            if (
+                tmux_guarded
+                and isinstance(node, ast.Return)
+                and node.value is not None
+                and _raw_tmux_argv_literal(node.value)
+            ):
+                raw_tmux.append(f"raw tmux execution in {tmux_relative}:{node.lineno}")
                 continue
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if (
+                tmux_guarded
+                and node.args
+                and isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "subprocess"
+                and function.attr in {"run", "Popen", "call", "check_call", "check_output"}
+                and _raw_tmux_argv_literal(node.args[0])
+            ):
+                raw_tmux.append(f"raw tmux execution in {tmux_relative}:{node.lineno}")
+            if not isinstance(function, ast.Attribute):
+                continue
+            if not isinstance(function.value, ast.Name) or function.value.id != "requests":
+                continue
+            if function.attr not in _REQUEST_METHODS or relative.endswith("utils/http.py"):
+                continue
+            if owner is None:
+                owner = _enclosing_functions(tree)
             if (relative, owner.get(id(node))) in _CROSS_NODE_REQUEST_SITES:
                 continue
             # The installer fetches a user-selected remote profile, not the CAO API.
-            assert relative.endswith("services/install_service.py"), (
-                relative,
-                owner.get(id(node)),
-                node.lineno,
-            )
+            if not relative.endswith("services/install_service.py"):
+                endpoint.append((relative, owner.get(id(node)), node.lineno))
+        del tree, owner
+    _SCAN_FINDINGS = {"endpoint": endpoint, "tmux": raw_tmux}
+    return _SCAN_FINDINGS
 
 
-@pytest.mark.slow  # F254 D19: exceeds unit budget
+# F254 D19 tier — `integration`, not `slow`. These are whole-tree static scans
+# over 422 files, never unit tests, so the 1.0s unit budget was never the right
+# one; but `slow` has NO budget and is deselected by the working selection
+# `-m "not e2e and not slow"`, so neither guard ran by default and a red one went
+# unnoticed. `integration` (10.0s budget in test/plugins/tier_budget.py) is both
+# honest and selected. Measured on this laptop: whichever guard runs first pays
+# the shared pass, the second is < 0.01s. 5 runs under
+# CAO_TEST_TIER_BUDGET=enforce while the box was loaded: 3.15 / 3.34 / 3.39 /
+# 3.48 / 3.62s; 1.88s idle. ~3x headroom under the budget at the worst reading.
+@pytest.mark.integration
+def test_endpoint_ast_guard_is_closed() -> None:
+    violations = _scan_findings()["endpoint"]
+    assert not violations, f"endpoint guard breached: {violations}"
+
+
+@pytest.mark.integration
 def test_tmux_ast_guard_is_closed() -> None:
-    allowed = {"utils/tmux_command.py", "sandbox_bootstrap.py", "services/readopt_service.py"}
-    for path in _python_files():
-        relative = path.relative_to(SOURCE).as_posix()
-        violations = _raw_tmux_calls(ast.parse(path.read_text(encoding="utf-8")))
-        if relative in allowed:
-            continue
-        assert not violations, f"raw tmux execution in {relative}"
+    violations = _scan_findings()["tmux"]
+    assert not violations, f"tmux guard breached: {violations}"
 
 
 @pytest.mark.parametrize(
