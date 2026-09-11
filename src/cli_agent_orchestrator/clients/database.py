@@ -11240,6 +11240,23 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
     )
 
 
+#: Legacy rows a previous adoption pass could not take, so a later pass can skip
+#: past them instead of re-filling its window with the same stuck ids.
+#:
+#: WP-ARCH 3c r2 N2: without this, the scan takes the first ``limit`` PENDING
+#: rows by id ASC and leaves an un-adoptable one PENDING, so it reoccupies a slot
+#: on every tick FOREVER -- and ``limit`` of them starve everything behind them.
+#: The two ways in are a row with no resolvable receiver and an enqueue that
+#: keeps raising for that one row. Both are unlikely; neither may be able to
+#: block the queue, and neither may be silent.
+_ADOPTION_POISON_IDS: set[int] = set()
+
+
+def reset_adoption_poison_ids() -> None:
+    """Forget the skip set. For tests, and for an operator who fixed the cause."""
+    _ADOPTION_POISON_IDS.clear()
+
+
 def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
     """Hand PENDING legacy ``inbox`` rows to the queue, one row per transaction.
 
@@ -11275,6 +11292,16 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
     delivery. ``idempotency_key`` is the mechanism and it is derived from the
     legacy row id, so re-adopting a row is a no-op at the store.
 
+    **A row that cannot be adopted is skipped, not retried forever** (r2 N2). The
+    scan takes the first ``limit`` PENDING ids ascending, so a row that fails
+    every pass would reoccupy a slot indefinitely and ``limit`` of them would
+    starve everything behind. A row whose receiver cannot be named, or whose
+    enqueue raises, is recorded in ``_ADOPTION_POISON_IDS`` and excluded from
+    later scans, with a WARNING naming the id -- a stuck row must reach the
+    journal rather than fail at debug level. A failed RETIRE is NOT skipped: its
+    enqueue succeeded, so the queue already carries the message and retrying the
+    retire is both correct and idempotent.
+
     **HELD rows are deliberately out of scope.** A barrier member is not owed to
     anyone yet; it becomes PENDING when its barrier completes, and the tick after
     that adopts it.
@@ -11291,13 +11318,10 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
 
     try:
         with SessionLocal() as db:
-            rows = (
-                db.query(InboxModel)
-                .filter(InboxModel.status == MessageStatus.PENDING.value)
-                .order_by(InboxModel.id.asc())
-                .limit(max(1, int(limit)))
-                .all()
-            )
+            query = db.query(InboxModel).filter(InboxModel.status == MessageStatus.PENDING.value)
+            if _ADOPTION_POISON_IDS:
+                query = query.filter(InboxModel.id.notin_(sorted(_ADOPTION_POISON_IDS)))
+            rows = query.order_by(InboxModel.id.asc()).limit(max(1, int(limit))).all()
             candidates = [
                 (
                     int(row.id),
@@ -11334,6 +11358,13 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
         supersede_key,
     ) in candidates:
         if not receiver_id:
+            _ADOPTION_POISON_IDS.add(legacy_id)
+            logger.warning(
+                "wp_arch adoption skipping legacy row %s permanently: it names no "
+                "receiver, so nothing can be addressed; it will not be retried and "
+                "will not hold the scan window",
+                legacy_id,
+            )
             continue
         try:
             result = adopt_enqueue(
@@ -11356,7 +11387,14 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
                 )
             )
         except Exception:  # noqa: BLE001 -- one bad row must not stop the pass
-            logger.debug("wp_arch adoption enqueue failed for %s", legacy_id, exc_info=True)
+            _ADOPTION_POISON_IDS.add(legacy_id)
+            logger.warning(
+                "wp_arch adoption enqueue raised for legacy row %s; skipping it on "
+                "later passes so it cannot hold the scan window. The row stays "
+                "PENDING and uncarried -- this needs an operator.",
+                legacy_id,
+                exc_info=True,
+            )
             continue
         if result is None:
             continue
@@ -11380,7 +11418,16 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
                 )
                 db.commit()
         except Exception:  # noqa: BLE001
-            logger.debug("wp_arch adoption retire failed for %s", legacy_id, exc_info=True)
+            # NOT added to the skip set: the enqueue succeeded, so the message is
+            # already carried by the queue. Retrying the retire next pass is the
+            # right move and it is idempotent through the key.
+            logger.warning(
+                "wp_arch adoption retire failed for legacy row %s after a successful "
+                "enqueue; the queue already carries it and the next pass retries "
+                "the retire",
+                legacy_id,
+                exc_info=True,
+            )
             continue
         if changed:
             adopted.append((legacy_id, msg_id, receiver_id))

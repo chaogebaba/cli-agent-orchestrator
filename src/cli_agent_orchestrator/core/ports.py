@@ -774,12 +774,23 @@ class LegacyInboxAdopter(Protocol):
     import it.  So the whole find-enqueue-retire runs on the legacy side, where
     it can hold ONE transaction, and reports back as values.
 
-    **Why one transaction is the contract, not an implementation detail.** The
-    row must become invisible to the legacy pending-set in the same write that
-    creates its queue counterpart.  Enqueue-then-retire across two transactions
-    has a window in which both carriers own the id, which is #506; retire-then-
-    enqueue has one in which neither does, which is #604.  A crash between them
-    must leave the row in exactly one of the two sets.
+    **The ordering contract: enqueue BEFORE retire.** One transaction is not
+    available — the enqueue writes the queue's own connection, a separate
+    database attachment from the session that holds the legacy row — so the ORDER
+    is what carries the guarantee, and it is chosen for which residue a crash can
+    leave.
+
+    Enqueue-first leaves, on a crash between the two writes, a live queue row and
+    a legacy row still in the pending set. That legacy row has NO carrier (its
+    two carriers were deleted in 3c slice 2, which is why adoption exists), so
+    the message is delivered exactly once, by the tick, and the next adoption
+    pass retires the stale row: re-adopting is idempotent through the
+    idempotency key, so it returns the SAME queue row rather than a second one.
+
+    Retire-first inverts that into a window in which NEITHER set owns the row,
+    which is the silent seat of #604. An implementation must therefore enqueue
+    first, key the enqueue on the legacy row id, and make the retire conditional
+    on the row still being pending so a concurrent mutator wins.
 
     **Why it exists at all.** ``write_through`` returns a detached model and adds
     nothing to the inbox table, so a row physically present there has no

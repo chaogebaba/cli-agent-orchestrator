@@ -256,8 +256,8 @@ def test_a_pending_seat_legacy_row_is_adopted_and_natively_woken(env) -> None:
     assert injector.pastes == [], "a supervisor receiver is never pasted (K8)"
 
     assert _status(sessions, row_id) == MessageStatus.ADOPTED.value, (
-        "the legacy row is still PENDING after adoption: two carriers may now own "
-        "one id, which is #506"
+        "the legacy row is still PENDING after adoption: the retire did not run, "
+        "so the row is re-scanned on every tick forever"
     )
     queued = store.get(adoption.msg_id)
     assert queued is not None
@@ -295,8 +295,8 @@ def test_adoption_is_idempotent_across_two_ticks(env) -> None:
     """The property that makes adoption safe to run every ten seconds.
 
     Two ticks, one row: exactly one adoption, one queue row, and ONE finding
-    whose count is 1. A second queue row here would be the duplicate-carrier
-    family (#506) arriving through the fix for the silent one.
+    whose count is 1. A second queue row here would be a duplicate arriving
+    through the very fix for the silent seat.
     """
     sessions, store, tick, carrier, _injector, findings = env
     with sessions.begin() as db:
@@ -465,3 +465,141 @@ def test_adoption_is_a_noop_outside_on(env) -> None:
     assert (
         _status(sessions, row_id) == MessageStatus.PENDING.value
     ), "the row was retired without being enqueued: nothing owns it now"
+
+
+# -- r2 N2: a poison row may not hold the scan window ------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_poison() -> Iterator[None]:
+    """The skip set is module state; a leaked id would silently shrink a sibling
+    test's scan window, which is exactly the failure this section is about."""
+    from cli_agent_orchestrator.clients.database import reset_adoption_poison_ids
+
+    reset_adoption_poison_ids()
+    yield
+    reset_adoption_poison_ids()
+
+
+def test_a_receiverless_row_is_skipped_once_and_never_retried(env, caplog) -> None:
+    """A row naming no receiver cannot be addressed, so it must leave the window.
+
+    Before the fix it stayed PENDING and reoccupied a scan slot on every tick
+    forever. It still stays PENDING — there is nothing to hand it to — but it is
+    recorded as poison, warned about by id, and excluded from later scans.
+    """
+    import logging
+
+    from cli_agent_orchestrator.clients import database as dbmod
+
+    sessions, _store, tick, _carrier, _injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = InboxModel(
+            sender_id=WORKER,
+            receiver_id="",
+            logical_receiver_id=None,
+            enqueue_generation=1,
+            message="NO_RECEIVER",
+            orchestration_type="send_message",
+            status=MessageStatus.PENDING.value,
+            created_at=datetime.now(),
+        )
+        db.add(row)
+        db.flush()
+        row_id = int(row.id)
+
+    with caplog.at_level(logging.WARNING):
+        report = tick.run_once()
+
+    assert report.adopted == ()
+    assert _status(sessions, row_id) == MessageStatus.PENDING.value
+    assert row_id in dbmod._ADOPTION_POISON_IDS, "the row can still hold the window"
+    assert any(
+        str(row_id) in r.getMessage() for r in caplog.records
+    ), "a stuck row failed silently: it must name its id in the journal"
+
+
+def test_a_poison_row_does_not_starve_the_rows_behind_it(env) -> None:
+    """The property the skip set exists for, at the scan boundary.
+
+    The poison row has the LOWEST id, so an ascending scan reaches it first.
+    With a window of one it would take the only slot every tick and the good row
+    behind it would never be adopted. The second tick must adopt the good row.
+    """
+    from cli_agent_orchestrator.app.delivery import tick as tick_mod
+
+    sessions, _store, tick, carrier, _injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        poison = InboxModel(
+            sender_id=WORKER,
+            receiver_id="",
+            logical_receiver_id=None,
+            enqueue_generation=1,
+            message="POISON",
+            orchestration_type="send_message",
+            status=MessageStatus.PENDING.value,
+            created_at=datetime.now(),
+        )
+        db.add(poison)
+        db.flush()
+        good = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="BEHIND_THE_POISON")
+        good_id = int(good.id)
+        assert int(poison.id) < good_id, "the poison row must sort first for this to bite"
+
+    # A window of ONE makes the starvation exact rather than probabilistic.
+    original = tick_mod.ADOPT_LIMIT
+    tick_mod.ADOPT_LIMIT = 1
+    try:
+        first = tick.run_once()
+        assert first.adopted == (), "the poison row is not adoptable"
+        second = tick.run_once()
+    finally:
+        tick_mod.ADOPT_LIMIT = original
+
+    assert [a.legacy_message_id for a in second.adopted] == [
+        good_id
+    ], "the row behind the poison was starved: the skip set is not excluding it"
+    assert len(carrier.writes) == 1
+
+
+# -- r2 N3: the receiver that no longer exists -------------------------------
+
+
+def test_a_row_whose_receiver_vanished_is_adopted_and_dies_on_its_budget(env) -> None:
+    """The pre-slice behaviour was worse: the row sat PENDING forever.
+
+    Adoption hands it to the queue, the directory resolves no live incarnation,
+    the attempt records `pane_absent`, and the row ages toward `delivery_dead` on
+    D10's budget. That is a BOUNDED ending, which is the property worth pinning —
+    an unbounded one is how a row disappears without anyone learning.
+    """
+    sessions, store, tick, carrier, injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="ORPHANED_RECEIVER")
+        row_id = int(row.id)
+
+    # The mailbox survives (it is the durable address) but its incarnation is
+    # gone — a reaped terminal, which is the real shape of "the receiver left".
+    with sessions.begin() as db:
+        db.query(MailboxModel).filter(MailboxModel.id == SEAT_MAILBOX).update(
+            {MailboxModel.current_terminal_id: ""}, synchronize_session=False
+        )
+        db.query(TerminalModel).filter(TerminalModel.id == SEAT).delete(synchronize_session=False)
+
+    report = tick.run_once()
+
+    assert [a.legacy_message_id for a in report.adopted] == [row_id], (
+        "a row for a vanished receiver must still be adopted: leaving it PENDING "
+        "is the unbounded ending"
+    )
+    assert carrier.writes == [], "there is no live incarnation to write to"
+    assert injector.pastes == []
+
+    queued = store.get(report.adopted[0].msg_id)
+    assert queued is not None
+    attempts = store.attempts_for(queued.msg_id)
+    assert attempts, "an unreachable receiver must still record an attempt"
+    assert any("pane_absent" in (a.detail or "") or a.outcome for a in attempts), attempts

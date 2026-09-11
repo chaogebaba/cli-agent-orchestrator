@@ -201,6 +201,11 @@ class DeliveryTick:
         it could have had immediately, and a one-shot ``run_once`` in a test
         observes no emission at all.  Reading the clock after adoption keeps the
         stamp at least as late as the newest row the tick created.
+
+        That holds only on the ``now is None`` branch.  A caller passing an
+        explicit stamp MUST pass one at least as late as the adoption, or it gets
+        the old behaviour back for its own rows; production never passes one
+        (:meth:`_run` calls this bare), but tests do.
         """
         report = TickReport()
         self.adopt(report)
@@ -214,8 +219,9 @@ class DeliveryTick:
         """Pull orphaned legacy ``inbox`` rows into the queue (WP-ARCH 3c).
 
         The tick owns the schedule and the observability; the adopter owns the
-        transaction, because only legacy can read that table and the enqueue and
-        the retire have to commit together (see
+        writes, because only legacy can read that table, and it enqueues BEFORE
+        it retires so that a crash between the two leaves the row delivered once
+        rather than owned by nobody (see
         :class:`~cli_agent_orchestrator.core.ports.LegacyInboxAdopter`).
 
         One INFO line per adopted row, naming BOTH ids, because the operator
