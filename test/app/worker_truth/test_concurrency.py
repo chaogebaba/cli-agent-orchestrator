@@ -229,3 +229,72 @@ def test_a_heartbeat_that_lands_mid_sweep_is_not_overwritten(rig: Rig) -> None:
 
     assert rig.state_of(TERMINAL) is WorkerState.DEGRADED
     assert rig.states.get(TERMINAL).last_probe_at == probed_at
+
+
+# ------------------------------------------- the publish is off the lock (2b s3)
+
+
+def _lock_is_free(rig: Rig, timeout: float = 2.0) -> bool:
+    """Can ANOTHER thread take the projector's lock right now?
+
+    An RLock tells the owning thread nothing — it is re-entrant — so the only
+    honest test is a second thread trying to acquire it.
+    """
+    taken: list[bool] = []
+
+    def probe() -> None:
+        acquired = rig.projector._lock.acquire(timeout=timeout)  # type: ignore[attr-defined]
+        taken.append(acquired)
+        if acquired:
+            rig.projector._lock.release()  # type: ignore[attr-defined]
+
+    worker = threading.Thread(target=probe, name="lock-probe")
+    worker.start()
+    worker.join(timeout=timeout * 2)
+    return bool(taken and taken[0])
+
+
+def test_the_fold_publishes_with_the_lock_released(rig: Rig) -> None:
+    """The publisher reaches the legacy status monitor and takes ITS lock.
+
+    The fold is usually entered from inside that same monitor lock — a hook on
+    the monitor's publish path calls ``emit`` — so the monitor-to-projector
+    direction already exists.  Publishing from inside the projector's critical
+    section would add the OPPOSITE direction on the three threads that fold
+    without the monitor lock (the sweep, the liveness probe, the rollout tailer),
+    and two threads taking two locks in opposite orders is the textbook deadlock.
+    The monitor's lock guards ``get_status``, so it would present as every status
+    read in the server stopping.
+    """
+    observed: list[bool] = []
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+
+    def publisher(terminal_id, state, **kwargs) -> bool:
+        observed.append(_lock_is_free(rig))
+        return True
+
+    rig.projector._publisher = publisher  # type: ignore[attr-defined]
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    assert observed == [True]
+
+
+def test_the_sweep_publishes_with_the_lock_released(rig: Rig) -> None:
+    """The sweep is the path that made this necessary: its thread holds no
+    monitor lock, so a publish from inside the projector's lock takes the pair in
+    the inverting order."""
+    observed: list[bool] = []
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    def publisher(terminal_id, state, **kwargs) -> bool:
+        observed.append(_lock_is_free(rig))
+        return True
+
+    rig.projector._publisher = publisher  # type: ignore[attr-defined]
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.projector.sweep()
+
+    assert observed == [True]
