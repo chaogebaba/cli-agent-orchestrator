@@ -601,8 +601,8 @@ async def test_adj_r4_event_pushed_BEFORE_the_subscribe_ack_is_buffered(
             await server.reply(rid, {"type": "subscription_started"})
         elif method == "session.snapshot":
             await server.reply(rid, {"snapshot": _snapshot_body()})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.close_connection()
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
@@ -634,11 +634,11 @@ async def test_adj_r1_event_arrives_during_the_snapshot_response_itself(
         if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
         elif method == "session.snapshot":
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
             await server.reply(rid, {"snapshot": _snapshot_body()})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
-            await server.close_connection()
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
@@ -673,11 +673,11 @@ async def test_adj_r2_burst_of_fifty_interleaved_events_no_drop_dup_or_reorder(
                 await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
         elif method == "session.snapshot":
             for i in range(21, 41):  # 20 more inside the snapshot round trip
-                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+                await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": i}}})
             await server.reply(rid, {"snapshot": _snapshot_body()})
             for i in range(41, 51):  # 10 live, after the snapshot
-                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-            await server.close_connection()
+                await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
