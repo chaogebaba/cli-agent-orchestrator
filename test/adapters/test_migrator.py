@@ -220,3 +220,65 @@ def test_unopenable_database_is_reported_not_raised(tmp_path: Path) -> None:
     assert result.ok is False
     assert result.failed_step == "connect"
     assert pool is None
+
+
+# --------------------------------------------------- #738: shadow rows retire
+
+
+def _seed_shadow_and_live_rows(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    common = (
+        "INSERT INTO delivery_msg (msg_id, idempotency_key, payload_digest, receiver_id, "
+        "sender_id, kind, payload, state, mode, claim_id, attempts, max_attempts, "
+        "available_at, dead_by, created_at) VALUES (?, ?, '', 'mb_x', 'w', 'send_message', "
+        "'', ?, ?, 0, 0, 5, '2026-09-04T00:00:00+00:00', '2026-09-04T01:00:00+00:00', "
+        "'2026-09-04T00:00:00+00:00')"
+    )
+    conn.execute(common, ("shadow-ready", "k1", "ready", "shadow"))
+    conn.execute(common, ("shadow-done", "k2", "delivered", "shadow"))
+    conn.execute(common, ("live-ready", "k3", "ready", "live"))
+    conn.execute(
+        "INSERT INTO delivery_attempt (msg_id, claim_id, carrier, started_at, outcome) "
+        "VALUES ('shadow-done', 1, 'legacy', '2026-09-04T00:00:01+00:00', 'legacy_other')"
+    )
+    conn.execute(
+        "INSERT INTO delivery_dead (msg_id, reason, mode, died_at) "
+        "VALUES ('shadow-dead', 'max_attempts', 'shadow', '2026-09-04T00:00:02+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_shadow_mode_rows_are_deleted_at_boot_and_recorded_as_a_finding(db_path: Path) -> None:
+    """#738 / F883: ``QueueMode`` has one member, so a shadow row on disk is a
+    crash at the first read that parses it (the laptop's first ``on`` tick,
+    2026-09-11).  The migrator removes them, keeps every live row, and leaves
+    one finding carrying the counts.  A second boot is a no-op."""
+    result, pool = migrate(db_path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
+    assert result.ok and pool is not None
+    pool.close_all()
+    _seed_shadow_and_live_rows(db_path)
+
+    result, pool = migrate(db_path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
+    assert result.ok and pool is not None
+    conn = pool.connection()
+    assert [r[0] for r in conn.execute("SELECT msg_id FROM delivery_msg").fetchall()] == [
+        "live-ready"
+    ]
+    assert conn.execute("SELECT COUNT(*) FROM delivery_attempt").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM delivery_dead").fetchone()[0] == 0
+    findings = conn.execute(
+        "SELECT code, detail, count FROM finding WHERE code = 'DIAG-SHADOW-ROWS-RETIRED'"
+    ).fetchall()
+    assert len(findings) == 1
+    assert findings[0][1] == "delivery_msg=2 delivery_dead=1 delivery_attempt=1"
+
+    # Idempotent: nothing left to retire, no second finding.
+    result, pool2 = migrate(db_path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
+    assert result.ok and pool2 is not None
+    n = (
+        pool2.connection()
+        .execute("SELECT COUNT(*) FROM finding WHERE code = 'DIAG-SHADOW-ROWS-RETIRED'")
+        .fetchone()[0]
+    )
+    assert n == 1

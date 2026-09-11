@@ -28,9 +28,12 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
-from cli_agent_orchestrator.adapters.store.connection import ConnectionPool
+from cli_agent_orchestrator.adapters.store.connection import ConnectionPool, render_timestamp
+from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.ids import new_ulid
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +507,49 @@ ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
 
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)
 # so a test can substitute a failing step and watch boot survive it.
+
+
+def _retire_shadow_delivery_rows(conn: sqlite3.Connection) -> None:
+    """Delete delivery rows written in the retired ``shadow`` mode (#738 / F883).
+
+    F883 shrank :class:`~cli_agent_orchestrator.core.delivery.QueueMode` to one
+    member and left the on-disk rows to the ``mode='live'`` conjunct in ``claim``.
+    That conjunct is NOT in ``reclaim``, the time-bound sweep or the digest
+    reads, so the first tick after the flip to ``on`` hit a shadow row, raised
+    ``ValueError: 'shadow' is not a valid QueueMode`` and every tick after it
+    did the same (laptop, 2026-09-11: 1,162 ready + 440 delivered shadow rows,
+    delivery dead on arrival).  Shadow rows were observational copies of
+    messages the legacy inbox owned and delivered, so deleting them loses
+    nothing; a finding records the counts so the deletion is auditable.
+    Idempotent: a second boot finds nothing and writes nothing.
+    """
+    counts = {
+        table: conn.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE mode != 'live'").fetchone()[
+            "n"
+        ]
+        for table in ("delivery_msg", "delivery_dead")
+    }
+    if not any(counts.values()):
+        return
+    attempts = conn.execute(
+        "DELETE FROM delivery_attempt WHERE msg_id IN "
+        "(SELECT msg_id FROM delivery_msg WHERE mode != 'live' "
+        "UNION SELECT msg_id FROM delivery_dead WHERE mode != 'live')"
+    ).rowcount
+    conn.execute("DELETE FROM delivery_msg WHERE mode != 'live'")
+    conn.execute("DELETE FROM delivery_dead WHERE mode != 'live'")
+    counts["delivery_attempt"] = attempts
+    detail = " ".join(f"{k}={v}" for k, v in counts.items())
+    now = render_timestamp(datetime.now(UTC))
+    conn.execute(
+        "INSERT INTO finding (finding_id, code, terminal_id, dedupe_key, detail, "
+        "sample_event_id, count, first_seen_at, last_seen_at, state) "
+        "VALUES (?, ?, '', ?, ?, NULL, 1, ?, ?, 'open')",
+        (new_ulid(), FindingCode.DIAG_SHADOW_ROWS_RETIRED.value, now, detail, now, now),
+    )
+    logger.warning("delivery: retired shadow-mode rows (#738): %s", detail)
+
+
 MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
     ("worker_event", (_WORKER_EVENT_DDL,)),
     ("worker_event_seq", (_WORKER_EVENT_SEQ_DDL,)),
@@ -564,6 +610,8 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
     ),
     ("delivery_attempt", (_DELIVERY_ATTEMPT_DDL,)),
     ("delivery_dead", (_DELIVERY_DEAD_DDL,)),
+    # After both tables exist: rows from the retired shadow mode (#738) leave.
+    ("delivery_retire_shadow_rows", (_retire_shadow_delivery_rows,)),
     ("seat_digest", (_SEAT_DIGEST_DDL,)),
     (
         "seat_digest_indexes",

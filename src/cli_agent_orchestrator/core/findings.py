@@ -105,6 +105,11 @@ class FindingCode(StrEnum):
     DIAG_STATUS_GUARD = "DIAG-STATUS-GUARD"
     DIAG_DELIVERY_TIME_BOUND = "DIAG-DELIVERY-TIME-BOUND"
     DIAG_SEAT_WAKE_UNREACHABLE = "DIAG-SEAT-WAKE-UNREACHABLE"
+    #: The migrator deleted delivery rows written in the retired shadow mode
+    #: (#738 / F883).  Raised once per upgrade, fleet-wide; ``detail`` carries
+    #: the per-table counts.  The rows were observational copies of messages
+    #: the legacy inbox owned, so deleting them loses no delivery.
+    DIAG_SHADOW_ROWS_RETIRED = "DIAG-SHADOW-ROWS-RETIRED"
 
 
 #: Codes that remain readable but which no code path raises any more (D9b).
