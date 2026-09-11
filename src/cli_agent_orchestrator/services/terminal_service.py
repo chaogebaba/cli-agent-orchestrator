@@ -7260,6 +7260,14 @@ def send_prepared_input(
     life and is forwarded to the provider verify hook so a TUI provider may relax
     its composer-ownership rule for last-resort submit recovery on that path only.
     """
+    # D8 / #545, the other send seam, and FIRST here exactly as it is first in
+    # ``send_input``.  This path carries already-shaped bytes, so the message it
+    # delivers is the one the pane will echo — but it also does real pane work
+    # before the paste (the native stash, the fixture override), and any of that
+    # can put the server's own text into the rolling buffer before the note
+    # lands.  Noting it lower down left open the precise window the sibling
+    # seam's comment says must be closed.
+    status_monitor.note_delivered_text(terminal_id, message)
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -7314,10 +7322,6 @@ def send_prepared_input(
             provider,
             defer_on_dialog=defer_on_dialog,
         )
-    # D8 / #545, the other send seam: ``send_prepared_input`` carries bytes that
-    # have already been shaped, so the message it delivers is the one the pane
-    # will echo.
-    status_monitor.note_delivered_text(terminal_id, message)
     status_monitor.notify_input_sent(terminal_id)
     status_monitor.clear_rolling_buffer(terminal_id, provider)
     if prepared_stash is not None:

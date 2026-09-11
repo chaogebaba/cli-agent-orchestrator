@@ -586,19 +586,28 @@ _CLINE_PROC_EXITED = re.compile(r"\[Command exited with code (?P<code>\d+)\]")
 _CLINE_COMMAND_ECHO = re.compile(r"\[run_commands\]\s+(?P<command>.+)")
 
 # The commands whose exit 1 means "ran fine, found nothing" rather than "died".
+# SEARCH AND COMPARE ONLY, and the boundary is exact rather than thematic:
+# ``grep``, ``rg``, ``ag``, ``ack`` and ``diff`` all document 1 as "no match" or
+# "files differ", which is a RESULT and not a failure.
+#
+# The test runners are deliberately NOT here, and the blueprint's "or a test
+# runner" is declined with its reason: pytest's exit 1 means tests FAILED — "no
+# tests collected" is exit 5 — so suppressing it would silence a real failing
+# run, which is the opposite of #613's ask and the half of its criterion that
+# says other non-zero exits must still classify. jest and vitest read the same
+# way. A failing test run may well be noise rather than a process death, but
+# that is a different argument from this one and it needs its own decision.
+#
 # Anchored at a word boundary and matched anywhere in the command line, so a
-# pipeline (``rg foo | head``) and a prefixed form (``git grep``, ``uv run
-# pytest``) both match — the exit status of a pipeline is its LAST command's,
-# but every member of this set uses 1 for the same "no match" meaning, and the
-# conservative direction here is to under-report a condition rather than to ping
-# a seat about a healthy search.
+# pipeline (``rg foo | head``) and a prefixed form (``git grep``) both match.
+# The exit status of a pipeline is its LAST command's, so a search piped into
+# something else can still carry another command's code; under-reporting a
+# condition is the safe direction and pinging a seat about a healthy search is
+# not.
 #
 # Deliberately a closed list rather than a heuristic: an exit 1 from anything
-# NOT named here is a process failure and is still reported, which is the half
-# of #613's criterion that a broader rule would fail.
-_NO_MATCH_EXIT_COMMANDS = re.compile(
-    r"(?:^|[\s|;&(])(?:grep|egrep|fgrep|rg|ag|ack|diff|pytest|jest|vitest)\b"
-)
+# NOT named here is a process failure and is still reported.
+_NO_MATCH_EXIT_COMMANDS = re.compile(r"(?:^|[\s|;&(])(?:grep|egrep|fgrep|rg|ag|ack|diff)\b")
 
 # F775 (#632): reset anchor for scoping the PROC_EXITED text evidence. A stale
 # ``[Command exited with code N]`` line in scrollback must NOT keep re-asserting
@@ -718,9 +727,10 @@ def _is_no_match_exit(tail: List[str], exit_row: int, code: str) -> bool:
     * only exit **1**.  Every other non-zero code still classifies, from any
       command — the rule is about searches reporting "no match", not about
       silencing process failures.
-    * only a **named** command family, matched on the command line the driver
-      echoes above the exit row.  An exit 1 from anything else is a failure and
-      is reported.
+    * only a **named** command family — search and compare, never a test runner:
+      pytest's exit 1 means tests FAILED rather than "found nothing" (that is
+      exit 5), so suppressing it would silence a real failing run.  An exit 1
+      from anything else is a failure and is reported.
 
     The command is read from the nearest preceding driver echo rather than from
     the exit row itself, because the exit row carries the CODE and the echo
