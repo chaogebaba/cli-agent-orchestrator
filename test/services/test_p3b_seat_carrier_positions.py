@@ -746,11 +746,22 @@ def _doorbell_decision(terminal_id: str, row_id: int) -> str:
     with a recorder, so the module's own mute never runs and an arm written on it
     would certify a mute it never reached. The K3 surface is the subject here, so
     it is the thing that has to be called.
+
+    F747 (#747) took the ``supervisor.doorbell`` default OUT of that call site
+    (the registry is the tier that owns it now, and it ships False), so a stub
+    that echoes the CALL-SITE default answers ``None`` and the ring is skipped at
+    the outer gate before the ``queue_owns`` MUTE this helper exists to probe is
+    ever consulted. The shipped posture is OFF and is pinned where it belongs,
+    in ``test_f747_native_default.py``; this arm is about the mute, not the flag,
+    so it says which posture it needs -- the same shape as ``_seat_meta_and_flags``
+    in ``test_f803_wake_only_no_consume.py``.
     """
     from cli_agent_orchestrator.services import doorbell_service
 
     with patch.object(
-        doorbell_service.ConfigService, "get", side_effect=lambda key, default=None: default
+        doorbell_service.ConfigService,
+        "get",
+        side_effect=lambda key, default=None: True if key == "supervisor.doorbell" else default,
     ):
         return doorbell_service.ring_supervisor_doorbell(terminal_id, row_id)
 
@@ -788,6 +799,8 @@ def test_a_legacy_row_at_on_keeps_its_carrier(seat_db) -> None:
             "inbox is read-only from the flip, not empty (#741)"
         )
 
+        # The doorbell flag is pinned ON by the helper so this reaches the mute;
+        # the returned value is the queue_owns decision, not the shipped posture.
         assert (
             _doorbell_decision(SEAT_TERMINAL, row_id) != "skipped_disabled"
         ), "K3 stayed muted for a row the tick will never serve"
