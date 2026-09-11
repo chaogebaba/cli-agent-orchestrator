@@ -2470,7 +2470,7 @@ def _mcp_apps_enabled() -> bool:
     whole surface is consistently default-off.
     """
 
-    return bool(ConfigService.get("apps.enabled", default=False))
+    return bool(ConfigService.get("apps.enabled"))
 
 
 def _require_mcp_apps_enabled() -> None:
@@ -5455,6 +5455,35 @@ async def get_terminal_memory_context(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get memory context: {str(e)}",
         )
+
+
+@app.get("/terminals/{terminal_id}/native-delivery")
+async def get_native_delivery_health(terminal_id: TerminalId) -> Dict[str, Any]:
+    """F747 (#747): is native agent-message delivery healthy for this terminal?
+
+    The seat's legacy fallback surfaces -- the ``CAO callback waiting``
+    task-notification armed by the rewake hook, and the ``[CAO INBOX]`` drain
+    digest -- consult this before surfacing anything. ``healthy: true`` means
+    the native channel is the ONLY surface and the fallback must stay silent;
+    ``healthy: false`` names the reason from the closed set in
+    ``teammate_push_service.NATIVE_FALLBACK_REASONS`` and arms the fallback,
+    logging one rate-limited ``native_fallback_engaged`` WARNING server-side so
+    each engagement is a filed quirk rather than an invisible default.
+    """
+    from cli_agent_orchestrator.services.teammate_push_service import (
+        log_native_fallback_engaged,
+        native_fallback_reason,
+    )
+
+    try:
+        reason = native_fallback_reason(terminal_id)
+    except Exception as e:  # never let a health probe break a hook
+        logger.debug("native_fallback_reason failed for %s: %s", terminal_id, e)
+        return {"terminal_id": terminal_id, "healthy": False, "reason": "probe_failed"}
+    if reason is None:
+        return {"terminal_id": terminal_id, "healthy": True, "reason": None}
+    log_native_fallback_engaged(terminal_id, reason)
+    return {"terminal_id": terminal_id, "healthy": False, "reason": reason}
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
@@ -9526,6 +9555,40 @@ async def list_messages_endpoint(
                         "message": "--claim requires write or admin scope",
                     },
                 )
+            # F747 (#747): the hook claim is the fallback surface's ONLY read,
+            # and it is what was STARVING native delivery. The seat's drain hook
+            # fires on every turn edge; it claimed and acked the rows inside the
+            # reconciler's grace window, so by the time the native push ran, the
+            # send-time recount against ``consumed_through_id`` found every
+            # message already consumed and wrote nothing. The seat therefore saw
+            # the legacy task-notification even with ``teammate_push`` on and a
+            # valid ``cc_team_inbox_path`` -- the flag and the path were never
+            # the whole story.
+            #
+            # Suppressing the claim SERVER-SIDE (not only in the hook) is
+            # deliberate: the hook is baked into a seat's settings overlay at
+            # creation, so a client-side gate alone cannot reach a seat that is
+            # already running. This gate takes effect on the next request.
+            if claim == "hook":
+                _seat = to
+                if _seat.startswith("mb_"):
+                    from cli_agent_orchestrator.clients.database import (
+                        get_current_mailbox_terminal,
+                    )
+
+                    _seat = get_current_mailbox_terminal(to) or to
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    native_fallback_reason,
+                )
+
+                try:
+                    _reason = native_fallback_reason(_seat)
+                except Exception as e:  # never let the probe break a drain
+                    logger.debug("native_fallback_reason failed for %s: %s", _seat, e)
+                    _reason = "probe_failed"
+                if _reason is None:
+                    logger.debug("native_owns_seat terminal=%s hook_claim_suppressed", _seat)
+                    return {"items": [], "next_after_id": None, "has_more": False}
             kwargs["claim"] = claim
         return await asyncio.to_thread(list_messages, to, **kwargs)
     except MailboxDomainError as exc:

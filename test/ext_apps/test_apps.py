@@ -120,7 +120,7 @@ class TestGetResourceBody:
 
 class TestRegisterApps:
     def test_returns_false_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
 
         class StubMCP:
             def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
@@ -180,7 +180,7 @@ class TestRegisterApps:
 
                 return decorator
 
-        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
         assert register_apps(StubMCP()) is False
 
         monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")

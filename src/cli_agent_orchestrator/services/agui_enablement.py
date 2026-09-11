@@ -31,4 +31,4 @@ def agui_surface_enabled() -> bool:
 
     if os.environ.get("CAO_AGUI_ENABLED", "").strip().lower() in _TRUTHY:
         return True
-    return bool(ConfigService.get("apps.enabled", default=False))
+    return bool(ConfigService.get("apps.enabled"))

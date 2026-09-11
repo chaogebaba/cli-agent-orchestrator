@@ -402,6 +402,63 @@ def _fsync_dir(dir_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _try_acquire_lockfile(lock_path: Path) -> Optional[int]:
+    """One non-blocking attempt at the lockfile (F747 #747). fd, or None.
+
+    Deliberately NOT ``_acquire_lockfile_deadline(path, now)``: that helper
+    checks its deadline BEFORE the first attempt, so a deadline of `now` never
+    tries at all and every push reports contention. This makes exactly one
+    O_CREAT|O_EXCL attempt, and reclaims a stale lock the same way the deadline
+    helper does so a crashed writer cannot wedge the inbox forever.
+    """
+    try:
+        return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        pass  # held by someone else -- a race, handled below
+    # F747 (#747) r7: every OTHER OSError PROPAGATES. A PermissionError or
+    # ENOSPC on the lock path is PERMANENT: retrying cannot fix it, and a
+    # permanently unwritable inbox is a BROKEN native channel, not a busy one.
+    # Swallowing it here returned None, the caller read that as
+    # ``inbox_contended``, the write-failure ledger was never armed, and
+    # ``native_fallback_reason`` kept answering healthy -- so the r7 hook gate
+    # suppressed the fallback surface indefinitely for a seat that could never
+    # receive anything. The parent-mkdir guard does not cover it: the directory
+    # can be creatable while the lock file is not.
+    # Present: reclaim only if stale, and verify we own what we opened (TOCTOU).
+    try:
+        if (time.time() - os.stat(str(lock_path)).st_mtime) <= _LOCK_STALE_SECONDS:
+            return None
+        os.unlink(str(lock_path))
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except (FileNotFoundError, FileExistsError):
+        # The holder vanished or beat us to the reclaim: a race, not a fault.
+        return None
+    try:
+        fd_stat = os.fstat(fd)
+        path_stat = os.stat(str(lock_path))
+        if fd_stat.st_ino != path_stat.st_ino or fd_stat.st_dev != path_stat.st_dev:
+            # Someone re-created the lock between our unlink and our open: a
+            # race, so the caller retries rather than giving up on the seat.
+            os.close(fd)
+            return None
+    except FileNotFoundError:
+        # The path we just created is already gone -- another writer reclaimed
+        # it. Still a race.
+        os.close(fd)
+        return None
+    except OSError:
+        # F747 (#747) r9: anything else here is PERMANENT (EACCES on the parent
+        # directory, EIO, ...). r7 fixed the first acquisition attempt but this
+        # branch still swallowed every OSError into None, so a permission
+        # failure reaching the TOCTOU verify was still classified as transient
+        # contention -- the same blocker as r7's, one code path further in.
+        # Close our fd, then let it propagate: the writer converts it to False,
+        # which arms the write-failure ledger.
+        os.close(fd)
+        raise
+    return fd
+
+
 def _acquire_lockfile_deadline(lock_path: Path, deadline_mono: float | None) -> Optional[int]:
     """Acquire lockfile with optional monotonic deadline.
 
@@ -512,7 +569,152 @@ def _should_teammate_push(terminal_id: str) -> bool:
     return _resolve_inbox_path(terminal_id) is not None
 
 
-def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
+#: F747 (#747): most entries retained in a CC team inbox file.
+#:
+#: ``_write_inbox_entry`` reads the whole JSON array, scans it for the F175
+#: msg_id dedup, appends, and re-serialises ALL of it under the lock. That is
+#: O(entries) per push, so M pushes to one inbox cost O(M**2) and the file grows
+#: without bound. It never bit while the push was opt-in; F747 turns it on by
+#: default, and every claude_code terminal sharing a project directory shares
+#: one file, so the cost became the dominant term (measured: a two-directory
+#: test scope went from 211s to not finishing at all).
+#:
+#: The file is a NOTIFICATION carrier, not the system of record -- the inbox
+#: table is, and ``consumed_through_id`` tracks what the seat has taken.
+#: Trimming drops only the OLDEST entries, the ones already surfaced; anything
+#: still unconsumed is re-delivered from the DB by the reconciler or, failing
+#: that, by the fallback surface under its typed reason.
+INBOX_ENTRIES_CAP = 200
+
+#: F747 (#747): a contended push NEVER blocks.
+#:
+#: ``cc_team_inbox_path`` is a pure function of the terminal's cwd, so every
+#: claude_code terminal in one project directory contends on ONE lockfile. The
+#: old flat 1.0s wait meant a contended push paid up to a full second, and with
+#: the push default-on that became the dominant cost.
+#:
+#: The acquire is now a TRY-LOCK: one attempt, one retry after a short pause,
+#: then give up. Giving up is safe and is the design, not a loss: the row stays
+#: PENDING and the reconciler's next tick carries it, so delivery under
+#: contention is eventually-consistent while an UNCONTENDED push stays
+#: synchronous and immediate.
+INBOX_LOCK_RETRY_PAUSE_S = 0.05
+
+
+#: Closed set of reasons the legacy fallback surface may engage (F747 #747).
+NATIVE_FALLBACK_REASONS = (
+    "provider_not_native",
+    "push_disabled_by_operator",
+    "no_inbox_path",
+    "no_native_driver",
+    "native_write_failed",
+)
+
+#: How long a native write failure keeps the fallback armed for a terminal.
+NATIVE_WRITE_FAILURE_TTL_S = 300.0
+
+#: Rate limit for the engagement WARN, matching the inbox reconciler's window.
+NATIVE_FALLBACK_WARN_INTERVAL_S: float = 60.0
+
+#: terminal_id -> monotonic ts of the last failed native write.
+_native_write_failures: Dict[str, float] = {}
+
+#: terminal_id -> monotonic ts of the last engagement WARN.
+_native_fallback_last_warn: Dict[str, float] = {}
+
+
+def record_native_write_failure(terminal_id: str) -> None:
+    """Arm the fallback for ``terminal_id`` after a failed native write."""
+    _native_write_failures[terminal_id] = time.monotonic()
+
+
+def clear_native_write_failure(terminal_id: str) -> None:
+    """Disarm the fallback after a native write succeeds."""
+    _native_write_failures.pop(terminal_id, None)
+
+
+def _has_recent_native_write_failure(terminal_id: str) -> bool:
+    ts = _native_write_failures.get(terminal_id)
+    if ts is None:
+        return False
+    if (time.monotonic() - ts) >= NATIVE_WRITE_FAILURE_TTL_S:
+        _native_write_failures.pop(terminal_id, None)
+        return False
+    return True
+
+
+def log_native_fallback_engaged(terminal_id: str, reason: str) -> bool:
+    """Emit one rate-limited WARNING per fallback engagement. True if emitted."""
+    now_ts = time.monotonic()
+    last = _native_fallback_last_warn.get(terminal_id)
+    if last is not None and (now_ts - last) < NATIVE_FALLBACK_WARN_INTERVAL_S:
+        return False
+    _native_fallback_last_warn[terminal_id] = now_ts
+    logger.warning("native_fallback_engaged terminal=%s reason=%s", terminal_id, reason)
+    return True
+
+
+#: Row ids already reported as contended, so the log carries one line per row.
+_inbox_contended_logged: set[int] = set()
+
+#: Bound on the above, so a long-lived server cannot grow it without limit.
+_INBOX_CONTENDED_LOG_CAP = 4096
+
+
+def _log_inbox_contended_once(terminal_id: str, message_ids: tuple[int, ...]) -> None:
+    """Log a contended push once per ROW (F747 #747).
+
+    Per row, not per attempt: the reconciler retries a contended row every tick,
+    and one line per attempt would turn a busy inbox into a log flood while
+    saying nothing new. The first sighting is the one that carries information.
+    """
+    fresh = [m for m in message_ids if m not in _inbox_contended_logged]
+    if not fresh:
+        return
+    if len(_inbox_contended_logged) > _INBOX_CONTENDED_LOG_CAP:
+        _inbox_contended_logged.clear()
+    _inbox_contended_logged.update(fresh)
+    logger.info(
+        "inbox_contended terminal=%s rows=%s (left for the reconciler)",
+        terminal_id,
+        ",".join(str(m) for m in fresh),
+    )
+
+
+def native_fallback_reason(terminal_id: str) -> Optional[str]:
+    """Return why the legacy fallback surface may engage, or None when healthy.
+
+    F747 (#747): native agent-message delivery is the default and ONLY seat
+    surface. The task-notification ("CAO callback waiting") + drain-hook digest
+    survive strictly as a net for a terminal whose native channel is VERIFIABLY
+    broken, and every engagement must name which of the closed set below broke.
+    A healthy terminal returns None and the fallback stays silent.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata or metadata.get("provider") != "claude_code":
+        return "provider_not_native"
+    # Resolve BEFORE the flag check so the re-derivation happens on read even
+    # for a terminal created while the flag was off (ruling 2). ``persist=False``
+    # keeps this probe side-effect-free; the push path still persists.
+    inbox_path = _resolve_inbox_path(terminal_id, persist=False)
+    if not ConfigService.get("supervisor.teammate_push"):
+        # Default is True, so a False here is an explicit operator decision
+        # (settings.json or CAO_W2M_TEAMMATE_PUSH), never a shipped posture.
+        return "push_disabled_by_operator"
+    if inbox_path is None:
+        return "no_inbox_path"
+    if not ConfigService.get("supervisor.mailbox_pull") and not ConfigService.get(
+        "delivery.seat_wake_reconcile"
+    ):
+        # Nothing drives a push: neither the pull-mode reconciler nor the
+        # idle-seat wake reconcile is running, so native writes never happen.
+        return "no_native_driver"
+    if _has_recent_native_write_failure(terminal_id):
+        return "native_write_failed"
+    return None
+
+
+def _resolve_inbox_path(terminal_id: str, *, persist: bool = True) -> Optional[Path]:
     """Resolve and expand the CC inbox path from terminal metadata.
 
     WPDT W3 (F152): Includes lazy-derive self-heal — if cc_team_inbox_path is
@@ -527,7 +729,20 @@ def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
     if raw:
         return Path(os.path.expanduser(raw))
 
-    # F152 self-heal: derive path from working_directory + provider
+    # F152 self-heal: derive path from working_directory + provider.
+    #
+    # F747 (#747) tried an ``os.getcwd()`` fallback here so a row with an empty
+    # ``working_directory`` could still resolve. That was wrong twice over.
+    # Correctness: every terminal without a recorded cwd would derive the SAME
+    # path (the server's cwd), so unrelated seats would share one inbox file and
+    # serialise on its lockfile -- measured as a two-order-of-magnitude suite
+    # slowdown. Design: a terminal with no cwd is precisely the "native cannot
+    # work here" case, and the typed ``no_inbox_path`` reason plus the fallback
+    # surface is the designed answer to it, not an invented shared path.
+    #
+    # Ruling 2 is satisfied at CREATE time instead, where
+    # ``_maybe_derive_cc_team_inbox_path`` receives the already-resolved launch
+    # cwd (never None) for every claude_code terminal.
     provider = metadata.get("provider")
     working_dir = metadata.get("working_directory")
     if not working_dir or provider != "claude_code":
@@ -537,7 +752,15 @@ def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
     if derived is None:
         return None
 
-    # Persist to metadata for future calls
+    # Persist to metadata for future calls.
+    # F747 (#747): ``persist=False`` makes this a pure read. The native-delivery
+    # HEALTH PROBE runs on the seat's PostToolUse edge -- once per tool call per
+    # seat -- so letting it write metadata turned a read-only question into a DB
+    # write on the hottest path in the system, serializing every caller behind
+    # the same SQLite lock. The self-heal write belongs on the PUSH path, which
+    # runs on delivery, not on inspection.
+    if not persist:
+        return derived
     try:
         from cli_agent_orchestrator.clients.database import update_terminal_metadata
 
@@ -562,8 +785,12 @@ def _derive_cc_team_inbox_path(working_directory: str) -> Optional[Path]:
     try:
         cwd_key = re.sub(r"[^A-Za-z0-9]", "-", working_directory)
         inbox_path = Path.home() / ".claude" / "projects" / cwd_key / "team-lead.json"
-        # Ensure parent directory exists (W3: "mkdir included")
-        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        # F747 (#747): derivation is a PURE function of the cwd -- no mkdir.
+        # W3's "mkdir included" was safe while this ran only for a seat whose
+        # flag was already on; F747 derives for every claude_code terminal, so a
+        # filesystem side effect here would fire on every terminal create and
+        # every health probe. ``_write_inbox_entry`` already creates the parent
+        # directory before it writes, which is the only place it is needed.
         return inbox_path
     except Exception:
         return None
@@ -613,7 +840,7 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
+def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> Optional[bool]:
     """Write an entry to the CC inbox file under lockfile protection (legacy).
 
     F175: deduplicates by msg_id — if an entry with the same msg_id already
@@ -629,10 +856,24 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
         return False
     # F656: "before" stat taken before lock acquisition (never in-lock).
     size_before, mtime_before = _stat_size_mtime(inbox_path)
-    fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 1.0)
-    if fd is None:
-        logger.warning(f"teammate_push: failed to acquire lock {lock_path} after retries")
+    # F747 (#747): try-lock, one retry, never a blocking wait.
+    # r7: a PERMANENT lock error propagates out of the helper and is converted
+    # to a write FAILURE here (False), never to contention (None). That is what
+    # arms the write-failure ledger, so a seat whose inbox cannot be written
+    # reports native_write_failed and the fallback surface engages.
+    try:
+        fd = _try_acquire_lockfile(lock_path)
+        if fd is None:
+            time.sleep(INBOX_LOCK_RETRY_PAUSE_S)
+            fd = _try_acquire_lockfile(lock_path)
+    except OSError as e:
+        logger.warning("teammate_push: inbox lock %s permanently unwritable: %s", lock_path, e)
         return False
+    if fd is None:
+        # None (not False) means CONTENDED, not failed. The caller must not
+        # treat a transient lock as a broken native channel, and the row is
+        # left for the reconciler rather than waited on.
+        return None
     emit_data: "bytes | str | None" = None
     entries_before = 0
     entry_msg_id = entry.get("msg_id")
@@ -659,6 +900,10 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
 
         entries_before = len(entries_list)
         entries_list.append(entry)
+        # F747 (#747): bound the file so the NEXT push is not more expensive
+        # than this one. Oldest-first, and only ever above the cap.
+        if len(entries_list) > INBOX_ENTRIES_CAP:
+            entries_list = entries_list[-INBOX_ENTRIES_CAP:]
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
             payload = json.dumps(entries_list, indent=2)
@@ -684,7 +929,7 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
             op="append_legacy",
             inbox_path=inbox_path,
             entries_before=entries_before,
-            entries_after=entries_before + 1,
+            entries_after=min(entries_before + 1, INBOX_ENTRIES_CAP),
             msg_ids_added=[entry_msg_id] if entry_msg_id else [],
             msg_ids_removed=[],
             size_before=size_before,
@@ -717,8 +962,10 @@ class PushOutcome:
     """Structured result of a teammate push attempt (fx158 D4)."""
 
     pushed: bool
-    reason: str  # closed set: empty_batch, no_inbox_path, already_notified, consumed, write_failed, pushed
-    message_ids: tuple  # diagnostic only (N1)
+    # closed set: empty_batch, no_inbox_path, already_notified, consumed,
+    # write_failed, inbox_contended, pushed
+    reason: str
+    message_ids: tuple[int, ...]  # diagnostic only (N1)
 
 
 def attempt_teammate_push_reported(
@@ -752,10 +999,20 @@ def attempt_teammate_push_reported(
         worker_name, message_preview, len(new_messages), mailbox_id=_mbid, first_row_id=first_msg.id
     )
     success = _write_inbox_entry(inbox_path, entry)
+    if success is None:
+        # Contended, not broken: the row stays PENDING and the reconciler's next
+        # tick carries it. Deliberately does NOT arm the write-failure ledger,
+        # so the fallback surface stays silent for a transient race. Logged once
+        # per row, so a busy inbox cannot flood the log.
+        _log_inbox_contended_once(terminal_id, ids)
+        return PushOutcome(pushed=False, reason="inbox_contended", message_ids=ids)
     if success:
+        # F747 (#747): a good write disarms the fallback for this terminal.
+        clear_native_write_failure(terminal_id)
         return PushOutcome(
             pushed=True, reason="pushed", message_ids=tuple(m.id for m in new_messages)
         )
+    record_native_write_failure(terminal_id)
     return PushOutcome(pushed=False, reason="write_failed", message_ids=ids)
 
 

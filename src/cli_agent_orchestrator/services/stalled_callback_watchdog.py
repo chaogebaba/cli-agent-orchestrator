@@ -1743,7 +1743,7 @@ class StalledCallbackWatchdog:
         from cli_agent_orchestrator.services.config_service import ConfigService
 
         # D7: check flag per-tick
-        if not ConfigService.get("supervisor.watchdog.quiescence", False):
+        if not ConfigService.get("supervisor.watchdog.quiescence"):
             return
 
         now = now if now is not None else time.monotonic()

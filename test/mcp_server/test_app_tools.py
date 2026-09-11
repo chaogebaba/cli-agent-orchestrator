@@ -253,7 +253,7 @@ def test_submit_command_denies_when_scope_missing() -> None:
 def test_register_app_tools_disabled_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """With CAO_MCP_APPS_ENABLED unset, registration is a no-op returning False."""
 
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     fake = _FakeMCP()
     assert app_tools.register_app_tools(fake) is False
     assert fake.registered == {}

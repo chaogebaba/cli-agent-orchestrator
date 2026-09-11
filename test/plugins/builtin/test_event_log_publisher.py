@@ -188,7 +188,7 @@ class TestDefaultOff:
 
     @pytest.mark.asyncio
     async def test_hooks_noop_when_surface_disabled(self, monkeypatch) -> None:
-        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
         monkeypatch.delenv("CAO_AGUI_ENABLED", raising=False)
 
         log = EventLog()
@@ -234,7 +234,7 @@ class TestAguiEnablement:
     @pytest.mark.asyncio
     async def test_hooks_emit_when_only_agui_enabled(self, monkeypatch) -> None:
         # Only the dedicated AG-UI flag — the MCP Apps flag stays unset.
-        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
         monkeypatch.setenv("CAO_AGUI_ENABLED", "true")
 
         log = EventLog()

@@ -30,7 +30,7 @@ def _enable_mcp_apps(monkeypatch):
 def test_events_history_404_when_disabled(client, monkeypatch) -> None:
     """/events/history is not reachable unless the MCP Apps surface is enabled."""
 
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     assert client.get("/events/history").status_code == 404
 
 
@@ -38,7 +38,7 @@ def test_events_history_404_when_disabled(client, monkeypatch) -> None:
 def test_events_stream_404_when_disabled(client, monkeypatch) -> None:
     """/events is not reachable unless the MCP Apps surface is enabled."""
 
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     assert client.get("/events").status_code == 404
 
 

@@ -152,6 +152,27 @@ def _build_digest(items: list[dict[str, Any]]) -> tuple[str | None, int | None]:
     return digest, max_id_int
 
 
+def _native_delivery_healthy(terminal_id: str, base_url: str, headers: dict[str, str]) -> bool:
+    """F747 (#747): True when native delivery owns this seat, so skip the digest.
+
+    Native agent-message delivery is the seat's ONE surface; this digest is the
+    net for a seat whose native channel is verifiably broken. FAIL-OPEN: any
+    error reports "not healthy" and the digest still surfaces, because a missed
+    callback costs more than a duplicated one.
+    """
+    try:
+        resp = cao_http.get(
+            f"/terminals/{terminal_id}/native-delivery",
+            base_url=base_url,
+            headers=headers,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("healthy"))
+    except Exception:
+        return False
+
+
 def _headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     token = get_local_bearer()
@@ -222,6 +243,14 @@ def main() -> int:
         event_name = str(event.get("hook_event_name") or event.get("hookEventName") or "")
         if event_name == _SESSION_START_EVENT:
             return 0
+
+        # F747 (#747): one surface. When native delivery is healthy the rows are
+        # being pushed to the seat as agent messages, so this hook must neither
+        # claim them (a claim would steal them from the native path) nor print a
+        # second copy of the same callback into the seat's context.
+        if _native_delivery_healthy(terminal_id, base_url, headers):
+            return 0
+
         try:
             listing = cao_http.get(
                 "/messages",

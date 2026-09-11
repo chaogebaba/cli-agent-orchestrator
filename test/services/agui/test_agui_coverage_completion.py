@@ -86,7 +86,7 @@ def test_map_resume_payload(payload, expected):
 
 def test_inprocess_emitter_refuses_when_surface_disabled(monkeypatch):
     monkeypatch.delenv("CAO_AGUI_ENABLED", raising=False)
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     with pytest.raises(RuntimeError):
         InProcessUiEmitter().emit_intent("approval_card", {"title": "x"})
 
@@ -162,7 +162,7 @@ async def test_bridge_run_returns_when_surface_disabled(monkeypatch):
     from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
 
     monkeypatch.delenv("CAO_AGUI_ENABLED", raising=False)
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     # Returns immediately (disabled) rather than subscribing/looping forever.
     await asyncio.wait_for(ApprovalBridge(construct=_construct()).run(), timeout=1.0)
 

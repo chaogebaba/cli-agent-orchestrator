@@ -3795,6 +3795,7 @@ class InboxService:
             PushOutcome,
             _should_teammate_push,
             attempt_teammate_push_reported,
+            native_fallback_reason,
         )
 
         # D3 condition 1: flag must be on
@@ -3824,8 +3825,14 @@ class InboxService:
 
                 # D3 condition 5: teammate_push flag gate
                 if not _should_teammate_push(mb.current_terminal_id):
-                    # F162 D10: rate-limited WARN when unregistered
-                    tid = mb.current_terminal_id
+                    # F162 D10: rate-limited WARN, one line per engagement.
+                    # F747 (#747): the line now NAMES why native delivery is
+                    # unusable for this terminal, because the legacy fallback
+                    # surface engaging at all is a filed quirk, not a posture.
+                    # F747 (#747) r6: SQLAlchemy types this Column[str]; the typed
+                    # reason helper takes a plain str, so narrow once here rather
+                    # than casting at each use.
+                    tid = str(mb.current_terminal_id)
                     now_ts = time.monotonic()
                     last = _fx158_gate5_last_warn.get(tid)
                     if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:
@@ -3841,8 +3848,9 @@ class InboxService:
                             )
                         if pending_count > 0:
                             logger.warning(
-                                "fx158_gate5_unregistered terminal=%s pending=%d",
+                                "native_fallback_engaged terminal=%s reason=%s pending=%d",
                                 tid,
+                                native_fallback_reason(tid) or "unknown",
                                 pending_count,
                             )
                             _fx158_gate5_last_warn[tid] = now_ts

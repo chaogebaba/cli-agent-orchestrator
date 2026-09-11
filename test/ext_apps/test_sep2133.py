@@ -25,7 +25,7 @@ def enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
 
 
 class TestNegotiateCapabilities:

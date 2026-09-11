@@ -21,7 +21,7 @@ import cli_agent_orchestrator.api.main as main
 @pytest.fixture(autouse=True)
 def _only_agui(monkeypatch):
     monkeypatch.setenv("CAO_AGUI_ENABLED", "1")
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     monkeypatch.setattr(main, "is_auth_enabled", lambda: False)
     monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
 

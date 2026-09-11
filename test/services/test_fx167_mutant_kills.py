@@ -377,7 +377,7 @@ exit 0
 
 
 class TestM12Gate5WarnRateLimit:
-    """M12: fx158_gate5_unregistered WARN is emitted on transition then
+    """M12: native_fallback_engaged WARN is emitted on transition then
     suppressed inside 60s. An every-tick mutant (no rate-limit) fails.
     """
 
@@ -483,14 +483,14 @@ class TestM12Gate5WarnRateLimit:
 
         # Tick 1: first observation → should WARN (transition)
         svc.reconcile_pull_mode_notifications()
-        tick1_warns = [w for w in warn_calls if "fx158_gate5_unregistered" in w]
+        tick1_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
         assert len(tick1_warns) == 1, f"Tick 1: expected 1 WARN, got {len(tick1_warns)}: {tick1_warns}"
 
         # Tick 2: +30s (within 60s window) → suppressed
         fake_time[0] = 1030.0
         warn_calls.clear()
         svc.reconcile_pull_mode_notifications()
-        tick2_warns = [w for w in warn_calls if "fx158_gate5_unregistered" in w]
+        tick2_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
         assert len(tick2_warns) == 0, (
             f"Tick 2 (+30s): expected 0 WARN (suppressed within 60s), got {len(tick2_warns)}. "
             "M12 mutant (every-tick emit) would emit here."
@@ -500,7 +500,7 @@ class TestM12Gate5WarnRateLimit:
         fake_time[0] = 1059.0
         warn_calls.clear()
         svc.reconcile_pull_mode_notifications()
-        tick3_warns = [w for w in warn_calls if "fx158_gate5_unregistered" in w]
+        tick3_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
         assert len(tick3_warns) == 0, (
             f"Tick 3 (+59s): expected 0 WARN (suppressed), got {len(tick3_warns)}"
         )
@@ -594,13 +594,13 @@ class TestM12Gate5WarnRateLimit:
 
         # Tick 1: transition WARN
         svc.reconcile_pull_mode_notifications()
-        assert any("fx158_gate5_unregistered" in w for w in warn_calls)
+        assert any("native_fallback_engaged" in w for w in warn_calls)
 
         # Tick 2: +61s → re-emit (window expired)
         fake_time[0] = 2061.0
         warn_calls.clear()
         svc.reconcile_pull_mode_notifications()
-        tick2_warns = [w for w in warn_calls if "fx158_gate5_unregistered" in w]
+        tick2_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
         assert len(tick2_warns) == 1, (
             f"After 61s: expected WARN re-emission, got {len(tick2_warns)}"
         )

@@ -48,7 +48,7 @@ def test_mcp_apps_is_a_cao_plugin() -> None:
 
 
 def test_on_mcp_server_default_off_does_not_raise(monkeypatch) -> None:
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     # Default-off: registration is best-effort and must never raise.
     McpAppsPlugin().on_mcp_server(_FakeMcp())
 
@@ -98,7 +98,7 @@ def test_no_warning_when_idp_configured(monkeypatch, caplog) -> None:
 
 def test_no_warning_when_surface_disabled(monkeypatch, caplog) -> None:
     # Default-off: no surface, so no posture warning regardless of IdP config.
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     _no_idp(monkeypatch)
     with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.builtin.mcp_apps"):
         McpAppsPlugin().on_mcp_server(_FakeMcp())

@@ -116,8 +116,12 @@ def start(
         params["session_name"] = session_name
     if provider:
         params["provider"] = provider
-    if working_directory:
-        params["working_directory"] = working_directory
+    # F747 (#747): always send a cwd, exactly as ``cao launch`` does. Omitting
+    # it made the server persist ITS OWN cwd (a systemd unit's WorkingDirectory)
+    # as the terminal's launch directory, which then derived a wrong
+    # cc_team_inbox_path for a claude_code seat. The client's cwd is the only
+    # value that matches the operator's intent.
+    params["working_directory"] = working_directory or os.getcwd()
     if allowed_tools:
         params["allowed_tools"] = allowed_tools
     if allow_incomplete_brief:
