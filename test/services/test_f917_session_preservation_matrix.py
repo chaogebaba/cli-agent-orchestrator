@@ -352,3 +352,134 @@ class TestProviderMatrix:
                 )
             ],
         )
+
+
+# ==========================================================================
+# R6 — ledger L6 regression: F913 guard must DEFER to F867 D2.
+# A force delete racing a LIVE resume of THIS terminal is resume_in_progress
+# (F867 D2), NOT refuse_discard_live_session (F913). This must hold even when
+# the terminal is GENUINELY resumable (owner_principal set) — i.e. it must not
+# depend on the accidental F865-B3 owner_principal masking.
+# ==========================================================================
+class TestF867D2Precedence:
+    def _seed_resumable_pi(self, d, tid, session, ns):
+        d.create_terminal(
+            terminal_id=tid,
+            tmux_session=session,
+            tmux_window=f"win-{tid}",
+            agent_profile="empirical_reviewer_lite",
+            provider="pi_cli",
+        )
+        d.mint_spawn_identity(
+            identity_key=f"conv_{tid}",
+            provider="pi_cli",
+            provider_namespace=ns,
+            agent_profile="empirical_reviewer_lite",
+            model=None,
+            reasoning_effort=None,
+            origin_callback_ref=None,
+            current_terminal_id=tid,
+            cwd="/data/cao-scratch/x",
+            owner_principal="owner-1",  # GENUINELY resumable (not the NULL-owner mask)
+        )
+
+    def _mock_seams(self, monkeypatch):
+        monkeypatch.setattr(ts, "get_backend", lambda: MagicMock())
+        monkeypatch.setattr(
+            ts,
+            "_delete_terminal_under_lease",
+            lambda t, token, **kw: {
+                "terminal_deleted": True,
+                "resumable": False,
+                "reason": "abandoned",
+            },
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.rebind_lease.acquire_rebind_lease",
+            lambda t: MagicMock(terminal_id=t),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.rebind_lease.release_rebind_lease", lambda _t: None
+        )
+
+    def test_force_defers_to_resume_in_progress_when_genuinely_resumable(
+        self, real_sqlite_env, monkeypatch
+    ):
+        """pass-after: with owner_principal set (genuinely resumable) AND a live
+        provider-session lease held (resume in flight), force delete must raise
+        resume_in_progress (F867 D2) — the F913 guard defers. Before the fix the
+        F913 guard fired first and raised refuse_discard_live_session (ledger L6).
+        """
+        import cli_agent_orchestrator.clients.database as d
+        from cli_agent_orchestrator.services import conversation_transition as ct
+        from cli_agent_orchestrator.services import provider_session_lease as psl
+        from cli_agent_orchestrator.services.terminal_service import (
+            RefuseDiscardLiveSessionError,
+        )
+
+        tid = "l6defer1"
+        self._seed_resumable_pi(d, tid, "cao-l6", "/data/cao-scratch/x")
+        ct.attach_captured_uuid(
+            tid,
+            provider_session_id=tid,
+            provider="pi_cli",
+            provider_namespace="/data/cao-scratch/x",
+        )
+        self._mock_seams(monkeypatch)
+
+        # Confirm the terminal is GENUINELY resumable now (owner set) — so the
+        # F913 guard WOULD fire were it not for the D2 deferral.
+        _alive, _resumable, _prov, _reason = ts._f913_live_resumable(
+            tid, d.get_terminal_metadata(tid)
+        )
+        assert _resumable is True, "precondition: terminal must be genuinely resumable"
+
+        held = psl.acquire_provider_session_lease(tid)  # live resume in flight
+        assert held is not None
+        try:
+            with pytest.raises(RuntimeError, match="resume_in_progress"):
+                ts.delete_terminal(tid, force=True)
+            # And specifically NOT the F913 refusal.
+            try:
+                ts.delete_terminal(tid, force=True)
+            except RefuseDiscardLiveSessionError:  # pragma: no cover
+                pytest.fail("F913 guard pre-empted F867 D2 (ledger L6 regression)")
+            except RuntimeError as e:
+                assert "resume_in_progress" in str(e)
+        finally:
+            psl.release_provider_session_lease(held)
+
+        # After the resume releases, no resume is in flight. The terminal is
+        # still genuinely resumable, so a plain force delete is (correctly)
+        # refused by F913 — the deliberate discard proceeds with confirm_discard.
+        with pytest.raises(RefuseDiscardLiveSessionError):
+            ts.delete_terminal(tid, force=True)
+        r = ts.delete_terminal(tid, force=True, confirm_discard=True)
+        assert r["reaped"] and r["reaped"][0]["id"] == tid
+
+    def test_mutant_no_d2_deferral_is_caught(self, real_sqlite_env, monkeypatch):
+        """Mutant 'no-d2-deferral' (F913 guard evaluated WITHOUT the
+        _f867_resume_in_flight pre-check): with a genuinely resumable terminal
+        and a live resume lease, the guard would raise refuse_discard_live_session
+        instead of resume_in_progress. Asserting resume_in_progress kills it.
+        """
+        import cli_agent_orchestrator.clients.database as d
+        from cli_agent_orchestrator.services import conversation_transition as ct
+        from cli_agent_orchestrator.services import provider_session_lease as psl
+
+        tid = "l6defer2"
+        self._seed_resumable_pi(d, tid, "cao-l6b", "/data/cao-scratch/x")
+        ct.attach_captured_uuid(
+            tid,
+            provider_session_id=tid,
+            provider="pi_cli",
+            provider_namespace="/data/cao-scratch/x",
+        )
+        self._mock_seams(monkeypatch)
+        held = psl.acquire_provider_session_lease(tid)
+        assert held is not None
+        try:
+            with pytest.raises(RuntimeError, match="resume_in_progress"):
+                ts.delete_terminal(tid, force=True)
+        finally:
+            psl.release_provider_session_lease(held)

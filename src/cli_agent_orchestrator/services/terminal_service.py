@@ -7708,6 +7708,45 @@ def _surviving_ancestor(by_id: dict[str, dict[str, Any]], node_id: str, reap_set
     return ""
 
 
+def _f867_resume_in_flight(terminal_id: str, root: dict[str, Any]) -> bool:
+    """F867 D2 predicate: is a RESUME or REBIND of THIS terminal in flight?
+
+    True when this terminal holds its rebind lease OR the conversation's
+    provider-session uuid lease is held (a live resume owns the session). This
+    is the SAME signal ``_delete_terminal_inner`` uses to raise
+    ``resume_in_progress``; factored out so the F913 force-discard guard can
+    DEFER to it — a delete racing a live resume of this terminal is a
+    ``resume_in_progress`` 409 (F867 D2), NOT a ``refuse_discard_live_session``
+    (F913). Evaluating F913 first would pre-empt D2 and change the 409 shape the
+    D2 contract asserts (ledger L6). Never raises — a lookup failure degrades to
+    False (no false in-flight), leaving the F913 guard to decide.
+    """
+    try:
+        from cli_agent_orchestrator.services.provider_session_lease import (
+            provider_session_lease_held,
+        )
+        from cli_agent_orchestrator.services.rebind_lease import rebind_lease_held
+
+        if rebind_lease_held(terminal_id):
+            return True
+        uuid = root.get("provider_session_id")
+        if not uuid:
+            from cli_agent_orchestrator.clients.database import (
+                get_conversation_identity,
+                get_terminal_identity,
+            )
+
+            _ti = get_terminal_identity(terminal_id)
+            _ikey = _ti.get("identity_key") if _ti else None
+            if _ikey:
+                _croot = get_conversation_identity(_ikey)
+                uuid = _croot.get("provider_session_id") if _croot else None
+        return isinstance(uuid, str) and bool(uuid) and provider_session_lease_held(uuid)
+    except Exception:
+        logger.debug("f867 resume-in-flight probe failed for %s", terminal_id, exc_info=True)
+        return False
+
+
 def _f913_live_resumable(
     terminal_id: str, root: dict[str, Any]
 ) -> tuple[bool, bool, str | None, str]:
@@ -7870,13 +7909,19 @@ def delete_terminal(
     # (non-force delete already interrupts-and-preserves the session — the resume
     # contract), and confirm_discard=True is the deliberate opt-out.
     if force and not confirm_discard:
-        _f913_alive, _f913_resumable, _f913_provider, _f913_reason = _f913_live_resumable(
-            terminal_id, root
-        )
-        if _f913_alive and _f913_resumable:
-            raise RefuseDiscardLiveSessionError(
-                terminal_id, provider=_f913_provider, reason=_f913_reason
+        # F867 D2 precedence (ledger L6): a force delete racing a LIVE resume/
+        # rebind of THIS terminal is a resume_in_progress 409 owned by
+        # _delete_terminal_inner — NOT an F913 refusal. Defer to it so the D2
+        # contract (and its 409 detail shape) is preserved; the F913 guard only
+        # decides when no resume of this terminal is in flight.
+        if not _f867_resume_in_flight(terminal_id, root):
+            _f913_alive, _f913_resumable, _f913_provider, _f913_reason = _f913_live_resumable(
+                terminal_id, root
             )
+            if _f913_alive and _f913_resumable:
+                raise RefuseDiscardLiveSessionError(
+                    terminal_id, provider=_f913_provider, reason=_f913_reason
+                )
 
     # F829 D2(a): PLANNED HIBERNATE gate — evaluated BEFORE the teardown intent is
     # opened so a refusal returns without opening/leaking an intent. On the
@@ -8339,29 +8384,11 @@ def _delete_terminal_inner(
     # (lease still held) blocks. The uuid is read from the terminal metadata row
     # when present, else the F829 conversation root (D1 fills the root for pi
     # even when the metadata column is not mirrored).
-    from cli_agent_orchestrator.services.provider_session_lease import (
-        provider_session_lease_held,
-    )
-    from cli_agent_orchestrator.services.rebind_lease import rebind_lease_held
-
-    _this_uuid = root.get("provider_session_id")
-    if not _this_uuid:
-        try:
-            from cli_agent_orchestrator.clients.database import (
-                get_conversation_identity,
-                get_terminal_identity,
-            )
-
-            _ti = get_terminal_identity(terminal_id)
-            _ikey = _ti.get("identity_key") if _ti else None
-            if _ikey:
-                _croot = get_conversation_identity(_ikey)
-                _this_uuid = _croot.get("provider_session_id") if _croot else None
-        except Exception:
-            logger.debug("f867 resume-guard uuid lookup failed for %s", terminal_id, exc_info=True)
-    _resume_in_flight = rebind_lease_held(terminal_id) or (
-        isinstance(_this_uuid, str) and bool(_this_uuid) and provider_session_lease_held(_this_uuid)
-    )
+    # F867 (#723) D2 resume-in-flight guard: while THIS terminal is being
+    # RESUMED or REBOUND in place, the delete must be FULLY blocked and do
+    # nothing. Uses the shared _f867_resume_in_flight predicate (the same signal
+    # the F913 force-discard guard defers to, so the two never diverge).
+    _resume_in_flight = _f867_resume_in_flight(terminal_id, root)
     if _resume_in_flight:
         release_session_lifecycle_terminal_exclusive(lifecycle_lease)
         raise RuntimeError("resume_in_progress")
