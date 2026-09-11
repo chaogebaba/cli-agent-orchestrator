@@ -28,8 +28,13 @@ def test_chooser_fixtures_render_the_resume_cwd_dialog_in_region():
     for incident in CHOOSER_INCIDENTS:
         replay = DialogReplay(incident)
         region = dialog_region(replay.final_rows())
-        assert "Choose working directory to resume this session" in region.normalized
-        assert "Press enter to continue" in region.normalized
+        # F597 #454 (3f29c722): ``normalize_screen`` folds the screen through
+        # ``canonicalize`` (NFKC -> lowercase -> non-[a-z0-9] -> space), so the
+        # match domain is lower-case by design. Anchors are spelled in that
+        # domain -- exactly as a rule's question/options are canonicalized on
+        # load -- not in the card's authored casing.
+        assert "choose working directory to resume this session" in region.normalized
+        assert "press enter to continue" in region.normalized
 
 
 def test_replay_advances_the_fake_clock_by_frame_offsets():
