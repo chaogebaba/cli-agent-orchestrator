@@ -205,6 +205,15 @@ class Transport:
         # the turn proceeds either way, because D6's conversation GET, not this
         # stream, decides completion.
         self.sse_tracker: Optional["SseProgressTracker"] = None
+        # F970 (#819) step 3: the detached conversation reader. When set, polls
+        # leave the browser entirely (r4: the authoritative GET succeeds on the
+        # exported session alone). It is a TRANSPORT swap only — the same dict
+        # shape, the same containment check, the same D6 gate. A failure demotes
+        # it back to the in-page read for the rest of the turn rather than
+        # failing a delivered turn.
+        self.reader: Optional[Any] = None
+        self.detached_reads = 0
+        self.detached_demoted = False
 
     def arm_send_observer(self) -> None:
         """Observe page-owned responses for early conversation-id discovery (D6).
@@ -613,10 +622,44 @@ class Transport:
             pass
 
     async def read_conversation(self, conversation_id: str) -> dict[str, Any]:
-        """Read the conversation GET via the containment-checked in-page fetch."""
+        """Read the conversation GET — detached when available, else in-page.
+
+        Both transports return the identical ``{httpStatus, ok, retryAfter,
+        body}`` shape and both check read containment first, so ``poll_to_gate``
+        and ``evaluate_gate`` cannot tell them apart (F970 step 3).
+        """
         from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
             enforce_read_allowed,
         )
+
+        if self.reader is not None:
+            import asyncio as _asyncio
+
+            try:
+                probe = await _asyncio.to_thread(self.reader.read_conversation, conversation_id)
+                if isinstance(probe, dict) and probe.get("httpStatus"):
+                    self.detached_reads += 1
+                    return probe
+                # A zero status means the client produced nothing usable; treat
+                # it the same as a raise and fall back rather than reporting a
+                # bogus non-200 to the poll loop.
+                raise RunnerError(
+                    RunnerErrorCode.NET_INTERRUPTED,
+                    "detached conversation read returned no status",
+                    delivery_state=DeliveryState.DELIVERED,
+                )
+            except RunnerError as exc:
+                if exc.code is RunnerErrorCode.READ_FORBIDDEN:
+                    raise  # containment is not a transport problem
+                logger.warning("chatgpt_web detached read demoted to in-page (%s)", exc.code.value)
+                self.reader = None
+                self.detached_demoted = True
+            except Exception as exc:
+                logger.warning(
+                    "chatgpt_web detached read demoted to in-page (%s)", type(exc).__name__
+                )
+                self.reader = None
+                self.detached_demoted = True
 
         url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
         enforce_read_allowed(url, conversation_id)

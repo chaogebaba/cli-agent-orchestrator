@@ -8,6 +8,7 @@ same-origin read-containment predicates (AC-11b). No browser import.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
@@ -169,6 +170,30 @@ def readiness_reached(present_signals: "frozenset[str] | set[str]") -> bool:
 # --- Same-origin read containment (D3 / AC-11b) ---------------------------------
 
 
+#: A backend conversation id is a bare uuid-shaped token (F862 r2: the ``WEB:``
+#: route prefix is a FRONT-END id and 404s/429s on the backend path).
+_CONVERSATION_ID_SHAPE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+
+
+def assert_conversation_id_shape(conversation_id: str) -> None:
+    """Refuse an id that is not a bare uuid, BEFORE it is put in a URL (AC-11b).
+
+    The path check alone is not sufficient containment: neither ``urlparse``
+    nor an in-page ``fetch('/backend-api/conversation/' + id)`` normalizes
+    ``..`` the same way, so an id like ``../conversations`` compares equal to
+    the permitted path here while the browser resolves it to the ENUMERATION
+    endpoint the read exception exists to keep unreachable. Both transports
+    route through this, so the guard cannot be added to one and forgotten in
+    the other.
+    """
+    if not isinstance(conversation_id, str) or not _CONVERSATION_ID_SHAPE.match(conversation_id):
+        raise RunnerError(
+            RunnerErrorCode.READ_FORBIDDEN,
+            "conversation id is not a bare uuid — refusing to build a read URL",
+            delivery_state=DeliveryState.DELIVERED,
+        )
+
+
 def is_same_origin_read_allowed(url: str, owned_conversation_id: str) -> bool:
     """AC-11b: the read exception is bound to the conversation THIS run created
     and to the chatgpt.com origin. A GET for any other conversation id, an
@@ -199,6 +224,7 @@ def is_enumeration_endpoint(url: str) -> bool:
 
 def enforce_read_allowed(url: str, owned_conversation_id: str) -> None:
     """Raise ``read_forbidden`` unless ``url`` is the bounded permitted read."""
+    assert_conversation_id_shape(owned_conversation_id)
     if is_enumeration_endpoint(url) or not is_same_origin_read_allowed(url, owned_conversation_id):
         raise RunnerError(
             RunnerErrorCode.READ_FORBIDDEN,

@@ -118,6 +118,16 @@ fleet = [
 chatgpt_web = [
     "cloakbrowser[patchright]>=0.3.28,<0.4",
     "playwright>=1.40,<2",
+    # F970 (#819) step 3: the detached read/upload path (the conversation GET
+    # and the signed-upload chain run browser-free on the exported session).
+    # Amendment C's C5 requires the client version and the accepted TLS posture
+    # to be pinned TOGETHER — a bump re-owes the route acceptance checks,
+    # because `chrome` is a floating alias for the library's newest profile.
+    # The runner asserts the configured template against both the
+    # probe-certified set and the client's own declared set BEFORE constructing
+    # a client, since 0.13.0 was measured accepting an unknown template
+    # silently (r4 §2).
+    "curl_cffi>=0.13.0,<0.15",
 ]
 
 [project.scripts]

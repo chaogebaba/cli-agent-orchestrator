@@ -388,6 +388,36 @@ async def _drive_browser(
             delivery_state=submit.delivery_state,
         )
 
+    # F970 (#819) step 3 — move the POLL off the browser. The send needed the
+    # page; the read does not (r4 §7). Export once, here, after the turn is
+    # delivered, and poll from Python. Best-effort: an export or client failure
+    # (no optional extra installed, an uncertified TLS template, a bad session)
+    # logs and leaves the in-page read in place, so this can never turn a
+    # delivered turn into a failed one.
+    if os.environ.get("CAO_CHATGPT_DETACHED_READ", "1") not in ("0", "false", "no"):
+        try:
+            from cli_agent_orchestrator.chatgpt_web_runner.detached_transport import (
+                DetachedReader,
+            )
+            from cli_agent_orchestrator.chatgpt_web_runner.session_export import (
+                default_export_path,
+                export_session,
+                save_session,
+            )
+
+            bundle = await export_session(context, page, profile=str(profile))
+            if bundle.usable:
+                save_session(bundle, default_export_path(profile))
+                transport.reader = DetachedReader(bundle)
+                logger.info("chatgpt_web polling detached: %s", bundle.summary())
+            else:
+                logger.info("chatgpt_web session export unusable; polling in-page")
+        except Exception as exc:
+            logger.warning(
+                "chatgpt_web detached read unavailable (%s); polling in-page",
+                type(exc).__name__,
+            )
+
     submitted_uid = ""
     for _ in range(10):
         probe = await transport.read_conversation(conv_id)
@@ -414,6 +444,8 @@ async def _drive_browser(
             if snap is not None:
                 stream_holder.clear()
                 stream_holder.update(snap)
+                stream_holder["detached_reads"] = transport.detached_reads
+                stream_holder["detached_demoted"] = transport.detached_demoted
                 logger.info(
                     "chatgpt_web stream: %s token events, %s frames (%s dropped), quota=%s",
                     snap.get("token_events"),
