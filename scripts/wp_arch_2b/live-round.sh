@@ -243,17 +243,12 @@ SERIES_PID=\$!
 # ``/fleet`` answers an OBJECT with a ``terminals`` key, not a bare list — the
 # first run of this round drove nothing at all because the parser assumed a list
 # and silently produced no lanes.
-# ONE fleet read feeds both the lane list and the provider map.  Two reads a
-# second apart disagreed on a live box: the first saw a transient id that was
-# gone by the second, and the turns loop then spent one send per turn on a
-# terminal that answered 404 for the whole arm.
-curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" > "\$ROUND/fleet-lanes.json" 2>/dev/null
-LANES=\$(python3 -c '
+LANES=\$(curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
 import json, sys
-body = json.load(open(sys.argv[1]))
+body = json.load(sys.stdin)
 rows = body["terminals"] if isinstance(body, dict) else body
 print(" ".join(r["id"] for r in rows))
-' "\$ROUND/fleet-lanes.json" 2>/dev/null)
+' 2>/dev/null)
 if [ -z "\$LANES" ]; then echo "HARNESS: the session has no lanes; see launch.log"; exit 2; fi
 echo "lanes: \$LANES"
 
@@ -261,13 +256,13 @@ echo "lanes: \$LANES"
 # classifier is banner-only and each provider has its OWN banner regex
 # (providers/condition.py:760-772).  Driving the wrong one produces nothing and
 # the check SKIPs on a round that looked like it ran.
-python3 -c '
+curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
 import json, sys
-body = json.load(open(sys.argv[1]))
+body = json.load(sys.stdin)
 rows = body["terminals"] if isinstance(body, dict) else body
 for row in rows:
     print(row["id"], row.get("provider") or "")
-' "\$ROUND/fleet-lanes.json" > "\$ROUND/lane-providers.txt" 2>/dev/null || true
+' > "\$ROUND/lane-providers.txt" 2>/dev/null || true
 cat "\$ROUND/lane-providers.txt"
 ARM_STARTED=\$(date +%s)
 
@@ -342,12 +337,79 @@ cap_banner_for() {
     *)         return 1 ;;
   esac
 }
+cappable_lanes=""
 while read -r lane_id lane_provider; do
   cap_banner_for "\$lane_provider" > "\$ROUND/cap-banner-\$lane_provider.txt" 2>/dev/null || continue
+  cappable_lanes="\$cappable_lanes \$lane_id"
   send "\$lane_id" "Run this exact shell command and nothing else, then stop: cat \$ROUND/cap-banner-\$lane_provider.txt"
   echo "cap drive -> \$lane_id (\$lane_provider)" >> "\$ROUND/send.log"
 done < "\$ROUND/lane-providers.txt"
 sleep 60
+
+# THE PRECONDITIONS (N11).  Every ``N/A`` scope used to be INFERRED from an
+# empty result, which made a harness regression indistinguishable from a
+# criterion the box cannot reach: a workload that silently stopped driving
+# produced the same empty table as a fleet with nothing cappable on it, and the
+# verdict stayed YES.  Three of this harness's defects have now had that exact
+# shape.  So the arm RECORDS what it actually set up, and the analyser reads the
+# record instead of guessing from absence.  An empty result whose precondition
+# says the workload SHOULD have produced something is a FAIL.
+python3 - "\$ROUND" "\$cappable_lanes" <<'PRECONDITIONS'
+import json, os, subprocess, sys, urllib.request
+
+round_dir, cappable = sys.argv[1], sys.argv[2].split()
+providers = {}
+for line in open(os.path.join(round_dir, "lane-providers.txt")):
+    parts = line.split()
+    if len(parts) == 2:
+        providers[parts[0]] = parts[1]
+
+# The spawn command per lane, from the terminal row.  A lane whose command
+# carries a permissions-skip flag cannot raise a real dialog, and that is the
+# precondition behind prompt-awaiting's scope — recorded, not assumed.
+spawn = {}
+for terminal_id in providers:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:$PORT/terminals/{terminal_id}", timeout=20
+        ) as response:
+            spawn[terminal_id] = json.load(response).get("shell_command") or ""
+    except Exception as exc:
+        spawn[terminal_id] = f"<unreadable: {exc}>"
+
+skip_flags = ("--dangerously-skip-permissions", "--yolo", "--skip-permissions")
+dialog_capable = [
+    terminal_id
+    for terminal_id, command in spawn.items()
+    if command and not command.startswith("<unreadable")
+    and not any(flag in command for flag in skip_flags)
+]
+unreadable = [t for t, c in spawn.items() if c.startswith("<unreadable")]
+
+json.dump(
+    {
+        "lane_providers": providers,
+        "spawn_commands": spawn,
+        "spawn_unreadable": unreadable,
+        # Lanes the cap drive actually targeted, i.e. whose provider has a
+        # banner the CAPPED classifier knows.
+        "cappable_lanes": cappable,
+        # Lanes that could raise a REAL permission card.  Empty means the round
+        # structurally cannot exercise prompt-awaiting.
+        "dialog_capable_lanes": dialog_capable,
+        # A terminal can only be certified when the H1 seam is armed, so an
+        # unarmed seam means no cohort can exist and certified-pane-silence has
+        # nothing to arm on.  Certification itself lives in server memory and is
+        # not readable from here; the seam is.
+        "herdr_seam_armed": os.environ.get("CAO_HERDR_RUNTIME", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+    },
+    open(os.path.join(round_dir, "preconditions.json"), "w"),
+    indent=2,
+)
+print("preconditions recorded")
+PRECONDITIONS
+cat "\$ROUND/preconditions.json" 2>/dev/null | head -40
 
 # Hold the arm open to its floor.  Not padding: the sweep runs every
 # PANE_HEARTBEAT_S and the condition label's lifetime is measured in sweeps, so
@@ -464,7 +526,7 @@ for arm in off on; do
   if ! grokfleet ssh --lease "$LEASE_ID" "echo $payload_b64 | base64 -d > $REMOTE_SCRATCH-payload.sh && bash $REMOTE_SCRATCH-payload.sh" >>"$OUT/round.log" 2>&1; then
     die "arm $arm did not complete; see $OUT/round.log"
   fi
-  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log; do
+  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt send.log; do
     grokfleet ssh --lease "$LEASE_ID" "cat $REMOTE_SCRATCH/$arm/$artefact 2>/dev/null | base64 -w0" \
       2>/dev/null | base64 -d > "$OUT/$arm/$artefact" 2>/dev/null || true
   done
@@ -484,7 +546,8 @@ grokfleet ssh --lease "$LEASE_ID" "
     --on-fleet $REMOTE_SCRATCH/on/fleet.json \
     --on-fleet-series $REMOTE_SCRATCH/on/fleet-series.jsonl \
     --on-read-path $REMOTE_SCRATCH/on/read-path.jsonl \
-    --on-server-log $REMOTE_SCRATCH/on/cao.log
+    --on-server-log $REMOTE_SCRATCH/on/cao.log \
+    --on-preconditions $REMOTE_SCRATCH/on/preconditions.json
 " | tee "$OUT/report.txt"
 verdict_status=${PIPESTATUS[0]}
 
