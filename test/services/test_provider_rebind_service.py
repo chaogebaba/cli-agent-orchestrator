@@ -1381,7 +1381,9 @@ def test_public_delete_passes_current_lease_token_to_single_teardown_body(monkey
     }
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: metadata)
     monkeypatch.setattr(terminal_service, "list_terminals_by_session", lambda _session: [metadata])
-    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", lambda _session: None)
+    monkeypatch.setattr(
+        terminal_service, "quiesce_session_teardown_set_sync", lambda _session: None
+    )
     monkeypatch.setattr(
         terminal_service,
         "_delete_terminal_under_lease",
@@ -1442,7 +1444,9 @@ async def test_delete_is_busy_with_zero_teardown_at_commit_boundaries(monkeypatc
     }
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: metadata)
     monkeypatch.setattr(terminal_service, "list_terminals_by_session", lambda _session: [metadata])
-    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", lambda _session: None)
+    monkeypatch.setattr(
+        terminal_service, "quiesce_session_teardown_set_sync", lambda _session: None
+    )
     monkeypatch.setattr(terminal_service, "_delete_terminal_under_lease", teardown)
     observed = []
 

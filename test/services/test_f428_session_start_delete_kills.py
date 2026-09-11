@@ -122,7 +122,7 @@ def _patch_delete_seams(
             return_value=None,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service.quiesce_session_teardown_set_sync",
             return_value=None,
         ),
         patch(
@@ -518,7 +518,7 @@ def test_delete_quiesce_runs_before_lifecycle_lease():
         patches[3],
         patches[4],
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service.quiesce_session_teardown_set_sync",
             side_effect=_quiesce,
         ),
         patches[6],

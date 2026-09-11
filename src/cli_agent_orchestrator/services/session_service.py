@@ -633,7 +633,7 @@ def delete_session(
         # only thing deliberately left OUTSIDE — see finalize_session /
         # _delete_terminal_under_lease, which emit their events themselves.
         with session_lifecycle_lock(session_name):
-            terminal_service.quiesce_deferred_session_sync(session_name)
+            terminal_service.quiesce_session_teardown_set_sync(session_name)
             lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
             if lifecycle_lease is None:
                 raise RuntimeError("resume_in_progress")
