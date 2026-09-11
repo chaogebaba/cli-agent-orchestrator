@@ -76,6 +76,15 @@ class RunnerOutcome:
     report_body_sha256: Optional[str] = None
     # --- attachment identity tuple (D8), when an attachment was sent --------
     attachment_identity: Optional[dict[str, Any]] = field(default=None)
+    # --- teed send-stream facts (F970 #819, Amendment D) --------------------
+    #: The ``SseProgressTracker`` snapshot: token/frame counts, observed status,
+    #: model/effort as the STREAM saw them, and the ``limits_progress`` quota
+    #: ``[{feature_name, remaining, reset_after}]``. Allow-listed and non-secret
+    #: by construction (see ``sse_stream``). None when the tee was not armed.
+    #:
+    #: DIAGNOSTIC ONLY: the accepted answer, its model and its effort come from
+    #: the conversation GET (D6). Nothing here promotes a partial.
+    stream_snapshot: Optional[dict[str, Any]] = field(default=None)
 
     def to_envelope(self) -> dict[str, Any]:
         """Serialize to a plain JSON-safe dict with enum values flattened.

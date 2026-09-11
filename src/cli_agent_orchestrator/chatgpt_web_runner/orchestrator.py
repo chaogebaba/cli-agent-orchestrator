@@ -66,6 +66,7 @@ def run_review(
     attachment_identity: "dict[str, Any] | None" = None,
     validate_schema: bool = True,
     manifest_text: "str | None" = None,
+    stream_snapshot: "dict[str, Any] | None" = None,
     now: Callable[[], float] = time.monotonic,
 ) -> RunnerOutcome:
     """Execute one review run under the D2 anchor sequence.
@@ -91,6 +92,7 @@ def run_review(
             request,
             delivery_state=DeliveryState.NOTHING_SENT,
             submitted=Submitted.FALSE,
+            stream_snapshot=stream_snapshot,
         )
 
     try:
@@ -106,6 +108,7 @@ def run_review(
             submitted=_submitted_for(exc.delivery_state),
             partial_source=_partial_for(exc),
             conversation_url=_conv_url_for(exc),
+            stream_snapshot=stream_snapshot,
         )
 
     try:
@@ -130,6 +133,7 @@ def run_review(
             request,
             delivery_state=DeliveryState.DELIVERED,
             submitted=Submitted.TRUE,
+            stream_snapshot=stream_snapshot,
         )
 
     # AC-2: the second pin check happens AFTER the report is built but BEFORE it
@@ -143,6 +147,7 @@ def run_review(
             request,
             delivery_state=DeliveryState.DELIVERED,
             submitted=Submitted.TRUE,
+            stream_snapshot=stream_snapshot,
         )
 
     report_path = publish(report.body)
@@ -160,6 +165,7 @@ def run_review(
         report_path=report_path,
         report_body_sha256=report.body_sha256,
         attachment_identity=attachment_identity,
+        stream_snapshot=stream_snapshot,
     )
 
 
@@ -191,6 +197,7 @@ def _fail(
     submitted: Submitted,
     partial_source: Optional[PartialSource] = None,
     conversation_url: Optional[str] = None,
+    stream_snapshot: "dict[str, Any] | None" = None,
 ) -> RunnerOutcome:
     return RunnerOutcome(
         ok=False,
@@ -202,4 +209,5 @@ def _fail(
         conversation_url=conversation_url,
         elapsed_ms=int((now() - started) * 1000),
         bundle_sha256=request.bundle_sha256,
+        stream_snapshot=stream_snapshot,
     )

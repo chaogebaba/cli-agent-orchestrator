@@ -113,6 +113,7 @@ def run_production_review(
     callback: Any = _callback_as_worker,
     verify_pin: Any = _verify_pin_real,
     browser_turn: Any = None,
+    on_stream_event: Any = None,
 ) -> RunnerOutcome:
     """Drive one production review turn through the D2 anchor sequence.
 
@@ -168,6 +169,9 @@ def run_production_review(
     # Holder the browser turn fills with the OBSERVED attachment identity (incl.
     # the composer-side reference) so the envelope carries it (D8/AC-9).
     _observed_attachment: dict[str, Any] = {}
+    # F970 (#819): holder for the teed send-stream facts (token/frame counts,
+    # observed status/model, limits_progress quota). Diagnostic; D6 unchanged.
+    _stream_facts: dict[str, Any] = {}
 
     # F862 (#718) D7/D16 r6 — open the DURABLE send-intent record for this
     # attempt BEFORE any browser work. Amendment C's owed-code row 1: at
@@ -209,6 +213,8 @@ def run_production_review(
                 bundle_sha=bundle_sha,
                 observed_holder=_observed_attachment,
                 intent_log=_intent_log,
+                stream_holder=_stream_facts,
+                on_stream_event=on_stream_event,
             )
         )
 
@@ -234,6 +240,7 @@ def run_production_review(
         manifest_text=(
             Path(upload_path).read_text(encoding="utf-8", errors="ignore") if upload_path else None
         ),
+        stream_snapshot=(_stream_facts or None),
     )
 
     # Worker-scoped callback AFTER publication (report-before-callback, D10/AC-1).
@@ -263,6 +270,8 @@ async def _drive_browser(
     bundle_sha: str,
     observed_holder: Optional[dict[str, Any]] = None,
     intent_log: Optional[Any] = None,
+    stream_holder: Optional[dict[str, Any]] = None,
+    on_stream_event: Any = None,
 ) -> AcceptedAnswer:
     """The real browser turn: launch, egress-guard, (attach), submit, poll (D3/D6).
 
@@ -307,6 +316,10 @@ async def _drive_browser(
 
     transport = Transport(page, intent_log=intent_log)
     transport.arm_send_observer()
+    # F970 (#819): arm the SSE tee BEFORE the first navigation — an init script
+    # only applies to subsequent loads. Progress/quota only; D6 unchanged.
+    armed = await transport.arm_sse_tee(on_event=on_stream_event)
+    logger.info("chatgpt_web sse tee armed=%s", armed)
     await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
     await page.locator(SEL_COMPOSER).first.wait_for(state="visible", timeout=20000)
 
@@ -331,6 +344,11 @@ async def _drive_browser(
     submit = await transport.submit_and_confirm(timeout_s=40.0)
     conv_id = submit.conversation_id
     if submit.delivery_state is not DeliveryState.DELIVERED or not conv_id:
+        if stream_holder is not None:
+            snap = transport.stream_snapshot()
+            if snap is not None:
+                stream_holder.clear()
+                stream_holder.update(snap)
         await context.close()
         raise RunnerError(
             RunnerErrorCode.SUBMIT_UNKNOWN,
@@ -357,6 +375,20 @@ async def _drive_browser(
             conv_id, submitted_uid, run_id, bundle_sha, timeout_s=420.0
         )
     finally:
+        # The stream facts are published on EVERY exit — a quota or truncation
+        # failure is exactly when the caller wants the last thing the stream saw.
+        if stream_holder is not None:
+            snap = transport.stream_snapshot()
+            if snap is not None:
+                stream_holder.clear()
+                stream_holder.update(snap)
+                logger.info(
+                    "chatgpt_web stream: %s token events, %s frames (%s dropped), quota=%s",
+                    snap.get("token_events"),
+                    snap.get("frames_seen"),
+                    snap.get("frames_dropped"),
+                    snap.get("quota"),
+                )
         await context.close()
     assert isinstance(answer, AcceptedAnswer)
     return answer

@@ -382,6 +382,17 @@ def test_reachability_egress_guard_installed_and_calls_enforce(monkeypatch) -> N
         def arm_send_observer(self):
             pass
 
+        async def arm_sse_tee(self, on_event=None):
+            # F970 (#819): production arms the SSE tee BEFORE navigating. The
+            # double tracks the real seam (same reason it takes intent_log):
+            # a missing method here would hide a wiring break behind an
+            # AttributeError instead of failing the assertion below.
+            self.tee_armed = True
+            return False
+
+        def stream_snapshot(self):
+            return None
+
         async def type_prompt(self, text):
             pass
 

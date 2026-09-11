@@ -167,6 +167,10 @@ def _newest_user_msg_id(conv: dict[str, Any]) -> str:
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+    from cli_agent_orchestrator.chatgpt_web_runner.sse_stream import (
+        SseProgressTracker,
+        StreamEvent,
+    )
 
 
 class Transport:
@@ -196,6 +200,11 @@ class Transport:
         # /backend-api/conversation/<uuid> response (NOT the /c/WEB:<uuid> route
         # id — F862 r2: they differ; the route uuid 404s on the backend).
         self.backend_conversation_id: Optional[str] = None
+        # F970 (#819, Amendment D): the teed send-SSE progress tracker, set by
+        # ``arm_sse_tee``. None when the tee is not armed or could not install —
+        # the turn proceeds either way, because D6's conversation GET, not this
+        # stream, decides completion.
+        self.sse_tracker: Optional["SseProgressTracker"] = None
 
     def arm_send_observer(self) -> None:
         """Observe page-owned responses for early conversation-id discovery (D6).
@@ -229,6 +238,62 @@ class Transport:
                 pass
 
         self.page.on("response", _on_response)
+
+    async def arm_sse_tee(self, on_event: Any = None) -> bool:
+        """Install the in-page tee that reads the send SSE body (F970, D6 note).
+
+        Before F970 the send response was observed by URL only and its body was
+        discarded, so the runner learned nothing until the first conversation
+        GET came back. The tee reads ``response.clone()`` — the browser's own
+        copy — inside the page and pushes decoded chunks to
+        :class:`SseProgressTracker`, giving token-level progress, the
+        ``limits_progress`` quota and an early view of status/end_turn.
+
+        **It does not change what decides the turn.** D6 stands: completion and
+        the accepted answer come from the conversation GET. It also cannot
+        cause a second send — the script calls through to the original fetch
+        exactly once, for the request the app itself made (D7/D16).
+
+        Best-effort by construction: a page that refuses ``expose_function`` or
+        ``add_init_script`` (an older Playwright, a re-armed transport) returns
+        False and the turn runs exactly as it did before F970. Call BEFORE
+        ``page.goto`` — an init script only applies to subsequent navigations.
+        """
+        from cli_agent_orchestrator.chatgpt_web_runner.sse_stream import (
+            SSE_BINDING_NAME,
+            SseProgressTracker,
+            build_sse_tee_script,
+        )
+
+        tracker = SseProgressTracker()
+
+        def _sink(chunk: Any) -> None:
+            try:
+                events = tracker.feed(str(chunk))
+            except Exception:  # pragma: no cover - a parse bug must not fail a turn
+                logger.debug("chatgpt_web sse tee: chunk ignored", exc_info=True)
+                return
+            if on_event is None:
+                return
+            for event in events:
+                try:
+                    on_event(event)
+                except Exception:  # pragma: no cover - a sink bug must not fail a turn
+                    logger.debug("chatgpt_web sse tee: sink raised", exc_info=True)
+
+        try:
+            await self.page.expose_function(SSE_BINDING_NAME, _sink)
+            await self.page.add_init_script(build_sse_tee_script())
+        except Exception as exc:
+            logger.warning("chatgpt_web sse tee not armed (%s); progress only", type(exc).__name__)
+            self.sse_tracker = None
+            return False
+        self.sse_tracker = tracker
+        return True
+
+    def stream_snapshot(self) -> Optional[Dict[str, Any]]:
+        """The teed stream's non-secret summary, or None when not armed."""
+        return self.sse_tracker.snapshot() if self.sse_tracker is not None else None
 
     async def type_prompt(self, text: str) -> None:
         """Type via insert_text (never fill), then read back (ask.ts:429/423)."""

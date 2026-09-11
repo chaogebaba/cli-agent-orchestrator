@@ -1,0 +1,38 @@
+event: delta_encoding
+data: "v1"
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "a1b2c3d4-0000-4000-8000-000000000001", "author": {"role": "assistant"}, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "end_turn": null, "metadata": {"model_slug": "gpt-5-6-thinking", "resolved_model_slug": "gpt-5-6-thinking", "thinking_effort": "extended", "request_id": "99aa00bb11cc", "turn_exchange_id": "te-1"}, "recipient": "all", "channel": null}, "conversation_id": "6aa15468-e7a0-83e9-8db7-18a35b16e573"}}
+
+data: {"type": "resume_conversation_token", "resume_conversation_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.THIS-IS-A-FAKE-JWT-FIXTURE-VALUE.c2lnbmF0dXJl", "conversation_id": "6aa15468-e7a0-83e9-8db7-18a35b16e573"}
+
+data: {"type": "input_message", "conversation_id": "6aa15468-e7a0-83e9-8db7-18a35b16e573"}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": "The sentinel "}
+
+event: delta
+data: {"v": "line goes last. "}
+
+event: delta
+data: {"v": "Findings follow."}
+
+data: {"type": "message_marker", "marker": "final_channel_token"}
+
+event: delta
+data: {"p": "/message/metadata/finished_duration_sec", "o": "add", "v": 31}
+
+event: delta
+data: {"v": 32}
+
+event: delta
+data: {"o": "patch", "v": [{"p": "/message/status", "o": "replace", "v": "finished_successfully"}, {"p": "/message/end_turn", "o": "replace", "v": true}]}
+
+data: {"type": "server_ste_metadata", "plan_type": "plus", "timing": {"total_ms": 31402}}
+
+data: {"type": "conversation_detail_metadata", "default_model_slug": "gpt-5-6-thinking", "conversation_id": "6aa15468-e7a0-83e9-8db7-18a35b16e573", "limits_progress": [{"feature_name": "deep_research", "remaining": 25, "reset_after": "2026-09-12T04:00:00Z"}, {"feature_name": "file_upload", "remaining": 80, "reset_after": "2026-09-12T04:00:00Z", "internal_bucket": "fu-9"}]}
+
+data: {"type": "message_stream_complete", "conversation_id": "6aa15468-e7a0-83e9-8db7-18a35b16e573"}
+
+data: [DONE]
+
