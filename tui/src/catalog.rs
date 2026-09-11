@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 116;
+const COMMAND_COUNT: usize = 117;
 
 /// What the TUI does with a command.
 ///
@@ -238,6 +238,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::ScheduleList,
     CommandId::ScheduleRemove,
     CommandId::ScheduleRun,
+    CommandId::SessionAttach,
     CommandId::SessionList,
     CommandId::SessionSend,
     CommandId::SessionStatus,
@@ -567,6 +568,8 @@ pub enum CommandId {
     SeamStatus,
 
     // `cao session` lifecycle extras
+    /// `cao session attach`
+    SessionAttach,
     /// `cao session close`
     SessionClose,
     /// `cao session manifest`
@@ -1742,6 +1745,15 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::SessionAttach => Command {
+            id: CommandId::SessionAttach,
+            parent: Some("session"),
+            leaf_name: "attach",
+            summary: "Attach this terminal to a session's multiplexer UI (herdr or tmux).",
+            policy: Policy::Handoff,
+            params: &[Param { name: "session_name", required: true, kind: ParamKind::Text }],
+            handoff_reason: Some("takes over the terminal (herdr attach execvp / tmux attach blocks) — MUST open a NEW tab/window and leave the TUI alive"),
+        },
         CommandId::SessionClose => Command {
             id: CommandId::SessionClose,
             parent: Some("session"),
@@ -1976,12 +1988,12 @@ mod tests {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
-        assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
+        assert_eq!(handoff, 19, "expected 19 HANDOFF commands, found {handoff}");
         assert_eq!(hidden, 74, "expected 74 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            116,
-            "the three policy counts must account for all 116 leaf commands of the Click tree"
+            117,
+            "the three policy counts must account for all 117 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1991,8 +2003,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            116,
-            "DISPLAY_ORDER must list 116 DISTINCT commands; a duplicate would let one command go \
+            117,
+            "DISPLAY_ORDER must list 117 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -2165,6 +2177,7 @@ mod tests {
                     CommandId::SeamReset => CommandId::SeamReset,
                     CommandId::SeamRollback => CommandId::SeamRollback,
                     CommandId::SeamStatus => CommandId::SeamStatus,
+                    CommandId::SessionAttach => CommandId::SessionAttach,
                     CommandId::SessionClose => CommandId::SessionClose,
                     CommandId::SessionManifest => CommandId::SessionManifest,
                     CommandId::SessionRecover => CommandId::SessionRecover,
@@ -2194,7 +2207,7 @@ mod tests {
                 CommandId::ConfigList,
                 CommandId::ConfigPath,
                 CommandId::ConfigSet,
-    CommandId::ConfigPreflight,
+                CommandId::ConfigPreflight,
                 CommandId::EnvGet,
                 CommandId::EnvList,
                 CommandId::EnvSet,
@@ -2286,6 +2299,7 @@ mod tests {
                 CommandId::SeamReset,
                 CommandId::SeamRollback,
                 CommandId::SeamStatus,
+                CommandId::SessionAttach,
                 CommandId::SessionClose,
                 CommandId::SessionManifest,
                 CommandId::SessionRecover,
@@ -2353,8 +2367,8 @@ mod tests {
 
         assert_eq!(
             offered.len(),
-            42,
-            "commands() must offer the 24 IN-APP plus 18 HANDOFF commands and nothing else; an \
+            43,
+            "commands() must offer the 24 IN-APP plus 19 HANDOFF commands and nothing else; an \
              empty or short list would satisfy the Hidden check below while offering nothing"
         );
 
@@ -2435,6 +2449,7 @@ mod tests {
                 "profile templates",
                 "profile validate",
                 "schedule run",
+                "session attach",
                 "skills add",
                 "skills list",
                 "skills remove",
@@ -2443,7 +2458,7 @@ mod tests {
                 "workflow run",
                 "workflow wait"
             ],
-            "expected exactly these 18 HANDOFF commands; without this assertion the loop above \
+            "expected exactly these 19 HANDOFF commands; without this assertion the loop above \
              passes vacuously when zero entries are HANDOFF"
         );
     }

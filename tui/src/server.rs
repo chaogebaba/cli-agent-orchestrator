@@ -742,6 +742,7 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::SeamReset => None,
         CommandId::SeamRollback => None,
         CommandId::SeamStatus => None,
+        CommandId::SessionAttach => None,
         CommandId::SessionClose => None,
         CommandId::SessionManifest => None,
         CommandId::SessionRecover => None,

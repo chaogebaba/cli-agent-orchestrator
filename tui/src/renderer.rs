@@ -7628,7 +7628,7 @@ mod tests {
 
         // And the list states that it is showing a window, so 42 commands do not read as 13.
         assert!(
-            drawn.contains("of 42 commands"),
+            drawn.contains("of 43 commands"),
             "the windowed list must say how many commands there are in total, or the operator \
              cannot tell a window from the whole catalog. Screen:\n{drawn}"
         );
