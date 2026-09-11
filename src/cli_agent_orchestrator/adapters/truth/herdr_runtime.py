@@ -111,6 +111,7 @@ __all__ = [
     "attach",
     "detach",
     "reset_sources",
+    "set_event_loop",
     "source_for",
 ]
 
@@ -161,6 +162,23 @@ _PROBE_KEEPALIVE_S = NO_SIGNAL_S / 4.0
 _lock = threading.RLock()
 #: terminal_id -> the live source for it (one source per terminal, §4).
 _sources: dict[str, "HerdrRuntimeSource"] = {}
+#: The server's event loop, recorded by the composition root.
+#:
+#: This is not a convenience.  ``attach`` is called from the backend shim inside
+#: ``create_window``, which the terminal service runs on a WORKER THREAD under
+#: the lifecycle lock — there is no running loop there, so ``get_running_loop``
+#: raises and the source would be created and never started.  A source that never
+#: starts never subscribes, so the live cohort would report nothing at all while
+#: every unit test (which drives the source by hand) stayed green.  The loop the
+#: server actually runs on has to be handed in from the one place that knows it.
+_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_event_loop(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Record the server's loop so a worker-thread attach can schedule onto it."""
+    global _loop
+    with _lock:
+        _loop = loop
 
 
 def reset_sources() -> None:
@@ -782,20 +800,38 @@ def attach(
 
 
 def _schedule(source: HerdrRuntimeSource) -> None:
-    """Start the streaming task when a loop is running; else stay dormant.
+    """Start the streaming task, from a loop thread OR a worker thread.
 
-    A source with no running loop is created and returned but not started — a
-    test drives its ``_process_pane``/``_emit_gap_degraded`` directly, and the
-    server schedules ``start`` on its own loop.
+    Three cases, and the middle one is the production case:
+
+    * **A loop is running here** — a test, or a caller already on the server
+      loop: schedule directly.
+    * **No loop here, but the server's loop was recorded** — the real path.
+      ``create_window`` runs on a worker thread under the lifecycle lock, so this
+      is where every live attach lands.  ``run_coroutine_threadsafe`` hands the
+      coroutine to the loop that can actually run it; without this the source is
+      built, registered, and silently never subscribes.
+    * **Neither** — a unit test with no loop at all: the source stays dormant and
+      the test drives ``_process_pane``/``_emit_gap_degraded`` by hand.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        pass
+    else:
+        try:
+            asyncio.ensure_future(source.start())
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("could not schedule herdr runtime source", exc_info=True)
+        return
+    with _lock:
+        loop = _loop
+    if loop is None or loop.is_closed():
         return
     try:
-        asyncio.ensure_future(source.start())
+        asyncio.run_coroutine_threadsafe(source.start(), loop)
     except Exception:  # pragma: no cover - defensive
-        logger.debug("could not schedule herdr runtime source", exc_info=True)
+        logger.debug("could not schedule herdr runtime source on the server loop", exc_info=True)
 
 
 def detach(cao_terminal_id: str) -> None:

@@ -30,6 +30,7 @@ ingestion disabled for the process.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Callable, Sequence
@@ -45,6 +46,7 @@ from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
 from cli_agent_orchestrator.adapters.store.readonly import ReadOnlyPool
 from cli_agent_orchestrator.adapters.store.retention import RetentionTask
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
+from cli_agent_orchestrator.adapters.truth import herdr_runtime
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
 from cli_agent_orchestrator.adapters.truth.liveness_probe import (
     LivenessProbe,
@@ -801,6 +803,15 @@ async def start_worker_truth(
         # is the behaviour every arm before the cutover must have.
         health = SourceHealth()
         producer_check = ProducerDisagreementCheck(finding_store)
+        # WP-HERDR H1: hand the herdr source module the loop the server actually
+        # runs on. Its `attach` is called from `create_window`, which the terminal
+        # service runs on a worker thread — with no loop of its own, so without
+        # this the source is built and never started, and the cohort reports
+        # nothing while every unit test stays green.
+        try:
+            herdr_runtime.set_event_loop(asyncio.get_running_loop())
+        except RuntimeError:  # pragma: no cover - a bootstrap outside a loop
+            pass
         projector = Projector(
             event_store,
             state_store,
