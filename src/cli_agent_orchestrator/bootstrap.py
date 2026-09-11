@@ -978,6 +978,11 @@ async def start_worker_truth(
             # cutover on: with it off the label keeps its single F611 driver,
             # which is what "no behaviour change" means for an unsourced fleet.
             reclassify=_reclassify_condition if cutover_on else None,
+            # WP-HERDR §6(ii)'s bound.  Unconditional, unlike the seam above:
+            # §6(ii) keeps a certified terminal projected through a stale
+            # source whether or not the STATUS cutover is on, so the finding
+            # that makes that visible must be wired on the same terms.
+            findings=finding_store,
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
