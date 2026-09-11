@@ -418,11 +418,17 @@ class TestAC4NativeRingPassesAuth:
 
 class TestAC5WakeNativeGateTerminalService:
     """S2 r4: exercises the REAL production helper _maybe_derive_cc_team_inbox_path
-    from terminal_service.py. A mutant `_native_wake_enabled = True` in production
-    code would cause the derive mock to be called when it shouldn't be."""
+    from terminal_service.py.
 
-    def test_inbox_path_not_derived_when_native_disabled(self, monkeypatch):
-        """Production helper: wake.native=false → _derive NOT called."""
+    F747 (#747) SUPERSEDES the AC5 gate. The derivation is now unconditional for
+    a claude_code terminal: the flags decide whether we PUSH, the metadata only
+    records WHERE a push would go. Gating the metadata on the flag is what made a
+    seat born flag-off permanently unreachable by native delivery, so the former
+    "not derived when native disabled" assertion is inverted below.
+    """
+
+    def test_inbox_path_derived_even_when_native_disabled(self, monkeypatch):
+        """F747: wake.native=false no longer suppresses the derivation."""
         from unittest.mock import MagicMock
 
         from cli_agent_orchestrator.services.config_service import ConfigService
@@ -452,9 +458,9 @@ class TestAC5WakeNativeGateTerminalService:
         # Call the PRODUCTION gate helper
         result = _maybe_derive_cc_team_inbox_path("claude_code", None, "/tmp")
 
-        # Gate must suppress derivation when native=False
-        mock_derive.assert_not_called()
-        assert result is None
+        # F747: derivation is unconditional for claude_code.
+        mock_derive.assert_called_once()
+        assert result == {"cc_team_inbox_path": "/fake/inbox"}
 
     def test_inbox_path_derived_when_native_enabled(self, monkeypatch):
         """Production helper: wake.native=true → _derive IS called."""

@@ -88,7 +88,7 @@ class TestAC1FlagOffNoWrite:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With CAO_W2M_TEAMMATE_PUSH absent/false, _should_teammate_push returns False."""
-        monkeypatch.delenv("CAO_W2M_TEAMMATE_PUSH", raising=False)
+        monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "false")
         with patch(
             "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
         ) as mock_cfg:

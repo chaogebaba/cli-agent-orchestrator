@@ -72,7 +72,7 @@ def test_ac5_each_construct_has_docs_and_example() -> None:
 @pytest.fixture()
 def _rest_bridge(monkeypatch):
     monkeypatch.setenv("CAO_AGUI_ENABLED", "1")
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
     app.state.approval_bridge = ApprovalBridge(construct=construct)
     yield construct

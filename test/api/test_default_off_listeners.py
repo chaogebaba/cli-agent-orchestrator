@@ -42,8 +42,20 @@ def test_no_agent_card_listener_state_without_flag():
         assert not any(p.startswith("/a2a") for p in paths)
 
 
-def test_agui_surface_defaults_off():
-    """No flags => the AG-UI routes 404 (byte-identical default posture)."""
+def test_agui_surface_is_off_when_apps_is_off(monkeypatch):
+    """AG-UI routes 404 when ``apps.enabled`` is off.
+
+    F747 (#747): ``_agui_enabled()`` ORs ``CAO_AGUI_ENABLED`` with
+    ``apps.enabled``, and apps.enabled now SHIPS ON -- so "no env vars set" is
+    no longer the off posture; the shipped default is itself a flag. Deleting
+    the env vars (the autouse fixture above) leaves the surface ENABLED, and
+    ``GET /agui/v1/stream`` then opens the live event bus, which never
+    terminates. That blocked the TestClient forever and took an xdist worker
+    with it -- one of the two hangs behind the F747 suite crawl.
+
+    Turning apps.enabled off explicitly is what this test always meant.
+    """
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     with TestClient(app, base_url="http://localhost") as client:
         assert client.get("/agui/v1/stream").status_code == 404
         resp = client.post("/agui/v1/emit_ui", json={"component": "progress", "props": {}})

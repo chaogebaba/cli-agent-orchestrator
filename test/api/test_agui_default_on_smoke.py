@@ -26,7 +26,7 @@ client = TestClient(app, base_url="http://localhost")
 @pytest.fixture(autouse=True)
 def _only_agui_flag(monkeypatch):
     """Enable ONLY the documented CAO_AGUI_ENABLED flag (never MCP Apps)."""
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     monkeypatch.setenv("CAO_AGUI_ENABLED", "1")
 
 
@@ -92,7 +92,7 @@ def test_single_flag_drives_lifecycle_event_onto_the_stream(monkeypatch) -> None
 def test_publisher_noops_without_any_flag(monkeypatch) -> None:
     """Anti-regression for the reverse: with no flag the observer is silent."""
     monkeypatch.delenv("CAO_AGUI_ENABLED", raising=False)
-    monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "false")
     from cli_agent_orchestrator.services.event_log_service import get_event_log
 
     tid = "term-" + uuid.uuid4().hex[:8]

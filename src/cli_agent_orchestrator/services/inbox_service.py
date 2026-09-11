@@ -539,17 +539,23 @@ def _get_backoff_delay(terminal_id: str) -> float:
     return _BACKOFF_SCHEDULE[idx]
 
 
-def _queue_owns_delivery() -> bool:
-    """Is sub-phase 3b's write-through position live? (D6's muting.)
+def _queue_owns_delivery(terminal_id: str | None = None) -> bool:
+    """Does the queue own this receiver's undelivered rows? (D6's muting.)
 
-    One import, wrapped: an admission signal is unnecessary once the tick polls
-    (§13b), but a mute that could raise into the delivery path would be worse
-    than no mute at all.
+    ROW-SCOPED since #741. The switch alone answers "is the position ``on``",
+    and at ``on`` the legacy inbox is read-only but not empty — muting the whole
+    terminal strands every row still in it with no carrier at all. The predicate
+    below mutes only while the queue owns EVERYTHING this receiver is owed; see
+    ``queue_carrier.queue_owns_receiver_delivery`` for why un-muting for the
+    remainder cannot produce a second carrier over one id.
+
+    One import, wrapped: a mute that could raise into the delivery path would be
+    worse than no mute at all.
     """
     try:
-        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
 
-        return queue_owns_delivery()
+        return queue_owns_receiver_delivery(terminal_id)
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
         return False
 
@@ -565,7 +571,7 @@ def request_delivery(terminal_id: str) -> None:
     an admission signal is unnecessary once something polls the durable rows on
     a schedule no wake path can suppress.
     """
-    if _queue_owns_delivery():
+    if _queue_owns_delivery(terminal_id):
         return
     service = globals().get("inbox_service")
     if not isinstance(service, InboxService):
@@ -2304,7 +2310,7 @@ class InboxService:
         # Note what this mute does NOT carry: the paste ban. That is role-gated
         # further down and holds in every switch position, because muting follows
         # the position and the ban does not (§A1.5).
-        if _queue_owns_delivery():
+        if _queue_owns_delivery(terminal_id):
             self._log_delivery_skip(terminal_id, "queue_owns_delivery")
             return
 
@@ -3789,6 +3795,7 @@ class InboxService:
             PushOutcome,
             _should_teammate_push,
             attempt_teammate_push_reported,
+            native_fallback_reason,
         )
 
         # D3 condition 1: flag must be on
@@ -3818,8 +3825,14 @@ class InboxService:
 
                 # D3 condition 5: teammate_push flag gate
                 if not _should_teammate_push(mb.current_terminal_id):
-                    # F162 D10: rate-limited WARN when unregistered
-                    tid = mb.current_terminal_id
+                    # F162 D10: rate-limited WARN, one line per engagement.
+                    # F747 (#747): the line now NAMES why native delivery is
+                    # unusable for this terminal, because the legacy fallback
+                    # surface engaging at all is a filed quirk, not a posture.
+                    # F747 (#747) r6: SQLAlchemy types this Column[str]; the typed
+                    # reason helper takes a plain str, so narrow once here rather
+                    # than casting at each use.
+                    tid = str(mb.current_terminal_id)
                     now_ts = time.monotonic()
                     last = _fx158_gate5_last_warn.get(tid)
                     if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:
@@ -3835,8 +3848,9 @@ class InboxService:
                             )
                         if pending_count > 0:
                             logger.warning(
-                                "fx158_gate5_unregistered terminal=%s pending=%d",
+                                "native_fallback_engaged terminal=%s reason=%s pending=%d",
                                 tid,
+                                native_fallback_reason(tid) or "unknown",
                                 pending_count,
                             )
                             _fx158_gate5_last_warn[tid] = now_ts

@@ -945,8 +945,8 @@ def test_reconcile_pull_mode_pending_count_filters_by_mailbox_id(f424_db, monkey
 
     pending_by_tid: dict[str, int] = {}
     for rec in caplog.records:
-        if rec.msg == "fx158_gate5_unregistered terminal=%s pending=%d":
-            tid, pending = rec.args
+        if rec.msg == "native_fallback_engaged terminal=%s reason=%s pending=%d":
+            tid, _reason, pending = rec.args
             pending_by_tid[tid] = pending
     assert pending_by_tid["term-a"] == 2
     assert pending_by_tid["term-b"] == 5

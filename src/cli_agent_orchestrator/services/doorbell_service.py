@@ -125,7 +125,7 @@ def is_socket_delivered(row_id: int) -> bool:
         return False
 
 
-def _queue_owns_delivery() -> bool:
+def _queue_owns_delivery(terminal_id: str | None = None) -> bool:
     """Is sub-phase 3b's write-through position live? (D6's muting.)
 
     Asked through the delivery wiring rather than the environment: the boot guard
@@ -135,9 +135,9 @@ def _queue_owns_delivery() -> bool:
     which is the safe direction for a mute.
     """
     try:
-        from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+        from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
 
-        return queue_owns_delivery()
+        return queue_owns_receiver_delivery(terminal_id)
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
         return False
 
@@ -169,7 +169,7 @@ def ring_supervisor_doorbell(
     # `drain` deliberately does not mute: there the tick finishes rows already
     # enqueued while NEW traffic goes back to the legacy inbox, so muting would
     # leave that traffic with no carrier at all (§6).
-    if _queue_owns_delivery():
+    if _queue_owns_delivery(terminal_id):
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_muted reason=queue_owns_delivery row=%s",
             terminal_id,
@@ -178,7 +178,7 @@ def ring_supervisor_doorbell(
         return "skipped_disabled"
 
     # D10 (fx168): outer switch — off means no bell of any kind.
-    if not ConfigService.get("supervisor.doorbell", default=True):
+    if not ConfigService.get("supervisor.doorbell"):
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled reason=flag_off row=%s",
             terminal_id,
@@ -277,9 +277,7 @@ def ring_supervisor_doorbell(
         # emit failure never changes the delivery decision below.
         if native_refusal == "socket_unpublished":
             try:
-                transport_ejection_service.emit_native_unreachable(
-                    terminal_id, "fallback"
-                )
+                transport_ejection_service.emit_native_unreachable(terminal_id, "fallback")
             except Exception:
                 pass
         logger.info(

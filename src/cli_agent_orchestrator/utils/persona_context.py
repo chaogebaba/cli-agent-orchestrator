@@ -206,11 +206,44 @@ def _write_memory_tree(destination: Path, files: Sequence[Path]) -> None:
     (destination / "MEMORY.md").chmod(0o600)
 
 
-def _persona_root(*, create: bool = True) -> Path:
+def _persona_runtime_dir() -> Path:
+    """The private, owner-only directory the persona tree lives under.
+
+    ``XDG_RUNTIME_DIR`` when the host publishes one, and a directory under the
+    CAO home when it does not (#743).
+
+    The two cases are deliberately not symmetric. A variable that is SET but not
+    absolute is an operator misconfiguration and stays fail-loud, because
+    silently relocating a path someone chose is how a persona ends up somewhere
+    they did not intend. A variable that is UNSET is not a misconfiguration at
+    all: it is a host without a systemd user session, which every grok box is —
+    and since a box live round is now the only acceptance surface for a flag
+    flip, "codex cannot start here" made an acceptance criterion untestable
+    rather than merely inconvenient (0 codex terminals, AC10 INVALID).
+
+    What the fallback keeps is the part that matters: the SAME ownership and
+    mode assertions run on it, so the tree is owner-only either way. What it
+    changes is lifetime -- ``XDG_RUNTIME_DIR`` is cleared when the session ends
+    and the CAO home is not -- which is why the fallback lives under a ``run``
+    leaf that the retained-home sweep already reconciles at startup.
+    """
     raw = os.environ.get("XDG_RUNTIME_DIR", "")
-    if not raw or not os.path.isabs(raw):
-        raise PersonaContextError("persona_runtime_dir_invalid")
-    runtime = Path(raw)
+    if raw:
+        if not os.path.isabs(raw):
+            raise PersonaContextError("persona_runtime_dir_invalid")
+        return Path(raw)
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    fallback = Path(CAO_HOME_DIR) / "run"
+    try:
+        fallback.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PersonaContextError("persona_runtime_dir_invalid") from exc
+    return fallback
+
+
+def _persona_root(*, create: bool = True) -> Path:
+    runtime = _persona_runtime_dir()
     try:
         runtime_stat = runtime.stat()
     except OSError as exc:
@@ -237,10 +270,11 @@ def _persisted_persona_manifest(terminal_id: str) -> Path | None:
     This probe is only used to distinguish an ordinary terminal from a
     persisted persona before applying the fail-loud runtime-root contract.
     """
-    raw = os.environ.get("XDG_RUNTIME_DIR")
-    if not raw:
+    try:
+        runtime = _persona_runtime_dir()
+    except PersonaContextError:
         return None
-    candidate = Path(raw) / "cao-personas" / terminal_id / "current" / "persona-manifest.json"
+    candidate = runtime / "cao-personas" / terminal_id / "current" / "persona-manifest.json"
     try:
         candidate.stat()
     except FileNotFoundError:
@@ -1047,9 +1081,6 @@ def reconcile_retained_persona_homes() -> None:
     from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox
 
     if is_sandbox():
-        return
-    raw = os.environ.get("XDG_RUNTIME_DIR", "")
-    if not raw:
         return
     try:
         retained_root = _persona_root() / "retained"

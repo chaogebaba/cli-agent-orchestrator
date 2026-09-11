@@ -55,6 +55,7 @@ from cli_agent_orchestrator.core.delivery import (
     QueueMode,
     SeatDigest,
     SwitchPosition,
+    is_service_sender,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import (
@@ -206,18 +207,53 @@ class DeliveryTick:
         )
         digest = self._epoch_for(receiver_id, now, report)
         if digest is None:
+            logger.debug("delivery_wake receiver=%s decision=no_open_epoch", receiver_id)
             return
         if not claimed:
             # Every row is still inside its lease, so this is not a new lease
             # period and I3 forbids a second wake.  Emitting here would also
             # re-send a byte-identical line, which the transport's content window
             # would swallow — a wake reported as sent and never written.
+            logger.debug(
+                "delivery_wake receiver=%s epoch=%s decision=inside_lease",
+                receiver_id,
+                digest.epoch,
+            )
             return
         wake = self._wake.deliver(digest, claimed)
+        self._log_wake(wake, len(claimed))
         report.wakes = (*report.wakes, wake)
         if wake.recordable:
             self._record_attempts(wake, claimed, now)
         self._raise_wake_finding(wake)
+
+    @staticmethod
+    def _log_wake(wake: WakeOutcomeReport, claimed: int) -> None:
+        """One line per emission, and it is load-bearing rather than decorative.
+
+        Every non-emitting outcome this path can take is SILENT otherwise: the
+        carrier returns a refusal string, the attempt row records it, and nothing
+        reaches the log. The first live round under ``on`` found the seat quiet
+        and could not say why, because the only surviving evidence was an
+        ``attempts`` counter that four different outcomes leave at zero (#741).
+        A refusal is therefore logged at WARNING and an emission at INFO, both
+        naming the outcome, the carrier and the detail, so "which of the four"
+        is answered by reading the log rather than by reasoning about the schema.
+        """
+        level = logging.INFO if wake.emitted else logging.WARNING
+        logger.log(
+            level,
+            "delivery_wake receiver=%s epoch=%s carrier=%s outcome=%s emitted=%s "
+            "wake=%s claimed=%d detail=%s",
+            wake.receiver_id,
+            wake.epoch,
+            wake.carrier,
+            wake.outcome.value,
+            wake.emitted,
+            wake.wake_count,
+            claimed,
+            wake.detail or "-",
+        )
 
     def _epoch_for(self, receiver_id: str, now: datetime, report: TickReport) -> SeatDigest | None:
         """The receiver's open epoch, opened or extended to cover what is owed."""
@@ -300,13 +336,32 @@ class DeliveryTick:
                 dedupe_key=row.msg_id,
                 detail=f"reason={row.reason.value} attempts={row.attempts}",
             )
-        if row.is_notice or not row.sender_id:
+        if row.is_notice or is_service_sender(row.sender_id):
             # D14: a dead-letter notice is never itself dead-lettered into
             # another notice.  The flagged row records the finding ALONE and
             # enqueues nothing, so the chain is one notice deep BY CONSTRUCTION
             # rather than by rate — the rate argument bounds a loop only by how
             # long receivers keep disappearing, and the second-order notice tells
             # a reader nothing the first did not.
+            #
+            # #741 r3: the empty-sender case widened to every SERVICE sender.
+            # The docstring's justification above — "the sender of a
+            # supervisor-bound callback is a WORKER, whose composer is not
+            # killed" — is TRUE of workers and false of `watchdog:<terminal>`,
+            # `message-trace:<terminal>` and the `cao-` writers. Those ids own no
+            # terminal and no mailbox, so the notice could never be carried; it
+            # was claimed, refused `no_terminal`, and re-woken every lease period
+            # because a refusal does not terminate the row. The r2d live round
+            # produced 20 such refusals across three service ids, and they are
+            # what made its remaining 40 unreadable as acceptance evidence.
+            #
+            # The finding above still fires, so the death is not silenced — only
+            # the undeliverable notice is not written.
+            logger.debug(
+                "delivery: no sender notice for %s — sender=%s is not addressable",
+                row.msg_id,
+                row.sender_id or "<empty>",
+            )
             return
         try:
             self._store.enqueue(

@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.services import terminal_service as terminal_service_module
 from cli_agent_orchestrator.services.terminal_service import (
+    MAX_PEEK_TERMINAL_LINES,
     OutputMode,
     TerminalInputBlockedError,
     _deferred_init_tasks,
@@ -2286,12 +2287,12 @@ class TestPeekTerminal:
         }
         mock_backend.get_history.return_value = "tail"
 
-        assert peek_terminal("test1234", lines=999) == "tail"
+        assert peek_terminal("test1234", lines=99_999) == "tail"
 
         mock_backend.get_history.assert_called_once_with(
             "cao-session",
             "developer-abcd",
-            tail_lines=200,
+            tail_lines=MAX_PEEK_TERMINAL_LINES,
             strip_escapes=True,
         )
 

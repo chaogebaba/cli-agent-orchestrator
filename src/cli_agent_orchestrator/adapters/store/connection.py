@@ -27,12 +27,15 @@ cheap, boring answer.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from typing import Protocol, runtime_checkable
 
 __all__ = [
@@ -185,4 +188,38 @@ def read_only_connect(db_path: Path, *, busy_timeout_ms: int) -> sqlite3.Connect
     )
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    _warn_if_wal_unrecoverable(db_path)
     return conn
+
+
+def _warn_if_wal_unrecoverable(db_path: Path) -> None:
+    """Say so when this reader may be looking at a pre-WAL view (#744).
+
+    A ``mode=ro`` connection cannot CREATE the ``-shm`` index and cannot run WAL
+    recovery, because both are writes. While a healthy writer holds the database
+    that costs nothing -- the shm is live and the reader sees every committed
+    frame. After the writer dies UNCLEANLY the shm is stale, recovery is owed to
+    the next writer, and this connection silently reports the last checkpoint
+    instead: a count that is too LOW, with no error to distinguish it from a
+    database that genuinely holds fewer rows.
+
+    That is precisely how a live round mistook a surviving queue for a lost one.
+    The condition is not repairable from here without taking a write lock, which
+    a diagnostic may not do, so it is REPORTED: a recount that must be exact
+    reopens read-write, or reads through the running server.
+    """
+    wal = db_path.with_name(db_path.name + "-wal")
+    shm = db_path.with_name(db_path.name + "-shm")
+    try:
+        pending = wal.stat().st_size
+    except OSError:
+        return
+    if pending <= 0 or shm.exists():
+        return
+    logger.warning(
+        "read-only open of %s has %d bytes of un-checkpointed WAL and no -shm index: "
+        "this view may predate the last commits (#744). Reopen read-write, or read "
+        "through the running server, for a count that must be exact.",
+        db_path,
+        pending,
+    )

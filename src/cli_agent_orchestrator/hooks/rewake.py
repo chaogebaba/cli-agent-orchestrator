@@ -234,6 +234,28 @@ def _poll_pending(terminal_id: str, base_url: str, headers: dict[str, str]) -> t
     return "pending", max_id, "\n".join(preview_lines)
 
 
+def _native_delivery_healthy(terminal_id: str, base_url: str, headers: dict[str, str]) -> bool:
+    """F747 (#747): True when native delivery owns this seat and we must not wake.
+
+    Native agent-message delivery is the default and only seat surface; this
+    task-notification wake is the net for a terminal whose native channel is
+    verifiably broken. FAIL-OPEN: a server error, a missing route, or an
+    unparseable body all report "not healthy" so the net still fires -- losing a
+    callback is worse than one redundant notification.
+    """
+    try:
+        resp = cao_http.get(
+            f"/terminals/{terminal_id}/native-delivery",
+            base_url=base_url,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return bool(resp.json().get("healthy"))
+    except Exception:
+        return False
+
+
 def _wake(terminal_id: str, max_id: int, preview: str, streak: int, now: float) -> int:
     _save_state(terminal_id, max_id, now, streak + 1)
     # stdout: minimal valid rewake JSON (D5/AC16).
@@ -336,6 +358,16 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_max_id = max_id
                 candidate_seen = 1
             if candidate_seen < stability_polls:
+                time.sleep(poll_interval)
+                continue
+
+            # F747 (#747): one surface. When native delivery is healthy for
+            # this seat the callback is already arriving as an agent message,
+            # so the task-notification must stay silent; keep polling in case
+            # the native channel breaks later in this same arm.
+            if _native_delivery_healthy(terminal_id, base_url, headers):
+                candidate_max_id = 0
+                candidate_seen = 0
                 time.sleep(poll_interval)
                 continue
 
