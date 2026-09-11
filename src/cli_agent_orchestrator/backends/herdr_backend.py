@@ -60,9 +60,14 @@ _STATUS_UNKNOWN_WARNED_MAX = 1024
 _STATUS_UNKNOWN_LOCK = threading.Lock()
 
 
-#: A CAO terminal id as ``generate_terminal_id`` mints it: 8 lowercase hex.
-#: Mirrors ``utils.terminal._RAW_TERMINAL_ID_RE``.
-_TERMINAL_ID_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
+def _seat_key(session_name: str, window_name: str) -> tuple[str, str]:
+    """The identity of one worker seat, defined ONCE (N5).
+
+    The warn-once set and the finding's dedupe identity must agree on what "the
+    same seat" means, or the log would fall silent for a seat whose finding
+    count is still climbing. Both go through here.
+    """
+    return (session_name, window_name)
 
 
 def _terminal_id_from_window(window_name: str) -> str:
@@ -81,8 +86,10 @@ def _terminal_id_from_window(window_name: str) -> str:
     distinct inside a UNIQUE index, so the store's dedupe contract is written in
     terms of ``""``.
     """
+    from cli_agent_orchestrator.utils.terminal import is_raw_terminal_id
+
     suffix = window_name.rsplit("-", 1)[-1]
-    return suffix if _TERMINAL_ID_SUFFIX_RE.fullmatch(suffix) else ""
+    return suffix if is_raw_terminal_id(suffix) else ""
 
 
 def map_native_status(agent_status: str | None) -> TerminalStatus | None:
@@ -1209,7 +1216,12 @@ class HerdrBackend(TerminalBackend):
             record_finding(
                 FindingCode.DIAG_HERDR_STATUS_UNKNOWN,
                 terminal_id=terminal_id,
-                dedupe_key=window_name,
+                # N5: the finding's dedupe identity and the warn-once set's key
+                # are the SAME seat. The store already scopes a row by
+                # (code, terminal_id, dedupe_key) and terminal_id carries the
+                # session-unique id, so the window alone is the right dedupe_key
+                # here — _seat_key names the pairing the log side needs.
+                dedupe_key=_seat_key(session_name, window_name)[1],
                 detail=(
                     f"{observed} for pane {pane_id} (session={session_name}, "
                     f"window={window_name}); no native status, falling back to "
@@ -1218,7 +1230,7 @@ class HerdrBackend(TerminalBackend):
             )
         except Exception:  # noqa: BLE001 — an observation must never break the poll
             logger.debug("herdr status-unknown finding could not be recorded", exc_info=True)
-        seat = (session_name, window_name)
+        seat = _seat_key(session_name, window_name)
         with _STATUS_UNKNOWN_LOCK:
             first_for_seat = seat not in _STATUS_UNKNOWN_WARNED
             if first_for_seat:
@@ -1842,10 +1854,23 @@ class HerdrBackend(TerminalBackend):
     def _resolve_pane_id_from_window(self, session_name: str, window_name: str) -> str:
         """Resolve a pane_id given session_name and window_name.
 
-        Performs a fresh herdr workspace + tab + pane lookup on every call. Pane
-        IDs are not stable across deletions — herdr renumbers remaining panes
-        when any pane in the workspace is removed, so a cached pane_id would go
-        stale and cause pane_not_found errors for live terminals. workspace_id
+        Performs a fresh herdr workspace + tab + pane lookup on every call. A
+        pane_id can go DEAD while its tab label lives — the pane was closed and
+        re-created, or moved to another workspace (which mints a new
+        workspace-qualified id), or the server restarted — so a cached pane_id
+        would cause pane_not_found errors for live terminals.
+
+        It is NOT that herdr renumbers siblings. Measured on herdr 0.9.0
+        (protocol 22, grok-box-010), four tabs in one workspace, closing the
+        middle one:
+
+            BEFORE  w1:p1 tab-1   w1:p2 tab-a   w1:p3 tab-b   w1:p4 tab-c
+            AFTER   w1:p1 tab-1                 w1:p3 tab-b   w1:p4 tab-c
+
+        Surviving panes keep their ids and the closed id is retired, not reused
+        (herdr's skill file: "Closed tab and pane IDs are not reused"). The
+        conclusion — resolve live, never cache a pane_id here — is unchanged;
+        only the reason it was written down was wrong. workspace_id
         resolution is cached with a short TTL inside _resolve_workspace_id as a
         latency optimization; the chain is otherwise resolved live.
 

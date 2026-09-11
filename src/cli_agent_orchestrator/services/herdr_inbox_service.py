@@ -565,11 +565,18 @@ class HerdrInboxService:
 
         # Find stale panes: stored pane_id no longer in herdr's live pane list.
         #
-        # A stale pane_id does NOT mean the terminal is dead. herdr renumbers
-        # compact pane_ids when a sibling tab in the workspace closes, so a
-        # still-running terminal's stored pane_id can fall out of the live list
-        # while its tab is very much alive. Identity must come from the durable
-        # tab label (tmux_window), never the ephemeral pane_id.
+        # A stale pane_id does NOT mean the terminal is dead: a still-running
+        # terminal's stored pane_id can fall out of the live list while its tab
+        # is very much alive — the pane was closed and re-created, or moved to
+        # another workspace (which mints a new workspace-qualified id), or the
+        # server restarted. Identity must come from the durable tab label
+        # (tmux_window), never the ephemeral pane_id.
+        #
+        # This used to say herdr renumbers sibling panes when a tab closes.
+        # It does not: measured on herdr 0.9.0 (grok-box-010), closing a middle
+        # tab left every surviving pane id unchanged, and a closed id is retired
+        # rather than reused. The pruning rule below is unaffected — a dead id
+        # is a dead id however it died.
         stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
         if not stale_pane_ids:
             logger.debug("Reconcile: all panes live, nothing to prune")
@@ -595,10 +602,11 @@ class HerdrInboxService:
             term_session: Optional[str] = meta["tmux_session"] if meta else None
             term_window: Optional[str] = meta["tmux_window"] if meta else None
 
-            # Re-map renumbered-but-live panes instead of deleting. A live tab
-            # label means the pane_id was renumbered, not closed: re-resolve the
-            # current pane_id and update both maps. Only when re-resolution fails
-            # do we fall through to the delete path.
+            # Re-map dead-id-but-live-tab panes instead of deleting. A live tab
+            # label means the terminal survived even though its pane_id did not
+            # (pane re-created, moved to another workspace, or server restarted):
+            # re-resolve the current pane_id and update both maps. Only when
+            # re-resolution fails do we fall through to the delete path.
             if term_window and self._label_still_live(term_window):
                 try:
                     # Invalidate every cached pane answer so get_pane_id
@@ -632,7 +640,7 @@ class HerdrInboxService:
                         new_pane_id,
                     )
                     logger.info(
-                        "Reconcile: re-mapped %s %s -> %s (pane renumbered, tab still live)",
+                        "Reconcile: re-mapped %s %s -> %s (pane id no longer live, tab still live)",
                         terminal_id,
                         pane_id,
                         new_pane_id,
@@ -655,8 +663,8 @@ class HerdrInboxService:
 
         # Kill a workspace only when its label is gone from herdr AND no managed
         # terminal remains for the session. A live label means the workspace is
-        # alive and its panes were merely renumbered — killing it would tear down
-        # working agents.
+        # alive and its panes merely have ids we have not caught up with —
+        # killing it would tear down working agents.
         if affected_sessions:
             remaining_by_session: Dict[str, int] = {s: 0 for s in affected_sessions}
             for tid in self._terminal_to_pane:

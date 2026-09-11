@@ -359,7 +359,9 @@ class HerdrRuntimeSource:
 
         The binding key is the STORED stable ``agent_session`` (§7/§9), NOT the
         ephemeral herdr ``terminal_id`` (which is new after every server restart)
-        and NOT the pane_id (which herdr renumbers).  Two phases:
+        and NOT the pane_id (which does not survive the pane being re-created,
+        moved to another workspace, or the server restarting — measured on herdr
+        0.9.0: it is retired rather than renumbered).  Two phases:
 
         * **Before a stable session is bound** the source matches by the herdr
           ``terminal_id`` it was constructed with — the id herdr reports at first
@@ -402,9 +404,7 @@ class HerdrRuntimeSource:
             return (source, value)
         return None
 
-    def _bind_session(
-        self, pane: dict[str, Any], session: tuple[str, str] | None
-    ) -> None:
+    def _bind_session(self, pane: dict[str, Any], session: tuple[str, str] | None) -> None:
         """Record the stable session as the binding key on first match."""
         if session is not None:
             self._bound_session = session
