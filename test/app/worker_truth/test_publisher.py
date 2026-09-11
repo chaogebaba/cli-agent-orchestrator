@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from test.app.conftest import Rig
 
+import pytest
+
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.core.events import EventKind
 from cli_agent_orchestrator.core.findings import FindingCode
@@ -324,6 +326,11 @@ def test_the_stale_certified_source_is_recorded_as_a_finding_once_per_terminal(
     makes it visible.  Deduped per terminal, because one dead source is one
     problem however many sweeps re-confirm it: ten sweeps must be one finding
     with a count of ten, not ten findings.
+
+    ``count`` is the number of sweeps that OBSERVED the stale source; the
+    duration is ``last_seen_at - first_seen_at``, which the same writes refresh.
+    Both are asserted, because they are different numbers and only the second
+    answers "how long".
     """
     rig.sources.add(TERMINAL)
     rig.sources.set_fallback_disabled(TERMINAL)
@@ -343,9 +350,14 @@ def test_the_stale_certified_source_is_recorded_as_a_finding_once_per_terminal(
     stale = rig.findings.list_findings(code=FindingCode.DIAG_CERTIFIED_SOURCE_STALE)
     assert len(stale) == 1
     assert stale[0].terminal_id == TERMINAL
-    # Ten sweeps, ONE finding, count ten: dedup keeps it a single row and the
-    # count is what tells an operator how long the source has been quiet.
+    # Ten sweeps, ONE finding: dedup keeps it a single row.
     assert stale[0].count == 10
+    # And the DURATION is the span, not the count.  Ten sweeps each advancing
+    # the clock by NO_SIGNAL_S + 1 means nine intervals between the first
+    # observation and the last.
+    assert (stale[0].last_seen_at - stale[0].first_seen_at).total_seconds() == pytest.approx(
+        9 * (NO_SIGNAL_S + 1)
+    )
 
 
 def test_an_uncertified_stale_source_records_no_such_finding(rig: Rig) -> None:

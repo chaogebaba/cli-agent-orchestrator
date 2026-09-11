@@ -90,6 +90,28 @@ class DiagSources:
 # ---------------------------------------------------------------------- helpers
 
 
+def _span(first: datetime | None, last: datetime | None) -> str:
+    """How long a finding has been recurring: ``last_seen_at - first_seen_at``.
+
+    This is the DURATION, and it is a different number from ``count``.  ``count``
+    is how many times a writer observed the condition, which under-reports
+    whenever a tick is missed, slowed, or lost to a restart — a source stale for
+    six hours across a server bounce can carry a count of three.  The two
+    timestamps are refreshed by the same writes, so their difference is the
+    honest answer to "how long has this been going on".
+    """
+    if first is None or last is None:
+        return "-"
+    seconds = (last - first).total_seconds()
+    if seconds <= 0:
+        return "once"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 def _age(now: datetime, then: datetime | None) -> str:
     """Render a timestamp as an age, which is what an operator actually reads."""
     if then is None:
@@ -466,6 +488,10 @@ def findings_payload(
             "state": finding.state.value,
             "first_seen_at": finding.first_seen_at.isoformat(),
             "last_seen_at": finding.last_seen_at.isoformat(),
+            # The duration, spelled out rather than left for the reader to
+            # subtract — and distinct from ``count``, which is an observation
+            # tally and under-reports across missed ticks and restarts.
+            "duration_s": max(0.0, (finding.last_seen_at - finding.first_seen_at).total_seconds()),
             "sample_event_id": finding.sample_event_id,
         }
         for finding in sources.findings.list_findings(state=state, code=code)
@@ -484,19 +510,23 @@ def render_findings(
         return "no findings"
 
     lines = [
-        f"{'code':<24} {'count':>6}  {'terminal':<16} {'last seen':<12} detail",
+        # ``seen`` is the observation COUNT and ``for`` is the DURATION, and both
+        # are printed because neither implies the other: a slow or restarted
+        # writer under-counts a condition that has lasted for hours.
+        f"{'code':<24} {'seen':>5} {'for':>7}  {'terminal':<16} {'last seen':<12} detail",
         _SEPARATOR,
     ]
     # Loudest first: a code seen four hundred times is the one to look at, and a
     # list sorted by insertion order buries it under whatever fired once.
     for finding in sorted(findings, key=lambda f: (-f.count, f.code.value)):
         lines.append(
-            f"{finding.code.value:<24} {finding.count:>6}  "
+            f"{finding.code.value:<24} {finding.count:>5} "
+            f"{_span(finding.first_seen_at, finding.last_seen_at):>7}  "
             f"{(finding.terminal_id or '-'):<16} {_age(now, finding.last_seen_at):<12} "
             f"{finding.detail}".rstrip()
         )
         if finding.sample_event_id:
-            lines.append(f"{'':<24} {'':>6}  sample {finding.sample_event_id}")
+            lines.append(f"{'':<24} {'':>5} {'':>7}  sample {finding.sample_event_id}")
     return "\n".join(lines)
 
 

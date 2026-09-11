@@ -1063,10 +1063,15 @@ class Projector:
         whole design rather than an oversight.  The store dedupes on
         ``(code, terminal, dedupe_key)``, so the row stays one row; what each
         re-confirmation buys is a bumped ``count`` and a fresh ``last_seen_at``.
-        Raising only on the first degrade would leave an operator a finding with
-        a count of one whether the source had been dead for a minute or for six
-        hours, and "how long has this been going on" is the question the finding
-        exists to answer.
+        Raising only on the first degrade would leave an operator a finding
+        frozen at its first instant whether the source had been dead for a
+        minute or for six hours, and "how long has this been going on" is the
+        question the finding exists to answer.
+
+        The answer is ``last_seen_at - first_seen_at``, NOT ``count``.  ``count``
+        is how many sweeps observed the condition, and it under-reports whenever
+        a tick is missed or slowed or a restart interrupts the series; the two
+        timestamps are refreshed by these same writes and do not.
 
         Gated on the SAME condition ``_projected`` short-circuits on, not on
         certification alone: a certified terminal whose stream has never

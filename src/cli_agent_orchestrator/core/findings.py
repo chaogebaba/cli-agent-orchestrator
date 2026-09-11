@@ -137,7 +137,12 @@ class FindingCode(StrEnum):
     #: simply quiet.  Delivery to it withholds for as long as it lasts, so hours
     #: of a dead certified stream would otherwise be a status outage with no
     #: name.  Deduped PER TERMINAL, because one stale source is one problem however
-    #: many sweeps re-confirm it; the count is how long it has been going on.
+    #: many sweeps re-confirm it.  ``count`` is the number of SWEEPS that
+    #: observed the stale source, which is not the same as how long it has been
+    #: stale: a missed tick, a slowed one, or a server restart all under-report
+    #: it.  The DURATION is ``last_seen_at - first_seen_at``, refreshed by the
+    #: same writes, and that is what ``cao diag findings`` prints in its ``for``
+    #: column.
     DIAG_CERTIFIED_SOURCE_STALE = "DIAG-CERTIFIED-SOURCE-STALE"
     #: herdr answered ``pane get`` with ``agent_status: unknown`` for a pane CAO
     #: owns, so the herdr backend has NO native status for that seat and the
