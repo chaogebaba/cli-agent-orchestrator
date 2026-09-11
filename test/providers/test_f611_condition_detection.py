@@ -511,3 +511,56 @@ def test_f775_process_state_signal_survives_scoping() -> None:
     assert cond.kind is ConditionKind.PROC_EXITED
     assert cond.subtype == "shell_baseline_return"
     assert cond.confidence is Confidence.LOW
+
+
+# ── #613 ask 3 (WP-ARCH 2b, D8): exit 1 from a SEARCH is "no match" ───────────
+# grep, rg, diff and the test runners use exit 1 for "I ran correctly and found
+# nothing". Reading that as PROC_EXITED classifies a healthy worker's ordinary
+# tool call as a process failure, pings the seat about it, and sticks the label
+# on the fleet row — #613's sample verbatim.
+
+
+def _run_pane(command: str, code: int) -> str:
+    """The shape the cline driver produces: the command echo, then the exit row."""
+    return "\n".join([f"[run_commands] {command}", f"   ⎿ [Command exited with code {code}]"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["rg foo src/", "grep -rn x .", "git grep needle", "uv run pytest -q", "diff a.txt b.txt"],
+)
+def test_exit_1_from_a_search_is_not_a_condition(command: str) -> None:
+    cond = classify_condition(_run_pane(command, 1), "cline_cli")
+
+    assert cond is None or cond.kind is not ConditionKind.PROC_EXITED
+
+
+@pytest.mark.parametrize("command", ["ls /nope", "cargo build", "./deploy.sh"])
+def test_exit_1_from_anything_else_still_is(command: str) -> None:
+    """The half of the criterion a broader rule would fail: the rule is about
+    searches reporting "no match", not about silencing process failures."""
+    cond = classify_condition(_run_pane(command, 1), "cline_cli")
+
+    assert cond is not None
+    assert cond.kind is ConditionKind.PROC_EXITED
+    assert cond.subtype == "command_exit_code"
+
+
+@pytest.mark.parametrize("code", [2, 127, 130])
+def test_a_search_that_really_failed_still_is(code: int) -> None:
+    """``rg`` exits 2 on a bad pattern or an unreadable path — a real failure,
+    and only exit 1 carries the "no match" meaning."""
+    cond = classify_condition(_run_pane("rg foo src/", code), "cline_cli")
+
+    assert cond is not None
+    assert cond.kind is ConditionKind.PROC_EXITED
+
+
+def test_an_exit_with_no_command_echo_is_still_a_condition() -> None:
+    """The rule reads the command from the driver's own echo.  With no echo to
+    read there is nothing to exempt, and the conservative answer is the
+    pre-existing one."""
+    cond = classify_condition("   ⎿ [Command exited with code 1]", "cline_cli")
+
+    assert cond is not None
+    assert cond.kind is ConditionKind.PROC_EXITED

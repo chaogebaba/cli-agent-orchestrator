@@ -6962,6 +6962,12 @@ def send_input(
     (F802 #658). Defaults False for every ordinary send.
     """
     try:
+        # WP-ARCH phase 2 (D8 / #545): tell the status monitor what the SERVER is
+        # about to put into this pane, so the condition classifier does not read
+        # it back as the worker's own evidence. Before the send rather than
+        # after: the echo can reach the rolling buffer while the send call is
+        # still returning.
+        status_monitor.note_delivered_text(terminal_id, message)
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -7308,6 +7314,10 @@ def send_prepared_input(
             provider,
             defer_on_dialog=defer_on_dialog,
         )
+    # D8 / #545, the other send seam: ``send_prepared_input`` carries bytes that
+    # have already been shaped, so the message it delivers is the one the pane
+    # will echo.
+    status_monitor.note_delivered_text(terminal_id, message)
     status_monitor.notify_input_sent(terminal_id)
     status_monitor.clear_rolling_buffer(terminal_id, provider)
     if prepared_stash is not None:

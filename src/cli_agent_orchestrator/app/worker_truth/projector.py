@@ -109,6 +109,12 @@ def _no_producer_check(event: "WorkerEvent", row: "ProjectedState") -> bool:
     return False
 
 
+def _no_reclassify(terminal_id: str) -> None:
+    """The default condition re-drive: none.  The label keeps its one F611
+    driver, which is every arm before the cutover."""
+    return None
+
+
 def _no_publish(
     terminal_id: str,
     state: WorkerState,
@@ -366,6 +372,7 @@ class Projector:
         health: SourceHealthWriter | None = None,
         producer_check: Callable[[WorkerEvent, ProjectedState], bool] | None = None,
         publisher: PublishTransition | None = None,
+        reclassify: Callable[[str], None] | None = None,
     ) -> None:
         self._events = events
         self._states = states
@@ -414,6 +421,14 @@ class Projector:
         # nothing reads it, which is what made phase 1's "no behaviour change"
         # true by construction.
         self._publisher: PublishTransition = publisher if publisher is not None else _no_publish
+        # D8's second driver for the condition label.  Absent until the cutover
+        # is on: for an unsourced terminal the label keeps F611's transition
+        # driver and F752's read-side suppression exactly as they are (I7), and
+        # re-driving it here would make an unsourced terminal's behaviour depend
+        # on this phase — which #609 closed and this phase must not reopen.
+        self._reclassify: Callable[[str], None] = (
+            reclassify if reclassify is not None else _no_reclassify
+        )
 
     # -------------------------------------------------------------------- apply
 
@@ -937,6 +952,22 @@ class Projector:
         for projection in self._states.all_terminals():
             with self._lock:
                 self._legacy_check(projection.terminal_id)
+
+        # D8 — the condition label's SECOND driver, and the one that bounds its
+        # lifetime.  F611 sets a label at a genuine status transition and never
+        # revisits it, so a terminal that has gone quiet keeps whatever label its
+        # last transition produced — and going quiet is exactly when a stale
+        # label sits on the fleet row longest.  The fold owns the label's VALUE
+        # (the projected transition classifies through the same seam the pane
+        # path does); this pass owns its LIFETIME.
+        #
+        # Outside the lock, for the reason ``_deliver`` is: this reaches the
+        # legacy monitor and takes its lock.  Per terminal rather than in bulk so
+        # one slow classification cannot stall the rest, and the sink decides for
+        # itself which terminals it owns — an unsourced one keeps F611's driver
+        # and F752's read-side suppression untouched (I7).
+        for terminal_id in [projection.terminal_id for projection in self._states.all_terminals()]:
+            self._reclassify(terminal_id)
         return outcomes
 
     @staticmethod
