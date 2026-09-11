@@ -166,6 +166,27 @@ class BaseProvider(ABC):
         """Prove the launch route before any resource is allocated. Default: no-op."""
         return None
 
+    # F935 (#787): does this provider's launch HIDE the agent from the terminal
+    # backend? A wrapped launch — ``podman exec`` / ``docker exec``, an ssh
+    # hop — makes the backend's foreground process the wrapper rather than the
+    # nested agent CLI, so herdr never registers an agent and reports "unknown"
+    # indefinitely. Two places in this tree already document that as a HEALTHY,
+    # supported condition resolved by buffer analysis instead of native status:
+    # ``_resolve_native_status`` below, and
+    # ``backends/herdr_backend.fetch_native_status``.
+    #
+    # Launch health's agent-detection gate would otherwise read exactly that
+    # condition as a dead seat and tear it down 30s in. Providers that launch
+    # through a wrapper set this True and the gate stands down for them, saying
+    # so in its log line. Default False: the gate is ON unless a provider
+    # declares it cannot be satisfied, so a new provider is protected rather
+    # than silently exempt.
+    #
+    # Nothing sets this today — no shipped profile or provider launches through
+    # a wrapper (checked at r2). It exists so the person who wires one does not
+    # spend a day discovering why their healthy seat dies at launch.
+    launch_hides_agent_from_backend: bool = False
+
     # F124 S4: provider process contract
     has_process_child: bool = True
     launch_health_grace_s: float = 0.0
@@ -836,7 +857,10 @@ class BaseProvider(ABC):
         ``get_native_status()`` returns None when the backend cannot resolve a
         real agent state — always on tmux, and on herdr when the agent_status
         is "unknown" (a wrapped ``podman``/``docker exec`` launch hides the
-        agent CLI from herdr). In both cases this returns None unconditionally
+        agent CLI from herdr — such a provider declares
+        ``launch_hides_agent_from_backend`` above, which is what keeps F935's
+        launch-health gate from reading this documented-healthy state as a dead
+        seat). In both cases this returns None unconditionally
         so the caller falls through to buffer analysis via ``_resolve_buffer()``
         — never a guess derived from dispatch timing. A guess here previously
         traded fail-fast init detection (a dead/wedged launch reported ERROR)

@@ -505,6 +505,24 @@ class TerminalBackend(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support get_pane_id()")
 
+    def probe_agent_detected(self, session_name: str, window_name: str) -> Optional[bool]:
+        """Has this backend RECOGNISED an agent in the pane? (F935 #787)
+
+        Distinct from :meth:`probe_provider_liveness`, which asks whether a
+        process is alive. A wrapper or runtime that starts and stays up is alive
+        without an agent ever appearing inside it, and a seat the backend never
+        recognises carries no native status for delivery to wait on.
+
+        Returns:
+            ``True``  — an agent is named for the pane;
+            ``False`` — the backend answered and named none;
+            ``None``  — this backend has NO OPINION, and callers must skip the
+            gate entirely rather than read it as a negative. That is the default
+            here, so a backend without agent awareness (tmux) is unaffected by
+            anything built on this.
+        """
+        return None
+
     def invalidate_pane(
         self, terminal_id: str, session_name: str = "", window_name: str = ""
     ) -> None:

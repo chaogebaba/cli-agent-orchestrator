@@ -3464,6 +3464,8 @@ async def create_terminal(
             # F138 D21: strict activation in sync path (after launch health)
             if _f138_incarnation_id is not None:
                 await _confirm_launch_health(terminal_id, provider_instance)
+                # F935 (#787): and that the backend RECOGNISED an agent.
+                await _confirm_agent_detected(terminal_id, provider_instance)
                 from cli_agent_orchestrator.clients.database import (
                     f138_strict_activate,
                 )
@@ -3868,6 +3870,7 @@ def _notify_elastic_terminal_ended(terminal_id: str) -> None:
 
 
 _PERSIST_FAILURE_CODES = {
+    "agent_never_detected",
     "terminal_metadata_missing",
     "identity_persist_failed",
     "shell_baseline_unavailable",
@@ -3889,6 +3892,30 @@ class ProviderLaunchFailed(_DeferredInitFailure):
     def __init__(self, detail: str = "") -> None:
         super().__init__("provider_launch_failed")
         self.detail = detail
+
+
+class AgentNeverDetected(ProviderLaunchFailed):
+    """F935 (#787): a process is running but the backend never named an agent.
+
+    A SUBCLASS of ProviderLaunchFailed, so every existing handler — the
+    post-exposure force-reconcile branch, `_claim_and_settle_deferred_failure`,
+    the pane teardown — keeps working untouched. It carries its own code so the
+    two conditions are told apart where an operator actually looks.
+
+    That distinction is the same one F926 drew for DIAG-HERDR-STATUS-UNKNOWN,
+    and it has to survive the trip out of the process: `str(exc)` is the typed
+    code (which is what the API 500 body and the supervisor notice render), so
+    without a code of its own this would be byte-identical to a dead-process
+    failure on every surface but the server log. `__repr__` carries the prose,
+    because the deferred path settles with `reason=repr(e)`.
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        _DeferredInitFailure.__init__(self, "agent_never_detected")
+        self.detail = detail
+
+    def __repr__(self) -> str:
+        return f"AgentNeverDetected({self.detail!r})"
 
 
 def _failure_code(exc: BaseException) -> str:
@@ -3940,6 +3967,7 @@ def _notice_text(
 # F124 S7: pre-delivery failure codes — task was NOT delivered to the worker
 _PRE_DELIVERY_CODES = frozenset(
     {
+        "agent_never_detected",
         "provider_launch_failed",
         "identity_persist_failed",
         "terminal_cwd_unavailable",
@@ -5813,6 +5841,152 @@ async def _confirm_launch_health(terminal_id: str, provider) -> None:
     raise ProviderLaunchFailed(f"provider process tree is empty/dead for terminal {terminal_id}")
 
 
+async def _confirm_agent_detected(terminal_id: str, provider) -> None:
+    """F935 (#787): a live process is not yet a usable seat.
+
+    ``_confirm_launch_health`` proves a PROCESS is alive. A wrapper, launcher or
+    runtime that starts and stays up satisfies that — its foreground process is
+    not the baseline shell — while the agent inside it never comes up. The seat
+    then passes launch health carrying no native status: delivery waits on a
+    lifecycle that never arrives, and the only trace is a
+    ``DIAG-HERDR-STATUS-UNKNOWN`` row whose count climbs quietly.
+
+    Measured on herdr 0.9.0, polling from the moment the command was sent:
+
+        live pane   no agent (0s) -> agent named (1s) -> classified idle (4s)
+        crashed     agent NEVER named, indefinitely
+        bare shell  agent NEVER named, indefinitely
+
+    **The decision is the LAST DEFINITE answer, never a latch** (r2 B1). Note
+    the first line: at t=0 a perfectly healthy pane answers "no agent". r1
+    latched a negative on the first sample and then acted on it at the deadline,
+    so any backend outage starting one poll in — a herdr restart, an
+    unresolvable pane, a run of parse failures — killed a live seat, and killed
+    it precisely in the population the 30s window exists to protect (the seat
+    slow to start behind a cold model catalogue or an MCP handshake). Now an
+    early ``False`` decides nothing; only the final poll does, and a ``None``
+    at the deadline is no opinion and returns.
+
+    Skipped entirely when the backend has NO OPINION (``None`` at the first
+    ask), which is the base-class default, so tmux is untouched.
+
+    Also skipped, loudly, for a provider that declares
+    ``launch_hides_agent_from_backend`` (r2 B2). A wrapped launch —
+    ``podman exec``, ``docker exec``, an ssh hop — makes the backend's
+    foreground process the wrapper rather than the nested agent CLI, so the
+    backend never registers an agent. ``herdr_backend.fetch_native_status`` and
+    ``providers/base._resolve_native_status`` both document that as a HEALTHY
+    condition resolved by buffer analysis; failing it here would condemn a seat
+    those two files call fine.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    from cli_agent_orchestrator.core.timing import HERDR_AGENT_DETECT_S
+
+    if not getattr(provider, "has_process_child", True):
+        return
+    if getattr(provider, "launch_hides_agent_from_backend", False):
+        logger.info(
+            "f935_gate_skipped terminal=%s reason=launch_hides_agent_from_backend — "
+            "a wrapped launch hides the agent from the backend by design; status "
+            "comes from buffer analysis, not native detection",
+            terminal_id,
+        )
+        return
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return
+
+    from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+    backend = _get_backend()
+    probe = getattr(backend, "probe_agent_detected", None)
+    if not callable(probe):
+        return
+
+    # N4: resolve the pane ONCE and reuse it across polls. The resolver
+    # deliberately never caches, so a fresh resolve per poll is a
+    # workspace-list + tab-list + pane-list chain, and this loop runs ~60 times.
+    # Resolving once turns ~4 subprocesses per poll into ~1.
+    #
+    # That pin knowingly departs from the resolver's never-cache rule for the
+    # life of one gate (<= HERDR_AGENT_DETECT_S). The rule exists because a pane
+    # id can go dead — a restart, a move to another workspace — and a stale id
+    # must not be trusted. Here it cannot be: a dead id makes `pane get`
+    # unreadable, which is NO OPINION, which returns and lets the seat live. The
+    # pin therefore fails OPEN, and open is the right direction for a launch
+    # gate: the cost of a stale pin is a gate that does not run, never a live
+    # seat torn down. A herdr restart mid-gate lands exactly there.
+    session, window = metadata["tmux_session"], metadata["tmux_window"]
+    resolver = getattr(backend, "_resolve_pane_id_from_window", None)
+    pane_kwargs: dict[str, Any] = {}
+    if callable(resolver):
+        try:
+            pane_kwargs = {"pane_id": resolver(session, window)}
+        except Exception:
+            pane_kwargs = {}
+
+    def _ask() -> Optional[bool]:
+        """One sample, and it NEVER raises (r2 review B4).
+
+        The guard lives here rather than around the loop because there are two
+        call sites — the poll and the confirming ask after the deadline — and in
+        r2 only the first was covered. A probe that raised on that final ask
+        escaped as a raw exception into deferred init: a teardown and an HTTP
+        500 for a seat that may be perfectly alive, which is the precise
+        invariant B1 had just restored. A backend that cannot answer has NO
+        OPINION; that is what an exception means here too.
+        """
+        try:
+            try:
+                answer = probe(session, window, **pane_kwargs)
+            except TypeError:
+                # A backend whose probe does not take the pane_id hint.
+                answer = probe(session, window)
+        except Exception:
+            logger.warning(
+                "f935_agent_probe_error terminal=%s — treating as no opinion",
+                terminal_id,
+                exc_info=True,
+            )
+            return None
+        return cast(Optional[bool], answer)
+
+    deadline = _time.monotonic() + HERDR_AGENT_DETECT_S
+    last_definite: Optional[bool] = None
+    first = True
+    while True:
+        detected = _ask()
+        if detected is None:
+            # No opinion. On the FIRST ask that means this backend has no agent
+            # awareness at all and the gate does not apply. Later it means the
+            # backend went quiet, which is not evidence of anything.
+            if first:
+                return
+        else:
+            last_definite = detected
+            if detected:
+                return
+        first = False
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        await _asyncio.sleep(min(CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL, remaining))
+
+    # `last_definite` is only read for the log below: a True would have returned
+    # from the loop already, so the deadline can only be reached with it False or
+    # None. The decision is the CONFIRMING ask, and only a definite False fails.
+    if _ask() is False:
+        detail = (
+            f"terminal backend never detected an agent for terminal {terminal_id} "
+            f"within {HERDR_AGENT_DETECT_S}s (a process is running but no agent was "
+            f"recognised in the pane, so the seat has no native status)"
+        )
+        logger.warning("f935_agent_never_detected terminal=%s detail=%s", terminal_id, detail)
+        raise AgentNeverDetected(detail)
+
+
 # ---------------------------------------------------------------------------
 # F491: Wait for auto-responder-dismissable dialogs before send_input
 # ---------------------------------------------------------------------------
@@ -6048,6 +6222,8 @@ def _schedule_deferred_init(
             await provider_instance.initialize()
             # F124 S6: confirm provider process is alive before proceeding
             await _confirm_launch_health(terminal_id, provider_instance)
+            # F935 (#787): and that the backend RECOGNISED an agent.
+            await _confirm_agent_detected(terminal_id, provider_instance)
             # F138 D21: strict activation with pinned incarnation ID
             if f138_incarnation_id is not None:
                 from cli_agent_orchestrator.clients.database import (
