@@ -415,3 +415,46 @@ def test_ac12_reason_field_distinguishes_from_bare_unknown() -> None:
     assert r_bare.reason != r_stale.reason
     assert r_stale.reason == "expired"
     assert r_bare.reason == "no_evidence"
+
+
+# ── AC-24 (healthy-path witness, reducer level) ────────────────────────────
+def test_ac24_active_interval_always_processing_no_false_lower() -> None:
+    """Every sample of an observed active interval (activity PRESENT) publishes
+    PROCESSING — zero false idle/completed/error/cap — regardless of what the
+    last published status was."""
+    for last in (
+        TerminalStatus.IDLE,
+        TerminalStatus.COMPLETED,
+        TerminalStatus.PROCESSING,
+        TerminalStatus.UNKNOWN,
+    ):
+        s = _sample(activity=ActivityFact(value=FactValue.PRESENT))
+        out = reduce(s, _ctx(last_status=last))
+        assert out.status is TerminalStatus.PROCESSING
+        assert out.condition.kind is None  # no false cap during active work
+
+
+def test_ac24_true_end_lowers_via_confirmation() -> None:
+    """A true end lowers: an event-confirmed end lands COMPLETED in one sample;
+    the two-sample screen path lands it on the second distinct sample."""
+    # event-confirmed
+    s_evt = _sample(
+        settlement=SettlementFact(value=FactValue.PRESENT),
+        native_coverage=True,
+        native_end_event=True,
+    )
+    assert reduce(s_evt, _ctx(last_status=TerminalStatus.PROCESSING)).status is (
+        TerminalStatus.COMPLETED
+    )
+    # screen two-sample
+    ctx = _ctx(last_status=TerminalStatus.PROCESSING)
+    a = _sample(
+        readiness=ReadinessFact(value=FactValue.PRESENT), filtered_fingerprint="a", sequence=1
+    )
+    r1 = reduce(a, ctx)
+    assert r1.status is TerminalStatus.PROCESSING  # not lowered on one sample
+    assert r1.next_context is not None
+    b = _sample(
+        readiness=ReadinessFact(value=FactValue.PRESENT), filtered_fingerprint="b", sequence=2
+    )
+    assert reduce(b, r1.next_context).status is TerminalStatus.IDLE
