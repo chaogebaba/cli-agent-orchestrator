@@ -107,6 +107,7 @@ boot_server() {
 name: pi_dev
 description: F913 B4 live-round pi worker
 provider: pi_cli
+provider_init_timeout: 180
 ---
 You are a terse pi worker for a preservation-round smoke test. Answer in one word.
 PIPROF
@@ -133,7 +134,7 @@ pi_half() {
   tailf "$LOGDIR/pi-start.log"
   PI_TID=$(find_tid); echo "PI_TID=$PI_TID"
   [ -n "$PI_TID" ] || { echo "no pi terminal spawned"; return 20; }
-  wait_status "$PI_TID" 'idle|completed' 120 || { tailf "$LOGDIR/server.log"; return 20; }
+  wait_status "$PI_TID" 'idle|completed' 200 || { tailf "$LOGDIR/server.log"; return 20; }
 
   echo "\$ drive one turn (POST /terminals/$PI_TID/input)"
   api POST "/terminals/${PI_TID}/input" "$LOGDIR/pi-turn.log" \
@@ -159,11 +160,10 @@ codex_half() {
   command -v codex >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/codex" ] || { echo "codex absent"; return 40; }
 
   echo "\$ POST /sessions/start codex"
-  api POST "/sessions/start?agent_profile=codex_empirical_reviewer&provider=codex&session_name=${SESS}c&working_directory=${LIVE_HOME}" \
+  api POST "/sessions/start?agent_profile=codex_dev&provider=codex&session_name=${SESS}c&working_directory=${LIVE_HOME}" \
       "$LOGDIR/cx-start.log" -H 'Content-Type: application/json' -d '{}' >/dev/null
   tailf "$LOGDIR/cx-start.log"
-  # capture server-side detail on a 500
-  grep -qiE 'internal server error' "$LOGDIR/cx-start.log" && { echo "codex start 500 — server tail:"; tail -n 25 "$LOGDIR/server.log"; }
+  grep -qiE 'internal server error|Traceback' "$LOGDIR/cx-start.log" && { echo "codex start error — server tail:"; tail -n 25 "$LOGDIR/server.log"; }
   # newest terminal in the codex session
   curl -sS -m 10 -o "$LOGDIR/cx-terminals.json" "${BASE}/sessions/${SESS}c/terminals" 2>/dev/null
   CODEX_TID=$(python3 -c "import json;ts=json.load(open('$LOGDIR/cx-terminals.json'));print(ts[-1]['id'] if ts else '')" 2>/dev/null)
@@ -193,7 +193,7 @@ codex_half() {
   # (2) resume it
   echo "\$ POST /sessions/${SESS}c/terminals {resume_from:$CODEX_TID}"
   api POST "/sessions/${SESS}c/terminals" "$LOGDIR/cx-resume.log" \
-      -H 'Content-Type: application/json' -d "{\"agent_profile\":\"codex_empirical_reviewer\",\"provider\":\"codex\",\"resume_from\":\"${CODEX_TID}\"}" >/dev/null
+      -H 'Content-Type: application/json' -d "{\"agent_profile\":\"codex_dev\",\"provider\":\"codex\",\"resume_from\":\"${CODEX_TID}\"}" >/dev/null
   tailf "$LOGDIR/cx-resume.log"
   CODEX_RESUMED_TID=$(jqr "$LOGDIR/cx-resume.log" id | tr -d '"')
   echo "CODEX_RESUMED_TID=$CODEX_RESUMED_TID"
