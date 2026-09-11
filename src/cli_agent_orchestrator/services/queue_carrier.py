@@ -126,9 +126,12 @@ def forget_terminal_status(terminal_id: str) -> None:
 def queue_owns_new_traffic() -> bool:
     """Does the queue own NEW traffic, so the legacy inbox stops inserting? (§6)
 
-    False everywhere but ``on``. ``drain`` accepts no new queue rows at all —
-    that is the position's whole point, since it empties on its own budget while
-    new enqueues go back to the legacy inbox.
+    True whenever the queue came up. It used to be false at ``drain`` as well as
+    at ``off`` — ``drain`` accepted no new queue rows at all, which was the
+    position's whole point, since it emptied on its own budget while new enqueues
+    went back to the legacy inbox. WP-ARCH 3c deletes the legacy carriers, so
+    there is nothing for new traffic to go back TO and the switch that chose
+    between them has one position left.
     """
     try:
         from cli_agent_orchestrator.app.delivery.wiring import queue_owns_new_traffic as _owns
@@ -196,11 +199,14 @@ def queue_runtime() -> Any:
 
 
 def queue_owns_delivery() -> bool:
-    """Is the write-through position live, so D6's surfaces must stay quiet?
+    """Is the queue the carrier, so D6's surfaces must stay quiet?
 
     ONE spelling of the mute for the whole legacy tree. Each of K1 through K7
-    asks this before it emits, so 3b's single-emitter property rests on the
-    SWITCH — in 3c it rests on the deletions, and AC-3c's greps test those.
+    asked this before it emitted, so 3b's single-emitter property rested on the
+    SWITCH — in 3c it rests on the deletions, and AC-3c's greps test those. What
+    it asked was "is the resolved position ``on``?"; with the ladder collapsed it
+    asks whether the queue came up at all, which is the same question now that
+    ``on`` is the only position.
 
     Never raises. A wiring module that cannot answer leaves legacy behaving
     exactly as it does today, which is the safe direction for a mute: the cost of
@@ -232,8 +238,10 @@ def queue_owns_receiver_delivery(receiver_id: str | None) -> bool:
     PENDING row into the queue and retires it, so the set the row-scoped
     predicate existed to protect is emptied on a schedule rather than served by a
     second carrier. With no such rows, "the queue owns every undelivered row" and
-    "the position is ``on``" are the same claim, and keeping two spellings of one
-    claim is how they drift apart.
+    "the queue is running" are the same claim, and keeping two spellings of one
+    claim is how they drift apart. (The second half of that sentence used to read
+    "the position is ``on``"; the switch collapsed to that one position when the
+    legacy carriers it chose between were deleted.)
 
     ``receiver_id`` is accepted and ignored, deliberately: the callers are
     legacy mute sites that pass what they have, and a signature change would

@@ -59,9 +59,18 @@ def seam_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_activation_bootstrap_rows_are_legacy_by_default(seam_db) -> None:
+    """One row per consumer op, and every one of them starts on legacy.
+
+    The count is derived from ``SEAM_ACTIVATION_CONSUMER_OPS`` rather than
+    hard-coded: the property is "bootstrap covers the whole op list", and a
+    literal states the list's length in a second place that then has to be kept
+    in step by hand. WP-ARCH 3c slice 4 took it from 9 to 7 by removing the two
+    watchdog gates whose recorders it deleted.
+    """
     with seam_db() as db:
         rows = db.query(database.SeamActivationModel).all()
-    assert len(rows) == 9
+    assert len(rows) == len(database.SEAM_ACTIVATION_CONSUMER_OPS)
+    assert {row.consumer_op for row in rows} == set(database.SEAM_ACTIVATION_CONSUMER_OPS)
     assert {row.active_authority for row in rows} == {"legacy"}
     assert {row.active_version for row in rows} == {0}
     assert {row.acceptance_token for row in rows} == {None}
@@ -503,14 +512,27 @@ def test_view_reads_incremental_slot_only(monkeypatch) -> None:
     )
 
 
-def test_trace_manifest_is_byte_exact_and_has_36_hits() -> None:
+def test_trace_manifest_is_byte_exact() -> None:
+    """The manifest matches what the generator produces from today's source.
+
+    The COUNT is deliberately not asserted any more. It was pinned at 40 while
+    the function name said 36, which is what a hard-coded total does: it drifts
+    from its own name and then from the code, and every slice that adds or
+    removes a traced call site has to be told the new number. What actually
+    matters is that the committed file is byte-identical to a fresh generation —
+    a stale manifest is the defect, not a particular size. WP-ARCH 3c slice 4
+    took it from 40 to 33 by deleting the watchdog's notifier half.
+
+    The count is still bounded below, because zero would mean the generator
+    silently produced nothing and byte-equality against an empty file would pass.
+    """
     manifest_path = (
         Path(__file__).parents[2]
         / "src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt"
     )
     expected = manifest_path.read_text(encoding="utf-8")
     _assert_trace_manifest_current(Path(__file__).parents[2], expected)
-    assert len([line for line in expected.splitlines() if line]) == 40
+    assert len([line for line in expected.splitlines() if line]) > 0
 
 
 def test_trace_manifest_failure_names_regen_command(tmp_path: Path) -> None:

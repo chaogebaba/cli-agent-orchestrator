@@ -20,7 +20,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from cli_agent_orchestrator.core.delivery import (
-    TERMINAL_STATES,
     DeadLetter,
     DeadReason,
     DeliveryAttempt,
@@ -28,7 +27,6 @@ from cli_agent_orchestrator.core.delivery import (
     MsgState,
     QueueMessage,
     QueueMode,
-    QueueOccupancy,
     SeatDigest,
     compute_dead_by,
 )
@@ -155,15 +153,6 @@ class InMemoryQueueStore:
 
     def dead_letter(self, msg_id: str) -> DeadLetter | None:
         return self.dead.get(msg_id)
-
-    def occupancy(self) -> QueueOccupancy:
-        return QueueOccupancy(
-            live_non_terminal=sum(
-                1
-                for row in self.rows.values()
-                if row.mode is QueueMode.LIVE and row.state not in TERMINAL_STATES
-            )
-        )
 
     def count(self, *, mode: QueueMode | None = None) -> int:
         return sum(1 for row in self.rows.values() if mode is None or row.mode is mode)

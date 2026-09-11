@@ -69,13 +69,6 @@ from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
-from cli_agent_orchestrator.core.delivery import (
-    GuardOutcome,
-    QueueOccupancy,
-    SwitchPosition,
-    parse_switch,
-    resolve_switch,
-)
 from cli_agent_orchestrator.core.ports import (
     Clock,
     EventStore,
@@ -95,7 +88,6 @@ from cli_agent_orchestrator.core.switches import Rejected
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DELIVERY_ENV_VAR",
     "delivery_health_component",
     "INGEST_ENV_VAR",
     "STATUS_ENV_VAR",
@@ -105,7 +97,6 @@ __all__ = [
     "build_readonly_diag_stores",
     "build_readonly_gate_store",
     "current_runtime",
-    "delivery_position",
     "ingest_enabled",
     "shutdown_worker_truth",
     "start_worker_truth",
@@ -113,13 +104,6 @@ __all__ = [
 ]
 
 INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
-
-#: The delivery queue's own switch (D9).  A SEPARATE variable from the ingestion
-#: one, sitting beside it here and read once at boot in the same structural way.
-#: One master strangler flag was rejected because it would couple a phase-1
-#: rollback to a phase-3 rollback; this is a different switch, not the second
-#: spelling this module's own docstring warns against.
-DELIVERY_ENV_VAR = "CAO_DELIVERY_QUEUE"
 
 #: The status cutover's own switch (phase 2, D9), and its per-provider allowlist.
 #: A THIRD variable beside the other two, for the reason the second one exists:
@@ -140,28 +124,18 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     return source.get(INGEST_ENV_VAR) == "1"
 
 
-def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition | Rejected:
-    """The REQUESTED position, before D9's guard resolves it.
-
-    Requested, not effective: the guard can demote ``off`` to ``drain`` over a
-    non-empty queue, and resolve ``drain`` back to ``off`` over an empty one.  The
-    effective position is on the runtime, and a caller that wants to know what the
-    server is actually doing must read it there.
-
-    A RETIRED position (#738) is not a position at all: the answer is
-    :class:`~core.switches.Rejected`, and the delivery subsystem does not start.
-    """
-    source = os.environ if env is None else env
-    return parse_switch(source.get(DELIVERY_ENV_VAR))
-
-
 def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
     """The REQUESTED status-cutover position, before D9's guard resolves it.
 
-    Requested, not effective, for the same reason :func:`delivery_position` says
-    so: the guard demotes ``on`` to ``off`` when ingestion is off or the allowlist
-    is empty.  The effective position is on the runtime.  A retired position
-    (#738) answers :class:`~core.switches.Rejected` and arms nothing.
+    Requested, not effective: the guard demotes ``on`` to ``off`` when ingestion
+    is off or the allowlist is empty.  The effective position is on the runtime,
+    and a caller that wants to know what the server is actually doing must read
+    it there.  A retired position (#738) answers
+    :class:`~core.switches.Rejected` and arms nothing.
+
+    Phase 3's delivery queue had the same shape until WP-ARCH 3c collapsed its
+    switch; the status cutover keeps it because phase 2 still has two carriers to
+    choose between.
     """
     source = os.environ if env is None else env
     return parse_status_switch(source.get(STATUS_ENV_VAR))
@@ -170,18 +144,22 @@ def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejec
 def delivery_health_component() -> str:
     """One string for ``/health``'s ``components.delivery``.
 
-    An operator whose drop-in still says ``shadow`` learns it from the running
-    server rather than from a log line they have to go looking for: the boot's
-    ERROR scrolls past, this does not.  ``rejected/#738`` is deliberately short —
-    the reason is in the log, and a health payload is a status board, not an
-    explanation.
+    Two answers, where there were four.  The queue either started or it did not,
+    so an operator reads ``on`` or ``off`` and nothing else.  ``off`` no longer
+    names a switch position — there is no switch — it means the subsystem did not
+    come up, which on a healthy server happens only when the migration failed or
+    the queue store could not be opened; both are loud in the boot log.  The
+    three answers it replaced belonged to the ``off``/``drain``/``on`` ladder and
+    to ``rejected/#738``, the refusal of a retired position; a switch with one
+    position has neither a ladder nor a value to refuse.
+
+    A health payload is a status board, not an explanation: the reason a boot
+    came up ``off`` is in the log.
     """
     runtime = _runtime
-    if runtime is None or runtime.delivery is None:
+    if runtime is None or not runtime.delivery:
         return "off"
-    if isinstance(runtime.delivery, Rejected):
-        return "rejected/#738"
-    return runtime.delivery.position.value
+    return "on"
 
 
 @dataclass
@@ -222,19 +200,24 @@ class WorkerTruthRuntime:
     probe: LivenessProbe | None = None
     sweep: ProjectorSweep | None = None
     retention: RetentionTask | None = None
-    #: The delivery queue's RESOLVED position (D9), and the guard's reasoning.
-    #: Present whatever the ingestion switch says: the two are independent, and
-    #: a queue that only ran when worker-truth ingestion happened to be on would
-    #: be a coupling neither blueprint asks for.
-    delivery: GuardOutcome | Rejected | None = None
+    #: Whether the delivery queue's hooks were ARMED.  Set whatever the ingestion
+    #: switch says: the two are independent, and a queue that only ran when
+    #: worker-truth ingestion happened to be on would be a coupling neither
+    #: blueprint asks for.
+    #:
+    #: A bool rather than D9's resolved position and its reasoning, because
+    #: WP-ARCH 3c left the switch one position: with the legacy carriers deleted
+    #: there is no second carrier to fall back to, so the only thing still worth
+    #: recording is whether the subsystem came up.
+    delivery: bool = False
     queue_store: QueueStore | None = None
     #: The status cutover's RESOLVED position (phase 2, D9) and the guard's
     #: reasoning.  Present whatever the ingestion switch says, because the guard's
     #: whole job in the ingestion-off cells is to record that it demoted.
     status: StatusGuardOutcome | None = None
-    #: §5c's tick, present only for a position that is SERVED (``on`` or
-    #: ``drain``).  Held here so shutdown can stop it and so a test can drive
-    #: ``run_once`` directly rather than waiting on a cadence.
+    #: §5c's tick, present whenever the queue came up.  Held here so shutdown can
+    #: stop it and so a test can drive ``run_once`` directly rather than waiting
+    #: on a cadence.
     delivery_tick: DeliveryTick | None = None
 
 
@@ -612,93 +595,38 @@ def _reconcile_question_marker(terminal_id: str) -> None:
 def _start_delivery(
     pool: ConnectionPool,
     clock: Clock,
-    *,
-    env: dict[str, str] | None = None,
-) -> tuple[GuardOutcome | Rejected, QueueStore | None, DeliveryTick | None]:
-    """Resolve ``CAO_DELIVERY_QUEUE`` through D9's guard and arm the hooks.
+) -> tuple[bool, QueueStore | None, DeliveryTick | None]:
+    """Open the queue store, arm the delivery hooks, and build §5c's tick.
 
-    Never raises.  Three things happen, in this order and for this reason:
+    Never raises, and reads no environment.  ``CAO_DELIVERY_QUEUE`` had three
+    positions while the queue and the legacy inbox were both carriers.  ``off``
+    was the pre-flip default, under which legacy delivered and nothing here armed.
+    ``drain`` was the way back out of ``on``: it accepted no NEW queue rows while
+    the tick finished delivering the ones already enqueued, which is the only
+    rollback that does not leave those rows in a table nothing reads (#584).  D9's
+    boot guard resolved the three against the queue's own occupancy so that an
+    operator could not orphan rows by editing a variable.
 
-    0. **A retired position is refused before anything else.**  ``shadow`` was a
-       shipped position and #738 removed the mode, so an operator carrying it in a
-       drop-in gets a loud ERROR naming the value and the line to type, and the
-       delivery subsystem does NOT start.  It is refused rather than coerced to
-       ``off`` because coercion would run a deployment in a position nobody
-       requested while its configuration still claimed otherwise.  The refusal
-       costs the subsystem, never the server: the boot continues.
-    1. **The requested position is read once**, from the process environment,
-       which makes it a deployment decision rather than something that can flip
-       mid-session.
-    2. **The guard resolves it against the queue.**  Boot-time only — no runtime
-       transition exists, so a position changes when the server restarts and at
-       no other moment.  The guard never refuses the boot: this ships into the
-       server running the strangler work, so a self-inflicted boot failure would
-       be worse than the condition it reports, and an operator whose only mistake
-       was leaving a variable unset must not lose the server.
-    3. **A demotion writes its finding**, which is how an operator learns.  The
-       finding store is built here regardless of the INGESTION switch, because
-       the ``finding`` table is created by step 0 of every migration and the
-       guard's notice belongs to phase 3, not to phase 1.
+    WP-ARCH 3c deletes the legacy carriers.  There is no carrier to roll back TO,
+    so ``drain`` has nothing to hand traffic back to and ``off`` names a server
+    that cannot deliver at all; the switch is left with one position, and a switch
+    with one position is not a switch.  The guard, the ladder and the variable go
+    together — a resolution over a single value is a table with one cell.
 
-    ``drain`` and ``on`` arm the hooks, and they arm different things.  ``on``
-    writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.  ``drain``
-    accepts NO new queue rows while the tick finishes delivering the ones already
-    there, which is the only way back out of ``on`` that does not orphan them
-    (§6).  ``off`` arms nothing, and there is no code path from a hook to the
-    queue that does not pass the install guard in the wiring module.
+    What survives is the failure direction the guard was careful about.  This
+    ships into the server running the strangler work, so a self-inflicted boot
+    failure would be worse than the condition it reports: a queue store that
+    cannot be OPENED costs the delivery subsystem and not the server.  It is
+    logged, the hooks stay disarmed, and the boot continues.
     """
-    requested = delivery_position(env)
-    if isinstance(requested, Rejected):
-        logger.error(
-            "delivery queue NOT started: %s (%s=%s)",
-            requested.detail,
-            DELIVERY_ENV_VAR,
-            requested.value,
-        )
-        return requested, None, None
     try:
         store: QueueStore = SqliteQueueStore(pool, clock=clock)
-        occupancy = store.occupancy()
-    except Exception as exc:  # noqa: BLE001 — a queue we cannot read must not block boot
+    except Exception as exc:  # noqa: BLE001 — a queue we cannot open must not block boot
         logger.error("delivery queue could not be opened: %r", exc)
-        return GuardOutcome(requested=requested, position=SwitchPosition.OFF), None, None
+        return False, None, None
 
-    outcome = resolve_switch(requested, occupancy)
-
-    if outcome.finding is not None:
-        try:
-            SqliteFindingStore(pool, clock=clock).record(
-                outcome.finding,
-                dedupe_key=f"{outcome.requested.value}->{outcome.position.value}",
-                detail=outcome.detail,
-            )
-        except Exception:  # noqa: BLE001 — a notice that cannot be written is logged
-            logger.warning(
-                "delivery boot guard: %s (finding could not be recorded)",
-                outcome.detail,
-                exc_info=True,
-            )
-
-    if outcome.demoted:
-        logger.warning(
-            "delivery boot guard resolved %s=%s to %s: %s",
-            DELIVERY_ENV_VAR,
-            outcome.requested.value,
-            outcome.position.value,
-            outcome.detail,
-        )
-
-    if outcome.position is SwitchPosition.OFF:
-        return outcome, store, None
-
-    delivery_wiring.install_delivery(
-        delivery_wiring.DeliveryRuntime(
-            store=store,
-            clock=clock,
-            position=outcome.position,
-        )
-    )
-    logger.info("delivery queue armed in %s mode (%s)", outcome.position.value, DELIVERY_ENV_VAR)
+    delivery_wiring.install_delivery(delivery_wiring.DeliveryRuntime(store=store, clock=clock))
+    logger.info("delivery queue armed")
 
     findings: FindingStore | None
     try:
@@ -706,27 +634,31 @@ def _start_delivery(
     except Exception:  # noqa: BLE001 — a tick without findings still delivers
         logger.warning("delivery: the finding store could not be built", exc_info=True)
         findings = None
-    tick = _build_delivery_tick(store, clock, position=outcome.position, findings=findings)
-    return outcome, store, tick
+    tick = _build_delivery_tick(store, clock, findings=findings)
+    return True, store, tick
 
 
 def _build_delivery_tick(
     store: QueueStore,
     clock: Clock,
     *,
-    position: SwitchPosition,
     findings: FindingStore | None,
 ) -> DeliveryTick | None:
-    """Assemble §5c's tick, or ``None`` for a position that is not served.
+    """Assemble §5c's tick, or ``None`` if it cannot be assembled.
 
     The one place the legacy carrier bridge is NAMED, for the same reason this
     module is the one place an adapter is named: ``app`` may not import
     ``services``, so the tick depends on three Protocols and the composition root
     is what satisfies them.  Imported inside the function so a test can build the
     tick from doubles without pulling the legacy service tree in.
+
+    It used to refuse a switch position that was not served, and to wire the
+    adopter for both served positions while relying on ``adopt_legacy_row`` to
+    no-op at ``drain`` — an adopted row IS new queue traffic, and ``drain``
+    existed not to accept any.  With one position left (WP-ARCH 3c) there is
+    nothing to refuse and nothing to no-op for: a tick exists whenever the queue
+    does, and it always adopts.
     """
-    if position not in (SwitchPosition.ON, SwitchPosition.DRAIN):
-        return None
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
             LegacyInboxAdoption,
@@ -749,17 +681,8 @@ def _build_delivery_tick(
             directory=directory,
             findings=findings,
             clock=clock,
-            position=position,
             # 3c: the fourth Protocol, and the one that keeps the legacy inbox
             # from stranding rows now that its two carriers are deleted.
-            #
-            # Wired for both served positions, but it is a NO-OP outside ``on``
-            # and deliberately so: ``adopt_legacy_row`` refuses unless the queue
-            # owns new traffic, and an adopted row IS new queue traffic. Letting
-            # it run at ``drain`` would make that position accept inserts, which
-            # is the one thing ``drain`` exists not to do. The alternative —
-            # gating the wiring here instead — would put the same rule in two
-            # places and let them drift.
             adopter=LegacyInboxAdoption(),
         )
     except Exception:  # noqa: BLE001 — a tick that cannot be built must not block boot
@@ -788,13 +711,15 @@ def _resolve_status_cutover(
     Sub-phase 2a implements ``off`` only, now that ``shadow`` is retired (#738):
     the publisher is D1's feed and lands in 2b.  A boot that resolves to ``on``
     therefore gets a loud warning and NO publisher, rather than being quietly
-    reinterpreted as something that runs — the shape ``_start_delivery`` uses
-    above, and for its reason: an operator who asked for the feed and silently got
-    a different mode would believe consumers were reading the projection when they
-    were not.
+    reinterpreted as something that runs: an operator who asked for the feed and
+    silently got a different mode would believe consumers were reading the
+    projection when they were not.
 
-    A REQUESTED ``shadow`` is refused outright, exactly as ``_start_delivery``
-    refuses it, and resolves to ``off`` with one ERROR line naming the fix.
+    A REQUESTED ``shadow`` is refused outright and resolves to ``off`` with one
+    ERROR line naming the fix.  This shape was shared with ``_start_delivery``
+    until WP-ARCH 3c collapsed the delivery switch to a single position; phase 2
+    keeps it because it still has two carriers to choose between, and its
+    rollback still has somewhere to go.
     """
     source = os.environ if env is None else env
     requested_or_rejected = parse_status_switch(source.get(STATUS_ENV_VAR))
@@ -894,7 +819,7 @@ async def start_worker_truth(
     # The delivery switch is resolved whatever the INGESTION switch says: they
     # are two independent strangler phases and coupling them would mean a
     # phase-3 rollback needed a phase-1 decision.
-    delivery, queue_store, delivery_tick = _start_delivery(pool, resolved_clock, env=env)
+    delivery, queue_store, delivery_tick = _start_delivery(pool, resolved_clock)
     if delivery_tick is not None:
         # Started HERE rather than behind the ingestion switch: the two are
         # independent strangler phases, and a queue that only ran when phase 1

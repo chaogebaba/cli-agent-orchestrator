@@ -2326,9 +2326,10 @@ async def health_check():
             "cao": "ok",
             "herdr": herdr_component,
             "claude": _probe("claude"),
-            # #738: ``rejected/#738`` means CAO_DELIVERY_QUEUE names a retired
-            # position (shadow-live mode) and the delivery subsystem did not
-            # start; otherwise the RESOLVED position, or "off".
+            # "on" when the delivery queue's hooks are armed, "off" when the
+            # subsystem did not come up. Two answers because WP-ARCH 3c left the
+            # queue one mode: with the legacy carriers deleted there is no second
+            # carrier to switch to, so there is no position to report.
             "delivery": bootstrap.delivery_health_component(),
         },
         # F497 AC2: advertise resolver support so `cao install` can refuse

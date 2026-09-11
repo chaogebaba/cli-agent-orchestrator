@@ -44,7 +44,7 @@ from cli_agent_orchestrator.clients.database import (
     MailboxModel,
     TerminalModel,
 )
-from cli_agent_orchestrator.core.delivery import MsgState, SwitchPosition
+from cli_agent_orchestrator.core.delivery import MsgState
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.services import mailbox_service
@@ -117,12 +117,6 @@ def env(tmp_path, monkeypatch) -> Iterator[tuple]:
     db_file = tmp_path / "adopt.sqlite"
     engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -133,9 +127,7 @@ def env(tmp_path, monkeypatch) -> Iterator[tuple]:
 
     clock = _Clock()
     store = SqliteQueueStore(pool, clock=clock)
-    wiring.install_delivery(
-        wiring.DeliveryRuntime(store=store, clock=clock, position=SwitchPosition.ON)
-    )
+    wiring.install_delivery(wiring.DeliveryRuntime(store=store, clock=clock))
 
     from cli_agent_orchestrator.services.queue_carrier import (
         LegacyInboxAdoption,
@@ -158,7 +150,6 @@ def env(tmp_path, monkeypatch) -> Iterator[tuple]:
         directory=directory,
         findings=findings,
         clock=clock,
-        position=SwitchPosition.ON,
         adopter=LegacyInboxAdoption(),
     )
 
@@ -188,7 +179,6 @@ def _receiver(db, *, terminal_id: str, mailbox_id: str, role: str) -> None:
             current_terminal_id=terminal_id,
             generation=1,
             consumed_through_id=0,
-            schema_version=1,
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
@@ -428,14 +418,24 @@ def test_the_adopted_row_reaches_a_terminal_state_when_acked(env) -> None:
     ), "the adopted row was never claimed: it is in the queue but nothing served it"
 
 
-def test_adoption_is_a_noop_outside_on(env) -> None:
-    """``drain`` accepts no new queue traffic, and an adopted row is new traffic.
+def test_adoption_is_a_noop_when_the_queue_is_not_installed(env) -> None:
+    """A refused adoption must leave the legacy row PENDING, not retired.
 
-    The adopter is wired for both served positions, so the refusal has to live in
-    ``adopt_legacy_row`` rather than in the wiring — otherwise the same rule sits
-    in two places and they drift. This arm pins the refusal at the position, not
-    at the composition root: the legacy row must still be PENDING afterwards,
-    because a retire without an enqueue is the window in which nothing owns it.
+    This arm used to drive ``drain``: the adopter was wired for both served
+    positions and an adopted row IS new queue traffic, which ``drain`` existed
+    not to accept, so the refusal had to live in ``adopt_legacy_row`` rather than
+    in the wiring or the same rule would sit in two places and drift.  WP-ARCH 3c
+    deletes the legacy carriers, so ``drain`` has nothing to hand traffic back to
+    and the switch has one position left.
+
+    The load-bearing half is NOT the position — it is that a refusal is total.
+    ``adopt_orphaned_legacy_rows`` enqueues BEFORE it retires, so a refusal that
+    still retired would leave a row owned by nobody; ``clients/database.py``
+    skips the retire only because the enqueue answered ``None``.  That refusal
+    path still exists, reached now by the one condition that still disarms the
+    queue — no runtime installed — so the arm is RE-POINTED at it rather than
+    deleted.  Driving it this way also keeps it honest about where the rule
+    lives: the tick and its adopter are untouched, and only the runtime is gone.
     """
     sessions, _store, tick, carrier, _injector, findings = env
     with sessions.begin() as db:
@@ -443,20 +443,11 @@ def test_adoption_is_a_noop_outside_on(env) -> None:
         row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX)
         row_id = int(row.id)
 
-    # The refusal is keyed on the INSTALLED RUNTIME's position, not on a helper
-    # a test could patch beside it — ``adopt_legacy_row`` reads
-    # ``runtime.position`` directly. So the runtime is reinstalled at ``drain``,
-    # which is what the composition root does for that position in production.
-    # (Patching ``wiring.queue_position`` instead leaves the runtime at ``on``
-    # and the row IS adopted — tried, and it is why this note exists.)
+    # The refusal is keyed on the INSTALLED RUNTIME, not on a helper a test could
+    # patch beside it — ``adopt_legacy_row`` reads the module global directly.
     from cli_agent_orchestrator.app.delivery import wiring as _wiring
 
-    runtime = _wiring._runtime
-    _wiring.install_delivery(
-        _wiring.DeliveryRuntime(
-            store=runtime.store, clock=runtime.clock, position=SwitchPosition.DRAIN
-        )
-    )
+    _wiring.reset_delivery()
     report = tick.run_once()
 
     assert report.adopted == ()

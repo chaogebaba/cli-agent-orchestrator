@@ -6,15 +6,19 @@ named ``dead_by``, or the shipped ``SELECT`` quietly dropped its ``mode``
 conjunct — and those two are exactly the phase's easiest-to-lose properties, the
 ones §14 records as having no second line of defence.
 
-Four of the phase's named mutants are killed in this file:
+Three of the phase's named mutants are killed in this file:
 
 * ``dead_by`` recomputed from the current ``available_at`` on re-offer (D12);
 * ``claim``'s ``mode='live'`` filter moved out of the statement (D9/B20);
-* the re-parent that rewrites ``receiver_id`` without the digest (§5 item 6);
-* the boot occupancy predicate counting non-live rows (D9/B16).
+* the re-parent that rewrites ``receiver_id`` without the digest (§5 item 6).
 
-The last one is measured through :meth:`SqliteQueueStore.occupancy`, which is
-where a store can get it wrong; the pure half is in ``test/core/test_delivery.py``.
+A fourth used to be here: the boot occupancy predicate counting non-live rows
+(D9/B16), measured through ``SqliteQueueStore.occupancy``.  WP-ARCH 3c deleted
+the boot guard along with the switch it resolved, and the occupancy read with
+it — it had exactly one caller.  B16's real subject survives as the second bullet
+above, which is now the ONLY line of defence for "a non-live row is never
+served": the occupancy count was the second, and this file is where that one
+conjunct is killed.
 """
 
 from __future__ import annotations
@@ -315,39 +319,19 @@ def test_an_expiring_row_dies_with_the_callers_reason(
 
 
 # -------------------------------------------------------------- occupancy
-
-
-def test_occupancy_counts_live_non_terminal_rows_only(
-    queue: SqliteQueueStore, clock: FakeClock
-) -> None:
-    """B16 at the store level: the number the boot guard is handed.
-
-    Non-live rows and terminal rows both present as zero, and for different
-    reasons: a non-live row is a leftover the queue must never serve (#738), and
-    a terminal row is finished.  Counting either would demote a deployment that
-    has nothing outstanding.
-    """
-    for key in ("legacy-inbox:1", "legacy-inbox:2"):
-        demote_to_legacy_mode(queue, queue.enqueue(live(key)).msg_id)
-    assert queue.occupancy().live_non_terminal == 0
-
-    row = queue.enqueue(live("k1"))
-    assert queue.occupancy().live_non_terminal == 1
-
-    queue.settle(row.msg_id, state=MsgState.DELIVERED, now=clock.now())
-    assert queue.occupancy().live_non_terminal == 0
-
-
-def test_occupancy_survives_a_database_with_no_barrier_table(
-    queue: SqliteQueueStore,
-) -> None:
-    """A missing legacy table must not stop the boot resolving its own switch.
-
-    "No barrier is open" is the honest reading when the barrier schema is not
-    there; the alternative is a server that cannot boot because a table it does
-    not own is absent.
-    """
-    assert queue.occupancy().open_barrier_labels == ()
+#
+# Two arms deleted, not re-pointed: ``occupancy`` no longer exists.  They
+# measured what D9's boot guard was handed — the live non-terminal count and the
+# open-barrier labels, the latter read from a legacy table that a deployment
+# might not have.  The guard resolved a switch between the queue and the legacy
+# inbox; WP-ARCH 3c deletes the legacy carriers, so the switch has one position,
+# the guard has nothing to resolve, and the only caller of this read is gone.
+#
+# The property the first arm protected — a non-live or terminal row is never
+# treated as work — did not go with it.  It is enforced by the ``mode='live'``
+# and state conjuncts of the CLAIM statement, killed by
+# ``test_claim_never_returns_a_non_live_row`` above, which is now the single
+# line of defence rather than the second of two.
 
 
 # ----------------------------------------------------------------- settling

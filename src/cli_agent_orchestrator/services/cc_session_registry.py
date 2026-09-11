@@ -63,6 +63,7 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
+
 # ---------------------------------------------------------------------------
 # F547 #403 point 5: CAO-side per-sender content-hash dedupe window.
 #

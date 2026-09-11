@@ -91,7 +91,6 @@ def _seed(env: Any, *, cursor: int = 0, consumed: int = 0, path: str | None = No
                 current_terminal_id="t1",
                 generation=1,
                 consumed_through_id=consumed,
-                schema_version=1,
                 callback_notified_through_id=cursor,
                 cc_inbox_path=inbox_path,
                 cc_inbox_path_version=1,

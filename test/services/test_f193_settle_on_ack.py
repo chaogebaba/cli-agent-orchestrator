@@ -41,7 +41,6 @@ from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.services import mailbox_service
 from cli_agent_orchestrator.services.mailbox_service import ack_messages
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -56,12 +55,6 @@ def scratch_db(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(bind=engine)
     # Ensure schema_version column exists (migration compat)
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -99,7 +92,6 @@ def ack_shape(scratch_db):
             current_terminal_id="sup-f193",
             generation=1,
             consumed_through_id=0,
-            schema_version=1,
             created_at=datetime.now(tz=timezone.utc),
             updated_at=datetime.now(tz=timezone.utc),
         )
@@ -176,9 +168,9 @@ class TestF193SettleOnAck:
             f"F193 regression: obligation still {observed_state} after ack; "
             "floor will re-ring into the busy supervisor"
         )
-        assert observed_reason == "consumed", (
-            f"terminal_reason should be 'consumed', got {observed_reason!r}"
-        )
+        assert (
+            observed_reason == "consumed"
+        ), f"terminal_reason should be 'consumed', got {observed_reason!r}"
         assert observed_terminal_at is not None, "terminal_at must be set on settlement"
 
     def test_settled_count_includes_obligation_rowcount(self, ack_shape, monkeypatch):

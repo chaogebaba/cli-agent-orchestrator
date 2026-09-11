@@ -47,7 +47,6 @@ from cli_agent_orchestrator.core.delivery import (
     MsgState,
     QueueMode,
     ReceiverResolution,
-    SwitchPosition,
     WakeEmission,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
@@ -257,7 +256,6 @@ def harness(queue: SqliteQueueStore, wake_clock: FakeClock) -> Harness:
         directory=directory,
         findings=findings,  # type: ignore[arg-type]
         clock=wake_clock,
-        position=SwitchPosition.ON,
     )
     return Harness(queue, tick, carrier, injector, directory, findings, wake_clock)
 
@@ -419,45 +417,21 @@ def test_case17_a_worker_receiver_still_gets_the_pane(harness: Harness) -> None:
     assert harness.carrier.writes == []
 
 
-def test_case17_the_ban_does_not_consult_the_switch(queue: SqliteQueueStore, wake_clock) -> None:
-    """The paste ban is a property of the RECEIVER'S ROLE, in every position.
-
-    Muting follows the switch position and the ban does not.  ``drain`` is the
-    position D9's boot guard can impose without an operator asking for it, so a
-    ban scoped to ``on`` would be false in the one position nobody chose.
-    """
-    for position in (SwitchPosition.OFF, SwitchPosition.DRAIN):
-        carrier = RecordingCarrier()
-        injector = RecordingInjector()
-        directory = FakeDirectory()
-        wake = WakeService(
-            store=queue,
-            directory=directory,
-            carrier=carrier,
-            injector=injector,
-            clock=wake_clock,
-        )
-        tick = DeliveryTick(
-            store=queue,
-            wake=wake,
-            directory=directory,
-            findings=None,
-            clock=wake_clock,
-            position=position,
-        )
-        queue.enqueue(
-            EnqueueDraft(
-                idempotency_key=f"pos-{position.value}",
-                receiver_id=SEAT,
-                mode=QueueMode.LIVE,
-            )
-        )
-        tick.run_once(now=wake_clock.now())
-        assert injector.pastes == [], f"a seat paste appeared under {position.value}"
-        # And silence is not a pass: the arm must observe an actual emission.
-        assert carrier.writes, f"no wake was emitted under {position.value}"
-        tick.run_once(now=wake_clock.now())  # let the lease expire cleanly
-        wake_clock.advance(seconds=DELIVERY_LEASE_S + DELIVERY_BACKOFF_S + 2)
+# ``test_case17_the_ban_does_not_consult_the_switch`` stood here.  It drove the
+# tick at ``off`` and at ``drain`` and asserted that the seat paste ban held in
+# both, because muting followed the switch position and the ban did not —
+# ``drain`` was the position D9's boot guard could impose without an operator
+# asking for it, so a ban scoped to ``on`` would have been false in the one
+# position nobody chose.
+#
+# WP-ARCH 3c leaves the switch one position and ``DeliveryTick`` no longer takes
+# one, so the independence the arm asserted is now structural rather than
+# testable: there is no switch for the ban to consult.  The ban itself is not
+# left untested — ``test_case17_a_seat_receiver_is_never_pasted`` and
+# ``test_case17_a_worker_receiver_still_gets_the_pane`` above pin both halves of
+# it on the harness.  Re-pointing this arm at the single surviving configuration
+# would have made it a third copy of the first, which is the vacuity the deletion
+# avoids.
 
 
 # ------------------------------------------- case 18: the carrier refuses, seat alive

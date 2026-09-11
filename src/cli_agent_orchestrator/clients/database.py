@@ -101,8 +101,6 @@ TRANSCRIPT_HOOK_BINDING_SOURCES = TRANSCRIPT_BINDING_SOURCES - {"server_recovery
 
 SEAM_ACTIVATION_CONSUMER_OPS = (
     "watchdog.cached_status",
-    "watchdog.waiting_inbox_gate",
-    "watchdog.ready_backlog_gate",
     "agent_step.status_reads",
     "delivery.admission_status",
     "watchdog.pane_classify",
@@ -622,7 +620,17 @@ class MailboxModel(Base):
     current_terminal_id = Column(String, nullable=True)
     generation = Column(Integer, nullable=False, default=1, server_default="1")
     consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
-    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
+    # WP-ARCH 3c: ``schema_version`` is GONE from this model. WP-MAILBOX-CHANNEL
+    # added it so a compatibility refusal could reject a mailbox written by a
+    # future build; K8 deleted that refusal along with
+    # ``is_supervisor_mailbox_pull_terminal``, leaving a column nothing read. A
+    # schema field carried for nothing is worse than absent: the next reader
+    # takes it for a guard that is enforcing something.
+    #
+    # The physical COLUMN may persist in a database created before this build.
+    # That is harmless and deliberately not migrated away: it is NOT NULL with a
+    # server default, so an INSERT that omits it still succeeds, and a SQLite
+    # column drop is a full table rebuild — a real risk taken for no gain.
     # F136: callback notification cursor and path authority
     callback_notified_through_id = Column(Integer, nullable=True)
     cc_inbox_path = Column(String, nullable=True)
@@ -1951,7 +1959,6 @@ def init_db() -> None:
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
     _migrate_memory_relationships()
-    _migrate_mailbox_schema_version()
     _migrate_f136_callback_delivery()
     _migrate_f138_orphan_reconciliation()
     _migrate_f175_dedup_columns()
@@ -2368,17 +2375,6 @@ def _migrate_f136_callback_delivery() -> None:
                     "ON callback_replay_queue(mailbox_id, inbox_row_id)"
                 )
             )
-
-
-def _migrate_mailbox_schema_version() -> None:
-    """Add schema_version column to mailboxes table (WP-MAILBOX-CHANNEL)."""
-    with engine.begin() as connection:
-        columns = connection.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if not columns or "schema_version" in {col["name"] for col in columns}:
-            return
-        connection.execute(
-            text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-        )
 
 
 def _bootstrap_seam_activation() -> None:

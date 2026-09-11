@@ -35,7 +35,6 @@ from cli_agent_orchestrator.core.delivery import (
     MsgState,
     QueueMessage,
     QueueMode,
-    QueueOccupancy,
     ReceiverResolution,
     ReclaimResult,
     SeatDigest,
@@ -463,11 +462,11 @@ class QueueStore(Protocol):
 
         The statement selects ``state='ready' AND available_at<=now AND
         mode='live'``.  **The mode filter lives inside this statement**, not in
-        any caller: all three consumers of the queue inherit it that way — the
-        boot occupancy test, the drain tick and the ordinary tick — and no future
-        caller can forget it.  The occupancy predicate and the drain rule keep
-        their own ``mode`` conditions as redundant defence rather than as the
-        enforcement.
+        any caller: every consumer of the queue inherits it that way and no
+        future caller can forget it.  It was written while three consumers
+        existed — the boot guard's occupancy test and the drain tick were the
+        other two, both gone with the switch ladder in WP-ARCH 3c — and the rule
+        outliving its other callers is the point of putting it here.
         """
         ...
 
@@ -504,15 +503,6 @@ class QueueStore(Protocol):
 
     def attempts_for(self, msg_id: str) -> list[DeliveryAttempt]:
         """Every attempt for one id, oldest first — the ``cao diag`` body (I5)."""
-        ...
-
-    def occupancy(self) -> QueueOccupancy:
-        """What D9's boot guard resolves the requested position against.
-
-        Counts rows that are BOTH ``mode='live'`` and non-terminal.  Callers do
-        not compose this from ``claim``; a guard that ran the claim statement
-        would issue leases as a side effect of asking a question.
-        """
         ...
 
     def count(self, *, mode: QueueMode | None = None) -> int:

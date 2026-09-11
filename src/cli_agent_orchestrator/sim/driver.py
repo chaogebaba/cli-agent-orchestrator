@@ -8,7 +8,7 @@ Virtual time advances by jump-to-next-deadline (D13), not fixed increment.
 Wall-clock cost of a 10-minute virtual scenario stays milliseconds.
 
 F254 D12: The tick roster is data (a list of Tick tuples), not hardcoded branches.
-The current seven ticks are `DELIVERY_TICKS`, a module constant.
+The current tick roster is `DELIVERY_TICK_NAMES`, a module constant.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class EventTrace:
 
 
 def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
-    """Build the default seven delivery ticks from a watchdog instance.
+    """Build the default delivery ticks from a watchdog instance.
 
     This is the DELIVERY_TICKS constant materialized for a specific watchdog.
     The tick order and set are identical to the pre-D12 hardcoded body.
@@ -84,33 +84,23 @@ def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
     def _refresh_screen(now: float) -> None:
         watchdog.refresh_screen_fingerprints(now=now)
 
-    def _notify_due(now: float) -> None:
-        watchdog.notify_due()
-
-    def _tick_waiting(now: float) -> None:
-        watchdog.tick_waiting_inbox(now=now)
-
-    def _tick_ready(now: float) -> None:
-        watchdog.tick_ready_backlog(now=now)
-
-    def _tick_quiescence(now: float) -> None:
-        watchdog.tick_quiescence(now=now)
-
+    # WP-ARCH 3c K4: four more entries went here — ``notify_due``,
+    # ``tick_waiting_inbox``, ``tick_ready_backlog`` and ``tick_quiescence``,
+    # plus ``tick_no_progress`` and ``tick_wedge`` before them. All six were the
+    # watchdog's notifier half, deleted with it. What the roster drives now is
+    # exactly what the server schedules: the delivery tick, and the two liveness
+    # ticks the watchdog keeps.
     return [
         Tick("delivery_tick", _delivery),
         Tick("poll_unarmed_statuses", _poll_unarmed),
         Tick("refresh_screen_fingerprints", _refresh_screen),
-        Tick("notify_due", _notify_due),
-        Tick("tick_waiting_inbox", _tick_waiting),
-        Tick("tick_ready_backlog", _tick_ready),
-        Tick("tick_quiescence", _tick_quiescence),
     ]
 
 
 class SimDriver:
     """Drives the convergence ticks in deterministic order under simulated time.
 
-    D10: The roster is the full run-loop fan-out — all seven ticks.
+    D10: The roster is the full run-loop fan-out.
     D12: The roster is data (ticks parameter), not a hardcoded body.
     D13: Time advances by jump-to-next-deadline.
     """
@@ -242,8 +232,4 @@ DELIVERY_TICK_NAMES = [
     "delivery_tick",
     "poll_unarmed_statuses",
     "refresh_screen_fingerprints",
-    "notify_due",
-    "tick_waiting_inbox",
-    "tick_ready_backlog",
-    "tick_quiescence",
 ]

@@ -11,11 +11,12 @@ Three properties are worth reading this file for, because each is a mechanism th
 design rests on and each has exactly one line of defence:
 
 * **``mode='live'`` is a conjunct of the CLAIM statement itself**, not something
-  a caller adds.  Every consumer of the queue inherits it that way — the boot
-  occupancy test, the drain tick and the ordinary tick — and no future caller can
-  forget it.  The rule was in force before there was anything for it to guard,
-  which is the only ordering that could have caught it; it outlives the
-  observational rows it was written for (#738).
+  a caller adds.  Every consumer of the queue inherits it that way and no future
+  caller can forget it.  The rule was in force before there was anything for it
+  to guard, which is the only ordering that could have caught it; it outlives the
+  observational rows it was written for (#738) and it outlived the other two
+  consumers it was written for — the boot guard's occupancy test and the drain
+  tick, both deleted with the switch ladder in WP-ARCH 3c.
 * **No ``UPDATE`` in this module names ``dead_by``.**  The column is written once,
   by ``enqueue``, from :func:`~core.delivery.compute_dead_by`.  ``reclaim``
   rewrites ``available_at`` on every re-offer, so a deadline recomputed from the
@@ -55,7 +56,6 @@ from cli_agent_orchestrator.core.delivery import (
     MsgState,
     QueueMessage,
     QueueMode,
-    QueueOccupancy,
     ReclaimResult,
     SeatDigest,
     compute_dead_by,
@@ -204,8 +204,10 @@ class SqliteQueueStore:
 
         The ``mode='live'`` conjunct is in this statement and nowhere else.  A
         non-live row — one written by a build that still had the observational
-        mode retired in #738 — is therefore unclaimable by construction, and the
-        boot guard's occupancy test is redundant defence.  Removing the conjunct
+        mode retired in #738 — is therefore unclaimable by construction.  Until
+        WP-ARCH 3c the boot guard's occupancy test was a second line of defence
+        over the same rows; the guard is gone, so this conjunct is now the ONLY
+        one, which raises rather than lowers the stake.  Removing the conjunct
         here makes such a row claimable, so the tick would inject a copy of a
         message the legacy path already delivered — a second carrier over one
         id.  That is the mutant the empirical gate kills.
@@ -457,36 +459,6 @@ class SqliteQueueStore:
             .fetchall()
         )
         return [_row_to_message(row) for row in rows]
-
-    def occupancy(self) -> QueueOccupancy:
-        """D9's two predicates, read in one place.
-
-        The live non-terminal count, and the open-barrier labels.  The barrier
-        half reads the LEGACY ``callback_barrier`` table, because that is where
-        barrier state lives and phase 3 does not reproduce it — D13 carries the
-        association into the queue's enqueue but leaves the barrier tables
-        untouched.  A missing table is not an error here: on a deployment whose
-        barrier schema predates this column set, "no barrier is open" is the
-        honest reading and the alternative would be a boot that cannot resolve
-        its own switch.
-        """
-        conn = self._pool.connection()
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM delivery_msg WHERE mode = 'live' "
-            f"AND state NOT IN ({', '.join('?' * len(_TERMINAL_VALUES))})",
-            _TERMINAL_VALUES,
-        ).fetchone()
-        live = int(row["n"]) if row is not None else 0
-
-        labels: tuple[str, ...] = ()
-        try:
-            barrier_rows = conn.execute(
-                "SELECT label FROM callback_barrier WHERE state = 'OPEN' ORDER BY label"
-            ).fetchall()
-            labels = tuple(str(barrier["label"]) for barrier in barrier_rows)
-        except sqlite3.Error:
-            labels = ()
-        return QueueOccupancy(live_non_terminal=live, open_barrier_labels=labels)
 
     def count(self, *, mode: QueueMode | None = None) -> int:
         conn = self._pool.connection()

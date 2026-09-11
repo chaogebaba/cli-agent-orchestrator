@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from sqlalchemy import Column, DateTime, Integer, String, Boolean, create_engine, event, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from cli_agent_orchestrator.clients import database
@@ -35,7 +35,6 @@ from cli_agent_orchestrator.services import mailbox_service
 from cli_agent_orchestrator.services.flow_service import _get_next_run_time
 from cli_agent_orchestrator.services.mailbox_service import list_messages
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -50,12 +49,6 @@ def scratch_db(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(engine)
     # Ensure schema_version column exists on mailboxes
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -76,9 +69,7 @@ def _make_terminal(db: Session, terminal_id: str, session: str = "test-sess") ->
     )
 
 
-def _make_mailbox(
-    db: Session, terminal_id: str = "t-001", *, generation: int = 1
-) -> MailboxModel:
+def _make_mailbox(db: Session, terminal_id: str = "t-001", *, generation: int = 1) -> MailboxModel:
     row = MailboxModel(
         id="mb_test",
         session_name="test-sess",
@@ -86,7 +77,6 @@ def _make_mailbox(
         current_terminal_id=terminal_id,
         generation=generation,
         consumed_through_id=0,
-        schema_version=1,
         created_at=_utcnow(),
         updated_at=_utcnow(),
     )
@@ -184,9 +174,9 @@ class TestAC11NaiveSinceCoercion:
         since_non_utc = row_time.replace(hour=8, minute=0).replace(tzinfo=utc_plus_4)
         # This represents 04:00 UTC expressed as 08:00+04:00
         result = list_messages("t-001", since=since_non_utc)
-        assert len(result["items"]) == 1, (
-            "Row at 04:30 UTC should be included when since=08:00+04:00 (=04:00 UTC)"
-        )
+        assert (
+            len(result["items"]) == 1
+        ), "Row at 04:30 UTC should be included when since=08:00+04:00 (=04:00 UTC)"
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +382,9 @@ class TestColumnDeclarations:
     def test_mailbox_incarnation_published_at_is_tz_aware(self):
         col = MailboxIncarnationModel.__table__.columns["published_at"]
         assert isinstance(col.type, DateTime)
-        assert col.type.timezone is True, "MailboxIncarnationModel.published_at must have timezone=True"
+        assert (
+            col.type.timezone is True
+        ), "MailboxIncarnationModel.published_at must have timezone=True"
 
     def test_flow_last_run_is_tz_aware(self):
         col = FlowModel.__table__.columns["last_run"]
@@ -483,7 +475,6 @@ class TestEndpointSinceNormalization:
         assert parsed.hour == 4
 
 
-
 # ---------------------------------------------------------------------------
 # F130 regression: write a row, filter with UTC since one minute earlier
 # ---------------------------------------------------------------------------
@@ -509,9 +500,9 @@ class TestF130Regression:
 
         # Query with aware-UTC since
         result = list_messages("t-001", since=one_min_ago)
-        assert len(result["items"]) == 1, (
-            f"Row at {now.isoformat()} must be found with since={one_min_ago.isoformat()}"
-        )
+        assert (
+            len(result["items"]) == 1
+        ), f"Row at {now.isoformat()} must be found with since={one_min_ago.isoformat()}"
 
     def test_fresh_row_found_with_naive_since_one_minute_earlier(self, scratch_db):
         """Write a row NOW, query with naive since = 1 min ago. Must return it."""
@@ -523,9 +514,9 @@ class TestF130Regression:
             _make_inbox_row(db, "t-001", created_at=now)
 
         result = list_messages("t-001", since=one_min_ago)
-        assert len(result["items"]) == 1, (
-            f"Row must be found with naive since={one_min_ago.isoformat()}"
-        )
+        assert (
+            len(result["items"]) == 1
+        ), f"Row must be found with naive since={one_min_ago.isoformat()}"
 
     def test_utc_since_after_row_excludes_it(self, scratch_db):
         """A since AFTER the row's time must exclude it."""
@@ -648,6 +639,4 @@ class TestF130LegacyRowCompat:
             _make_inbox_row(db, "t-001", created_at=known_utc)
 
         result = list_messages("t-001", since=since_before)
-        assert len(result["items"]) == 1, (
-            "Row at 23:22:16Z must be found with since=23:20:00Z"
-        )
+        assert len(result["items"]) == 1, "Row at 23:22:16Z must be found with since=23:20:00Z"

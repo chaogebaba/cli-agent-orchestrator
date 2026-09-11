@@ -1,42 +1,37 @@
 """The pure delivery domain (WP-ARCH phase 3a, F728 #584).
 
-No database anywhere in this file, which is the point of putting the boot guard
-and the deadline in ``core``: the two pieces of phase-3 logic most likely to be
-got wrong are decidable from values alone, so they are tested by enumerating the
-space rather than by contriving a server state and hoping the case was reached.
+No database anywhere in this file, which is the point of putting the deadline in
+``core``: the piece of phase-3 logic most likely to be got wrong is decidable
+from values alone, so it is tested by enumerating the space rather than by
+contriving a server state and hoping the case was reached.
 
-Three of the phase's named mutants have their killer here:
+Two of the phase's named mutants have their killer here:
 
 * recomputing ``dead_by`` from the current ``available_at`` (D12) — the arithmetic
   half; the store half is in ``test/adapters/test_queue_store.py``;
-* the boot guard counting non-live rows as occupancy (B16), which would resolve a
-  bounced deployment to ``drain``;
 * dropping ``expire_after_s`` from the deadline (D8/B22), which would make every
   expiring message non-expiring.
+
+The third used to be D9's boot guard counting non-live rows as occupancy (B16),
+which would have resolved a bounced deployment to ``drain``.  The guard is gone
+with the switch it resolved (WP-ARCH 3c), and so is the mutant: what B16 really
+protected is the ``mode='live'`` conjunct of the CLAIM statement, whose killer is
+in ``test/adapters/test_queue_store.py`` and which is now that rule's only line
+of defence.
 """
 
 from __future__ import annotations
 
-import itertools
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from cli_agent_orchestrator.core.delivery import (
-    RETIRED_SWITCH_VALUES,
     TERMINAL_STATES,
     AttemptOutcome,
     DeadReason,
     MsgState,
     QueueMode,
-    QueueOccupancy,
-    SwitchPosition,
     compute_dead_by,
-    parse_switch,
-    resolve_switch,
 )
-from cli_agent_orchestrator.core.findings import FindingCode
-from cli_agent_orchestrator.core.switches import Rejected
 from cli_agent_orchestrator.core.timing import (
     DELIVERY_BACKOFF_S,
     DELIVERY_DEDUP_WINDOW_S,
@@ -113,174 +108,37 @@ def test_the_attempt_span_is_over_the_lease_and_includes_the_backoff() -> None:
 
 
 # ------------------------------------------------------------------ D9 guard
-
-
-@pytest.mark.parametrize(
-    ("requested", "occupied", "expected", "finding"),
-    [
-        (SwitchPosition.OFF, False, SwitchPosition.OFF, None),
-        (SwitchPosition.OFF, True, SwitchPosition.DRAIN, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
-        (SwitchPosition.ON, False, SwitchPosition.ON, None),
-        (SwitchPosition.ON, True, SwitchPosition.ON, None),
-        (SwitchPosition.DRAIN, False, SwitchPosition.OFF, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
-        (SwitchPosition.DRAIN, True, SwitchPosition.DRAIN, None),
-    ],
-)
-def test_the_boot_guard_table_is_total_over_positions_and_conditions(
-    requested: SwitchPosition,
-    occupied: bool,
-    expected: SwitchPosition,
-    finding: FindingCode | None,
-) -> None:
-    """All six cells of D9's table, enumerated (eight before #738 retired
-    ``shadow``).
-
-    Written as a parametrised enumeration rather than as a handful of examples
-    because the guard's defect class is a MISSING cell, not a wrong one: the
-    blueprint went three rounds with the guard cited in three places and defined
-    in none, and what closed it was making the function total.
-    """
-    outcome = resolve_switch(requested, QueueOccupancy(live_non_terminal=3 if occupied else 0))
-    assert outcome.position is expected
-    assert outcome.finding is finding
-
-
-def test_the_table_covers_every_position_and_both_conditions() -> None:
-    """No position is unhandled, whatever is added to the enum later."""
-    for requested, occupied in itertools.product(SwitchPosition, (False, True)):
-        outcome = resolve_switch(requested, QueueOccupancy(live_non_terminal=1 if occupied else 0))
-        assert isinstance(outcome.position, SwitchPosition)
-
-
-def test_a_finished_queue_does_not_pin_the_server_in_drain() -> None:
-    """ "Non-empty" means non-TERMINAL rows, not merely rows.
-
-    Counting any row would leave a deployment that had ever delivered anything
-    pinned in ``drain`` for the rest of its life, with the delivery machinery
-    running over a queue that has nothing left to deliver.
-    """
-    assert QueueOccupancy(live_non_terminal=0).occupied is False
-    assert resolve_switch(SwitchPosition.OFF, QueueOccupancy(0)).position is SwitchPosition.OFF
-
-
-def test_non_live_rows_are_not_occupancy_which_is_the_bounce_case() -> None:
-    """B16, at the level the rule is written.
-
-    A deployment bounced from a build that still had the observational mode holds
-    in-flight non-live rows.  If those counted as occupancy the guard would
-    resolve ``off`` to ``drain``, whose tick would then inject copies of messages
-    the legacy path already delivered — a second carrier over one id, which is
-    #506 reproduced by the guard added to prevent loss.
-
-    The occupancy value here is what a store computes over ``mode='live'`` rows
-    only, so a queue holding nothing but leftovers presents zero.
-    """
-    bounced_deployment = QueueOccupancy(live_non_terminal=0)
-    outcome = resolve_switch(SwitchPosition.OFF, bounced_deployment)
-    assert outcome.position is SwitchPosition.OFF
-    assert outcome.finding is None
-    assert outcome.demoted is False
-
-
-def test_an_open_barrier_holds_the_flip_back() -> None:
-    """D9's second predicate.
-
-    D13 makes every barrier opened AFTER the flip associate normally, so this
-    covers the one case association cannot: a barrier already open at the moment
-    of the flip, whose members would otherwise be split across the legacy inbox
-    and the queue.
-
-    Where it is held depends on the queue, which is the #738 change: ``shadow``
-    used to absorb both cases, and with it gone an OCCUPIED queue holds at
-    ``drain`` — the rows already enqueued still have to be served — and an empty
-    one at ``off``.
-    """
-    empty = resolve_switch(
-        SwitchPosition.ON, QueueOccupancy(live_non_terminal=0, open_barrier_labels=("gate-r4",))
-    )
-    assert empty.position is SwitchPosition.OFF
-    assert empty.finding is FindingCode.DIAG_BARRIER_OPEN_AT_FLIP
-    assert "gate-r4" in empty.detail
-
-    occupied = resolve_switch(
-        SwitchPosition.ON, QueueOccupancy(live_non_terminal=2, open_barrier_labels=("gate-r4",))
-    )
-    assert occupied.position is SwitchPosition.DRAIN
-    assert occupied.finding is FindingCode.DIAG_BARRIER_OPEN_AT_FLIP
-
-
-def test_the_barrier_predicate_only_guards_the_flip() -> None:
-    """An open barrier is ordinary while the queue is not being served.
-
-    Guarding ``off`` on a barrier would demote a deployment for a condition that
-    cannot affect it: nothing is served from the queue there, so no member can be
-    split across two tables.
-    """
-    occupancy = QueueOccupancy(live_non_terminal=0, open_barrier_labels=("gate-r4",))
-    assert resolve_switch(SwitchPosition.OFF, occupancy).position is SwitchPosition.OFF
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (None, SwitchPosition.OFF),
-        ("", SwitchPosition.OFF),
-        ("off", SwitchPosition.OFF),
-        ("Drain", SwitchPosition.DRAIN),
-        ("on", SwitchPosition.ON),
-        ("true", SwitchPosition.OFF),
-        ("1", SwitchPosition.OFF),
-        ("yes", SwitchPosition.OFF),
-    ],
-)
-def test_an_unreadable_switch_value_means_off(raw: str | None, expected: SwitchPosition) -> None:
-    """Unknown means ``off``, and the guard's finding is what tells the operator.
-
-    Guessing at an intended position would be a worse failure than the default,
-    because the default is the safe one.  ``"1"`` is in the table deliberately:
-    it is the phase-1 switch's spelling, and an operator who copied that habit
-    across must get ``off`` rather than a queue.
-    """
-    assert parse_switch(raw) is expected
-
-
-# ------------------------------------------------------- #738 shadow retirement
-
-
-@pytest.mark.parametrize("raw", ["shadow", "SHADOW", "  Shadow  "])
-def test_a_retired_position_is_rejected_and_never_coerced(raw: str) -> None:
-    """#738's contract, and the mutant it exists to kill.
-
-    ``shadow`` shipped, so an operator carrying it in a systemd drop-in typed
-    something that USED to work.  Two wrong answers are available and both are
-    silent: accepting it (the mode is gone, so nothing would serve the
-    deployment) and folding it into the unknown-value default (the server runs in
-    ``off`` while the configuration still says ``shadow``).  The rejection is a
-    VALUE, so the caller can decline to start the subsystem without failing the
-    boot.
-
-    MUTANT: delete the ``RETIRED_SWITCH_VALUES`` branch from ``parse_switch`` and
-    ``shadow`` falls through to the ``ValueError`` default — this test fails on
-    the type, not on a string comparison.
-    """
-    answer = parse_switch(raw)
-    assert isinstance(answer, Rejected)
-    assert answer.value == "shadow"
-    assert "738" in answer.reason
-    assert answer.hint == "set CAO_DELIVERY_QUEUE=off|drain|on"
-    assert "off|drain|on" in answer.detail
-
-
-def test_no_retired_position_survives_in_the_enum() -> None:
-    """The member is REMOVED, not kept as a value nothing may select.
-
-    A member that exists only to be refused is a mode a future caller can reach
-    for; the refusal lives at the parse boundary, where an operator's typed value
-    arrives, and nowhere else.
-    """
-    assert {position.value for position in SwitchPosition} == {"off", "drain", "on"}
-    assert RETIRED_SWITCH_VALUES == frozenset({"shadow"})
-    assert not RETIRED_SWITCH_VALUES & {position.value for position in SwitchPosition}
+#
+# D9's boot guard had eleven assertions here — the six-cell transition table, its
+# totality over the enum, the occupancy predicate, the open-barrier hold, the
+# unreadable-value default and the #738 rejection of ``shadow``.  All of them are
+# DELETED, and none is re-pointed, because their subject no longer exists rather
+# than having moved.
+#
+# The guard resolved ``CAO_DELIVERY_QUEUE``'s three positions against the queue's
+# occupancy.  Three positions were worth resolving while the queue and the legacy
+# inbox were both carriers: ``off`` was the pre-flip default under which legacy
+# delivered, and ``drain`` was the way back out of ``on`` — it served the rows
+# already enqueued while new traffic returned to legacy, so a rollback did not
+# strand them in a table nothing read (#584).  WP-ARCH 3c deletes the legacy
+# carriers.  There is no carrier to roll back TO, ``on`` is the only position
+# that still names something that exists, and a resolution over one value is a
+# table with one cell.
+#
+# Two things those tests protected DID move, and are asserted elsewhere rather
+# than weakened into vacuity here:
+#
+# * "a non-live row must never be served" — B16's real subject — is the
+#   ``mode='live'`` conjunct of the claim statement, killed by
+#   ``test/adapters/test_queue_store.py``.
+# * "a retired switch value is refused rather than coerced" (#738) is
+#   ``core/switches.py``'s contract and is still exercised by the phase-2 status
+#   switch in ``test/core/test_status_cutover.py``; it was the delivery switch's
+#   USE of that contract that died, not the contract.
+#
+# What replaces the guard is not an assertion but the absence of a choice: the
+# composition root installs a runtime or it does not, and
+# ``test/adapters/test_delivery_bootstrap.py`` asserts that pair.
 
 
 def test_every_row_this_build_writes_is_live() -> None:

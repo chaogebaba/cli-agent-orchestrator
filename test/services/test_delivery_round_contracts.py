@@ -1,6 +1,6 @@
 """What a live acceptance round needs from the product to be measurable at all.
 
-Three defects the first box round under ``CAO_DELIVERY_QUEUE=on`` hit, none of
+Three defects the first box round with the delivery queue armed hit, none of
 which is a delivery bug and all of which stopped an acceptance criterion from
 being measured. They are collected here because that is what they have in
 common: the box live round is now the ONLY acceptance surface for a flag flip,

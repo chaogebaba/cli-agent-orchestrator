@@ -66,24 +66,40 @@ class FindingCode(StrEnum):
                                 to survive its own migration failing.
 
     Phase 3 names SIX codes (D5, as amended by A1).  Sub-phase 3a landed the two
-    D9's boot guard raises; 3b adds the two its own transitions can reach.  The
+    D9's boot guard raised; 3b added the two its own transitions can reach.  The
     remaining two (``DIAG-DUP-DELIVERY`` and ``DIAG-DOUBLE-WAKE``) belong to 3c
     and land with the code that can raise them.  A finding code no code path
     reaches is a promise the enum cannot keep, and ``cao diag findings`` would
-    offer an operator a filter that never matches.
+    offer an operator a filter that never matches — which is exactly why a code
+    that STOPS being reachable is listed in :data:`RETIRED_FINDING_CODES` rather
+    than left looking live.
 
     ``DIAG_QUEUE_ORPHAN_GUARD``   — the boot guard demoted the requested switch
                                     position to ``drain`` because live
                                     non-terminal rows were outstanding (D9).
-                                    This is also how an operator learns that an
-                                    UNSET variable started the delivery
-                                    machinery: the guard overrides the default,
-                                    and the finding is the notice.
+                                    This is also how an operator learned that an
+                                    UNSET variable had started the delivery
+                                    machinery: the guard overrode the default,
+                                    and the finding was the notice.
+                                    RETIRED from WP-ARCH 3c — accepted, never
+                                    raised; see below.
     ``DIAG_BARRIER_OPEN_AT_FLIP`` — a boot requested ``on`` while a callback
                                     barrier was still OPEN, so the flip was held
                                     back — at ``drain`` over an occupied queue,
                                     else at ``off`` — rather than splitting that
                                     barrier's members across two tables (D9).
+                                    RETIRED from WP-ARCH 3c — accepted, never
+                                    raised; see below.
+
+    Those two are the boot guard's, and the boot guard is gone.  It resolved
+    ``CAO_DELIVERY_QUEUE``'s three positions against the queue's occupancy, which
+    was a decision worth making while the queue and the legacy inbox were both
+    carriers: ``off`` was the pre-flip default and ``drain`` was the way back out
+    of ``on`` without stranding the rows enqueued while it was on.  3c deletes
+    the legacy carriers, so there is nothing to roll back to, one position is
+    left, and a resolution over one value raises nothing.  They are RETIRED here
+    rather than deleted, by this module's own rule: rows written before the
+    cutover stay readable after it.
     ``DIAG_DELIVERY_TIME_BOUND``  — a row died on a TIME bound rather than an
                                     attempt bound: ``dead_by`` passed, the
                                     dialog ceiling elapsed, or the caller's own
@@ -164,7 +180,21 @@ class FindingCode(StrEnum):
 #: that starts raising one again is a defect a test can name.  Retiring a code
 #: this way rather than by deletion is what keeps a finding written before a
 #: cutover readable after it.
-RETIRED_FINDING_CODES: frozenset[FindingCode] = frozenset({FindingCode.DIAG_LEGACY_DISAGREE})
+#:
+#: The two delivery codes joined WP-ARCH 3c.  Both were D9's boot guard's, and
+#: the guard resolved a switch between the queue and the legacy inbox; 3c deletes
+#: the legacy carriers, so the switch has one position and the guard has nothing
+#: to resolve.  A server that ran the guard wrote these rows, and an operator
+#: reading ``cao diag findings`` on an upgraded server must still be able to see
+#: what an earlier boot decided — which is the whole reason this set exists
+#: rather than a delete.
+RETIRED_FINDING_CODES: frozenset[FindingCode] = frozenset(
+    {
+        FindingCode.DIAG_LEGACY_DISAGREE,
+        FindingCode.DIAG_QUEUE_ORPHAN_GUARD,
+        FindingCode.DIAG_BARRIER_OPEN_AT_FLIP,
+    }
+)
 
 
 class FindingState(StrEnum):

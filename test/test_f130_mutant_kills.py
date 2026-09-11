@@ -31,7 +31,6 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.services import mailbox_service
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -45,12 +44,6 @@ def scratch_db(tmp_path, monkeypatch):
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -91,7 +84,6 @@ def _setup_terminal_and_mailbox(db: Session, terminal_id: str = "ab001122") -> N
         current_terminal_id=terminal_id,
         generation=1,
         consumed_through_id=0,
-        schema_version=1,
         created_at=_utcnow(),
         updated_at=_utcnow(),
     )
@@ -140,20 +132,16 @@ class TestF130M1EndpointNaiveSinceKill:
             "cli_agent_orchestrator.services.mailbox_service.list_messages",
             side_effect=_mock_list_messages,
         ):
-            resp = api_client.get(
-                "/messages", params={"to": terminal_id, "since": naive_since_str}
-            )
+            resp = api_client.get("/messages", params={"to": terminal_id, "since": naive_since_str})
 
         assert resp.status_code == 200, f"Unexpected {resp.status_code}: {resp.text}"
         since_val = captured_kwargs.get("since")
         assert since_val is not None, "since was not forwarded to service"
         # M1 kill: without endpoint normalization, since_val.tzinfo is None
-        assert since_val.tzinfo is not None, (
-            "Endpoint must normalize naive since to aware-UTC (M1 mutant survived)"
-        )
-        assert since_val.tzinfo == timezone.utc, (
-            f"Expected UTC, got {since_val.tzinfo}"
-        )
+        assert (
+            since_val.tzinfo is not None
+        ), "Endpoint must normalize naive since to aware-UTC (M1 mutant survived)"
+        assert since_val.tzinfo == timezone.utc, f"Expected UTC, got {since_val.tzinfo}"
         # Digits preserved (naive treated as UTC, not converted)
         assert since_val.hour == 4
 

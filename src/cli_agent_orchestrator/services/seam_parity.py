@@ -32,10 +32,13 @@ logger = logging.getLogger(__name__)
 
 ParityPhase: TypeAlias = Literal["collecting", "confirming", "done"]
 
+#: WP-ARCH 3c K4 removed two entries: ``watchdog.waiting_inbox_gate`` and
+#: ``watchdog.ready_backlog_gate``. Their ONLY recorders were the two ticks K4
+#: deletes, so leaving them here would be worse than cosmetic — an op nothing
+#: samples never reaches its clean-sample count, and parity would then never
+#: promote. A silent hang, not a failure.
 PARITY_CONSUMER_OPS = (
     "watchdog.cached_status",
-    "watchdog.waiting_inbox_gate",
-    "watchdog.ready_backlog_gate",
     "agent_step.status_reads",
     "delivery.admission_status",
 )

@@ -1,11 +1,14 @@
 """What a boot switch answers when a position it once accepted is gone (#738).
 
-The strangler phases each own a switch — ``CAO_WORKER_TRUTH_INGEST``,
-``CAO_WORKER_TRUTH_STATUS``, ``CAO_DELIVERY_QUEUE`` — and two of them shipped a
-``shadow`` position: the new machinery runs, nothing is served from it, and the
-evidence for a flip comes from a dark deployment running beside the real one.
-That mode is RETIRED (user ruling 2026-09-09, #738).  A flag flip is accepted by
-a grok-box live round now.
+The strangler phases each own a switch — ``CAO_WORKER_TRUTH_INGEST`` and
+``CAO_WORKER_TRUTH_STATUS`` — and both shipped a ``shadow`` position: the new
+machinery runs, nothing is served from it, and the evidence for a flip comes from
+a dark deployment running beside the real one.  That mode is RETIRED (user ruling
+2026-09-09, #738).  A flag flip is accepted by a grok-box live round now.
+
+``CAO_DELIVERY_QUEUE`` was a third, and WP-ARCH 3c slice 4 removed it entirely: a
+switch chooses between two carriers, and after 3c there is only one.  This module
+outlives it because the other two switches still need what it does.
 
 Retiring a position that shipped is not the same as never having had it, and this
 module is that difference.  An operator still carrying ``=shadow`` in a systemd

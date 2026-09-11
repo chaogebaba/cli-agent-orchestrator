@@ -236,7 +236,6 @@ class TestF524StallSurfacing:
                     current_terminal_id="worker01",
                     generation=1,
                     consumed_through_id=0,
-                    schema_version=1,
                 )
             )
             session.add(

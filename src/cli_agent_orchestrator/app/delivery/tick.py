@@ -64,7 +64,6 @@ from cli_agent_orchestrator.core.delivery import (
     QueueMessage,
     QueueMode,
     SeatDigest,
-    SwitchPosition,
     is_service_sender,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
@@ -137,7 +136,6 @@ class DeliveryTick:
         directory: ReceiverDirectory,
         findings: FindingStore | None,
         clock: Clock,
-        position: SwitchPosition,
         interval_s: float = DELIVERY_TICK_S,
         adopter: LegacyInboxAdopter | None = None,
     ) -> None:
@@ -146,7 +144,6 @@ class DeliveryTick:
         self._directory = directory
         self._findings = findings
         self._clock = clock
-        self._position = position
         self._adopter = adopter
         self._interval_s = interval_s
         self._task: asyncio.Task[None] | None = None
@@ -231,8 +228,11 @@ class DeliveryTick:
         keeps losing its race, which is a defect to fix rather than a steady
         state to tolerate.
 
-        No adopter wired is not an error: a tick built for a position that does
-        not serve, or by a test with doubles, simply has nothing to adopt.
+        No adopter wired is not an error: a tick built by a test with doubles
+        simply has nothing to adopt.  Until WP-ARCH 3c a tick built for a switch
+        position that did not serve was the other such case; the switch had one
+        position left once the legacy carriers were deleted, so the tick no
+        longer takes one.
         """
         if self._adopter is None:
             return

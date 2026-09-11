@@ -724,7 +724,6 @@ def test_f136_written_counter_on_the_real_persistence_path(f424_db, tmp_path):
                 current_terminal_id=terminal_id,
                 generation=1,
                 consumed_through_id=0,
-                schema_version=1,
                 callback_notified_through_id=0,
                 cc_inbox_path=str(inbox_path),
                 cc_inbox_path_version=1,

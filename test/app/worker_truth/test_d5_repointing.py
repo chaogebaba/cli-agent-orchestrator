@@ -88,9 +88,18 @@ def test_a_pane_classification_moves_no_state(rig: Rig) -> None:
 def test_the_old_code_is_retained_and_never_raised(rig: Rig) -> None:
     """Deleting the member would orphan its rows in the table phase 1 built to BE
     the evidence base; renaming the string in place would make ``count`` on a
-    repeat ambiguous across the cutover boundary."""
+    repeat ambiguous across the cutover boundary.
+
+    The set is asserted by MEMBERSHIP rather than by equality since WP-ARCH 3c.
+    D5's rename owns one entry in it; the other two arrived when 3c deleted the
+    delivery switch's boot guard and retired the two codes only that guard could
+    raise.  An equality assertion here would have made this arm fail for a
+    retirement in a different phase, which is not what it is about — and the
+    guarantee it exists for, that a retired code is never silently deleted, is
+    exactly as strong stated as membership.
+    """
     assert FindingCode.DIAG_LEGACY_DISAGREE in FindingCode
-    assert RETIRED_FINDING_CODES == frozenset({FindingCode.DIAG_LEGACY_DISAGREE})
+    assert FindingCode.DIAG_LEGACY_DISAGREE in RETIRED_FINDING_CODES
 
 
 def test_a_pre_cutover_finding_is_still_readable_after_the_rename(rig: Rig) -> None:

@@ -58,12 +58,6 @@ def scratch_db(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(engine)
     # Apply the schema_version migration for the mailboxes table
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -372,7 +366,6 @@ def test_ac4_superseded_incarnation_is_not_the_seat(scratch_db):
             current_terminal_id="sup-002",  # superseded — sup-001 is stale
             generation=2,
             consumed_through_id=0,
-            schema_version=1,
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )

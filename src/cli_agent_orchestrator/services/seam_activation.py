@@ -26,8 +26,6 @@ logger = logging.getLogger(__name__)
 
 ConsumerOp: TypeAlias = Literal[
     "watchdog.cached_status",
-    "watchdog.waiting_inbox_gate",
-    "watchdog.ready_backlog_gate",
     "agent_step.status_reads",
     "delivery.admission_status",
     "watchdog.pane_classify",

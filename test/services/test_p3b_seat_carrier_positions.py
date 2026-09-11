@@ -1,4 +1,14 @@
-"""The seat's carrier, per queue position (WP-ARCH 3b, §A1.5, AC-3b case 17).
+"""The seat's carrier (WP-ARCH 3b, §A1.5, AC-3b case 17; 3c slice 4).
+
+**The file no longer has positions to be "per".**  ``CAO_DELIVERY_QUEUE``'s
+``off`` and ``drain`` are deleted in 3c slice 4 and ``on`` is the sole position,
+because the switch chose between the queue and the legacy inbox and slice 3
+deleted the legacy carriers: there is nothing left to choose.  The arms that were
+parametrised over the two non-queue positions are re-pointed at the one state
+that still disarms the queue — no runtime installed — which is the same condition
+those positions produced at every seam these arms count, and the STRONGER one for
+K8: an un-muted legacy chain that still does not paste proves the deletion is
+doing the work rather than the mute.
 
 **WP-ARCH 3c K3b/K3c REVERSED the polarity of the first half of this file.**
 
@@ -11,10 +21,12 @@ removes. So the arms below now pin the ABSENCE of a legacy emission, and the
 positive emission they used to own lives with the carrier that does it:
 ``test/app/delivery/test_seat_wake.py`` for ``DeliveryTick.serve`` → ``wake_seat``.
 
-* **`on`** — the queue's tick owns the seat and emits through ``wake_seat``.
-* **`off`, `drain`** — nothing serves the seat any more. That is not a hole left
-  open: those positions are deleted outright in 3c slice 4 (``on`` becomes the
-  sole position), and ``CAO_DELIVERY_QUEUE=on`` is what ships today.
+* **queue armed** — the queue's tick owns the seat and emits through
+  ``wake_seat``.
+* **queue disarmed** — nothing serves the seat.  That is not a hole left open: it
+  is the state a boot reaches only when the migration failed or the queue store
+  could not be opened, both of which are loud, and it is where these arms drive
+  the legacy chain to prove it emits nothing of its own.
 
 What survives here unchanged is the CURSOR: claim/commit must still advance so an
 acked or aged id is never re-emitted (#388).
@@ -49,18 +61,13 @@ from cli_agent_orchestrator.clients.database import (
     MailboxModel,
     TerminalModel,
 )
-from cli_agent_orchestrator.core.delivery import MsgState, QueueMode, SwitchPosition
+from cli_agent_orchestrator.core.delivery import MsgState, QueueMode
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.services import mailbox_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 SEAT_TERMINAL = "sup-p3b01"
 WORKER_TERMINAL = "wrk-p3b01"
-
-#: The positions where the QUEUE does not serve the seat. ``on`` is absent
-#: because there the tick is the carrier and its coverage lives with the tick.
-#: ``shadow`` was a third until #738 retired it.
-NON_QUEUE_POSITIONS = [SwitchPosition.OFF, SwitchPosition.DRAIN]
 
 
 @pytest.fixture
@@ -70,12 +77,6 @@ def seat_db(tmp_path, monkeypatch):
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -108,7 +109,6 @@ def _seat(db, *, cc_inbox_path: str | None = None) -> None:
         current_terminal_id=SEAT_TERMINAL,
         generation=1,
         consumed_through_id=0,
-        schema_version=1,
         cc_inbox_path=cc_inbox_path,
         created_at=datetime.now(),
         updated_at=datetime.now(),
@@ -156,20 +156,22 @@ class _Recorder:
         self.pane_writes.append(terminal_id)
 
 
-def _drive(position: SwitchPosition, recorder: _Recorder) -> None:
-    """Run one delivery cycle at ``position`` and record what emitted.
+def _drive(recorder: _Recorder) -> None:
+    """Run one delivery cycle with the queue DISARMED and record what emitted.
 
     Counted at the SEAM — the pane write — and never from a rendered transcript,
     which #613 showed can report zero emitters on a seat where emitters had in
     fact fired. (The coalesce seam that used to sit between the runner and the
     ring went in 3c K3c; the ring itself went in K3a.)
+
+    It used to patch ``wiring.queue_position`` to ``off`` or ``drain``, the two
+    positions where the queue did not own the seat.  Slice 4 deletes them and the
+    reader they were read through; no runtime is installed in this fixture, so the
+    legacy chain runs UN-MUTED, which is what those positions gave it and what
+    makes the assertions below about K8's deletion rather than about a flag.
     """
     service = InboxService()
     with (
-        patch(
-            "cli_agent_orchestrator.app.delivery.wiring.queue_position",
-            return_value=position,
-        ),
         patch(
             "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
             side_effect=recorder.paste,
@@ -197,8 +199,7 @@ def _wake_cursor(sessions) -> int:
         return int(mb.callback_notified_through_id or 0)
 
 
-@pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
-def test_the_legacy_chain_emits_nothing_in_any_position(seat_db, position: SwitchPosition) -> None:
+def test_the_legacy_chain_emits_nothing_even_un_muted(seat_db) -> None:
     """WP-ARCH 3c K8: the F136 chain never types into the seat's input box.
 
     The ring half of this arm is gone with K3a — ``ring_supervisor_doorbell`` is
@@ -211,26 +212,24 @@ def test_the_legacy_chain_emits_nothing_in_any_position(seat_db, position: Switc
 
     This is NOT a silence certificate for the seat: the positive emission is
     owned by ``test/app/delivery/test_seat_wake.py`` (``DeliveryTick.serve`` ->
-    ``wake_seat``), and these non-queue positions are themselves deleted in
-    slice 4.
+    ``wake_seat``).  It was parametrised over ``off`` and ``drain``, whose only
+    contribution was to leave the legacy mute OFF; with the switch gone the
+    disarmed queue does that, so the arm keeps its full strength as one case.
     """
     with seat_db.begin() as db:
         _seat(db)
         _callback(db)
 
     recorder = _Recorder()
-    _drive(position, recorder)
+    _drive(recorder)
 
     assert recorder.pane_writes == [], (
-        f"a supervisor-role receiver was pasted under {position.value}: "
+        "a supervisor-role receiver was pasted while the legacy chain ran un-muted: "
         "K8 removes the seat's reachability of the paste seam"
     )
 
 
-@pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
-def test_the_run_advances_the_cursor_so_an_acked_id_is_never_reclaimed(
-    seat_db, position: SwitchPosition
-) -> None:
+def test_the_run_advances_the_cursor_so_an_acked_id_is_never_reclaimed(seat_db) -> None:
     """The ring is gone; the CURSOR is not (#388).
 
     Deleting the wake transport must not delete the claim/commit that gates an
@@ -244,12 +243,12 @@ def test_the_run_advances_the_cursor_so_an_acked_id_is_never_reclaimed(
         row_id = int(row.id)
 
     first = _Recorder()
-    _drive(position, first)
+    _drive(first)
     assert _wake_cursor(seat_db) == row_id, "the first cycle must advance the wake cursor"
 
     before = _wake_cursor(seat_db)
     second = _Recorder()
-    _drive(position, second)
+    _drive(second)
     assert _wake_cursor(seat_db) == before, "a re-run must not re-claim an id below the cursor"
     assert second.pane_writes == []
 
@@ -290,12 +289,6 @@ def flip_env(tmp_path, monkeypatch):
     db_file = tmp_path / "flip.sqlite"
     engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
-    with engine.begin() as conn:
-        columns = conn.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
-        if "schema_version" not in {col["name"] for col in columns}:
-            conn.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-            )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -313,8 +306,9 @@ def flip_env(tmp_path, monkeypatch):
     clock = _Clock()
     store = SqliteQueueStore(pool, clock=clock)
 
-    def install(position: SwitchPosition) -> None:
-        wiring.install_delivery(wiring.DeliveryRuntime(store=store, clock=clock, position=position))
+    def install() -> None:
+        """Arm the queue.  No argument: slice 4 left the switch one position."""
+        wiring.install_delivery(wiring.DeliveryRuntime(store=store, clock=clock))
 
     yield sessions, store, install
     wiring.reset_delivery()
@@ -343,47 +337,52 @@ def _send(sessions) -> Any:
         return int(row.id)
 
 
-def test_on_produces_zero_legacy_inbox_inserts(flip_env) -> None:
+def test_an_armed_queue_produces_zero_legacy_inbox_inserts(flip_env) -> None:
     """§6's requirement, counted in the table it is about.
 
-    One message at `on` writes ONE queue row and NO inbox row. r1 wrote both,
-    which is the dual-written fifth carrier the blueprint excludes.
+    One message with the queue armed writes ONE queue row and NO inbox row. r1
+    wrote both, which is the dual-written fifth carrier the blueprint excludes.
     """
     sessions, store, install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(SwitchPosition.ON)
+    install()
 
     before = _legacy_row_count(sessions)
     message_id = _send(sessions)
 
-    assert _legacy_row_count(sessions) == before, "the legacy inbox must accept no inserts at `on`"
+    assert (
+        _legacy_row_count(sessions) == before
+    ), "the legacy inbox must accept no inserts while the queue is armed"
     assert store.count(mode=QueueMode.LIVE) == 1
     assert message_id > 0, "the caller still gets an integer handle"
 
 
-@pytest.mark.parametrize(
-    "position",
-    [SwitchPosition.OFF, SwitchPosition.DRAIN],
-    ids=lambda p: p.value,
-)
-def test_the_other_positions_still_write_the_legacy_row(flip_env, position) -> None:
-    """`off` and `drain` write the legacy row and no queue row.
+def test_a_disarmed_queue_still_writes_the_legacy_row(flip_env) -> None:
+    """The other side of the count, so the arm above is a DIFFERENCE.
 
-    `drain` is deliberately in this list rather than with `on`. §6: "the tick
-    keeps claiming, injecting and reclaiming the mode='live' rows already in
-    delivery_msg while new enqueues go to the legacy inbox, and `drain` accepts
-    no new queue rows, so it empties on its own budget."
+    This was parametrised over ``off`` and ``drain``: both wrote the legacy row
+    and no queue row, ``drain`` deliberately with them rather than with ``on``
+    because §6 gave it the rows already enqueued and sent new traffic back to
+    legacy.  Slice 4 deletes both, and with them the only way to reach this
+    branch ON PURPOSE.
+
+    It is re-pointed rather than deleted because the branch itself is not gone:
+    ``_insert_routed_inbox_row`` still falls back to the legacy insert whenever
+    the write-through answers ``None``, which is what a boot whose migration
+    failed or whose queue store would not open leaves behind.  That fallback is
+    the reason a queue fault degrades to the pre-flip behaviour instead of losing
+    the message, and an arm that stopped counting it would let a change to the
+    fallback pass unnoticed.
     """
-    sessions, store, install = flip_env
+    sessions, store, _install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(position)
 
     _send(sessions)
 
     assert _legacy_row_count(sessions) == 1
-    assert store.count(mode=QueueMode.LIVE) == 0, "only `on` writes the authority row"
+    assert store.count(mode=QueueMode.LIVE) == 0, "only an armed queue writes the authority row"
     assert store.count() == 0, "and no other row: #738 left no observational writer"
 
 
@@ -403,7 +402,7 @@ def test_the_window_dedup_is_carried_with_all_five_conjuncts(flip_env) -> None:
     from datetime import timezone
 
     sessions, store, install = flip_env
-    install(SwitchPosition.ON)
+    install()
     now = datetime.now(timezone.utc)
 
     from cli_agent_orchestrator.core.delivery import EnqueueDraft
@@ -512,7 +511,7 @@ def test_the_seat_drains_the_queue_at_on_and_the_ack_closes_the_epoch(flip_env) 
     sessions, store, install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(SwitchPosition.ON)
+    install()
 
     message_id = _send(sessions)
     digest = store.build_digest(
@@ -568,7 +567,7 @@ def test_a_receiver_completion_cancels_its_flagged_steers(flip_env) -> None:
     sessions, store, install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(SwitchPosition.ON)
+    install()
     forget_terminal_status(SEAT_TERMINAL)
 
     steer = store.enqueue(
@@ -617,7 +616,7 @@ def test_the_completion_cancel_fires_once_per_edge_not_per_publish(flip_env) -> 
     sessions, store, install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(SwitchPosition.ON)
+    install()
     forget_terminal_status(SEAT_TERMINAL)
 
     note_terminal_status(SEAT_TERMINAL, "completed")
@@ -651,7 +650,7 @@ def test_the_write_through_row_satisfies_the_public_message_shape(flip_env) -> N
     sessions, store, install = flip_env
     with sessions.begin() as db:
         _seat(db)
-    install(SwitchPosition.ON)
+    install()
 
     from cli_agent_orchestrator.clients.database import _insert_routed_inbox_row
     from cli_agent_orchestrator.models.inbox import OrchestrationType

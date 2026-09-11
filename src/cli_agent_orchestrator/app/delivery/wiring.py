@@ -4,15 +4,23 @@ This is phase 1's ``adapters/truth/wiring.py`` applied to delivery, and for the
 same two reasons.
 
 **The switch is structural, not a per-call environment read.**  ``bootstrap.py``
-owns ``CAO_DELIVERY_QUEUE``, reads it ONCE at boot, resolves it through D9's
-guard, and installs a runtime here only for a position that writes rows.  With
-nothing installed every hook point costs one module-global lookup and returns,
-so AC-3a's off-arm criterion — zero ``delivery_msg`` rows — is true by
-construction rather than by assertion: there is no code path from a hook to the
-queue that does not pass the ``_runtime is None`` check below.  "The switch was
-ignored" is therefore not expressible as a missing ``if`` in a hook; it would
-have to be a deleted install guard in the composition root, where the A/B suite
-sees it.
+opens the queue store ONCE at boot and installs a runtime here; with nothing
+installed every hook point costs one module-global lookup and returns.  Zero
+``delivery_msg`` rows on an unarmed server is therefore true by construction
+rather than by assertion: there is no code path from a hook to the queue that
+does not pass the ``_runtime is None`` check below.  "The switch was ignored" is
+not expressible as a missing ``if`` in a hook; it would have to be a deleted
+install guard in the composition root, where the A/B suite sees it.
+
+**There is one position, so the runtime carries none.**  ``CAO_DELIVERY_QUEUE``
+had three while the queue and the legacy inbox were both carriers: ``off`` was
+the pre-flip default under which legacy delivered, and ``drain`` was the way back
+out of ``on`` — it served the rows already enqueued while new traffic returned to
+legacy, so a rollback did not strand them in a table nothing read (#584).
+WP-ARCH 3c deletes the legacy carriers, so there is nothing to roll back TO and
+nothing for a second position to mean.  What used to be "is the resolved position
+``on``?" is now "is a runtime installed?", which is the same question the null
+check was already asking.
 
 **A queue write never breaks the send it serves.**  §7a states it directly: the
 enqueue call sits behind the switch and does not raise into its caller.  Every
@@ -24,10 +32,7 @@ messages, which is the failure class the whole phase exists to remove.
 ``BaseException`` is deliberately NOT swallowed: a ``KeyboardInterrupt`` or a
 ``CancelledError`` arriving inside a hook belongs to the caller's control flow.
 
-The env var is deliberately NOT named here.  One spelling of a switch, in the one
-module that reads it; a second definition in this layer is how a switch starts
-meaning two different things — and ``bootstrap.py:18`` already warns about
-exactly that.
+No environment variable is named here, and there is no longer one to name.
 """
 
 from __future__ import annotations
@@ -37,12 +42,7 @@ import threading
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
-from cli_agent_orchestrator.core.delivery import (
-    EnqueueDraft,
-    MsgKind,
-    QueueMode,
-    SwitchPosition,
-)
+from cli_agent_orchestrator.core.delivery import EnqueueDraft, MsgKind, QueueMode
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
 from cli_agent_orchestrator.core.timing import DELIVERY_DEDUP_WINDOW_S
 
@@ -52,10 +52,8 @@ __all__ = [
     "DeliveryRuntime",
     "delivery_runtime",
     "install_delivery",
-    "queue_enabled",
     "queue_owns_delivery",
     "queue_owns_new_traffic",
-    "queue_position",
     "record_completion",
     "reset_delivery",
     "write_through",
@@ -66,15 +64,16 @@ __all__ = [
 class DeliveryRuntime:
     """Everything a delivery hook needs, assembled by the composition root.
 
-    ``position`` is the RESOLVED position, after D9's boot guard — not what the
-    operator asked for.  Carrying it here rather than re-reading the environment
-    is what makes the guard's decision the one the hooks obey; a hook that read
-    the variable itself could act on a position the guard had already refused.
+    Two fields, and until WP-ARCH 3c a third: the RESOLVED switch position, which
+    the hooks obeyed so that no hook could act on a position D9's boot guard had
+    already refused.  With the legacy carriers deleted the switch has one
+    position, so the field could only ever hold one value; INSTALLED is now the
+    whole of the state, and its presence or absence is carried by ``_runtime``
+    itself rather than by a field inside it.
     """
 
     store: QueueStore
     clock: Clock
-    position: SwitchPosition
 
 
 _lock = threading.Lock()
@@ -104,48 +103,35 @@ def delivery_runtime() -> DeliveryRuntime | None:
     return _runtime
 
 
-def queue_enabled() -> bool:
-    """True when a runtime is installed, i.e. the hooks write rows."""
+def queue_owns_delivery() -> bool:
+    """True when a runtime is installed: the queue serves the seat.
+
+    This was sub-phase 3b's mute, asked by K1 through K7 before each emitted, so
+    the single-emitter property rested on the SWITCH.  In 3c it rests on the
+    deletions — those emitters are gone — and this predicate is left as the one
+    spelling of "the queue is the carrier" for the legacy sites that still ask.
+
+    It was false at ``drain``, and that was the position's point: under ``drain``
+    the tick finished delivering rows already enqueued while new traffic went
+    back to the legacy inbox, so legacy had to keep emitting for those rows and
+    muting it there would have left the new traffic with no carrier at all.  With
+    the legacy carriers deleted there is no such arrangement to describe, so the
+    predicate has nothing left to be false for except a queue that never started.
+    """
     return _runtime is not None
 
 
-def queue_position() -> SwitchPosition:
-    """The RESOLVED position, or ``off`` when nothing is installed.
-
-    One reader for the whole legacy tree, so "is the queue serving this?" has one
-    answer and not one per call site.  Legacy modules ask this rather than the
-    environment: the boot guard can demote a requested position, and a hook that
-    read the variable itself could act on a position the guard already refused.
-    """
-    runtime = _runtime
-    return SwitchPosition.OFF if runtime is None else runtime.position
-
-
-def queue_owns_delivery() -> bool:
-    """True at ``on``: the queue serves the seat and D6's surfaces are MUTED.
-
-    This is the whole of sub-phase 3b's muting, in one predicate.  K1 through K7
-    are still present — they are deleted in 3c — and each asks this before it
-    emits, so the single-emitter property in 3b rests on the SWITCH while in 3c
-    it rests on the deletions.  Case 17 therefore tests the muting, and a second
-    emitter in its ``on`` arm is a leaky mute rather than a missing deletion.
-
-    ``drain`` is deliberately false.  Under ``drain`` the tick finishes
-    delivering rows already enqueued while new traffic goes back to the legacy
-    inbox (§6), so legacy must keep emitting for those rows; muting there would
-    leave the new traffic with no carrier at all.
-    """
-    return queue_position() is SwitchPosition.ON
-
-
 def queue_owns_new_traffic() -> bool:
-    """True at ``on``: a new enqueue becomes a ``mode='live'`` queue row.
+    """True when a runtime is installed: a new enqueue becomes a queue row.
 
-    False at ``drain``, which is the position's whole point — it accepts no new
-    queue rows, so it empties on its own budget while new enqueues go to the
-    legacy inbox (§6, D9).
+    The same claim as :func:`queue_owns_delivery`, and the two are deliberately
+    NOT merged into one name.  They were distinct questions while ``drain``
+    existed — it accepted no NEW rows while still SERVING old ones, so exactly
+    one of the two was true there — and the legacy call sites still ask the one
+    they mean.  Keeping both spellings costs a line each and keeps each call site
+    readable as the question it is actually asking.
     """
-    return queue_position() is SwitchPosition.ON
+    return _runtime is not None
 
 
 def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
@@ -175,7 +161,7 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
     pre-flip behaviour rather than losing the message.
     """
     runtime = _runtime
-    if runtime is None or runtime.position is not SwitchPosition.ON:
+    if runtime is None:
         return None
     try:
         now = runtime.clock.now()
@@ -243,7 +229,7 @@ def adopt_legacy_row(fact: LegacyEnqueue) -> str | None:
     ``None``, the legacy row stays PENDING, and the next tick tries again.
     """
     runtime = _runtime
-    if runtime is None or runtime.position is not SwitchPosition.ON:
+    if runtime is None:
         return None
     try:
         message = runtime.store.enqueue(
@@ -289,7 +275,7 @@ def record_completion(receiver_id: str) -> tuple[str, ...]:
     diagnosable through ``cao diag <msg_id>``.
     """
     runtime = _runtime
-    if runtime is None or runtime.position is not SwitchPosition.ON:
+    if runtime is None:
         return ()
     try:
         return runtime.store.cancel_on_complete(receiver_id, now=runtime.clock.now())
