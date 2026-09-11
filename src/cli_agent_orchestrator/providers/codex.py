@@ -3536,7 +3536,7 @@ class CodexProvider(BaseProvider):
         # fail closed while INITIALIZING, preserve the same rows as content once
         # RUNNING. The startup handler remains responsible for dismissal.
         if not self._initialized and _has_update_dialog_in_bottom(strip_terminal_escapes(output)):
-            return self.derive_status(
+            return self.derive_status_from_verdict(
                 TerminalStatus.WAITING_USER_ANSWER,
                 mode=status_contract.SampleMode.DIRECT_RENDERED,
             ).status
@@ -3544,23 +3544,46 @@ class CodexProvider(BaseProvider):
         # verdict is projected through the pure reducer (the single status
         # authority, D2). The buffer path is the DIRECT rendered route.
         verdict = self._get_screen_local_status(output)
-        return self.derive_status(verdict, mode=status_contract.SampleMode.DIRECT_RENDERED).status
+        return self.derive_status_from_verdict(
+            verdict, mode=status_contract.SampleMode.DIRECT_RENDERED
+        ).status
 
     def derive_status(
+        self,
+        sample: "status_contract.StatusSample",
+        context: "status_contract.ReducerContext",
+    ) -> "status_contract.Candidate":
+        """fx751 AC-2 (r2 B1): the TYPED production entry point.
+
+        Accepts a ``StatusSample`` the monitor built with REAL provenance, runs
+        codex's hardened classifier on the sample's raw frame via the route the
+        sample declares (SCREEN → the rendered-screen classifier; DIRECT_RENDERED
+        → the buffer classifier), records the verdict AS TYPED FACTS preserving
+        provenance, and reduces with the monitor-supplied context. No fabricated
+        freshness — the reducer's D4 gate sees the sample's real age/generation.
+        """
+        if sample.sample_mode is status_contract.SampleMode.SCREEN:
+            verdict = self.classify_screen(sample.raw_frame.splitlines()).status
+        else:
+            verdict = self._get_screen_local_status(sample.raw_frame)
+        faceted = status_contract.apply_verdict_to_sample(sample, verdict)
+        return status_contract.reduce(faceted, context)
+
+    def derive_status_from_verdict(
         self,
         verdict: TerminalStatus,
         *,
         mode: "status_contract.SampleMode",
         context: "status_contract.ReducerContext | None" = None,
     ) -> "status_contract.Candidate":
-        """fx751 AC-2: route a classifier verdict through the pure reducer.
+        """fx751 AC-2: route a classifier verdict through the pure reducer for
+        the LEGACY per-call ``get_status`` / ``get_status_from_screen`` contract.
 
         codex declares BOTH representation routes — ``SCREEN`` (its pyte
         ``get_status_from_screen`` override, ``supports_screen_detection=True``)
-        and ``DIRECT_RENDERED`` (the raw buffer path). ``context`` is supplied by
-        the monitor fusion path with real generations (AC-5a); a bare call seeds
-        a fresh context so the verdict projects immediately, preserving the
-        legacy per-call contract.
+        and ``DIRECT_RENDERED`` (the raw buffer path). A bare call seeds a fresh
+        context so the verdict projects immediately; the TYPED live path is
+        ``derive_status`` above.
         """
         declared = (
             status_contract.SampleMode.SCREEN,
@@ -3999,7 +4022,9 @@ class CodexProvider(BaseProvider):
         # its verdict is projected through the pure reducer (the single status
         # authority, D2). SCREEN is a declared codex route.
         verdict = self.classify_screen(screen_lines).status
-        return self.derive_status(verdict, mode=status_contract.SampleMode.SCREEN).status
+        return self.derive_status_from_verdict(
+            verdict, mode=status_contract.SampleMode.SCREEN
+        ).status
 
     def read_composer_draft(self, screen_lines: list[str]) -> str | None:
         """Read the visible Codex composer draft from rendered screen lines.

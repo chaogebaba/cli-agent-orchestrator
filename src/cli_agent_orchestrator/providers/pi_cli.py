@@ -934,21 +934,44 @@ class PiCliProvider(BaseProvider):
             return TerminalStatus.UNKNOWN
 
         verdict = self._classify_verdict(strip_terminal_escapes(self._resolve_buffer(buffer)))
-        return self.derive_status(verdict).status
+        return self.derive_status_from_verdict(verdict).status
 
     def derive_status(
+        self,
+        sample: "status_contract.StatusSample",
+        context: "status_contract.ReducerContext",
+    ) -> "status_contract.Candidate":
+        """fx751 AC-2 (r2 B1): the TYPED production entry point.
+
+        Accepts a ``StatusSample`` the monitor built with REAL provenance
+        (generations, sequence, age, fingerprint from the live pane sample),
+        runs pi's hardened chrome classifier on the sample's raw frame, records
+        that verdict AS TYPED FACTS on the sample (preserving provenance), and
+        reduces with the monitor-supplied context. The reducer is the authority
+        and its D4 gate sees the sample's real age/generation — no fabricated
+        freshness. pi declares only the DIRECT_RENDERED route; a sample on a
+        route it does not declare is rejected by the reducer.
+        """
+        verdict = self._classify_verdict(strip_terminal_escapes(sample.raw_frame))
+        faceted = status_contract.apply_verdict_to_sample(
+            sample, verdict, dispatched=self._task_dispatched
+        )
+        return status_contract.reduce(faceted, context)
+
+    def derive_status_from_verdict(
         self,
         verdict: TerminalStatus,
         context: "status_contract.ReducerContext | None" = None,
     ) -> "status_contract.Candidate":
-        """fx751 AC-2: route a classifier verdict through the pure reducer.
+        """fx751 AC-2: route a classifier verdict through the pure reducer for
+        the LEGACY per-call ``get_status`` contract (no live sample provenance).
 
         pi's representation route is ``DIRECT_RENDERED`` (it has no
         ``get_status_from_screen`` override and ``supports_screen_detection`` is
         False), so it declares only that mode; the reducer rejects a
-        rendered-frame (``SCREEN``) route it does not declare. ``context`` is
-        supplied by the monitor fusion path with real generations (AC-5a); a
-        bare call seeds a fresh context so the verdict projects immediately.
+        rendered-frame (``SCREEN``) route it does not declare. A bare call seeds
+        a fresh context so the verdict projects immediately; the TYPED live path
+        is ``derive_status`` above.
         """
         if context is None:
             return status_contract.derive_status_from_legacy(

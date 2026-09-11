@@ -69,6 +69,7 @@ __all__ = [
     "is_migrated",
     "SAMPLE_EXPIRY_S",
     "facts_from_legacy_status",
+    "apply_verdict_to_sample",
     "sample_from_legacy_status",
     "derive_status_from_legacy",
 ]
@@ -704,6 +705,40 @@ def facts_from_legacy_status(
         readiness = ReadinessFact(value=FactValue.PRESENT, evidence=ev)
     # UNKNOWN / RENDER_UNCERTAIN → all facts UNKNOWN (no evidence).
     return health, activity, readiness, settlement
+
+
+def apply_verdict_to_sample(
+    sample: StatusSample,
+    status: TerminalStatus,
+    *,
+    dispatched: bool = False,
+    condition: Optional[ConditionFact] = None,
+) -> StatusSample:
+    """Return a copy of ``sample`` with its typed facts set from a classifier
+    ``status`` verdict, PRESERVING all of the sample's provenance
+    (generations, sequence, age, captured_after_trigger, native_* cursor).
+
+    This is the migrated-provider integration seam (B1 repair): the monitor
+    builds a ``StatusSample`` with REAL provenance from the live pane sample,
+    the provider runs its hardened classifier on ``sample.raw_frame`` and calls
+    this to record the verdict AS FACTS, then reduces. Unlike
+    ``sample_from_legacy_status`` (which fabricates ``age=0`` +
+    ``native_end_event=True`` for a bare per-call contract), this NEVER
+    fabricates freshness — the reducer's D4 gate therefore sees the sample's
+    real age/sequence/generation and can genuinely reject a stale or
+    off-generation sample at production ingress.
+    """
+    health, activity, readiness, settlement = facts_from_legacy_status(
+        status, dispatched=dispatched
+    )
+    return replace(
+        sample,
+        health=health,
+        activity=activity,
+        readiness=readiness,
+        settlement=settlement,
+        condition=condition if condition is not None else sample.condition,
+    )
 
 
 def sample_from_legacy_status(

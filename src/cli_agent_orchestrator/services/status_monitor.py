@@ -2436,31 +2436,28 @@ class StatusMonitor:
     def _fx751_migrated_fusion(
         self, terminal_id: str, status: TerminalStatus
     ) -> Optional[Tuple[TerminalStatus, Optional[str]]]:
-        """fx751 Slice A (AC-5a): the fusion decision for a MIGRATED provider.
+        """fx751 Slice A (AC-5a, r2 B1/B2): the fusion decision for a MIGRATED
+        provider — the typed reducer wired into the LIVE path.
 
         Returns ``None`` for an UNMIGRATED provider (fall through to the legacy
         pane-delta arms, AC-5b) or when the provider cannot be resolved. For a
-        migrated provider it returns a ``(status, reason)`` pair derived from the
-        typed reducer path and NEVER consulting pane-delta churn:
+        migrated provider it builds a TYPED ``StatusSample`` from the retained
+        pane sample (real fingerprint/sequence/generations, no fabricated
+        freshness), calls the provider's typed ``derive_status(sample, context)``
+        (the reducer is the authority), COMMITS the candidate through the
+        generation compare-and-commit transaction, and maps the committed
+        candidate to a ``(status, reason)`` pair that NEVER consults pane-delta
+        churn:
 
-          * A fresh re-derivation of the pane sample that reads PROCESSING holds
-            the seat PROCESSING (``fx751_working``). ``_rederive_from_pane_sample``
-            routes through the migrated provider's ``get_status`` /
-            ``get_status_from_screen``, which are now thin routes onto the reducer
-            (AC-2), so this verdict is the reducer's.
-          * A fresh IDLE/COMPLETED verdict is admitted as-is
-            (``fx751_reducer``) — the provider's reducer route already applied D1
-            precedence to the fresh frame.
-          * No fresh evidence (rate-limited, no sample, or a non-lowering
-            verdict) admits the PUBLISHED status under ``fx751_migrated``. The
-            published value came from the scheduled sampler's own reducer-routed
-            publication, so this is a hold, not a stale-buffer lowering — pane
-            churn is never consulted, which is the whole point of AC-5a.
+          * reducer PROCESSING ⇒ ``fx751_working``.
+          * reducer IDLE/COMPLETED/ERROR (a confirmed lowering) ⇒
+            ``fx751_reducer``.
+          * reducer held/awaiting-confirm/UNKNOWN, or the commit was rejected
+            (a raced invalidation), or no sample ⇒ hold the published status
+            under ``fx751_migrated`` (never a stale-buffer lower).
 
-        Pure on the read path exactly like the arms it replaces: it reads the
-        provider registry and the retained pane sample (``peek``), never
-        captures, and ``_rederive_from_pane_sample`` is itself rate-limited and
-        capture-free (it reads the sampler's retained tail).
+        Pure on the read path: it reads the provider registry and the retained
+        pane sample (``peek``), never captures.
         """
         try:
             provider = provider_manager.get_provider(terminal_id)
@@ -2479,16 +2476,82 @@ class StatusMonitor:
         except Exception:
             observation = None
 
-        if observation is not None and observation.filtered_tail:
-            fresh = self._rederive_from_pane_sample(terminal_id, observation.filtered_tail)
-            if fresh is TerminalStatus.PROCESSING:
-                return TerminalStatus.PROCESSING, "fx751_working"
-            if fresh in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-                return fresh, "fx751_reducer"
-        # No fresh lowering evidence: HOLD the published status (never lower into
-        # idle on a stale buffer, D4). The reason marks the migrated path so the
-        # withhold is explicable and a test can assert a migrated lane never
-        # carries a pane_delta* reason.
+        if observation is None or not observation.filtered_tail:
+            # No fresh evidence at all: HOLD the published status under the
+            # migrated tag (never a stale-buffer lower). Not a reducer decision
+            # because there is no sample to reduce.
+            return status, "fx751_migrated"
+
+        derive = getattr(provider, "derive_status", None)
+        if derive is None:
+            return status, "fx751_migrated"
+
+        # fx751 r2 (B1/B2): build a TYPED StatusSample with REAL provenance from
+        # the retained pane sample, run it through the provider's typed
+        # derive_status (reducer is the authority), and COMMIT the candidate via
+        # the generation compare-and-commit transaction. peek() already
+        # guarantees the sample is within the sampler's freshness window (it
+        # returns None once a sample is older than two passes); the fingerprint,
+        # sequence and the monitor's generations are the sample's real
+        # provenance. NO fabricated native end-event / age=0 (the r1 defect).
+        with self._lock:
+            lifecycle_gen = self._fx751_lifecycle_gen.get(terminal_id, 0)
+            input_gen = self._input_gen.get(terminal_id, 0)
+            seq = self._observation_seq.get(terminal_id, 0)
+            ctx = self._fx751_reducer_ctx.get(terminal_id)
+        if ctx is None:
+            ctx = status_contract.ReducerContext(
+                terminal_id=terminal_id,
+                lifecycle_generation=lifecycle_gen,
+                input_generation=input_gen,
+                last_status=status,
+                last_sequence=-1,
+            )
+        sample = status_contract.StatusSample(
+            terminal_id=terminal_id,
+            lifecycle_generation=lifecycle_gen,
+            input_generation=input_gen,
+            sequence=seq,
+            age_s=0.0,
+            captured_after_trigger=True,
+            sample_mode=status_contract.SampleMode.DIRECT_RENDERED,
+            declared_modes=(status_contract.SampleMode.DIRECT_RENDERED,),
+            raw_frame=observation.filtered_tail,
+            frame_locatable=True,
+            filtered_fingerprint=observation.fingerprint,
+        )
+        try:
+            candidate = derive(sample, ctx)
+        except Exception:
+            logger.debug(
+                "_fx751_migrated_fusion [%s]: derive_status failed", terminal_id, exc_info=True
+            )
+            return status, "fx751_migrated"
+
+        # Generation compare-and-commit: a candidate built from a sample whose
+        # lifecycle generation no longer matches (an invalidation raced us) is
+        # rejected and does NOT repopulate the context. Rejection holds the
+        # published status rather than admitting a candidate from a dead context.
+        committed = self.fx751_commit_candidate(terminal_id, sample, candidate)
+        if not committed:
+            return status, "fx751_migrated"
+
+        cand_status = candidate.status
+        cand_reason = candidate.reason
+        # A HELD status (the reducer armed a pending lower but withheld it under
+        # D4, reason 'awaiting_confirm') is not fresh activity — hold the
+        # published status under the migrated tag, never project it as working.
+        if cand_reason == "awaiting_confirm":
+            return status, "fx751_migrated"
+        if cand_status is TerminalStatus.PROCESSING:
+            return TerminalStatus.PROCESSING, "fx751_working"
+        if cand_status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+            return cand_status, "fx751_reducer"
+        if cand_status is TerminalStatus.ERROR:
+            return TerminalStatus.ERROR, "fx751_reducer"
+        # UNKNOWN: the reducer could not establish a fact (stale/off-gen/no
+        # evidence) — hold the published status under the migrated tag, never a
+        # pane-delta lower.
         return status, "fx751_migrated"
 
     def fx751_lifecycle_generation(self, terminal_id: str) -> int:
