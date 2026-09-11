@@ -702,16 +702,25 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
     socket_path: str,
 ) -> None:
     """The buffer must not survive a close() (no cross-connection replay).
-    Verbatim from the reviewer probe test_adj_r2_race.py."""
+    From the reviewer probe test_adj_r2_race.py.
+
+    The racing push moved AHEAD of the subscribe ack, and the snapshot call is
+    gone.  Both follow from the snapshot travelling on its own short-lived
+    connection now (``request_once``): only a request on the STREAM connection
+    can race a pushed event into ``_event_buffer``, and ``subscribe`` is the one
+    such request.  An event pushed after the ack simply waits in the socket until
+    ``events()`` reads it — correct, and not what this test is about.  The
+    property under test is unchanged: whatever the buffer holds, ``close()``
+    drops it.
+    """
 
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
         if method == "events.subscribe":
-            await server.reply(rid, {"type": "subscription_started"})
+            # AHEAD of the ack, so ``subscribe`` buffers it on the way past.
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-        elif method == "session.snapshot":
-            await server.reply(rid, {"snapshot": _snapshot_body()})
+            await server.reply(rid, {"type": "subscription_started"})
         else:
             await server.reply(rid, {})
 
@@ -720,7 +729,6 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
         client = HerdrClient(socket_path)
         await client.connect()
         await client.subscribe([{"type": "pane.updated"}])
-        await client.snapshot()
         assert len(client._event_buffer) == 1
         await client.close()
         assert len(client._event_buffer) == 0
