@@ -2649,6 +2649,15 @@ class CodexProvider(BaseProvider):
 
         command_parts.extend(["-c", "features.multi_agent=false"])
 
+        # F922 (#774): Codex's animated composer (braille shimmer) is read as
+        # activity by fleet/API status probes — an empty pane mid-animation
+        # reports PROCESSING and delivery waits forever for IDLE (init deaths
+        # #768, false-BUSY rows #751, draft-guard deferrals). Turn the TUI
+        # animation off at the source so the fix does not depend on the user's
+        # ~/.codex/config.toml. Emitted after the profile overrides above so it
+        # wins, and before the update-suppression line, which must stay last.
+        command_parts.extend(["-c", "tui.animations=false"])
+
         # Suppress the startup update dialog at the source. This follows all
         # profile overrides so it wins, but stays before a fork/resume UUID,
         # which Codex requires as the final positional argument.
