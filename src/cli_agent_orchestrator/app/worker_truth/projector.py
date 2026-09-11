@@ -141,6 +141,22 @@ class SourceRegistry(Protocol):
 
     def is_authoritative(self, terminal_id: str) -> bool: ...
 
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        """Is the DERIVED lifecycle fallback switched off for this terminal?
+
+        WP-HERDR §6(ii).  Distinct from :meth:`is_authoritative` in exactly the
+        case that matters: a CERTIFIED herdr terminal whose source has gone stale
+        or detached.  Source-level precedence alone would hand such a terminal
+        back to the scraped pane, silently, which is the failure §6(ii) names —
+        the cohort must DEGRADE (``no_signal``, delivery-ineligible) instead, so
+        the operator sees that the authoritative source is gone rather than
+        reading a plausible state derived from pixels.
+
+        ``False`` for every terminal on every pre-H1 path, which is what keeps
+        this additive.
+        """
+        ...
+
 
 class NullSourceRegistry:
     """No terminal has an authoritative source.
@@ -153,6 +169,9 @@ class NullSourceRegistry:
     def is_authoritative(self, terminal_id: str) -> bool:
         return False
 
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        return False
+
 
 class StaticSourceRegistry:
     """A fixed set of terminals with authoritative sources.
@@ -162,8 +181,13 @@ class StaticSourceRegistry:
     terminal without running a tailer.
     """
 
-    def __init__(self, terminal_ids: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        terminal_ids: frozenset[str] = frozenset(),
+        fallback_disabled_ids: frozenset[str] = frozenset(),
+    ) -> None:
         self._terminal_ids = set(terminal_ids)
+        self._fallback_disabled_ids = set(fallback_disabled_ids)
 
     def add(self, terminal_id: str) -> None:
         self._terminal_ids.add(terminal_id)
@@ -171,8 +195,25 @@ class StaticSourceRegistry:
     def discard(self, terminal_id: str) -> None:
         self._terminal_ids.discard(terminal_id)
 
+    def set_fallback_disabled(self, terminal_id: str) -> None:
+        """Mark a certified herdr terminal (WP-HERDR §6(ii))."""
+        self._fallback_disabled_ids.add(terminal_id)
+
+    def clear_fallback_disabled(self, terminal_id: str) -> None:
+        """Unmark it.  Called at TEARDOWN only.
+
+        Not on a source detach and not on a subscription gap: §6(ii) is precisely
+        the rule that a certified cohort keeps its derived lifecycle muted while
+        its source is gone.  Clearing this on a gap would reinstate the silent
+        revert the rule exists to prevent.
+        """
+        self._fallback_disabled_ids.discard(terminal_id)
+
     def is_authoritative(self, terminal_id: str) -> bool:
         return terminal_id in self._terminal_ids
+
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        return terminal_id in self._fallback_disabled_ids
 
 
 @dataclass(frozen=True)

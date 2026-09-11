@@ -8437,6 +8437,19 @@ def _delete_terminal_under_lease(
             status_monitor.unregister(terminal_id)
         except Exception as exc:
             logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
+        # WP-HERDR H1 seam A: stop this terminal's herdr lifecycle source and
+        # drop both its authority and its §6(ii) fallback mute.  This is the
+        # terminal-id-bearing teardown; the backend's own ``kill_window`` takes
+        # (session, window) and never sees a terminal id, so it cannot be the
+        # detach anchor.  Inert unless CAO_HERDR_RUNTIME is set.
+        try:
+            from cli_agent_orchestrator.backends.herdr_backend import (
+                detach_herdr_runtime_source,
+            )
+
+            detach_herdr_runtime_source(terminal_id)
+        except Exception as exc:
+            logger.warning(f"Failed to detach herdr runtime source for {terminal_id}: {exc}")
 
     persona_retention_error = None
     try:

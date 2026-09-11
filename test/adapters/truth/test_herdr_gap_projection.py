@@ -18,20 +18,26 @@ The runtime source now emits the gap event at ``authoritative`` confidence with
 
 from __future__ import annotations
 
+from test.app.fakes import FakeClock, InMemoryEventStore, InMemoryStateStore
+
 from cli_agent_orchestrator.adapters.truth import herdr_runtime, wiring
 from cli_agent_orchestrator.adapters.truth.herdr_runtime import HerdrRuntimeSource
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
-from test.app.fakes import FakeClock, InMemoryEventStore, InMemoryStateStore
+from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
-
+#: The CAO terminal id — what events are attributed to and what the projection
+#: is keyed by.  A herdr pane record never carries it (H1 slice 1).
 TERMINAL = "cao-terminal"
+
+#: herdr's OWN terminal id, the only thing a pane record can be matched on.
+HERDR_TID = "term_65b015bb41ad32"
 
 
 def _pane(status: str) -> dict[str, object]:
     return {
         "pane_id": "w1:p1",
-        "terminal_id": TERMINAL,
+        "terminal_id": HERDR_TID,
         "agent": "pi",
         "agent_session": {
             "agent": "pi",
@@ -53,10 +59,14 @@ def _wired(*, source_healthy: bool) -> tuple[HerdrRuntimeSource, InMemoryStateSt
     wiring.install_producers(
         wiring.ProducerRuntime(store=events, clock=clock, state_store=states, folder=projector)
     )
-    source = HerdrRuntimeSource(TERMINAL, socket_path="/unused")
+    source = HerdrRuntimeSource(TERMINAL, herdr_terminal_id=HERDR_TID, socket_path="/unused")
     source._process_pane(_pane("working"))
-    if source_healthy:
-        states.touch_source_probe(TERMINAL, probed_at=clock.now())
+    if not source_healthy:
+        # Processing a pane record is itself a health bump now (slice 1), so an
+        # UNHEALTHY source is one whose last bump has aged past ``NO_SIGNAL_S``
+        # rather than one that never bumped at all — which is also the realistic
+        # shape of the case: a source that streamed and then went quiet.
+        clock.advance(NO_SIGNAL_S * 2)
     return source, states
 
 
@@ -64,7 +74,7 @@ def teardown_function() -> None:
     wiring.reset_producers()
 
 
-def test_gap_projects_exactly_no_signal_when_no_health_touch_exists() -> None:
+def test_gap_projects_exactly_no_signal_when_the_source_is_already_stale() -> None:
     source, states = _wired(source_healthy=False)
     source._emit_gap_degraded()
     row = states.get(TERMINAL)

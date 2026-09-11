@@ -53,8 +53,23 @@ resnapshot on reconnect — events
 are not receipts, so the only safe recovery from a gap is to re-read the whole
 state, exactly the herdr client recipe (subscribe → snapshot → apply events).
 
-**Identity (§7, §9 round 2).**  herdr's ``terminal_id`` is new after every server
-restart, so nothing here keys resume on it.  The stable handle is herdr's
+**Identity (§7, §9 round 2, and the H1 binding contract).**  There are TWO
+identifier namespaces and they are NOT interchangeable:
+
+* the **CAO terminal id** — a UUID, minted by CAO, reaching the pane only as
+  ``--env CAO_TERMINAL_ID`` (``backends/herdr_backend.py`` ``_build_env_args``).
+  It is what every emitted ``EventDraft`` is attributed to, because it is the
+  only id the projector, the state store and ``cao diag`` know.
+* the **herdr terminal id** — herdr's own ``term_65b014cd203821``, minted by the
+  herdr server and carried on its pane records.  It is what a pane record must
+  be MATCHED on, and it is new after every herdr server restart.
+
+Conflating them is not a naming slip, it is a silent no-op: a source constructed
+with the CAO uuid and matching pane records on ``pane["terminal_id"]`` binds to
+no real pane, so every event is dropped and the cohort looks permanently quiet.
+So the binding contract is: **emit on the CAO id, match on the herdr id (or the
+pane id), rebind on the stable ``agent_session``.**  herdr's ``terminal_id`` is
+new after every server restart, so nothing here keys resume on it.  The stable handle is herdr's
 ``agent_session`` (``{kind, source, value}`` — the provider session reference)
 together with the pane's ``agent`` name; this producer records that handle in
 each event's ``source_ref`` and payload so a later resume rebinds on the stable
@@ -88,6 +103,7 @@ from cli_agent_orchestrator.core.events import (
     Producer,
 )
 from cli_agent_orchestrator.core.states import DegradedReason
+from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
 __all__ = [
     "HERDR_STATUS_TO_EVENT",
@@ -132,6 +148,16 @@ _SUBSCRIPTIONS: list[dict[str, Any]] = [{"type": "pane.updated"}]
 #: ``core/timing.py`` is a noted H2 follow-up (see the module report's Deviations).
 _BACKOFF_MULTIPLIER = 2.0
 
+#: How often a connected-but-quiet source bumps ``last_source_probe_at``.
+#:
+#: ``Projector._source_healthy`` treats a source whose probe column is older than
+#: ``NO_SIGNAL_S`` as UNHEALTHY and stops muting derived events — which is the
+#: correct fallback for a source that has genuinely died, and exactly the WRONG
+#: reading of a herdr source whose worker simply has not changed state for a
+#: minute.  So health is a heartbeat, not an event count: a quarter of
+#: ``NO_SIGNAL_S`` leaves three missed beats before the projector doubts us.
+_PROBE_KEEPALIVE_S = NO_SIGNAL_S / 4.0
+
 _lock = threading.RLock()
 #: terminal_id -> the live source for it (one source per terminal, §4).
 _sources: dict[str, "HerdrRuntimeSource"] = {}
@@ -149,10 +175,19 @@ def reset_sources() -> None:
 class HerdrRuntimeSource:
     """Streams one herdr session's ``pane.updated`` events for its bound panes.
 
-    Satisfies ``core.ports.EventSource`` structurally.  One source per terminal
-    (§4); the ``pane_id`` it cares about is resolved from the pane records the
-    events and the snapshot carry, keyed by the terminal's herdr ``terminal_id``
-    OR its stable ``agent_session`` — never assumed stable across a restart.
+    Satisfies ``core.ports.EventSource`` structurally.  One source per CAO
+    terminal (§4).  ``terminal_id`` on this object is the **CAO** id — the id
+    every emitted draft is attributed to.  The pane it watches is matched on the
+    **herdr** id namespace instead: the herdr ``terminal_id`` and/or the herdr
+    ``pane_id`` it was attached with, and thereafter the stable
+    ``agent_session`` — never assumed stable across a restart.
+
+    A caller that knows only one of the two herdr keys may pass only that one.
+    The shim attaches at ``create_window``, where herdr's create response yields
+    the ``pane_id`` but not yet herdr's own ``terminal_id``; the herdr terminal
+    id is then LEARNED from the first pane record that matches on the pane id,
+    and from that point carries provenance and the post-restart ephemeral
+    fallback.
 
     ``is_authoritative`` is True: for a hook-backed cohort (pi and the other
     hook-backed kinds) herdr's status is the worker's own report, which is what
@@ -165,15 +200,27 @@ class HerdrRuntimeSource:
 
     def __init__(
         self,
-        terminal_id: str,
+        cao_terminal_id: str,
         *,
+        herdr_terminal_id: str | None = None,
+        pane_id: str | None = None,
         herdr_session: str = "cao",
         socket_path: str | None = None,
         client: HerdrClient | None = None,
         reconnect_backoff_base_s: float = 1.0,
         reconnect_backoff_max_s: float = 30.0,
+        probe_keepalive_s: float = _PROBE_KEEPALIVE_S,
     ) -> None:
-        self.terminal_id = terminal_id
+        if not herdr_terminal_id and not pane_id:
+            raise ValueError(
+                "a herdr runtime source needs at least one herdr-namespace key "
+                "(herdr_terminal_id or pane_id); the CAO terminal id never "
+                "matches a herdr pane record"
+            )
+        #: The **CAO** terminal id.  Every emitted draft is attributed to it, and
+        #: it is this source's key in the module registry.  It is NEVER compared
+        #: against a herdr pane record.
+        self.terminal_id = cao_terminal_id
         self._herdr_session = herdr_session
         self._socket_path = socket_path or default_socket_path(herdr_session)
         self._backoff_base_s = reconnect_backoff_base_s
@@ -206,10 +253,18 @@ class HerdrRuntimeSource:
         #: alone.  ``None`` until the first bind; a pane with no stable session
         #: can only ever match on the initial terminal_id.
         self._bound_session: tuple[str, str] | None = None
-        #: The herdr terminal_id currently associated with the bound session.
-        #: Re-learned on every stable-session match so provenance and payload
+        #: The **herdr** terminal id this source matches pane records on, in
+        #: herdr's own namespace (``term_*``).  ``None`` when the attacher knew
+        #: only the pane id; learned from the first matching pane record and
+        #: re-learned on every stable-session match, so provenance and payload
         #: carry the LIVE ephemeral id while the binding stays on the stable one.
-        self._herdr_terminal_id: str = terminal_id
+        self._herdr_terminal_id: str | None = herdr_terminal_id
+        #: The **herdr** pane id this source matches on when the herdr terminal
+        #: id is not (yet) known — the id the shim gets back from herdr's tab
+        #: create response.  Re-learned alongside the terminal id.
+        self._bound_pane_id: str | None = pane_id
+        self._probe_keepalive_s = probe_keepalive_s
+        self._keepalive_task: asyncio.Task[None] | None = None
 
     # -- EventSource ---------------------------------------------------------
 
@@ -229,6 +284,7 @@ class HerdrRuntimeSource:
 
     async def stop(self) -> None:
         self._stopping.set()
+        self._stop_keepalive()
         task = self._task
         self._task = None
         client = self._client
@@ -245,6 +301,7 @@ class HerdrRuntimeSource:
     def stop_sync(self) -> None:
         """Signal the loop to end without awaiting it — teardown from sync code."""
         self._stopping.set()
+        self._stop_keepalive()
         task = self._task
         self._task = None
         if task is not None:
@@ -296,15 +353,82 @@ class HerdrRuntimeSource:
         await client.connect()
         await client.check_protocol()
         await client.subscribe(_SUBSCRIPTIONS)
-        # Recipe step 2: snapshot after subscribing, apply current state, THEN
-        # stream buffered events.  On a reconnect this is what recovers the gap —
-        # events are not receipts, so the snapshot is the source of truth and the
-        # event stream only carries changes after it.
-        await self._apply_snapshot(client)
-        async for event in client.events():
+        # A live subscription IS this source's health, and it is the only thing
+        # that keeps the projector muting the pane fallback (§5/§6).  Bump the
+        # column immediately on connect and then on a heartbeat, so a worker that
+        # simply says nothing for a minute does not read as a dead source.
+        self._touch_source_probe()
+        self._start_keepalive()
+        try:
+            # Recipe step 2: snapshot after subscribing, apply current state, THEN
+            # stream buffered events.  On a reconnect this is what recovers the gap —
+            # events are not receipts, so the snapshot is the source of truth and the
+            # event stream only carries changes after it.
+            await self._apply_snapshot(client)
+            async for event in client.events():
+                if self._stopping.is_set():
+                    return
+                self._handle_event(event)
+        finally:
+            self._stop_keepalive()
+
+    # -- source health -------------------------------------------------------
+
+    def _touch_source_probe(self) -> None:
+        """Bump ``worker_state_shadow.last_source_probe_at`` for this terminal.
+
+        ``Projector._source_healthy`` reads that column and treats NULL as
+        UNHEALTHY, so a source that never bumps it is a source the projector
+        never believes: ``_is_muted`` returns False for every derived pane event
+        and §5's source-level precedence silently never engages.  Nothing in the
+        shipped adapter called this, which is why wiring it was a precondition
+        for the seam binding at all rather than an optimisation.
+
+        Best-effort by the same rule :func:`~adapters.truth.wiring.emit` follows:
+        a diagnostic may never raise into the thing it observes.
+        """
+        runtime = producer_runtime()
+        if runtime is None:
+            return
+        store = runtime.state_store
+        if store is None:
+            # A lane brought producers up without a StateStore.  Strictly less
+            # information, never wrong information: the projector then treats the
+            # source as unhealthy and the pane fallback stays live.
+            return
+        try:
+            store.touch_source_probe(self.terminal_id, probed_at=runtime.clock.now())
+        except Exception:  # pragma: no cover - the never-break-the-server rule
+            logger.debug(
+                "herdr runtime source probe bump failed for %s",
+                self.terminal_id,
+                exc_info=True,
+            )
+
+    def _start_keepalive(self) -> None:
+        if self._keepalive_task is not None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - a test driving the source by hand
+            return
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(), name=f"herdr-runtime-keepalive:{self.terminal_id}"
+        )
+
+    def _stop_keepalive(self) -> None:
+        task = self._keepalive_task
+        self._keepalive_task = None
+        if task is not None:
+            task.cancel()
+
+    async def _keepalive_loop(self) -> None:
+        """Bump source health while the subscription is up but quiet."""
+        while not self._stopping.is_set():
+            await asyncio.sleep(self._probe_keepalive_s)
             if self._stopping.is_set():
                 return
-            self._handle_event(event)
+            self._touch_source_probe()
 
     async def _apply_snapshot(self, client: HerdrClient) -> None:
         """Seed per-pane status from ``api snapshot`` without replaying history.
@@ -357,35 +481,56 @@ class HerdrRuntimeSource:
     def _pane_belongs(self, pane: dict[str, Any]) -> bool:
         """Whether this pane record is the one this source's terminal is bound to.
 
+        Every comparison here is in the **herdr** namespace.  ``self.terminal_id``
+        — the CAO uuid — is never compared against a pane record: it reaches the
+        pane only as an environment variable and appears in no herdr field, so a
+        match against it can only ever be False (the shipped conflation, which
+        bound no pane and dropped every event).
+
         The binding key is the STORED stable ``agent_session`` (§7/§9), NOT the
         ephemeral herdr ``terminal_id`` (which is new after every server restart)
         and NOT the pane_id (which does not survive the pane being re-created,
         moved to another workspace, or the server restarting — measured on herdr
         0.9.0: it is retired rather than renumbered).  Two phases:
 
-        * **Before a stable session is bound** the source matches by the herdr
-          ``terminal_id`` it was constructed with — the id herdr reports at first
-          contact — and learns that pane's stable ``agent_session`` as the
-          binding key (:meth:`_bind_session`).  A pane that carries no stable
-          session can only ever match here, on the initial terminal_id.
+        * **Before a stable session is bound** the source matches on whichever
+          herdr-namespace key it was attached with — herdr's ``terminal_id``, the
+          ``pane_id``, or both — and learns that pane's stable ``agent_session``
+          as the binding key (:meth:`_bind_session`).  A pane that carries no
+          stable session can only ever match here, on those ephemeral keys.
         * **Once a stable session is bound** a pane belongs when its stable
           session equals the bound one, EVEN IF its herdr ``terminal_id`` has
           changed across a restart; the live terminal_id is then re-learned.  A
-          pane whose terminal_id still matches the last-known ephemeral id also
-          belongs (covers a pane record that omits the session mid-stream), but
-          the stable session is authoritative — a DIFFERENT stable session on the
+          pane whose ephemeral keys still match the last-known ones also belongs
+          (covers a pane record that omits the session mid-stream), but the
+          stable session is authoritative — a DIFFERENT stable session on the
           same terminal_id does NOT belong.
         """
         session = self._session_key(pane)
         if self._bound_session is not None:
             if session is not None:
                 return session == self._bound_session
-            return pane.get("terminal_id") == self._herdr_terminal_id
-        # Unbound: match on the constructor's herdr terminal_id, then bind.
-        if pane.get("terminal_id") != self.terminal_id:
+            return self._matches_ephemeral(pane)
+        # Unbound: match on the herdr-namespace key(s) we were attached with.
+        if not self._matches_ephemeral(pane):
             return False
         self._bind_session(pane, session)
         return True
+
+    def _matches_ephemeral(self, pane: dict[str, Any]) -> bool:
+        """Does this pane record match either herdr-namespace key we hold?
+
+        Either key alone is sufficient.  The shim attaches knowing only the pane
+        id (herdr's tab-create response yields that and not its terminal id), and
+        a test or a reconciler attaching from a snapshot knows the terminal id;
+        both must bind, and once either matches the other is learned.
+        """
+        term = pane.get("terminal_id")
+        if self._herdr_terminal_id is not None and term == self._herdr_terminal_id:
+            return True
+        if self._bound_pane_id is None:
+            return False
+        return str(pane.get("pane_id") or "") == self._bound_pane_id
 
     @staticmethod
     def _session_key(pane: dict[str, Any]) -> tuple[str, str] | None:
@@ -405,12 +550,14 @@ class HerdrRuntimeSource:
         return None
 
     def _bind_session(self, pane: dict[str, Any], session: tuple[str, str] | None) -> None:
-        """Record the stable session as the binding key on first match."""
+        """Record the stable session as the binding key on first match.
+
+        Both ephemeral herdr keys are learned here too, so a source attached with
+        only one of them carries both from the first matching record onward.
+        """
         if session is not None:
             self._bound_session = session
-        term = pane.get("terminal_id")
-        if isinstance(term, str) and term:
-            self._herdr_terminal_id = term
+        self._learn_ephemeral(pane)
 
     def _process_pane(self, pane: dict[str, Any]) -> None:
         """Map one pane record's ``agent_status`` to a boundary and emit it.
@@ -424,6 +571,11 @@ class HerdrRuntimeSource:
         status = pane.get("agent_status")
         if not isinstance(status, str) or not status:
             return
+        # A pane record that BELONGS is this source's proof of life, whether or
+        # not it carries a new boundary — a repeated ``working`` is still the
+        # stream delivering truth.  Bump health before the edge check so a busy
+        # worker that reports the same status for a minute stays healthy.
+        self._touch_source_probe()
         self._remember_identity(pane)
         if pane_id:
             self._tracked_panes.add(pane_id)
@@ -451,9 +603,16 @@ class HerdrRuntimeSource:
             value = session.get("value")
             if source and value:
                 self._identity_ref = f"{source}:{value}"
+        self._learn_ephemeral(pane)
+
+    def _learn_ephemeral(self, pane: dict[str, Any]) -> None:
+        """Re-learn the live herdr terminal_id and pane_id for the bound pane."""
         term = pane.get("terminal_id")
         if isinstance(term, str) and term:
             self._herdr_terminal_id = term
+        pane_id = pane.get("pane_id")
+        if pane_id is not None and str(pane_id):
+            self._bound_pane_id = str(pane_id)
 
     def _confidence_for(self, pane: dict[str, Any]) -> Confidence:
         """Hook-backed panes are authoritative; screen-manifest panes are derived.
@@ -573,34 +732,51 @@ class HerdrRuntimeSource:
 
 
 def attach(
-    terminal_id: str,
+    cao_terminal_id: str,
     *,
+    herdr_terminal_id: str | None = None,
+    pane_id: str | None = None,
     herdr_session: str = "cao",
     socket_path: str | None = None,
     client: HerdrClient | None = None,
 ) -> HerdrRuntimeSource | None:
-    """Create (or return) the herdr runtime source for one terminal.
+    """Create (or return) the herdr runtime source for one CAO terminal.
 
-    Idempotent per terminal.  Returns ``None`` when ingestion is off, so a caller
-    on the legacy path can attach unconditionally and pay nothing when the switch
-    is not set — the same shape ``codex_rollout.attach`` has.  Scheduling the
-    async task is left to the caller's loop via :meth:`HerdrRuntimeSource.start`;
-    when a running loop exists this schedules it, otherwise the source is returned
-    for a test to drive by hand.
+    ``cao_terminal_id`` is the id every emitted event is ATTRIBUTED to;
+    ``herdr_terminal_id`` / ``pane_id`` are the herdr-namespace keys the pane
+    records are MATCHED on.  At least one herdr key is required — attaching with
+    only the CAO uuid is the shipped defect (it matches no pane record and drops
+    every event), so it is refused here rather than failing silently at runtime.
+
+    Idempotent per CAO terminal.  Returns ``None`` when ingestion is off or when
+    no herdr key was given, so a caller on the legacy path can attach
+    unconditionally and pay nothing when the switch is not set — the same shape
+    ``codex_rollout.attach`` has.  Scheduling the async task is left to the
+    caller's loop via :meth:`HerdrRuntimeSource.start`; when a running loop exists
+    this schedules it, otherwise the source is returned for a test to drive by
+    hand.
     """
-    if not terminal_id or producer_runtime() is None:
+    if not cao_terminal_id or producer_runtime() is None:
+        return None
+    if not herdr_terminal_id and not pane_id:
+        logger.debug(
+            "herdr runtime attach for %s skipped: no herdr-namespace key",
+            cao_terminal_id,
+        )
         return None
     with _lock:
-        existing = _sources.get(terminal_id)
+        existing = _sources.get(cao_terminal_id)
         if existing is not None:
             return existing
         source = HerdrRuntimeSource(
-            terminal_id,
+            cao_terminal_id,
+            herdr_terminal_id=herdr_terminal_id,
+            pane_id=pane_id,
             herdr_session=herdr_session,
             socket_path=socket_path,
             client=client,
         )
-        _sources[terminal_id] = source
+        _sources[cao_terminal_id] = source
     _schedule(source)
     return source
 
@@ -622,14 +798,14 @@ def _schedule(source: HerdrRuntimeSource) -> None:
         logger.debug("could not schedule herdr runtime source", exc_info=True)
 
 
-def detach(terminal_id: str) -> None:
-    """Stop and drop the source for one terminal."""
+def detach(cao_terminal_id: str) -> None:
+    """Stop and drop the source for one CAO terminal."""
     with _lock:
-        source = _sources.pop(terminal_id, None)
+        source = _sources.pop(cao_terminal_id, None)
     if source is not None:
         source.stop_sync()
 
 
-def source_for(terminal_id: str) -> HerdrRuntimeSource | None:
+def source_for(cao_terminal_id: str) -> HerdrRuntimeSource | None:
     with _lock:
-        return _sources.get(terminal_id)
+        return _sources.get(cao_terminal_id)
