@@ -371,3 +371,47 @@ def test_ac2_legacy_bridge_projects_verdict_identically() -> None:
             "t", verdict, mode=SampleMode.DIRECT_RENDERED, declared_modes=declared
         )
         assert out.status is expected, f"{verdict} -> {out.status}, want {expected}"
+
+
+# ── AC-12 (MANDATORY per brief): pi stale-frame reason field ───────────────
+# The discriminating element of AC-12 is the stale-frame REASON FIELD, not the
+# status. Pre-fx751, pi's no-chrome/no-spinner path published UNKNOWN with NO
+# reason (providers/pi_cli.py:968), so a status-only assertion pinned nothing —
+# HEAD already publishes UNKNOWN there. fx751 rejects a stale pushed frame under
+# D4 and publishes UNKNOWN carrying a populated stale-frame reason field. These
+# tests assert the REASON is present and names staleness (the mutant that drops
+# the reason while keeping the UNKNOWN must fail).
+def test_ac12_stale_pi_pushed_frame_publishes_unknown_with_reason_field() -> None:
+    """A pi frame reaching the reducer from a pushed buffer with no age check
+    (older than the expiry budget) is rejected under D4 -> UNKNOWN with a
+    NON-EMPTY reason field naming staleness, plus last_known state + time."""
+    # This frame WOULD read idle if trusted (readiness present), but it is stale.
+    stale = _sample(
+        terminal_id="pi1",
+        age_s=sc.SAMPLE_EXPIRY_S + 5.0,
+        readiness=ReadinessFact(value=FactValue.PRESENT),
+    )
+    out = reduce(stale, _ctx(terminal_id="pi1", last_status=TerminalStatus.PROCESSING))
+    assert out.status is TerminalStatus.UNKNOWN
+    # MANDATORY: the reason field is present and non-empty (the mutant that
+    # drops it must fail here).
+    assert out.reason is not None and out.reason != ""
+    assert out.reason == "expired"
+    # last-known state, time and reason accompany the UNKNOWN (D4).
+    assert out.last_known is TerminalStatus.PROCESSING
+    assert out.last_known_at is not None
+
+
+def test_ac12_reason_field_distinguishes_from_bare_unknown() -> None:
+    """A no-evidence UNKNOWN and a stale-frame UNKNOWN carry DIFFERENT reasons —
+    the reason field is what discriminates the stale-frame defect family from an
+    ordinary blank frame (the status alone cannot)."""
+    bare = _sample(terminal_id="pi1")  # no facts, fresh
+    stale = _sample(terminal_id="pi1", age_s=sc.SAMPLE_EXPIRY_S + 1.0)
+    r_bare = reduce(bare, _ctx(terminal_id="pi1", last_status=TerminalStatus.UNKNOWN))
+    r_stale = reduce(stale, _ctx(terminal_id="pi1", last_status=TerminalStatus.PROCESSING))
+    assert r_bare.status is TerminalStatus.UNKNOWN
+    assert r_stale.status is TerminalStatus.UNKNOWN
+    assert r_bare.reason != r_stale.reason
+    assert r_stale.reason == "expired"
+    assert r_bare.reason == "no_evidence"
