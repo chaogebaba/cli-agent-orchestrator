@@ -27,7 +27,15 @@ PassOutcome: TypeAlias = Literal[
 FreshnessKind: TypeAlias = Literal["not_probed", "identity_ok", "identity_failed", "probe_failed"]
 ReceiverStateKey: TypeAlias = tuple[str, int, str]
 FreshToken: TypeAlias = tuple[str, float]
-ObservationOrigin: TypeAlias = Literal["incremental", "probe", "forced", "native", "native_poll"]
+#: Where an observation came from.  ``worker_truth`` is WP-ARCH phase 2's sixth
+#: member (D1): the state projection publishing through this same egress, which
+#: is what makes the cutover a change of PRODUCER rather than a second store.
+#: Naming it is load-bearing — ``legacy_egress.fed_by`` reads the origin to stamp
+#: which producer caused a publish, and without a distinct value the
+#: disagreement check would compare the projection against an echo of itself.
+ObservationOrigin: TypeAlias = Literal[
+    "incremental", "probe", "forced", "native", "native_poll", "worker_truth"
+]
 ReceiverSlot: TypeAlias = Literal["incremental", "fresh"]
 
 
@@ -123,6 +131,28 @@ class ProbeEvidence:
 
 
 @dataclass(frozen=True)
+class ProjectionEvidence:
+    """Why the state projection published this observation (WP-ARCH phase 2, I2).
+
+    The ``worker_truth`` origin's evidence, beside ``probe_evidence`` and
+    ``native_evidence`` and for the same reason: each origin carries what it
+    alone can prove, rather than everything sharing one loose payload.
+
+    ``event_id`` is the ``status.transition`` row that caused the publish, and it
+    is the whole of I2 — "the status a consumer reads can be traced to the event
+    that caused it".  It is resolvable: ``cao diag --why <event_id>`` walks that
+    row's evidence chain back to the worker's own record.  ``worker_state`` is
+    the projection's own vocabulary, kept because the legacy status it maps to is
+    lossy for two states (``starting`` and ``capped`` both publish as
+    ``processing``), so a reader that wants the un-narrowed answer has it here.
+    """
+
+    event_id: str
+    worker_state: str
+    since: str
+
+
+@dataclass(frozen=True)
 class NativeEvidence:
     agent_status: str
     resolved_status: TerminalStatus
@@ -187,6 +217,7 @@ class ReceiverState:
     raw_classification: ScreenClassificationResult | None = None
     probe_evidence: ProbeEvidence | None = None
     native_evidence: NativeEvidence | None = None
+    projection_evidence: ProjectionEvidence | None = None
     freshness_eligible: bool = field(init=False)
 
     def __post_init__(self) -> None:

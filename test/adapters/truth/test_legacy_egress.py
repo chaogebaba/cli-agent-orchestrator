@@ -195,3 +195,26 @@ def test_forget_drops_one_terminals_edge_state(ingest_on: FakeEventStore) -> Non
 @pytest.mark.parametrize("value,expected", [(None, None), (_Status.IDLE, "idle"), (7, "7")])
 def test_value_rendering_prefers_enum_value(value: object, expected: str | None) -> None:
     assert legacy_egress._as_text(value) == expected
+
+
+def test_a_projected_publish_names_the_projection_as_its_feeder(
+    ingest_on: FakeEventStore,
+) -> None:
+    """D5, at the moment it stops being theoretical (phase 2 slice 3).
+
+    Until the cutover, every publish through this egress was fed by the pane and
+    ``fed_by`` always answered ``pane``.  Now the projection publishes through
+    the same egress, so the row it produces is *caused by* the projection — and a
+    comparison that did not know the difference would compare the projection with
+    itself and report perfect agreement forever.  It would not break; it would go
+    quiet, which is worse.
+    """
+    monitor = _Monitor()
+
+    legacy_egress.record_legacy_publish(
+        monitor, "t1", _Status.IDLE, legacy_egress.PROJECTION_ORIGIN, "incremental", "accepted"
+    )
+
+    row = ingest_on.of_kind(EventKind.STATUS_LEGACY_PUBLISHED)[0]
+    assert row.payload["origin"] == "worker_truth"
+    assert row.payload["fed_by"] == "worker_truth"

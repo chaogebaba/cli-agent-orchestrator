@@ -177,3 +177,66 @@ async def test_the_guard_never_refuses_the_boot(db_path: Path, clock: FakeClock)
     assert runtime.ingest_enabled is True
     assert runtime.status is not None
     assert runtime.status.position is StatusPosition.OFF
+
+
+# ------------------------------------------------ slice 3: what ``on`` arms
+
+
+def _monitor() -> object:
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    return status_monitor
+
+
+async def test_off_arms_no_publisher_and_no_predicate(db_path: Path, clock: FakeClock) -> None:
+    """The behaviour-neutrality claim, asserted at the composition root.
+
+    With the cutover off the monitor has no predicate, so every suppression and
+    the read-time bypass are unreachable rather than merely unused — and the
+    projector has no publisher, so the projection moves and nothing reads it.
+    """
+    runtime = await bootstrap.start_worker_truth(db_path=db_path, clock=clock, env=dict(_ON))
+
+    assert runtime.status is not None and runtime.status.position is StatusPosition.OFF
+    assert runtime.allowlist is None
+    assert _monitor()._projected("anything") is False
+    assert runtime.projector is not None
+    assert runtime.projector._publisher.__name__ == "_no_publish"
+
+
+async def test_on_with_a_provider_arms_both_halves(db_path: Path, clock: FakeClock) -> None:
+    """D1 is one decision with two halves, so the boot arms them together."""
+    runtime = await bootstrap.start_worker_truth(
+        db_path=db_path,
+        clock=clock,
+        env={
+            **_ON,
+            "CAO_WORKER_TRUTH_STATUS": "on",
+            "CAO_WORKER_TRUTH_STATUS_PROVIDERS": "codex",
+        },
+    )
+
+    assert runtime.status is not None and runtime.status.position is StatusPosition.ON
+    assert runtime.allowlist is not None
+    assert runtime.projector is not None
+    assert runtime.projector._publisher.__class__.__name__ == "StatusPublisher"
+    # The predicate is live on the monitor, and still answers False for a
+    # terminal no source has claimed — the gate is armed, not opened.
+    assert _monitor()._projected("unsourced") is False
+
+
+async def test_shutdown_returns_the_fleet_to_the_pane(db_path: Path, clock: FakeClock) -> None:
+    """AC-2b case 11c at the boundary: a stopped projector projects nothing."""
+    await bootstrap.start_worker_truth(
+        db_path=db_path,
+        clock=clock,
+        env={
+            **_ON,
+            "CAO_WORKER_TRUTH_STATUS": "on",
+            "CAO_WORKER_TRUTH_STATUS_PROVIDERS": "codex",
+        },
+    )
+
+    await bootstrap.shutdown_worker_truth()
+
+    assert _monitor()._is_projected is None

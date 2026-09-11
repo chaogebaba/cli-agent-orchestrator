@@ -55,7 +55,9 @@ from cli_agent_orchestrator.app.worker_truth.mapping import (
     implied_state,
     legacy_state,
 )
+from cli_agent_orchestrator.app.worker_truth.publisher import PublishTransition
 from cli_agent_orchestrator.core.events import (
+    AnyKind,
     Confidence,
     DecisionKind,
     EventDraft,
@@ -93,6 +95,20 @@ def _no_check(terminal_id: str) -> bool:
 
 def _no_producer_check(event: "WorkerEvent", row: "ProjectedState") -> bool:
     """The default producer-disagreement check: none."""
+    return False
+
+
+def _no_publish(
+    terminal_id: str,
+    state: WorkerState,
+    *,
+    causing_kind: "AnyKind | None",
+    degraded_reason: DegradedReason | None,
+    event_id: str | None,
+    since: datetime,
+) -> bool:
+    """The default publisher: none.  The projection moves and nobody reads it,
+    which is every arm before the cutover and the ``off`` position after it."""
     return False
 
 
@@ -173,6 +189,23 @@ class StaticSourceRegistry:
 
     def is_authoritative(self, terminal_id: str) -> bool:
         return terminal_id in self._terminal_ids
+
+
+@dataclass(frozen=True)
+class _PublishIntent:
+    """One decided-but-not-yet-published move.
+
+    The value that lets the decision stay inside the projector's lock while the
+    publish happens outside it — see :meth:`Projector._deliver` for why those two
+    must not be the same critical section.
+    """
+
+    terminal_id: str
+    state: WorkerState
+    causing_kind: AnyKind | None
+    degraded_reason: DegradedReason | None
+    event_id: str | None
+    since: datetime
 
 
 @dataclass(frozen=True)
@@ -259,6 +292,7 @@ class Projector:
         legacy_check: Callable[[str], bool] | None = None,
         health: SourceHealthWriter | None = None,
         producer_check: Callable[[WorkerEvent, ProjectedState], bool] | None = None,
+        publisher: PublishTransition | None = None,
     ) -> None:
         self._events = events
         self._states = states
@@ -282,6 +316,11 @@ class Projector:
         # Re-entrant because a decision append inside the critical section reaches
         # the store's ``CheckRunner``; nothing there folds today, and an RLock
         # means nothing there ever deadlocks if something one day does.
+        #
+        # NOTHING that reaches the legacy status monitor may run while this is
+        # held — see :meth:`_deliver`.  The monitor's own lock is taken before
+        # this one on the fold's usual path, so taking them the other way round
+        # anywhere else is the deadlock that stops every status read.
         self._lock = threading.RLock()
         # D1e's gate, written here and read by the legacy status monitor.  A
         # projector with no view still folds: the view is what the CUTOVER needs,
@@ -297,6 +336,11 @@ class Projector:
         # ``legacy_check`` is: a projector must stay runnable without the
         # diagnostics that ride on it.
         self._producer_check = producer_check if producer_check is not None else _no_producer_check
+        # D1's publisher.  Absent until the cutover switch resolves ``on``, and
+        # absent is the shape of every arm before it: the projection moves and
+        # nothing reads it, which is what made phase 1's "no behaviour change"
+        # true by construction.
+        self._publisher: PublishTransition = publisher if publisher is not None else _no_publish
 
     # -------------------------------------------------------------------- apply
 
@@ -343,6 +387,11 @@ class Projector:
             else:
                 outcome = self._transition(row, event)
 
+            # D1 — what to publish is decided INSIDE the critical section, from
+            # the row this fold just wrote.  The publish itself happens outside
+            # it; see :meth:`_deliver` for why that separation is not optional.
+            intent = self._publish_intent(outcome, causing_kind=event.kind)
+
             # Run for EVERY event, muted ones included.  A muted
             # ``status.legacy_published`` is exactly where a disagreement begins —
             # the pane said one thing, the healthy source said another — so
@@ -351,6 +400,8 @@ class Projector:
             # here: the horizon is measured from the latest legacy publish, which
             # at this moment is zero seconds old.
             self._legacy_check(event.terminal_id)
+
+        self._deliver(intent)
         return outcome
 
     def _load(self, terminal_id: str, at: datetime) -> ProjectedState:
@@ -371,6 +422,66 @@ class Projector:
         if event.kind in DERIVED_ALWAYS_KINDS:
             return False
         return self._projected(event.terminal_id, row)
+
+    def _publish_intent(
+        self, outcome: ProjectionOutcome, *, causing_kind: AnyKind | None
+    ) -> "_PublishIntent | None":
+        """What to publish for an APPLIED move.  Caller holds the lock.
+
+        Only an applied move: a diagonal changed nothing to publish, a muted
+        event was not applied, and a decision row never reaches here.  The row is
+        re-read rather than reconstructed from the outcome, because ``since`` and
+        the standing degraded reason are the store's answer and the outcome
+        carries neither — and ``since`` is what the fleet row's ``status_since``
+        will be read from.  That read is why this half stays inside the lock: it
+        must see the row this fold just wrote and no later one.
+        """
+        if not outcome.applied or outcome.to_state is None:
+            return None
+        current = self._states.get(outcome.terminal_id)
+        if current is None:  # pragma: no cover - the row was just written
+            return None
+        return _PublishIntent(
+            terminal_id=outcome.terminal_id,
+            state=outcome.to_state,
+            causing_kind=causing_kind,
+            degraded_reason=current.degraded_reason,
+            event_id=outcome.decision_event_id,
+            since=current.since,
+        )
+
+    def _deliver(self, intent: "_PublishIntent | None") -> None:
+        """Publish, OUTSIDE the projector's lock.  Never holds both.
+
+        The separation is a deadlock fix, not a tidiness one.  The publisher
+        reaches the legacy status monitor and takes ITS lock, and the fold is
+        most often entered from inside that same lock (a hook on the monitor's
+        publish path calls ``emit``).  So the monitor-to-projector direction
+        already exists, on the monitor's own thread, where re-entrancy makes it
+        safe.  Publishing while holding the projector's lock would add the
+        OPPOSITE direction on three other threads — the sweep, the liveness probe
+        and the rollout tailer all fold without holding the monitor lock — and
+        two threads taking the same two locks in opposite orders is the textbook
+        shape.  The status monitor's lock guards ``get_status``, so the deadlock
+        would present as the whole server's status reads stopping.
+
+        The cost is that two applied moves for one terminal could in principle
+        reach the egress out of order, in the window between releasing the lock
+        and publishing.  That is bounded and self-correcting — the next event
+        republishes, the observation carries its own sequence, and the receiver
+        slot is last-write-wins by construction (D2) — where a deadlock is
+        neither.
+        """
+        if intent is None:
+            return
+        self._publisher(
+            intent.terminal_id,
+            intent.state,
+            causing_kind=intent.causing_kind,
+            degraded_reason=intent.degraded_reason,
+            event_id=intent.event_id,
+            since=intent.since,
+        )
 
     def _projected(self, terminal_id: str, row: ProjectedState) -> bool:
         """Does the projection own this terminal's status? (D1e.)
@@ -563,6 +674,15 @@ class Projector:
             reason = DegradedReason.RENDER_UNCERTAIN if target is WorkerState.DEGRADED else None
             return target, reason
 
+        # N3 — why the unmuted ``starting -> busy`` path is not a second writer.
+        #
+        # A derived event applies in full for an UNPROJECTED terminal, so the
+        # pane can drive the projection through the same cells the source does.
+        # That is not two writers of the published status, because the publisher
+        # refuses a terminal ``is_projected`` says no to — and the two are the
+        # same predicate, which is the whole of D1e.  A terminal is projected
+        # only when its provider is on the operator's allowlist AND its source is
+        # registered and healthy; anything else is the pane's, end to end.
         if event.kind is EventKind.PROMPT_ANSWERED:
             # WP-ARCH phase 2, D1f — the RESULTING state wins over the kind.
             #
@@ -638,6 +758,7 @@ class Projector:
         # snapshot is precisely how the sweep would clobber a transition that
         # arrived while it was reading (see the lock's note in ``__init__``).
         for terminal_id in [projection.terminal_id for projection in self._states.all_terminals()]:
+            intent: _PublishIntent | None = None
             with self._lock:
                 current = self._states.get(terminal_id)
                 if current is None:
@@ -666,7 +787,20 @@ class Projector:
                 last_event = self._last_event(terminal_id, row.last_event_seq)
                 if last_event is None:
                     continue
-                outcomes.append(self._degrade_no_signal(row, last_event, now))
+                outcome = self._degrade_no_signal(row, last_event, now)
+                outcomes.append(outcome)
+                # Offered to the publisher like any other applied move, and
+                # refused by it: the mark above has just been lowered, because
+                # a terminal is only here when its source went silent.  The
+                # handover is the point — the pane path is publishing for this
+                # terminal again, and a projected ``unknown`` on top of it would
+                # be the cutover turning a source outage into a status outage.
+                intent = self._publish_intent(outcome, causing_kind=None)
+            # OUTSIDE the lock, and this is the path that made it necessary: the
+            # sweep runs on its own thread and holds no monitor lock, so
+            # publishing from inside the critical section would take the two
+            # locks in the opposite order to the fold's own caller.
+            self._deliver(intent)
 
         # The durational check runs for EVERY terminal, not only the ones this
         # pass degraded.  ``DIAG-LEGACY-DISAGREE`` is defined by how long a

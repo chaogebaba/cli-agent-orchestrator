@@ -77,6 +77,7 @@ __all__ = [
     "SeatCarrier",
     "SourceHealthView",
     "StateFolder",
+    "StatusEgress",
     "StateProjection",
     "StateStore",
 ]
@@ -246,6 +247,44 @@ class SourceHealthView(Protocol):
     """
 
     def is_projected(self, terminal_id: str) -> bool: ...
+
+
+@runtime_checkable
+class StatusEgress(Protocol):
+    """Where the projection publishes a status (WP-ARCH phase 2, D1).
+
+    The cutover is a change of PRODUCER, not a new store: the projection
+    publishes through the single legacy egress every other origin already passes
+    through, so the fleet, the inbox and every getter read what it wrote without
+    learning a second truth.  That egress lives in the legacy tree, which ``app``
+    may not import — so it arrives as this Protocol, filled by the composition
+    root, and the publisher never names a service.
+
+    The status crosses as a legacy ``TerminalStatus`` STRING for the reason
+    ``mapping.py`` carries the vocabulary as strings: the enum is legacy, and a
+    port typed on it would drag the fence across.  The adapter on the other side
+    is the one thing allowed to know both spellings.
+
+    ``event_id`` is the ``status.transition`` that caused the publish, and it is
+    not decoration: I2 is "the status a consumer reads can be traced to the event
+    that caused it", and this is the only place that link is made.  ``None`` is
+    accepted for a publish with no decision row behind it, which is what a
+    ghost-transition check would then notice.
+
+    Implementations MUST NOT raise: this is called from inside the fold, and a
+    publisher that could break the fold would make a status feature into a
+    status outage.
+    """
+
+    def publish(
+        self,
+        terminal_id: str,
+        status: str,
+        *,
+        event_id: str | None,
+        worker_state: str,
+        since: datetime,
+    ) -> None: ...
 
 
 class StateProjection(Protocol):

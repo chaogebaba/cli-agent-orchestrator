@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from cli_agent_orchestrator.adapters.clock import SystemClock
@@ -63,6 +65,7 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
 )
 from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
+from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
 from cli_agent_orchestrator.core.delivery import (
     GuardOutcome,
@@ -208,6 +211,9 @@ class WorkerTruthRuntime:
     #: D9b's check (phase 2).  Held because it keeps an in-memory episode per
     #: terminal, which the teardown path has to be able to drop.
     producer_check: ProducerDisagreementCheck | None = None
+    #: D9's provider gate, present only when the cutover resolved ``on``.  Held
+    #: for the same reason: it caches one fact per terminal.
+    allowlist: "_ProviderAllowlist | None" = None
     #: The two periodic drivers (phase 2, sub-phase 2b).  ``probe`` also owns the
     #: pane-delta sampler's re-drive (§12), which is why it is started even on a
     #: backend that cannot list panes for it.
@@ -446,6 +452,121 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
                 logger.debug("worker-truth: pane sample failed for %s", terminal_id, exc_info=True)
 
     return tick
+
+
+class _ProviderAllowlist:
+    """D9's per-provider gate, as a predicate over TERMINALS (D9c).
+
+    The operator's control is a list of PROVIDER names; the projection's gate is
+    per terminal.  Bridging the two needs one fact — which provider a terminal
+    runs — and that fact is in the database, which this predicate must not read
+    on a getter path (D1e's whole objection to the obvious implementation).
+
+    So it is cached, and the cache is sound for the reason a provider cache
+    usually is not: a terminal's provider is fixed for its lifetime.  It is read
+    at most once per terminal per process, and the teardown path drops the entry
+    with the rest of the terminal's per-lifecycle state, so a recycled id cannot
+    inherit a dead terminal's provider.
+
+    The predicate is consulted ONLY for a terminal the projector has already
+    marked projected, so it narrows and never widens: a provider that cannot be
+    resolved reads as NOT allowlisted, which leaves the pane path in charge.
+    """
+
+    def __init__(self, providers: frozenset[str]) -> None:
+        self._providers = providers
+        self._lock = threading.Lock()
+        self._cache: dict[str, str] = {}
+
+    def __call__(self, terminal_id: str) -> bool:
+        if not self._providers:
+            return False
+        provider = self._provider_of(terminal_id)
+        return provider is not None and provider in self._providers
+
+    def forget(self, terminal_id: str) -> None:
+        with self._lock:
+            self._cache.pop(terminal_id, None)
+
+    def _provider_of(self, terminal_id: str) -> str | None:
+        with self._lock:
+            cached = self._cache.get(terminal_id)
+        if cached is not None:
+            return cached
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+        except Exception:
+            logger.debug("provider lookup failed for %s", terminal_id, exc_info=True)
+            return None
+        if not metadata:
+            return None
+        provider = str(metadata.get("provider") or "").strip().lower()
+        if not provider:
+            return None
+        with self._lock:
+            self._cache[terminal_id] = provider
+        return provider
+
+
+class _StatusEgress:
+    """``core.ports.StatusEgress``, filled with the legacy status monitor.
+
+    Here rather than under ``adapters/`` because it names a service, and
+    ``adapters-are-leaves`` forbids that: the composition root is the one module
+    allowed to know both halves.  It is also the only place the projection's
+    legacy status STRING becomes a ``TerminalStatus`` — the fence the publisher
+    is kept behind runs right through this class.
+    """
+
+    def publish(
+        self,
+        terminal_id: str,
+        status: str,
+        *,
+        event_id: str | None,
+        worker_state: str,
+        since: "datetime",
+    ) -> None:
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        try:
+            legacy = TerminalStatus(status)
+        except ValueError:
+            # The forward map is pinned against this enum by a test, so this is
+            # unreachable rather than defensive — and if the pin ever fails, the
+            # safe answer is to publish nothing and leave the pane in charge.
+            logger.warning("worker-truth publish: %r is not a TerminalStatus", status)
+            return
+        status_monitor.publish_projection(
+            terminal_id,
+            legacy,
+            event_id=event_id,
+            worker_state=worker_state,
+            since=since.isoformat(),
+        )
+
+
+def _enable_projection(view: object) -> None:
+    """Hand D1e's predicate to the legacy status monitor.  Never raises."""
+    try:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.enable_projection(view)
+    except Exception:  # noqa: BLE001 — a cutover must not break the boot
+        logger.warning("worker-truth: could not arm the status cutover", exc_info=True)
+
+
+def _disable_projection() -> None:
+    """Drop the predicate, returning the whole fleet to the pane path."""
+    try:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.disable_projection()
+    except Exception:  # noqa: BLE001
+        logger.debug("worker-truth: could not disarm the status cutover", exc_info=True)
 
 
 def _reconcile_question_marker(terminal_id: str) -> None:
@@ -799,7 +920,16 @@ async def start_worker_truth(
         # a read-only ``core.ports.SourceHealthView``.  Empty at construction, so
         # every terminal reads NOT projected until a fold says otherwise, which
         # is the behaviour every arm before the cutover must have.
-        health = SourceHealth()
+        # D9/D9c — the cutover's two halves of one gate.  The allowlist is the
+        # OPERATOR's control and the projector's source registry is the FACT;
+        # ``is_projected`` is their conjunction, composed here so no suppression
+        # site ever grows a second opinion about when to fall back.  With the
+        # switch off there is no allowlist and no publisher, so the projection
+        # moves and nothing reads it — phase-1 behaviour, by construction.
+        cutover_on = status is not None and status.position is StatusPosition.ON
+        allowlist = _ProviderAllowlist(status.providers) if cutover_on else None
+        health = SourceHealth(admits=allowlist)
+        publisher = StatusPublisher(_StatusEgress(), health) if cutover_on else None
         producer_check = ProducerDisagreementCheck(finding_store)
         projector = Projector(
             event_store,
@@ -816,6 +946,7 @@ async def start_worker_truth(
             # to re-derive source health and would then be a second
             # implementation of the precedence rule.
             producer_check=producer_check,
+            publisher=publisher,
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
@@ -870,6 +1001,18 @@ async def start_worker_truth(
                 folder=projector,
             )
         )
+        if cutover_on:
+            # D1e — the monitor learns the predicate LAST, after the producers
+            # are armed, and the ORDER is the whole content of this line.
+            #
+            # ``install_producers`` above is what turns the seven legacy hooks
+            # from no-ops into appends; until it runs, no event reaches the
+            # projector and the projection therefore publishes nothing.  Handing
+            # the monitor the predicate before that would open a window in which
+            # a terminal read as projected — so its pane publish was suppressed —
+            # while the producer that was meant to replace it had not started.
+            # A status outage, measured in whatever the boot takes.
+            _enable_projection(health)
     except Exception as exc:  # noqa: BLE001 — wiring must not block boot either
         logger.error("worker-truth bootstrap failed to wire adapters: %r", exc)
         truth_wiring.reset_producers()
@@ -898,6 +1041,7 @@ async def start_worker_truth(
         sources=sources,
         health=health,
         producer_check=producer_check,
+        allowlist=allowlist,
         retention=retention,
         probe=probe,
         sweep=sweep,
@@ -917,7 +1061,12 @@ async def shutdown_worker_truth() -> None:
     runtime = _runtime
     _runtime = None
     # Disarm the producers FIRST: a hook that fires while the pool is closing
-    # would log a failure for a shutdown that is going perfectly well.
+    # would log a failure for a shutdown that is going perfectly well.  The
+    # status cutover goes with them and for the same reason, in the other order:
+    # the monitor stops consulting a projection whose projector is about to stop
+    # moving, so the whole fleet falls back to the pane rather than freezing at
+    # its last projected value (AC-2b case 11c).
+    _disable_projection()
     truth_wiring.reset_producers()
     delivery_wiring.reset_delivery()
     if runtime is None:
