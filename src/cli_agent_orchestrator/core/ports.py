@@ -47,6 +47,7 @@ from cli_agent_orchestrator.core.gate import (
     ArtifactManifest,
     ClaimOwnershipResult,
     ConsumerCoverage,
+    ContinuationKind,
     Dispatch,
     Disposition,
     EffectIntent,
@@ -55,7 +56,10 @@ from cli_agent_orchestrator.core.gate import (
     GateRound,
     GateRun,
     OpenFinding,
+    QuestionAnswer,
+    QuestionState,
     RoundProjection,
+    RoundQuestion,
     RoundState,
     RunState,
     Severity,
@@ -69,6 +73,7 @@ __all__ = [
     "EventStore",
     "FindingStore",
     "GateStore",
+    "QuestionNotifier",
     "LegacyInboxAdopter",
     "PaneInjector",
     "ProviderAdapter",
@@ -888,6 +893,146 @@ class GateStore(Protocol):
         """Transfer ownership monotonically in the epoch (P2, DESIGN r2 C1, AC-A12)."""
         ...
 
+    # -- the question primitive (slice B1; §10.2 P2, A2) -------------------
+    #
+    # Every mutator below is ONE transaction in the adapter.  That is not a
+    # performance note: the ask writes the question, suspends the dispatch and
+    # records the notification intent together, so there is no instant at which a
+    # lane is suspended with nothing recorded to wake it, and the answer writes
+    # the answer row, settles the question and records the delivery intent
+    # together, so an answer can never exist without an obligation to deliver it.
+
+    def ask_question(
+        self,
+        *,
+        dispatch_id: str,
+        round_id: str | None,
+        client_request_id: str,
+        owner_conversation: str,
+        owner_epoch: int,
+        continuation_kind: ContinuationKind,
+        continuation_ref: str,
+        question: str,
+        options: Sequence[str],
+        blocking: bool,
+        asked_at: datetime,
+        expires_at: datetime,
+        answer_schema: str | None = None,
+        default_answer: str | None = None,
+    ) -> tuple[RoundQuestion, bool]:
+        """Insert a PENDING question, suspend its dispatch and record the notice intent.
+
+        Returns the question and whether it was REPLAYED rather than written.
+
+        Idempotent on ``client_request_id``: an identical retry returns the row it
+        already wrote.  A SECOND open question for the same dispatch is refused
+        with a typed :class:`~cli_agent_orchestrator.core.gate.GateQuestionError`
+        (AC-A10) rather than leaking the ``ux_question_open`` ``IntegrityError``,
+        because a lane has to be able to branch on "you are already waiting".  A
+        dispatch that has RETURNED, FAILED or been ABANDONED is refused too: a
+        finished lane has nobody left to answer to, and suspending it would make
+        the whole run project as awaiting an answer forever.
+        """
+        ...
+
+    def ensure_dispatch(self, dispatch: Dispatch) -> bool:
+        """Insert this dispatch only if none exists; True when it inserted.
+
+        ONE statement, so provisioning cannot clobber a dispatch recorded between
+        a check and an act — which ``record_dispatch``'s UPSERT would.
+        """
+        ...
+
+    def get_dispatch(self, dispatch_id: str) -> Dispatch | None:
+        """One dispatch by id, or ``None``.
+
+        A read, not a convenience: ``record_dispatch`` UPSERTS, so a caller that
+        provisions a missing dispatch without checking first would silently
+        rewrite a live gate dispatch's role and state.
+        """
+        ...
+
+    def get_question(self, question_id: str) -> RoundQuestion | None: ...
+
+    def get_answer(self, answer_event_id: str) -> QuestionAnswer | None:
+        """The recorded answer event, for handing back to a waiting asker."""
+        ...
+
+    def notices_to_retry(self, *, limit: int = 50) -> list[RoundQuestion]:
+        """Open questions whose notice intent has not landed (PENDING or FAILED).
+
+        A READ, deliberately: the sweep decides what to re-send from it and then
+        re-sends, so a period in which nothing is outstanding costs one SELECT
+        and takes no write lock at all.  A question that has already settled is
+        excluded — re-announcing an answered question would be worse than never
+        having announced it.
+        """
+        ...
+
+    def open_question_for_dispatch(self, dispatch_id: str) -> RoundQuestion | None:
+        """The dispatch's PENDING/ESCALATED question, if it has one (AC-A10)."""
+        ...
+
+    def answer_question(
+        self,
+        *,
+        question_id: str,
+        answer: str,
+        answered_by: str,
+        client_request_id: str,
+        caller_conversation: str,
+        caller_epoch: int,
+        now: datetime,
+    ) -> tuple[RoundQuestion, QuestionAnswer]:
+        """Record an answer conditionally on state, expiry AND owner epoch (AC-A12).
+
+        One transaction whose WHERE clause carries all three conditions, so an
+        answer and an expiry cannot both win.  An identical retry by
+        ``client_request_id`` returns the recorded answer; a DIFFERENT answer
+        under the same request id is refused as a conflict.
+        """
+        ...
+
+    def escalate_question(self, question_id: str, *, now: datetime) -> RoundQuestion:
+        """Move a PENDING question to ESCALATED; it keeps the open slot (AC-A10)."""
+        ...
+
+    def expire_due_questions(self, now: datetime) -> list[RoundQuestion]:
+        """Settle every open question past its ``expires_at`` and return them.
+
+        Returns the rows it changed, so the caller emits exactly one anomaly per
+        question (AC-A7) instead of re-reading and risking a double notice.
+        """
+        ...
+
+    def mark_notice_sent(self, question_id: str, *, msg_id: str) -> None:
+        """Settle the notification intent as SENT, recording the message id."""
+        ...
+
+    def mark_notice_failed(self, question_id: str, *, error: str) -> None:
+        """Settle the notification intent as FAILED and bump its attempt count."""
+        ...
+
+    def mark_answer_consumed(self, answer_event_id: str, *, now: datetime) -> None:
+        """Record that the ASKER received the answer, and release its dispatch.
+
+        ``ANSWERED`` is not proof of receipt (R28); this is the receipt, and it is
+        what returns the dispatch from ``AWAITING_ANSWER`` so the run stops
+        projecting as awaiting an answer.
+        """
+        ...
+
+    def questions_for_owner(
+        self,
+        *,
+        owner_conversation: str | None = None,
+        states: Sequence[QuestionState] = (),
+        round_id: str | None = None,
+        limit: int = 100,
+    ) -> list[RoundQuestion]:
+        """List questions, newest first, filtered by owner, state and round."""
+        ...
+
     def get_run(self, run_id: str) -> GateRun | None: ...
 
     def get_round(self, round_id: str) -> GateRound | None: ...
@@ -903,6 +1048,44 @@ class GateStore(Protocol):
     def open_findings_for_run(self, run_id: str) -> list[OpenFinding]:
         """The run's still-open findings, for the next round's brief (AC-A2)."""
         ...
+
+
+@runtime_checkable
+class QuestionNotifier(Protocol):
+    """How a rendered question or anomaly reaches the supervisor seat (A2, B2).
+
+    INTERFACE ONLY in slice B1.  The implementation is a closure the composition
+    root builds over the delivery queue, and it lives there for a structural
+    reason: the notice becomes a queue row through the legacy
+    ``clients.database`` write-through, which ``app`` and ``adapters`` may not
+    import (``new-code-never-imports-legacy``) and ``bootstrap`` may.  Declaring
+    the port now is what lets ``app/gate`` be written, and tested with a fake,
+    before that wiring exists.
+
+    The envelope arrives as already-rendered LINES rather than a
+    ``CallbackEnvelope``: the renderer lives in ``app`` and ``core`` may not
+    import it, and a notifier's job is transport, not judgement about what the
+    seat reads.  ``classification`` and ``code`` travel beside ``kind`` because
+    A5 fixes the wire at four kinds and an expiry shares one with every other run
+    condition: ``classification`` says whether anyone should be alarmed and
+    ``code`` says about what.  A transport lacking them would have to match on
+    the prose of a summary line.
+
+    Returns the delivered message id.  Returning ``None`` or raising both mean
+    the notice did NOT land, and the caller settles the intent ``FAILED`` for a
+    later sweep — a notifier is never permitted to fail silently into a question
+    nobody will hear about.
+    """
+
+    def notify(
+        self,
+        *,
+        question: RoundQuestion,
+        kind: str,
+        classification: str,
+        code: str,
+        lines: Sequence[str],
+    ) -> str | None: ...
 
 
 @runtime_checkable

@@ -10,11 +10,14 @@ naming the one-line edit to the new code that must turn the test red.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from cli_agent_orchestrator.core import gate as g
+
+#: The fixed "now" every slice-B1 question arm is written against.
+_T0 = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
 
 def _manifest(
@@ -292,3 +295,195 @@ def test_epoch_supersedes_is_strict() -> None:
     assert g.epoch_supersedes(3, 4)
     assert not g.epoch_supersedes(4, 4)
     assert not g.epoch_supersedes(5, 4)
+
+
+# -- slice B1: the question primitive's pure rules ---------------------------
+
+
+def _question(**overrides: object) -> g.RoundQuestion:
+    """A PENDING question an hour from expiry, with fields overridable by name."""
+    base: dict[str, object] = {
+        "question_id": "Q1",
+        "dispatch_id": "d1",
+        "client_request_id": "cr1",
+        "owner_conversation": "c1",
+        "owner_epoch": 3,
+        "continuation_kind": g.ContinuationKind.ASSIGNMENT,
+        "continuation_ref": "d1",
+        "asked_at": _T0,
+        "expires_at": _T0 + timedelta(hours=1),
+        "question": "accept, re-round or override?",
+        "row_version": 1,
+    }
+    base.update(overrides)
+    return g.RoundQuestion(**base)  # type: ignore[arg-type]
+
+
+def test_question_transition_table_is_enumerated() -> None:
+    """Every (from, to) pair, decided here rather than discovered in the store.
+
+    Enumerated rather than spot-checked because the table is small and the
+    dangerous cells are the ones nobody thinks to write a test for: a settled
+    question re-settling would let an expiry overwrite an answer the asker has
+    already consumed.
+    """
+    S = g.QuestionState
+    legal = {
+        (S.PENDING, S.ESCALATED),
+        (S.PENDING, S.ANSWERED),
+        (S.PENDING, S.EXPIRED),
+        (S.ESCALATED, S.ANSWERED),
+        (S.ESCALATED, S.EXPIRED),
+    }
+    for current in S:
+        for target in S:
+            if (current, target) in legal:
+                assert g.next_question_state(current, target) is target
+            else:
+                with pytest.raises(g.GateQuestionError) as exc:
+                    g.next_question_state(current, target)
+                assert exc.value.code is g.QuestionRefusal.ILLEGAL_TRANSITION
+
+
+def test_escalated_is_not_reachable_from_escalated_or_settled() -> None:
+    """Escalation is one-way into the open slot, never a way back out of it."""
+    for origin in (g.QuestionState.ESCALATED, g.QuestionState.ANSWERED, g.QuestionState.EXPIRED):
+        with pytest.raises(g.GateQuestionError):
+            g.next_question_state(origin, g.QuestionState.ESCALATED)
+
+
+def test_validate_ask_requires_a_default_only_when_non_blocking() -> None:
+    """The rule that matters: a caller who does not wait must say what it does instead."""
+    window = {"asked_at": _T0, "expires_at": _T0 + timedelta(hours=1)}
+    g.validate_ask(blocking=True, default_answer=None, question="go?", **window)
+    g.validate_ask(blocking=False, default_answer="no", question="go?", **window)
+    with pytest.raises(g.GateQuestionError) as exc:
+        g.validate_ask(blocking=False, default_answer=None, question="go?", **window)
+    assert exc.value.code is g.QuestionRefusal.DEFAULT_REQUIRED
+    with pytest.raises(g.GateQuestionError) as empty_default:
+        g.validate_ask(blocking=False, default_answer="", question="go?", **window)
+    assert empty_default.value.code is g.QuestionRefusal.DEFAULT_REQUIRED
+
+
+def test_validate_ask_refuses_a_question_born_expired() -> None:
+    """An ``expires_at`` at or before ``asked_at`` would settle before anyone saw it."""
+    for expires in (_T0, _T0 - timedelta(seconds=1)):
+        with pytest.raises(g.GateQuestionError) as exc:
+            g.validate_ask(
+                blocking=True,
+                default_answer=None,
+                question="go?",
+                asked_at=_T0,
+                expires_at=expires,
+            )
+        assert exc.value.code is g.QuestionRefusal.QUESTION_EXPIRED
+
+
+def test_validate_ask_refuses_empty_question_text() -> None:
+    with pytest.raises(g.GateQuestionError) as exc:
+        g.validate_ask(
+            blocking=True,
+            default_answer=None,
+            question="   ",
+            asked_at=_T0,
+            expires_at=_T0 + timedelta(hours=1),
+        )
+    assert exc.value.code is g.QuestionRefusal.QUESTION_EMPTY
+
+
+def test_answer_admissible_accepts_the_current_owner() -> None:
+    verdict = g.answer_admissible(
+        _question(),
+        caller_conversation="c1",
+        caller_epoch=3,
+        now=_T0 + timedelta(minutes=1),
+    )
+    assert verdict.admissible and verdict.code is None
+
+
+def test_answer_admissible_refuses_a_superseded_epoch_and_reuses_the_pure_rule() -> None:
+    """AC-A12: an answer from a conversation a later claim overtook is refused.
+
+    The caller's epoch is BEHIND the row's, which is what ``claim_ownership``
+    leaves behind after it rewrites an open question.  The check is
+    :func:`epoch_supersedes` itself, so a second spelling of "ownership is
+    monotonic" cannot come to disagree with the store's.
+    """
+    verdict = g.answer_admissible(
+        _question(owner_epoch=5),
+        caller_conversation="c1",
+        caller_epoch=4,
+        now=_T0 + timedelta(minutes=1),
+    )
+    assert not verdict.admissible
+    assert verdict.code is g.QuestionRefusal.EPOCH_SUPERSEDED
+    assert g.epoch_supersedes(4, 5) is True
+
+
+def test_answer_admissible_admits_an_epoch_ahead_of_the_row() -> None:
+    """A claim that has not yet rewritten THIS row is not a stale answer."""
+    verdict = g.answer_admissible(
+        _question(owner_epoch=3),
+        caller_conversation="c1",
+        caller_epoch=9,
+        now=_T0 + timedelta(minutes=1),
+    )
+    assert verdict.admissible
+
+
+def test_answer_admissible_refuses_a_different_conversation() -> None:
+    verdict = g.answer_admissible(
+        _question(),
+        caller_conversation="c2",
+        caller_epoch=3,
+        now=_T0 + timedelta(minutes=1),
+    )
+    assert verdict.code is g.QuestionRefusal.OWNER_MISMATCH
+
+
+def test_answer_admissible_refuses_past_the_deadline_before_any_sweep_runs() -> None:
+    """Wall-clock expiry is checked here, not only by the sweep's cadence.
+
+    A row still reading PENDING past its deadline is refused at the instant an
+    answer arrives, so an answer and an expiry cannot both be admitted through
+    the window a 30-second sweep period would otherwise open.
+    """
+    verdict = g.answer_admissible(
+        _question(),
+        caller_conversation="c1",
+        caller_epoch=3,
+        now=_T0 + timedelta(hours=1),
+    )
+    assert verdict.code is g.QuestionRefusal.QUESTION_EXPIRED
+
+
+def test_answer_admissible_refuses_a_settled_question() -> None:
+    for state in (g.QuestionState.ANSWERED, g.QuestionState.EXPIRED):
+        verdict = g.answer_admissible(
+            _question(state=state),
+            caller_conversation="c1",
+            caller_epoch=3,
+            now=_T0 + timedelta(minutes=1),
+        )
+        assert verdict.code is g.QuestionRefusal.QUESTION_SETTLED
+
+
+def test_a_question_is_open_in_exactly_the_two_slot_holding_states() -> None:
+    """AC-A10's slot: PENDING and ESCALATED, and nothing else."""
+    assert _question(state=g.QuestionState.PENDING).is_open
+    assert _question(state=g.QuestionState.ESCALATED).is_open
+    assert not _question(state=g.QuestionState.ANSWERED).is_open
+    assert not _question(state=g.QuestionState.EXPIRED).is_open
+
+
+def test_awaiting_answer_stays_a_projection_with_questions_in_play() -> None:
+    """No ``TerminalStatus`` member: the wait is the dispatch state, projected.
+
+    Re-asserted in the question arms because B1 is where somebody would be
+    tempted to add one — the question now exists, so "what is the lane doing"
+    has an answer that must keep coming from the rows.
+    """
+    assert g.run_awaiting_answer([g.DispatchState.AWAITING_ANSWER]) is True
+    assert g.run_awaiting_answer([g.DispatchState.DISPATCHED]) is False
+    with pytest.raises(g.GateError):
+        g.next_run_state(g.RunState.OPEN, g.RunState.AWAITING_ANSWER)

@@ -39,6 +39,9 @@ __all__ = [
     "DELIVERY_RETENTION_DAYS",
     "DELIVERY_TICK_S",
     "DELIVERY_VETO_CEILING_S",
+    "GATE_QUESTION_EXPIRY_S",
+    "GATE_QUESTION_SWEEP_S",
+    "GATE_QUESTION_WAIT_CAP_S",
     "IDLE_STALL_AGE_S",
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
@@ -250,6 +253,31 @@ DELIVERY_MAX_LIFETIME_S = 1700
 #: prunes them (§13d).  A row named by an OPEN finding is never pruned, exactly
 #: as phase 1's ``prune`` keeps open evidence.
 DELIVERY_RETENTION_DAYS = 30
+
+#: How long a durable gate question stays open before the sweep expires it
+#: (WP-ARCH Amendment A slice B1, A2/AC-A7).  An hour is long enough that a
+#: supervisor reading a digest between tasks still answers in time, and short
+#: enough that a forgotten question surfaces as an anomaly inside one working
+#: session rather than sitting open across a restart.  It lives HERE, not next
+#: to the service that uses it, because §4c admits exactly one home for a
+#: duration and a second declaration is how two numbers come to disagree.
+GATE_QUESTION_EXPIRY_S = 3600
+
+#: How often the expiry daemon sweeps overdue questions (slice B2, AC-A7).
+#: Thirty seconds is two orders of magnitude finer than the hour a question
+#: lives, so an expiry is observed promptly, and coarse enough that the sweep is
+#: not competing with the status monitor for the write lock: the sweep reads
+#: first and takes a write transaction ONLY when it has something to settle, so
+#: an idle fleet costs one SELECT per period and no lock at all.
+GATE_QUESTION_SWEEP_S = 30
+
+#: The ceiling on ONE bounded long poll, in seconds.  Deliberately under
+#: ``MCP_REQUEST_TIMEOUT`` so the server answers before the client gives up: a
+#: caller that times out client-side cannot tell "still waiting" from "the
+#: server died", and a blocking asker would then retry an ask it already made.
+#: A longer wait is many of these in a row, each a fresh request holding nothing
+#: open between them.
+GATE_QUESTION_WAIT_CAP_S = 25
 
 #: The legacy stalled-notice age, MIRRORED here rather than imported.
 #:

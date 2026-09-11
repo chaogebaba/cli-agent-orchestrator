@@ -1,12 +1,14 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import (
     Annotated,
@@ -4596,6 +4598,220 @@ async def answer_user_prompt(
     # F172 input leniency.
     terminal_id = _resolve_input_terminal_id(terminal_id)
     return _send_user_prompt_answer(terminal_id, answer)
+
+
+def _gate_question_route(path: str, *, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to a ``/gate/questions`` route, translating a typed refusal.
+
+    The tools below go over HTTP to the SAME handlers ``cao gate ask|answer``
+    calls (standing invariant #535/F680): one service call, reached two ways, so
+    the CLI verb and the tool cannot drift into meaning different things.  A
+    refused command arrives as a 4xx whose body carries the domain ``code``, and
+    it is re-raised as a ``ValueError`` carrying that code so the agent sees
+    something it can act on rather than a bare HTTP status.
+    """
+    response = cao_http.post(
+        path, json=payload, headers=_api_headers() or None, timeout=_mcp_timeout()
+    )
+    if response.status_code >= 400:
+        raise ValueError(str(_extract_structured_detail(response, f"{path} refused")))
+    result: Dict[str, Any] = response.json()
+    return result
+
+
+def _stable_request_id(*parts: str) -> str:
+    """A caller-owned idempotency key derived from what is being asked.
+
+    Derived rather than random on purpose: a lane that retries the SAME ask after
+    a transport timeout must get its own question back, and a fresh uuid each
+    attempt would instead produce a second ask that the one-open-question index
+    then refuses — turning a recoverable retry into a hard failure.
+    """
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+    return digest[:32]
+
+
+#: The ceiling on ONE bounded wait, mirrored from ``core.timing`` rather than
+#: imported: ``mcp_server`` is legacy and importing the new tree here would add a
+#: file to the hook-point set for a single integer.  The server's ``wait`` query
+#: parameter validates against the real constant, so a drift here is refused
+#: there rather than silently honoured.
+_GATE_WAIT_CAP_S = 25
+
+
+def _gate_question_get(question_id: str, *, wait: int = 0) -> Dict[str, Any]:
+    params = {"wait": int(wait)} if wait else None
+    response = cao_http.get(
+        f"/gate/questions/{question_id}",
+        params=params,
+        headers=_api_headers() or None,
+        # The read must outlive the server's own wait, or the client gives up on
+        # a request the server was about to answer and cannot tell that from a
+        # dead server.
+        timeout=max(_mcp_timeout(), float(wait) + 10.0),
+    )
+    if response.status_code >= 400:
+        raise ValueError(str(_extract_structured_detail(response, "gate question read failed")))
+    result: Dict[str, Any] = response.json()
+    return result
+
+
+@mcp.tool()
+async def ask_supervisor(
+    question: str = Field(description="The question to put to the supervisor"),
+    options: List[str] = Field(
+        default_factory=list, description="Optional closed set of acceptable answers"
+    ),
+    blocking: bool = Field(
+        default=True,
+        description=(
+            "Wait here until the supervisor answers. False returns at once and "
+            "requires default_answer"
+        ),
+    ),
+    default_answer: str = Field(
+        default="",
+        description=(
+            "Required when blocking is False: what this lane proceeds with if " "nobody answers"
+        ),
+    ),
+    expires_in_s: int = Field(
+        # MIRRORED from ``core.timing.GATE_QUESTION_EXPIRY_S``, not imported:
+        # ``mcp_server`` is legacy and importing the new tree here would add a
+        # file to the hook-point equality set for one integer. The SERVER
+        # validates against the real constant, so a drift is refused there
+        # rather than silently honoured (N5).
+        default=3600,
+        description="Seconds before the question expires, 1..86400",
+    ),
+    client_request_id: str = Field(
+        default="", description="Idempotency key; derived from the question when omitted"
+    ),
+) -> Dict[str, Any]:
+    """Ask the supervisor a question and, by default, wait here for the answer.
+
+    The question becomes a durable row the supervisor can answer by id from any
+    session, so it survives a server restart and does not depend on anyone
+    reading a pane.
+
+    BLOCKING (the default) suspends this tool call itself: the wait happens
+    inside one HTTP request at a time, so your turn is genuinely parked rather
+    than spinning. It returns when the supervisor answers, or when the question
+    expires. NON-BLOCKING returns as soon as the question is recorded and
+    therefore requires ``default_answer`` — this lane keeps working, and
+    something has to decide what it keeps working WITH.
+    """
+    terminal_id = _current_terminal_id()
+    if not terminal_id:
+        raise ValueError("CAO_TERMINAL_ID not set - cannot identify the asking lane")
+    if not blocking and not default_answer:
+        raise ValueError(
+            "a non-blocking ask needs default_answer: this lane continues "
+            "immediately and something must decide what with"
+        )
+    _callback_url, supervisor_id = _callback_route()
+    owner = supervisor_id or os.environ.get("CAO_CALLBACK_TERMINAL_ID") or "supervisor"
+    payload: Dict[str, Any] = {
+        "dispatch_id": terminal_id,
+        "question": question,
+        "client_request_id": client_request_id or _stable_request_id(terminal_id, question),
+        "owner_conversation": owner,
+        "options": list(options),
+        "blocking": bool(blocking),
+        "default_answer": default_answer or None,
+        "expires_in_s": int(expires_in_s),
+        "position": os.environ.get("CAO_AGENT_NAME") or "worker",
+    }
+    asked = _gate_question_route("/gate/questions", payload=payload)
+    if not blocking:
+        return asked
+
+    question_id = str(asked["question_id"])
+    deadline = _parse_expiry(asked.get("expires_at"))
+    settlement: Dict[str, Any] = {"question": asked, "answer": None}
+    while True:
+        remaining = _seconds_until(deadline)
+        if remaining <= 0:
+            break
+        settlement = await asyncio.to_thread(
+            _gate_question_get, question_id, wait=int(min(_GATE_WAIT_CAP_S, remaining))
+        )
+        current = settlement.get("question") or {}
+        if not current.get("is_open"):
+            break
+
+    current = settlement.get("question") or {}
+    answered = current.get("state") == "ANSWERED"
+    if answered:
+        # ANSWERED is not proof of receipt: this lane HAS it now, so record that
+        # (R28). Best-effort — the answer is already in hand, and failing the
+        # tool call over a bookkeeping write would lose it.
+        try:
+            await asyncio.to_thread(_gate_question_consume, question_id)
+        except Exception:  # noqa: BLE001
+            pass
+    answer_block = settlement.get("answer") or {}
+    return {
+        "question_id": question_id,
+        "state": current.get("state"),
+        "answer": answer_block.get("answer") if answered else None,
+        "answered_by": answer_block.get("answered_by") if answered else None,
+        "expired": current.get("state") == "EXPIRED",
+    }
+
+
+def _gate_question_consume(question_id: str) -> Dict[str, Any]:
+    return _gate_question_route(f"/gate/questions/{question_id}/consume", payload={})
+
+
+def _parse_expiry(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:  # pragma: no cover - the server renders isoformat
+        return None
+
+
+def _seconds_until(deadline: Optional[datetime]) -> float:
+    """Seconds left before a question expires, or one cap's worth if unknown.
+
+    An unparseable deadline must not mean "wait forever": the fallback is a
+    single bounded wait, after which the loop re-reads and decides again.
+    """
+    if deadline is None:
+        return float(_GATE_WAIT_CAP_S)
+    now = datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.now()
+    return (deadline - now).total_seconds()
+
+
+@mcp.tool()
+async def answer_question(
+    question_id: str = Field(description="The question id to answer"),
+    answer: str = Field(description="The answer text"),
+    client_request_id: str = Field(
+        default="", description="Idempotency key; derived from the answer when omitted"
+    ),
+) -> Dict[str, Any]:
+    """Answer a durable question a lane is waiting on, by id.
+
+    Refused if the question already settled, if its deadline has passed, or if
+    this conversation's ownership was superseded by a later claim. An identical
+    retry returns the recorded answer; a DIFFERENT answer under the same
+    idempotency key is a conflict rather than a silent overwrite.
+
+    This is not ``answer_user_prompt``: that answers a PROVIDER DIALOG in
+    somebody's pane, this settles a recorded question in the gate.
+    """
+    terminal_id = _current_terminal_id() or "supervisor"
+    payload: Dict[str, Any] = {
+        "answer": answer,
+        "answered_by": terminal_id,
+        "client_request_id": client_request_id
+        or _stable_request_id(question_id, answer, terminal_id),
+        "caller_conversation": terminal_id,
+    }
+    return _gate_question_route(f"/gate/questions/{question_id}/answer", payload=payload)
 
 
 @mcp.tool()
