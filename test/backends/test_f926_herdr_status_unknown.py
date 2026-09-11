@@ -250,3 +250,70 @@ class TestTheWarnSetIsBounded:
             backend.fetch_native_status("cao-a", "w1")
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 2, "the seat is (session, window), not window alone"
+
+
+def _backend_with(payload: str):
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._resolve_pane_id_from_window = MagicMock(return_value="w1:p3")  # type: ignore[method-assign]
+    backend._run_herdr = MagicMock(  # type: ignore[method-assign]
+        return_value=MagicMock(returncode=0, stdout=payload, stderr="")
+    )
+    return backend
+
+
+class TestNoAgentDetectedIsNamedAsSuch:
+    """F926 detection half: `unknown` has two causes and they are not alike.
+
+    Measured on herdr 0.9.0 by polling panes once a second from launch:
+
+        live pane   None/unknown (0s) -> pi/unknown (1s) -> pi/idle (4s)
+        crashed     None/unknown, agent field NEVER present, indefinitely
+        bare shell  None/unknown, agent field NEVER present, indefinitely
+
+    So the presence of herdr's `agent` field separates a transient
+    classification gap from a pane with no live provider process — which is a
+    liveness fact, and the one that actually explains #778's persistent rows.
+    """
+
+    def test_no_agent_field_says_no_provider_process(self, findings):
+        backend = _backend_with(
+            '{"id":"x","result":{"pane":{"pane_id":"w1:p3","agent_status":"unknown"}}}'
+        )
+        fetch = backend.fetch_native_status("cao", "w-dead")
+
+        assert fetch.agent_status == "unknown"
+        assert fetch.failure_cause is None, "still no delivery veto"
+        detail = findings.calls[0][3]
+        assert "NO agent detected" in detail, detail
+        assert "no provider process alive" in detail, detail
+
+    def test_an_agent_named_reads_as_a_classification_gap(self, findings):
+        backend = _backend_with(
+            '{"id":"x","result":{"pane":{"pane_id":"w1:p3","agent_status":"unknown",'
+            '"agent":"pi"}}}'
+        )
+        backend.fetch_native_status("cao", "w-pi")
+
+        detail = findings.calls[0][3]
+        assert "detected agent 'pi'" in detail, detail
+        assert "classification gap" in detail, detail
+        assert "NO agent detected" not in detail, detail
+
+    def test_the_log_line_carries_the_distinction(self, findings, caplog):
+        backend = _backend_with(
+            '{"id":"x","result":{"pane":{"pane_id":"w1:p3","agent_status":"unknown"}}}'
+        )
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.backends.herdr_backend"):
+            backend.fetch_native_status("cao", "w-dead")
+        msg = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"][0]
+        assert "detected_agent=<none>" in msg, msg
+        assert "NOT a launch-shape or manifest problem" in msg, msg
+
+    def test_a_non_string_agent_is_treated_as_undetected(self, findings):
+        """Defensive: a protocol change must not make the row claim an agent."""
+        backend = _backend_with(
+            '{"id":"x","result":{"pane":{"pane_id":"w1:p3","agent_status":"unknown",'
+            '"agent":123}}}'
+        )
+        backend.fetch_native_status("cao", "w-odd")
+        assert "NO agent detected" in findings.calls[0][3]
