@@ -904,13 +904,15 @@ def test_get_pane_id_fresh_map_hit_skips_refresh(monkeypatch):
     backend = HerdrBackend.__new__(HerdrBackend)
     backend._herdr_session = "cao"
     backend._pane_cache = {}
-    backend._pane_id_map = {"term_a": "w1:p1"}
+    # F930 (#782): the map is keyed by the (session, window) labels CAO writes,
+    # not by herdr's own ``term_*`` handle, which CAO never looks up by.
+    backend._pane_id_map = {("cao-x", "win-0"): "w1:p1"}
     backend._pane_id_map_ts = _t.time()  # fresh
     called = {"n": 0}
     monkeypatch.setattr(
         backend, "_refresh_pane_id_map", lambda: called.__setitem__("n", called["n"] + 1)
     )
-    assert backend.get_pane_id("term_a") == "w1:p1"
+    assert backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0") == "w1:p1"
     assert called["n"] == 0  # fresh hit, no refresh
 
 
@@ -922,19 +924,19 @@ def test_get_pane_id_stale_map_refreshes(monkeypatch):
     backend = HerdrBackend.__new__(HerdrBackend)
     backend._herdr_session = "cao"
     backend._pane_cache = {}
-    backend._pane_id_map = {"term_a": "w1:p1"}  # stale id from before restart
+    backend._pane_id_map = {("cao-x", "win-0"): "w1:p1"}  # stale id from before restart
     backend._pane_id_map_ts = 0.0  # far in the past => stale (> TTL)
 
     def fake_refresh():
         # A successful refresh rebuilds the map AND stamps the timestamp fresh
         # (mirrors the real _refresh_pane_id_map success path).
-        backend._pane_id_map = {"term_a": "w2:p5"}  # fresh id post-restart
+        backend._pane_id_map = {("cao-x", "win-0"): "w2:p5"}  # fresh id post-restart
         backend._pane_id_map_ts = time.time()
 
     monkeypatch.setattr(backend, "_refresh_pane_id_map", fake_refresh)
 
     # Stale hit must NOT be returned; refresh fires and yields the new id.
-    assert backend.get_pane_id("term_a") == "w2:p5"
+    assert backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0") == "w2:p5"
 
 
 def test_get_pane_id_failed_refresh_does_not_return_stale_entry(monkeypatch):
@@ -946,7 +948,7 @@ def test_get_pane_id_failed_refresh_does_not_return_stale_entry(monkeypatch):
     backend = HerdrBackend.__new__(HerdrBackend)
     backend._herdr_session = "cao"
     backend._pane_cache = {}
-    backend._pane_id_map = {"term_a": "stale:pane"}  # expired entry
+    backend._pane_id_map = {("cao-x", "win-0"): "stale:pane"}  # expired entry
     backend._pane_id_map_ts = 0.0  # far past => stale
 
     # Failed refresh: real _refresh_pane_id_map preserves map + ts on failure.
@@ -959,22 +961,32 @@ def test_get_pane_id_failed_refresh_does_not_return_stale_entry(monkeypatch):
 
 
 def test_refresh_pane_id_map_builds_from_snapshot(backend):
-    """Direct coverage of the real parse path + `api snapshot` invocation."""
+    """Direct coverage of the real parse path + `api snapshot` invocation.
+
+    F930 (#782): the join is panes -> tabs -> workspaces on the LABELS CAO
+    writes at create time. A pane's own ``terminal_id`` is herdr's handle and is
+    deliberately ignored — keying on it produced a map that could never be hit.
+    """
     snap = {
         "id": "cli:api:snapshot",
         "result": {
             "snapshot": {
+                "workspaces": [{"workspace_id": "w1", "label": "cao-x"}],
+                "tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1", "label": "win-0"},
+                    {"tab_id": "w1:t2", "workspace_id": "w1", "label": "win-1"},
+                ],
                 "panes": [
-                    {"pane_id": "w1:p1", "terminal_id": "term_a"},
-                    {"pane_id": "w1:p2", "terminal_id": "term_b"},
-                    {"pane_id": "w1:p3"},  # missing terminal_id -> skipped
-                ]
+                    {"pane_id": "w1:p1", "tab_id": "w1:t1", "terminal_id": "term_a"},
+                    {"pane_id": "w1:p2", "tab_id": "w1:t2", "terminal_id": "term_b"},
+                    {"pane_id": "w1:p3"},  # no tab_id -> unmappable, skipped
+                ],
             }
         },
     }
     with patch.object(backend, "_run_herdr", return_value=_completed(json.dumps(snap))) as mock_run:
         backend._refresh_pane_id_map()
-    assert backend._pane_id_map == {"term_a": "w1:p1", "term_b": "w1:p2"}
+    assert backend._pane_id_map == {("cao-x", "win-0"): "w1:p1", ("cao-x", "win-1"): "w1:p2"}
     assert backend._pane_id_map_ts > 0
     # invoked `api snapshot`
     assert mock_run.call_args[0][0] == ["api", "snapshot"]
@@ -982,13 +994,13 @@ def test_refresh_pane_id_map_builds_from_snapshot(backend):
 
 def test_refresh_pane_id_map_survives_error(backend):
     """A failing/raising snapshot leaves the map and ts unchanged, no raise."""
-    backend._pane_id_map = {"term_x": "w9:p9"}
+    backend._pane_id_map = {("cao-x", "win-0"): "w9:p9"}
     backend._pane_id_map_ts = 0.0
     from cli_agent_orchestrator.backends.base import TerminalBackendError
 
     with patch.object(backend, "_run_herdr", side_effect=TerminalBackendError("timeout")):
         backend._refresh_pane_id_map()  # must not raise
-    assert backend._pane_id_map == {"term_x": "w9:p9"}  # unchanged
+    assert backend._pane_id_map == {("cao-x", "win-0"): "w9:p9"}  # unchanged
 
 
 # --- Session socket path ---

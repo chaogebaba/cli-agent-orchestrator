@@ -216,9 +216,13 @@ class HerdrBackend(TerminalBackend):
         self._herdr_session = herdr_session
         # Resolution cache: terminal_id → (pane_id, timestamp)
         self._pane_cache: Dict[str, tuple[str, float]] = {}
-        # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
-        # Public IDs are stable except across a full herdr server restart.
-        self._pane_id_map: Dict[str, str] = {}
+        # Durable map: (session_name, window_name) → pane_id, rebuilt from
+        # `api snapshot`. Public IDs are stable except across a full herdr
+        # server restart. Keyed on the labels CAO itself writes at create time
+        # (workspace label = CAO session, tab label = CAO window) because those
+        # are the ONLY CAO-controlled identifiers the snapshot carries — see
+        # _refresh_pane_id_map.
+        self._pane_id_map: Dict[tuple[str, str], str] = {}
         # Timestamp of the last successful map rebuild; bounds map staleness
         # against a herdr restart via _PANE_ID_MAP_TTL (0.0 => never built).
         self._pane_id_map_ts: float = 0.0
@@ -1288,10 +1292,9 @@ class HerdrBackend(TerminalBackend):
         # Durable map (rebuilt from api snapshot). Trust a hit only while the map
         # is fresh; herdr IDs are stable except across a server restart, which
         # this TTL bounds — a stale entry expires and the next lookup refreshes.
-        if (
-            time.time() - self._pane_id_map_ts
-        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
-            return self._pane_id_map[terminal_id]
+        map_key = (session_name, window_name)
+        if (time.time() - self._pane_id_map_ts) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
+            return self._pane_id_map[map_key]
         # Map is stale (or a miss). Rebuild, then trust it ONLY if the rebuild
         # succeeded — _refresh_pane_id_map leaves the timestamp untouched on
         # failure, so re-check freshness here. Without this re-gate a failed
@@ -1299,10 +1302,8 @@ class HerdrBackend(TerminalBackend):
         # the self-healing this TTL exists to provide (fall through to the
         # label-based fallback instead).
         self._refresh_pane_id_map()
-        if (
-            time.time() - self._pane_id_map_ts
-        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
-            return self._pane_id_map[terminal_id]
+        if (time.time() - self._pane_id_map_ts) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
+            return self._pane_id_map[map_key]
 
         # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
@@ -1342,11 +1343,43 @@ class HerdrBackend(TerminalBackend):
             snapshot = data.get("snapshot", data)
             if not isinstance(snapshot, dict):
                 return
-            self._pane_id_map = {
-                p["terminal_id"]: p["pane_id"]
-                for p in snapshot.get("panes", [])
-                if p.get("terminal_id") and p.get("pane_id")
+            # F930 (#782): key on the labels CAO writes, not on herdr's own
+            # ``terminal_id``. A snapshot pane's ``terminal_id`` is HERDR's
+            # terminal handle (``term_65b3308e082471``), never CAO's terminal
+            # uuid (``919751d7``), so a map built from it could not be hit by
+            # ``get_pane_id``'s CAO-keyed lookup even once: every call missed,
+            # paid a full ``api snapshot`` subprocess, missed again and fell
+            # through to the legacy label walk. The durable map was dead weight
+            # that made every resolution SLOWER than having no map at all.
+            #
+            # The snapshot does carry CAO identity, one level up: CAO creates
+            # each workspace labelled with its session name and each tab
+            # labelled with its window name (``create_window`` passes
+            # ``--label window_name``), and a pane names its ``tab_id``. Joining
+            # panes → tabs → workspaces on those ids recovers exactly the
+            # (session, window) pair callers ask with.
+            #
+            # The key is the PAIR, not the window alone: a snapshot spans every
+            # workspace on the server, so two CAO sessions on one herdr server
+            # would otherwise collide on a shared window name.
+            workspace_labels = {
+                w["workspace_id"]: w["label"]
+                for w in snapshot.get("workspaces", [])
+                if w.get("workspace_id") and w.get("label")
             }
+            tabs = {
+                t["tab_id"]: (workspace_labels.get(t.get("workspace_id", "")), t["label"])
+                for t in snapshot.get("tabs", [])
+                if t.get("tab_id") and t.get("label")
+            }
+            rebuilt: Dict[tuple[str, str], str] = {}
+            for pane in snapshot.get("panes", []):
+                if not pane.get("pane_id"):
+                    continue
+                session_label, window_label = tabs.get(pane.get("tab_id", ""), (None, None))
+                if session_label and window_label:
+                    rebuilt[(session_label, window_label)] = pane["pane_id"]
+            self._pane_id_map = rebuilt
             self._pane_id_map_ts = time.time()
         except (
             TerminalBackendError,
