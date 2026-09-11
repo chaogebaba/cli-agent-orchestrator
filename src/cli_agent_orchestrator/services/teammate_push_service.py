@@ -849,9 +849,7 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> Optional[bool
             time.sleep(INBOX_LOCK_RETRY_PAUSE_S)
             fd = _try_acquire_lockfile(lock_path)
     except OSError as e:
-        logger.warning(
-            "teammate_push: inbox lock %s permanently unwritable: %s", lock_path, e
-        )
+        logger.warning("teammate_push: inbox lock %s permanently unwritable: %s", lock_path, e)
         return False
     if fd is None:
         # None (not False) means CONTENDED, not failed. The caller must not
