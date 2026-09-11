@@ -1,0 +1,61 @@
+# F913 (#765): session-preservation lifecycle invariant.
+#
+# Pins the guard that refuses force-deleting a LIVE, RESUMABLE provider session
+# (resume is the drift path). Runs ONLY the three F913 test files so a
+# regression in delete/reap/resume lifecycle handling fails a small, fast,
+# clearly-named job rather than hiding in the full suite.
+name: session-preservation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: session-preservation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  session-preservation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run F913 session-preservation tests
+        shell: bash
+        run: |
+          set -o pipefail
+          # Exactly the three F913 test files, deterministic order (no randomly).
+          # A failure here means the F913 (#765) session-preservation guard
+          # regressed: delete_terminal(force=True) must refuse to discard a LIVE,
+          # RESUMABLE provider session unless confirm_discard=True.
+          uv run pytest -p no:randomly \
+            test/services/test_f913_force_delete_guard.py \
+            test/api/test_f913_delete_confirm_discard.py \
+            test/mcp_server/test_f913_delete_confirm_discard.py \
+            --strict-markers \
+            --tb=short \
+            -q \
+          || {
+            echo "::error title=session-preservation::F913 (#765) session-preservation guard regressed — force-delete of a LIVE, resumable provider session must be refused unless confirm_discard=True. See https://github.com/chaogebaba/cli-agent-orchestrator/issues/765" >&2
+            exit 1
+          }
