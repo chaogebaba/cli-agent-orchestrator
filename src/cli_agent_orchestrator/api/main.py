@@ -204,6 +204,7 @@ from cli_agent_orchestrator.services.terminal_guard_service import (
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     OutputMode,
+    RefuseDiscardLiveSessionError,
     TerminalCapExceeded,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -8843,6 +8844,7 @@ async def delete_terminal(
     force: bool = False,
     orphan: bool = False,
     caller_id: Optional[TerminalId] = None,
+    confirm_discard: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
@@ -8860,6 +8862,11 @@ async def delete_terminal(
             delete_kwargs["orphan"] = True
         if caller_id is not None:
             delete_kwargs["caller_id"] = caller_id
+        # F913 (#765): forward the explicit discard confirmation so a force
+        # delete of a LIVE, RESUMABLE session proceeds only when the caller
+        # meant to abandon it. Default false — the resume path is the default.
+        if confirm_discard:
+            delete_kwargs["confirm_discard"] = True
         result = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
@@ -8885,6 +8892,19 @@ async def delete_terminal(
             caller_id,
         )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except RefuseDiscardLiveSessionError as e:
+        # F913 (#765): a force delete would discard a LIVE, RESUMABLE session.
+        # Return the typed structured 409 {error, how, ...}; the caller either
+        # resumes (assign(resume_from=<id>)) or retries with confirm_discard=true.
+        logger.warning(
+            "delete_terminal refuse_discard_live_session terminal_id=%s "
+            "provider=%s reason=%s caller=%s",
+            terminal_id,
+            e.provider,
+            e.reason,
+            caller_id,
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except HTTPException:
         raise
     except ValueError as e:

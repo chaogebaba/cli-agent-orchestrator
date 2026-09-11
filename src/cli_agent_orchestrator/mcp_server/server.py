@@ -3516,7 +3516,14 @@ async def assign(
             "terminal's frozen authority-pin set (same shas) onto the resumed "
             "worker, which re-verifies them before continuing. Default TRUE. Set "
             "False only if you re-declare equivalent pins via authority_files — "
-            "otherwise a resume of a terminal that HAD pins is refused."
+            "otherwise a resume of a terminal that HAD pins is refused. "
+            "F913 (#765): resume_from + inherit_pins=False + authority_files=[...] "
+            "IS THE PIN-DRIFT PATH — when a worker's authority pins have drifted, "
+            "do NOT delete the live worker and cold-assign a replacement (that "
+            "abandons a resumable session and re-spends its quota). Instead "
+            "interrupt it, delete WITHOUT force (preserving the session), then "
+            "resume it here with the fresh pins re-declared via authority_files "
+            "so the resumed worker keeps its provider context and quota."
         ),
     ),
     barrier: Optional[str] = Field(default=None, description="Callback barrier label"),
@@ -4608,6 +4615,7 @@ _DELETE_409_PASSTHROUGH_INDICATORS = (
     "rebind_in_progress",
     "cascade_quiesce_unstable",
     "cascade_outside_caller_subtree",
+    "refuse_discard_live_session",
 )
 
 
@@ -4645,6 +4653,19 @@ def delete_terminal(
         ),
     ),
     orphan: bool = Field(default=False, description="Leave descendants running and re-parent them"),
+    confirm_discard: bool = Field(
+        default=False,
+        description=(
+            "F913: authorize discarding a LIVE, RESUMABLE provider session. "
+            "Default false. With force=true, deleting a terminal whose session "
+            "is still alive AND resumable is REFUSED with a typed 409 "
+            "(refuse_discard_live_session) — because resume is the drift path: "
+            "interrupt then delete WITHOUT force, then "
+            "assign(resume_from=<id>, inherit_pins=False, authority_files=[...]). "
+            "Set confirm_discard=true only when you truly mean to abandon that "
+            "session (its provider context and any spent quota are lost)."
+        ),
+    ),
     target_host: Optional[str] = Field(
         default=None,
         description=(
@@ -4675,10 +4696,22 @@ def delete_terminal(
     contention (``resume_in_progress`` etc.) means a sibling create/init on
     the same session is finishing; retry shortly.
 
+    F913 (#765): ``force`` also does NOT let you silently destroy a LIVE,
+    RESUMABLE provider session. If the target is still alive AND
+    ``assign(resume_from=<id>)`` could re-attach to it, a force delete is
+    REFUSED with a typed 409 ``refuse_discard_live_session`` unless
+    ``confirm_discard=true``. Resume is the drift path (e.g. on pin drift):
+    interrupt the worker, delete it WITHOUT force (which interrupts-and-
+    preserves the session), then
+    ``assign(resume_from=<id>, inherit_pins=False, authority_files=[...])``.
+    A dead/unreachable session is non-resumable and is never refused.
+
     Args:
         terminal_id: The terminal ID to delete
         force: Override protection and authorize the cleanup-force path
         orphan: Leave descendants running and re-parent them
+        confirm_discard: Authorize discarding a live, resumable session
+            (default false — prefer resume via assign(resume_from=<id>))
         target_host: Remote CAO node hosting the terminal; omit for local
 
     Returns:
@@ -4690,12 +4723,20 @@ def delete_terminal(
     # string to "local", preserving the pre-target_host behavior exactly.
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
+    # F913: same leniency for confirm_discard — a direct (non-MCP) positional
+    # call receives the pydantic FieldInfo default; coerce anything that is not
+    # a real bool True to False (default off, resume is the default path).
+    confirm_discard = confirm_discard is True
     try:
         # F172 input leniency: accept display form.
         terminal_id = _resolve_input_terminal_id(terminal_id)
         # F493/F512: `force` is the same flag the API maps to its cleanup-force
         # path — forward it verbatim as a query param.
         params: dict[str, Any] = {"force": force is True, "orphan": orphan is True}
+        # F913 (#765): forward the explicit discard confirmation so a force
+        # delete of a LIVE, RESUMABLE session proceeds only when meant.
+        if confirm_discard:
+            params["confirm_discard"] = True
         # Upstream #693: a terminal created on a remote node has its record
         # there, so a target_host delete must bypass the local cao_http client
         # and address that node directly.

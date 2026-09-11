@@ -219,6 +219,52 @@ class TerminalCapExceeded(RuntimeError):
         }
 
 
+class RefuseDiscardLiveSessionError(RuntimeError):
+    """F913 (#765): a ``force=True`` delete would destroy a LIVE, RESUMABLE
+    provider session — refuse non-destructively unless ``confirm_discard=True``.
+
+    The M44 incident: a supervisor cold-spawned a codex reviewer on pin drift and
+    force-deleted the live one mid-review; the reap abandoned a still-resumable
+    session and the codex quota already spent was lost, then re-spent on the fresh
+    spawn. ``force`` was meant to override ready-base/profile protection and the
+    cleanup-force path (F493/F512) — NOT to silently discard a session that
+    ``assign(resume_from=<id>)`` could have re-attached to. Resume is the drift
+    path (F129 §5, rewritten); this guard makes discarding it a deliberate,
+    typed act.
+
+    Fail-safe by construction: it fires ONLY when the session is BOTH alive AND
+    resumable, so the existing recovery reaps (pi ``hibernate_refused`` /
+    ``session_artifact_missing`` / any dead-or-unreachable session) are never
+    refused — they are non-resumable and fall straight through to the force reap.
+
+    Subclasses ``RuntimeError`` so the DELETE-terminal HTTP boundary's existing
+    ``except RuntimeError`` catches it; :meth:`detail` supplies the structured
+    409 body the issue names ``{error, how}``.
+    """
+
+    code = "refuse_discard_live_session"
+
+    def __init__(self, terminal_id: str, *, provider: str | None, reason: str) -> None:
+        self.terminal_id = terminal_id
+        self.provider = provider
+        self.reason = reason
+        super().__init__(self.code)
+
+    def detail(self) -> dict[str, Any]:
+        """Structured HTTP 409 detail body (issue #765)."""
+        return {
+            "error": self.code,
+            "how": (
+                "interrupt then delete without force, then "
+                f"assign(resume_from={self.terminal_id})"
+            ),
+            "terminal_id": self.terminal_id,
+            "provider": self.provider,
+            "reason": self.reason,
+            "confirm_discard": ("pass confirm_discard=true to discard the live session anyway"),
+        }
+
+
 class ProfileMissingError(ValueError):
     """F786 (#643) D8: a NAMED agent profile could not be loaded, so the spawn is refused.
 
@@ -7661,6 +7707,65 @@ def _surviving_ancestor(by_id: dict[str, dict[str, Any]], node_id: str, reap_set
     return ""
 
 
+def _f913_live_resumable(
+    terminal_id: str, root: dict[str, Any]
+) -> tuple[bool, bool, str | None, str]:
+    """F913 (#765): decide whether a ``force`` delete would discard a LIVE,
+    RESUMABLE provider session.
+
+    Returns ``(alive, resumable, provider, reason)``.
+
+    ``alive`` — the provider session is present, per the issue's definition
+    ("process present or status not error/dead"). A terminal whose provider
+    process has EXITED reports :class:`TerminalStatus.ERROR`; anything else
+    (IDLE / PROCESSING / WAITING_USER_ANSWER / COMPLETED / RENDER_UNCERTAIN /
+    UNKNOWN) is treated as still-alive. A boundary-observation failure fails
+    OPEN as alive (we would rather ask for confirmation than silently discard),
+    but the paired ``resumable`` gate below still lets a truly dead-and-
+    non-resumable session through.
+
+    ``resumable`` — whether ``assign(resume_from=<terminal_id>)`` would succeed:
+    computed by :func:`_resolve_reap_resume_key` with ``force=False`` (the
+    force=True path deliberately reports ``abandoned_force_delete`` and must NOT
+    be used to decide the guard). A dead/unreachable session (no captured id,
+    dangling root link, capture error) is honestly non-resumable, so the guard
+    below never refuses the existing recovery reaps.
+
+    Never raises — a failure degrades to a permissive verdict for ``alive`` and
+    the resume resolver's own non-resumable verdict for ``resumable``.
+    """
+    # Resumability: ask the resume resolver as if this were a NON-force reap.
+    try:
+        _cap_id, resumable, reason = _resolve_reap_resume_key(terminal_id, root, force=False)
+    except Exception:
+        logger.debug("f913 resume-resolution failed for %s", terminal_id, exc_info=True)
+        resumable, reason = False, "capture_error"
+
+    provider: str | None = None
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_identity
+
+        _identity = get_terminal_identity(terminal_id)
+        if _identity:
+            provider = _identity.get("provider") or None
+    except Exception:
+        logger.debug("f913 provider lookup failed for %s", terminal_id, exc_info=True)
+    if provider is None:
+        provider = root.get("provider")
+
+    # Liveness: ERROR means the provider process exited (see TerminalStatus /
+    # TerminalInputBlockedError docs); anything else is still-alive. Fail OPEN.
+    alive = True
+    try:
+        observation = status_monitor.get_boundary_observation(terminal_id)
+        alive = observation.status != TerminalStatus.ERROR
+    except Exception:
+        logger.debug("f913 liveness observation failed for %s", terminal_id, exc_info=True)
+        alive = True
+
+    return alive, bool(resumable), provider, reason
+
+
 def delete_terminal(
     terminal_id: str,
     registry: PluginRegistry | None = None,
@@ -7668,8 +7773,19 @@ def delete_terminal(
     force: bool = False,
     orphan: bool = False,
     caller_id: str | None = None,
+    confirm_discard: bool = False,
 ) -> dict[str, Any]:
-    """Cascade-delete a terminal's managed descendant tree."""
+    """Cascade-delete a terminal's managed descendant tree.
+
+    F913 (#765): ``force=True`` overrides ready-base/profile protection and
+    authorizes the cleanup-force path, but it must NOT silently destroy a LIVE,
+    RESUMABLE provider session — resume is the drift path. When the target's
+    provider session is alive AND ``assign(resume_from=<id>)`` would succeed,
+    a ``force`` delete refuses with :class:`RefuseDiscardLiveSessionError`
+    (typed 409) unless ``confirm_discard=True``. The guard fires only on the
+    both-true case, so dead/unreachable-session recovery reaps (non-resumable)
+    are never refused.
+    """
     from cli_agent_orchestrator.services.terminal_guard_service import require_delete_allowed
 
     root = get_terminal_metadata(terminal_id)
@@ -7677,6 +7793,22 @@ def delete_terminal(
         raise ValueError(f"Terminal '{terminal_id}' not found")
     require_delete_allowed(terminal_id, force=force)
     session_name = root["tmux_session"]
+
+    # F913 (#765): refuse a force-discard of a LIVE, RESUMABLE session unless the
+    # caller has explicitly confirmed the discard. Evaluated HERE — after the
+    # protection preflight and BEFORE any teardown intent is opened (mirrors the
+    # F829 hibernate gate below) — so a refusal returns without opening/leaking
+    # an intent and without touching tmux. force=False never reaches this branch
+    # (non-force delete already interrupts-and-preserves the session — the resume
+    # contract), and confirm_discard=True is the deliberate opt-out.
+    if force and not confirm_discard:
+        _f913_alive, _f913_resumable, _f913_provider, _f913_reason = _f913_live_resumable(
+            terminal_id, root
+        )
+        if _f913_alive and _f913_resumable:
+            raise RefuseDiscardLiveSessionError(
+                terminal_id, provider=_f913_provider, reason=_f913_reason
+            )
 
     # F829 D2(a): PLANNED HIBERNATE gate — evaluated BEFORE the teardown intent is
     # opened so a refusal returns without opening/leaking an intent. On the
