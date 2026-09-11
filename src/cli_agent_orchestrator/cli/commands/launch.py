@@ -104,6 +104,23 @@ def _parse_env_pairs(pairs):
     return result
 
 
+def _launch_error_remedy(message: str, session_name) -> str:
+    """F241 (#64): append the actionable remedy for the duplicate-name refusal.
+
+    ``terminal_service`` guards a duplicate ``--session-name`` with
+    ``ValueError("Session '<name>' already exists")``, which the start endpoint
+    now serves as a typed 400. Nothing is broken in that case: the named session
+    is alive and the user wants to ATTACH to it, so say so — the failure message
+    must never leave "restart the server" as the only reading.
+    """
+    if session_name and "already exists" in message:
+        return (
+            f"{message}\n  The session is already running — attach with: "
+            f"cao session attach {session_name}"
+        )
+    return message
+
+
 def _poll_session_supervisor_after_timeout(session_name):
     """F541 (#397): after a read timeout on POST /sessions/start, confirm the
     launch actually succeeded by polling ``GET /sessions/<session_name>``.
@@ -564,6 +581,14 @@ def launch(
 
     except click.exceptions.Exit:
         raise
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): the round-trip SUCCEEDED — the server answered 4xx/5xx.
+        # Report the served status and body instead of "Failed to connect",
+        # which points the user at a cao-server restart (the one action that
+        # kills live sessions) and would not have cleared the condition anyway.
+        from cli_agent_orchestrator.cli.http import served_error_message
+
+        raise click.ClickException(_launch_error_remedy(served_error_message(e), session_name))
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
     except click.ClickException:

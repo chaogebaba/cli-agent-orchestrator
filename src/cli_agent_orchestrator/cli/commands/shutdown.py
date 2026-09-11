@@ -3,6 +3,7 @@
 import click
 import requests
 
+from cli_agent_orchestrator.cli.http import served_error_message
 from cli_agent_orchestrator.utils.http import CAOHttpClient
 
 cao_http = CAOHttpClient(lambda: requests)
@@ -13,6 +14,11 @@ def _list_sessions():
         response = cao_http.get(f"/sessions")
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): the server ANSWERED — report its status and body, never
+        # "Failed to connect" (that wording sends the user to restart a server
+        # that is up, which on CAO kills live sessions).
+        raise click.ClickException(served_error_message(e))
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
@@ -39,6 +45,11 @@ def _delete_session(name):
                 "Grok processes exit"
             )
         return True
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): the server ANSWERED — report its status and body, never
+        # "Failed to connect" (that wording sends the user to restart a server
+        # that is up, which on CAO kills live sessions).
+        raise click.ClickException(served_error_message(e))
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 

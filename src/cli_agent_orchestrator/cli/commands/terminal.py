@@ -7,6 +7,7 @@ import click
 import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.http import served_error_message
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.utils.http import CAOHttpClient
 
@@ -81,6 +82,11 @@ def restore(terminal_id: str):
                 f"Session '{session_name}' no longer exists. Cannot restore."
             )
         response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): raise_for_status() above raises HTTPError, which this arm
+        # never caught — a served 4xx/5xx escaped as a bare traceback. Report
+        # the status and body the server actually sent.
+        raise click.ClickException(served_error_message(e))
     except requests.exceptions.ConnectionError:
         raise click.ClickException("Failed to connect to cao-server")
 
