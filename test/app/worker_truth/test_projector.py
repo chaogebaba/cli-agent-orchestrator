@@ -560,3 +560,50 @@ def test_two_producers_of_one_dialog_fold_to_one_transition(rig: Rig) -> None:
     awaiting = [row for row in _transitions(rig) if row.payload["to"] == "awaiting_input"]
     assert len(awaiting) == 1
     assert rig.states.get(TERMINAL).since == since
+
+
+# ------------------------------------------------------- D1f, the dialog edge
+
+
+def test_a_dismissed_card_projects_what_the_pane_read_not_busy(rig: Rig) -> None:
+    """S1.  ``prompt.answered`` means "the card is gone", not "the agent is working".
+
+    The derived producer at the classification site reads the screen and puts the
+    reading in the payload, so it knows which of the two happened.  Keying on the
+    kind alone would project a dismissed card as BUSY — and for a source-healthy
+    terminal nothing would correct it, because the pane's own
+    ``status.legacy_published`` is muted by precedence.
+    """
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+    assert rig.state_of(TERMINAL) is WorkerState.AWAITING_INPUT
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "idle"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.IDLE
+
+
+def test_an_answered_card_still_projects_busy(rig: Rig) -> None:
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "processing"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_a_hook_produced_answer_with_no_reading_still_implies_busy(rig: Rig) -> None:
+    """The provider-hook shape: a hook fires because the agent answered and
+    proceeded, so the implied BUSY is right and the payload rule must not
+    swallow it."""
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.emit(TERMINAL, EventKind.PROMPT_ANSWERED)
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_an_unreadable_reading_falls_back_to_busy(rig: Rig) -> None:
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "nonsense"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY

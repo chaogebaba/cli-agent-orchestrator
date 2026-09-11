@@ -23,9 +23,9 @@ from cli_agent_orchestrator.adapters.truth.liveness_probe import LivenessProbe, 
 from .conftest import FakeEventStore
 
 
-def _probe(sampler_tick: Callable[[], None] | None = None) -> LivenessProbe:
+def _probe(sampler_tick: Callable[..., None] | None = None) -> LivenessProbe:
     return LivenessProbe(
-        list_panes=lambda: [PaneRecord(session="s", window="0", pid=1)],
+        list_panes=lambda _fleet: [PaneRecord(session="s", window="0", pid=1)],
         fleet=lambda: [],
         sampler_tick=sampler_tick,
     )
@@ -33,7 +33,7 @@ def _probe(sampler_tick: Callable[[], None] | None = None) -> LivenessProbe:
 
 def test_the_tick_drives_the_sampler_once_per_probe(ingest_on: FakeEventStore) -> None:
     calls: list[int] = []
-    probe = _probe(sampler_tick=lambda: calls.append(1))
+    probe = _probe(sampler_tick=lambda _fleet: calls.append(1))
 
     probe.probe_once()
     probe.probe_once()
@@ -51,9 +51,9 @@ def test_a_failed_probe_still_refreshes_the_sample(ingest_on: FakeEventStore) ->
     """
     calls: list[int] = []
     probe = LivenessProbe(
-        list_panes=lambda: (_ for _ in ()).throw(RuntimeError("tmux is gone")),
+        list_panes=lambda _fleet: (_ for _ in ()).throw(RuntimeError("tmux is gone")),
         fleet=lambda: [],
-        sampler_tick=lambda: calls.append(1),
+        sampler_tick=lambda _fleet: calls.append(1),
     )
 
     probe.probe_once()
@@ -95,6 +95,6 @@ def test_with_ingestion_off_the_probe_does_not_even_tick_the_sampler(
     work in the arm that is meant to be phase-1 behaviour exactly.
     """
     calls: list[int] = []
-    _probe(sampler_tick=lambda: calls.append(1)).probe_once()
+    _probe(sampler_tick=lambda _fleet: calls.append(1)).probe_once()
 
     assert calls == []

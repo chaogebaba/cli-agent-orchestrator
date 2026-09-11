@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Iterable, Protocol
@@ -62,7 +62,12 @@ from cli_agent_orchestrator.core.events import (
     Producer,
 )
 from cli_agent_orchestrator.core.states import DegradedReason
-from cli_agent_orchestrator.core.timing import PANE_HEARTBEAT_S, PANE_MISS_TICKS, PROBE_FAIL_TICKS
+from cli_agent_orchestrator.core.timing import (
+    PANE_HEARTBEAT_S,
+    PANE_MISS_TICKS,
+    PANE_SAMPLE_S,
+    PROBE_FAIL_TICKS,
+)
 
 __all__ = [
     "LivenessProbe",
@@ -128,16 +133,22 @@ class LivenessProbe:
     only for tests that want to bypass the event-log read; production leaves it
     ``None`` and the exit reason comes from the ``teardown.intended`` rows.
 
-    ``list_panes`` is itself OPTIONAL, and the distinction it draws is the one
-    B13 draws one level down.  A failed probe is a statement that the probe RAN
-    and learned nothing, and ``PROBE_FAIL_TICKS`` of those degrade the entire
-    fleet with ``producer_error``.  A backend that cannot enumerate the fleet's
-    panes at all — herdr inherits ``enumerate_windows``'s fail-closed default —
-    has not failed a probe; it has no probe to fail, and reading a missing
-    capability as a fleet-wide outage would degrade every terminal forever on
-    the strength of a feature nobody implemented.  So the composition root
-    leaves the listing unset for such a backend and the probe runs as the
-    sampler's driver alone: less information, never wrong information.
+    ``list_panes`` draws a distinction B13 draws one level down, and it has
+    THREE answers, not two.  Records are a listing.  A raise, or an empty
+    iterable, is a FAILED probe — a statement that the probe ran and learned
+    nothing, and ``PROBE_FAIL_TICKS`` of those degrade the entire fleet with
+    ``producer_error``.  ``None`` is neither: it means there is no listing to be
+    had, which is the answer on a backend that cannot enumerate the fleet's panes
+    at all (herdr inherits ``enumerate_windows``'s fail-closed default).  Reading
+    that as a failure would degrade every terminal forever on the strength of a
+    feature nobody implemented.  The whole callable is optional too, for a probe
+    built with no listing at all; either way it runs as the sampler's driver:
+    less information, never wrong information.
+
+    The callable is handed the ROSTER the tick already read, and so is
+    ``sampler_tick``.  One tick, one roster query: it is a full table read
+    through the ORM, and a tick that asked four callers for it separately paid
+    four times for one answer.
 
     ``sampler_tick`` is WP-ARCH phase 2's §12 seam, and it is here because phase 2
     is the phase that notices a cross-phase defect neither phase owns.  The
@@ -161,18 +172,20 @@ class LivenessProbe:
     def __init__(
         self,
         *,
-        list_panes: Callable[[], Iterable[PaneRecord]] | None = None,
+        list_panes: Callable[[Sequence[TerminalRef]], Iterable[PaneRecord] | None] | None = None,
         fleet: Callable[[], Iterable[TerminalRef]],
         teardown_lookup: Callable[[str], bool] | None = None,
-        sampler_tick: Callable[[], None] | None = None,
+        sampler_tick: Callable[[Sequence[TerminalRef]], None] | None = None,
+        sleeper: Callable[[float], Awaitable[bool]] | None = None,
     ) -> None:
         self._list_panes = list_panes
         self._fleet = fleet
         self._teardown_lookup = teardown_lookup
         self._sampler_tick = sampler_tick
+        self._sleeper = sleeper
         self._state = _ProbeState()
         self._task: asyncio.Task[None] | None = None
-        self._stopping = threading.Event()
+        self._stopping: asyncio.Event | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -193,22 +206,56 @@ class LivenessProbe:
     async def start(self) -> None:
         if self._task is not None:
             return
-        self._stopping.clear()
+        self._stopping = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="cao-liveness-probe")
 
     async def stop(self) -> None:
-        self._stopping.set()
+        """Ask the loop to finish and WAIT for the tick that is in flight.
+
+        Not a cancel.  A task parked on ``asyncio.to_thread`` raises
+        ``CancelledError`` in the coroutine while the worker thread runs on to
+        completion, so cancelling would return here with a real ``capture-pane``
+        still in progress against a server that believes it has shut down.  The
+        stop flag ends the sleep instead, the tick finishes, and the loop exits.
+        """
+        stopping = self._stopping
+        if stopping is not None:
+            stopping.set()
         task = self._task
         self._task = None
         if task is not None:
-            task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
 
+    async def _sleep(self, seconds: float) -> bool:
+        """Sleep, or wake early to stop.  True when the loop should exit."""
+        if self._sleeper is not None:
+            return await self._sleeper(seconds)
+        stopping = self._stopping
+        if stopping is None:  # pragma: no cover - start() always sets it
+            await asyncio.sleep(seconds)
+            return False
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=seconds)
+        except (asyncio.TimeoutError, TimeoutError):
+            return False
+        return True
+
     async def _run(self) -> None:
-        while not self._stopping.is_set():
+        # Two cadences, one task.  The pane listing is a HEARTBEAT and the
+        # pane-delta sample is a SAMPLE: the first answers "is the pane there",
+        # which changes on the scale of a terminal's life, and the second feeds
+        # rules that call their own evidence stale after
+        # ``PANE_LIVENESS_STALENESS_S``.  Running the sample at the heartbeat
+        # would leave those rules blind for half of every window; running the
+        # listing at the sample rate would quadruple the fleet's tmux work for
+        # nothing.  ``check_orderings`` keeps the heartbeat a whole multiple of
+        # the sample so this counter never drifts.
+        every = max(1, int(PANE_HEARTBEAT_S // PANE_SAMPLE_S))
+        tick = 0
+        while True:
             try:
                 # OFF the event loop.  One tick shells out to the backend for the
                 # pane listing and then drives the pane-delta sampler across the
@@ -217,27 +264,48 @@ class LivenessProbe:
                 # server is serving.  ``RetentionTask`` offloads its sweep for the
                 # same reason, and the producers are already called from the
                 # legacy monitor's own threads, so nothing here is loop-affine.
-                await asyncio.to_thread(self.probe_once)
+                if tick % every == 0:
+                    await asyncio.to_thread(self.probe_once)
+                else:
+                    await asyncio.to_thread(self.sample_once)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - the never-break-the-server rule
                 logger.debug("liveness probe tick failed", exc_info=True)
-            await asyncio.sleep(PANE_HEARTBEAT_S)
+            tick += 1
+            if await self._sleep(PANE_SAMPLE_S):
+                return
 
     # -- one tick ------------------------------------------------------------
 
+    def sample_once(self) -> None:
+        """Drive the pane-delta sampler and nothing else.  Never raises.
+
+        The between-heartbeats tick.  It reads the roster because the sampler
+        needs one, and that is the whole of its work.
+        """
+        if producer_runtime() is None:
+            return
+        self._drive_sampler(self._safe_fleet())
+
     def probe_once(self) -> None:
-        """Run one probe: update columns, append edges.  Never raises."""
+        """Run one probe: update columns, append edges.  Never raises.
+
+        Reads the roster ONCE and threads it through the sampler drive and the
+        pane listing.  The roster is a full table read through the ORM, so a tick
+        that asked for it four times paid four times for one answer.
+        """
         runtime = producer_runtime()
         if runtime is None:
             return
-        self._drive_sampler()
+        fleet = self._safe_fleet()
+        self._drive_sampler(fleet)
         if self._list_panes is None:
             # No pane listing on this backend — see the class docstring.  The
             # sampler drive above still ran, which is the half of the tick that
             # has nothing to do with tmux.
             return
-        if not self._safe_fleet():
+        if not fleet:
             # An empty fleet is not a failed probe either.  A server with no
             # terminals would otherwise file one ``probe.failed`` row every tick
             # forever and then declare a fleet-wide ``producer_error`` episode
@@ -246,20 +314,28 @@ class LivenessProbe:
         try:
             panes: list[PaneRecord] | None
             try:
-                panes = list(self._list_panes())
+                listed = self._list_panes(fleet)
+                if listed is None:
+                    # A THIRD answer, distinct from both failure shapes below:
+                    # "there is no listing to be had on this backend right now".
+                    # A backend that cannot enumerate has not failed a probe, and
+                    # reading it as one would degrade the fleet for
+                    # ``producer_error`` on the strength of a missing feature.
+                    return
+                panes = list(listed)
             except Exception:
                 panes = None
             if not panes:
                 # None (the call failed) and [] (tmux answered with nothing) are
                 # the SAME verdict: this probe learned nothing.  B13 forbids
                 # reading either as absence.
-                self._on_failed_probe(runtime)
+                self._on_failed_probe(runtime, fleet)
                 return
-            self._on_successful_probe(runtime, panes)
+            self._on_successful_probe(runtime, panes, fleet)
         except Exception:  # pragma: no cover - the never-break-the-server rule
             logger.debug("liveness probe failed", exc_info=True)
 
-    def _drive_sampler(self) -> None:
+    def _drive_sampler(self, fleet: Sequence[TerminalRef]) -> None:
         """WP-ARCH phase 2 §12 — one pane-delta sample per tick.  Never raises.
 
         Runs BEFORE the probe's own work rather than after, so a probe that fails
@@ -271,13 +347,13 @@ class LivenessProbe:
         if tick is None:
             return
         try:
-            tick()
+            tick(fleet)
         except Exception:  # pragma: no cover - the never-break-the-probe rule
             logger.debug("pane-delta sampler tick failed", exc_info=True)
 
     # -- failure path --------------------------------------------------------
 
-    def _on_failed_probe(self, runtime: ProducerRuntime) -> None:
+    def _on_failed_probe(self, runtime: ProducerRuntime, fleet: Sequence[TerminalRef]) -> None:
         state = self._state
         state.consecutive_failures += 1
         now = runtime.clock.now()
@@ -297,7 +373,7 @@ class LivenessProbe:
         # Open the fleet-wide episode exactly once: one row per terminal naming
         # producer_error, not one row per terminal per tick.
         state.producer_error_open = True
-        for ref in self._safe_fleet():
+        for ref in fleet:
             track = state.tracks.setdefault(ref.terminal_id, _Track())
             track.confirmed_present = False
             track.degraded_reason = DegradedReason.PRODUCER_ERROR.value
@@ -305,7 +381,9 @@ class LivenessProbe:
 
     # -- success path --------------------------------------------------------
 
-    def _on_successful_probe(self, runtime: ProducerRuntime, panes: list[PaneRecord]) -> None:
+    def _on_successful_probe(
+        self, runtime: ProducerRuntime, panes: list[PaneRecord], fleet: Sequence[TerminalRef]
+    ) -> None:
         state = self._state
         now = runtime.clock.now()
         state.consecutive_failures = 0
@@ -315,7 +393,7 @@ class LivenessProbe:
         sessions = {pane.session for pane in panes}
         by_key = {(pane.session, pane.window): pane for pane in panes}
 
-        for ref in self._safe_fleet():
+        for ref in fleet:
             track = state.tracks.setdefault(ref.terminal_id, _Track())
             pane = by_key.get((ref.tmux_session, ref.tmux_window))
 

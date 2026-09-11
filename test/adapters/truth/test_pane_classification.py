@@ -303,7 +303,7 @@ def test_a_status_that_could_not_be_read_is_recorded_as_unknown(
     pane_classification.record_pane_classification(TERMINAL, None, None, "incremental", "accepted")
 
     row = ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)[0]
-    assert row.payload["latched_status"] == pane_classification.UNCLASSIFIED_STATUS
+    assert row.payload["latched_status"] == legacy_egress.UNKNOWN_STATUS
 
 
 def test_the_awaiting_spelling_matches_the_real_legacy_enum() -> None:
@@ -315,4 +315,4 @@ def test_the_awaiting_spelling_matches_the_real_legacy_enum() -> None:
     from cli_agent_orchestrator.models.terminal import TerminalStatus
 
     assert pane_classification.AWAITING_STATUS == TerminalStatus.WAITING_USER_ANSWER.value
-    assert pane_classification.UNCLASSIFIED_STATUS == TerminalStatus.UNKNOWN.value
+    assert legacy_egress.UNKNOWN_STATUS == TerminalStatus.UNKNOWN.value

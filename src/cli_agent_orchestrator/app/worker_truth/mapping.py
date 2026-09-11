@@ -24,6 +24,7 @@ __all__ = [
     "LEGACY_STATUS_MAP",
     "LOSSY_FORWARD_STATES",
     "STATE_ASSERTING_KINDS",
+    "answered_state",
     "implied_state",
     "legacy_state",
     "legacy_status",
@@ -178,6 +179,25 @@ def legacy_status(
     if state is WorkerState.DEGRADED and degraded_reason is DegradedReason.NO_SIGNAL:
         return "unknown"
     return FORWARD_STATUS_MAP[state]
+
+
+def answered_state(payload: dict[str, object]) -> WorkerState | None:
+    """The state a ``prompt.answered`` row asserts, read from its own payload.
+
+    D1f's producer records the pane reading that ENDED the dialog, and that
+    reading is what the terminal is now in — ``processing`` for an answered card,
+    ``idle`` for a dismissed one.  ``prompt.answered`` therefore cannot assert a
+    state by kind: the same kind covers both outcomes, and the difference is the
+    whole content of the event.
+
+    Returns ``None`` when the payload carries no readable status, which is the
+    provider-hook shape: a hook fires because the agent answered and proceeded,
+    so the caller's implied ``BUSY`` is right there and this must not override it.
+    """
+    raw = payload.get("latched_status")
+    if not isinstance(raw, str):
+        return None
+    return legacy_state(raw)
 
 
 def implied_state(kind: AnyKind) -> WorkerState | None:

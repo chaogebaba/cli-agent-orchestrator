@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from cli_agent_orchestrator.core.timing import PANE_HEARTBEAT_S
@@ -46,9 +47,20 @@ class Sweeper(Protocol):
 class ProjectorSweep:
     """Runs :meth:`Sweeper.sweep` every ``PANE_HEARTBEAT_S``."""
 
-    def __init__(self, projector: Sweeper) -> None:
+    def __init__(
+        self,
+        projector: Sweeper,
+        sleeper: Callable[[float], Awaitable[bool]] | None = None,
+    ) -> None:
         self._projector = projector
+        # The cadence, injectable.  A test that wants to assert WHEN this sweeps
+        # must not have to sleep through ``PANE_HEARTBEAT_S`` or monkeypatch the
+        # constant to zero — the first is unrunnable and the second deletes the
+        # very property under test, since a period of zero makes "sleeps first"
+        # and "sweeps first" indistinguishable.
+        self._sleeper = sleeper
         self._task: asyncio.Task[None] | None = None
+        self._stopping: asyncio.Event | None = None
 
     @property
     def running(self) -> bool:
@@ -58,26 +70,47 @@ class ProjectorSweep:
         """Start the periodic sweep.  Idempotent."""
         if self.running:
             return
+        self._stopping = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="worker-truth-sweep")
 
     async def stop(self) -> None:
-        """Cancel the sweep and wait for it to unwind."""
+        """Ask the loop to finish and WAIT for the sweep that is in flight.
+
+        Not a cancel, for the reason ``LivenessProbe.stop`` is not: a task parked
+        on ``asyncio.to_thread`` raises in the coroutine while the worker thread
+        runs on, so cancelling would return here with a sweep still writing to
+        the projection after shutdown said it had stopped.
+        """
+        stopping = self._stopping
+        if stopping is not None:
+            stopping.set()
         task = self._task
         self._task = None
         if task is None or task.done():
             return
-        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
 
+    async def _sleep(self, seconds: float) -> bool:
+        """Sleep, or wake early to stop.  True when the loop should exit."""
+        if self._sleeper is not None:
+            return await self._sleeper(seconds)
+        stopping = self._stopping
+        if stopping is None:  # pragma: no cover - start() always sets it
+            await asyncio.sleep(seconds)
+            return False
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=seconds)
+        except (asyncio.TimeoutError, TimeoutError):
+            return False
+        return True
+
     async def _run(self) -> None:
         while True:
-            try:
-                await asyncio.sleep(PANE_HEARTBEAT_S)
-            except asyncio.CancelledError:
-                raise
+            if await self._sleep(PANE_HEARTBEAT_S):
+                return
             try:
                 # Off the loop: the sweep reads every projection row and the
                 # event log behind each one, against SQLite.

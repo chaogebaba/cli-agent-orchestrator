@@ -238,3 +238,54 @@ def test_an_admission_predicate_that_raises_falls_back_to_the_pane() -> None:
     view.mark(TERMINAL, projected=True)
 
     assert view.is_projected(TERMINAL) is False
+
+
+# --------------------------------------------------- bounded reads (S5)
+
+
+def test_the_sweep_never_reads_a_terminals_whole_history(rig: Rig) -> None:
+    """The sweep runs 4320 times a day; its reads must not grow with uptime.
+
+    An unbounded read here materialises every row a terminal has ever stored —
+    thirty days of retention — to answer a question about the newest one, once
+    per silent terminal, per tick.
+    """
+    windows: list[int | None] = []
+    inner = rig.events.read
+
+    def recording_read(terminal_id=None, **kwargs):
+        windows.append(kwargs.get("since_seq"))
+        return inner(terminal_id, **kwargs)
+
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    for index in range(600):
+        rig.legacy(TERMINAL, "processing" if index % 2 else "idle")
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.events.read = recording_read  # type: ignore[method-assign]
+
+    rig.projector.sweep()
+
+    assert windows, "the sweep read nothing at all"
+    # Every read names a window, and over a long history every window has moved
+    # off zero — which is the difference between "bounded" and "the whole log".
+    assert all(window is not None for window in windows)
+    assert min(windows) > 0  # type: ignore[type-var]
+
+
+def test_a_pruned_evidence_row_skips_the_terminal_rather_than_citing_nothing(
+    rig: Rig,
+) -> None:
+    """Retention can take the row the sweep would cite.
+
+    A degradation with no surviving evidence is exactly what
+    ``DIAG-GHOST-TRANSITION`` exists to complain about, so the sweep stays quiet
+    instead of writing one.
+    """
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.events.prune(rig.clock.now())  # retention takes the evidence
+
+    outcomes = rig.projector.sweep()
+
+    assert outcomes == []
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY

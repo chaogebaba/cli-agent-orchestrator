@@ -71,6 +71,7 @@ from typing import Any
 
 from cli_agent_orchestrator.adapters.truth.legacy_egress import (
     CAPPED_CONDITION_LABEL,
+    UNKNOWN_STATUS,
     as_text,
     effective_origin,
 )
@@ -86,7 +87,6 @@ from cli_agent_orchestrator.core.events import (
 
 __all__ = [
     "AWAITING_STATUS",
-    "UNCLASSIFIED_STATUS",
     "forget",
     "record_pane_classification",
     "reset_edges",
@@ -101,16 +101,6 @@ logger = logging.getLogger(__name__)
 #: ``new-code-never-imports-legacy``.  A test on the legacy side of the fence
 #: pins it against the real enum, which is what keeps the spelling honest.
 AWAITING_STATUS = "waiting_user_answer"
-
-#: What is recorded when the classification site is reached with no status at all.
-#:
-#: The 2a producer wrote ``""`` here, and an empty string is the one value
-#: ``legacy_state`` cannot read: it returns ``None``, and ``DIAG-PANE-DISAGREE``
-#: then SKIPS the row rather than comparing it.  A row that silently drops out of
-#: the comparison is worse than a wrong one, because the comparison goes quiet
-#: instead of failing — so the absence is recorded as the legacy vocabulary's own
-#: word for it, which the check can read and disagree with.
-UNCLASSIFIED_STATUS = "unknown"
 
 _lock = threading.Lock()
 #: terminal_id -> the last classified ``(latched_status, origin)`` pair.
@@ -220,7 +210,10 @@ def record_pane_classification(
     if runtime is None:
         return
     try:
-        status_text = as_text(latched_status) or UNCLASSIFIED_STATUS
+        # Shared with the egress producer rather than spelled twice: the two
+        # rows describe one reading at two stages, and a fallback that differed
+        # between them would read as a disagreement between the producers.
+        status_text = as_text(latched_status) or UNKNOWN_STATUS
         origin_text = effective_origin(origin, pass_outcome)
         pair = (status_text, origin_text)
         condition = _read_condition(monitor, terminal_id)

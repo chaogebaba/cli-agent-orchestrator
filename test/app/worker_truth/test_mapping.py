@@ -232,3 +232,30 @@ def test_capped_is_lost_to_busy_and_must_never_read_as_error() -> None:
     assert published == "processing"
     assert legacy_state(published) is WorkerState.BUSY
     assert published != TerminalStatus.ERROR.value
+
+
+# ------------------------------------------- the resulting state, not the kind
+
+
+def test_prompt_answered_publishes_what_the_terminal_REACHED() -> None:
+    """S1: the forward map is keyed on the STATE, and the kind never overrides it.
+
+    ``prompt.answered`` is the case that makes the rule visible: the same kind
+    covers an answered card (the agent proceeds — BUSY) and a dismissed one (the
+    card goes, the worker is idle), so a map keyed on the kind would publish
+    ``processing`` for a terminal that is sitting idle and nothing would correct
+    it for a source-healthy lane.  ``turn.ended`` is the ONLY kind that
+    discriminates, and only for ``IDLE``.
+    """
+    assert legacy_status(WorkerState.IDLE, causing_kind=EventKind.PROMPT_ANSWERED) == "idle"
+    assert legacy_status(WorkerState.BUSY, causing_kind=EventKind.PROMPT_ANSWERED) == "processing"
+
+
+@pytest.mark.parametrize("state", list(WorkerState))
+def test_no_kind_but_turn_ended_can_change_the_published_status(state: WorkerState) -> None:
+    """Exhaustive over both axes: every state, every state-asserting kind."""
+    baseline = legacy_status(state)
+    for kind in EventKind:
+        if kind is EventKind.TURN_ENDED:
+            continue
+        assert legacy_status(state, causing_kind=kind) == baseline

@@ -50,6 +50,7 @@ from cli_agent_orchestrator.core.events import (
 
 __all__ = [
     "CAPPED_CONDITION_LABEL",
+    "UNKNOWN_STATUS",
     "PROJECTION_ORIGIN",
     "as_text",
     "fed_by",
@@ -68,6 +69,23 @@ logger = logging.getLogger(__name__)
 #: string.  Matching the label rather than the kind is deliberate — the label is
 #: what the fleet row, the capped-lane policy and the operator all read.
 CAPPED_CONDITION_LABEL = "CAPPED"
+
+#: What a status that could not be rendered is recorded as, on BOTH truth
+#: producers (WP-ARCH phase 2, plan §2).
+#:
+#: It used to be ``""``, and the empty string is the one value the vocabulary
+#: cannot read: ``legacy_state('')`` is ``None``, so ``DIAG-PANE-DISAGREE``
+#: SKIPPED such a row rather than comparing it — the check went quiet instead of
+#: failing, and a box round counting disagreements by raw string comparison read
+#: those rows as real ones.  ``unknown`` is in the legacy vocabulary, maps to
+#: ``degraded``, and is therefore a value the checks can disagree with.
+#:
+#: No live caller can produce it: all five ``_publish_observation`` call sites
+#: pass a real ``TerminalStatus`` (three ``classification.status``, one
+#: ``resolution.status or UNKNOWN``, one ``_last_status.get(..., UNKNOWN)``).
+#: It is the floor under a ``None`` that a future caller might introduce, and
+#: under an object whose rendering fails.
+UNKNOWN_STATUS = "unknown"
 
 
 def fed_by(origin: str) -> str:
@@ -193,7 +211,7 @@ def record_legacy_publish(
     if runtime is None:
         return
     try:
-        status_text = _as_text(latched_status) or ""
+        status_text = _as_text(latched_status) or UNKNOWN_STATUS
         origin_text = _effective_origin(origin, pass_outcome)
         pair = (status_text, origin_text)
 

@@ -37,6 +37,14 @@ class FindingCode(StrEnum):
     ``DIAG_PANE_DISAGREE``    — the same disagreement, read from the pane's own
                                 ``status.pane_classified`` record rather than
                                 from the publish (D5).
+    ``DIAG_PRODUCER_DISAGREE`` — two PRODUCERS disagree about one terminal: a
+                                derived event that source precedence muted
+                                asserted a state the projection is not in (D9b).
+                                A different question from the two above, which
+                                compare the projection against a RECORD; this one
+                                compares two live producers at the moment the
+                                projector chose between them, which is the only
+                                moment both readings exist.
 
     Phase 2's D9b makes that a RENAME WITH HISTORY rather than a rename.  Rows
     already carry the old code and ``cao diag findings`` reads them, so the new
@@ -102,6 +110,7 @@ class FindingCode(StrEnum):
     DIAG_QUEUE_ORPHAN_GUARD = "DIAG-QUEUE-ORPHAN-GUARD"
     DIAG_BARRIER_OPEN_AT_FLIP = "DIAG-BARRIER-OPEN-AT-FLIP"
     DIAG_PANE_DISAGREE = "DIAG-PANE-DISAGREE"
+    DIAG_PRODUCER_DISAGREE = "DIAG-PRODUCER-DISAGREE"
     DIAG_STATUS_GUARD = "DIAG-STATUS-GUARD"
     DIAG_DELIVERY_TIME_BOUND = "DIAG-DELIVERY-TIME-BOUND"
     DIAG_SEAT_WAKE_UNREACHABLE = "DIAG-SEAT-WAKE-UNREACHABLE"

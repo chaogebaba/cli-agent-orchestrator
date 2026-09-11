@@ -16,6 +16,7 @@ import pytest
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
     PaneDisagreementCheck,
+    ProducerDisagreementCheck,
     register_phase1_checks,
 )
 from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
@@ -147,5 +148,13 @@ def rig() -> Rig:
     events.bind_findings(findings)
     sources = StaticSourceRegistry()
     health = SourceHealth()
-    projector = Projector(events, states, clock, sources, legacy_check=checks, health=health)
+    projector = Projector(
+        events,
+        states,
+        clock,
+        sources,
+        legacy_check=checks,
+        health=health,
+        producer_check=ProducerDisagreementCheck(findings),
+    )
     return Rig(clock, events, states, findings, registry, checks, sources, health, projector)
