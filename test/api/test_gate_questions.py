@@ -6,6 +6,11 @@ behaviour — its scope gate, its translation of a domain refusal into ONE statu
 and ONE machine-readable body — and a TestClient would add a middleware stack
 that decides none of that.
 
+The handlers live in ``api/routes_fork.py``, the fork's own router, mounted at
+the root by ``api/main.py``: the paths are the same, and the set of LEGACY files
+sanctioned to import the new tree grows by one small fork-only module instead of
+by the 11k-line upstream route table.
+
 The service is pointed at a temp database through the composition root, which is
 also the seam that proves these handlers never name ``adapters.store.gate``
 (``api`` is on the ``one-gate-writer`` forbidden list).
@@ -21,7 +26,7 @@ import pytest
 from fastapi import HTTPException
 
 from cli_agent_orchestrator.adapters.store.migrator import migrate
-from cli_agent_orchestrator.api.main import (
+from cli_agent_orchestrator.api.routes_fork import (
     GateAnswerRequest,
     GateAskRequest,
     answer_gate_question_endpoint,

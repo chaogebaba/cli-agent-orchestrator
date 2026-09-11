@@ -83,6 +83,19 @@ AC11_LEGACY_IMPORTERS = {
     # adapter anywhere but the delegating call.
     "backends/herdr_backend.py",
     "services/herdr_inbox_service.py",
+    # WP-ARCH Amendment A slice B1 adds ONE, and for the fifth time the same
+    # reason.  The five ``/gate/questions`` handlers must reach the new tree —
+    # ``core.gate`` for the typed refusal vocabulary they translate into HTTP
+    # statuses, ``app.gate.render`` for the ONE question serialiser the CLI also
+    # prints through.  They went into ``api/routes_fork.py``, the fork's own
+    # router (mounted at the root by ``api/main.py``), rather than into
+    # ``api/main.py`` itself: this set is an EQUALITY on purpose, and sanctioning
+    # the 11k-line upstream route table as a new-tree importer would cost far
+    # more of the guard than sanctioning 400 fork-only lines.  Like every entry
+    # above it names ``app`` and ``core`` but NOT ``adapters`` — the service
+    # arrives from ``bootstrap`` — so ``adapters-only-via-composition-root`` and
+    # ``one-gate-writer`` both still hold.
+    "api/routes_fork.py",
 }
 LANE_B_IMPORTERS = {
     "providers/codex.py",

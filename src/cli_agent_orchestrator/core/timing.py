@@ -39,6 +39,7 @@ __all__ = [
     "DELIVERY_RETENTION_DAYS",
     "DELIVERY_TICK_S",
     "DELIVERY_VETO_CEILING_S",
+    "GATE_QUESTION_EXPIRY_S",
     "IDLE_STALL_AGE_S",
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
@@ -178,6 +179,15 @@ DELIVERY_MAX_LIFETIME_S = 1700
 #: prunes them (§13d).  A row named by an OPEN finding is never pruned, exactly
 #: as phase 1's ``prune`` keeps open evidence.
 DELIVERY_RETENTION_DAYS = 30
+
+#: How long a durable gate question stays open before the sweep expires it
+#: (WP-ARCH Amendment A slice B1, A2/AC-A7).  An hour is long enough that a
+#: supervisor reading a digest between tasks still answers in time, and short
+#: enough that a forgotten question surfaces as an anomaly inside one working
+#: session rather than sitting open across a restart.  It lives HERE, not next
+#: to the service that uses it, because §4c admits exactly one home for a
+#: duration and a second declaration is how two numbers come to disagree.
+GATE_QUESTION_EXPIRY_S = 3600
 
 #: The legacy stalled-notice age, MIRRORED here rather than imported.
 #:

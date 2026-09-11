@@ -62,14 +62,9 @@ from cli_agent_orchestrator.core.gate import (
     validate_ask,
 )
 from cli_agent_orchestrator.core.ports import Clock
+from cli_agent_orchestrator.core.timing import GATE_QUESTION_EXPIRY_S
 
 __all__ = ["GateQuestionService"]
-
-#: The default life of a question.  An hour is long enough that a supervisor
-#: reading a digest between tasks still answers in time, and short enough that a
-#: forgotten question surfaces as an anomaly inside one working session rather
-#: than sitting open across a restart.
-DEFAULT_EXPIRY_S = 3600
 
 #: Open states — the two that hold the dispatch's one-question slot (AC-A10).
 OPEN_STATES: tuple[QuestionState, ...] = (QuestionState.PENDING, QuestionState.ESCALATED)
@@ -102,7 +97,7 @@ class GateQuestionService:
         round_id: str | None = None,
         options: Sequence[str] = (),
         blocking: bool = True,
-        expires_in_s: int = DEFAULT_EXPIRY_S,
+        expires_in_s: int = GATE_QUESTION_EXPIRY_S,
         continuation_kind: ContinuationKind = ContinuationKind.ASSIGNMENT,
         continuation_ref: str = "",
         answer_schema: str | None = None,
