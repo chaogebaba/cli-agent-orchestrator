@@ -823,7 +823,7 @@ class HerdrRuntimeSource:
         if kind is None:
             # blocked/unknown: recorded as the new edge baseline, no boundary.
             return
-        self._emit_status_event(pane, pane_id, status, kind, pushed=pushed)
+        self._emit_status_event(pane, pane_id, status, kind)
 
     def _remember_identity(self, pane: dict[str, Any]) -> None:
         """Record the stable ``agent_session`` handle for §9 resume identity.
@@ -850,7 +850,7 @@ class HerdrRuntimeSource:
         if pane_id is not None and str(pane_id):
             self._bound_pane_id = str(pane_id)
 
-    def _confidence_for(self, pane: dict[str, Any], *, pushed: bool = False) -> Confidence:
+    def _confidence_for(self, pane: dict[str, Any]) -> Confidence:
         """How much authority this particular reading carries.
 
         ``screen_detection_skipped`` is herdr's own signal that a pane's status
@@ -877,28 +877,33 @@ class HerdrRuntimeSource:
         same false-idle freeze the health rule was written to kill, reached from
         the other side.
 
-        So for a pushed frame on a terminal whose cell is CERTIFIED for this
-        backend, the answer comes from the certification rather than from a field
-        herdr does not send.  That is not a weaker claim, it is the claim
-        certification makes: a PASS row says this source is the authority for
-        this terminal's lifecycle.  An UNCERTIFIED terminal keeps the field-based
-        reading and stays ``derived`` — and nothing mutes its pane, so derived is
-        exactly right there.
+        So on a terminal whose cell is CERTIFIED for this backend, the answer
+        comes from the certification rather than from a field herdr does not
+        send.  That is not a weaker claim, it is the claim certification makes: a
+        PASS row says this source is the authority for this terminal's lifecycle.
+        An UNCERTIFIED terminal keeps the field-based reading and stays
+        ``derived`` — and nothing mutes its pane, so derived is right there.
+
+        **Authority does not key on whether the record was PUSHED**, and that
+        distinction cost a recovery path.  §6 says the only safe recovery from a
+        subscription gap is a resnapshot, because events are not receipts.  While
+        authority required ``pushed``, a resnapshot's records were DERIVED, so on
+        a certified terminal they were muted — the terminal degraded on the gap
+        and then stayed degraded through the very resnapshot meant to recover it,
+        waiting for a pushed edge that an edge-triggered stream may never send if
+        the status did not change across the gap.  ``pushed`` still decides
+        proof-of-stream (:meth:`_touch_source_probe`), which is a different
+        question: whether the subscription is delivering, not whether this source
+        is the authority.
         """
         if pane.get("screen_detection_skipped") is True:
             return Confidence.AUTHORITATIVE
-        if pushed and self._lifecycle_authoritative:
+        if self._lifecycle_authoritative:
             return Confidence.AUTHORITATIVE
         return Confidence.DERIVED
 
     def _emit_status_event(
-        self,
-        pane: dict[str, Any],
-        pane_id: str,
-        status: str,
-        kind: EventKind,
-        *,
-        pushed: bool = False,
+        self, pane: dict[str, Any], pane_id: str, status: str, kind: EventKind
     ) -> None:
         runtime = producer_runtime()
         if runtime is None:
@@ -927,7 +932,7 @@ class HerdrRuntimeSource:
                 terminal_id=self.terminal_id,
                 kind=kind,
                 producer=Producer.SERVER,
-                confidence=self._confidence_for(pane, pushed=pushed),
+                confidence=self._confidence_for(pane),
                 observed_at=runtime.clock.now(),
                 source_ref=self._identity_ref,
                 payload=payload,

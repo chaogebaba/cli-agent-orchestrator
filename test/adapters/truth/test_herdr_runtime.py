@@ -882,16 +882,68 @@ def test_a_pushed_frame_on_a_CERTIFIED_terminal_is_authoritative(
     assert ingest_on.rows[0].confidence is Confidence.AUTHORITATIVE
 
 
-def test_a_snapshot_record_still_decides_on_the_field(ingest_on: FakeEventStore) -> None:
-    """The snapshot path is untouched: where herdr DOES send the field it still
-    decides, on a certified terminal and an uncertified one alike."""
+def _snapshot_pane(status: str) -> dict[str, Any]:
+    """A pane record shaped like ``session.snapshot`` actually returns one.
+
+    N13: the field-bearing records in ``pane-records.json`` are AGENT records
+    (``herdr agent get``), per that fixture's own PROVENANCE — the ``idle`` and
+    ``unknown`` entries, lifted from the event stream, carry no
+    ``screen_detection_skipped``, and neither did ``api snapshot`` for a live
+    pane in the B4 capture. So the snapshot path is exercised against a record
+    with the field ABSENT, which is the shape the wire sends.
+    """
+    record = dict(PANE_RECORDS["idle"])
+    record["agent_status"] = status
+    record.setdefault("terminal_id", HERDR_TID)
+    assert "screen_detection_skipped" not in record
+    return record
+
+
+def test_a_field_bearing_record_still_grants_authority(ingest_on: FakeEventStore) -> None:
+    """Where herdr DOES send the field — an agent record — it still decides, on
+    an uncertified terminal too. That path is untouched."""
     source = HerdrRuntimeSource(
         CAO_TID,
         herdr_terminal_id=HERDR_TID,
         socket_path="/u.sock",
         lifecycle_authoritative=False,
     )
-    source._process_pane(_pane("working"), pushed=False)  # fixture carries sds=True
+    source._process_pane(_pane("working"), pushed=False)  # agent record, sds=True
+    assert ingest_on.rows[0].confidence is Confidence.AUTHORITATIVE
+
+
+def test_a_snapshot_record_without_the_field_is_derived_when_uncertified(
+    ingest_on: FakeEventStore,
+) -> None:
+    source = HerdrRuntimeSource(
+        CAO_TID,
+        herdr_terminal_id=HERDR_TID,
+        socket_path="/u.sock",
+        lifecycle_authoritative=False,
+    )
+    source._process_pane(_snapshot_pane("working"), pushed=False)
+    assert ingest_on.rows[0].confidence is Confidence.DERIVED
+
+
+def test_a_resnapshot_on_a_certified_terminal_is_authoritative(
+    ingest_on: FakeEventStore,
+) -> None:
+    """B5. §6 says a resnapshot is the ONLY safe recovery from a subscription
+    gap, because events are not receipts.
+
+    While authority required ``pushed``, a resnapshot's records were DERIVED and
+    therefore muted on a certified terminal — so the cohort degraded on the gap
+    and stayed degraded through the very resnapshot meant to recover it, waiting
+    on a pushed edge that an edge-triggered stream never sends when the status
+    did not change across the gap.
+    """
+    source = HerdrRuntimeSource(
+        CAO_TID,
+        herdr_terminal_id=HERDR_TID,
+        socket_path="/u.sock",
+        lifecycle_authoritative=True,
+    )
+    source._process_pane(_snapshot_pane("working"), pushed=False)
     assert ingest_on.rows[0].confidence is Confidence.AUTHORITATIVE
 
 
@@ -935,5 +987,56 @@ def test_a_certified_terminals_own_lifecycle_is_not_muted_by_its_own_authority(
             WorkerState.BUSY,
             WorkerState.IDLE,
         ), "a certified terminal with a working stream must project it, not freeze"
+    finally:
+        wiring.reset_producers()
+
+
+def test_a_certified_terminal_degraded_by_a_gap_recovers_on_the_RESNAPSHOT(
+    ingest_on: FakeEventStore,
+) -> None:
+    """B5 end to end, through the real projector.
+
+    Gap -> degraded(no_signal) -> reconnect -> resnapshot. §6 calls the
+    resnapshot the only safe recovery, so the terminal must leave `degraded` on
+    it — not sit there until a pushed edge that an edge-triggered stream may
+    never send, because a status unchanged across the gap produces no edge.
+    """
+    from cli_agent_orchestrator.adapters.truth import wiring
+    from cli_agent_orchestrator.app.worker_truth.projector import (
+        Projector,
+        StaticSourceRegistry,
+    )
+    from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
+    from test.app.fakes import FakeClock, InMemoryEventStore, InMemoryStateStore
+
+    clock = FakeClock()
+    events = InMemoryEventStore(clock)
+    states = InMemoryStateStore()
+    sources = StaticSourceRegistry(frozenset({CAO_TID}))
+    sources.set_fallback_disabled(CAO_TID)
+    projector = Projector(events, states, clock, sources)
+    wiring.install_producers(
+        wiring.ProducerRuntime(store=events, clock=clock, state_store=states, folder=projector)
+    )
+    try:
+        source = HerdrRuntimeSource(
+            CAO_TID,
+            herdr_terminal_id=HERDR_TID,
+            socket_path="/u.sock",
+            lifecycle_authoritative=True,
+        )
+        source._process_pane(_snapshot_pane("working"), pushed=True)
+        source._emit_gap_degraded()
+        row = states.get(CAO_TID)
+        assert row is not None
+        assert row.state is WorkerState.DEGRADED
+        assert row.degraded_reason is DegradedReason.NO_SIGNAL
+
+        # Reconnect: the resnapshot reports the level. No pushed edge follows,
+        # because the status did not change while the socket was down.
+        source._process_pane(_snapshot_pane("working"), pushed=False)
+        row = states.get(CAO_TID)
+        assert row is not None
+        assert row.state is WorkerState.BUSY, "the resnapshot must recover the terminal"
     finally:
         wiring.reset_producers()
