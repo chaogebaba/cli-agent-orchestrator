@@ -304,24 +304,48 @@ def test_the_tick_drives_all_three_consumers_of_one_sample(
     assert reconciled == ["t1"]
 
 
-def test_the_other_two_consumers_run_on_a_sample_this_tick_did_not_take(
+def test_a_tick_that_takes_no_sample_drives_nothing_at_all(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """They read the RETAINED tail, so a fresh sample still feeds them.
+    """R4: the guard gates all three consumers, not only the capture.
 
-    This is the shape while the watchdog is alive: no capture here, and the two
-    riders still get their input — which is why the guard costs nothing.
+    A fresh sample means another driver took it and is driving its riders.  A
+    tick that re-drove them anyway would double-call two consumers the watchdog
+    is already calling at 1-5 s — and ``resync_from_pane_tail`` CONSUMES the
+    drop-seq edge, so the forced re-derive would fire from whichever caller
+    arrived first.  Self-guarded and safe, but no longer one pass per sample,
+    and no longer today's behaviour.
     """
     sampler = _Sampler(fresh=True)
     monitor = _install_sampler(monkeypatch, sampler)
     reconciled: list[str] = []
     monkeypatch.setattr(bootstrap, "_reconcile_question_marker", reconciled.append)
 
-    bootstrap._build_sampler_tick()(_fleet(("t1", "s1", "w1")))
+    for _ in range(4):
+        bootstrap._build_sampler_tick()(_fleet(("t1", "s1", "w1")))
 
     assert sampler.observed == []
-    assert monitor.resyncs == ["t1"]
-    assert reconciled == ["t1"]
+    assert monitor.resyncs == []
+    assert reconciled == []
+
+
+def test_an_unusable_sample_drives_nothing_either(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable pane or a capture outage leaves nothing to re-derive from,
+    which is exactly how the watchdog's own loop reads it."""
+
+    class _NoSample(_Sampler):
+        def observe(self, terminal_id: str, *, now: float | None = None, monitor: object = None):
+            return None
+
+    sampler = _NoSample(fresh=False)
+    monitor = _install_sampler(monkeypatch, sampler)
+    reconciled: list[str] = []
+    monkeypatch.setattr(bootstrap, "_reconcile_question_marker", reconciled.append)
+
+    bootstrap._build_sampler_tick()(_fleet(("t1", "s1", "w1")))
+
+    assert monitor.resyncs == []
+    assert reconciled == []
 
 
 def test_one_terminal_that_explodes_does_not_stop_the_others(

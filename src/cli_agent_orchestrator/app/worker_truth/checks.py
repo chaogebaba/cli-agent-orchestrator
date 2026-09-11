@@ -21,6 +21,7 @@ what every later phase reads.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -380,10 +381,33 @@ class ProducerDisagreementCheck:
     recorded, deduped per ``(projected, asserted)`` pair, so a pane that reads
     ``processing`` against an idle rollout for an hour is one finding with a
     count, not thirty.
+
+    **And one WRITE, not thirty.**  The finding table could never flood — the
+    store's record is an UPDATE-then-INSERT on the open row — but every call
+    opens a ``BEGIN IMMEDIATE`` and takes SQLite's write lock, and this runs from
+    the status monitor's locked publish path on every status edge.  A standing
+    disagreement is the common shape rather than the exotic one (the pane reads
+    ``processing`` off a spinner while the rollout has already ended the turn),
+    so the write rate is the cost that matters.  An in-memory episode map holds
+    the open ``(projected, asserted)`` pair per terminal and writes only when it
+    CHANGES; agreement closes the episode, so a disagreement that recurs after
+    the two sides re-converge is a new one and does write again.
     """
 
     def __init__(self, finding_store: FindingStore) -> None:
         self._finding_store = finding_store
+        self._lock = threading.Lock()
+        #: terminal_id -> the ``(projected, asserted)`` pair currently recorded.
+        self._open: dict[str, tuple[str, str]] = {}
+
+    def forget(self, terminal_id: str) -> None:
+        """Drop one terminal's episode when it is deleted.
+
+        Terminal ids are recycled, and a recycled id inheriting an open episode
+        would have its FIRST real disagreement swallowed as a repeat.
+        """
+        with self._lock:
+            self._open.pop(terminal_id, None)
 
     def __call__(self, event: WorkerEvent, row: "object") -> bool:
         """Evaluate one muted event.  Returns whether a finding was recorded.
@@ -409,7 +433,18 @@ class ProducerDisagreementCheck:
             return False
         asserted = _asserted_state(event)
         if asserted is None or asserted is standing:
+            # Agreement — or a kind that asserts nothing — CLOSES the episode, so
+            # the next contradiction is recorded rather than swallowed as a
+            # repeat of one the two sides have since resolved.
+            with self._lock:
+                self._open.pop(event.terminal_id, None)
             return False
+
+        episode = (standing.value, asserted.value)
+        with self._lock:
+            if self._open.get(event.terminal_id) == episode:
+                return False
+            self._open[event.terminal_id] = episode
 
         self._finding_store.record(
             FindingCode.DIAG_PRODUCER_DISAGREE,

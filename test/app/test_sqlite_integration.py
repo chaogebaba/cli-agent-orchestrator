@@ -367,3 +367,54 @@ def test_a_row_read_from_the_table_is_frozen(rig: _Rig) -> None:
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.state = WorkerState.EXITED  # type: ignore[misc]
+
+
+def test_upsert_writes_the_projection_half_and_leaves_the_liveness_half(rig: _Rig) -> None:
+    """WP-ARCH 2b (R2): the projector is not a writer of the liveness columns.
+
+    ``touch_probe`` and ``touch_source_probe`` are owned by the liveness probe
+    and the rollout tailer, and neither takes the projector's lock — neither has
+    any business waiting on a fold.  So a full-row ``upsert`` would silently
+    overwrite a heartbeat that landed between ``_load`` and the write with a
+    value seconds old, and the two readers of those stamps make that expensive:
+    ``_last_signal`` would judge a live terminal silent and degrade it, and
+    ``_source_healthy`` would flip ``is_projected`` off for a healthy lane.
+
+    The stale row written below is exactly what a fold holds after a heartbeat
+    lands inside its critical section.  Against a full-row write every liveness
+    assertion here fails.
+    """
+    from cli_agent_orchestrator.app.worker_truth.projector import ProjectedState
+
+    rig.emit(EventKind.TURN_STARTED)
+    probed_at = rig.clock.now()
+    rig.states.touch_probe(
+        TERMINAL, probed_at=probed_at, pane_present=True, pane_pid=4242, miss_count=3
+    )
+    rig.states.touch_source_probe(TERMINAL, probed_at=probed_at)
+
+    rig.states.upsert(
+        ProjectedState(
+            terminal_id=TERMINAL,
+            state=WorkerState.IDLE,
+            since=probed_at,
+            last_event_seq=99,
+            last_probe_at=None,
+            last_source_probe_at=None,
+            pane_pid=None,
+            pane_present=False,
+            miss_count=0,
+        )
+    )
+
+    row = rig.row()
+    assert row is not None
+    # The projection half applied...
+    assert row.state is WorkerState.IDLE
+    assert row.last_event_seq == 99
+    # ...and the liveness half is untouched.
+    assert row.last_probe_at == probed_at
+    assert row.last_source_probe_at == probed_at
+    assert row.pane_pid == 4242
+    assert row.pane_present is True
+    assert row.miss_count == 3

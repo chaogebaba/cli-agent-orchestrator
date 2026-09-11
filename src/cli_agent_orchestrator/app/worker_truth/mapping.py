@@ -20,6 +20,7 @@ from cli_agent_orchestrator.core.events import AnyKind, EventKind
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 
 __all__ = [
+    "ANSWERED_STATES",
     "FORWARD_STATUS_MAP",
     "LEGACY_STATUS_MAP",
     "LOSSY_FORWARD_STATES",
@@ -181,6 +182,16 @@ def legacy_status(
     return FORWARD_STATUS_MAP[state]
 
 
+#: The only two states a ``prompt.answered`` row may assert (D1f).
+#:
+#: A dialog ending means the agent proceeded (``BUSY``) or the card was dismissed
+#: and the terminal is ready (``IDLE``).  Every other reading in the legacy
+#: vocabulary is a statement about something else — a dead process, an unreadable
+#: screen — and this producer has no standing to make it.  See
+#: :func:`answered_state` for what each rejected value would have cost.
+ANSWERED_STATES: frozenset[WorkerState] = frozenset({WorkerState.IDLE, WorkerState.BUSY})
+
+
 def answered_state(payload: dict[str, object]) -> WorkerState | None:
     """The state a ``prompt.answered`` row asserts, read from its own payload.
 
@@ -190,14 +201,32 @@ def answered_state(payload: dict[str, object]) -> WorkerState | None:
     state by kind: the same kind covers both outcomes, and the difference is the
     whole content of the event.
 
-    Returns ``None`` when the payload carries no readable status, which is the
-    provider-hook shape: a hook fires because the agent answered and proceeded,
-    so the caller's implied ``BUSY`` is right there and this must not override it.
+    CLAMPED to the two states a dialog edge can legitimately end in, and the
+    clamp is the load-bearing part.  ``prompt.answered`` is in the projector's
+    ``DERIVED_ALWAYS_KINDS``, so it applies with an authoritative source perfectly
+    healthy — it is the one derived kind that bypasses source precedence for
+    exactly the terminals D1 exists to protect.  Passing the pane's whole legacy
+    vocabulary through would hand a dialog producer authority it does not have:
+
+    * ``error`` maps to ``EXITED``, which is an ABSORBING state — the sweep skips
+      an exited terminal forever and only ``session.started`` re-enters it — and
+      ``process.exited`` belongs to the liveness probe, "of which it is the sole
+      owner, in phase 1 and after".  A transient pane misread while a card is up
+      (a redraw, a buffer eviction — the sticky-latch rules exist because this
+      happens) would take a healthy sourced lane through a one-way door.
+    * ``unknown`` and ``render_uncertain`` map to ``DEGRADED``, and this caller
+      carries no :class:`DegradedReason`, so they would write an UNLABELLED
+      degradation — which the closed-reason design exists to make impossible.
+
+    Anything outside the clamp returns ``None`` and the caller falls back to the
+    implied ``BUSY``: wrong in the same recoverable way the pre-clamp code was,
+    and corrected by the source's next event rather than by a respawn.
     """
     raw = payload.get("latched_status")
     if not isinstance(raw, str):
         return None
-    return legacy_state(raw)
+    state = legacy_state(raw)
+    return state if state in ANSWERED_STATES else None
 
 
 def implied_state(kind: AnyKind) -> WorkerState | None:

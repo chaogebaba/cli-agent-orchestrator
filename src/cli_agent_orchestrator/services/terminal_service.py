@@ -332,8 +332,11 @@ def forget_worker_truth_state(terminal_id: str) -> None:
         )
 
         runtime = _wt_bootstrap.current_runtime()
-        if runtime is not None and runtime.health is not None:
-            runtime.health.forget(terminal_id)
+        if runtime is not None:
+            if runtime.health is not None:
+                runtime.health.forget(terminal_id)
+            if runtime.producer_check is not None:
+                runtime.producer_check.forget(terminal_id)
         _wt_pane_classification.forget(terminal_id)
         _wt_legacy_egress.forget(terminal_id)
     except Exception as e:

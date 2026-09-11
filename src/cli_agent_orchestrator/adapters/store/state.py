@@ -120,13 +120,31 @@ class SqliteStateStore:
         return _row_to_projection(row) if row is not None else None
 
     def upsert(self, projection: StateProjection) -> None:
-        """Write the whole row.
+        """Write the six columns the PROJECTOR owns, and only those.
 
-        A full replace rather than a column-by-column update, because the
-        projector hands back an immutable value it has already reasoned about as
-        a whole; a partial write would let the stored row hold a combination of
-        fields the projector never actually decided on — a ``degraded`` state
-        with a stale ``prior_state``, say.
+        A full replace of the projection half rather than a column-by-column
+        update, because the projector hands back an immutable value it has
+        already reasoned about as a whole; a partial write would let the stored
+        row hold a combination of fields the projector never actually decided on
+        — a ``degraded`` state with a stale ``prior_state``, say.
+
+        The five LIVENESS columns are deliberately absent from the update
+        (WP-ARCH phase 2, sub-phase 2b).  They belong to other writers — the
+        liveness probe owns ``last_probe_at``, ``pane_present``, ``pane_pid`` and
+        ``miss_count``, the rollout tailer owns ``last_source_probe_at`` — and
+        neither of those takes the projector's lock, because neither has any
+        business waiting on a fold.  Writing them here from the snapshot the
+        projector loaded would silently overwrite a heartbeat that landed
+        mid-rule with a value seconds old, and the two readers of those stamps
+        make that expensive: ``_last_signal`` would judge a live terminal silent
+        and degrade it for ``no_signal``, and ``_source_healthy`` would flip
+        ``is_projected`` to ``False`` and hand a healthy sourced terminal back to
+        the pane path.  Removing the columns from the write removes the whole
+        class, which is smaller than putting a lock on two hot writers.
+
+        They stay in the INSERT: a row created by the projector carries whatever
+        the caller had (``NULL`` and the defaults, in practice), and the first
+        touch fills them in.
         """
         self._pool.connection().execute(
             """
@@ -139,12 +157,7 @@ class SqliteStateStore:
               since = excluded.since,
               last_event_seq = excluded.last_event_seq,
               degraded_reason = excluded.degraded_reason,
-              prior_state = excluded.prior_state,
-              last_probe_at = excluded.last_probe_at,
-              last_source_probe_at = excluded.last_source_probe_at,
-              pane_pid = excluded.pane_pid,
-              pane_present = excluded.pane_present,
-              miss_count = excluded.miss_count
+              prior_state = excluded.prior_state
             """,
             (
                 projection.terminal_id,

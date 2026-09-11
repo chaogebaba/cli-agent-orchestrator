@@ -16,6 +16,7 @@ import pytest
 
 from cli_agent_orchestrator import bootstrap
 from cli_agent_orchestrator.adapters.truth import legacy_egress, pane_classification
+from cli_agent_orchestrator.app.worker_truth.checks import ProducerDisagreementCheck
 from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.services.terminal_service import forget_worker_truth_state
 
@@ -25,6 +26,7 @@ TERMINAL = "term-gone"
 @dataclass
 class _Runtime:
     health: SourceHealth | None
+    producer_check: ProducerDisagreementCheck | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +66,30 @@ def test_the_producers_edge_state_goes_with_it(monkeypatch: pytest.MonkeyPatch) 
     assert TERMINAL not in pane_classification._edge_seq
     assert TERMINAL not in legacy_egress._last_pair
     assert legacy_egress.last_published_event_id(TERMINAL) is None
+
+
+def test_the_disagreement_episode_goes_with_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3's episode map is per-terminal memory too.
+
+    A recycled id inheriting an open episode would have its FIRST real
+    disagreement swallowed as a repeat of a dead terminal's.
+    """
+
+    class _Findings:
+        def record(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    check = ProducerDisagreementCheck(_Findings())
+    check._open[TERMINAL] = ("idle", "busy")
+    monkeypatch.setattr(
+        bootstrap,
+        "current_runtime",
+        lambda: _Runtime(health=SourceHealth(), producer_check=check),
+    )
+
+    forget_worker_truth_state(TERMINAL)
+
+    assert TERMINAL not in check._open
 
 
 def test_no_runtime_at_all_is_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -190,3 +190,90 @@ def test_an_authoritative_event_is_never_read_as_a_disagreement(rig: Rig) -> Non
     )
 
     assert check(event, ProjectedState(terminal_id=TERMINAL, since=rig.clock.now())) is False
+
+
+# ----------------------------------------------- the write rate (R3)
+
+
+class _CountingFindings:
+    """Counts WRITES, which is the cost the episode guard is about."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.writes = 0
+
+    def record(self, *args: object, **kwargs: object) -> object:
+        self.writes += 1
+        return self._inner.record(*args, **kwargs)  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+def _counting(rig: Rig) -> _CountingFindings:
+    from cli_agent_orchestrator.app.worker_truth.checks import ProducerDisagreementCheck
+
+    counter = _CountingFindings(rig.findings)
+    rig.projector._producer_check = ProducerDisagreementCheck(counter)  # type: ignore[attr-defined]
+    return counter
+
+
+def test_a_standing_disagreement_writes_once_not_once_per_edge(rig: Rig) -> None:
+    """Every write opens a ``BEGIN IMMEDIATE`` and takes SQLite's write lock —
+    from the status monitor's locked publish path, on every status edge.
+
+    The table could never flood (the store's record updates the open row), but
+    the write RATE could, and a standing disagreement is the common shape: the
+    pane reads ``processing`` off a spinner while the rollout has already ended
+    the turn.
+    """
+    counter = _counting(rig)
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+
+    for index in range(20):
+        rig.legacy(TERMINAL, "processing", origin=f"origin-{index}")
+
+    assert counter.writes == 1
+
+
+def test_agreement_closes_the_episode_so_a_recurrence_is_recorded(rig: Rig) -> None:
+    """The guard must not swallow a NEW disagreement after the two sides
+    re-converge — that is a second episode, and it is news."""
+    counter = _counting(rig)
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+
+    rig.legacy(TERMINAL, "processing")
+    rig.legacy(TERMINAL, "idle")  # agreement: the episode closes
+    rig.legacy(TERMINAL, "processing")  # a new one
+
+    assert counter.writes == 2
+
+
+def test_a_different_pair_is_a_different_episode(rig: Rig) -> None:
+    counter = _counting(rig)
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+
+    rig.legacy(TERMINAL, "processing")
+    rig.legacy(TERMINAL, "waiting_user_answer")
+
+    assert counter.writes == 2
+
+
+def test_the_episode_does_not_survive_the_terminal(rig: Rig) -> None:
+    """A recycled id must not have its first real disagreement swallowed."""
+    from cli_agent_orchestrator.app.worker_truth.checks import ProducerDisagreementCheck
+
+    counter = _CountingFindings(rig.findings)
+    check = ProducerDisagreementCheck(counter)
+    rig.projector._producer_check = check  # type: ignore[attr-defined]
+    _sourced(rig)
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)
+    rig.legacy(TERMINAL, "processing")
+
+    check.forget(TERMINAL)
+    rig.legacy(TERMINAL, "processing", origin="probe")
+
+    assert counter.writes == 2

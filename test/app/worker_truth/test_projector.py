@@ -607,3 +607,33 @@ def test_an_unreadable_reading_falls_back_to_busy(rig: Rig) -> None:
     rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "nonsense"})
 
     assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_a_pane_misread_during_a_dialog_cannot_exit_the_terminal(rig: Rig) -> None:
+    """R1.  ``exited`` is a ONE-WAY door and the dialog producer has no key.
+
+    ``prompt.answered`` is in ``DERIVED_ALWAYS_KINDS``, so it applies even with a
+    healthy rollout — and the sweep skips an exited terminal forever, so a single
+    misread while a card was up would strand a live worker until a respawn.
+    ``process.exited`` belongs to the liveness probe, "of which it is the sole
+    owner, in phase 1 and after".
+    """
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "error"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+@pytest.mark.parametrize("reading", ["unknown", "render_uncertain"])
+def test_a_dialog_edge_never_writes_an_unlabelled_degradation(rig: Rig, reading: str) -> None:
+    """The closed-reason design exists so that no path can produce one."""
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": reading})
+
+    row = rig.states.get(TERMINAL)
+    assert row.state is WorkerState.BUSY
+    assert row.degraded_reason is None

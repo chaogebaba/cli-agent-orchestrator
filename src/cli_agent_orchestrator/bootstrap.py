@@ -205,6 +205,9 @@ class WorkerTruthRuntime:
     #: runtime must drop the view with it: a stopped projector leaves marks
     #: behind, and a fleet whose publisher is gone must fall back to the pane.
     health: SourceHealth | None = None
+    #: D9b's check (phase 2).  Held because it keeps an in-memory episode per
+    #: terminal, which the teardown path has to be able to drop.
+    producer_check: ProducerDisagreementCheck | None = None
     #: The two periodic drivers (phase 2, sub-phase 2b).  ``probe`` also owns the
     #: pane-delta sampler's re-drive (§12), which is why it is started even on a
     #: backend that cannot list panes for it.
@@ -391,15 +394,27 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
     for this call to follow it there.  Named to that lane.
 
     The ``peek`` guard is what makes this a hand-off rather than a second
-    sampler.  While the watchdog is alive it samples every 1-5 s, so ``peek``
-    always answers fresh and this tick captures NOTHING — today's capture count,
-    exactly, with no flag to set and no ordering between the two lanes to get
-    right.  When the watchdog goes, ``peek`` starts answering ``None`` and this
-    becomes the driver, at ``PANE_SAMPLE_S``, which ``core/timing.py`` keeps
-    inside the sampler's own staleness horizon.  Without the guard both would
-    sample, and the extra call would advance ``unchanged_count`` on a cadence
-    rule 3a reads — a behaviour change in status fusion, delivered by a re-drive
-    whose whole purpose was to avoid one.
+    sampler, and it gates ALL THREE consumers rather than only the capture.  A
+    fresh sample means another driver took it and is driving its riders; this
+    tick then does nothing at all.  Only the tick that actually TAKES a sample
+    drives the three things that read it — which is the watchdog's own shape,
+    reproduced: sample, and on a usable one, resync and reconcile.
+
+    Gating only the capture would have been the subtle version of the same bug
+    the guard exists to prevent.  ``resync_from_pane_tail`` consumes the drop-seq
+    edge, so two callers racing for it means the forced re-derive fires from
+    whichever got there first — self-guarded and safe, but no longer one pass per
+    sample, and no longer today's behaviour.
+
+    While the watchdog is alive it samples every 1-5 s, so ``peek`` always
+    answers fresh and this tick is inert — today's behaviour, exactly, with no
+    flag to set and no ordering between the two lanes to get right.  When the
+    watchdog goes, ``peek`` starts answering ``None`` and this becomes the
+    driver, at ``PANE_SAMPLE_S``, which ``core/timing.py`` keeps inside the
+    sampler's own staleness horizon.  Without the guard both would sample, and
+    the extra call would advance ``unchanged_count`` on a cadence rule 3a reads —
+    a behaviour change in status fusion, delivered by a re-drive whose whole
+    purpose was to avoid one.
     """
 
     def tick(fleet: Sequence[TerminalRef]) -> None:
@@ -412,8 +427,15 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
         for member in fleet:
             terminal_id = member.terminal_id
             try:
-                if pane_liveness.peek(terminal_id, now=now) is None:
-                    pane_liveness.observe(terminal_id, now=now, monitor=status_monitor)
+                if pane_liveness.peek(terminal_id, now=now) is not None:
+                    # Someone sampled inside the staleness window; the tick that
+                    # took that sample owns its riders.
+                    continue
+                if pane_liveness.observe(terminal_id, now=now, monitor=status_monitor) is None:
+                    # No usable sample this tick — an unreadable pane, a capture
+                    # outage.  Nothing to re-derive from, which is exactly how the
+                    # watchdog's own loop reads it.
+                    continue
                 retained = pane_liveness.peek(terminal_id, now=now)
                 if retained is not None:
                     status_monitor.resync_from_pane_tail(
@@ -766,6 +788,7 @@ async def start_worker_truth(
         # every terminal reads NOT projected until a fold says otherwise, which
         # is the behaviour every arm before the cutover must have.
         health = SourceHealth()
+        producer_check = ProducerDisagreementCheck(finding_store)
         projector = Projector(
             event_store,
             state_store,
@@ -780,7 +803,7 @@ async def start_worker_truth(
             # decision and is not a row: a check reading the log alone would have
             # to re-derive source health and would then be a second
             # implementation of the precedence rule.
-            producer_check=ProducerDisagreementCheck(finding_store),
+            producer_check=producer_check,
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
@@ -862,6 +885,7 @@ async def start_worker_truth(
         projector=projector,
         sources=sources,
         health=health,
+        producer_check=producer_check,
         retention=retention,
         probe=probe,
         sweep=sweep,

@@ -186,3 +186,46 @@ def test_a_terminal_deleted_mid_sweep_is_forgotten_not_degraded(rig: Rig) -> Non
 
 def _kinds(rig: Rig) -> list[AnyKind]:  # pragma: no cover - debugging helper
     return [row.kind for row in rig.events.read(TERMINAL)]
+
+
+# ------------------------------------------- the liveness columns (R2)
+
+
+def test_a_heartbeat_that_lands_mid_fold_is_not_overwritten(rig: Rig) -> None:
+    """The projector's lock cannot help here, so the WRITE has to be narrower.
+
+    ``touch_probe`` and ``touch_source_probe`` are partial-column writes owned by
+    the liveness probe and the rollout tailer, and neither takes the projector's
+    lock — neither has any business waiting on a fold.  So a full-row ``upsert``
+    would overwrite a heartbeat that landed between ``_load`` and the write with
+    a value seconds old, and both readers of those stamps make that expensive:
+    ``_last_signal`` would judge a live terminal silent and degrade it, and
+    ``_source_healthy`` would flip ``is_projected`` off for a healthy lane.
+    """
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    probed_at = rig.clock.advance(1)
+    rig.states.touch_probe(
+        TERMINAL, probed_at=probed_at, pane_present=True, pane_pid=4242, miss_count=0
+    )
+    rig.states.touch_source_probe(TERMINAL, probed_at=probed_at)
+
+    rig.emit(TERMINAL, EventKind.TURN_ENDED)  # a fold whose snapshot predates them
+
+    row = rig.states.get(TERMINAL)
+    assert row.state is WorkerState.IDLE
+    assert row.last_probe_at == probed_at
+    assert row.last_source_probe_at == probed_at
+    assert row.pane_pid == 4242
+    assert row.pane_present is True
+
+
+def test_a_heartbeat_that_lands_mid_sweep_is_not_overwritten(rig: Rig) -> None:
+    """Same property on the sweep's write, which is the one that degrades."""
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    probed_at = rig.states.rows[TERMINAL].last_probe_at
+
+    rig.projector.sweep()
+
+    assert rig.state_of(TERMINAL) is WorkerState.DEGRADED
+    assert rig.states.get(TERMINAL).last_probe_at == probed_at

@@ -26,9 +26,11 @@ from __future__ import annotations
 import pytest
 
 from cli_agent_orchestrator.app.worker_truth.mapping import (
+    ANSWERED_STATES,
     FORWARD_STATUS_MAP,
     LEGACY_STATUS_MAP,
     LOSSY_FORWARD_STATES,
+    answered_state,
     legacy_state,
     legacy_status,
 )
@@ -259,3 +261,57 @@ def test_no_kind_but_turn_ended_can_change_the_published_status(state: WorkerSta
         if kind is EventKind.TURN_ENDED:
             continue
         assert legacy_status(state, causing_kind=kind) == baseline
+
+
+# --------------------------------------------------- the answered clamp (R1)
+
+
+@pytest.mark.parametrize("reading", ["idle", "completed"])
+def test_a_dialog_that_ends_in_a_ready_state_answers_idle(reading: str) -> None:
+    assert answered_state({"latched_status": reading}) is WorkerState.IDLE
+
+
+def test_a_dialog_that_ends_in_a_working_state_answers_busy() -> None:
+    assert answered_state({"latched_status": "processing"}) is WorkerState.BUSY
+
+
+@pytest.mark.parametrize(
+    ("reading", "would_have_been"),
+    [
+        ("error", WorkerState.EXITED),
+        ("unknown", WorkerState.DEGRADED),
+        ("render_uncertain", WorkerState.DEGRADED),
+        ("waiting_user_answer", WorkerState.AWAITING_INPUT),
+    ],
+)
+def test_every_other_reading_is_rejected(reading: str, would_have_been: WorkerState) -> None:
+    """The clamp, stated as the difference between the two maps.
+
+    ``prompt.answered`` is in ``DERIVED_ALWAYS_KINDS``, so it applies with an
+    authoritative source perfectly healthy — the one derived kind that bypasses
+    precedence for exactly the terminals D1 exists to protect.  Unclamped:
+
+    * ``error`` would reach ``EXITED``, which is ABSORBING (the sweep skips an
+      exited terminal forever, and only ``session.started`` re-enters it) and
+      which belongs to the liveness probe alone.  A transient pane misread while
+      a card is up would take a healthy lane through a one-way door.
+    * ``unknown`` and ``render_uncertain`` would write an UNLABELLED
+      ``DEGRADED``, since this caller carries no reason.
+
+    The parameters assert the rejected value really is the dangerous one —
+    ``legacy_state`` still maps it — so the test fails if the clamp is widened
+    rather than passing vacuously.
+    """
+    assert legacy_state(reading) is would_have_been
+    assert answered_state({"latched_status": reading}) is None
+
+
+def test_an_absent_or_unrenderable_reading_is_rejected() -> None:
+    assert answered_state({}) is None
+    assert answered_state({"latched_status": None}) is None
+    assert answered_state({"latched_status": "nonsense"}) is None
+
+
+def test_the_clamp_is_exactly_the_two_states_a_dialog_can_end_in() -> None:
+    assert ANSWERED_STATES == {WorkerState.IDLE, WorkerState.BUSY}
+    assert set(LEGACY_STATUS_MAP.values()) - ANSWERED_STATES
