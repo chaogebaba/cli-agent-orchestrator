@@ -1365,7 +1365,20 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.MINIMAX_CODE.value,
 }
 
-MAX_PEEK_TERMINAL_LINES = 200
+#: The transport ceiling for one pane read (#742).
+#:
+#: 200 was the MCP tool's context budget doing duty as the transport's limit, and
+#: the two are not the same quantity. A seat that peeks pays for every line in
+#: its own context, so the MCP tool still caps at
+#: ``MCP_PEEK_TERMINAL_LINES``; an out-of-band probe counting seat-visible copies
+#: over a 30-message round pays nothing and simply could not ask -- the HTTP
+#: route rejected ``lines=400`` with 422 and the copy-count acceptance criterion
+#: had no way to be measured at all.
+MAX_PEEK_TERMINAL_LINES = 2000
+
+#: What the MCP tool asks for at most, which is a CONTEXT budget and stays where
+#: it was. Raising the transport ceiling must not raise what lands in a seat.
+MCP_PEEK_TERMINAL_LINES = 200
 
 
 def _append_message_contract(message: str, metadata: Dict, orchestration_value: str) -> str:

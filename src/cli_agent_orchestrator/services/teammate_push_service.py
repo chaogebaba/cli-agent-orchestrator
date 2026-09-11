@@ -221,9 +221,13 @@ def write_supervisor_callback_notification(
     # refused wake and rejected that too: a fallback that resurrects a killed
     # surface gives one id two carriers again the moment the primary is flaky,
     # which is the defect family this phase closes.
-    from cli_agent_orchestrator.services.queue_carrier import queue_owns_delivery
+    from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
 
-    if queue_owns_delivery():
+    # ROW-SCOPED since #741: the row reaching here came OUT of the legacy inbox,
+    # so the queue holds no counterpart for it and muting its only carrier is a
+    # message with nowhere to go.  The receiver's cache id is what the pending
+    # probe is keyed on, which is the same id the legacy delivery path uses.
+    if queue_owns_receiver_delivery(message.receiver_id):
         return NativeInboxWriteResult(kind="skipped", reason="queue_owns_delivery")
 
     # F178-S1: resolve symlinks so os.replace targets the real file, not the link.

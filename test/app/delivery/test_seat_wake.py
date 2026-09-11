@@ -23,6 +23,8 @@ a seat where emitters had in fact fired.
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -958,3 +960,180 @@ def test_an_epoch_that_closes_mid_tick_records_no_attempt(harness: Harness) -> N
     assert report.detail == "epoch_closed"
     assert len(harness.queue.attempts_for(row.msg_id)) == before
     assert resolution.live
+
+
+# ------------------------------------------------- #741: the outcome is LOGGED
+
+
+def test_every_wake_outcome_reaches_the_log(harness: Harness, caplog) -> None:
+    """A refusal at WARNING and an emission at INFO, both naming the outcome.
+
+    The first live round under ``on`` found the seat quiet and could not say
+    why, and the reason it could not is here rather than in the round: the
+    carrier's refusal reached an ``delivery_attempt`` row and nothing else, and
+    the ``attempts`` COUNTER four different outcomes leave at zero was the only
+    surviving evidence. So the arm asserts both directions -- a silent success
+    is as useless to the next round as a silent refusal.
+    """
+    caplog.set_level(logging.DEBUG, logger="cli_agent_orchestrator.app.delivery.tick")
+
+    harness.carrier.reason = "socket_unpublished"
+    harness.enqueue("log1")
+    harness.tick.run_once(now=harness.clock.now())
+
+    refusals = [r for r in caplog.records if r.message.startswith("delivery_wake receiver=")]
+    assert refusals, "a refused wake left no line in the log"
+    assert refusals[-1].levelno == logging.WARNING
+    assert "socket_unpublished" in refusals[-1].message
+    assert "emitted=False" in refusals[-1].message
+
+    caplog.clear()
+    harness.carrier.reason = None
+    harness.lease_period()
+    harness.tick.run_once(now=harness.clock.now())
+
+    emissions = [
+        r
+        for r in caplog.records
+        if r.message.startswith("delivery_wake receiver=") and "emitted=True" in r.message
+    ]
+    assert emissions, "an emitted wake left no line in the log either"
+    assert emissions[-1].levelno == logging.INFO
+
+
+# ---------------------------------------------------------------------------
+# #741 r3 — the dead-letter notice must be ADDRESSABLE.
+#
+# The r1 EMPIRICAL adjudication could not read the r2d live round as acceptance
+# because 20 of its 60 `no_terminal` refusals named service ids rather than the
+# dead probe worker: 10 `receiver=message-trace:4ec96674`, 5
+# `receiver=watchdog:4ec96674`, 5 `receiver=watchdog:ae282428`. Traced to their
+# producer, all 20 are this method: `_announce_death` addressed the notice to
+# `row.sender_id` unconditionally, and the watchdog auto-resume and message-trace
+# writers set `sender_id` to a namespace that owns no terminal and no mailbox.
+#
+# The refusal does not terminate the row, so each notice was re-woken every lease
+# period — `wake=1` through `wake=5` per id in the retained logs, which is where
+# 4 ids x 5 wakes = 20 comes from. This is a real defect the queue introduced,
+# not probe noise, and the arms below are what stop it coming back.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "service_sender",
+    ["watchdog:4ec96674", "message-trace:4ec96674", "cao-bridge", "cao-digest:mb_x"],
+)
+def test_a_service_sender_gets_no_dead_letter_notice(harness: Harness, service_sender: str) -> None:
+    """A notice nobody can receive is not a quieter failure — it is a louder one.
+
+    Addressed to a service namespace the notice is claimed, refused
+    `no_terminal`, and re-offered forever, so it manufactures delivery traffic
+    that looks exactly like real loss. The finding still fires, so the death is
+    recorded; only the undeliverable notice is not written.
+    """
+    row = harness.enqueue("svc", sender=service_sender)
+    harness.clock.advance(seconds=DELIVERY_MAX_LIFETIME_S + 1)
+    report = harness.tick.run_once(now=harness.clock.now())
+
+    dead = harness.queue.dead_letter(row.msg_id)
+    assert dead is not None and dead.reason is DeadReason.MAX_LIFETIME
+    assert harness.findings.of(
+        FindingCode.DIAG_DELIVERY_TIME_BOUND
+    ), "the death must still be recorded — this fix silences the notice, not the finding"
+
+    assert report.notices_enqueued == 0, (
+        f"a dead-letter notice was addressed to {service_sender!r}, which owns no "
+        "terminal and no mailbox: it can only ever refuse `no_terminal` and be "
+        "re-woken every lease period (#741)"
+    )
+    assert not list(harness.queue.undelivered_ids(service_sender))
+
+
+def test_a_worker_sender_still_gets_its_dead_letter_notice(harness: Harness) -> None:
+    """The direction that keeps the repair honest.
+
+    §13d's escalation is the whole reason the notice exists, and a fix that
+    suppressed it for real senders would replace a visible line in a live pane
+    with a row in a table nobody is watching.
+    """
+    row = harness.enqueue("wrk", sender=WORKER)
+    harness.clock.advance(seconds=DELIVERY_MAX_LIFETIME_S + 1)
+    report = harness.tick.run_once(now=harness.clock.now())
+
+    assert harness.queue.dead_letter(row.msg_id) is not None
+    assert report.notices_enqueued == 1
+    assert list(harness.queue.undelivered_ids(WORKER))
+
+
+def test_the_service_sender_rule_is_the_same_rule_on_both_sides_of_the_seam() -> None:
+    """The legacy stall path and the queue tick must ask the SAME question.
+
+    They had the same rule and only one of them implemented it, which is how the
+    tick came to address 20 live notices to ids the inbox had always refused to
+    route back to (#741 r3).
+
+    The tidy fix -- one function imported by both -- is FORBIDDEN here: a legacy
+    module may name the new package tree only from the AC11 allowlist, and
+    ``clients/database.py`` is not on it
+    (``test_legacy_files_importing_new_packages_stay_within_the_ac11_allowlist``
+    in ``test/adapters/test_import_contracts.py``). The rule is therefore stated
+    twice on purpose, and THIS arm is what stops the two copies drifting: it
+    drives both over one corpus and compares them answer by answer.
+    """
+    from cli_agent_orchestrator.clients.database import _is_service_sender as legacy_rule
+    from cli_agent_orchestrator.core.delivery import is_service_sender as queue_rule
+
+    service = ("watchdog:t1", "message-trace:t1", "cao-bridge", "cao-digest:m", "", None)
+    addressable = ("4ec96674", "wrk-p3b01", "codex_general-abc", "mb_supervisor")
+
+    for sender in service:
+        assert queue_rule(sender) is True, sender
+    for sender in addressable:
+        assert queue_rule(sender) is False, sender
+
+    for sender in (*service, *addressable):
+        assert queue_rule(sender) == legacy_rule(sender), (
+            f"the two copies of the service-sender rule disagree about {sender!r}; "
+            "they are duplicated for the strangler seam, not permitted to drift"
+        )
+
+
+def test_the_wake_line_carries_every_field_a_round_parses(harness: Harness, caplog) -> None:
+    """The log line's SHAPE is load-bearing, so it is pinned field by field.
+
+    The r1 EMPIRICAL memo observed that the arm above asserts the level and the
+    outcome and nothing else. That was a NIT while the line was only read by a
+    human. It stopped being one in r3: the live round's refusal-disposition
+    collector parses `receiver=` out of these lines to classify every
+    `no_terminal` refusal, and that classification is what a flip verdict is now
+    gated on. A field silently renamed or dropped would not fail a test — it
+    would make the next round's acceptance evidence wrong, which is the exact
+    failure mode this whole fix round exists to close.
+    """
+    caplog.set_level(logging.DEBUG, logger="cli_agent_orchestrator.app.delivery.tick")
+
+    harness.carrier.reason = "socket_unpublished"
+    harness.enqueue("shape1")
+    harness.tick.run_once(now=harness.clock.now())
+
+    lines = [r.message for r in caplog.records if r.message.startswith("delivery_wake receiver=")]
+    assert lines, "a refused wake left no line in the log"
+    line = lines[-1]
+
+    fields = dict(
+        part.split("=", 1)
+        for part in line.split()
+        if "=" in part and not part.startswith("delivery_wake")
+    )
+    assert fields["receiver"] == SEAT
+    assert fields["epoch"] == "1"
+    assert fields["carrier"], "carrier must name WHICH surface refused"
+    assert fields["outcome"], "outcome must name the refusal kind, not just emitted=False"
+    assert fields["emitted"] == "False"
+    assert fields["wake"] == "1", "the wake ordinal distinguishes a re-offer from a first try"
+    assert fields["claimed"] == "1"
+    assert fields["detail"] == "socket_unpublished"
+
+    # And `receiver=` must be parseable by the round's own regex, unquoted and
+    # whitespace-free, because that is how the collector reads it.
+    assert re.search(r"receiver=(\S+)", line).group(1) == SEAT
