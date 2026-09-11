@@ -1195,8 +1195,8 @@ class TestAC13SocketErrorsFallback:
 # ``TestAC15ConfigMatrix`` was the truth table for ``supervisor.wake.native``
 # and ``supervisor.doorbell``: native off → gated ring only; doorbell off →
 # neither transport. Both keys are deleted, and the reason is written at
-# ``cc_session_registry.WAKE_NATIVE_DEFAULT``, a constant kept only as a note to
-# an operator holding an old settings.json. After K8 the native channel is the
+# the head of ``cc_session_registry`` — where slice 3 r2 moved it when it deleted
+# the ``WAKE_NATIVE_DEFAULT`` constant. After K8 the native channel is the
 # seat's ONLY carrier, so a switch that turns it off buys silence rather than a
 # different carrier — and silence at the seat is #604, the bug the phase exists
 # to remove. A matrix whose "off" row is a defect is not a matrix.

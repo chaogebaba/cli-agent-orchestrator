@@ -23,6 +23,13 @@ group also names something that MUST still be present, and the two wake keys the
 from __future__ import annotations
 
 from pathlib import Path
+from test.services.test_p3b_seat_carrier_positions import (  # noqa: F401
+    SEAT_TERMINAL,
+    _callback,
+    _seat,
+    seat_db,
+)
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -164,35 +171,169 @@ def test_the_paste_seam_is_named_by_a_closed_set_of_modules() -> None:
     }, sorted(callers)
 
 
-def test_the_seat_returns_before_the_paste_seam(monkeypatch) -> None:
-    """The behavioural half of K8, and the one that would actually break.
+def test_the_seat_returns_before_the_paste_seam(seat_db) -> None:
+    """The behavioural half of K8, against a REAL seat.
 
     ``deliver_pending`` must return for a supervisor-role receiver BEFORE any
-    paste call is reachable. Asserted by making the role probe answer True and
-    counting calls at the seam — a refactor that moved the gate below the paste
-    would pass every grep in this file and fail here.
+    paste call is reachable. A refactor that moved the gate below
+    ``prepare_input`` would pass every grep in this file and fail here.
+
+    **This arm was vacuous in r1 and the rewrite is the point.** It called
+    ``deliver_pending("sup-k8")`` against a database with no such terminal, so
+    the method returned at its ``no_terminal_metadata`` guard — dozens of lines
+    ABOVE the role gate. ``pastes == []`` held because nothing ran at all, and
+    the arm would have stayed green with the gate deleted outright. Stubbing the
+    metadata is not enough either: the pending-row sentinel has to survive a real
+    grouping pass, so the row must be real too.
+
+    So it now runs on the ``seat_db`` fixture, which seeds the terminal, the
+    mailbox and its incarnation, with one genuine PENDING row. And it asserts
+    BOTH halves — that the probe was REACHED and that the seam was not — because
+    "no paste happened" is exactly the claim an early return also satisfies.
     """
-    from cli_agent_orchestrator.services import inbox_service, terminal_service
+    from unittest.mock import patch
 
+    from cli_agent_orchestrator.services import inbox_service as inbox_mod
+    from cli_agent_orchestrator.services import mailbox_service as mailbox_mod
+
+    with seat_db.begin() as db:
+        _seat(db)
+        _callback(db)
+
+    probed: list[str] = []
     pastes: list[str] = []
-    monkeypatch.setattr(
-        terminal_service, "send_prepared_input", lambda *a, **k: pastes.append("paste")
-    )
-    monkeypatch.setattr(terminal_service, "prepare_input", lambda *a, **k: pastes.append("prepare"))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
-        lambda tid: True,
-    )
-    monkeypatch.setattr(inbox_service, "get_pending_messages", lambda *a, **k: [object()])
 
-    try:
-        inbox_service.InboxService().deliver_pending("sup-k8")
-    except Exception:
-        # The gate is what is under test, not the rest of the method's wiring.
-        # Any exception AFTER the gate would still have had to pass the seam.
-        pass
+    def _probe(terminal_id):
+        probed.append(terminal_id)
+        return True
 
+    with (
+        patch.object(mailbox_mod, "probe_supervisor_role", _probe),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.prepare_input",
+            side_effect=lambda *a, **k: pastes.append("prepare"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
+            side_effect=lambda *a, **k: pastes.append("send"),
+        ),
+        patch.object(inbox_mod, "status_monitor", MagicMock()),
+        patch.object(inbox_mod, "provider_manager", MagicMock()),
+        patch.object(
+            inbox_mod,
+            "get_terminal_metadata",
+            return_value={
+                "tmux_session": "cao-p3b",
+                "tmux_window": SEAT_TERMINAL,
+                "lifecycle_generation": 1,
+                "recovery_state": None,
+                "metadata": {},
+            },
+        ),
+    ):
+        inbox_mod.InboxService().deliver_pending(SEAT_TERMINAL)
+
+    assert probed == [SEAT_TERMINAL], (
+        "the role gate was never reached: deliver_pending returned above it, so "
+        "an empty paste list proves nothing about the ban"
+    )
     assert pastes == [], "a supervisor receiver reached the paste seam"
+
+
+def test_the_role_gate_precedes_every_paste_in_deliver_pending() -> None:
+    """The ORDER of the gate and the seam, read off the parsed method.
+
+    **Why this is structural and says so.** The arm above proves the gate is
+    REACHED on a real seat with a real pending row — which r1's version did not,
+    and which is the half that was vacuous. It cannot prove the second half,
+    because ``deliver_pending`` does not reach ``prepare_input`` in that harness
+    for EITHER role: something downstream of the gate (the attempt open and the
+    status gate) stops it first. Measured, not assumed — the worker contrast was
+    tried and pastes nothing either, so an arm asserting "no paste" there would
+    be asserting the harness's limit, not the ban.
+
+    So the ordering is taken from the AST instead, and that is a real assertion
+    rather than a consolation: K8's ban IS an ordering claim — the gate returns
+    BEFORE the seam is reachable — and moving the gate below ``prepare_input`` is
+    exactly the refactor this has to catch. It changes the parsed order and this
+    reddens. Verified against that mutant.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from cli_agent_orchestrator.services.inbox_service import InboxService
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(InboxService.deliver_pending)))
+
+    gate_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "probe_supervisor_role"
+    ]
+    seam_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("prepare_input", "send_prepared_input")
+    ]
+
+    assert gate_lines, "deliver_pending no longer consults the role gate at all"
+    assert seam_lines, (
+        "deliver_pending reaches no paste seam, so this arm is watching nothing — "
+        "if the worker path moved, re-point it rather than deleting it"
+    )
+
+    # The gate must RETURN for a supervisor receiver — a gate that falls through
+    # is the first mutant this pairs with.
+    guarded_returns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and isinstance(node.test.func, ast.Name)
+        and node.test.func.id == "probe_supervisor_role"
+        and any(isinstance(stmt, ast.Return) for stmt in node.body)
+    ]
+    assert guarded_returns, "the role gate no longer RETURNS for a supervisor receiver"
+
+    # And it must sit OUTSIDE every loop that can paste. Textual order is not the
+    # property and asserting it was the second mutant's escape: a gate moved to
+    # the line directly above ``prepare_input`` is still textually first, and
+    # still lets a supervisor row reach the seam on the iteration that gets
+    # there. What K8 requires is that the seat leaves the method BEFORE the
+    # delivery loop is entered at all.
+    def _contains_paste(node: ast.AST) -> bool:
+        return any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Attribute)
+            and inner.func.attr in ("prepare_input", "send_prepared_input")
+            for inner in ast.walk(node)
+        )
+
+    pasting_loops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.For, ast.While, ast.AsyncFor)) and _contains_paste(node)
+    ]
+    assert pasting_loops, "no loop in deliver_pending pastes — re-point this arm"
+
+    for loop in pasting_loops:
+        nested_gates = [
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "probe_supervisor_role"
+        ]
+        assert not nested_gates, (
+            "the role gate moved INSIDE a loop that pastes: a supervisor receiver "
+            "now reaches the seam on the iteration the gate happens to run in, "
+            "which is the ban only by accident"
+        )
 
 
 def test_the_worker_injector_still_exists() -> None:

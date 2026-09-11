@@ -10,6 +10,15 @@ Wire format (probe §2, D5):
    "priority":"next","from":"bridge:cao-<name>"}
 
 Resolution (D3): pane-pid descent primary, registry `tmux` field cross-check.
+
+There is no "is native on?" switch. ``supervisor.wake.native`` and its
+``WAKE_NATIVE_DEFAULT`` constant are both gone (WP-ARCH 3c): after K8 removed the
+seat's reachability of the paste seam, this native cross-session channel is the
+seat's ONLY carrier, and a switch that can turn off the sole carrier buys silence
+rather than a different carrier — which is #604, not a setting. An operator
+finding ``"wake": {"native": false}`` in an old ``settings.json`` can delete the
+entry; nothing reads it, and it never meant "use the other carrier" because there
+is no other carrier.
 Identity guards: procStart PID-reuse check + record freshness.
 """
 
@@ -54,19 +63,6 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
-
-# WP-ARCH 3c: ``supervisor.wake.native`` is DELETED, and this constant with it —
-# nothing reads it any more.
-#
-# Kept as a one-line record of why there is no flag: after K8 the native
-# cross-session channel is the seat's ONLY carrier, so a switch that can turn it
-# off buys silence rather than a different carrier, and silence at the seat is
-# #604. The question the flag used to answer ("is native on?") now has one
-# answer for every deployment.
-#: Retained only so an operator reading an old settings.json finds the answer.
-WAKE_NATIVE_DEFAULT = True
-
-
 # ---------------------------------------------------------------------------
 # F547 #403 point 5: CAO-side per-sender content-hash dedupe window.
 #

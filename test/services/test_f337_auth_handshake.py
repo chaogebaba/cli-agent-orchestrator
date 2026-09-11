@@ -516,15 +516,15 @@ class TestAC5DeriveCcTeamInboxPath:
 # (``doorbell_service.ring_supervisor_doorbell`` and
 # ``delivery_service.attempt_rung1``), a third pinned that
 # ``ENV_REGISTRY["CAO_SUPERVISOR_WAKE_NATIVE"]`` and
-# ``cc_session_registry.WAKE_NATIVE_DEFAULT`` carry the same value so the
+# ``cc_session_registry.WAKE_NATIVE_DEFAULT`` carried the same value so the
 # duplicated default cannot drift, and the fourth restated the shipped value.
 #
 # 3c deletes the flag, both of its call sites and its registry entry. A gate
 # obeyed by every call site has no call sites left; a default that cannot drift
 # from a registry entry has no entry to drift from. ``WAKE_NATIVE_DEFAULT``
-# itself is retained in ``cc_session_registry``, but the comment above it says
-# plainly that nothing reads it — it is a note to an operator holding an old
-# settings.json, and asserting the value of a note is not a test.
+# itself went in the same slice's r2: a constant no code reads is a claim nobody
+# checks, and the operator-facing answer moved into the module docstring where a
+# reader looking for it will actually be.
 #
 # What the arms were ultimately defending — that the seat is never left with no
 # carrier at all — is now structural rather than configured, and
