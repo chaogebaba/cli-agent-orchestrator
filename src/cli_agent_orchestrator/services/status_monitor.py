@@ -194,6 +194,13 @@ _STICKY_READY_STATUSES = frozenset(
 # these it is stale by construction and is neither written nor served.
 _QUIESCENT_STATUSES = frozenset({TerminalStatus.IDLE, TerminalStatus.COMPLETED})
 
+# WP-ARCH phase 2 (D8 / #545): the shortest delivered line worth remembering as
+# possible condition contamination.  A condition anchor is a distinctive string
+# — a cap banner, an exit-code row — so excluding short lines costs nothing and
+# stops a bare ``ok`` or a lone bracket from blinding the classifier to genuine
+# rows that happen to share it.
+_DELIVERED_ANCHOR_MIN_CHARS = 8
+
 # F794 (#651): the published statuses the low-frequency pane-tail backstop
 # re-derives (see resync_from_pane_tail). Screen/raw detection is OUTPUT-driven
 # — it runs on pipe-pane chunks plus one quiescence tick after the last chunk —
@@ -303,6 +310,16 @@ class StatusMonitor:
         # means "no terminal is projected", so every path below is phase-1
         # behaviour by construction rather than by assertion.
         self._is_projected: object | None = None
+        # WP-ARCH phase 2 (D8 / #545): the lines the SERVER last delivered to
+        # each terminal, so the condition classifier does not read its own text
+        # back as the worker's evidence.  One message per terminal, replaced on
+        # each delivery.
+        self._delivered_text: Dict[str, set[str]] = {}
+        # WP-ARCH phase 2 (D11 / N7): WHO wrote ``_last_status`` last — the
+        # projection or the pane.  The fleet row pairs a status with a moment,
+        # and the two must come from the same producer or the row reads as one
+        # fact while being two.
+        self._status_origin: Dict[str, str] = {}
         self._buffers: Dict[str, str] = {}
         # Monotonic per-terminal byte-buffer generation.  A provider that
         # remembers positions across get_status() calls needs an explicit reset
@@ -1339,6 +1356,7 @@ class StatusMonitor:
                             pass_outcome = pass_outcome_for_source(pass_source, "no_change")
                         else:
                             self._last_status[terminal_id] = detected
+                            self._status_origin[terminal_id] = "pane"
                             if pass_source == "inline":
                                 self._status_fusion_reason.pop(terminal_id, None)
                             if detected == TerminalStatus.PROCESSING:
@@ -2174,6 +2192,8 @@ class StatusMonitor:
         provider: Any,
         buffer: str,
         status: Optional[TerminalStatus] = None,
+        *,
+        clear_only_on_edge: bool = False,
     ) -> None:
         """F611 (#467): detection + ONE-event delivery at a status transition.
 
@@ -2199,7 +2219,10 @@ class StatusMonitor:
         if classify is None:
             return
         try:
-            cond = classify(buffer)
+            # D8 / #545: the server's own delivered text is not evidence about
+            # the worker.  A no-op for an unprojected terminal and for a terminal
+            # nothing has been delivered to.
+            cond = classify(self._without_delivered_text(terminal_id, buffer))
         except Exception:
             logger.debug("condition classify failed for %s", terminal_id, exc_info=True)
             return
@@ -2230,6 +2253,23 @@ class StatusMonitor:
                     status.value if status is not None else None,
                 )
                 cond = None
+        if clear_only_on_edge and cond is None and self.get_condition(terminal_id) is None:
+            # D8's periodic driver, on the one branch with no de-dup of its own.
+            #
+            # ``deliver``'s clear arm writes a ``cleared`` decision row and a
+            # fleet write EVERY time it is called, which was bounded while
+            # F611's genuine-transition branch was its only caller.  A sweep
+            # calls it for every terminal on every tick, and "the classifier
+            # returns nothing" is the steady state of a healthy terminal — so
+            # the clear becomes one row per terminal per tick, for ever, into an
+            # append-only ledger that has no prune.
+            #
+            # There is nothing to clear when nothing is standing, so the sweep
+            # says nothing.  The guard is HERE and not in ``deliver`` on purpose:
+            # F611's transition path must keep clearing exactly as it does today,
+            # and a contract change there would be this phase reaching into a
+            # closed issue.
+            return
         with self._lock:
             epoch = self._buffer_epochs.get(terminal_id, 0)
         try:
@@ -2288,6 +2328,112 @@ class StatusMonitor:
         except Exception:
             logger.debug("projection predicate failed for %s", terminal_id, exc_info=True)
             return False
+
+    def note_delivered_text(self, terminal_id: str, message: str) -> None:
+        """Record what the SERVER just put into this terminal (D8 / #545).
+
+        The condition classifier reads the rolling output buffer, and the pane
+        echoes everything the server pastes into it — so a message whose body
+        contains ``[Command exited with code 1]`` or a cap banner is read back as
+        the worker's own evidence and classified as a condition.  #545 is that,
+        verbatim: the server pings itself about text it wrote.
+
+        Kept as the message's own lines, REPLACING any previous delivery rather
+        than accumulating: one message per terminal is what the next
+        classification could be contaminated by, and an unbounded history would
+        be a leak that also suppressed more and more real evidence over time.
+        Short lines are dropped — a condition anchor is a distinctive string, and
+        excluding ``ok`` or a bare bracket would blind the classifier to genuine
+        rows for nothing.
+
+        The trade, stated: a genuine worker line that is character-identical to a
+        line the server just delivered is suppressed until the next delivery.
+        That is the direction #545 asks for — the server's own text must not be
+        evidence — and the alternative, trusting position or timing in a buffer
+        that reflows, is what the pane path already gets wrong.
+        """
+        try:
+            lines = {
+                stripped
+                for line in message.splitlines()
+                if len(stripped := line.strip()) > _DELIVERED_ANCHOR_MIN_CHARS
+            }
+        except Exception:  # pragma: no cover - defensive on an exotic message
+            return
+        with self._lock:
+            if lines:
+                self._delivered_text[terminal_id] = lines
+            else:
+                self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
+
+    def _without_delivered_text(self, terminal_id: str, buffer: str) -> str:
+        """Drop rows the server itself delivered.  Projected terminals only.
+
+        Gated on the cutover for the reason every other D8 leg is: with the
+        switch off an unsourced fleet's condition behaviour must not depend on
+        this phase (I7), and AC-2b case 4 states the criterion as a contrast
+        between the two arms rather than as an unconditional fix.
+        """
+        if not buffer or not self._projected(terminal_id):
+            return buffer
+        with self._lock:
+            delivered = self._delivered_text.get(terminal_id)
+        if not delivered:
+            return buffer
+        return "\n".join(line for line in buffer.splitlines() if line.strip() not in delivered)
+
+    def reclassify_condition(self, terminal_id: str) -> None:
+        """D8 — re-evaluate the condition label off a transition.  Never raises.
+
+        The projector's sweep calls this every ``PANE_HEARTBEAT_S`` for the whole
+        fleet.  F611's only driver is the genuine-transition branch of pane
+        detection, so a label is set at a transition and not revisited until the
+        next one; a terminal that has gone quiet produces no transition at all,
+        which is when a stale label sits on the fleet row longest.
+
+        **Projected terminals only.**  For an unsourced terminal the label keeps
+        F611's driver and F752's read-side suppression exactly as they are — I7
+        promises the fallback is untouched, and re-driving here would make an
+        unsourced terminal's condition behaviour depend on this phase, which is
+        #609 reopened.
+
+        The status handed to the classifier is the PUBLISHED one, read without
+        fusing: ``get_published_status`` is the one public accessor that does not
+        fuse, and fusing on this path would re-enter the read rules from a sweep
+        thread for no gain — F752's own parameter exists so this seam can pass
+        the status the caller already holds.
+        """
+        if not self._projected(terminal_id):
+            return
+        try:
+            with self._lock:
+                buffer = self._buffers.get(terminal_id, "")
+                status = self._last_status.get(terminal_id)
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+            self._classify_and_deliver_condition(
+                terminal_id, provider, buffer, status=status, clear_only_on_edge=True
+            )
+        except Exception:
+            logger.debug("condition re-drive failed for %s", terminal_id, exc_info=True)
+
+    def status_written_by_projection(self, terminal_id: str) -> bool:
+        """Did the PROJECTION write the status this terminal is publishing? (N7.)
+
+        ``is_projected`` answers who OWNS the terminal now; this answers who
+        produced the value now being served, and after a fallback and back they
+        differ for one publish.  The projection keeps folding for an unprojected
+        terminal — only the publisher is gated — so a terminal that fell back to
+        the pane and became projected again carries the pane's last status beside
+        the projection's ``since`` until the next fold publishes.  One publish
+        wide, self-correcting, and still wrong to render: the fleet row would
+        pair a status with a moment that belongs to a different reading.
+        """
+        with self._lock:
+            return self._status_origin.get(terminal_id) == PROJECTION_ORIGIN
 
     def is_projected(self, terminal_id: str) -> bool:
         """The cutover's predicate, for a caller outside this module (D7).
@@ -2357,6 +2503,7 @@ class StatusMonitor:
                 # ``turn.started`` is the ordinary case rather than a corner.
                 previous = self._last_status.get(terminal_id)
                 self._last_status[terminal_id] = status
+                self._status_origin[terminal_id] = PROJECTION_ORIGIN
                 # Cleared HERE rather than at the moment the terminal became
                 # projected, so a pane-derived reason written before the cutover
                 # took over — ``resync_after_drop`` is written outside the fusion
@@ -2824,6 +2971,8 @@ class StatusMonitor:
             self._buffers.pop(terminal_id, None)
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
+            self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
@@ -2942,6 +3091,8 @@ class StatusMonitor:
                 self._receiver_state_store.invalidate(receiver_key)
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
+            self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)

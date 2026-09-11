@@ -65,6 +65,7 @@ from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 __all__ = [
     "CheckRunner",
     "Clock",
+    "ConditionSink",
     "EventSource",
     "EventStore",
     "FindingStore",
@@ -285,6 +286,29 @@ class StatusEgress(Protocol):
         worker_state: str,
         since: datetime,
     ) -> None: ...
+
+
+@runtime_checkable
+class ConditionSink(Protocol):
+    """Re-drive the provider condition for one terminal (phase 2, D8).
+
+    The condition label has had one driver since F611: the genuine-transition
+    branch of pane detection.  A label is therefore set at a transition and not
+    revisited until the next one — and a terminal that has gone quiet produces no
+    transition by definition, which is exactly when a stale label sits on the
+    fleet row longest.
+
+    D8 gives the label a second driver on the projector's sweep, so its lifetime
+    is bounded by ``PANE_HEARTBEAT_S`` rather than by the worker's next move.
+    The classifier lives in the legacy monitor, which ``app`` may not import, so
+    it arrives as this Protocol and the composition root fills it.
+
+    Implementations MUST NOT raise: this runs inside the sweep, and a
+    diagnostics re-drive that could break the sweep would take
+    ``degraded(no_signal)`` — which has no other producer — down with it.
+    """
+
+    def reclassify(self, terminal_id: str) -> None: ...
 
 
 class StateProjection(Protocol):

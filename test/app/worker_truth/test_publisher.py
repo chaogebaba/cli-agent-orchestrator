@@ -11,8 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from test.app.conftest import Rig
 
+import pytest
+
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.core.events import EventKind
+from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 
@@ -269,3 +272,127 @@ def test_the_named_session_started_sequence_needs_an_exit_first(rig: Rig) -> Non
     assert rig.state_of(TERMINAL) is WorkerState.BUSY
     assert [o.latched_status.value for o in observations] == ["error", "processing", "processing"]
     assert announce.call_count == 2
+
+
+# ---------------------------------------------- WP-HERDR §6(ii) overrides case 7
+
+
+def test_a_certified_terminal_keeps_publishing_unknown_when_its_stream_goes_stale(
+    rig: Rig,
+) -> None:
+    """§6(ii) beats AC-2b case 7, asserted at the SEAM rather than the predicate.
+
+    The sibling test above is the uncertified half: the sweep degrades, the
+    publisher is offered nothing, and the pane resumes.  For a CERTIFIED
+    terminal whose stream has proven itself the answer inverts, and it has to be
+    asserted here rather than on ``_projected`` alone — a predicate-level test
+    passes under either rule, which is how two docstrings came to disagree about
+    one predicate in the first place.
+
+    Three things are the contract, and all three are asserted: the publisher
+    published, what it published was ``unknown``, and ``is_projected`` is still
+    True so the legacy pane path stays suppressed.
+    """
+    real_view = rig.health
+    publisher = StatusPublisher(_Egress(), real_view)
+    rig.projector._publisher = publisher  # type: ignore[attr-defined]
+    egress = publisher._egress  # type: ignore[attr-defined]
+    rig.sources.add(TERMINAL)
+    rig.sources.set_fallback_disabled(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+    assert egress.published  # publishing while the stream was alive
+    egress.published.clear()
+
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.projector.sweep()
+
+    assert rig.state_of(TERMINAL) is WorkerState.DEGRADED
+    assert rig.states.get(TERMINAL).degraded_reason is DegradedReason.NO_SIGNAL
+    # The override: still projected, so the pane path is still standing down.
+    assert rig.health.is_projected(TERMINAL) is True
+    # And the publisher wrote the honest answer rather than nothing.
+    assert [(row[0], row[1]) for row in egress.published] == [(TERMINAL, "unknown")]
+
+
+def test_the_stale_certified_source_is_recorded_as_a_finding_once_per_terminal(
+    rig: Rig,
+) -> None:
+    """The bound on the standing ``unknown``.
+
+    §6(ii) can hold a terminal at ``unknown`` with delivery withheld for as long
+    as the source stays quiet, and that is invisible from outside — a terminal
+    nobody can deliver to looks exactly like a quiet one.  The finding is what
+    makes it visible.  Deduped per terminal, because one dead source is one
+    problem however many sweeps re-confirm it: ten sweeps must be one finding
+    with a count of ten, not ten findings.
+
+    ``count`` is the number of sweeps that OBSERVED the stale source; the
+    duration is ``last_seen_at - first_seen_at``, which the same writes refresh.
+    Both are asserted, because they are different numbers and only the second
+    answers "how long".
+    """
+    rig.sources.add(TERMINAL)
+    rig.sources.set_fallback_disabled(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    # The clock advances BETWEEN sweeps, because that is what makes the
+    # re-confirming sweeps reachable at all: ``_last_signal`` counts ``since``,
+    # which the first degrade sets to now, so a second sweep at the same instant
+    # is correctly skipped as "just heard from".  A test that swept ten times on
+    # a frozen clock would exercise one degrade and nine no-ops and would have
+    # said nothing about the finding's count.
+    for _ in range(10):
+        rig.clock.advance(NO_SIGNAL_S + 1)
+        rig.projector.sweep()
+
+    stale = rig.findings.list_findings(code=FindingCode.DIAG_CERTIFIED_SOURCE_STALE)
+    assert len(stale) == 1
+    assert stale[0].terminal_id == TERMINAL
+    # Ten sweeps, ONE finding: dedup keeps it a single row.
+    assert stale[0].count == 10
+    # And the DURATION is the span, not the count.  Ten sweeps each advancing
+    # the clock by NO_SIGNAL_S + 1 means nine intervals between the first
+    # observation and the last.
+    assert (stale[0].last_seen_at - stale[0].first_seen_at).total_seconds() == pytest.approx(
+        9 * (NO_SIGNAL_S + 1)
+    )
+
+
+def test_an_uncertified_stale_source_records_no_such_finding(rig: Rig) -> None:
+    """The off half.  An ordinary terminal hands back to the pane (case 7), so
+    nothing is stuck at ``unknown`` and there is nothing to report."""
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.projector.sweep()
+
+    assert rig.health.is_projected(TERMINAL) is False
+    assert rig.findings.list_findings(code=FindingCode.DIAG_CERTIFIED_SOURCE_STALE) == []
+
+
+def test_a_certified_source_that_never_delivered_keeps_the_pane_and_files_nothing(
+    rig: Rig,
+) -> None:
+    """§6(ii)'s own proviso, carried through to the finding.
+
+    Certification alone does not mute the pane — the stream has to have proven
+    itself first, or an ACKed-but-silent subscription would freeze the cohort at
+    its connect-time snapshot.  A terminal in that state still has the pane, so
+    it is not stuck, so the finding must not fire.  This is the case that
+    separates "is certified" from the condition ``_projected`` actually
+    short-circuits on.
+    """
+    rig.sources.add(TERMINAL)
+    rig.sources.set_fallback_disabled(TERMINAL)
+    # No touch_source_probe: the stream never delivered a frame.
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    rig.clock.advance(NO_SIGNAL_S + 1)
+    rig.projector.sweep()
+
+    assert rig.health.is_projected(TERMINAL) is False
+    assert rig.findings.list_findings(code=FindingCode.DIAG_CERTIFIED_SOURCE_STALE) == []

@@ -22,10 +22,29 @@ the composition root fills it.
 the one question (D1e): a terminal whose source is registered and healthy and
 whose provider the operator allowlisted.  Publishing on a different predicate
 than the one that suppresses the pane would produce the two failure modes the
-phase exists to end — two writers, or none.  The sweep's ``degraded(no_signal)``
-is the case that makes this concrete: by the time the projection reaches it the
-source is by definition gone, ``is_projected`` is already ``False``, and the
-right answer is to publish nothing and let the pane resume (AC-2b case 7).
+phase exists to end — two writers, or none.
+
+The sweep's ``degraded(no_signal)`` is the case that makes this concrete, and it
+answers DIFFERENTLY for the two cohorts.  For an ordinary terminal AC-2b case 7
+still holds: the source is gone, ``is_projected`` is already ``False``, and the
+right answer is to publish nothing and let the pane resume.
+
+For a CERTIFIED terminal whose source has ever delivered, WP-HERDR §6(ii)
+overrides case 7 and ``_projected`` short-circuits to ``True`` on a stale source
+(``app/worker_truth/projector.py``).  So this publisher keeps publishing, the
+status becomes ``unknown``, and the pane is NOT handed the lifecycle back.  That
+is deliberate, and the reason is an asymmetry rather than a preference: under
+§6(ii) the terminal reads ``unknown``, inbox admission withholds, the row is
+already time-bounded by ``DELIVERY_VETO_CEILING_S``, and the queued message
+survives the source coming back.  Under case 7 the scraper's guess silently
+replaces a known-unknown, and a false ``idle`` pastes into a mid-turn worker —
+unbounded, invisible, and not undoable (#361, #439, F582 are its history).
+Withholding is observable and reversible; a corrupted turn is neither.
+
+The standing ``unknown`` this creates is bounded by a finding rather than by a
+timeout: ``DIAG-CERTIFIED-SOURCE-STALE``, deduped per terminal, is written where
+the sweep degrades, so a certified source that has been quiet for hours is
+visible instead of merely silent.
 
 **Every publish names the event that caused it.**  I2 in one field: the
 ``status.transition`` row's ``event_id`` rides on the observation, and

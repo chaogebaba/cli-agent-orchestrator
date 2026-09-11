@@ -578,7 +578,36 @@ _CHATGPT_WEB_CONDITION = re.compile(
 
 # PROC_EXITED (cline text anchor; the process-state path is handled separately by
 # the provider via pane_current_command == shell_baseline — see D5/precedence 1).
-_CLINE_PROC_EXITED = re.compile(r"\[Command exited with code \d+\]")
+_CLINE_PROC_EXITED = re.compile(r"\[Command exited with code (?P<code>\d+)\]")
+
+# #613 ask 3: the driver echoes the command it is about to run on its own row,
+# above the output and the exit line — ``[run_commands] rg foo src/``.  That echo
+# is where the COMMAND is; the exit row carries only the CODE.
+_CLINE_COMMAND_ECHO = re.compile(r"\[run_commands\]\s+(?P<command>.+)")
+
+# The commands whose exit 1 means "ran fine, found nothing" rather than "died".
+# SEARCH AND COMPARE ONLY, and the boundary is exact rather than thematic:
+# ``grep``, ``rg``, ``ag``, ``ack`` and ``diff`` all document 1 as "no match" or
+# "files differ", which is a RESULT and not a failure.
+#
+# The test runners are deliberately NOT here, and the blueprint's "or a test
+# runner" is declined with its reason: pytest's exit 1 means tests FAILED — "no
+# tests collected" is exit 5 — so suppressing it would silence a real failing
+# run, which is the opposite of #613's ask and the half of its criterion that
+# says other non-zero exits must still classify. jest and vitest read the same
+# way. A failing test run may well be noise rather than a process death, but
+# that is a different argument from this one and it needs its own decision.
+#
+# Anchored at a word boundary and matched anywhere in the command line, so a
+# pipeline (``rg foo | head``) and a prefixed form (``git grep``) both match.
+# The exit status of a pipeline is its LAST command's, so a search piped into
+# something else can still carry another command's code; under-reporting a
+# condition is the safe direction and pinging a seat about a healthy search is
+# not.
+#
+# Deliberately a closed list rather than a heuristic: an exit 1 from anything
+# NOT named here is a process failure and is still reported.
+_NO_MATCH_EXIT_COMMANDS = re.compile(r"(?:^|[\s|;&(])(?:grep|egrep|fgrep|rg|ag|ack|diff)\b")
 
 # F775 (#632): reset anchor for scoping the PROC_EXITED text evidence. A stale
 # ``[Command exited with code N]`` line in scrollback must NOT keep re-asserting
@@ -667,15 +696,55 @@ def _scoped_proc_exited_evidence(brows: List[str]) -> Optional[str]:
     """
     tail = brows[-BUSY_TAIL_ROWS:]
     last_exit = -1
+    match: "re.Match[str] | None" = None
     for i, row in enumerate(tail):
-        if _CLINE_PROC_EXITED.search(row):
+        found = _CLINE_PROC_EXITED.search(row)
+        if found is not None:
             last_exit = i
-    if last_exit < 0:
+            match = found
+    if last_exit < 0 or match is None:
         return None
     for row in tail[last_exit + 1 :]:
         if _CLINE_SHELL_PROMPT.match(row):
             return None
+    if _is_no_match_exit(tail, last_exit, match.group("code")):
+        return None
     return tail[last_exit].strip()
+
+
+def _is_no_match_exit(tail: List[str], exit_row: int, code: str) -> bool:
+    """WP-ARCH phase 2, D8 / #613 ask 3 — exit 1 from a SEARCH is "no match".
+
+    ``grep``, ``rg``, ``diff`` and the test runners all use exit 1 for "I ran
+    correctly and found nothing / something differs".  Reading that as
+    ``PROC_EXITED`` classifies a healthy worker's ordinary tool call as a process
+    failure, pings the seat about it, and sticks the label on the fleet row —
+    which is #613's sample verbatim.
+
+    The rule is deliberately narrow in two directions at once, because the
+    acceptance criterion fails in both:
+
+    * only exit **1**.  Every other non-zero code still classifies, from any
+      command — the rule is about searches reporting "no match", not about
+      silencing process failures.
+    * only a **named** command family — search and compare, never a test runner:
+      pytest's exit 1 means tests FAILED rather than "found nothing" (that is
+      exit 5), so suppressing it would silence a real failing run.  An exit 1
+      from anything else is a failure and is reported.
+
+    The command is read from the nearest preceding driver echo rather than from
+    the exit row itself, because the exit row carries the CODE and the echo
+    carries the COMMAND; a rule that guessed from the exit row alone would have
+    nothing to match on.
+    """
+    if code != "1":
+        return False
+    for row in reversed(tail[:exit_row]):
+        echo = _CLINE_COMMAND_ECHO.search(row)
+        if echo is None:
+            continue
+        return _NO_MATCH_EXIT_COMMANDS.search(echo.group("command")) is not None
+    return False
 
 
 def _first_evidence(rows: List[str], pattern: "re.Pattern[str]") -> Optional[str]:

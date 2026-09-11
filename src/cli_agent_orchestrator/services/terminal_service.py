@@ -6962,6 +6962,12 @@ def send_input(
     (F802 #658). Defaults False for every ordinary send.
     """
     try:
+        # WP-ARCH phase 2 (D8 / #545): tell the status monitor what the SERVER is
+        # about to put into this pane, so the condition classifier does not read
+        # it back as the worker's own evidence. Before the send rather than
+        # after: the echo can reach the rolling buffer while the send call is
+        # still returning.
+        status_monitor.note_delivered_text(terminal_id, message)
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
@@ -7254,6 +7260,14 @@ def send_prepared_input(
     life and is forwarded to the provider verify hook so a TUI provider may relax
     its composer-ownership rule for last-resort submit recovery on that path only.
     """
+    # D8 / #545, the other send seam, and FIRST here exactly as it is first in
+    # ``send_input``.  This path carries already-shaped bytes, so the message it
+    # delivers is the one the pane will echo — but it also does real pane work
+    # before the paste (the native stash, the fixture override), and any of that
+    # can put the server's own text into the rolling buffer before the note
+    # lands.  Noting it lower down left open the precise window the sibling
+    # seam's comment says must be closed.
+    status_monitor.note_delivered_text(terminal_id, message)
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
