@@ -1,18 +1,20 @@
-"""AC-2a's agreement report gets BOTH sides, end to end (WP-ARCH phase 2, A1).
+"""The fold driver writes the projection side, end to end (WP-ARCH phase 2, A1).
 
 This is the criterion the fold driver exists for, asserted against the real
 composition root rather than against a fake.
 
-AC-2a compares the projection against the legacy published status.  The
-projection side of that comparison is `status.transition` rows, and those are
-written by `Projector.project` and by nothing else in the tree.  At phase 1's
-anchor the projector had no call site, so the report could only ever see the
-legacy side — it would not error, it would report on one input and fail the
-content floor as "no evidence".
+AC-2a was once stated in terms of the agreement report, which compared the
+projection against the legacy published status; that report went with shadow-live
+mode (#738).  The CRITERION it measured is what this file asserts, now read
+straight off the event log: `status.transition` rows are written by
+`Projector.project` and by nothing else in the tree, so their presence is the
+proof that the fold driver has a call site at all.  At phase 1's anchor the
+projector had none, and the failure was silent rather than loud.
 
-The arm difference here is the whole point.  A green run with a folder proves
-nothing on its own; the same session with `folder=None` is what shows the report
-losing a side, which is exactly the mutant A1 names.
+The arm difference is still the whole point.  A green run with a folder proves
+nothing on its own; the same session with `folder=None` is what shows the
+projection side vanishing while the legacy side is untouched, which is exactly
+the mutant A1 names.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ from cli_agent_orchestrator.adapters.store.event_log import SqliteEventStore
 from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring
-from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.core.events import (
     Confidence,
@@ -93,7 +94,7 @@ def _drive_a_session() -> None:
     wiring.emit(_legacy("idle"))
 
 
-def test_with_the_fold_driven_the_report_has_both_sides(
+def test_with_the_fold_driven_both_sides_are_written(
     store_and_projector: tuple[SqliteEventStore, Projector],
 ) -> None:
     """The criterion, against the real store and the real projector."""
@@ -104,12 +105,10 @@ def test_with_the_fold_driven_the_report_has_both_sides(
 
     rows = events.read(TERMINAL)
     transitions = [r for r in rows if r.decision is DecisionKind.STATUS_TRANSITION]
-    assert transitions, "the fold wrote no status.transition rows"
+    legacy = [r for r in rows if r.kind is EventKind.STATUS_LEGACY_PUBLISHED]
 
-    report = build_agreement_report(rows)
-    assert report.total_transitions > 0, "the projection side is empty"
-    assert report.total_legacy_publishes > 0, "the legacy side is empty"
-    assert report.total_comparisons > 0, "nothing was comparable"
+    assert transitions, "the projection side is empty: the fold wrote no status.transition rows"
+    assert legacy, "the legacy side is empty"
 
 
 def test_without_the_fold_the_projection_side_is_empty(
@@ -129,12 +128,11 @@ def test_without_the_fold_the_projection_side_is_empty(
     _drive_a_session()
 
     rows = events.read(TERMINAL)
-    assert [r for r in rows if r.decision is DecisionKind.STATUS_TRANSITION] == []
 
-    report = build_agreement_report(rows)
-    assert report.total_transitions == 0
-    assert report.total_legacy_publishes > 0, "the legacy side should be unaffected"
-    assert report.total_comparisons == 0
+    assert [r for r in rows if r.decision is DecisionKind.STATUS_TRANSITION] == []
+    assert [
+        r for r in rows if r.kind is EventKind.STATUS_LEGACY_PUBLISHED
+    ], "the legacy side should be unaffected"
 
 
 def test_the_fold_moves_the_durable_projection(

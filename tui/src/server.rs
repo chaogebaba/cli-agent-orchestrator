@@ -711,7 +711,6 @@ fn route(id: CommandId) -> Option<Route> {
         // HIDE: `cao diag *` reads the server database directly (read-only, `mode=ro`), so there
         // is no HTTP route to bind — and there should not be one. The whole point of AC7 is that
         // a diagnostic works when the server is the thing being diagnosed. (WP-ARCH F725 #581)
-        CommandId::DiagAgreement => None,
         CommandId::DiagFindings => None,
         CommandId::DiagTerminal => None,
         CommandId::DiagWhy => None,
@@ -725,7 +724,6 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::BarrierStatus => None,
         CommandId::BaseRegister => None,
         CommandId::ConfigReconcile => None,
-        CommandId::DiagDelivery => None,
         CommandId::DiagMsg => None,
         CommandId::Fold => None,
         CommandId::IdentityBackfillOwners => None,

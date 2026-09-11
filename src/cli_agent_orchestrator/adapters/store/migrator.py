@@ -4,8 +4,8 @@ Runs at EVERY boot, whatever ``CAO_WORKER_TRUTH_INGEST`` says.  The DDL is
 purely additive and, with ingestion off, entirely inert: three new tables and
 four indexes that nothing reads.  Running it unconditionally is what makes
 turning the switch on a one-variable change rather than a migration event, which
-matters because the agreement session (AC10) has to be startable on a server
-that is already up.
+matters because the phase-1 diagnostics have to be startable on a server that
+is already up.
 
 Two ordering rules, both from AC5 (N6):
 
@@ -157,8 +157,10 @@ CREATE TABLE IF NOT EXISTS worker_state_shadow (
 # The column set is the audit's statement plus what the blueprint's decisions
 # require, each named where it is decided:
 #
-#   mode                D9/B16 — the shadow/live discriminator the occupancy
-#                       predicate and ``claim``'s filter both read.
+#   mode                D9/B16 — the live discriminator the occupancy predicate
+#                       and ``claim``'s filter both read.  Every row this build
+#                       writes is ``live``; the second value went with
+#                       shadow-live mode (#738) and old rows still carry it.
 #   dead_by             D12    — stamped ONCE at enqueue.  No UPDATE statement in
 #                       the adapter names this column; that is the enforcement.
 #   held_since          D12    — the dialog-hold clock.
@@ -232,9 +234,9 @@ CREATE TABLE IF NOT EXISTS delivery_attempt (
 
 # A separate table, not a status flag — the audit adopted honker's decision, so
 # a poisoned message stops occupying the reclaim loop and hiding live rows.
-# ``mode`` is carried beyond the audit's columns: without it a shadow row that
-# mirrored a legacy expiry is indistinguishable from a live dead-letter, and
-# AC-3a's counting turns on exactly that distinction.
+# ``mode`` is carried beyond the audit's columns: it keeps a dead-letter written
+# by a build that still had the retired observational mode (#738) distinguishable
+# from a live one.
 _DELIVERY_DEAD_DDL = """
 CREATE TABLE IF NOT EXISTS delivery_dead (
   msg_id          TEXT PRIMARY KEY,
@@ -483,7 +485,7 @@ CREATE TABLE IF NOT EXISTS ownership_transfer (
 #
 # ``CREATE TABLE IF NOT EXISTS`` is a no-op against a table 3a already created,
 # so a column added to a DDL above reaches a fresh install and NOT a deployment
-# that has been running the shadow queue.  ``ALTER TABLE … ADD COLUMN`` is the
+# that has been running the queue since 3a.  ``ALTER TABLE … ADD COLUMN`` is the
 # other half, and it is not idempotent — a second boot raises "duplicate column
 # name", which under this migrator's all-or-nothing step loop would fail the
 # whole migration on every boot and take the delivery queue down with it.  So
@@ -550,10 +552,9 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
             # The audit's index, and the one ``claim`` runs on.
             "CREATE INDEX IF NOT EXISTS ix_delivery_ready "
             "ON delivery_msg(receiver_id, state, available_at)",
-            # The mirror writer's join key.  Sub-phase 3a looks a row up by the
-            # legacy inbox id on every observed edge, so without this every
-            # settle is a full scan of the queue.  Partial, because only shadow
-            # rows carry one.
+            # The legacy-id join key.  A row is looked up by its legacy inbox id
+            # (the write-through's surrogate), so without this the lookup is a
+            # full scan of the queue.  Partial, because not every row carries one.
             "CREATE INDEX IF NOT EXISTS ix_delivery_legacy "
             "ON delivery_msg(legacy_message_id) WHERE legacy_message_id IS NOT NULL",
             # Retention scans terminal rows by when they ended.

@@ -46,14 +46,10 @@ AC11_LEGACY_IMPORTERS = {
     # ``adapters``, so ``adapters-only-via-composition-root`` still holds, and the
     # contact surface a reviewer reads stays one command file.
     "cli/commands/gate.py",
-    # WP-ARCH phase 3a (#584) adds ONE entry. The five delivery hook points sit in
-    # ``clients/database.py``, ``services/mailbox_service.py`` and
-    # ``services/inbox_service.py``, but each is a legacy-to-legacy call into
-    # ``services/delivery_mirror.py``, which is the only phase-3a file that names
-    # the new tree. That is lane C's phase-1 pattern applied again, and for the
-    # same reason: the contact surface a reviewer has to read stays at one file
-    # instead of spreading across the two largest legacy packages.
-    "services/delivery_mirror.py",
+    # WP-ARCH phase 3a (#584) added ONE entry, ``services/delivery_mirror.py``,
+    # for the five observational hook points. Shadow-live mode is retired (#738)
+    # and the bridge went with it; the PATTERN did not, and the entries above and
+    # below are its later applications.
     # WP-ARCH phase 2a (#583) adds ONE entry, and it is not the file the blueprint
     # named. §5 lists ``api/main.py`` as the seventh, because D3b puts the hook
     # producer's append inside the two shipped route handlers — which is the right
@@ -64,8 +60,8 @@ AC11_LEGACY_IMPORTERS = {
     # So the append happens where D3b says and the handlers reach it through
     # ``services/claude_truth_hooks.py``, which is legacy and may import the new
     # tree. That is lane C's ``cli/commands/diag.py`` pattern and phase 3a's
-    # ``services/delivery_mirror.py`` pattern applied a third time, for the third
-    # time's own reason: the contact surface a reviewer reads stays at one file.
+    # 3a bridge pattern applied a third time, for the third time's own reason:
+    # the contact surface a reviewer reads stays at one file.
     # The set grows by one as §5 requires; only the file's name differs.
     "services/claude_truth_hooks.py",
     # WP-ARCH phase 3b (#584) adds ONE more, and for the third time the same

@@ -126,7 +126,7 @@ def test_every_row_the_new_producers_write_carries_a_known_prefix(
 ) -> None:
     """AC-2a's second half, scoped to what this phase adds.
 
-    The criterion reads "every event appended during the shadow session carries
+    The criterion reads "every event appended during the session carries
     one of them", which cannot hold literally at this anchor: phase 1's codex
     tailer keys its own refs ``rollout:``, a fourth prefix D4's constructor does
     not know about. Scoped to phase 2's producers it holds exactly, and the

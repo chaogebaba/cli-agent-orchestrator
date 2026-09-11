@@ -141,9 +141,9 @@ def emit(draft: EventDraft) -> WorkerEvent | None:
     (WP-ARCH phase 2, A1).  At phase 1's anchor ``Projector.project`` had no call
     site at all: the composition root built the projector and then handed the
     producer runtime everything except it, so the local was dropped and nothing
-    ever folded an appended event.  AC-2a's agreement report compares
-    ``status.transition`` rows against ``status.legacy_published``, and the fold
-    is what writes the former — without a driver that criterion has one side.
+    ever folded an appended event.  ``status.transition`` rows are written by
+    the fold and by nothing else, so without a driver the projection side of the
+    log is simply empty — silently, which is what makes this seam worth a test.
 
     Three properties, each of which is a way this seam fails quietly:
 

@@ -288,16 +288,42 @@ def test_both_disagreement_codes_print_across_the_cutover_boundary(
     assert "written before the cutover" in retired.output
 
 
-# ------------------------------------------------------------------- agreement
+# ------------------------------------------------- the retired agreement report
 
 
-def test_an_invalid_agreement_report_exits_non_zero(db: Path) -> None:
-    """AC10 makes this report the phase gate.  A gate that exits 0 on "no
-    evidence" is not a gate."""
+def test_the_agreement_subcommand_no_longer_exists(db: Path) -> None:
+    """#738: the AC10 agreement report is GONE, not hidden.
+
+    It held a rate over days of a dark deployment before the next phase could
+    start, which is the machinery shadow-live mode WAS — so it went with the
+    mode rather than staying on as a diagnostic.
+
+    Asserted against the group's registry and its help text rather than an exit
+    code, because ``cao diag`` reads a bare argument as a TERMINAL ID (see
+    ``test_a_bare_terminal_id_needs_no_subcommand``). ``cao diag agreement``
+    therefore exits 0 reporting an unknown terminal, and an exit-code assertion
+    here would pass no matter what — it would be testing the terminal-id path.
+
+    MUTANT: re-register `diag agreement` and both assertions fail.
+    """
+    assert "agreement" not in diag.commands
+
+    listed = _run(db, "--help").output
+    assert "agreement" not in listed, listed
+
+
+def test_a_stale_agreement_invocation_is_read_as_a_terminal_id(db: Path) -> None:
+    """What an operator whose runbook still says ``cao diag agreement`` sees.
+
+    Not an error: the bare-argument shape swallows it and reports that no such
+    terminal exists. Asserted so the behaviour is a known consequence of the
+    removal rather than a surprise in a bug report — the message names the
+    argument, so it is at least self-explaining.
+    """
     result = _run(db, "agreement")
 
-    assert result.exit_code == 2
-    assert "INVALID" in result.output
+    assert result.exit_code == 0
+    assert "agreement" in result.output
 
 
 # ----------------------------------------------------------------- since parser
@@ -343,80 +369,3 @@ def test_since_narrows_the_timeline(db: Path) -> None:
 
     assert everything["shown"] == everything["total"]
     assert narrow["shown"] <= everything["shown"]
-
-
-def test_a_valid_agreement_report_exits_zero_and_names_its_scope(tmp_path: Path) -> None:
-    """The happy path end to end, including the legacy scope lookup.
-
-    The invalid path is covered above; this asserts that a run meeting the AC10
-    content floor actually reports VALID, and that ``--session`` reaches the
-    legacy ``terminals`` table through the composition root rather than silently
-    comparing the whole fleet.
-    """
-    import sqlite3
-
-    path = tmp_path / "cao.db"
-    result, pool = migrate(path, busy_timeout_ms=5000)
-    assert result.ok and pool is not None
-
-    clock = FakeClock()
-    findings = SqliteFindingStore(pool, clock=clock)
-    registry = register_phase1_checks(CheckRegistry(findings))
-    events = SqliteEventStore(pool, clock=clock, check_runner=registry)
-    states = SqliteStateStore(pool)
-    projector = Projector(events, states, clock, StaticSourceRegistry())
-
-    for index in range(3):
-        terminal = f"t{index}"
-        producer = Producer.JSONL if index == 0 else Producer.PANE
-        for _ in range(30):
-            for kind, status in (
-                (EventKind.TURN_STARTED, "processing"),
-                (EventKind.TURN_ENDED, "idle"),
-            ):
-                projector.project(
-                    events.append(
-                        EventDraft(
-                            terminal_id=terminal,
-                            kind=kind,
-                            producer=producer,
-                            confidence=Confidence.AUTHORITATIVE,
-                            observed_at=clock.now(),
-                        )
-                    )
-                )
-                projector.project(
-                    events.append(
-                        EventDraft(
-                            terminal_id=terminal,
-                            kind=EventKind.STATUS_LEGACY_PUBLISHED,
-                            producer=Producer.PANE,
-                            confidence=Confidence.DERIVED,
-                            observed_at=clock.now(),
-                            payload={"latched_status": status, "origin": "incremental"},
-                        )
-                    )
-                )
-                clock.advance(1)
-    pool.close_all()
-
-    conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT, provider TEXT)")
-    conn.executemany(
-        "INSERT INTO terminals VALUES (?, ?, ?)",
-        [("t0", "cao-alpha", "codex"), ("t1", "cao-alpha", "kiro"), ("t2", "cao-alpha", "cline")],
-    )
-    conn.commit()
-    conn.close()
-
-    result_all = _run(path, "agreement")
-    assert result_all.exit_code == 0
-    assert "VALID" in result_all.output
-
-    scoped = _run(path, "agreement", "--session", "cao-alpha")
-    assert scoped.exit_code == 0
-    assert "codex" in scoped.output
-
-    absent = _run(path, "agreement", "--session", "cao-nothing-here")
-    assert absent.exit_code == 2
-    assert "no evidence" in absent.output

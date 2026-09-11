@@ -13,7 +13,7 @@ Two rules the rest of phase 1 leans on:
 * **The migrator runs at EVERY boot**, whatever the switch says.  The DDL is
   additive and, with ingestion off, inert.  Running it unconditionally makes
   turning the switch on a one-variable change rather than a migration event —
-  which matters because the AC10 agreement session has to be startable against a
+  which matters because the phase-1 diagnostics have to be readable against a
   server that is already running.
 * **Nothing else runs unless ``CAO_WORKER_TRUTH_INGEST=1``.**  No producer, no
   projector, no sweep, no retention task.  AC11's "no behaviour change with the
@@ -46,11 +46,9 @@ from cli_agent_orchestrator.adapters.store.retention import RetentionTask
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.adapters.truth import wiring as truth_wiring
 from cli_agent_orchestrator.app.delivery import wiring as delivery_wiring
-from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 from cli_agent_orchestrator.app.delivery.tick import DeliveryTick
 from cli_agent_orchestrator.app.delivery.wake import WakeService
 from cli_agent_orchestrator.app.diag.report import DiagSources
-from cli_agent_orchestrator.app.worker_truth.agreement import TerminalFacts
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
     PaneDisagreementCheck,
@@ -78,20 +76,20 @@ from cli_agent_orchestrator.core.status_cutover import (
     parse_status_switch,
     resolve_status_switch,
 )
+from cli_agent_orchestrator.core.switches import Rejected
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DELIVERY_ENV_VAR",
+    "delivery_health_component",
     "INGEST_ENV_VAR",
     "STATUS_ENV_VAR",
     "STATUS_PROVIDERS_ENV_VAR",
     "WorkerTruthRuntime",
     "build_gate_service",
-    "build_legacy_inbox_status",
     "build_readonly_diag_stores",
     "build_readonly_gate_store",
-    "build_terminal_scope",
     "current_runtime",
     "delivery_position",
     "ingest_enabled",
@@ -128,28 +126,48 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     return source.get(INGEST_ENV_VAR) == "1"
 
 
-def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition:
+def delivery_position(env: dict[str, str] | None = None) -> SwitchPosition | Rejected:
     """The REQUESTED position, before D9's guard resolves it.
 
-    Requested, not effective: the guard can demote ``off`` or ``shadow`` to
-    ``drain`` over a non-empty queue, and promote ``drain`` to ``shadow`` over an
-    empty one.  The effective position is on the runtime, and a caller that wants
-    to know what the server is actually doing must read it there.
+    Requested, not effective: the guard can demote ``off`` to ``drain`` over a
+    non-empty queue, and resolve ``drain`` back to ``off`` over an empty one.  The
+    effective position is on the runtime, and a caller that wants to know what the
+    server is actually doing must read it there.
+
+    A RETIRED position (#738) is not a position at all: the answer is
+    :class:`~core.switches.Rejected`, and the delivery subsystem does not start.
     """
     source = os.environ if env is None else env
     return parse_switch(source.get(DELIVERY_ENV_VAR))
 
 
-def status_position(env: dict[str, str] | None = None) -> StatusPosition:
+def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
     """The REQUESTED status-cutover position, before D9's guard resolves it.
 
     Requested, not effective, for the same reason :func:`delivery_position` says
-    so: the guard demotes ``shadow`` and ``on`` to ``off`` when ingestion is off,
-    and ``on`` to ``shadow`` over an empty allowlist.  The effective position is
-    on the runtime.
+    so: the guard demotes ``on`` to ``off`` when ingestion is off or the allowlist
+    is empty.  The effective position is on the runtime.  A retired position
+    (#738) answers :class:`~core.switches.Rejected` and arms nothing.
     """
     source = os.environ if env is None else env
     return parse_status_switch(source.get(STATUS_ENV_VAR))
+
+
+def delivery_health_component() -> str:
+    """One string for ``/health``'s ``components.delivery``.
+
+    An operator whose drop-in still says ``shadow`` learns it from the running
+    server rather than from a log line they have to go looking for: the boot's
+    ERROR scrolls past, this does not.  ``rejected/#738`` is deliberately short —
+    the reason is in the log, and a health payload is a status board, not an
+    explanation.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.delivery is None:
+        return "off"
+    if isinstance(runtime.delivery, Rejected):
+        return "rejected/#738"
+    return runtime.delivery.position.value
 
 
 @dataclass
@@ -177,7 +195,7 @@ class WorkerTruthRuntime:
     #: Present whatever the ingestion switch says: the two are independent, and
     #: a queue that only ran when worker-truth ingestion happened to be on would
     #: be a coupling neither blueprint asks for.
-    delivery: GuardOutcome | None = None
+    delivery: GuardOutcome | Rejected | None = None
     queue_store: QueueStore | None = None
     #: The status cutover's RESOLVED position (phase 2, D9) and the guard's
     #: reasoning.  Present whatever the ingestion switch says, because the guard's
@@ -221,11 +239,18 @@ def _start_delivery(
     clock: Clock,
     *,
     env: dict[str, str] | None = None,
-) -> tuple[GuardOutcome, QueueStore | None, DeliveryTick | None]:
+) -> tuple[GuardOutcome | Rejected, QueueStore | None, DeliveryTick | None]:
     """Resolve ``CAO_DELIVERY_QUEUE`` through D9's guard and arm the hooks.
 
     Never raises.  Three things happen, in this order and for this reason:
 
+    0. **A retired position is refused before anything else.**  ``shadow`` was a
+       shipped position and #738 removed the mode, so an operator carrying it in a
+       drop-in gets a loud ERROR naming the value and the line to type, and the
+       delivery subsystem does NOT start.  It is refused rather than coerced to
+       ``off`` because coercion would run a deployment in a position nobody
+       requested while its configuration still claimed otherwise.  The refusal
+       costs the subsystem, never the server: the boot continues.
     1. **The requested position is read once**, from the process environment,
        which makes it a deployment decision rather than something that can flip
        mid-session.
@@ -240,21 +265,22 @@ def _start_delivery(
        the ``finding`` table is created by step 0 of every migration and the
        guard's notice belongs to phase 3, not to phase 1.
 
-    ``shadow``, ``drain`` and ``on`` all arm the hooks, and they arm different
-    things.  ``shadow`` writes observational rows and nothing serves them.
-    ``on`` writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.
-    ``drain`` accepts NO new queue rows while the tick finishes delivering the
-    ones already there, which is the only way back out of ``on`` that does not
-    orphan them (§6).  ``off`` arms nothing, and there is no code path from a
-    hook to the queue that does not pass the install guard in the wiring module.
-
-    The write-through flip's FIRST act is the shadow sweep: a shadow row the
-    mirror writer never resolved is still ``ready`` with no terminal state, and
-    although ``claim``'s ``mode`` filter already makes it unclaimable, a durable
-    row with no ending is the shape this phase exists to remove.  The sweep and
-    the filter are independent — either alone prevents the delivery.
+    ``drain`` and ``on`` arm the hooks, and they arm different things.  ``on``
+    writes ``mode='live'`` rows, mutes D6's surfaces and runs the tick.  ``drain``
+    accepts NO new queue rows while the tick finishes delivering the ones already
+    there, which is the only way back out of ``on`` that does not orphan them
+    (§6).  ``off`` arms nothing, and there is no code path from a hook to the
+    queue that does not pass the install guard in the wiring module.
     """
     requested = delivery_position(env)
+    if isinstance(requested, Rejected):
+        logger.error(
+            "delivery queue NOT started: %s (%s=%s)",
+            requested.detail,
+            DELIVERY_ENV_VAR,
+            requested.value,
+        )
+        return requested, None, None
     try:
         store: QueueStore = SqliteQueueStore(pool, clock=clock)
         occupancy = store.occupancy()
@@ -290,20 +316,11 @@ def _start_delivery(
     if outcome.position is SwitchPosition.OFF:
         return outcome, store, None
 
-    if outcome.position is SwitchPosition.ON:
-        try:
-            swept = store.sweep_shadow(now=clock.now())
-            if swept:
-                logger.info("delivery flip swept %d unresolved shadow rows to superseded", swept)
-        except Exception:  # noqa: BLE001 — a sweep that fails must not block boot
-            logger.warning("delivery flip: the shadow sweep failed", exc_info=True)
-
     delivery_wiring.install_delivery(
         delivery_wiring.DeliveryRuntime(
             store=store,
             clock=clock,
             position=outcome.position,
-            mirror=MirrorWriter(store, clock),
         )
     )
     logger.info("delivery queue armed in %s mode (%s)", outcome.position.value, DELIVERY_ENV_VAR)
@@ -381,15 +398,32 @@ def _resolve_status_cutover(
     drove any of them, so the finding is asserted here — a boot per demoting cell
     — which is cheaper as a startup test than as a live session case.
 
-    Sub-phase 2a implements ``off`` and ``shadow`` only: the feed is D1's and
-    lands in 2b.  A boot that resolves to ``on`` therefore gets a loud warning and
-    NO publisher, rather than being quietly reinterpreted as ``shadow`` — the
-    shape ``_start_delivery`` uses above, and for its reason: an operator who
-    asked for the feed and silently got a shadow run would believe consumers were
-    reading the projection when they were not.
+    Sub-phase 2a implements ``off`` only, now that ``shadow`` is retired (#738):
+    the publisher is D1's feed and lands in 2b.  A boot that resolves to ``on``
+    therefore gets a loud warning and NO publisher, rather than being quietly
+    reinterpreted as something that runs — the shape ``_start_delivery`` uses
+    above, and for its reason: an operator who asked for the feed and silently got
+    a different mode would believe consumers were reading the projection when they
+    were not.
+
+    A REQUESTED ``shadow`` is refused outright, exactly as ``_start_delivery``
+    refuses it, and resolves to ``off`` with one ERROR line naming the fix.
     """
     source = os.environ if env is None else env
-    requested = parse_status_switch(source.get(STATUS_ENV_VAR))
+    requested_or_rejected = parse_status_switch(source.get(STATUS_ENV_VAR))
+    if isinstance(requested_or_rejected, Rejected):
+        logger.error(
+            "status cutover NOT armed: %s (%s=%s)",
+            requested_or_rejected.detail,
+            STATUS_ENV_VAR,
+            requested_or_rejected.value,
+        )
+        return StatusGuardOutcome(
+            requested=StatusPosition.OFF,
+            position=StatusPosition.OFF,
+            providers=parse_providers(source.get(STATUS_PROVIDERS_ENV_VAR)),
+        )
+    requested = requested_or_rejected
     providers = parse_providers(source.get(STATUS_PROVIDERS_ENV_VAR))
     outcome = resolve_status_switch(requested, ingest_enabled=enabled, providers=providers)
 
@@ -420,12 +454,10 @@ def _resolve_status_cutover(
         logger.warning(
             "%s resolved to on, which sub-phase 2a does not implement: the "
             "projection is NOT being published and every consumer still reads the "
-            "pane path. Set %s=shadow, or unset it, until sub-phase 2b ships.",
+            "pane path. Unset %s until sub-phase 2b ships.",
             STATUS_ENV_VAR,
             STATUS_ENV_VAR,
         )
-    elif outcome.position is StatusPosition.SHADOW:
-        logger.info("status cutover armed in SHADOW mode (%s)", STATUS_ENV_VAR)
     return outcome
 
 
@@ -543,8 +575,8 @@ async def start_worker_truth(
         # the ``StateFolder`` port, so ``emit`` folds every appended event. At
         # phase 1's anchor this line passed everything but the projector, so the
         # local was dropped and ``Projector.project`` had no call site anywhere —
-        # the fold that writes ``status.transition`` never ran, and AC-2a's
-        # agreement report compares exactly those rows. The field is typed on the
+        # the fold that writes ``status.transition`` never ran, and those rows
+        # are the only proof the projector runs at all. The field is typed on the
         # Protocol, so nothing under ``adapters/`` names ``Projector``; this is
         # the one module allowed to know both halves.
         truth_wiring.install_producers(
@@ -646,81 +678,22 @@ def build_readonly_diag_stores(db_path: str | Path | None = None) -> DiagSources
     )
 
 
-def build_terminal_scope(db_path: str | Path | None = None) -> dict[str, TerminalFacts]:
-    """Session and provider per terminal, from the legacy ``terminals`` table.
-
-    The agreement report (AC10) needs to scope by session and to know which
-    terminals are codex, and neither fact is in the event log — ``tmux_session``
-    and ``provider`` live on the legacy row.  Read here rather than in ``app``
-    for the usual reason: this is the module allowed to know about both halves.
-
-    Raw SQL rather than the SQLAlchemy model, because the model would pull the
-    fork's whole ``clients.database`` import graph into a read-only CLI path, and
-    because this connection is deliberately read-only while that module's engine
-    is not.
-
-    Returns an empty mapping when the table cannot be read.  A missing scope
-    degrades the report to fleet-wide with codex detected from the producer
-    column, which is a worse report but a real one; raising here would mean the
-    agreement command failed on a database that is otherwise perfectly readable.
-    """
-    path = Path(db_path) if db_path is not None else _default_db_path()
-    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
-    try:
-        rows = pool.connection().execute("SELECT id, tmux_session, provider FROM terminals")
-        return {
-            row["id"]: TerminalFacts(
-                session=row["tmux_session"] or "", provider=row["provider"] or ""
-            )
-            for row in rows
-        }
-    except Exception:  # noqa: BLE001 — a missing scope degrades the report, never fails it
-        logger.warning("could not read the legacy terminals table for diag scope", exc_info=True)
-        return {}
-    finally:
-        pool.close_all()
-
-
-def build_legacy_inbox_status(db_path: str | Path | None = None) -> dict[int, str]:
-    """Every legacy inbox row's id and current status, for AC-3a's report.
-
-    Read here rather than in ``app`` for the reason that shapes the whole
-    phase-3a package: ``app`` may not import legacy, so it cannot look at the
-    inbox table.  Handing the statuses in is also what makes the comparison
-    honest — the report has no way to make its own side agree.
-
-    Raw SQL rather than the SQLAlchemy model, for the same two reasons the
-    terminal scope uses it: the model would pull the fork's whole
-    ``clients.database`` import graph into a read-only CLI path, and this
-    connection is deliberately read-only while that module's engine is not.
-
-    Returns an empty mapping when the table cannot be read.  Every comparison
-    then classifies as ``queue_early`` and the content floor fails the report,
-    which is the honest outcome — an unreadable legacy side is "no evidence",
-    not "perfect agreement".
-    """
-    path = Path(db_path) if db_path is not None else _default_db_path()
-    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
-    try:
-        rows = pool.connection().execute("SELECT id, status FROM inbox")
-        return {int(row["id"]): str(row["status"] or "") for row in rows}
-    except Exception:  # noqa: BLE001 — an unreadable legacy side is no evidence
-        logger.warning("could not read the legacy inbox for the delivery report", exc_info=True)
-        return {}
-    finally:
-        pool.close_all()
-
-
 # ---------------------------------------------------------------------------
 # Gate record wiring (WP-ARCH Amendment A, slice 2a).
 #
 # The gate store is a SEPARATE adapter, named only here, exactly as the queue
-# and event log are.  Slice 2a is SHADOW: the migrator (which runs at every boot)
-# creates the gate tables, but nothing in the live supervisor loop calls the gate
-# service — there is no routing.toml change and no hook change.  So this module
-# offers two builders and calls neither at boot; a caller (the CLI, or 2c's
-# workflow shim) asks for a service or a read-only store when it needs one, and
-# until then the gate tables sit inert beside the delivery ones.
+# and event log are.  Slice 2a is BUILT BUT SUPERVISOR-UNWIRED: the migrator
+# (which runs at every boot) creates the gate tables, but nothing in the live
+# supervisor loop calls the gate service — there is no routing.toml change and no
+# hook change.  So this module offers two builders and calls neither at boot; a
+# caller (the CLI, or 2c's workflow shim) asks for a service or a read-only store
+# when it needs one, and until then the gate tables sit inert beside the delivery
+# ones.
+#
+# Deliberately NOT called "shadow" (#738).  That word named a mode this build
+# retired — new machinery running beside the real path and writing observational
+# copies — and reusing it for "exists but nobody calls it" would make the
+# retirement unauditable by grep, which is how the retirement is checked.
 # ---------------------------------------------------------------------------
 
 
@@ -731,8 +704,8 @@ def build_gate_service(db_path: str | Path | None = None, *, clock: Clock | None
     this module's signature imposes on callers; the concrete type is
     ``app.gate.service.GateRoundService`` and a caller that wants the methods
     imports that type for its own annotation.  Built on demand rather than at boot
-    because slice 2a is shadow — the service exists to be called by the CLI and by
-    2c's workflow shim, not by the supervisor loop.
+    because slice 2a is supervisor-unwired — the service exists to be called by the
+    CLI and by 2c's workflow shim, not by the supervisor loop.
     """
     from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
     from cli_agent_orchestrator.app.gate.service import GateRoundService

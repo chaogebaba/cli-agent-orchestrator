@@ -3,9 +3,12 @@
 The resolution table is TOTAL over requested position × condition, which is the
 property phase 3's D9 has and this phase's own r1 and r2 did not.  Totality is
 only worth claiming if every cell is exercised, so every cell is a case here —
-including the three that raise ``DIAG-STATUS-GUARD``, which §12 asks for as a
+including the ones that raise ``DIAG-STATUS-GUARD``, which §12 asks for as a
 startup check precisely because no session-level acceptance criterion drove any
 of them.
+
+Six cells became four when #738 retired ``shadow``.  The refusal of that value is
+asserted here too: it is a parse-boundary answer, not a table cell.
 """
 
 from __future__ import annotations
@@ -14,11 +17,13 @@ import pytest
 
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.status_cutover import (
+    RETIRED_STATUS_VALUES,
     StatusPosition,
     parse_providers,
     parse_status_switch,
     resolve_status_switch,
 )
+from cli_agent_orchestrator.core.switches import Rejected
 
 # -- parsing ----------------------------------------------------------------
 
@@ -29,8 +34,6 @@ from cli_agent_orchestrator.core.status_cutover import (
         (None, StatusPosition.OFF),
         ("", StatusPosition.OFF),
         ("off", StatusPosition.OFF),
-        ("shadow", StatusPosition.SHADOW),
-        ("  SHADOW  ", StatusPosition.SHADOW),
         ("on", StatusPosition.ON),
         # An operator who typed something else gets the SAFE default and learns
         # from the guard's finding. Guessing at an intended position would be a
@@ -44,6 +47,33 @@ def test_parse_is_permissive_about_case_and_nothing_else(
     raw: str | None, expected: StatusPosition
 ) -> None:
     assert parse_status_switch(raw) is expected
+
+
+@pytest.mark.parametrize("raw", ["shadow", "SHADOW", "  Shadow  "])
+def test_a_retired_position_is_rejected_and_never_coerced(raw: str) -> None:
+    """#738, given the SAME treatment the delivery switch gets.
+
+    ``shadow`` here meant "the new producers and the fold run, nothing is
+    published" — a dark deployment used as evidence for a flip, which the user
+    ruling of 2026-09-09 replaced with a grok-box live round.  It shipped, so an
+    operator may still be carrying it; folding it into the unknown-value default
+    would start them in ``off`` and say nothing.
+
+    MUTANT: accept ``shadow`` again — restore the enum member and let
+    ``StatusPosition(cleaned)`` succeed — and this fails on the returned type.
+    """
+    answer = parse_status_switch(raw)
+    assert isinstance(answer, Rejected)
+    assert answer.value == "shadow"
+    assert "738" in answer.reason
+    assert answer.hint == "set CAO_WORKER_TRUTH_STATUS=off|on"
+
+
+def test_no_retired_position_survives_in_the_enum() -> None:
+    """The member is REMOVED, not kept as a value nothing may select."""
+    assert {position.value for position in StatusPosition} == {"off", "on"}
+    assert RETIRED_STATUS_VALUES == frozenset({"shadow"})
+    assert not RETIRED_STATUS_VALUES & {position.value for position in StatusPosition}
 
 
 @pytest.mark.parametrize(
@@ -79,12 +109,12 @@ def test_off_stays_off_under_every_condition(ingest: bool, providers: frozenset[
     assert not outcome.demoted
 
 
-@pytest.mark.parametrize("requested", [StatusPosition.SHADOW, StatusPosition.ON])
+@pytest.mark.parametrize("requested", [StatusPosition.ON])
 @pytest.mark.parametrize("providers", [frozenset(), frozenset({"codex"})])
 def test_ingestion_off_demotes_to_off_and_says_so(
     requested: StatusPosition, providers: frozenset[str]
 ) -> None:
-    """Rows 2 and 4.  A fold whose events reach no consumer is a silent status
+    """Row 2.  A fold whose events reach no consumer is a silent status
     outage: the producers would run, the projection would move, and nothing would
     read it.  The finding is how the operator learns."""
     outcome = resolve_status_switch(requested, ingest_enabled=False, providers=providers)
@@ -94,31 +124,22 @@ def test_ingestion_off_demotes_to_off_and_says_so(
     assert outcome.detail
 
 
-@pytest.mark.parametrize("providers", [frozenset(), frozenset({"codex"})])
-def test_shadow_with_ingestion_on_resolves_to_shadow_whatever_the_allowlist_says(
-    providers: frozenset[str],
-) -> None:
-    """Row 3.  The allowlist gates the FEED, and shadow has no feed, so it is not
-    a condition on this cell — writing it as one would make an operator set a
-    variable to get a position that ignores it."""
-    outcome = resolve_status_switch(StatusPosition.SHADOW, ingest_enabled=True, providers=providers)
-    assert outcome.position is StatusPosition.SHADOW
-    assert outcome.finding is None
-    assert not outcome.demoted
-
-
-def test_on_with_an_empty_allowlist_demotes_to_shadow() -> None:
-    """Row 5.  ``on`` with no provider to publish for is indistinguishable from a
+def test_on_with_an_empty_allowlist_demotes_to_off() -> None:
+    """Row 3.  ``on`` with no provider to publish for is indistinguishable from a
     misconfiguration, and reading it as "publish for everything" would turn a
-    typo into a fleet-wide cutover."""
+    typo into a fleet-wide cutover.
+
+    It lands on ``off`` rather than the ``shadow`` it once landed on: with the
+    dark position retired (#738) there is nowhere else for a refused cutover to
+    be held."""
     outcome = resolve_status_switch(StatusPosition.ON, ingest_enabled=True, providers=frozenset())
-    assert outcome.position is StatusPosition.SHADOW
+    assert outcome.position is StatusPosition.OFF
     assert outcome.finding is FindingCode.DIAG_STATUS_GUARD
     assert outcome.demoted
 
 
 def test_on_with_a_provider_named_resolves_to_on() -> None:
-    """Row 6, the only cell that reaches the feed."""
+    """Row 4, the only cell that reaches the feed."""
     outcome = resolve_status_switch(
         StatusPosition.ON, ingest_enabled=True, providers=frozenset({"codex"})
     )
@@ -154,13 +175,13 @@ def test_the_table_is_total() -> None:
 def test_no_position_is_ever_promoted() -> None:
     """The guard demotes and never promotes.
 
-    Phase 3's guard can promote ``drain`` to ``shadow`` over an empty queue, and
-    that asymmetry is worth pinning here so a later reader does not import it: an
-    operator who asked for ``off`` and got ``shadow`` would be running producers
-    they did not ask for, and the whole point of the ladder is that the kill
-    switch is always to move DOWN.
+    Phase 3's guard can move ``drain`` back up to the position an operator
+    asked for once the queue is empty, and that asymmetry is worth pinning here
+    so a later reader does not import it: an operator who asked for ``off`` and
+    got anything else would be running producers they did not ask for, and the
+    whole point of the ladder is that the kill switch is always to move DOWN.
     """
-    rank = {StatusPosition.OFF: 0, StatusPosition.SHADOW: 1, StatusPosition.ON: 2}
+    rank = {StatusPosition.OFF: 0, StatusPosition.ON: 1}
     for requested in StatusPosition:
         for ingest in (True, False):
             for providers in (frozenset(), frozenset({"codex"})):
