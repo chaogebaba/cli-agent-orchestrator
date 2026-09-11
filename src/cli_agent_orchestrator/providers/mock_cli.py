@@ -198,10 +198,28 @@ class MockCliProvider(BaseProvider):
                 "initialize() failed (simulated post-spawn crash)"
             )
 
+        # Budget note (baseline-green, 2026-09-11): a quiescent mock_cli pane
+        # publishes IDLE ~250ms after launch, but fuse_status rule 3a holds the
+        # fused status at PROCESSING until pane_liveness has K unchanged samples
+        # (liveness.stable_samples, default 3). Those samples arrive on the
+        # stalled-callback-watchdog tick, which is stretched by F351 idle backoff
+        # at server start, so the fused IDLE lands ~14s in -- measured 13.82 /
+        # 13.83 / 14.21s on an idle laptop. A 15s budget left under 1.2s of
+        # margin, so any co-tenant load turned POST /sessions into a 500 and made
+        # the send_message contract tests flake. mock_cli is a test-only provider
+        # (the binary is not on PATH outside pytest), so widening its own budget
+        # cannot mask a production regression. The durable fix is to let a freshly
+        # published IDLE short-circuit the unchanged_count hold; that lives in the
+        # status-fusion / watchdog path and is tracked separately.
+        _INIT_TIMEOUT_S = 45.0
         if not await wait_until_status(
-            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=15.0
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=_INIT_TIMEOUT_S,
         ):
-            raise TimeoutError("mock_cli initialization timed out after 15 seconds")
+            raise TimeoutError(
+                f"mock_cli initialization timed out after {_INIT_TIMEOUT_S:.0f} seconds"
+            )
 
 
         # ARM7: configurable startup delay — creates timing window for
