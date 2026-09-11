@@ -94,10 +94,26 @@ trap cleanup EXIT
 boot_server() {
   say "boot isolated cao-server :$PORT  CAO_HOME_DIR=$LIVE_HOME"
   command -v cao-server >/dev/null 2>&1 || command -v uv >/dev/null 2>&1 || { echo "no cao-server/uv"; return 10; }
+  # Seed the isolated agent-store from the box's real store so provider profiles
+  # resolve, then add a minimal pi profile (the store ships none). Copies (never
+  # symlinks into) so the round never writes the box's real store.
+  mkdir -p "$LIVE_HOME/agent-store"
+  if [ -d "$HOME/.aws/cli-agent-orchestrator/agent-store" ]; then
+    cp -n "$HOME/.aws/cli-agent-orchestrator/agent-store/"*.md "$LIVE_HOME/agent-store/" 2>/dev/null || true
+  fi
+  # Minimal pi profile for the round (provider pinned to pi_cli at spawn anyway).
+  cat >"$LIVE_HOME/agent-store/pi_dev.md" <<'PIPROF'
+---
+name: pi_dev
+description: F913 B4 live-round pi worker
+provider: pi_cli
+---
+You are a terse pi worker for a preservation-round smoke test. Answer in one word.
+PIPROF
   ( cd "$HOME/cli-subagents/cli-agent-orchestrator" && \
     CAO_HOME_DIR="$LIVE_HOME" nohup uv run cao-server --host 127.0.0.1 --port "$PORT" >"$LOGDIR/server.log" 2>&1 & echo $! >"$LOGDIR/server.pid" )
   SERVER_PID=$(cat "$LOGDIR/server.pid")
-  echo "server pid=$SERVER_PID  DB=$LIVE_HOME/db"
+  echo "server pid=$SERVER_PID  DB=$LIVE_HOME/db  profiles=$(ls "$LIVE_HOME/agent-store" | wc -l)"
   local i
   for i in $(seq 1 60); do
     curl -sS -m 3 "${BASE}/health" >/dev/null 2>&1 && { echo "healthy after ${i}s"; return 0; }
@@ -112,7 +128,7 @@ pi_half() {
   node --version | grep -qE 'v(2[2-9]|[3-9][0-9])' || { echo "node<22; pi bundle needs globSync"; return 11; }
 
   echo "\$ POST /sessions/start pi_cli"
-  api POST "/sessions/start?agent_profile=empirical_reviewer_lite&provider=pi_cli&session_name=${SESS}" \
+  api POST "/sessions/start?agent_profile=pi_dev&provider=pi_cli&session_name=${SESS}&working_directory=${LIVE_HOME}" \
       "$LOGDIR/pi-start.log" -H 'Content-Type: application/json' -d '{}' >/dev/null
   tailf "$LOGDIR/pi-start.log"
   PI_TID=$(find_tid); echo "PI_TID=$PI_TID"
@@ -143,9 +159,11 @@ codex_half() {
   command -v codex >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/codex" ] || { echo "codex absent"; return 40; }
 
   echo "\$ POST /sessions/start codex"
-  api POST "/sessions/start?agent_profile=empirical_reviewer_lite&provider=codex&session_name=${SESS}c" \
+  api POST "/sessions/start?agent_profile=codex_empirical_reviewer&provider=codex&session_name=${SESS}c&working_directory=${LIVE_HOME}" \
       "$LOGDIR/cx-start.log" -H 'Content-Type: application/json' -d '{}' >/dev/null
   tailf "$LOGDIR/cx-start.log"
+  # capture server-side detail on a 500
+  grep -qiE 'internal server error' "$LOGDIR/cx-start.log" && { echo "codex start 500 — server tail:"; tail -n 25 "$LOGDIR/server.log"; }
   # newest terminal in the codex session
   curl -sS -m 10 -o "$LOGDIR/cx-terminals.json" "${BASE}/sessions/${SESS}c/terminals" 2>/dev/null
   CODEX_TID=$(python3 -c "import json;ts=json.load(open('$LOGDIR/cx-terminals.json'));print(ts[-1]['id'] if ts else '')" 2>/dev/null)
@@ -175,7 +193,7 @@ codex_half() {
   # (2) resume it
   echo "\$ POST /sessions/${SESS}c/terminals {resume_from:$CODEX_TID}"
   api POST "/sessions/${SESS}c/terminals" "$LOGDIR/cx-resume.log" \
-      -H 'Content-Type: application/json' -d "{\"agent_profile\":\"empirical_reviewer_lite\",\"provider\":\"codex\",\"resume_from\":\"${CODEX_TID}\"}" >/dev/null
+      -H 'Content-Type: application/json' -d "{\"agent_profile\":\"codex_empirical_reviewer\",\"provider\":\"codex\",\"resume_from\":\"${CODEX_TID}\"}" >/dev/null
   tailf "$LOGDIR/cx-resume.log"
   CODEX_RESUMED_TID=$(jqr "$LOGDIR/cx-resume.log" id | tr -d '"')
   echo "CODEX_RESUMED_TID=$CODEX_RESUMED_TID"
