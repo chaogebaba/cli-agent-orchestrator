@@ -173,6 +173,15 @@ class InMemoryStateStore:
         return replace(row) if row is not None else None
 
     def upsert(self, projection: StateProjection) -> None:
+        """Write the six PROJECTION columns, leaving the five liveness ones.
+
+        Mirrors the real adapter exactly, and the asymmetry is the point: the
+        probe and the tailer own the liveness columns and write them without the
+        projector's lock, so a fake that let ``upsert`` replace them would accept
+        a clobber the real store rejects — and the test that exists to catch that
+        clobber would pass for the wrong reason.
+        """
+        existing = self.rows.get(projection.terminal_id)
         self.rows[projection.terminal_id] = Shadow(
             terminal_id=projection.terminal_id,
             state=projection.state,
@@ -180,11 +189,19 @@ class InMemoryStateStore:
             last_event_seq=projection.last_event_seq,
             degraded_reason=projection.degraded_reason,
             prior_state=projection.prior_state,
-            last_probe_at=projection.last_probe_at,
-            last_source_probe_at=projection.last_source_probe_at,
-            pane_pid=projection.pane_pid,
-            pane_present=projection.pane_present,
-            miss_count=projection.miss_count,
+            last_probe_at=(
+                existing.last_probe_at if existing is not None else projection.last_probe_at
+            ),
+            last_source_probe_at=(
+                existing.last_source_probe_at
+                if existing is not None
+                else projection.last_source_probe_at
+            ),
+            pane_pid=(existing.pane_pid if existing is not None else projection.pane_pid),
+            pane_present=(
+                existing.pane_present if existing is not None else projection.pane_present
+            ),
+            miss_count=(existing.miss_count if existing is not None else projection.miss_count),
         )
 
     def touch_probe(

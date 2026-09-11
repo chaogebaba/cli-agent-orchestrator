@@ -42,13 +42,16 @@ producer of ``degraded(no_signal)``.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
+from cli_agent_orchestrator.app.worker_truth.health import NullSourceHealth, SourceHealthWriter
 from cli_agent_orchestrator.app.worker_truth.mapping import (
     PANE_MISSING_REASON,
+    answered_state,
     implied_state,
     legacy_state,
 )
@@ -85,6 +88,11 @@ logger = logging.getLogger(__name__)
 
 def _no_check(terminal_id: str) -> bool:
     """The default durational check: none."""
+    return False
+
+
+def _no_producer_check(event: "WorkerEvent", row: "ProjectedState") -> bool:
+    """The default producer-disagreement check: none."""
     return False
 
 
@@ -249,16 +257,46 @@ class Projector:
         clock: Clock,
         sources: SourceRegistry | None = None,
         legacy_check: Callable[[str], bool] | None = None,
+        health: SourceHealthWriter | None = None,
+        producer_check: Callable[[WorkerEvent, ProjectedState], bool] | None = None,
     ) -> None:
         self._events = events
         self._states = states
         self._clock = clock
         self._sources = sources if sources is not None else NullSourceRegistry()
+        # One writer at a time.  Folds arrive on whatever thread called ``emit``
+        # — the status monitor's detection threads, a tailer's thread, the
+        # liveness probe's executor thread — and since sub-phase 2b the sweep runs
+        # on an executor thread of its own, every ``PANE_HEARTBEAT_S``.  Both
+        # paths are read-modify-write over a row the store replaces WHOLE
+        # (``upsert`` is an unconditional ``INSERT … ON CONFLICT DO UPDATE`` of
+        # every column, with no version guard) and both hold their row across an
+        # event-log read, so without this lock the sweep's stale snapshot can
+        # overwrite a transition that landed while it was reading: the arriving
+        # state is lost, ``last_event_seq`` goes BACKWARDS, and the log gains a
+        # transition row describing a move the worker never made — which the
+        # ghost- and pane-disagreement checks then report as real.  The event that
+        # races the sweep is precisely the event that ends the silence, so the
+        # window is the interesting case rather than a rare one.
+        #
+        # Re-entrant because a decision append inside the critical section reaches
+        # the store's ``CheckRunner``; nothing there folds today, and an RLock
+        # means nothing there ever deadlocks if something one day does.
+        self._lock = threading.RLock()
+        # D1e's gate, written here and read by the legacy status monitor.  A
+        # projector with no view still folds: the view is what the CUTOVER needs,
+        # and a projector must remain runnable without the thing that consumes
+        # it — which is also the shape of every phase before the cutover lands.
+        self._health: SourceHealthWriter = health if health is not None else NullSourceHealth()
         # ``DIAG-LEGACY-DISAGREE`` is durational, so it cannot ride the store's
         # on-append registry: during an append the projection is one event stale
         # by construction.  The projector drives it instead, after the fold.
         # Optional, because a projector must remain runnable without it.
         self._legacy_check = legacy_check if legacy_check is not None else _no_check
+        # D9b's ``DIAG-PRODUCER-DISAGREE``.  Optional for the same reason
+        # ``legacy_check`` is: a projector must stay runnable without the
+        # diagnostics that ride on it.
+        self._producer_check = producer_check if producer_check is not None else _no_producer_check
 
     # -------------------------------------------------------------------- apply
 
@@ -274,29 +312,45 @@ class Projector:
             # into it.
             return ProjectionOutcome(event.terminal_id, rule="decision_row", applied=False)
 
-        row = self._load(event.terminal_id, event.ingested_at)
+        # THE critical section (phase 2, sub-phase 2b).  Load, decide, upsert:
+        # one lock for the whole read-modify-write, held against the sweep, which
+        # is the second writer this sub-phase introduced.  See the class
+        # docstring's "One writer at a time" note for the interleaving this
+        # closes.
+        with self._lock:
+            row = self._load(event.terminal_id, event.ingested_at)
+            # D1e — re-state the gate on EVERY fold, before any rule runs.  The
+            # mark is level rather than edge-triggered (see ``health``'s module
+            # docstring): an arriving event is the freshest moment the two inputs
+            # are both known, and re-stating an unchanged answer costs one
+            # dictionary write.
+            self._health.mark(event.terminal_id, projected=self._projected(event.terminal_id, row))
 
-        if self._is_muted(row, event):
-            self._states.upsert(replace(row, last_event_seq=event.seq))
-            outcome = ProjectionOutcome(
-                event.terminal_id,
-                rule="derived_muted_by_healthy_source",
-                applied=False,
-                from_state=row.state,
-            )
-        elif event.kind is EventKind.PANE_RECOVERED:
-            outcome = self._recover(row, event)
-        else:
-            outcome = self._transition(row, event)
+            if self._is_muted(row, event):
+                self._states.upsert(replace(row, last_event_seq=event.seq))
+                outcome = ProjectionOutcome(
+                    event.terminal_id,
+                    rule="derived_muted_by_healthy_source",
+                    applied=False,
+                    from_state=row.state,
+                )
+                # D9b — a muted event that asserts a DIFFERENT state than the one
+                # the projection is standing on is two producers disagreeing, and
+                # the muted path is the only place both readings are in hand.
+                self._producer_check(event, row)
+            elif event.kind is EventKind.PANE_RECOVERED:
+                outcome = self._recover(row, event)
+            else:
+                outcome = self._transition(row, event)
 
-        # Run for EVERY event, muted ones included.  A muted
-        # ``status.legacy_published`` is exactly where a disagreement begins —
-        # the pane said one thing, the healthy source said another — so skipping
-        # the check on the muted path would leave the most interesting case to
-        # the sweep alone.  It cannot fire spuriously here: the horizon is
-        # measured from the latest legacy publish, which at this moment is zero
-        # seconds old.
-        self._legacy_check(event.terminal_id)
+            # Run for EVERY event, muted ones included.  A muted
+            # ``status.legacy_published`` is exactly where a disagreement begins —
+            # the pane said one thing, the healthy source said another — so
+            # skipping the check on the muted path would leave the most
+            # interesting case to the sweep alone.  It cannot fire spuriously
+            # here: the horizon is measured from the latest legacy publish, which
+            # at this moment is zero seconds old.
+            self._legacy_check(event.terminal_id)
         return outcome
 
     def _load(self, terminal_id: str, at: datetime) -> ProjectedState:
@@ -316,7 +370,18 @@ class Projector:
             return False
         if event.kind in DERIVED_ALWAYS_KINDS:
             return False
-        if not self._sources.is_authoritative(event.terminal_id):
+        return self._projected(event.terminal_id, row)
+
+    def _projected(self, terminal_id: str, row: ProjectedState) -> bool:
+        """Does the projection own this terminal's status? (D1e.)
+
+        Deliberately the SAME predicate source-level precedence mutes a derived
+        event with.  Two spellings of "this terminal has a live authoritative
+        source" would eventually disagree, and the disagreement would read as the
+        pane path being suppressed for a terminal whose derived events still
+        apply — a terminal publishing nothing at all.
+        """
+        if not self._sources.is_authoritative(terminal_id):
             return False
         return self._source_healthy(row)
 
@@ -498,6 +563,26 @@ class Projector:
             reason = DegradedReason.RENDER_UNCERTAIN if target is WorkerState.DEGRADED else None
             return target, reason
 
+        if event.kind is EventKind.PROMPT_ANSWERED:
+            # WP-ARCH phase 2, D1f — the RESULTING state wins over the kind.
+            #
+            # ``prompt.answered`` means "the card is gone", which is a statement
+            # about the dialog and not about what the worker did next.  The kind
+            # alone implies BUSY, and for the provider hooks that raise it that is
+            # right: the agent answered and proceeded.  The pane's derived
+            # producer sees the other case too — a card DISMISSED, leaving the
+            # terminal idle — and it knows which, because it read the screen and
+            # put the reading in the payload.  Keying on the kind there would
+            # project a dismissed card as a busy worker until the source next
+            # spoke, and for a source-healthy terminal nothing would correct it:
+            # the pane's own ``status.legacy_published`` is muted by precedence.
+            #
+            # Absent or unreadable payload falls through to the implied BUSY,
+            # which is the hook-produced shape.
+            resolved = answered_state(event.payload)
+            if resolved is not None:
+                return resolved, None
+
         target = implied_state(event.kind)
         if target is not WorkerState.DEGRADED:
             return target, None
@@ -546,17 +631,42 @@ class Projector:
         horizon = timedelta(seconds=NO_SIGNAL_S)
         outcomes: list[ProjectionOutcome] = []
 
-        for projection in self._states.all_terminals():
-            row = ProjectedState.from_projection(projection)
-            if row.state is WorkerState.EXITED:
-                continue
-            last_signal = self._last_signal(row)
-            if last_signal is None or now - last_signal <= horizon:
-                continue
-            last_event = self._last_event(row.terminal_id)
-            if last_event is None:
-                continue
-            outcomes.append(self._degrade_no_signal(row, last_event, now))
+        # ``all_terminals`` supplies the ROSTER and nothing else.  Every row it
+        # hands back is re-read inside the lock below, because by the time this
+        # pass reaches a given terminal its snapshot may be many seconds old — the
+        # loop does an event-log read per silent terminal — and acting on the
+        # snapshot is precisely how the sweep would clobber a transition that
+        # arrived while it was reading (see the lock's note in ``__init__``).
+        for terminal_id in [projection.terminal_id for projection in self._states.all_terminals()]:
+            with self._lock:
+                current = self._states.get(terminal_id)
+                if current is None:
+                    # Deleted between the roster read and now.  Nothing to judge,
+                    # and its mark goes with it.
+                    self._health.forget(terminal_id)
+                    continue
+                row = ProjectedState.from_projection(current)
+                # D1e — re-state the gate for EVERY terminal, before the guards
+                # below skip it.  This is the half of the mark that closes I7: a
+                # source that died quietly produces no event, so the fold can
+                # never lower a standing ``True``, and without this pass a
+                # terminal would stay projected for as long as it stayed silent —
+                # which is exactly the condition under which the projection has
+                # nothing to publish.  An exited terminal is marked by the same
+                # rule rather than forced to ``False``: while its source is still
+                # warm the projection has a real answer for it — ``error`` — and
+                # it is the row the sweep's own rules never revisit, so this pass
+                # is its only mark.
+                self._health.mark(terminal_id, projected=self._projected(terminal_id, row))
+                if row.state is WorkerState.EXITED:
+                    continue
+                last_signal = self._last_signal(row)
+                if last_signal is None or now - last_signal <= horizon:
+                    continue
+                last_event = self._last_event(terminal_id, row.last_event_seq)
+                if last_event is None:
+                    continue
+                outcomes.append(self._degrade_no_signal(row, last_event, now))
 
         # The durational check runs for EVERY terminal, not only the ones this
         # pass degraded.  ``DIAG-LEGACY-DISAGREE`` is defined by how long a
@@ -564,7 +674,8 @@ class Projector:
         # sides apart is precisely the case where no further event will arrive to
         # trigger the check on append.  Missing that is missing the bug.
         for projection in self._states.all_terminals():
-            self._legacy_check(projection.terminal_id)
+            with self._lock:
+                self._legacy_check(projection.terminal_id)
         return outcomes
 
     @staticmethod
@@ -581,7 +692,7 @@ class Projector:
         ]
         return max(candidates) if candidates else None
 
-    def _last_event(self, terminal_id: str) -> WorkerEvent | None:
+    def _last_event(self, terminal_id: str, last_event_seq: int) -> WorkerEvent | None:
         """The last WORKER TRUTH row for a terminal, decisions excluded.
 
         The exclusion is the whole point.  The projector's own
@@ -590,8 +701,29 @@ class Projector:
         sweep's evidence point at the projector rather than at the last thing
         anyone actually heard from the worker — a self-referential chain that
         ``cao diag --why`` would walk in circles.
+
+        BOUNDED by the projection's own cursor, and that bound is not an
+        optimisation detail: an unbounded ``read`` here materialises every row a
+        terminal has ever stored — thirty days of retention — into Python, once
+        per silent terminal, once per sweep, 4320 times a day.  The cost grows
+        with uptime while the answer never does.
+
+        ``last_event_seq`` is the seq of the event that last MOVED this
+        projection, so the row being looked for is that one; the window opens one
+        seq earlier so a ``read`` whose bound is exclusive still contains it.
+        When retention has pruned that row the window is empty and the answer is
+        ``None`` — the sweep then skips the terminal, exactly as it does for a
+        terminal that has never spoken, which is the right reading: a degradation
+        with no surviving evidence to cite is what ``DIAG-GHOST-TRANSITION``
+        exists to complain about.
         """
-        rows = [row for row in self._events.read(terminal_id) if row.decision is None]
+        if last_event_seq <= 0:
+            return None
+        rows = [
+            row
+            for row in self._events.read(terminal_id, since_seq=last_event_seq - 1)
+            if row.decision is None
+        ]
         return rows[-1] if rows else None
 
     def _degrade_no_signal(

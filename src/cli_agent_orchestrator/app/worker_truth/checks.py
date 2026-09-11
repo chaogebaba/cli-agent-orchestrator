@@ -21,12 +21,13 @@ what every later phase reads.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from cli_agent_orchestrator.app.worker_truth.mapping import legacy_state
-from cli_agent_orchestrator.core.events import DecisionKind, EventKind, WorkerEvent
+from cli_agent_orchestrator.app.worker_truth.mapping import implied_state, legacy_state
+from cli_agent_orchestrator.core.events import Confidence, DecisionKind, EventKind, WorkerEvent
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import Clock, EventStore, FindingStore, StateStore
 from cli_agent_orchestrator.core.states import TRANSITIONS, TransitionClass, WorkerState
@@ -41,6 +42,7 @@ __all__ = [
     "CheckRegistry",
     "EventCheck",
     "PaneDisagreementCheck",
+    "ProducerDisagreementCheck",
     "bad_transition_check",
     "ghost_transition_check",
     "record_migration_failure",
@@ -217,6 +219,17 @@ def bad_transition_check(event: WorkerEvent) -> CheckOutcome | None:
     )
 
 
+#: How many of a terminal's most recent event rows the durational checks read.
+#:
+#: Not a duration (§4c is about durations, and this is a row count), and not a
+#: tuning knob either: it is the bound that keeps a check that runs per terminal
+#: per sweep from growing with uptime.  Wide enough that a pane classification
+#: still in play is inside it — the pane classifies on every detection edge, so a
+#: row this far back is one the pane has had 256 events to restate — and narrow
+#: enough that the read is a constant.
+_RECENT_EVENT_WINDOW = 256
+
+
 class PaneDisagreementCheck:
     """``DIAG-PANE-DISAGREE``: projection ≠ the pane's reading for over a heartbeat.
 
@@ -272,8 +285,19 @@ class PaneDisagreementCheck:
         projection = self._state_store.get(terminal_id)
         if projection is None:
             return False
+        # BOUNDED, and for the same reason the sweep's evidence read is
+        # (``Projector._last_event``): this runs for every terminal on every
+        # sweep, and an unbounded read materialises a month of rows to answer a
+        # question about the newest one.  The window is the last
+        # ``_RECENT_EVENT_WINDOW`` rows of the terminal's log; a classification
+        # older than that has been followed by that many events without the pane
+        # speaking again, which is not the standing disagreement this check is
+        # about.
+        high_water = self._event_store.high_water(terminal_id)
         rows = self._event_store.read(
-            terminal_id, kinds=frozenset({EventKind.STATUS_PANE_CLASSIFIED})
+            terminal_id,
+            since_seq=max(0, high_water - _RECENT_EVENT_WINDOW),
+            kinds=frozenset({EventKind.STATUS_PANE_CLASSIFIED}),
         )
         if not rows:
             return False
@@ -330,6 +354,141 @@ class PaneDisagreementCheck:
                 break
             first = row
         return max(first.ingested_at, state_since), first
+
+
+class ProducerDisagreementCheck:
+    """``DIAG-PRODUCER-DISAGREE``: two producers, one terminal, two states (D9b).
+
+    The other two disagreement checks compare the projection against a RECORD —
+    what the pane published, or what it classified — and they are durational
+    because a record sits there while the clocks drift apart.  This one is
+    instantaneous and structural, because the moment it is about lasts no time at
+    all: source-level precedence has just MUTED a derived event, which means the
+    projector was holding two readings of one terminal and chose one.  If the
+    reading it discarded asserted a different state, the two producers disagree,
+    and nothing downstream will ever say so — the muted event is in the log and
+    applied to nothing, which is exactly how it should be and exactly why the
+    disagreement is invisible without a finding.
+
+    Why it is not a registry check: ``on_append`` cannot see the mute.  The
+    decision to mute is the projector's and is not recorded as a row, so a check
+    reading the log alone would have to re-derive source health and would then be
+    a second implementation of the precedence rule — free to disagree with the
+    first, which is the failure this whole package is about.
+
+    Why it does not fire on lag: a muted event whose implied state MATCHES the
+    projection is the normal case and is silent.  Only a contradiction is
+    recorded, deduped per ``(projected, asserted)`` pair, so a pane that reads
+    ``processing`` against an idle rollout for an hour is one finding with a
+    count, not thirty.
+
+    **And one WRITE, not thirty.**  The finding table could never flood — the
+    store's record is an UPDATE-then-INSERT on the open row — but every call
+    opens a ``BEGIN IMMEDIATE`` and takes SQLite's write lock, and this runs from
+    the status monitor's locked publish path on every status edge.  A standing
+    disagreement is the common shape rather than the exotic one (the pane reads
+    ``processing`` off a spinner while the rollout has already ended the turn),
+    so the write rate is the cost that matters — a contended ``BEGIN IMMEDIATE``
+    waits up to the busy timeout with the monitor's lock held, and ``get_status``,
+    ``fuse_status`` and ``get_published_status`` all take that lock.
+
+    An in-memory episode map holds the open ``(projected, asserted)`` pair per
+    terminal and writes only when it CHANGES.  Exactly one thing closes an
+    episode: AGREEMENT — the muted event asserting the state the projection is
+    already in.  A kind that asserts no state does not close it, and that is not
+    a nicety: ``status.pane_classified`` asserts none and is emitted immediately
+    before every ``status.legacy_published``, on the same edge and from the same
+    pair, so a guard that closed on it would re-open the episode on every edge
+    and suppress nothing while appearing to.
+    """
+
+    def __init__(self, finding_store: FindingStore) -> None:
+        self._finding_store = finding_store
+        self._lock = threading.Lock()
+        #: terminal_id -> the ``(projected, asserted)`` pair currently recorded.
+        self._open: dict[str, tuple[str, str]] = {}
+
+    def forget(self, terminal_id: str) -> None:
+        """Drop one terminal's episode when it is deleted.
+
+        Terminal ids are recycled, and a recycled id inheriting an open episode
+        would have its FIRST real disagreement swallowed as a repeat.
+        """
+        with self._lock:
+            self._open.pop(terminal_id, None)
+
+    def __call__(self, event: WorkerEvent, row: "object") -> bool:
+        """Evaluate one muted event.  Returns whether a finding was recorded.
+
+        Never raises: the projector calls this from inside its critical section.
+        """
+        try:
+            return self._evaluate(event, row)
+        except Exception:  # noqa: BLE001 — a diagnostic must not break the fold
+            logger.warning(
+                "producer-disagreement check failed for %s", event.terminal_id, exc_info=True
+            )
+            return False
+
+    def _evaluate(self, event: WorkerEvent, row: "object") -> bool:
+        standing = getattr(row, "state", None)
+        if not isinstance(standing, WorkerState):
+            return False
+        if event.confidence is not Confidence.DERIVED:
+            # Belt and braces: only a DERIVED event can be muted by precedence,
+            # so an authoritative one reaching here would mean the projector's
+            # rule changed shape and this check's premise no longer holds.
+            return False
+        asserted = _asserted_state(event)
+        if asserted is None:
+            # A kind that asserts no state says NOTHING about the episode, and
+            # must not close it.  ``status.pane_classified`` is the case that
+            # makes this load-bearing rather than tidy: the classification site
+            # emits it immediately before every ``status.legacy_published``, on
+            # the same edge and from the same pair, so closing on it would open
+            # the episode again on every single edge — and the guard would
+            # suppress nothing at all while looking like it did.
+            return False
+        if asserted is standing:
+            # Actual AGREEMENT closes the episode, so the next contradiction is
+            # recorded rather than swallowed as a repeat of one the two sides
+            # have since resolved.
+            with self._lock:
+                self._open.pop(event.terminal_id, None)
+            return False
+
+        episode = (standing.value, asserted.value)
+        with self._lock:
+            if self._open.get(event.terminal_id) == episode:
+                return False
+            self._open[event.terminal_id] = episode
+
+        self._finding_store.record(
+            FindingCode.DIAG_PRODUCER_DISAGREE,
+            terminal_id=event.terminal_id,
+            dedupe_key=f"{standing.value}|{asserted.value}",
+            detail=(
+                f"projected {standing.value} from the authoritative source while "
+                f"{event.producer.value} asserted {asserted.value} "
+                f"({event.kind.value}, muted)"
+            ),
+            sample_event_id=event.event_id,
+        )
+        return True
+
+
+def _asserted_state(event: WorkerEvent) -> WorkerState | None:
+    """The state a muted event claims, by whichever route its kind carries one.
+
+    ``status.legacy_published`` carries it in the payload — it is the pane's whole
+    reading — and every state-asserting kind carries it in the kind.  Anything
+    else (a classification row, a decision) asserts nothing and cannot disagree
+    with anything.
+    """
+    if event.kind is EventKind.STATUS_LEGACY_PUBLISHED:
+        raw = event.payload.get("latched_status")
+        return legacy_state(raw) if isinstance(raw, str) else None
+    return implied_state(event.kind)
 
 
 def register_phase1_checks(registry: CheckRegistry) -> CheckRegistry:

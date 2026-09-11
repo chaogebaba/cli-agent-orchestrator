@@ -140,3 +140,179 @@ def test_a_failing_store_never_raises_into_the_locked_detection_path(
     _classify("idle")
 
     assert ingest_on.rows == []
+
+
+# ---------------------------------------------------------------------------
+# WP-ARCH sub-phase 2b — the two DERIVED producers that moved to this site.
+# ---------------------------------------------------------------------------
+
+
+class _Monitor:
+    """Stands in for the status monitor: one pure, re-entrant read."""
+
+    def __init__(self, condition: str | None = None) -> None:
+        self.condition = condition
+
+    def get_condition(self, terminal_id: str) -> str | None:
+        return self.condition
+
+
+def _classify_with(monitor: object, status: str = "idle") -> None:
+    pane_classification.record_pane_classification(
+        TERMINAL, status, None, "incremental", "accepted", None, monitor=monitor
+    )
+
+
+def test_a_cap_appends_usage_capped_at_the_classification_site(
+    ingest_on: FakeEventStore,
+) -> None:
+    """D1c's other half.  The rollout can never say this, and after D1 the egress
+    will not be reached for the terminals that have one."""
+    monitor = _Monitor(condition=legacy_egress.CAPPED_CONDITION_LABEL)
+
+    _classify_with(monitor)
+    _classify_with(monitor)  # same pair AND same condition: one row, not two
+
+    rows = ingest_on.of_kind(EventKind.USAGE_CAPPED, TERMINAL)
+    assert len(rows) == 1
+    assert rows[0].producer is Producer.PANE
+    assert rows[0].confidence is Confidence.DERIVED
+    assert rows[0].payload["condition"] == legacy_egress.CAPPED_CONDITION_LABEL
+
+
+def test_the_cap_edge_fires_while_the_classification_sits_still(
+    ingest_on: FakeEventStore,
+) -> None:
+    """The reason the condition is tracked apart from the pair.
+
+    A cap is detected by the condition classifier, not by the screen reader, so
+    it routinely arrives with the latched status and origin unchanged.  Folding
+    it into the pair would make this case produce nothing at all — and the
+    capped-lane policy is the consumer that would silently lose its evidence.
+    """
+    monitor = _Monitor()
+    _classify_with(monitor)
+    assert ingest_on.of_kind(EventKind.USAGE_CAPPED, TERMINAL) == []
+
+    monitor.condition = legacy_egress.CAPPED_CONDITION_LABEL
+    _classify_with(monitor)
+
+    assert len(ingest_on.of_kind(EventKind.USAGE_CAPPED, TERMINAL)) == 1
+    # ...and the unchanged pair still produced no second classification row.
+    assert len(ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)) == 1
+
+
+def test_a_monitor_that_raises_never_breaks_the_classification_row(
+    ingest_on: FakeEventStore,
+) -> None:
+    class _Hostile:
+        def get_condition(self, terminal_id: str) -> str:
+            raise RuntimeError("boom")
+
+    _classify_with(_Hostile())
+
+    assert len(ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)) == 1
+    assert ingest_on.of_kind(EventKind.USAGE_CAPPED, TERMINAL) == []
+
+
+def test_no_monitor_at_all_is_legal(ingest_on: FakeEventStore) -> None:
+    """The pre-2b call shape stays valid; there is simply no condition to read."""
+    _classify("idle")
+
+    assert len(ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)) == 1
+    assert ingest_on.of_kind(EventKind.USAGE_CAPPED, TERMINAL) == []
+
+
+def test_a_dialog_edge_produces_prompt_awaiting(ingest_on: FakeEventStore) -> None:
+    """D1f.  Codex has no dialog hook at all, so with the egress suppressed its
+    AWAITING_INPUT would have no producer and #386's card would project busy."""
+    _classify("processing")
+    _classify(pane_classification.AWAITING_STATUS)
+
+    rows = ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)
+    assert len(rows) == 1
+    assert rows[0].producer is Producer.PANE
+    assert rows[0].confidence is Confidence.DERIVED
+    assert rows[0].payload["prior_status"] == "processing"
+
+
+def test_a_repainting_card_is_one_awaiting_row(ingest_on: FakeEventStore) -> None:
+    """The #386 shape: the pane repaints continuously while the card is up."""
+    for _ in range(20):
+        _classify(pane_classification.AWAITING_STATUS)
+
+    assert len(ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)) == 1
+
+
+def test_leaving_the_card_produces_prompt_answered(ingest_on: FakeEventStore) -> None:
+    _classify(pane_classification.AWAITING_STATUS)
+    _classify("processing")
+
+    assert len(ingest_on.of_kind(EventKind.PROMPT_ANSWERED, TERMINAL)) == 1
+    assert len(ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)) == 1
+
+
+def test_a_terminal_first_seen_already_waiting_still_reports_the_card(
+    ingest_on: FakeEventStore,
+) -> None:
+    """A server restart is exactly when a worker has been sitting on a card."""
+    _classify(pane_classification.AWAITING_STATUS)
+
+    assert len(ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)) == 1
+
+
+def test_the_dialog_row_and_the_classification_row_share_one_source_ref(
+    ingest_on: FakeEventStore,
+) -> None:
+    """Two readings of ONE pane observation.
+
+    Without the join, "what did the screen say when the card appeared" is
+    unanswerable from the log, which is the question ``cao diag`` exists for.
+    """
+    _classify(pane_classification.AWAITING_STATUS)
+
+    awaiting = ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)[0]
+    classified = ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)[0]
+    assert awaiting.source_ref == classified.source_ref
+
+
+def test_an_origin_only_edge_is_not_a_dialog_edge(ingest_on: FakeEventStore) -> None:
+    """The pair changed, the status did not — there is no card news here."""
+    pane_classification.record_pane_classification(
+        TERMINAL, pane_classification.AWAITING_STATUS, "incremental", "incremental", "accepted"
+    )
+    pane_classification.record_pane_classification(
+        TERMINAL, pane_classification.AWAITING_STATUS, "probe", "incremental", "accepted"
+    )
+
+    assert len(ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)) == 2
+    assert len(ingest_on.of_kind(EventKind.PROMPT_AWAITING, TERMINAL)) == 1
+
+
+def test_a_status_that_could_not_be_read_is_recorded_as_unknown(
+    ingest_on: FakeEventStore,
+) -> None:
+    """The ``''`` artefact, fixed.
+
+    ``legacy_state('')`` is ``None`` and ``DIAG-PANE-DISAGREE`` SKIPS a row it
+    cannot read — so an empty latched status did not produce a disagreement, it
+    produced silence, and a box round counting disagreements by raw string
+    comparison read those rows as real.  ``unknown`` is in the legacy vocabulary
+    and maps to ``degraded``, so the check can compare it and complain.
+    """
+    pane_classification.record_pane_classification(TERMINAL, None, None, "incremental", "accepted")
+
+    row = ingest_on.of_kind(EventKind.STATUS_PANE_CLASSIFIED, TERMINAL)[0]
+    assert row.payload["latched_status"] == legacy_egress.UNKNOWN_STATUS
+
+
+def test_the_awaiting_spelling_matches_the_real_legacy_enum() -> None:
+    """The pin that keeps a hand-spelled legacy constant honest.
+
+    ``adapters`` may not import ``models``; this test lives on the legacy side of
+    that fence, where it can.
+    """
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+    assert pane_classification.AWAITING_STATUS == TerminalStatus.WAITING_USER_ANSWER.value
+    assert legacy_egress.UNKNOWN_STATUS == TerminalStatus.UNKNOWN.value

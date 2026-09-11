@@ -43,7 +43,9 @@ __all__ = [
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
     "PANE_HEARTBEAT_S",
+    "PANE_LIVENESS_STALENESS_S",
     "PANE_MISS_TICKS",
+    "PANE_SAMPLE_S",
     "PROBE_FAIL_TICKS",
     "RETENTION_DAYS",
     "RETENTION_SWEEP_S",
@@ -58,6 +60,36 @@ __all__ = [
 #: ``miss_count`` as COLUMNS.  Doubles as the projector's sweep period, since a
 #: projector never notices silence by itself (r8 N5).
 PANE_HEARTBEAT_S = 20
+
+#: The pane-delta sampler's re-drive period in seconds (WP-ARCH phase 2, §12).
+#:
+#: SEPARATE from ``PANE_HEARTBEAT_S`` and strictly smaller, which is the whole
+#: point of naming it.  The liveness probe owns two jobs on one task: it lists
+#: the fleet's panes (a heartbeat, ``PANE_HEARTBEAT_S``) and it drives
+#: ``pane_liveness.observe`` (a sample, this).  Running both at the heartbeat
+#: would have been simpler and wrong: the sampler calls its own sample stale
+#: after ``PANE_LIVENESS_STALENESS_S``, so once phase 3 deletes the
+#: stalled-callback watchdog and this becomes the only driver, a 20-second
+#: cadence would leave ``fuse_status``'s rules 3a/3b with no evidence for half of
+#: every window — and ``unchanged_count`` would need a minute to reach the
+#: stable-sample threshold instead of the 3-15 seconds it takes today.
+#:
+#: The value MIRRORS the watchdog's own tick ceiling (``min(5.0, ...)``) rather
+#: than improving on it: this re-drive replaces that tick, and a faster cadence
+#: would change pane-delta timing rather than preserve it.  It does not ADD
+#: captures while both drivers are alive, because the drive defers to any sample
+#: taken inside the staleness window (the ``peek`` guard in the composition
+#: root); a test counts the captures to keep that true.
+PANE_SAMPLE_S = 5
+
+#: How long ``services/pane_liveness.py`` treats a sample as fresh, MIRRORED here
+#: for the reason ``IDLE_STALL_AGE_S`` is mirrored: ``core`` may not import a
+#: legacy service, and the ordering below has to be raisable at import.  The real
+#: definition is ``pane_liveness._STALENESS_S`` and it stays there; a test asserts
+#: the two agree, and that test is what catches a retune that moved one and not
+#: the other — a drift that would silently blind the pane-delta rules for part of
+#: every window with both files looking correct on their own.
+PANE_LIVENESS_STALENESS_S = 10.0
 
 #: Source-health horizon in seconds.  An authoritative source is healthy while
 #: its tailer stat-ed the file within this window; ``degraded(no_signal)`` needs
@@ -105,6 +137,22 @@ def check_orderings() -> None:
         )
     if PANE_MISS_TICKS < 2:
         raise ValueError(f"PANE_MISS_TICKS ({PANE_MISS_TICKS}) must be >= 2")
+    if PANE_SAMPLE_S * 2 > PANE_LIVENESS_STALENESS_S:
+        # The sampler's own freshness rule is "a sample from the last two passes".
+        # A drive slower than half the staleness window therefore hands the
+        # pane-delta rules a stale sample for part of every window, which reads
+        # to them as NO evidence and silently disables the downgrade.
+        raise ValueError(
+            f"PANE_SAMPLE_S * 2 ({PANE_SAMPLE_S * 2}) must be <= "
+            f"PANE_LIVENESS_STALENESS_S ({PANE_LIVENESS_STALENESS_S})"
+        )
+    if PANE_HEARTBEAT_S % PANE_SAMPLE_S != 0:
+        # One task interleaves both cadences, so the heartbeat has to be a whole
+        # number of sample ticks; otherwise the listing drifts against the sample.
+        raise ValueError(
+            f"PANE_HEARTBEAT_S ({PANE_HEARTBEAT_S}) must be a multiple of "
+            f"PANE_SAMPLE_S ({PANE_SAMPLE_S})"
+        )
     if RETENTION_DAYS < 1:
         raise ValueError(f"RETENTION_DAYS ({RETENTION_DAYS}) must be >= 1")
     if RETENTION_SWEEP_S < PANE_HEARTBEAT_S:

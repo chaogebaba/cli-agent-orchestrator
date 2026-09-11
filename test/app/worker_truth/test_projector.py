@@ -538,3 +538,102 @@ def test_the_projection_row_cannot_be_edited_in_place(rig: Rig) -> None:
     moved = dataclasses.replace(row, state=WorkerState.IDLE)
     assert moved.state is WorkerState.IDLE
     assert row.state is WorkerState.BUSY
+
+
+def test_two_producers_of_one_dialog_fold_to_one_transition(rig: Rig) -> None:
+    """AC-2b case 14.  D1f gives every provider a derived dialog producer, and
+    claude_code already has an authoritative hook for the same card — so the
+    common case on that provider is two rows describing one event.
+
+    The fold must make that one transition and one no-op, not two transitions:
+    the second row is the diagonal, which keeps ``since`` and writes nothing.
+    Two transitions would make "how long has this worker been waiting" wrong by
+    however long the second producer lagged the first.
+    """
+    rig.emit(TERMINAL, EventKind.TURN_STARTED)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)  # the classification site
+    since = rig.states.get(TERMINAL).since
+    rig.emit(TERMINAL, EventKind.PROMPT_AWAITING)  # the provider hook
+
+    assert rig.state_of(TERMINAL) is WorkerState.AWAITING_INPUT
+    awaiting = [row for row in _transitions(rig) if row.payload["to"] == "awaiting_input"]
+    assert len(awaiting) == 1
+    assert rig.states.get(TERMINAL).since == since
+
+
+# ------------------------------------------------------- D1f, the dialog edge
+
+
+def test_a_dismissed_card_projects_what_the_pane_read_not_busy(rig: Rig) -> None:
+    """S1.  ``prompt.answered`` means "the card is gone", not "the agent is working".
+
+    The derived producer at the classification site reads the screen and puts the
+    reading in the payload, so it knows which of the two happened.  Keying on the
+    kind alone would project a dismissed card as BUSY — and for a source-healthy
+    terminal nothing would correct it, because the pane's own
+    ``status.legacy_published`` is muted by precedence.
+    """
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+    assert rig.state_of(TERMINAL) is WorkerState.AWAITING_INPUT
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "idle"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.IDLE
+
+
+def test_an_answered_card_still_projects_busy(rig: Rig) -> None:
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "processing"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_a_hook_produced_answer_with_no_reading_still_implies_busy(rig: Rig) -> None:
+    """The provider-hook shape: a hook fires because the agent answered and
+    proceeded, so the implied BUSY is right and the payload rule must not
+    swallow it."""
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.emit(TERMINAL, EventKind.PROMPT_ANSWERED)
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_an_unreadable_reading_falls_back_to_busy(rig: Rig) -> None:
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "nonsense"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+def test_a_pane_misread_during_a_dialog_cannot_exit_the_terminal(rig: Rig) -> None:
+    """R1.  ``exited`` is a ONE-WAY door and the dialog producer has no key.
+
+    ``prompt.answered`` is in ``DERIVED_ALWAYS_KINDS``, so it applies even with a
+    healthy rollout — and the sweep skips an exited terminal forever, so a single
+    misread while a card was up would strand a live worker until a respawn.
+    ``process.exited`` belongs to the liveness probe, "of which it is the sole
+    owner, in phase 1 and after".
+    """
+    rig.sources.add(TERMINAL)
+    rig.states.touch_source_probe(TERMINAL, probed_at=rig.clock.now())
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": "error"})
+
+    assert rig.state_of(TERMINAL) is WorkerState.BUSY
+
+
+@pytest.mark.parametrize("reading", ["unknown", "render_uncertain"])
+def test_a_dialog_edge_never_writes_an_unlabelled_degradation(rig: Rig, reading: str) -> None:
+    """The closed-reason design exists so that no path can produce one."""
+    rig.pane(TERMINAL, EventKind.PROMPT_AWAITING)
+
+    rig.pane(TERMINAL, EventKind.PROMPT_ANSWERED, payload={"latched_status": reading})
+
+    row = rig.states.get(TERMINAL)
+    assert row.state is WorkerState.BUSY
+    assert row.degraded_reason is None

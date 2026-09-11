@@ -20,10 +20,15 @@ from cli_agent_orchestrator.core.events import AnyKind, EventKind
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 
 __all__ = [
+    "ANSWERED_STATES",
+    "FORWARD_STATUS_MAP",
     "LEGACY_STATUS_MAP",
+    "LOSSY_FORWARD_STATES",
     "STATE_ASSERTING_KINDS",
+    "answered_state",
     "implied_state",
     "legacy_state",
+    "legacy_status",
 ]
 
 
@@ -94,6 +99,134 @@ LEGACY_STATUS_MAP: dict[str, WorkerState] = {
     "render_uncertain": WorkerState.DEGRADED,
     "error": WorkerState.EXITED,
 }
+
+
+#: The FORWARD map: what the projection publishes as a legacy ``TerminalStatus``
+#: string (WP-ARCH phase 2, D1).  Strings, never the legacy enum, for the reason
+#: the module docstring gives for :func:`legacy_state`; a test on the legacy side
+#: of the fence pins every value here against the real enum.
+#:
+#: Two rows are CONDITIONAL and therefore not in this table — see
+#: :func:`legacy_status`, which holds them:
+#:
+#: * ``IDLE`` reached by ``turn.ended`` publishes ``completed`` rather than
+#:   ``idle``.  ``completed`` is not a state the projection holds: it is a screen
+#:   classification the fork uses for "the turn finished", and adding an eighth
+#:   ``WorkerState`` for it would break the audit's frozen seven-member enum and
+#:   its 49-cell table for a distinction no consumer reads as a state.  The
+#:   discriminator is free — the publisher is called from the fold and so holds
+#:   the causing event's kind — and the leg it preserves is
+#:   ``agent_step.py``'s ``_CompletionOutcome.COMPLETED``.
+#: * ``DEGRADED`` publishes ``unknown`` for ``no_signal`` and ``render_uncertain``
+#:   for every other reason.  Both map back to ``DEGRADED``, so the round trip
+#:   holds either way; the split keeps the audit §3.1 pairing that ``degraded``
+#:   replaced.
+FORWARD_STATUS_MAP: dict[WorkerState, str] = {
+    # Lossy.  Legacy has no member for "booting", and the choice between the
+    # remaining ones is not free: ``idle`` would let ``inbox_service``'s
+    # admission paste into a worker that has not finished starting.
+    WorkerState.STARTING: "processing",
+    WorkerState.IDLE: "idle",
+    WorkerState.BUSY: "processing",
+    WorkerState.AWAITING_INPUT: "waiting_user_answer",
+    # Lossy, and the least obvious row in the table.  The cap's legacy carrier is
+    # the CONDITION LABEL (``legacy_egress.CAPPED_CONDITION_LABEL``), which is
+    # what the fleet row and the capped-lane policy actually read; the status is
+    # not the carrier and must not pretend to be.  ``error`` would be actively
+    # wrong — it maps back to ``EXITED`` and makes the fork raise
+    # ``TerminalInputBlockedError`` on a worker that is merely waiting out a
+    # usage window.
+    WorkerState.CAPPED: "processing",
+    WorkerState.DEGRADED: "render_uncertain",
+    WorkerState.EXITED: "error",
+}
+
+#: The two states with NO legacy preimage: ``LEGACY_STATUS_MAP``'s image is the
+#: other five, so a round trip through the legacy vocabulary cannot return them.
+#:
+#: This set is the blueprint §5b correction.  §5b asserts that
+#: ``WorkerState -> TerminalStatus -> WorkerState`` is the identity, and for
+#: these two it is unsatisfiable rather than unimplemented: both land on
+#: ``processing`` and come back as ``BUSY``.  A test that enumerated all seven
+#: and asserted identity would be asserting something false about the legacy
+#: enum, so the round trip is scoped to the five that have a preimage and these
+#: two are asserted lossy BY NAME, with the reason each lands where it does
+#: written beside its row above.
+LOSSY_FORWARD_STATES: frozenset[WorkerState] = frozenset({WorkerState.STARTING, WorkerState.CAPPED})
+
+
+def legacy_status(
+    state: WorkerState,
+    *,
+    causing_kind: AnyKind | None = None,
+    degraded_reason: DegradedReason | None = None,
+) -> str:
+    """The legacy ``TerminalStatus`` string the projection publishes for ``state``.
+
+    The forward direction of :func:`legacy_state`, and the function D1's publisher
+    calls with the state it just folded into, the kind of the event that caused
+    the fold, and the standing degraded reason.  Pure: it reads no projection, no
+    clock and no configuration, so the whole mapping is decidable from a table
+    plus two discriminators.
+
+    ``causing_kind`` and ``degraded_reason`` are both optional and both ignored
+    for every state that does not name them.  A caller with no causing kind — a
+    sweep, a re-publish, a test — gets the unconditional row, which for ``IDLE``
+    is ``idle``: the plain reading, and the safe one, since ``completed`` asserts
+    that a turn just finished.
+    """
+    if state is WorkerState.IDLE and causing_kind is EventKind.TURN_ENDED:
+        return "completed"
+    if state is WorkerState.DEGRADED and degraded_reason is DegradedReason.NO_SIGNAL:
+        return "unknown"
+    return FORWARD_STATUS_MAP[state]
+
+
+#: The only two states a ``prompt.answered`` row may assert (D1f).
+#:
+#: A dialog ending means the agent proceeded (``BUSY``) or the card was dismissed
+#: and the terminal is ready (``IDLE``).  Every other reading in the legacy
+#: vocabulary is a statement about something else — a dead process, an unreadable
+#: screen — and this producer has no standing to make it.  See
+#: :func:`answered_state` for what each rejected value would have cost.
+ANSWERED_STATES: frozenset[WorkerState] = frozenset({WorkerState.IDLE, WorkerState.BUSY})
+
+
+def answered_state(payload: dict[str, object]) -> WorkerState | None:
+    """The state a ``prompt.answered`` row asserts, read from its own payload.
+
+    D1f's producer records the pane reading that ENDED the dialog, and that
+    reading is what the terminal is now in — ``processing`` for an answered card,
+    ``idle`` for a dismissed one.  ``prompt.answered`` therefore cannot assert a
+    state by kind: the same kind covers both outcomes, and the difference is the
+    whole content of the event.
+
+    CLAMPED to the two states a dialog edge can legitimately end in, and the
+    clamp is the load-bearing part.  ``prompt.answered`` is in the projector's
+    ``DERIVED_ALWAYS_KINDS``, so it applies with an authoritative source perfectly
+    healthy — it is the one derived kind that bypasses source precedence for
+    exactly the terminals D1 exists to protect.  Passing the pane's whole legacy
+    vocabulary through would hand a dialog producer authority it does not have:
+
+    * ``error`` maps to ``EXITED``, which is an ABSORBING state — the sweep skips
+      an exited terminal forever and only ``session.started`` re-enters it — and
+      ``process.exited`` belongs to the liveness probe, "of which it is the sole
+      owner, in phase 1 and after".  A transient pane misread while a card is up
+      (a redraw, a buffer eviction — the sticky-latch rules exist because this
+      happens) would take a healthy sourced lane through a one-way door.
+    * ``unknown`` and ``render_uncertain`` map to ``DEGRADED``, and this caller
+      carries no :class:`DegradedReason`, so they would write an UNLABELLED
+      degradation — which the closed-reason design exists to make impossible.
+
+    Anything outside the clamp returns ``None`` and the caller falls back to the
+    implied ``BUSY``: wrong in the same recoverable way the pre-clamp code was,
+    and corrected by the source's next event rather than by a respawn.
+    """
+    raw = payload.get("latched_status")
+    if not isinstance(raw, str):
+        return None
+    state = legacy_state(raw)
+    return state if state in ANSWERED_STATES else None
 
 
 def implied_state(kind: AnyKind) -> WorkerState | None:

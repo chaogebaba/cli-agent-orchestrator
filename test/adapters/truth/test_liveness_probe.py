@@ -55,7 +55,7 @@ def _probe(panes_by_tick: list[list[PaneRecord] | None], fleet: list[_Ref]) -> L
     """
     ticks = iter(panes_by_tick)
 
-    def list_panes() -> list[PaneRecord]:
+    def list_panes(_fleet: object) -> list[PaneRecord]:
         value = next(ticks)
         if value is None:
             raise RuntimeError("tmux unreachable")
@@ -261,14 +261,14 @@ def test_a_broken_fleet_roster_never_breaks_the_tick(ingest_on: FakeEventStore) 
     def boom() -> list[_Ref]:
         raise RuntimeError("database unavailable")
 
-    probe = LivenessProbe(list_panes=lambda: PRESENT, fleet=boom)
+    probe = LivenessProbe(list_panes=lambda _fleet: PRESENT, fleet=boom)
     probe.probe_once()  # must not raise
     assert ingest_on.rows == []
 
 
 def test_the_probe_is_not_authoritative() -> None:
     """It owns ``process.exited``, but a pane listing cannot know a turn."""
-    probe = LivenessProbe(list_panes=lambda: PRESENT, fleet=lambda: [ONE])
+    probe = LivenessProbe(list_panes=lambda _fleet: PRESENT, fleet=lambda: [ONE])
     assert probe.is_authoritative is False
     assert probe.name == "liveness_probe"
 

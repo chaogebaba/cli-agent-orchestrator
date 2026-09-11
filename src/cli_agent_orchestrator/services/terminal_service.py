@@ -308,6 +308,41 @@ _fleet_tui_ensure_attempted: bool = False
 _fleet_tui_ensure_lock = threading.Lock()
 
 
+def forget_worker_truth_state(terminal_id: str) -> None:
+    """Drop every per-terminal thing WP-ARCH holds in memory.  Never raises.
+
+    Called from the universal delete path, beside ``pane_liveness.forget`` and
+    ``question_state.forget``, and for the same reason they are there: this state
+    is per-LIFECYCLE, and terminal ids are recycled.
+
+    The projected mark is the one that would actually bite.  It gates phase 2's
+    status cutover, so a recycled id inheriting a dead terminal's ``True`` would
+    have its pane path suppressed on the strength of a source that belonged to
+    something else — a worker publishing nothing at all.  The two producers' edge
+    maps are the same leak in a milder form: ``_last_pair``, ``_edge_seq``,
+    ``_last_condition`` and the last-published event id grow one entry per
+    terminal for the life of the process, and a recycled id would inherit an edge
+    it never crossed and so miss the first real one.
+    """
+    try:
+        from cli_agent_orchestrator import bootstrap as _wt_bootstrap
+        from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
+        from cli_agent_orchestrator.adapters.truth import (
+            pane_classification as _wt_pane_classification,
+        )
+
+        runtime = _wt_bootstrap.current_runtime()
+        if runtime is not None:
+            if runtime.health is not None:
+                runtime.health.forget(terminal_id)
+            if runtime.producer_check is not None:
+                runtime.producer_check.forget(terminal_id)
+        _wt_pane_classification.forget(terminal_id)
+        _wt_legacy_egress.forget(terminal_id)
+    except Exception as e:
+        logger.warning(f"Failed to clear worker-truth state for {terminal_id}: {e}")
+
+
 def _maybe_ensure_fleet_tui(session_name: Optional[str] = None) -> None:
     """Fire-and-forget the fleet TUI ensure script, at most once per process.
 
@@ -8688,6 +8723,7 @@ def _delete_terminal_under_lease(
                 question_state.forget(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to clear question_state for {terminal_id}: {e}")
+            forget_worker_truth_state(terminal_id)
             try:
                 # F792 (#649): drop the per-terminal turn-end marker too, so a
                 # deleted terminal's turn state does not leak (same rationale as

@@ -99,3 +99,31 @@ def test_no_other_new_module_defines_a_duration_constant() -> None:
                     if isinstance(target, ast.Name) and target.id.endswith(_DURATION_SUFFIXES):
                         offenders.append(f"{path.relative_to(src)}:{node.lineno}:{target.id}")
     assert not offenders, "duration constants outside core/timing.py:\n" + "\n".join(offenders)
+
+
+# --------------------------------------------- the pane-sample cadence (2b)
+
+
+def test_the_staleness_mirror_matches_the_legacy_sampler() -> None:
+    """The one constant ``core`` cannot import, so drift is caught here instead.
+
+    ``PANE_SAMPLE_S`` is chosen against this horizon: the liveness probe becomes
+    the pane sample's only driver once phase 3 deletes the stalled-callback
+    watchdog, and a drive slower than half the staleness window hands
+    ``fuse_status``'s rules 3a/3b a stale sample for part of every window — which
+    reads to them as NO evidence and silently disables the pane-delta downgrade.
+    A retune that moved one number and not the other would leave both files
+    looking correct on their own.
+    """
+    from cli_agent_orchestrator.services.pane_liveness import _STALENESS_S
+
+    assert timing.PANE_LIVENESS_STALENESS_S == _STALENESS_S
+
+
+def test_the_sample_cadence_covers_the_staleness_window() -> None:
+    """Stated over the constants, so a retune fails here rather than at 3am."""
+    timing.check_orderings()
+
+    assert timing.PANE_SAMPLE_S * 2 <= timing.PANE_LIVENESS_STALENESS_S
+    assert timing.PANE_SAMPLE_S < timing.PANE_HEARTBEAT_S
+    assert timing.PANE_HEARTBEAT_S % timing.PANE_SAMPLE_S == 0
