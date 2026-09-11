@@ -5647,7 +5647,7 @@ class CodexProvider(BaseProvider):
         """Get the command to exit Codex CLI."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
         # Remove the developer_instructions temp file written by _build_codex_command, if any --

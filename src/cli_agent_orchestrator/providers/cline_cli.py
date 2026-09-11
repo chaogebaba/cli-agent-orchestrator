@@ -905,7 +905,7 @@ class ClineCliProvider(BaseProvider):
         """Exit the dispatcher loop. Ctrl-C followed by exit."""
         return "exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up temp files, sandbox dir, and state."""
         self._initialized = False
         # Clean up message temp files.

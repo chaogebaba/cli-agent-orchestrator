@@ -466,6 +466,6 @@ class OpenCodeCliProvider(BaseProvider):
         """Return the command to exit the OpenCode TUI."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up OpenCode provider state."""
         self._initialized = False

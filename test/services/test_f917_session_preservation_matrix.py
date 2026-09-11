@@ -483,3 +483,105 @@ class TestF867D2Precedence:
                 ts.delete_terminal(tid, force=True)
         finally:
             psl.release_provider_session_lease(held)
+
+
+# ==========================================================================
+# AC-6 — retention barrier: a preserving delete of a RESUMABLE lane must NOT
+# rmtree the session artifact for a session-destroying provider (pi_cli,
+# grok_cli). Fail-before/pass-after per provider + one unconditional-rmtree
+# mutant. (Blueprint fx913 AC-6, root commit 75dafa51.)
+# ==========================================================================
+class TestAC6RetentionBarrier:
+    def _make_pi(self, tmp_path, monkeypatch, tid="ac6pia00"):
+        import cli_agent_orchestrator.providers.pi_cli as pi
+
+        monkeypatch.setattr(pi, "PI_RUNTIME_ROOT", tmp_path / "pi")
+        prov = pi.PiCliProvider(
+            tid, "cao-ac6", f"win-{tid}", agent_profile="empirical_reviewer_lite"
+        )
+        prov.runtime_dir.mkdir(parents=True, exist_ok=True)
+        prov.session_dir.mkdir(parents=True, exist_ok=True)
+        artifact = prov.session_dir / f"20260911_{tid}.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+        # ephemeral files that SHOULD be removed even when preserving
+        prov.prompt_path.write_text("prompt")
+        prov.mcp_config_path.write_text("{}")
+        return prov, artifact
+
+    def test_pi_preserve_retains_session_artifact(self, tmp_path, monkeypatch):
+        """pass-after: cleanup(preserve_session=True) leaves the sessions
+        transcript in place (resumable via --session) while removing ephemerals.
+        """
+        prov, artifact = self._make_pi(tmp_path, monkeypatch)
+        prov.cleanup(preserve_session=True)
+        assert artifact.exists(), "AC-6: pi session artifact must survive a preserving delete"
+        assert not prov.prompt_path.exists()  # ephemeral removed
+        assert not prov.mcp_config_path.exists()
+
+    def test_pi_non_preserve_removes_everything(self, tmp_path, monkeypatch):
+        """fail-before contrast: without preservation the runtime dir (incl.
+        sessions) is rmtree'd — the pre-AC-6 behaviour."""
+        prov, artifact = self._make_pi(tmp_path, monkeypatch, tid="ac6pib00")
+        prov.cleanup(preserve_session=False)
+        assert not artifact.exists()
+        assert not prov.runtime_dir.exists()
+
+    def test_pi_preserved_artifact_is_resolvable_for_resume(self, tmp_path, monkeypatch):
+        """AC-6 end: after a preserving cleanup the retained artifact is what a
+        subsequent assign(resume_from=<id>) resolves (the pi session dir glob
+        that _resolve_pi / the resume arm uses finds it)."""
+        prov, artifact = self._make_pi(tmp_path, monkeypatch, tid="ac6pic00")
+        uuid = "ac6pic00"
+        prov.cleanup(preserve_session=True)
+        # The resume arm keys pi by artifact_locator (the JSONL). Assert the
+        # retained file is discoverable by the same **/*_<uuid>.jsonl glob
+        # session_artifact._resolve_pi uses over the namespace/session dir.
+        matches = list(prov.session_dir.glob(f"**/*_{uuid}.jsonl"))
+        assert matches and matches[0] == artifact
+
+    def test_mutant_pi_unconditional_rmtree_is_caught(self, tmp_path, monkeypatch):
+        """Mutant 'unconditional-rmtree': if pi cleanup ignored preserve_session
+        and always rmtree'd runtime_dir, the artifact would be gone after a
+        preserving delete. Asserting the artifact survives kills the mutant.
+        """
+        prov, artifact = self._make_pi(tmp_path, monkeypatch, tid="ac6pim00")
+        prov.cleanup(preserve_session=True)
+        assert artifact.exists()
+
+    # ---- grok ----
+    def _make_grok(self, tmp_path, monkeypatch, tid="ac6grk00"):
+        import cli_agent_orchestrator.providers.grok_cli as gk
+
+        home = tmp_path / "grok-home" / tid
+        monkeypatch.setattr(gk.GrokCliProvider, "_prepare_grok_home", lambda self: None)
+        monkeypatch.setattr(gk.GrokCliProvider, "_allocate_session_uuid", lambda self: "s-uuid")
+        prov = gk.GrokCliProvider(tid, "cao-ac6g", f"win-{tid}")
+        monkeypatch.setattr(prov, "_home_path", lambda: home)
+        monkeypatch.setattr(prov, "_is_managed_home", lambda h: True)
+        monkeypatch.setattr(prov, "_stop_home_processes", lambda h: True)
+        sessions = home / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        artifact = sessions / "session.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+        (home / "config.toml").write_text("x")  # ephemeral, should be removed
+        return prov, home, artifact
+
+    def test_grok_preserve_retains_session_store(self, tmp_path, monkeypatch):
+        prov, home, artifact = self._make_grok(tmp_path, monkeypatch)
+        assert prov.cleanup(preserve_session=True) is True
+        assert artifact.exists(), "AC-6: grok session store must survive a preserving delete"
+        assert not (home / "config.toml").exists()  # ephemeral removed
+
+    def test_grok_non_preserve_removes_home(self, tmp_path, monkeypatch):
+        prov, home, artifact = self._make_grok(tmp_path, monkeypatch, tid="ac6grkb0")
+        assert prov.cleanup(preserve_session=False) is True
+        assert not artifact.exists()
+        assert not home.exists()
+
+    def test_mutant_grok_unconditional_rmtree_is_caught(self, tmp_path, monkeypatch):
+        """Mutant 'unconditional-rmtree' (grok): always rmtree(home) would remove
+        the session store on a preserving delete. Asserting survival kills it.
+        """
+        prov, home, artifact = self._make_grok(tmp_path, monkeypatch, tid="ac6grkm0")
+        prov.cleanup(preserve_session=True)
+        assert artifact.exists()

@@ -392,7 +392,7 @@ class ProviderManager:
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 
-    def cleanup_provider(self, terminal_id: str) -> bool:
+    def cleanup_provider(self, terminal_id: str, *, preserve_session: bool = False) -> bool:
         """Cleanup a provider, retaining retryable Grok state on failure.
 
         Grok's private home can only be deleted after its escaped updater has
@@ -405,7 +405,7 @@ class ProviderManager:
             with self._lock:
                 provider = self._providers.get(terminal_id)
             if provider:
-                cleanup_result = provider.cleanup()
+                cleanup_result = provider.cleanup(preserve_session=preserve_session)
                 if cleanup_result is False:
                     logger.warning("Cleanup deferred for terminal: %s", terminal_id)
                     return False
@@ -434,7 +434,7 @@ class ProviderManager:
                     metadata["tmux_window"],
                     metadata.get("agent_profile"),
                 )
-                if restored_grok_provider.cleanup() is False:
+                if restored_grok_provider.cleanup(preserve_session=preserve_session) is False:
                     logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
                     return False
                 logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)

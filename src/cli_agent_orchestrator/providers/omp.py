@@ -325,7 +325,7 @@ class OmpProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Remove only this terminal's generated prompt/extension artifacts."""
         if self._artifact_dir is not None:
             try:

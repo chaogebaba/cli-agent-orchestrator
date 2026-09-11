@@ -1031,23 +1031,56 @@ class PiCliProvider(BaseProvider):
             return None
         return (self.terminal_id, str(self.session_dir), None)
 
-    def cleanup(self) -> None:
-        """Remove the per-worker runtime dir (prompt + MCP config + sessions)."""
+    def cleanup(self, *, preserve_session: bool = False) -> None:
+        """Remove the per-worker runtime dir (prompt + MCP config + sessions).
+
+        F913 AC-6 retention barrier: when ``preserve_session`` is True (a
+        preserving, non-force delete of a RESUMABLE lane), the ``sessions/``
+        subtree — pi's recoverable artifact (``--session <jsonl>`` resume input)
+        — must NOT be removed. Remove only the ephemeral runtime files
+        (system-prompt.md, mcp.json) and leave ``sessions/`` in place so a later
+        ``assign(resume_from=<id>)`` finds the transcript. Without preservation
+        the whole runtime dir is rmtree'd as before.
+        """
         self._initialized = False
         self._tui_processing_seen = False
         rd = self.runtime_dir
         # Guard: only remove our own terminal's subdirectory under PI_RUNTIME_ROOT.
-        if rd.parent == PI_RUNTIME_ROOT and rd.name == self.terminal_id and rd.exists():
+        if not (rd.parent == PI_RUNTIME_ROOT and rd.name == self.terminal_id and rd.exists()):
+            return
+        if preserve_session:
+            # AC-6: retain the sessions subtree; remove only ephemeral files.
             try:
-                shutil.rmtree(rd)
-                logger.info("pi worker %s: runtime dir removed: %s", self.terminal_id, rd)
+                for child in rd.iterdir():
+                    if child.name == "sessions":
+                        continue  # the recoverable artifact — never remove
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                logger.info(
+                    "pi worker %s: preserving delete — retained sessions dir %s",
+                    self.terminal_id,
+                    self.session_dir,
+                )
             except OSError as exc:
                 logger.warning(
-                    "pi worker %s: failed to remove runtime dir %s: %s",
+                    "pi worker %s: preserving cleanup of %s failed: %s",
                     self.terminal_id,
                     rd,
                     exc,
                 )
+            return
+        try:
+            shutil.rmtree(rd)
+            logger.info("pi worker %s: runtime dir removed: %s", self.terminal_id, rd)
+        except OSError as exc:
+            logger.warning(
+                "pi worker %s: failed to remove runtime dir %s: %s",
+                self.terminal_id,
+                rd,
+                exc,
+            )
 
 
 # ─── providers.toml knobs ──────────────────────────────────────────────────────

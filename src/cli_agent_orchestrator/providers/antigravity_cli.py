@@ -910,7 +910,7 @@ class AntigravityCliProvider(BaseProvider):
         """Get the command to exit agy. ``/quit`` is the slash command."""
         return "/quit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Remove the MCP servers this provider registered and reset state.
 
         _unregister_mcp_servers acquires _MCP_CONFIG_WRITE_LOCK and does file

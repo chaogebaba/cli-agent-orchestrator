@@ -2665,7 +2665,7 @@ class ClaudeCodeProvider(BaseProvider):
         """Get the command to exit Claude Code."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
         # Remove temp files created during initialization

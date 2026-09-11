@@ -1447,6 +1447,6 @@ class KiroCliProvider(BaseProvider):
         """Get the command to exit Kiro CLI."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Kiro CLI provider."""
         self._initialized = False

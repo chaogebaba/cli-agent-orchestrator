@@ -661,10 +661,18 @@ class GrokCliProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "/exit"
 
-    def cleanup(self) -> bool:
+    def cleanup(self, *, preserve_session: bool = False) -> bool:
         """Retryable cleanup: remove private GROK_HOME after stopping processes.
 
         Returns True if cleanup completed, False if deferred (processes still using home).
+
+        F913 AC-6 retention barrier: when ``preserve_session`` is True, the
+        ``sessions/`` subtree under the private GROK_HOME — grok's on-disk
+        session store — must NOT be removed. Remove everything else under the
+        home and leave ``sessions/`` in place. (Grok is not a resumable provider
+        today — AC-8 — so a preserving stop normally refuses before reaching
+        here; the barrier is symmetric with pi so a referenced grok artifact is
+        never rmtree'd once grok gains resume.)
         """
         self._initialized = False
         home = self._home_path()
@@ -680,6 +688,29 @@ class GrokCliProvider(BaseProvider):
         if not stopped:
             logger.warning("Deferred cleanup for %s: processes still active", self.terminal_id)
             return False
+        if preserve_session:
+            # AC-6: retain the sessions subtree; remove only the rest of the home.
+            try:
+                for child in home.iterdir():
+                    if child.name == "sessions":
+                        continue  # the recoverable artifact — never remove
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                logger.info(
+                    "grok worker %s: preserving delete — retained sessions dir %s",
+                    self.terminal_id,
+                    home / "sessions",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "grok worker %s: preserving cleanup of %s failed: %s",
+                    self.terminal_id,
+                    home,
+                    exc,
+                )
+            return True
         try:
             shutil.rmtree(home)
         except FileNotFoundError:
@@ -895,9 +926,7 @@ class GrokCliProvider(BaseProvider):
                 from cli_agent_orchestrator.backends.registry import get_backend
 
                 # F893 (#745): backend port, not tmux list-panes.
-                our_pane = get_backend().get_pane_process_id(
-                    self.session_name, self.window_name
-                )
+                our_pane = get_backend().get_pane_process_id(self.session_name, self.window_name)
                 if our_pane:
                     parent = proc.parent()
                     # Walk ancestry up to 10 levels

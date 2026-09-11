@@ -228,7 +228,7 @@ class ChatGptWebProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "C-d"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Release the review lease (owner-only stop, D5) and reset state."""
         self._initialized = False
         self._processing_seen = False

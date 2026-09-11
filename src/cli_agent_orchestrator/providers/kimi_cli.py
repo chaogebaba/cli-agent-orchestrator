@@ -1183,7 +1183,7 @@ class KimiCliProvider(BaseProvider):
             )
             return {}
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Kimi CLI provider resources.
 
         Removes any temporary files created for agent profiles

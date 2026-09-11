@@ -947,7 +947,7 @@ class CursorCliProvider(BaseProvider):
         """
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Cursor CLI provider state.
 
         Resets the initialised flag and removes every per-session

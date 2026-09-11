@@ -663,8 +663,15 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self) -> bool | None:
+    def cleanup(self, *, preserve_session: bool = False) -> bool | None:
         """Clean up provider resources.
+
+        ``preserve_session`` (F913 AC-6): when True, a provider whose cleanup
+        would otherwise remove its own session store MUST retain the recoverable
+        session artifact (skip or relocate the sessions subtree, never rmtree
+        it), so a preserving (non-force) delete of a resumable lane leaves a
+        working ``assign(resume_from=<id>)`` target. Providers with a
+        provider-global store (codex, kiro, claude) may ignore the flag.
 
         Providers may return ``False`` when cleanup is intentionally deferred
         and lifecycle metadata must be retained for a retry. Existing providers

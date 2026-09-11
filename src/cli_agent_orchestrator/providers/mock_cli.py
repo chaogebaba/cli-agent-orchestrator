@@ -405,5 +405,5 @@ class MockCliProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         return None

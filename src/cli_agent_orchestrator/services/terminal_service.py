@@ -8882,11 +8882,17 @@ def _delete_terminal_under_lease(
 
         # F917 (#769b) / astra D1 correction: for a provider whose cleanup()
         # rmtree's its OWN session store (pi_cli, grok_cli), resolve and retain
-        # the reap resume facts BEFORE cleanup runs — otherwise the resolution
-        # below (post-cleanup) reads a store cleanup just deleted and reports a
-        # false resumable=false, the #769 loss pattern. For providers with a
-        # global store this pre-computation is unnecessary; leave it None so the
-        # existing post-cleanup resolution runs unchanged.
+        # F917 (#769) / F913 AC-6 retention barrier: for a provider whose
+        # cleanup() rmtree's its OWN session store (pi_cli, grok_cli), resolve
+        # the reap resume decision BEFORE cleanup and, when the lane is
+        # RESUMABLE on a preserving (non-force) delete, pass a preserve_session
+        # disposition so cleanup RETAINS the session artifact instead of
+        # rmtree'ing it. (The DESIGN gate noted the pre-cleanup RESOLUTION is
+        # inert for these providers — pi resolves resumability from the identity
+        # row, grok has no resume capability — so the ordering does not change
+        # the resume ANSWER; the reason it runs here is to feed the retention
+        # barrier its resumable verdict at cleanup time. AC-6, not AC-2, is what
+        # actually protects the artifact.) Global-store providers are untouched.
         _f917_precomputed_resume: Optional[tuple[Optional[str], bool, str]] = None
         _f917_provider = metadata.get("provider") if metadata else None
         if _provider_cleanup_destroys_sessions(_f917_provider):
@@ -8900,11 +8906,20 @@ def _delete_terminal_under_lease(
                 )
                 _f917_precomputed_resume = None
 
+        # AC-6: retain the session artifact when this is a preserving delete of a
+        # resumable lane. force=True is an explicit abandon (never preserve);
+        # only the precomputed resumable verdict authorizes retention.
+        _f917_preserve_session = (
+            not force and _f917_precomputed_resume is not None and bool(_f917_precomputed_resume[1])
+        )
+
         # Grok cleanup can be deferred when a private-home owner cannot yet be
         # inspected/stopped.  Keep both the provider mapping and DB metadata so
         # a subsequent DELETE can retry; reporting success here would turn a
         # temporary process race into a permanent private-home leak.
-        cleanup_result = provider_manager.cleanup_provider(terminal_id)
+        cleanup_result = provider_manager.cleanup_provider(
+            terminal_id, preserve_session=_f917_preserve_session
+        )
         if cleanup_result is False:
             if not force:
                 logger.warning(

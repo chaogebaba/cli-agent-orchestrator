@@ -342,6 +342,6 @@ class HermesProvider(BaseProvider):
         """Get the command to exit Hermes."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         """Clean up Hermes provider state."""
         self._initialized = False

@@ -580,7 +580,7 @@ class MiniMaxCodeProvider(BaseProvider):
     def exit_cli(self) -> str:
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self, *, preserve_session: bool = False) -> None:
         data_dir = self._data_dir or self._data_dir_path()
         self._require_managed_data_dir(data_dir)
         if data_dir.exists():
