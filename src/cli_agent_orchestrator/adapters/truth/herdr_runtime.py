@@ -149,15 +149,6 @@ _SUBSCRIPTIONS: list[dict[str, Any]] = [{"type": "pane.updated"}]
 #: ``core/timing.py`` is a noted H2 follow-up (see the module report's Deviations).
 _BACKOFF_MULTIPLIER = 2.0
 
-#: How often a connected-but-quiet source bumps ``last_source_probe_at``.
-#:
-#: ``Projector._source_healthy`` treats a source whose probe column is older than
-#: ``NO_SIGNAL_S`` as UNHEALTHY and stops muting derived events — which is the
-#: correct fallback for a source that has genuinely died, and exactly the WRONG
-#: reading of a herdr source whose worker simply has not changed state for a
-#: minute.  So health is a heartbeat, not an event count: a quarter of
-#: ``NO_SIGNAL_S`` leaves three missed beats before the projector doubts us.
-_PROBE_KEEPALIVE_S = NO_SIGNAL_S / 4.0
 
 _lock = threading.RLock()
 #: terminal_id -> the live source for it (one source per terminal, §4).
@@ -227,7 +218,17 @@ class HerdrRuntimeSource:
         client: HerdrClient | None = None,
         reconnect_backoff_base_s: float = 1.0,
         reconnect_backoff_max_s: float = 30.0,
-        probe_keepalive_s: float = _PROBE_KEEPALIVE_S,
+        # A quarter of ``NO_SIGNAL_S``: ``Projector._source_healthy`` treats a
+        # probe column older than that horizon as UNHEALTHY and stops muting
+        # derived events, which is the right reading of a source that has died
+        # and the wrong reading of a herdr source whose worker simply has not
+        # changed state for a minute.  Health is a heartbeat, not an event count,
+        # and a quarter leaves three missed beats before the projector doubts us.
+        # An ARG DEFAULT rather than a module constant, deliberately: §4c forbids
+        # a ``*_S``-named module-level duration binding outside ``core/timing.py``
+        # (``test_no_other_new_module_defines_a_duration_constant``), and this
+        # module's backoff seconds are arg defaults for exactly the same reason.
+        probe_keepalive_s: float = NO_SIGNAL_S / 4.0,
     ) -> None:
         if not herdr_terminal_id and not pane_id:
             raise ValueError(
@@ -408,15 +409,20 @@ class HerdrRuntimeSource:
         runtime = producer_runtime()
         if runtime is None:
             return
-        store = runtime.state_store
-        if store is None:
-            # A lane brought producers up without a StateStore.  Strictly less
-            # information, never wrong information: the projector then treats the
-            # source as unhealthy and the pane fallback stays live.
-            return
         try:
+            store = runtime.state_store
+            if store is None:
+                # A lane brought producers up without a StateStore.  Strictly
+                # less information, never wrong information: the projector then
+                # treats the source as unhealthy and the pane fallback stays live.
+                return
             store.touch_source_probe(self.terminal_id, probed_at=runtime.clock.now())
         except Exception:  # pragma: no cover - the never-break-the-server rule
+            # The guard spans the whole body, not just the call.  A runtime
+            # assembled without a ``state_store`` attribute at all (a test
+            # double) must cost this producer nothing — a health bump is a
+            # diagnostic, and a diagnostic may never raise into the stream it
+            # is observing.
             logger.debug(
                 "herdr runtime source probe bump failed for %s",
                 self.terminal_id,

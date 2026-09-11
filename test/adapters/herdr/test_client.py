@@ -51,9 +51,11 @@ class FakeHerdrServer:
 
     ``on_request`` is called for every JSON-RPC line the client sends; the
     handler writes whatever replies/pushes the test wants via :meth:`reply`,
-    :meth:`error` and :meth:`push`.  The default handler answers ``api.schema``
-    with the pinned protocol and acks ``events.subscribe`` — enough for the happy
-    path — and a test overrides it for the edge cases.
+    :meth:`error` and :meth:`push`.  The default handler acks
+    ``events.subscribe`` and answers ``session.snapshot`` with the pinned
+    protocol — enough for the happy path, since 0.9.0 carries the protocol in the
+    snapshot and has no schema method — and a test overrides it for the edge
+    cases.
     """
 
     def __init__(self, socket_path: str) -> None:
@@ -125,17 +127,37 @@ class FakeHerdrServer:
     async def _default_handler(self, request: dict[str, Any]) -> None:
         method = request.get("method")
         request_id = request["id"]
-        if method == "api.schema":
+        if method == "events.subscribe":
+            await self.reply(request_id, {"type": "subscription_started"})
+        elif method == "session.snapshot":
+            # herdr 0.9.0 carries the protocol number IN the snapshot; there is
+            # no separate schema method, so ``check_protocol`` reads this reply.
             await self.reply(
                 request_id,
-                {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION},
+                {
+                    "snapshot": {
+                        "panes": [],
+                        "protocol": HERDR_PROTOCOL,
+                        "schema_version": HERDR_SCHEMA_VERSION,
+                    }
+                },
             )
-        elif method == "events.subscribe":
-            await self.reply(request_id, {"type": "subscription_started"})
-        elif method == "api.snapshot":
-            await self.reply(request_id, {"snapshot": {"panes": []}})
         else:
             await self.reply(request_id, {})
+
+
+def _snapshot_body(panes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A ``session.snapshot`` body carrying the pinned protocol numbers.
+
+    herdr 0.9.0 reports the protocol IN the snapshot and has no separate schema
+    method, so every fake that answers ``session.snapshot`` must carry the pin or
+    ``check_protocol`` — which now reads it from here — sees a mismatch.
+    """
+    return {
+        "panes": list(panes or []),
+        "protocol": HERDR_PROTOCOL,
+        "schema_version": HERDR_SCHEMA_VERSION,
+    }
 
 
 @pytest.fixture
@@ -199,8 +221,8 @@ async def test_request_returns_result_body(socket_path: str) -> None:
     async with FakeHerdrServer(socket_path):
         client = HerdrClient(socket_path)
         await client.connect()
-        result = await client.request("api.snapshot")
-        assert result == {"snapshot": {"panes": []}}
+        result = await client.request("session.snapshot")
+        assert result == {"snapshot": _snapshot_body()}
         await client.close()
 
 
@@ -255,8 +277,8 @@ async def test_event_between_subscribe_and_snapshot_is_delivered_once_in_order(
             await server.reply(request_id, {"type": "subscription_started"})
             # An event races in AFTER the ack but BEFORE the snapshot request.
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-        elif method == "api.snapshot":
-            await server.reply(request_id, {"snapshot": {"panes": []}})
+        elif method == "session.snapshot":
+            await server.reply(request_id, {"snapshot": _snapshot_body()})
             # A live event that arrives AFTER the snapshot.
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
             await server.close_connection()
@@ -288,7 +310,7 @@ async def test_request_times_out_when_server_never_answers(socket_path: str) -> 
         client = HerdrClient(socket_path, request_timeout_s=0.3)
         await client.connect()
         with pytest.raises(HerdrTransportError):
-            await client.request("api.snapshot")
+            await client.request("session.snapshot")
         await client.close()
 
 
@@ -301,7 +323,7 @@ async def test_reply_with_neither_result_nor_error_is_a_transport_error(socket_p
         client = HerdrClient(socket_path)
         await client.connect()
         with pytest.raises(HerdrTransportError):
-            await client.request("api.snapshot")
+            await client.request("session.snapshot")
         await client.close()
 
 
@@ -336,7 +358,12 @@ async def test_check_protocol_refuses_a_drifted_protocol(socket_path: str) -> No
 
 
 async def test_check_protocol_matches_the_fixture_schema_head() -> None:
-    """The pin equals what the real 0.9.0 ``api schema`` reported (fixture)."""
+    """The pin equals what the real 0.9.0 schema head reported (fixture).
+
+    The fixture is kept as the record of where the numbers came from; the LIVE
+    read is now ``session.snapshot``, because 0.9.0's API socket has no
+    ``api.schema`` method and closes the connection on one.
+    """
     head = json.loads((FIXTURES / "api-schema-head.json").read_text())
     assert head["protocol"] == HERDR_PROTOCOL
     assert head["schema_version"] == HERDR_SCHEMA_VERSION
@@ -511,15 +538,11 @@ async def test_adj_r4_event_pushed_BEFORE_the_subscribe_ack_is_buffered(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
             await server.reply(rid, {"type": "subscription_started"})
-        elif method == "api.snapshot":
-            await server.reply(rid, {"snapshot": {"panes": []}})
+        elif method == "session.snapshot":
+            await server.reply(rid, {"snapshot": _snapshot_body()})
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
             await server.close_connection()
         else:
@@ -550,16 +573,12 @@ async def test_adj_r1_event_arrives_during_the_snapshot_response_itself(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
-        elif method == "api.snapshot":
+        elif method == "session.snapshot":
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.reply(rid, {"snapshot": {"panes": []}})
+            await server.reply(rid, {"snapshot": _snapshot_body()})
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
             await server.close_connection()
         else:
@@ -590,18 +609,14 @@ async def test_adj_r2_burst_of_fifty_interleaved_events_no_drop_dup_or_reorder(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
             for i in range(1, 21):  # 20 between ack and snapshot request
                 await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-        elif method == "api.snapshot":
+        elif method == "session.snapshot":
             for i in range(21, 41):  # 20 more inside the snapshot round trip
                 await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-            await server.reply(rid, {"snapshot": {"panes": []}})
+            await server.reply(rid, {"snapshot": _snapshot_body()})
             for i in range(41, 51):  # 10 live, after the snapshot
                 await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
             await server.close_connection()
@@ -634,15 +649,11 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-        elif method == "api.snapshot":
-            await server.reply(rid, {"snapshot": {"panes": []}})
+        elif method == "session.snapshot":
+            await server.reply(rid, {"snapshot": _snapshot_body()})
         else:
             await server.reply(rid, {})
 
