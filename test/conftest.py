@@ -388,6 +388,32 @@ def _bypass_sender_token(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _delivery_runtime_leak_guard():
+    """No test may leave a delivery runtime installed for the next one.
+
+    WP-ARCH 3c slice 4 made this load-bearing. Before it, ``install_delivery``
+    carried a POSITION, and a runtime left behind at ``off`` or ``drain`` was
+    inert — ``queue_owns_new_traffic()`` asked the position, not the presence.
+    The switch is gone and presence IS the predicate, so a leaked runtime now
+    silently flips write-through ON for every later test in that xdist worker:
+    ``create_inbox_message`` stops writing a legacy inbox row, and anything that
+    then looks the row up gets ``stale_candidate``. Measured as ~65 failures
+    spread over fifteen unrelated files, none of which mention delivery.
+
+    An installer that forgets its teardown is the ordinary cause, and hunting it
+    down each time is the wrong shape of fix: process-global state that a test
+    installs must not outlive it, and that is cheap to enforce once, here.
+    """
+    yield
+    try:
+        from cli_agent_orchestrator.app.delivery import wiring
+
+        wiring.reset_delivery()
+    except Exception:  # pragma: no cover — an unimportable wiring is not a leak
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _sim_leak_guard():
     """F254 D14: suite-wide guard — no sim clock/RNG/backend leaks across tests.
 
