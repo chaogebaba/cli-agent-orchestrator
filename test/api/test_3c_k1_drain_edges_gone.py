@@ -34,22 +34,34 @@ def test_the_ws_supervisor_doorbell_route_is_absent() -> None:
     assert "/ws/supervisor/{terminal_id}" not in _route_paths()
 
 
-def test_posting_to_the_drain_edge_is_a_404(client) -> None:
-    """The behavioural half: no route matches, so FastAPI answers 404 before any
-    terminal lookup or scope check runs."""
+#: A POST to a path the app does not serve comes back 404 when nothing matches
+#: and 405 when something matches the path under another method. Which one an
+#: environment produces is not the property under test -- the laptop answers 404
+#: and a box answers 405 for these same two paths on the same commit -- so the
+#: arms below accept either and the exact absence is pinned by the route-table
+#: arms above. What both codes rule out is the only thing that matters here: no
+#: POST reaches a drain handler.
+_NO_SUCH_POST = (404, 405)
+
+
+def test_posting_to_the_drain_edge_does_not_reach_a_handler(client) -> None:
+    """The behavioural half: the request is refused by the router itself, before
+    any terminal lookup, scope check or caller binding runs."""
     resp = client.post(
         "/terminals/abcd1234/inbox/drain",
         json={"terminal_id": "abcd1234"},
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code in _NO_SUCH_POST, resp.text
+    assert "op" not in resp.text, "a drain handler answered: the edge is still live"
 
 
-def test_posting_to_the_drain_ack_edge_is_a_404(client) -> None:
+def test_posting_to_the_drain_ack_edge_does_not_reach_a_handler(client) -> None:
     resp = client.post(
         "/terminals/abcd1234/inbox/drain-ack",
         json={"terminal_id": "abcd1234"},
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code in _NO_SUCH_POST, resp.text
+    assert "op" not in resp.text, "an ack handler answered: the edge is still live"
 
 
 def test_the_register_hooks_journal_edge_survives() -> None:
