@@ -307,3 +307,67 @@ def test_process_identity_matches_requires_all_three() -> None:
     assert not a.matches(ProcessIdentity(boot_id="b", pid=100, start_ticks=43))
     assert not a.matches(ProcessIdentity(boot_id="b", pid=None, start_ticks=42))
     assert not a.matches(None)
+
+
+# ── AC-2: provider representation-routing (pi rejects rendered-frame route) ──
+def test_ac2_pi_declares_only_direct_rendered_and_rejects_screen() -> None:
+    """pi has no get_status_from_screen override and supports_screen_detection
+    is False, so it declares ONLY the direct rendered route. A SCREEN sample
+    built for pi is rejected by the reducer regardless of the verdict facts —
+    the routing assertion is INDEPENDENT of the outcome (D8 / AC-2)."""
+    # A pi sample that WOULD be idle if routed, but arrives on the SCREEN route.
+    s = sc.sample_from_legacy_status(
+        "pi1",
+        TerminalStatus.IDLE,
+        mode=SampleMode.SCREEN,
+        declared_modes=(SampleMode.DIRECT_RENDERED,),
+    )
+    out = reduce(s, _ctx(terminal_id="pi1"))
+    assert out.status is TerminalStatus.UNKNOWN
+    assert out.reason == "bad_route"
+
+
+def test_ac2_pi_accepts_its_direct_route() -> None:
+    s = sc.sample_from_legacy_status(
+        "pi1",
+        TerminalStatus.PROCESSING,
+        mode=SampleMode.DIRECT_RENDERED,
+        declared_modes=(SampleMode.DIRECT_RENDERED,),
+    )
+    out = reduce(s, _ctx(terminal_id="pi1"))
+    assert out.status is TerminalStatus.PROCESSING
+
+
+def test_ac2_codex_accepts_both_declared_routes() -> None:
+    declared = (SampleMode.SCREEN, SampleMode.DIRECT_RENDERED)
+    for mode in declared:
+        s = sc.sample_from_legacy_status(
+            "cx1", TerminalStatus.PROCESSING, mode=mode, declared_modes=declared
+        )
+        out = reduce(s, _ctx(terminal_id="cx1"))
+        assert out.reason != "bad_route"
+    # a route codex does NOT declare (RAW) is rejected
+    s_raw = sc.sample_from_legacy_status(
+        "cx1", TerminalStatus.PROCESSING, mode=SampleMode.RAW, declared_modes=declared
+    )
+    assert reduce(s_raw, _ctx(terminal_id="cx1")).reason == "bad_route"
+
+
+def test_ac2_legacy_bridge_projects_verdict_identically() -> None:
+    """The thin-route bridge projects each legacy verdict back to the same
+    status (byte-identical behaviour on a bare call — the migration is
+    transparent to existing get_status callers)."""
+    declared = (SampleMode.DIRECT_RENDERED,)
+    cases = {
+        TerminalStatus.PROCESSING: TerminalStatus.PROCESSING,
+        TerminalStatus.IDLE: TerminalStatus.IDLE,
+        TerminalStatus.COMPLETED: TerminalStatus.COMPLETED,
+        TerminalStatus.WAITING_USER_ANSWER: TerminalStatus.WAITING_USER_ANSWER,
+        TerminalStatus.ERROR: TerminalStatus.ERROR,
+        TerminalStatus.UNKNOWN: TerminalStatus.UNKNOWN,
+    }
+    for verdict, expected in cases.items():
+        out = sc.derive_status_from_legacy(
+            "t", verdict, mode=SampleMode.DIRECT_RENDERED, declared_modes=declared
+        )
+        assert out.status is expected, f"{verdict} -> {out.status}, want {expected}"

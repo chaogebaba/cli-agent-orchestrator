@@ -78,6 +78,7 @@ from typing import Any, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
+from cli_agent_orchestrator.providers import status_contract
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -912,6 +913,16 @@ class PiCliProvider(BaseProvider):
         line is transcript, never a terminal ERROR — so a nudged worker that
         resumes real work re-derives PROCESSING/IDLE instead of latching error.
         """
+        # fx751 Slice A (AC-2): get_status is now a THIN ROUTE onto the typed
+        # contract. The hardened pi chrome extraction is unchanged and lives in
+        # ``_classify_verdict``; here we run it, then project through the pure
+        # reducer so the reducer is the single status AUTHORITY (D2). The
+        # projected legacy status is byte-identical to the pre-migration verdict
+        # for every input — the reducer's D4 lowering gate does not apply on a
+        # BARE call (no generation/freshness context), which is supplied at the
+        # monitor fusion site (AC-5a). pi's declared representation route is the
+        # DIRECT rendered read; a rendered-frame path it does not declare is
+        # rejected there (AC-2 routing).
         native = self._resolve_native_status(buffer)
         if native is not None:
             return native
@@ -919,7 +930,47 @@ class PiCliProvider(BaseProvider):
         if not self._initialized:
             return TerminalStatus.UNKNOWN
 
-        clean = strip_terminal_escapes(self._resolve_buffer(buffer))
+        verdict = self._classify_verdict(strip_terminal_escapes(self._resolve_buffer(buffer)))
+        return self.derive_status(verdict).status
+
+    def derive_status(
+        self,
+        verdict: TerminalStatus,
+        context: "status_contract.ReducerContext | None" = None,
+    ) -> "status_contract.Candidate":
+        """fx751 AC-2: route a classifier verdict through the pure reducer.
+
+        pi's representation route is ``DIRECT_RENDERED`` (it has no
+        ``get_status_from_screen`` override and ``supports_screen_detection`` is
+        False), so it declares only that mode; the reducer rejects a
+        rendered-frame (``SCREEN``) route it does not declare. ``context`` is
+        supplied by the monitor fusion path with real generations (AC-5a); a
+        bare call seeds a fresh context so the verdict projects immediately.
+        """
+        if context is None:
+            return status_contract.derive_status_from_legacy(
+                self.terminal_id,
+                verdict,
+                mode=status_contract.SampleMode.DIRECT_RENDERED,
+                declared_modes=(status_contract.SampleMode.DIRECT_RENDERED,),
+                dispatched=self._task_dispatched,
+            )
+        sample = status_contract.sample_from_legacy_status(
+            self.terminal_id,
+            verdict,
+            mode=status_contract.SampleMode.DIRECT_RENDERED,
+            declared_modes=(status_contract.SampleMode.DIRECT_RENDERED,),
+            dispatched=self._task_dispatched,
+        )
+        return status_contract.reduce(sample, context)
+
+    def _classify_verdict(self, clean: str) -> TerminalStatus:
+        """The hardened pi chrome classifier (fact extraction for AC-2).
+
+        UNCHANGED behaviour from the pre-fx751 ``get_status`` body — factored out
+        so both the thin ``get_status`` route and the monitor fusion path derive
+        from ONE extractor rather than two competing state machines (D2).
+        """
         if not clean.strip():
             return TerminalStatus.UNKNOWN
 

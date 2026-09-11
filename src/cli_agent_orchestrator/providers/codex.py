@@ -28,6 +28,7 @@ from cli_agent_orchestrator.adapters.truth.codex_rollout import (
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR, PYTE_SCREEN_ROWS
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
+from cli_agent_orchestrator.providers import status_contract
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
     RetryableArtifactValidation,
@@ -3523,8 +3524,44 @@ class CodexProvider(BaseProvider):
         # fail closed while INITIALIZING, preserve the same rows as content once
         # RUNNING. The startup handler remains responsible for dismissal.
         if not self._initialized and _has_update_dialog_in_bottom(strip_terminal_escapes(output)):
-            return TerminalStatus.WAITING_USER_ANSWER
-        return self._get_screen_local_status(output)
+            return self.derive_status(
+                TerminalStatus.WAITING_USER_ANSWER,
+                mode=status_contract.SampleMode.DIRECT_RENDERED,
+            ).status
+        # fx751 AC-2 thin route: the hardened text classifier is unchanged; its
+        # verdict is projected through the pure reducer (the single status
+        # authority, D2). The buffer path is the DIRECT rendered route.
+        verdict = self._get_screen_local_status(output)
+        return self.derive_status(verdict, mode=status_contract.SampleMode.DIRECT_RENDERED).status
+
+    def derive_status(
+        self,
+        verdict: TerminalStatus,
+        *,
+        mode: "status_contract.SampleMode",
+        context: "status_contract.ReducerContext | None" = None,
+    ) -> "status_contract.Candidate":
+        """fx751 AC-2: route a classifier verdict through the pure reducer.
+
+        codex declares BOTH representation routes — ``SCREEN`` (its pyte
+        ``get_status_from_screen`` override, ``supports_screen_detection=True``)
+        and ``DIRECT_RENDERED`` (the raw buffer path). ``context`` is supplied by
+        the monitor fusion path with real generations (AC-5a); a bare call seeds
+        a fresh context so the verdict projects immediately, preserving the
+        legacy per-call contract.
+        """
+        declared = (
+            status_contract.SampleMode.SCREEN,
+            status_contract.SampleMode.DIRECT_RENDERED,
+        )
+        if context is None:
+            return status_contract.derive_status_from_legacy(
+                self.terminal_id, verdict, mode=mode, declared_modes=declared
+            )
+        sample = status_contract.sample_from_legacy_status(
+            self.terminal_id, verdict, mode=mode, declared_modes=declared
+        )
+        return status_contract.reduce(sample, context)
 
     @staticmethod
     def _get_screen_local_status(output: str) -> TerminalStatus:
@@ -3946,7 +3983,11 @@ class CodexProvider(BaseProvider):
         )
 
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
-        return self.classify_screen(screen_lines).status
+        # fx751 AC-2 thin route: the hardened screen classifier is unchanged;
+        # its verdict is projected through the pure reducer (the single status
+        # authority, D2). SCREEN is a declared codex route.
+        verdict = self.classify_screen(screen_lines).status
+        return self.derive_status(verdict, mode=status_contract.SampleMode.SCREEN).status
 
     def read_composer_draft(self, screen_lines: list[str]) -> str | None:
         """Read the visible Codex composer draft from rendered screen lines.

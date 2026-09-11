@@ -68,6 +68,9 @@ __all__ = [
     "MIGRATION_REGISTRY",
     "is_migrated",
     "SAMPLE_EXPIRY_S",
+    "facts_from_legacy_status",
+    "sample_from_legacy_status",
+    "derive_status_from_legacy",
 ]
 
 
@@ -654,3 +657,113 @@ def _confirm_lowering(
         evidence=_evidence_of(sample),
         next_context=next_ctx,
     )
+
+
+# ── legacy-verdict bridge (AC-2 thin routes) ───────────────────────────────
+# The migrated providers keep their hardened text classifiers (codex's
+# ScreenClassificationResult, pi's _live_working_spinner/_has_idle_chrome). AC-2
+# makes the reducer the single AUTHORITY without rewriting those extractors: the
+# provider runs its classifier, maps the verdict into typed facts, and routes
+# through the reducer. The full generation/freshness envelope is supplied at the
+# monitor fusion site (AC-5a); a BARE get_status call has no second sample, so
+# the bridge below builds a self-consistent, immediately-projectable sample and
+# seeds the context so no spurious two-sample hold is produced — preserving the
+# legacy per-call contract ("always returns a valid status").
+
+
+def facts_from_legacy_status(
+    status: TerminalStatus,
+    *,
+    dispatched: bool = False,
+    working_seen: bool = False,
+) -> Tuple[HealthFact, ActivityFact, ReadinessFact, SettlementFact]:
+    """Map a legacy per-call ``TerminalStatus`` verdict into typed facts.
+
+    This is the projection SEAM for a thin route: the classifier already
+    decided PROCESSING/IDLE/COMPLETED/WAITING/ERROR/UNKNOWN from the frame; we
+    express that decision as the facts D1 ranks. A verdict is *this frame's*
+    evidence, so it is marked PRESENT/ABSENT accordingly. UNKNOWN maps to all
+    facts UNKNOWN (no evidence).
+    """
+    ev = Evidence(kind="legacy_verdict", detail=status.value)
+    health = HealthFact()
+    activity = ActivityFact()
+    readiness = ReadinessFact()
+    settlement = SettlementFact(dispatched=dispatched)
+
+    if status is TerminalStatus.PROCESSING:
+        activity = ActivityFact(value=FactValue.PRESENT, evidence=ev)
+    elif status is TerminalStatus.WAITING_USER_ANSWER:
+        readiness = ReadinessFact(blocking_question=True, evidence=ev)
+    elif status is TerminalStatus.ERROR:
+        health = HealthFact(value=FactValue.ABSENT, exited=True, evidence=ev)
+    elif status is TerminalStatus.COMPLETED:
+        readiness = ReadinessFact(value=FactValue.PRESENT, evidence=ev)
+        settlement = SettlementFact(value=FactValue.PRESENT, dispatched=dispatched, evidence=ev)
+    elif status is TerminalStatus.IDLE:
+        readiness = ReadinessFact(value=FactValue.PRESENT, evidence=ev)
+    # UNKNOWN / RENDER_UNCERTAIN → all facts UNKNOWN (no evidence).
+    return health, activity, readiness, settlement
+
+
+def sample_from_legacy_status(
+    terminal_id: str,
+    status: TerminalStatus,
+    *,
+    mode: SampleMode,
+    declared_modes: Tuple[SampleMode, ...],
+    frame_locatable: bool = True,
+    condition: Optional[ConditionFact] = None,
+    dispatched: bool = False,
+) -> StatusSample:
+    """Build a self-consistent ``StatusSample`` from a legacy verdict for the
+    bare-call thin route (AC-2). A frame that produced UNKNOWN and whose
+    boundaries were unlocatable sets ``frame_locatable=False`` so AC-3 holds."""
+    health, activity, readiness, settlement = facts_from_legacy_status(
+        status, dispatched=dispatched
+    )
+    return StatusSample(
+        terminal_id=terminal_id,
+        sample_mode=mode,
+        declared_modes=declared_modes,
+        frame_locatable=frame_locatable,
+        captured_after_trigger=True,
+        age_s=0.0,
+        sequence=0,
+        # A bare call is event-confirmed-equivalent for a READY verdict: the
+        # legacy contract returns a valid status every call, so a lowering must
+        # project immediately rather than hold. native_coverage+native_end_event
+        # take the event-confirmed arm in the reducer for IDLE/COMPLETED.
+        native_coverage=status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED),
+        native_end_event=status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED),
+        health=health,
+        activity=activity,
+        readiness=readiness,
+        settlement=settlement,
+        condition=condition if condition is not None else ConditionFact(),
+    )
+
+
+def derive_status_from_legacy(
+    terminal_id: str,
+    status: TerminalStatus,
+    *,
+    mode: SampleMode,
+    declared_modes: Tuple[SampleMode, ...],
+    frame_locatable: bool = True,
+    condition: Optional[ConditionFact] = None,
+    dispatched: bool = False,
+) -> Candidate:
+    """Thin-route convenience: build a legacy-verdict sample and reduce it with
+    a fresh seeded context so the bare call projects immediately (AC-2)."""
+    sample = sample_from_legacy_status(
+        terminal_id,
+        status,
+        mode=mode,
+        declared_modes=declared_modes,
+        frame_locatable=frame_locatable,
+        condition=condition,
+        dispatched=dispatched,
+    )
+    ctx = ReducerContext(terminal_id=terminal_id, last_sequence=-1)
+    return reduce(sample, ctx)
