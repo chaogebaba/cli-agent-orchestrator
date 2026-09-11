@@ -339,7 +339,13 @@ cap_banner_for() {
 }
 cappable_lanes=""
 while read -r lane_id lane_provider; do
-  cap_banner_for "\$lane_provider" > "\$ROUND/cap-banner-\$lane_provider.txt" 2>/dev/null || continue
+  # Redirect AFTER the lookup succeeds.  Writing straight to the file created an
+  # empty ``cap-banner-claude_code.txt`` for every provider with no banner,
+  # because the shell opens the redirect before the function runs and
+  # ``continue`` cannot unmake it — an empty banner file in the artefacts reads
+  # like a drive that was attempted and produced nothing.
+  lane_banner=\$(cap_banner_for "\$lane_provider" 2>/dev/null) || continue
+  printf '%s\n' "\$lane_banner" > "\$ROUND/cap-banner-\$lane_provider.txt"
   cappable_lanes="\$cappable_lanes \$lane_id"
   send "\$lane_id" "Run this exact shell command and nothing else, then stop: cat \$ROUND/cap-banner-\$lane_provider.txt"
   echo "cap drive -> \$lane_id (\$lane_provider)" >> "\$ROUND/send.log"
