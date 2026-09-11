@@ -1028,6 +1028,30 @@ class PiCliProvider(BaseProvider):
         if native is not None:
             return native
 
+        # WP-HERDR H1 §8: on the CERTIFIED path, pi's TUI chrome is no longer a
+        # lifecycle source. The herdr runtime EventSource owns busy/idle for this
+        # terminal, and a scraper that keeps inferring lifecycle underneath it is
+        # a SECOND source for the same fact — which is what §4's "one source per
+        # terminal" forbids and what makes a disagreement unresolvable.
+        #
+        # This is a GATE, never a deletion. An UNCERTIFIED pi terminal — every pi
+        # terminal today, and every pi terminal on the tmux backend forever —
+        # still runs the whole chrome classifier below, byte-identically. Only a
+        # terminal whose bound cell carries a PASS herdr_certification row, with
+        # the seam armed, takes this branch.
+        #
+        # UNKNOWN rather than the last-known state: the native status being None
+        # on a certified terminal means the authoritative source has nothing to
+        # say right now, and fabricating a lifecycle answer from pixels is
+        # exactly the silent revert §6(ii) exists to prevent. UNKNOWN is the
+        # honest answer and the one the projector will not lower.
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+            herdr_lifecycle_authoritative,
+        )
+
+        if herdr_lifecycle_authoritative(self.terminal_id):
+            return TerminalStatus.UNKNOWN
+
         if not self._initialized:
             return TerminalStatus.UNKNOWN
 
