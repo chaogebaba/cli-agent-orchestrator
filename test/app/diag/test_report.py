@@ -15,14 +15,12 @@ from cli_agent_orchestrator.app.diag.report import (
     INGEST_OFF_NOTE,
     DiagSources,
     findings_payload,
-    render_agreement,
     render_findings,
     render_timeline,
     render_why,
     timeline_payload,
     why_payload,
 )
-from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.core.events import DecisionKind, EventKind
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
@@ -268,59 +266,6 @@ def test_findings_carry_the_sample_event_a_filed_issue_needs(rig: Rig) -> None:
 
 def test_no_findings_says_so(rig: Rig) -> None:
     assert render_findings(_sources(rig), now=rig.clock.now()) == "no findings"
-
-
-# ------------------------------------------------------------------- agreement
-
-
-def test_an_invalid_report_leads_with_its_invalidity(rig: Rig) -> None:
-    """It cannot be quoted out of context as a result."""
-    rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "idle")
-
-    text = render_agreement(build_agreement_report(rig.events.read()))
-
-    assert text.splitlines()[0].startswith("AGREEMENT REPORT — INVALID")
-    assert "no conclusion" in text
-
-
-def test_a_valid_report_says_the_floor_was_met(rig: Rig) -> None:
-    for index in range(3):
-        terminal = f"term-{index}"
-        for _ in range(30):
-            rig.emit(terminal, EventKind.TURN_STARTED)
-            rig.legacy(terminal, "processing")
-            rig.clock.advance(1)
-            rig.emit(terminal, EventKind.TURN_ENDED)
-            rig.legacy(terminal, "idle")
-            rig.clock.advance(1)
-
-    text = render_agreement(build_agreement_report(rig.events.read()))
-
-    assert text.splitlines()[0].startswith("AGREEMENT REPORT — VALID")
-    assert "genuine=" in text
-
-
-def test_the_rate_is_labelled_so_lag_is_not_read_as_breakage(rig: Rig) -> None:
-    rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    rig.legacy(TERMINAL, "processing")
-
-    text = render_agreement(build_agreement_report(rig.events.read()))
-
-    assert "lag counts against it" in text
-    assert "the number that matters is genuine" in text
-
-
-def test_genuine_disagreements_are_listed_individually(rig: Rig) -> None:
-    rig.emit(TERMINAL, EventKind.TURN_ENDED)
-    rig.legacy(TERMINAL, "idle")
-    rig.clock.advance(1)
-    rig.emit(TERMINAL, EventKind.TURN_STARTED)
-
-    text = render_agreement(build_agreement_report(rig.events.read()))
-
-    assert "genuine disagreements" in text
-    assert "unresolved" in text
 
 
 # ------------------------------------------------------------------ fleet rows

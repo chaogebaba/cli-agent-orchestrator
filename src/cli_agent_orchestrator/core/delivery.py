@@ -29,6 +29,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.switches import Rejected, retired_position
 from cli_agent_orchestrator.core.timing import DELIVERY_MAX_ATTEMPTS, DELIVERY_MAX_LIFETIME_S
 
 __all__ = [
@@ -69,6 +70,9 @@ __all__ = [
     "WakeClassification",
     "WakeEmission",
     "WakeSender",
+    "RETIRED_SWITCH_VALUES",
+    "Rejected",
+    "SWITCH_FIX_HINT",
     "build_digest_line",
     "classify_wake_reason",
     "compute_dead_by",
@@ -80,22 +84,16 @@ __all__ = [
 
 
 class QueueMode(StrEnum):
-    """Whether a row is an observational copy or the real thing.
+    """The row's mode column.  One value: every row is the real thing.
 
-    Set at enqueue and NEVER rewritten.  ``shadow`` from sub-phase 3a, ``live``
-    from the write-through flip onward.
-
-    The discriminator exists because 3a writes copies of messages the legacy
-    path owns into the same table the queue will later serve from.  Two
-    mechanisms depend on telling them apart, and the blueprint records why each
-    needs it: D9's boot guard counts occupancy over LIVE rows only, or a bounced
-    shadow deployment would resolve to ``drain`` and inject copies of messages
-    already delivered (#506, reproduced by the guard added to prevent loss); and
-    ``claim`` filters on it so a shadow row is undeliverable by construction
-    rather than by each consumer remembering (B20).
+    Sub-phase 3a had a second value, ``shadow``, for observational copies of
+    messages the legacy path owned.  Shadow-live mode is RETIRED (#738, user
+    ruling 2026-09-09): a flag flip is accepted by a grok-box live round, never
+    by a dark deployment writing copies beside the real traffic.  The column
+    survives the retirement because rows written before it exist and the store
+    still reads them; nothing writes anything but ``live``.
     """
 
-    SHADOW = "shadow"
     LIVE = "live"
 
 
@@ -103,8 +101,7 @@ class MsgState(StrEnum):
     """The state column of ``delivery_msg`` (audit §3.2, extended by the phase).
 
     ``superseded`` is the blueprint's addition to the audit's four: F578
-    supersession (D8) and the flip's sweep of unresolved shadow rows both need
-    an ending that is neither a delivery nor a death.  Folding it into ``dead``
+    supersession (D8) needs an ending that is neither a delivery nor a death.  Folding it into ``dead``
     would make the dead-letter table mean two different things and would put
     ordinary supersession traffic in front of an operator reading for failures.
 
@@ -122,7 +119,7 @@ class MsgState(StrEnum):
 
 #: I1's terminal set.  An enqueued message ends in exactly one of these and does
 #: not rest in a pending state without a deadline.  Read by D9's occupancy
-#: predicate, by retention, and by the AC-3a agreement report.
+#: predicate and by retention.
 TERMINAL_STATES = frozenset({MsgState.DELIVERED, MsgState.SUPERSEDED, MsgState.DEAD})
 
 
@@ -241,8 +238,9 @@ NON_DELIVERY_OUTCOMES = frozenset(
 #: error (§5b): the epoch stays open, the lease expires, ``reclaim`` re-offers,
 #: and the same epoch is re-woken with a fresh ordinal.
 #:
-#: ``LEGACY_OTHER`` is absent because it is a 3a mirror-writer value on a shadow
-#: row, and shadow rows are never leased, so ``reclaim`` never sees one.
+#: ``LEGACY_OTHER`` is absent because it was a 3a mirror-writer value, retired
+#: with shadow mode (#738); no live claim ever records one, so ``reclaim``
+#: never sees it.
 ATTEMPT_BUDGET_OUTCOMES = frozenset(
     {
         AttemptOutcome.VETO_UNVERIFIED,
@@ -629,29 +627,42 @@ def build_digest_line(*, epoch: int, msgs: int, wake: int, msg_ids: tuple[str, .
 
 
 class SwitchPosition(StrEnum):
-    """``CAO_DELIVERY_QUEUE``, four positions (D9).
+    """``CAO_DELIVERY_QUEUE``, three positions (D9, narrowed by #738).
 
     A separate variable from phase 1's ingestion switch, sitting beside it in
     ``bootstrap.py`` and read once at boot in the same structural way.  It is a
     DIFFERENT switch rather than a second spelling of the same one: one master
     strangler flag would couple a phase-1 rollback to a phase-3 rollback.
 
-    The fourth position is not decoration.  With dual-write excluded, a row
-    enqueued while ``on`` exists in ``delivery_msg`` and nowhere else, so
-    demoting straight to ``shadow`` would resume legacy inserts while leaving
-    those rows in a table the seat is no longer served from — silent message
-    loss on the one control the phase offers for backing out (#584).  ``drain``
-    keeps serving the rows already enqueued while new traffic goes back to
-    legacy, so the queue empties on its own budget.
+    ``drain`` is not decoration.  With dual-write excluded, a row enqueued while
+    ``on`` exists in ``delivery_msg`` and nowhere else, so demoting straight to
+    ``off`` would resume legacy inserts while leaving those rows in a table the
+    seat is no longer served from — silent message loss on the one control the
+    phase offers for backing out (#584).  ``drain`` keeps serving the rows
+    already enqueued while new traffic goes back to legacy, so the queue empties
+    on its own budget.
+
+    There is no fourth position.  ``shadow`` — the dark mode that wrote copies of
+    legacy traffic beside it — is RETIRED (#738, user ruling 2026-09-09):
+    :func:`parse_switch` answers :class:`Rejected` for it and the boot refuses to
+    start delivery rather than running a mode that no longer exists.  A flag flip
+    is accepted by a grok-box live round now, not by a dark deployment.
     """
 
     OFF = "off"
-    SHADOW = "shadow"
     DRAIN = "drain"
     ON = "on"
 
 
-def parse_switch(value: str | None) -> SwitchPosition:
+#: What an operator must be told to type instead of a retired position.
+SWITCH_FIX_HINT = "set CAO_DELIVERY_QUEUE=off|drain|on"
+
+#: The positions this build removed.  Named so the rejection can say which value
+#: it saw and why it is gone, rather than reporting a generic parse failure.
+RETIRED_SWITCH_VALUES = frozenset({"shadow"})
+
+
+def parse_switch(value: str | None) -> SwitchPosition | Rejected:
     """Read the environment variable's value.  Unknown or unset means ``off``.
 
     Deliberately permissive about case and surrounding whitespace and
@@ -659,11 +670,23 @@ def parse_switch(value: str | None) -> SwitchPosition:
     ``true`` gets ``off``, and the boot guard's finding is what tells them the
     queue is not being served.  Guessing at an intended position would be a
     worse failure than the default, because the default is the safe one.
+
+    A RETIRED position is the one exception, and the exception is the point:
+    ``shadow`` was a real position in a shipped build, so an operator still
+    carrying it in a drop-in typed something that used to work.  Folding it into
+    the unknown-value default would run their deployment in ``off`` and say
+    nothing; :class:`~core.switches.Rejected` names the value, cites #738 and
+    tells them what to type (:data:`SWITCH_FIX_HINT`).
     """
     if value is None:
         return SwitchPosition.OFF
+    cleaned = value.strip().lower()
+    if cleaned in RETIRED_SWITCH_VALUES:
+        return retired_position(
+            env_var="CAO_DELIVERY_QUEUE", value=cleaned, accepted="off|drain|on"
+        )
     try:
-        return SwitchPosition(value.strip().lower())
+        return SwitchPosition(cleaned)
     except ValueError:
         return SwitchPosition.OFF
 
@@ -676,11 +699,12 @@ class QueueOccupancy:
     :data:`TERMINAL_STATES`.  Both qualifications are load-bearing and each was
     a defect before it was a rule.  Not merely "at least one row", or a finished
     queue would pin the server in ``drain`` forever.  And live rows only,
-    because 3a writes shadow copies into this same table: counting those would
-    resolve a bounced shadow deployment into ``drain``, whose tick would then
-    inject copies of messages the legacy path already delivered — a second
-    carrier over one id, which is #506 reproduced by the guard, in the first
-    sub-phase to ship.
+    because 3a wrote observational copies into this same table: counting those
+    resolved a bounced deployment into ``drain``, whose tick would then inject
+    copies of messages the legacy path already delivered — a second carrier over
+    one id, which is #506 reproduced by the guard.  Those copies can no longer be
+    written (#738 retired the mode) but rows from a build that could are still on
+    disk, so the qualification stays.
 
     ``open_barrier_labels`` carries the labels rather than a count so the
     finding can name them; an operator holding a flip needs to know WHICH
@@ -711,7 +735,7 @@ class GuardOutcome:
 
 
 def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> GuardOutcome:
-    """D9's boot guard: total over four positions and the queue's condition.
+    """D9's boot guard: total over three positions and the queue's condition.
 
     Defined here and nowhere else.  Every other statement of the rule in the
     blueprint — §6's drain window, the occupancy test, the drain tick's own
@@ -723,17 +747,18 @@ def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> Guar
     Requested       Queue empty     Queue non-empty
     ==============  ==============  ==================================
     ``off``         ``off``         ``drain`` + ``DIAG-QUEUE-ORPHAN-GUARD``
-    ``shadow``      ``shadow``      ``drain`` + the same finding
     ``on``          ``on``          ``on`` — the queue is being served
-    ``drain``       ``shadow``      ``drain``
+    ``drain``       ``off``         ``drain``
     ==============  ==============  ==================================
 
     Three properties are worth stating because a reader will look for them:
 
-    * **``drain`` is the one cell that PROMOTES.**  It carries an operator's
-      stated intent forward once the queue is empty; holding a drained
-      deployment in ``drain`` would leave the delivery machinery running with
-      nothing to deliver.  The asymmetry is deliberate.
+    * **``drain`` is the one cell that CHANGES on its own.**  A drained
+      deployment falls back to ``off`` once the queue is empty; holding it in
+      ``drain`` would leave the delivery machinery running with nothing to
+      deliver.  Before #738 this cell landed on ``shadow``, which no longer
+      exists, and ``off`` is what ``shadow`` meant for the served path anyway:
+      neither position serves the queue.
     * **The guard overrides the default.**  A boot with the variable unset over
       a leftover queue runs in ``drain`` in a deployment that never opted in,
       and the finding is how an operator learns.  Silently orphaning the rows
@@ -741,14 +766,17 @@ def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> Guar
     * **It never refuses the boot.**  This ships into the server running the
       strangler work, so a self-inflicted boot failure would be worse than the
       condition it reports.  An operator whose only mistake was leaving a
-      variable unset must not lose the server.
+      variable unset must not lose the server.  A RETIRED position is refused
+      before it reaches here, by :func:`parse_switch`, and refusing it costs the
+      delivery subsystem rather than the server.
 
     A SECOND predicate guards the flip itself: a boot requesting ``on`` while
-    any callback barrier is OPEN resolves to ``shadow`` with
-    ``DIAG-BARRIER-OPEN-AT-FLIP``.  Every barrier opened AFTER the flip
-    associates normally through the queue's own enqueue, so this covers the one
-    case association cannot — a barrier already open at the moment of the flip,
-    whose members would otherwise be split across the legacy inbox and the
+    any callback barrier is OPEN is held back — to ``drain`` if the queue is
+    occupied, so the rows already enqueued are still served, and to ``off`` if it
+    is empty — with ``DIAG-BARRIER-OPEN-AT-FLIP``.  Every barrier opened AFTER
+    the flip associates normally through the queue's own enqueue, so this covers
+    the one case association cannot — a barrier already open at the moment of the
+    flip, whose members would otherwise be split across the legacy inbox and the
     queue.  It is a guard rather than advice about flipping at a quiet moment,
     for the same reason the occupancy predicate is: an operator cannot be asked
     to check a condition the server can check itself.
@@ -764,12 +792,13 @@ def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> Guar
 
     if requested is SwitchPosition.ON and occupancy.open_barrier_labels:
         labels = ", ".join(occupancy.open_barrier_labels)
+        held = SwitchPosition.DRAIN if occupancy.occupied else SwitchPosition.OFF
         return GuardOutcome(
             requested=requested,
-            position=SwitchPosition.SHADOW,
+            position=held,
             finding=FindingCode.DIAG_BARRIER_OPEN_AT_FLIP,
             detail=(
-                "held the write-through flip at shadow: callback barriers still "
+                f"held the write-through flip at {held.value}: callback barriers still "
                 f"OPEN ({labels}); their members would be split across the legacy "
                 "inbox and the queue"
             ),
@@ -786,16 +815,16 @@ def resolve_switch(requested: SwitchPosition, occupancy: QueueOccupancy) -> Guar
             return GuardOutcome(requested=requested, position=SwitchPosition.DRAIN, context=context)
         return GuardOutcome(
             requested=requested,
-            position=SwitchPosition.SHADOW,
+            position=SwitchPosition.OFF,
             finding=FindingCode.DIAG_QUEUE_ORPHAN_GUARD,
             detail=(
                 "drain complete: no live non-terminal rows remain, so the "
-                "requested drain resolved to shadow"
+                "requested drain resolved to off"
             ),
             context=context,
         )
 
-    # off and shadow: identical treatment, since neither serves the queue.
+    # off: it does not serve the queue, so leftover rows must not be orphaned.
     if occupancy.occupied:
         return GuardOutcome(
             requested=requested,
@@ -957,7 +986,7 @@ class EnqueueDraft(BaseModel):
     sender_id: str = ""
     kind: MsgKind = MsgKind.NOTE
     payload: str = ""
-    mode: QueueMode = QueueMode.SHADOW
+    mode: QueueMode = QueueMode.LIVE
     max_attempts: int = Field(default=DELIVERY_MAX_ATTEMPTS, ge=1)
     expire_after_s: int | None = None
     supersede_key: str | None = None
@@ -984,7 +1013,7 @@ class QueueMessage(BaseModel):
     kind: MsgKind = MsgKind.NOTE
     payload: str = ""
     state: MsgState = MsgState.READY
-    mode: QueueMode = QueueMode.SHADOW
+    mode: QueueMode = QueueMode.LIVE
     claim_id: int = 0
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
@@ -1030,11 +1059,8 @@ class DeliveryAttempt(BaseModel):
     """One row of ``delivery_attempt`` — I5's "one query, full history".
 
     Keyed ``(msg_id, claim_id, carrier)``, so a row's whole delivery history is
-    one indexed read rather than pane archaeology.  In sub-phase 3a the mirror
-    writer uses the legacy attempt's ORDINAL as ``claim_id``: shadow rows are
-    never leased, so no real claim ever issues one, and the ordinal is
-    deterministic, which keeps the mirror idempotent when the same legacy
-    attempt is observed twice.
+    one indexed read rather than pane archaeology.  ``claim_id`` is 0 until the
+    row is first leased.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -1057,9 +1083,9 @@ class DeadLetter(BaseModel):
 
     A separate table rather than a status flag, so a poisoned message stops
     occupying the reclaim loop and hiding live rows.  ``mode`` is carried here
-    although the audit's DDL omits it: without it a shadow row that mirrored a
-    legacy expiry would be indistinguishable from a live dead-letter, and
-    AC-3a's counting turns on exactly that distinction.
+    although the audit's DDL omits it: rows written by a build that still had
+    the retired observational mode (#738) are distinguishable from live
+    dead-letters without re-reading the queue.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -1070,7 +1096,7 @@ class DeadLetter(BaseModel):
     payload: str = ""
     attempts: int = 0
     reason: DeadReason
-    mode: QueueMode = QueueMode.SHADOW
+    mode: QueueMode = QueueMode.LIVE
     died_at: datetime
 
     @field_validator("died_at")

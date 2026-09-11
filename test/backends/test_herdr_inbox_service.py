@@ -190,9 +190,7 @@ class TestHerdrInboxServiceDelivery:
         """_deliver signals via request_delivery (F136 contract)."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_rd:
+        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_rd:
             service._deliver("tid1")
 
         mock_rd.assert_called_once_with("tid1")
@@ -211,9 +209,7 @@ class TestHerdrInboxServiceDelivery:
     def test_deliver_without_callback_still_signals(self):
         """_deliver with no callback still calls request_delivery."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ):
+        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery"):
             service._deliver("tid1")  # Should not raise
 
 
@@ -286,9 +282,8 @@ class TestHerdrInboxServiceEventParsing:
 
         from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_rd:
+        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_rd:
+
             async def run():
                 service._client = _FakeHerdrClient(
                     [idle_event, done_event, working_event, other_event]
@@ -340,9 +335,7 @@ class TestHerdrInboxServiceEventParsing:
         from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
         service._client = _FakeHerdrClient([frame])
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_rd:
+        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_rd:
             try:
                 _run_async(service._event_loop())
             except HerdrTransportError:
@@ -442,12 +435,13 @@ class TestHerdrInboxServiceKiroSupplement:
             stdout="Agent wants to: Execute command\n[Y]es / [N]o / Yes to [A]ll",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.herdr_inbox_service.re.search",
-            return_value=True,
-        ), patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_rd:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.herdr_inbox_service.re.search",
+                return_value=True,
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_rd,
+        ):
             _run_async(service.check_kiro_supplements())
 
         mock_rd.assert_called_once_with("tid_kiro")
@@ -1134,9 +1128,8 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         from cli_agent_orchestrator.adapters.herdr.client import HerdrTransportError
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as mock_rd:
+        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_rd:
+
             async def run():
                 service._client = _FakeHerdrClient([idle_event])
                 try:
@@ -1367,3 +1360,52 @@ class TestHerdrInboxServiceSocketPath:
         """The 'default' session should use ~/.config/herdr/herdr.sock (no subdir)."""
         path = HerdrInboxService._default_socket_path("default")
         assert path == "/custom/config/herdr/herdr.sock"
+
+
+# --- F881 (#734): workspace-close routing tolerates a concurrent teardown ---
+
+
+class TestRouteSpontaneousTerminalRebindInProgress:
+    """F881: a ready terminal whose teardown is owned elsewhere (rebind lease
+    held by a concurrent settlement) must be a typed, logged, benign outcome —
+    NOT an unhandled RuntimeError that aborts the whole workspace-close routing
+    and 404s the siblings."""
+
+    def test_rebind_in_progress_is_benign_and_returns_true(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            side_effect=RuntimeError("rebind_in_progress"),
+        ):
+            result = _run_async(
+                service._route_spontaneous_terminal({"id": "t1", "init_state": "ready"})
+            )
+        # Handled (someone else owns the teardown) — no exception propagated.
+        assert result is True
+
+    def test_other_runtime_error_is_logged_and_returns_false(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            side_effect=RuntimeError("something_else"),
+        ):
+            result = _run_async(
+                service._route_spontaneous_terminal({"id": "t1", "init_state": "ready"})
+            )
+        # A non-rebind failure is not swallowed as success; routing reports it.
+        assert result is False
+
+    def test_ready_success_returns_true(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            return_value=True,
+        ) as mock_delete:
+            result = _run_async(
+                service._route_spontaneous_terminal({"id": "t1", "init_state": "ready"})
+            )
+        assert result is True
+        mock_delete.assert_called_once_with("t1")

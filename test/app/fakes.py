@@ -143,7 +143,7 @@ class Shadow:
     """A ``worker_state_shadow`` row as the fake STORE keeps it.
 
     Mirrors AC6's column list in order.  Mutable on purpose, and the asymmetry
-    with the projector's frozen ``ShadowState`` is the point: ``touch_probe`` and
+    with the projector's frozen ``ProjectedState`` is the point: ``touch_probe`` and
     ``touch_source_probe`` are COLUMN writes, which is exactly what the real
     SQLite adapter does with a partial ``UPDATE``.  Modelling them as anything
     else would let the fake accept a probe that the real store would reject.

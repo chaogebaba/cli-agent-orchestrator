@@ -211,7 +211,7 @@ class TestAC2TerminalState:
             from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+            _drive_one_obligation(db, obl, _utcnow(), 120.0)
             db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -254,7 +254,7 @@ class TestAC2TerminalState:
                 mock_rung2.return_value = LadderResult(
                     delivered=True, phase="surface", decision="proceed", reason=None
                 )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -284,7 +284,7 @@ class TestAC2TerminalState:
         call_count = [0]
         original_drive = None
 
-        def mock_drive(db, obl, now, esc, phase):
+        def mock_drive(db, obl, now, esc):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("simulated failure")
@@ -355,7 +355,7 @@ class TestAC3SafetyGateEscalation:
                 mock_rung2.return_value = LadderResult(
                     delivered=False, phase="surface", decision="defer", reason="waiting_user_answer"
                 )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -544,7 +544,10 @@ class TestAC8NudgeTextSafe:
             ),
             patch(
                 "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
-                side_effect=lambda sess, win, text: sent_text.append(text),
+                # F893 (#745) sweep: the nudge now reaches this client through
+                # TmuxBackend.send_keys, which forwards its signature defaults as
+                # keyword arguments — the double has to accept them.
+                side_effect=lambda sess, win, text, **_kw: sent_text.append(text),
             ),
         ):
             attempt_rung2(target, 42, oldest_age_s=7.0)
@@ -665,7 +668,7 @@ class TestAC10EscalationOnceOnly:
                 mock_rung2.return_value = LadderResult(
                     delivered=True, phase="surface", decision="proceed", reason=None
                 )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -719,7 +722,7 @@ class TestAC10EscalationOnceOnly:
                     decision="defer",
                     reason="waiting_user_answer",
                 )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -772,7 +775,7 @@ class TestAC11NoLiveTarget:
             from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+            _drive_one_obligation(db, obl, _utcnow(), 120.0)
             db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -815,7 +818,7 @@ class TestAC12TraceLifecycle:
             from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+            _drive_one_obligation(db, obl, _utcnow(), 120.0)
             db.commit()
 
             # Check trace events
@@ -876,7 +879,7 @@ class TestAC13TraceEmitCount:
                 mock.return_value = LadderResult(
                     delivered=True, phase="surface", decision="proceed", reason=None
                 )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             escalate_events = (
@@ -981,7 +984,7 @@ class TestAC14PropertyTest:
                     mock_rung2.return_value = LadderResult(
                         delivered=True, phase="surface", decision="proceed", reason=None
                     )
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -1143,7 +1146,7 @@ class TestAC17AlarmDiscipline:
                     mock.return_value = LadderResult(
                         delivered=True, phase="surface", decision="proceed", reason=None
                     )
-                    _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                    _drive_one_obligation(db, obl, _utcnow(), 120.0)
                     db.commit()
 
             error_records = [
@@ -1303,7 +1306,7 @@ class TestS1Rung2FloorInvocation:
                     return_value=True,
                 ),
             ):
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
                 # FX193: nudge fires in the separate _fire_due_nudges pass
                 _fire_due_nudges()
@@ -1385,7 +1388,7 @@ class TestS2AC14MultiTickConvergence:
                     obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
                     prev_attempts = obl.attempts
                     tick_now = start_time + timedelta(seconds=tick_s * (i + 1))
-                    _drive_one_obligation(db, obl, tick_now, escalate_after_s, "shadow")
+                    _drive_one_obligation(db, obl, tick_now, escalate_after_s)
                     db.commit()
 
                     obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -1409,7 +1412,7 @@ class TestS2AC14MultiTickConvergence:
             ):
                 obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
                 escalation_time = start_time + timedelta(seconds=escalate_after_s + 1)
-                _drive_one_obligation(db, obl, escalation_time, escalate_after_s, "shadow")
+                _drive_one_obligation(db, obl, escalation_time, escalate_after_s)
                 db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()

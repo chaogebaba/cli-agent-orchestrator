@@ -54,7 +54,6 @@ WRK_MAILBOX = "mb_f210_wrk"
 # Deterministic timer values — the real ConfigService reads the developer's own
 # settings file, which must not decide whether an assertion holds.
 BASE_CONFIG = {
-    "delivery.phase": "shadow",
     "delivery.tick_s": 5.0,
     "delivery.escalate_after_s": 120.0,
     "delivery.interrupt_after_s": 30.0,
@@ -355,7 +354,7 @@ class TestAC3InterruptRungSpeaks:
             # Age 60s: past interrupt_after_s (30), below escalate_after_s (120).
             with supervisor() as db:
                 obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
-                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                _drive_one_obligation(db, obl, _utcnow(), 120.0)
                 db.commit()
             _fire_due_nudges()
 
@@ -365,7 +364,7 @@ class TestAC3InterruptRungSpeaks:
             for _ in range(5):
                 with supervisor() as db:
                     obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
-                    _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                    _drive_one_obligation(db, obl, _utcnow(), 120.0)
                     db.commit()
                 _fire_due_nudges()
 
@@ -495,7 +494,11 @@ class TestAC8NoNewlineInPayload:
             keys
             == "[cao] 3 message(s) waiting (oldest id 42, 41s). Run list_messages to surface them."
         )
-        assert "enter_count" not in kwargs
+        # F893 (#745) sweep: the nudge is injected through the backend port, and
+        # TmuxBackend.send_keys forwards its signature defaults explicitly. AC8 is
+        # about delivery_service not OVERRIDING enter_count, so assert the
+        # effective value is still the default rather than the kwarg's absence.
+        assert kwargs.get("enter_count", 1) == 1
 
 
 # ---------------------------------------------------------------------------

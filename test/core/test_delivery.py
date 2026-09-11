@@ -9,8 +9,8 @@ Three of the phase's named mutants have their killer here:
 
 * recomputing ``dead_by`` from the current ``available_at`` (D12) — the arithmetic
   half; the store half is in ``test/adapters/test_queue_store.py``;
-* the boot guard counting SHADOW rows as occupancy (B16), which would resolve a
-  bounced shadow deployment to ``drain``;
+* the boot guard counting non-live rows as occupancy (B16), which would resolve a
+  bounced deployment to ``drain``;
 * dropping ``expire_after_s`` from the deadline (D8/B22), which would make every
   expiring message non-expiring.
 """
@@ -23,10 +23,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from cli_agent_orchestrator.core.delivery import (
+    RETIRED_SWITCH_VALUES,
     TERMINAL_STATES,
     AttemptOutcome,
     DeadReason,
     MsgState,
+    QueueMode,
     QueueOccupancy,
     SwitchPosition,
     compute_dead_by,
@@ -34,6 +36,7 @@ from cli_agent_orchestrator.core.delivery import (
     resolve_switch,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.switches import Rejected
 from cli_agent_orchestrator.core.timing import (
     DELIVERY_BACKOFF_S,
     DELIVERY_DEDUP_WINDOW_S,
@@ -117,11 +120,9 @@ def test_the_attempt_span_is_over_the_lease_and_includes_the_backoff() -> None:
     [
         (SwitchPosition.OFF, False, SwitchPosition.OFF, None),
         (SwitchPosition.OFF, True, SwitchPosition.DRAIN, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
-        (SwitchPosition.SHADOW, False, SwitchPosition.SHADOW, None),
-        (SwitchPosition.SHADOW, True, SwitchPosition.DRAIN, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
         (SwitchPosition.ON, False, SwitchPosition.ON, None),
         (SwitchPosition.ON, True, SwitchPosition.ON, None),
-        (SwitchPosition.DRAIN, False, SwitchPosition.SHADOW, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
+        (SwitchPosition.DRAIN, False, SwitchPosition.OFF, FindingCode.DIAG_QUEUE_ORPHAN_GUARD),
         (SwitchPosition.DRAIN, True, SwitchPosition.DRAIN, None),
     ],
 )
@@ -131,7 +132,8 @@ def test_the_boot_guard_table_is_total_over_positions_and_conditions(
     expected: SwitchPosition,
     finding: FindingCode | None,
 ) -> None:
-    """All eight cells of D9's table, enumerated.
+    """All six cells of D9's table, enumerated (eight before #738 retired
+    ``shadow``).
 
     Written as a parametrised enumeration rather than as a handful of examples
     because the guard's defect class is a MISSING cell, not a wrong one: the
@@ -161,51 +163,61 @@ def test_a_finished_queue_does_not_pin_the_server_in_drain() -> None:
     assert resolve_switch(SwitchPosition.OFF, QueueOccupancy(0)).position is SwitchPosition.OFF
 
 
-def test_shadow_rows_are_not_occupancy_which_is_the_bounce_case() -> None:
-    """B16, and AC-3a's second case, at the level the rule is written.
+def test_non_live_rows_are_not_occupancy_which_is_the_bounce_case() -> None:
+    """B16, at the level the rule is written.
 
-    A bounced sub-phase 3a deployment holds in-flight SHADOW rows.  If those
-    counted as occupancy the guard would resolve ``shadow`` to ``drain``, whose
-    tick would then inject copies of messages the legacy path already delivered
-    — a second carrier over one id, which is #506 reproduced by the guard added
-    to prevent loss, in the first sub-phase to ship.
+    A deployment bounced from a build that still had the observational mode holds
+    in-flight non-live rows.  If those counted as occupancy the guard would
+    resolve ``off`` to ``drain``, whose tick would then inject copies of messages
+    the legacy path already delivered — a second carrier over one id, which is
+    #506 reproduced by the guard added to prevent loss.
 
     The occupancy value here is what a store computes over ``mode='live'`` rows
-    only, so a queue holding nothing but shadow rows presents zero.
+    only, so a queue holding nothing but leftovers presents zero.
     """
-    bounced_shadow_deployment = QueueOccupancy(live_non_terminal=0)
-    outcome = resolve_switch(SwitchPosition.SHADOW, bounced_shadow_deployment)
-    assert outcome.position is SwitchPosition.SHADOW
+    bounced_deployment = QueueOccupancy(live_non_terminal=0)
+    outcome = resolve_switch(SwitchPosition.OFF, bounced_deployment)
+    assert outcome.position is SwitchPosition.OFF
     assert outcome.finding is None
     assert outcome.demoted is False
 
 
-def test_an_open_barrier_holds_the_flip_at_shadow() -> None:
+def test_an_open_barrier_holds_the_flip_back() -> None:
     """D9's second predicate.
 
     D13 makes every barrier opened AFTER the flip associate normally, so this
     covers the one case association cannot: a barrier already open at the moment
     of the flip, whose members would otherwise be split across the legacy inbox
     and the queue.
+
+    Where it is held depends on the queue, which is the #738 change: ``shadow``
+    used to absorb both cases, and with it gone an OCCUPIED queue holds at
+    ``drain`` — the rows already enqueued still have to be served — and an empty
+    one at ``off``.
     """
-    outcome = resolve_switch(
+    empty = resolve_switch(
         SwitchPosition.ON, QueueOccupancy(live_non_terminal=0, open_barrier_labels=("gate-r4",))
     )
-    assert outcome.position is SwitchPosition.SHADOW
-    assert outcome.finding is FindingCode.DIAG_BARRIER_OPEN_AT_FLIP
-    assert "gate-r4" in outcome.detail
+    assert empty.position is SwitchPosition.OFF
+    assert empty.finding is FindingCode.DIAG_BARRIER_OPEN_AT_FLIP
+    assert "gate-r4" in empty.detail
+
+    occupied = resolve_switch(
+        SwitchPosition.ON, QueueOccupancy(live_non_terminal=2, open_barrier_labels=("gate-r4",))
+    )
+    assert occupied.position is SwitchPosition.DRAIN
+    assert occupied.finding is FindingCode.DIAG_BARRIER_OPEN_AT_FLIP
 
 
 def test_the_barrier_predicate_only_guards_the_flip() -> None:
     """An open barrier is ordinary while the queue is not being served.
 
-    Guarding ``off`` or ``shadow`` on a barrier would demote a deployment for a
-    condition that cannot affect it: nothing is served from the queue there, so
-    no member can be split across two tables.
+    Guarding ``off`` on a barrier would demote a deployment for a condition that
+    cannot affect it: nothing is served from the queue there, so no member can be
+    split across two tables.
     """
     occupancy = QueueOccupancy(live_non_terminal=0, open_barrier_labels=("gate-r4",))
     assert resolve_switch(SwitchPosition.OFF, occupancy).position is SwitchPosition.OFF
-    assert resolve_switch(SwitchPosition.SHADOW, occupancy).position is SwitchPosition.SHADOW
 
 
 @pytest.mark.parametrize(
@@ -214,7 +226,6 @@ def test_the_barrier_predicate_only_guards_the_flip() -> None:
         (None, SwitchPosition.OFF),
         ("", SwitchPosition.OFF),
         ("off", SwitchPosition.OFF),
-        (" SHADOW ", SwitchPosition.SHADOW),
         ("Drain", SwitchPosition.DRAIN),
         ("on", SwitchPosition.ON),
         ("true", SwitchPosition.OFF),
@@ -231,6 +242,50 @@ def test_an_unreadable_switch_value_means_off(raw: str | None, expected: SwitchP
     across must get ``off`` rather than a queue.
     """
     assert parse_switch(raw) is expected
+
+
+# ------------------------------------------------------- #738 shadow retirement
+
+
+@pytest.mark.parametrize("raw", ["shadow", "SHADOW", "  Shadow  "])
+def test_a_retired_position_is_rejected_and_never_coerced(raw: str) -> None:
+    """#738's contract, and the mutant it exists to kill.
+
+    ``shadow`` shipped, so an operator carrying it in a systemd drop-in typed
+    something that USED to work.  Two wrong answers are available and both are
+    silent: accepting it (the mode is gone, so nothing would serve the
+    deployment) and folding it into the unknown-value default (the server runs in
+    ``off`` while the configuration still says ``shadow``).  The rejection is a
+    VALUE, so the caller can decline to start the subsystem without failing the
+    boot.
+
+    MUTANT: delete the ``RETIRED_SWITCH_VALUES`` branch from ``parse_switch`` and
+    ``shadow`` falls through to the ``ValueError`` default — this test fails on
+    the type, not on a string comparison.
+    """
+    answer = parse_switch(raw)
+    assert isinstance(answer, Rejected)
+    assert answer.value == "shadow"
+    assert "738" in answer.reason
+    assert answer.hint == "set CAO_DELIVERY_QUEUE=off|drain|on"
+    assert "off|drain|on" in answer.detail
+
+
+def test_no_retired_position_survives_in_the_enum() -> None:
+    """The member is REMOVED, not kept as a value nothing may select.
+
+    A member that exists only to be refused is a mode a future caller can reach
+    for; the refusal lives at the parse boundary, where an operator's typed value
+    arrives, and nowhere else.
+    """
+    assert {position.value for position in SwitchPosition} == {"off", "drain", "on"}
+    assert RETIRED_SWITCH_VALUES == frozenset({"shadow"})
+    assert not RETIRED_SWITCH_VALUES & {position.value for position in SwitchPosition}
+
+
+def test_every_row_this_build_writes_is_live() -> None:
+    """``QueueMode`` has one member: there is no observational copy to write."""
+    assert {mode.value for mode in QueueMode} == {"live"}
 
 
 # ---------------------------------------------------------------- D12 dead_by
@@ -326,14 +381,15 @@ def test_a_caller_expiry_is_a_reason_not_a_fourth_state() -> None:
     assert len(TERMINAL_STATES) == 3
 
 
-def test_legacy_other_is_the_only_shadow_only_attempt_outcome() -> None:
+def test_legacy_other_is_the_only_retired_attempt_outcome() -> None:
     """3b's vocabulary is D12's four; ``legacy_other`` never appears in it.
 
     Recorded as a test because the value's whole justification is that it is
-    temporary: it exists so 3a can mirror a legacy outcome faithfully instead of
-    forcing it onto ``veto_dialog`` and inventing a dialog gate that was never
-    consulted.  A live row carrying it would mean the write-through path had
-    started borrowing legacy's vocabulary.
+    temporary: it existed so 3a could mirror a legacy outcome faithfully instead
+    of forcing it onto ``veto_dialog`` and inventing a dialog gate that was never
+    consulted.  The mirror is gone with shadow-live mode (#738) and the value
+    survives only for rows already written; a live row carrying it would mean the
+    write-through path had started borrowing legacy's vocabulary.
     """
     live_vocabulary = set(AttemptOutcome) - {AttemptOutcome.LEGACY_OTHER}
     assert live_vocabulary == {

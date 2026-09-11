@@ -1,11 +1,12 @@
-"""Fold worker events into the shadow state projection (WP-ARCH phase 1, AC6).
+"""Fold worker events into the worker-state projection (WP-ARCH phase 1, AC6).
 
 The projector is the only writer of ``worker_state_shadow`` and, in phase 1, the
 projection has no readers in ``services/``.  That is what makes AC11's "no
 behaviour change with the switch ON" true by construction rather than by
 assertion: the projector can be wrong for a whole session and nothing downstream
-notices, which is precisely the point of a shadow phase and of the agreement
-report (AC10) that measures it.
+notices.  What surfaces it is the ``DIAG-LEGACY-DISAGREE`` check and, for a flag
+flip, a grok-box live round (#738) — which is the whole acceptance now that the
+AC10 agreement report has gone with shadow-live mode.
 
 Four rules carry the design, and each is a named method below rather than a
 branch inside one loop, because the gate has to be able to point at them:
@@ -72,9 +73,9 @@ from cli_agent_orchestrator.core.timing import NO_SIGNAL_S
 __all__ = [
     "DERIVED_ALWAYS_KINDS",
     "NullSourceRegistry",
+    "ProjectedState",
     "ProjectionOutcome",
     "Projector",
-    "ShadowState",
     "SourceRegistry",
     "StaticSourceRegistry",
 ]
@@ -167,8 +168,9 @@ class StaticSourceRegistry:
 
 
 @dataclass(frozen=True)
-class ShadowState:
-    """One ``worker_state_shadow`` row, satisfying :class:`~core.ports.StateProjection`.
+class ProjectedState:
+    """One ``worker_state_shadow`` row (the table keeps its phase-1 name),
+    satisfying :class:`~core.ports.StateProjection`.
 
     Frozen, and every rule below produces a NEW instance with
     :func:`dataclasses.replace`.  A projector that edited a row in place would
@@ -197,7 +199,7 @@ class ShadowState:
     miss_count: int = 0
 
     @classmethod
-    def from_projection(cls, projection: StateProjection) -> "ShadowState":
+    def from_projection(cls, projection: StateProjection) -> "ProjectedState":
         """Adopt whatever concrete row the store handed back.
 
         The store's own type is its business — the port is structural — so the
@@ -297,18 +299,18 @@ class Projector:
         self._legacy_check(event.terminal_id)
         return outcome
 
-    def _load(self, terminal_id: str, at: datetime) -> ShadowState:
+    def _load(self, terminal_id: str, at: datetime) -> ProjectedState:
         existing = self._states.get(terminal_id)
         if existing is not None:
-            return ShadowState.from_projection(existing)
+            return ProjectedState.from_projection(existing)
         # A terminal the projector has never seen starts in ``starting``, which
         # every state is reachable from.  ``since`` is the server clock of the
         # first event rather than its ``observed_at``: the whole projection is
         # ordered by ``ingested_at`` (audit §3.1), and mixing the two orderings
         # in one row is how a "negative duration" bug is born.
-        return ShadowState(terminal_id=terminal_id, since=at)
+        return ProjectedState(terminal_id=terminal_id, since=at)
 
-    def _is_muted(self, row: ShadowState, event: WorkerEvent) -> bool:
+    def _is_muted(self, row: ProjectedState, event: WorkerEvent) -> bool:
         """Source-level precedence: is this derived event logged but not applied?"""
         if event.confidence is not Confidence.DERIVED:
             return False
@@ -318,7 +320,7 @@ class Projector:
             return False
         return self._source_healthy(row)
 
-    def _source_healthy(self, row: ShadowState) -> bool:
+    def _source_healthy(self, row: ProjectedState) -> bool:
         """A source is healthy while its tailer stat-ed the file within ``NO_SIGNAL_S``.
 
         A source that has never probed is NOT healthy.  That direction matters:
@@ -332,7 +334,7 @@ class Projector:
 
     # -------------------------------------------------------------------- rules
 
-    def _transition(self, row: ShadowState, event: WorkerEvent) -> ProjectionOutcome:
+    def _transition(self, row: ProjectedState, event: WorkerEvent) -> ProjectionOutcome:
         target, reason = self._target(event)
         if target is None:
             # A boundary event that asserts no state — a tool result on a
@@ -384,7 +386,7 @@ class Projector:
 
     def _diagonal(
         self,
-        row: ShadowState,
+        row: ProjectedState,
         event: WorkerEvent,
         target: WorkerState,
         reason: DegradedReason | None,
@@ -432,7 +434,7 @@ class Projector:
             classification=TransitionClass.NO_OP,
         )
 
-    def _recover(self, row: ShadowState, event: WorkerEvent) -> ProjectionOutcome:
+    def _recover(self, row: ProjectedState, event: WorkerEvent) -> ProjectionOutcome:
         """``pane.recovered``: restore ``prior_state`` (AC6 rule (b)).
 
         A no-op on a terminal that is not degraded.  The probe fires
@@ -545,7 +547,7 @@ class Projector:
         outcomes: list[ProjectionOutcome] = []
 
         for projection in self._states.all_terminals():
-            row = ShadowState.from_projection(projection)
+            row = ProjectedState.from_projection(projection)
             if row.state is WorkerState.EXITED:
                 continue
             last_signal = self._last_signal(row)
@@ -566,7 +568,7 @@ class Projector:
         return outcomes
 
     @staticmethod
-    def _last_signal(row: ShadowState) -> datetime | None:
+    def _last_signal(row: ProjectedState) -> datetime | None:
         """The most recent moment anything was heard about this terminal.
 
         ``since`` participates as a floor so a projection created moments ago
@@ -593,7 +595,7 @@ class Projector:
         return rows[-1] if rows else None
 
     def _degrade_no_signal(
-        self, row: ShadowState, last_event: WorkerEvent, now: datetime
+        self, row: ProjectedState, last_event: WorkerEvent, now: datetime
     ) -> ProjectionOutcome:
         target = WorkerState.DEGRADED
         reason = DegradedReason.NO_SIGNAL

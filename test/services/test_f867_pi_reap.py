@@ -403,6 +403,13 @@ def test_r2_1_reap_resolver_reports_pi_resumable(real_sqlite_env, monkeypatch):
         agent_profile="empirical_reviewer_lite",
         model=None,
         reasoning_effort=None,
+        # F865 B3 merge-forward: an OWNED root. A production spawn always
+        # resolves an owner (owner_principal / owner_caller_id); a NULL-owner
+        # root is refused at resume time with `resume_not_owner`, so the
+        # resolver honestly reports `identity_owner_unknown` for it (pinned by
+        # the companion test below). This test's subject is the provider
+        # capability read, so it seeds the production shape.
+        owner_principal="mb_r2reap",
         origin_callback_ref=None,
         current_terminal_id=tid,
         cwd="/data/cao-scratch/x",
@@ -419,6 +426,52 @@ def test_r2_1_reap_resolver_reports_pi_resumable(real_sqlite_env, monkeypatch):
     )
     assert resumable is True, (captured, resumable, reason)
     assert reason == "resumable"
+
+
+def test_r2_1_pi_reap_null_owner_root_is_not_advertised_resumable(real_sqlite_env, monkeypatch):
+    """F865 B3 x F867 R2-1b: the pi capability read does NOT override ownership.
+
+    A root with a NULL owner_principal is refused at resume time
+    (`authorize_and_classify_resume` -> `resume_not_owner`), so the reap
+    resolver reports `identity_owner_unknown` rather than advertising a resume
+    that would be refused — even for a provider whose declared capabilities say
+    resume is supported.
+    """
+    import cli_agent_orchestrator.clients.database as d
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    tid = "r2reapbb"
+    d.create_terminal(
+        terminal_id=tid,
+        tmux_session="cao-r2reap-null",
+        tmux_window=f"win-{tid}",
+        agent_profile="empirical_reviewer_lite",
+        provider="pi_cli",
+        provider_session_id=tid,
+    )
+    d.mint_spawn_identity(
+        identity_key=f"conv_{tid}",
+        provider="pi_cli",
+        provider_namespace="/data/cao-scratch/x",
+        agent_profile="empirical_reviewer_lite",
+        model=None,
+        reasoning_effort=None,
+        origin_callback_ref=None,  # no owner resolved -> NULL owner_principal
+        current_terminal_id=tid,
+        cwd="/data/cao-scratch/x",
+    )
+    from cli_agent_orchestrator.services import conversation_transition as ct
+
+    ct.attach_captured_uuid(
+        tid, provider_session_id=tid, provider="pi_cli", provider_namespace="/data/cao-scratch/x"
+    )
+    assert d.get_conversation_identity(f"conv_{tid}")["owner_principal"] is None
+
+    captured, resumable, reason = ts._resolve_reap_resume_key(
+        tid, d.get_terminal_metadata(tid), force=False
+    )
+    assert resumable is False, (captured, resumable, reason)
+    assert reason == "identity_owner_unknown"
 
 
 def test_r2_1_provider_supports_resume_honors_declared_capabilities():

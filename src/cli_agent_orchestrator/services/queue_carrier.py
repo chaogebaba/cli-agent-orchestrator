@@ -48,7 +48,6 @@ __all__ = [
     "note_terminal_status",
     "queue_owns_new_traffic",
     "queue_runtime",
-    "record_legacy_seat_wake",
     "write_through_enqueue",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
@@ -161,39 +160,6 @@ def legacy_enqueue_fact(**fields: Any) -> Any:
     from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
 
     return LegacyEnqueue(**fields)
-
-
-def record_legacy_seat_wake(legacy_message_id: int, *, detail: str = "") -> None:
-    """One emitted native seat wake owes one ``delivery_attempt`` row (I5).
-
-    Under ``off``, ``shadow`` and ``drain`` the seat's carrier is the F136 chain
-    into ``ring_supervisor_doorbell`` (§A1.5), not the tick's ``wake_seat``. The
-    ring wrote the socket bytes and opened no ``inbox_delivery_attempt`` row, so
-    without this hook the emission left no stored trace at all and ``cao diag
-    <msg_id>`` reported that nothing was ever attempted — the pane archaeology
-    I5 exists to end, and the exact reading #604 was diagnosed through.
-
-    ``legacy_message_id`` is the ring's ``max_written_row_id``, the epoch's
-    high-water row, so ONE emitted epoch writes exactly one attempt row.
-
-    Never raises: a diagnostic that could break the wake it is recording would
-    be worse than no diagnostic.
-    """
-    try:
-        from datetime import UTC, datetime
-
-        from cli_agent_orchestrator.app.delivery.facts import LegacySeatWake
-        from cli_agent_orchestrator.app.delivery.wiring import record_seat_wake
-
-        record_seat_wake(
-            LegacySeatWake(
-                legacy_message_id=int(legacy_message_id),
-                at=datetime.now(UTC),
-                detail=detail,
-            )
-        )
-    except Exception:  # noqa: BLE001 — a record may never break a wake
-        logger.debug("wp_arch seat-wake attempt not recorded", exc_info=True)
 
 
 def queue_runtime() -> Any:

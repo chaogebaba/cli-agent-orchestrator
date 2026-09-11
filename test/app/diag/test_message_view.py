@@ -91,7 +91,7 @@ def test_the_view_carries_the_row_its_attempts_and_its_events(
 
     payload = message_payload(sources, row.msg_id, now=NOW)
     assert payload["header"]["found"] is True
-    assert payload["header"]["mode"] == QueueMode.SHADOW.value
+    assert payload["header"]["mode"] == QueueMode.LIVE.value
     assert payload["header"]["legacy_message_id"] == 41
     assert len(payload["attempts"]) == 1
     assert payload["attempts"][0]["outcome"] == AttemptOutcome.PANE_ABSENT.value

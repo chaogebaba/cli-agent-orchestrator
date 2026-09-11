@@ -73,16 +73,13 @@ class TestBackendFactoryHerdr:
     def test_returns_herdr_when_configured(self, _isolated_settings):
         """HerdrBackend is returned when terminal.backend is 'herdr'."""
         _write_terminal_config(_isolated_settings, backend="herdr")
-        # Patch os.path.exists so HerdrBackend.__init__ -> _ensure_session_running
-        # finds the session socket and skips the subprocess.Popen(["herdr", ...])
-        # startup, which would raise FileNotFoundError where herdr is not installed
-        # (e.g. CI). Mirrors the fixture in test_herdr_backend.py.
+        # Patch _socket_is_live so HerdrBackend.__init__ -> _ensure_session_running
+        # treats the session as already running and skips the subprocess.Popen(["herdr",
+        # ...]) startup, which would raise FileNotFoundError where herdr is not
+        # installed (e.g. CI/box). F882: liveness, not mere path existence.
         from unittest.mock import patch
 
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=True,
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             backend = BackendFactory.create()
         assert isinstance(backend, HerdrBackend)
 
@@ -95,10 +92,7 @@ class TestBackendFactoryOverride:
         from unittest.mock import patch
 
         _write_terminal_config(_isolated_settings, backend="tmux")
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=True,
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             backend = BackendFactory.create(backend_override="herdr")
         assert isinstance(backend, HerdrBackend)
 
@@ -113,10 +107,7 @@ class TestBackendFactoryOverride:
         from unittest.mock import patch
 
         assert not _isolated_settings.exists()
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=True,
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             backend = BackendFactory.create(backend_override="herdr")
         assert isinstance(backend, HerdrBackend)
 
@@ -125,10 +116,7 @@ class TestBackendFactoryOverride:
         from unittest.mock import patch
 
         _write_terminal_config(_isolated_settings, backend="tmux", herdr_session="my-session")
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=True,
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             backend = BackendFactory.create(backend_override="herdr")
         assert isinstance(backend, HerdrBackend)
         assert backend.herdr_session == "my-session"

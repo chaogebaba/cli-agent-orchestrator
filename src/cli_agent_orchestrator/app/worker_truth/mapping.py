@@ -82,8 +82,9 @@ STATE_ASSERTING_KINDS: frozenset[EventKind] = frozenset(_IMPLIED)
 #: EXITED because the fork raises ``TerminalInputBlockedError`` on it with the
 #: words "the terminal's provider process has exited (status ERROR)" — #571's
 #: complaint is that legacy reaches it during a healthy teardown, and the
-#: agreement report (AC10) exists to measure exactly that kind of divergence
-#: rather than to paper over it.
+#: ``DIAG-LEGACY-DISAGREE`` check exists to surface exactly that kind of
+#: divergence rather than to paper over it.  (The AC10 agreement report used to
+#: count it in bulk; it went with shadow-live mode, #738.)
 LEGACY_STATUS_MAP: dict[str, WorkerState] = {
     "unknown": WorkerState.DEGRADED,
     "idle": WorkerState.IDLE,
@@ -112,7 +113,7 @@ def legacy_state(latched_status: str) -> WorkerState | None:
     Returns ``None`` for a status this map does not know, which is not an error:
     the legacy enum can grow, and the honest answer for an unrecognised value is
     "no opinion" rather than a guessed state that would then be compared against
-    the projection in the agreement report.
+    the projection by the disagreement check.
     """
     return LEGACY_STATUS_MAP.get(latched_status)
 

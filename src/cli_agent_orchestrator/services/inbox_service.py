@@ -947,10 +947,10 @@ class InboxService:
         # ``written`` at zero, which left ``_f136_post_delivery``'s
         # ``outcome.written > 0`` gate shut and the doorbell silent.
         #
-        # That is the whole of the shadow failure: the role gate routes the seat
+        # That is the whole of the failure: the role gate routes the seat
         # here, this returned ``no_path``, and the seat was NEITHER pasted NOR
         # woken — #604 arriving through the amendment written to end it. A1.5
-        # says the carrier in the three non-``on`` positions IS this chain into
+        # says the carrier in the non-``on`` positions IS this chain into
         # ``ring_supervisor_doorbell``, so the chain has to reach it.
         #
         # The cursor is what matters and it is kept: ``claim_unnotified_wake``
@@ -2518,10 +2518,10 @@ class InboxService:
             # position or a config flag:
             #
             #   * muting follows the switch position and the ban does not. Under
-            #     `off`, `shadow` and `drain` this path still serves new traffic,
+            #     `off` and `drain` this path still serves new traffic,
             #     and `drain` is a position D9's boot guard can impose without an
             #     operator asking for it. Scoping the ban to CAO_DELIVERY_QUEUE=on
-            #     would leave it false in three of four positions (#488).
+            #     would leave it false in two of three positions (#488).
             #   * a config-gated ban is exactly what F210 declined to build when
             #     it made the rung-2 exemption role-based; an operator could
             #     unset the flag and the user's decision would evaporate.
@@ -3072,22 +3072,6 @@ class InboxService:
                                 terminal_id,
                                 safety.reason,
                                 safety.gate_episode,
-                            )
-                            # WP-ARCH phase 3a, hook point 5. §7a requires a veto
-                            # be RECORDED rather than dropped: a dropped veto is
-                            # the difference between "we tried and were refused"
-                            # and "nothing happened", and the second is what made
-                            # #604 unreadable from the stored rows. This is the
-                            # veto site where the message batch is in scope; the
-                            # pre-admission check at the top of deliver_pending
-                            # runs before any batch is selected, so there is
-                            # nothing there to attribute a veto to.
-                            from cli_agent_orchestrator.services import delivery_mirror
-
-                            delivery_mirror.observe_veto(
-                                [int(m.id) for m in batch],
-                                reason=safety.reason,
-                                gate_episode=safety.gate_episode,
                             )
                             return
                         if probe_status not in {

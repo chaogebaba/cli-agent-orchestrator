@@ -526,10 +526,10 @@ def test_the_projection_row_cannot_be_edited_in_place(rig: Rig) -> None:
     """
     import dataclasses
 
-    from cli_agent_orchestrator.app.worker_truth.projector import ShadowState
+    from cli_agent_orchestrator.app.worker_truth.projector import ProjectedState
 
     rig.emit(TERMINAL, EventKind.TURN_STARTED)
-    row = ShadowState.from_projection(rig.states.get(TERMINAL))
+    row = ProjectedState.from_projection(rig.states.get(TERMINAL))
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.state = WorkerState.IDLE  # type: ignore[misc]

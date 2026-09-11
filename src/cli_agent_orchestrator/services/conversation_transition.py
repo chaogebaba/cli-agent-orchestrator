@@ -219,6 +219,11 @@ class ResumeAdmission:
     model: Optional[str] = None
     reasoning_effort: Optional[str] = None
     provider_namespace: Optional[str] = None
+    # F865 S3: the RECOVERING supervisor principal captured at claim time. The
+    # ``resumed_by`` EVENT is stamped only at publish (verify_and_publish_resume),
+    # once the new incarnation row exists (A2.5), never at claim — a spawn that
+    # fails after the claim must leave NO resumed_by.
+    claimed_by: Optional[str] = None
 
 
 def authorize_and_classify_resume(
@@ -291,16 +296,15 @@ def claim_resume_admission(admission: "ResumeAdmission", claimant: str) -> "Resu
         "resume_claimed",
         detail={"claimant": claimant, "generation": admission.generation + 1},
     )
-    # F829 AC5: record the RECOVERING supervisor separately as resumed_by — it is
-    # NOT the durable owner (owner_principal on the root is preserved untouched),
-    # so a bare callback still routes to the ORIGINAL caller, never to whoever
-    # requested the recovery.
-    record_conversation_event(
-        admission.identity_key,
-        "resumed_by",
-        detail={"resumed_by": claimant},
-    )
-    return admission
+    # F865 S3: DO NOT stamp ``resumed_by`` here. The blueprint (A2.5) requires it
+    # to be recorded only once the new incarnation row exists — i.e. at publish
+    # (verify_and_publish_resume), never at claim. Stamping it at claim left a
+    # stale ``resumed_by`` event behind whenever the spawn failed AFTER the claim
+    # (the api compensator clears the claim but not the event). Carry the
+    # recovering principal forward on the admission so publish can stamp it.
+    import dataclasses
+
+    return dataclasses.replace(admission, claimed_by=claimant)
 
 
 @dataclass(frozen=True)
@@ -417,6 +421,23 @@ def verify_and_publish_resume(
         terminal_id=terminal_id,
         detail={"provider_session_id": publish_uuid},
     )
+    # F829 AC5 / F865 S3: record the RECOVERING supervisor as ``resumed_by`` HERE,
+    # only now that the new incarnation row exists (publish moved current_terminal
+    # to it). It is NOT the durable owner (owner_principal on the root is
+    # preserved untouched), so a bare callback still routes to the ORIGINAL
+    # caller, never to whoever requested the recovery. A spawn that failed BEFORE
+    # this point leaves NO resumed_by event (the claim was compensated). The
+    # claimant is carried on the admission when the claim+publish share a call
+    # frame; otherwise (the D4 capture convergence rebuilds the admission from the
+    # root) it is recovered from the durable ``resume_claimed`` event.
+    _claimant = admission.claimed_by or _claimant_from_events(key)
+    if _claimant:
+        record_conversation_event(
+            key,
+            "resumed_by",
+            terminal_id=terminal_id,
+            detail={"resumed_by": _claimant},
+        )
     # D10 [A1-r8]: a successful resume MEASURES the resume capability — record it
     # as fresh PASSING evidence so a previously unmeasured (capability_unverified)
     # key is now measured. Best-effort; never fail a publish over evidence.
@@ -435,6 +456,38 @@ def _stored_artifact(identity_key: str) -> Optional[str]:
 
     root = get_conversation_identity(identity_key)
     return cast(Optional[str], root.get("artifact_locator")) if root else None
+
+
+def _claimant_from_events(identity_key: str) -> Optional[str]:
+    """F865 S3: recover the recovering principal from the durable timeline.
+
+    The ``resume_claimed`` event's ``claimant`` detail is the recovering
+    supervisor. When the publish call frame did not carry ``claimed_by`` (the D4
+    capture convergence rebuilds the admission from the root), read it back from
+    the most recent ``resume_claimed`` event so ``resumed_by`` can still be
+    stamped at publish. Best-effort; never fails a publish.
+    """
+    from cli_agent_orchestrator.clients.database import get_conversation_events
+
+    try:
+        import json as _json
+
+        for ev in reversed(get_conversation_events(identity_key)):
+            if ev.get("event") != "resume_claimed":
+                continue
+            detail = ev.get("detail")
+            if isinstance(detail, str):
+                try:
+                    detail = _json.loads(detail)
+                except (ValueError, TypeError):
+                    detail = {}
+            if not isinstance(detail, dict):
+                return None
+            claimant = detail.get("claimant")
+            return cast(Optional[str], claimant) if claimant else None
+    except Exception:
+        logger.debug("resumed_by claimant lookup failed for %s", identity_key, exc_info=True)
+    return None
 
 
 # ---------------------------------------------------------------------------

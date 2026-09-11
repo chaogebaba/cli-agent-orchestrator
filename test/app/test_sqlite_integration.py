@@ -28,7 +28,6 @@ from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.adapters.store.readonly import ReadOnlyPool
 from cli_agent_orchestrator.adapters.store.state import SqliteStateStore
 from cli_agent_orchestrator.app.diag.report import DiagSources, render_findings, render_timeline
-from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
 from cli_agent_orchestrator.app.worker_truth.checks import (
     CheckRegistry,
     PaneDisagreementCheck,
@@ -264,7 +263,16 @@ def test_the_read_only_pool_refuses_a_write(rig: _Rig) -> None:
         reader.close_all()
 
 
-def test_the_agreement_report_runs_over_stored_rows(rig: _Rig) -> None:
+def test_a_bulk_read_returns_both_sides_from_the_real_store(rig: _Rig) -> None:
+    """Both producers' rows come back from SQLite, in order, at volume.
+
+    This used to assert the AC10 agreement report over the same rows; the report
+    went with shadow-live mode (#738). What it was really exercising survives and
+    is what is asserted now: a reader asking the REAL store for the whole log
+    gets every projected-side and every legacy-side row, rather than a fake's
+    tidy list. A store that dropped one side would have made the old report
+    silently one-sided, and would make any future bulk reader wrong the same way.
+    """
     for index in range(3):
         terminal = f"t{index}"
         for _ in range(30):
@@ -275,10 +283,25 @@ def test_the_agreement_report_runs_over_stored_rows(rig: _Rig) -> None:
             rig.legacy("idle", terminal_id=terminal)
             rig.clock.advance(1)
 
-    report = build_agreement_report(rig.events.read())
+    rows = rig.events.read()
 
-    assert report.valid is True
-    assert report.classification_counts()["genuine"] == 0
+    legacy = [row for row in rows if row.kind is EventKind.STATUS_LEGACY_PUBLISHED]
+    projected = [row for row in rows if row.decision is DecisionKind.STATUS_TRANSITION]
+
+    # Both sides, at volume, for every terminal. Counted per side rather than as
+    # one total: the rig also folds, so the log carries transition rows the loop
+    # never appends, and a total would silently absorb one side going missing.
+    assert len(legacy) == 3 * 30 * 2
+    assert len(projected) == 3 * 30 * 2
+    assert {row.terminal_id for row in legacy} == {"t0", "t1", "t2"}
+    assert {row.terminal_id for row in projected} == {"t0", "t1", "t2"}
+    # A fleet-wide read orders by ``ingested_at``, not by ``seq`` — ``seq`` is
+    # per terminal, so the fleet view interleaves three sequences. Monotonicity
+    # is therefore asserted WITHIN a terminal, which is where it is promised.
+    assert [row.ingested_at for row in rows] == sorted(row.ingested_at for row in rows)
+    for terminal in ("t0", "t1", "t2"):
+        seqs = [row.seq for row in rows if row.terminal_id == terminal]
+        assert seqs == sorted(seqs)
 
 
 def test_findings_render_from_the_real_store(rig: _Rig) -> None:
@@ -307,7 +330,7 @@ def test_timestamps_come_back_as_aware_utc(rig: _Rig) -> None:
 
 
 def test_a_projection_written_before_a_restart_is_still_there(rig: _Rig) -> None:
-    """Shadow state is durable, not a cache.  Phase 2's ``status_monitor`` will
+    """The projected state is durable, not a cache.  Phase 2's ``status_monitor`` will
     read it after a bounce, and the agreement session spans one."""
     rig.emit(EventKind.TURN_STARTED)
     rig.pool.close_all()

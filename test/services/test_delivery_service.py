@@ -377,7 +377,7 @@ def test_drive_one_delivered_inbox_skips_transport(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 120.0, "shadow")
+            _drive_one_obligation(db, obl, now, 120.0)
             db.commit()
             refreshed = db.query(DeliveryObligationModel).one()
             assert refreshed.state == "OPEN"
@@ -420,7 +420,7 @@ def test_drive_one_pending_count_scoped_to_obligation_mailbox(ds_db):
         nd.arm_or_coalesce.side_effect = lambda **kw: _arm(**kw)
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 120.0, "shadow")
+            _drive_one_obligation(db, obl, now, 120.0)
 
     assert armed.get("message_count") == 2
     assert armed.get("oldest_inbox_row_id") == 1
