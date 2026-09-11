@@ -9254,11 +9254,13 @@ def _is_service_sender(sender_id: Any) -> bool:
     **Deliberately duplicated.** ``is_service_sender`` in the queue's own pure
     domain asks the identical question for the tick's dead-letter notice, and
     the obvious tidy-up — importing that one here — is forbidden by the
-    strangler seam: ``test_only_the_bridge_module_names_the_new_tree`` requires
-    that this module never name the new package tree at all, so that a reviewer
-    asking what phase 3 attached to the legacy tree reads one bridge module
-    instead of grepping the two largest legacy packages. That invariant outranks
-    removing six lines of duplication.
+    strangler seam: a legacy module may name the new package tree only from the
+    AC11 allowlist, and this file is not on it
+    (``test_legacy_files_importing_new_packages_stay_within_the_ac11_allowlist``).
+    The point of that allowlist is that a reviewer asking what the new
+    architecture attached to the legacy tree reads a short enumerated list
+    instead of grepping the two largest legacy packages. It outranks removing
+    six lines of duplication.
 
     What the duplication is NOT allowed to be is unwitnessed: the two are pinned
     to agree over a shared corpus by

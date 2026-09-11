@@ -1072,12 +1072,13 @@ def test_the_service_sender_rule_is_the_same_rule_on_both_sides_of_the_seam() ->
     tick came to address 20 live notices to ids the inbox had always refused to
     route back to (#741 r3).
 
-    The tidy fix -- one function imported by both -- is FORBIDDEN here:
-    ``test_only_the_bridge_module_names_the_new_tree`` requires that
-    ``clients/database.py`` never name the new package tree, so that phase 3's
-    attachment points stay readable in one bridge module. The rule is therefore
-    stated twice on purpose, and THIS arm is what stops the two copies drifting:
-    it drives both over one corpus and compares them answer by answer.
+    The tidy fix -- one function imported by both -- is FORBIDDEN here: a legacy
+    module may name the new package tree only from the AC11 allowlist, and
+    ``clients/database.py`` is not on it
+    (``test_legacy_files_importing_new_packages_stay_within_the_ac11_allowlist``
+    in ``test/adapters/test_import_contracts.py``). The rule is therefore stated
+    twice on purpose, and THIS arm is what stops the two copies drifting: it
+    drives both over one corpus and compares them answer by answer.
     """
     from cli_agent_orchestrator.clients.database import _is_service_sender as legacy_rule
     from cli_agent_orchestrator.core.delivery import is_service_sender as queue_rule
