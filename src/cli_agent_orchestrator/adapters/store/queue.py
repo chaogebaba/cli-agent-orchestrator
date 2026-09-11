@@ -202,15 +202,29 @@ class SqliteQueueStore:
     ) -> list[QueueMessage]:
         """Lease deliverable rows and issue each a fresh fencing token.
 
-        The ``mode='live'`` conjunct is in this statement and nowhere else.  A
-        non-live row — one written by a build that still had the observational
-        mode retired in #738 — is therefore unclaimable by construction.  Until
-        WP-ARCH 3c the boot guard's occupancy test was a second line of defence
-        over the same rows; the guard is gone, so this conjunct is now the ONLY
-        one, which raises rather than lowers the stake.  Removing the conjunct
-        here makes such a row claimable, so the tick would inject a copy of a
-        message the legacy path already delivered — a second carrier over one
-        id.  That is the mutant the empirical gate kills.
+        **The ``mode='live'`` conjunct here is the ENFORCEMENT, and after WP-ARCH
+        3c slice 4 it is the only one.**  A non-live row — one written by a build
+        that still had the observational mode retired in #738 — is unclaimable
+        because of this line.  Removing it makes such a row claimable, so the
+        tick would inject a copy of a message the legacy path already delivered:
+        a second carrier over one id.  That is the mutant the empirical gate
+        kills, and ``test_claim_never_returns_a_non_live_row`` is where.
+
+        Five read paths (``ready_receivers``, ``undelivered_ids``,
+        ``pending_for_receiver``, ``settle_through``, ``cancel_on_complete``)
+        carry the same conjunct, and they are DEFENCE rather than enforcement:
+        each says so at its own site.  A row that reached none of them would
+        still be unclaimable; a row that reached them all but not this statement
+        would not be.  ``test_the_mode_conjunct_in_claim_is_the_only_enforcement_left``
+        pins that closed set, so a sixth path cannot appear unnoticed.
+
+        Until slice 4 there WAS a second enforcement: D9's boot guard resolved
+        the requested switch position against an occupancy count over the same
+        ``mode='live'`` rows, and this conjunct was accurately described as
+        redundant beside it.  The guard, ``resolve_switch`` and
+        ``QueueOccupancy`` are deleted with the switch, so the conjunct did not
+        change but its STAKE did — which is the thing a reader simplifying this
+        SQL would otherwise have no way to know.
 
         Two statements rather than a single ``UPDATE … RETURNING``: SQLite gained
         ``RETURNING`` in 3.35 and the fork supports older runtimes, so the

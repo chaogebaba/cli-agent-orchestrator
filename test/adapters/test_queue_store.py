@@ -180,6 +180,55 @@ def test_the_filter_is_in_the_statement_not_in_the_caller() -> None:
     assert "mode = 'live'" in source
 
 
+def test_the_mode_conjunct_in_claim_is_the_only_enforcement_left() -> None:
+    """WP-ARCH 3c slice 4: the second line of defence is gone, so this is the line.
+
+    Until slice 4 the boot guard's occupancy test counted ``mode='live'`` rows
+    too, and ``claim``'s conjunct was described in its own docstring as the
+    "redundant defence D9 names rather than the enforcement". The switch collapse
+    deleted the guard, ``resolve_switch`` and ``QueueOccupancy`` — and with them
+    that second count. The conjunct did not change; its STAKE did.
+
+    That is worth a test rather than only a docstring, because the danger is
+    invisible at the call site: someone simplifying ``claim``'s SQL sees a filter
+    that reads redundant, and the thing that made it redundant no longer exists.
+    So this arm pins both halves — no other statement filters the column, and the
+    occupancy method that used to is gone.
+    """
+    import inspect
+    import re
+
+    from cli_agent_orchestrator.adapters.store import queue as queue_module
+    from cli_agent_orchestrator.core import ports
+
+    store = queue_module.SqliteQueueStore
+    filtering = {
+        name
+        for name, fn in vars(store).items()
+        if callable(fn) and re.search(r"mode\s*=\s*'live'", inspect.getsource(fn) or "")
+    }
+    # ``claim`` is the ENFORCEMENT — it is the write that leases, so a row it
+    # excludes is undeliverable whatever the reads do. The other five carry the
+    # same conjunct as read-side DEFENCE. The set is closed so a sixth path
+    # cannot appear unnoticed, and `claim` must never leave it.
+    assert "claim" in filtering, "the enforcement left `claim`"
+    assert filtering == {
+        "claim",
+        "ready_receivers",
+        "undelivered_ids",
+        "pending_for_receiver",
+        "settle_through",
+        "cancel_on_complete",
+    }, sorted(filtering)
+
+    assert not hasattr(store, "occupancy"), (
+        "QueueStore.occupancy is back. It counted live non-terminal rows for the "
+        "deleted boot guard; if something needs that count again it must not be "
+        "allowed to become a second mode filter by accident"
+    )
+    assert not hasattr(ports.QueueStore, "occupancy")
+
+
 def test_claim_leases_a_live_row_and_issues_a_fencing_token(
     queue: SqliteQueueStore, clock: FakeClock
 ) -> None:
