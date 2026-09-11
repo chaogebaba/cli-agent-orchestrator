@@ -264,7 +264,7 @@ class TestNonForceBusyReportsResumable:
             ),
             patch(
                 "cli_agent_orchestrator.clients.database.get_conversation_identity",
-                return_value={"provider_session_id": "sess-xyz"},
+                return_value={"provider_session_id": "sess-xyz", "owner_principal": "mb_owner"},
             ),
         ):
             cap, resumable, reason = ts._resolve_reap_resume_key(TID, dict(_ROOT), force=False)
@@ -292,7 +292,7 @@ class TestNonForceBusyReportsResumable:
             ),
             patch(
                 "cli_agent_orchestrator.clients.database.get_conversation_identity",
-                return_value={"provider_session_id": "sess-xyz"},
+                return_value={"provider_session_id": "sess-xyz", "owner_principal": "mb_owner"},
             ),
         ):
             # correct (force=False)
