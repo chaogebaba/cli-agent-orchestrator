@@ -20,10 +20,13 @@ from cli_agent_orchestrator.core.events import AnyKind, EventKind
 from cli_agent_orchestrator.core.states import DegradedReason, WorkerState
 
 __all__ = [
+    "FORWARD_STATUS_MAP",
     "LEGACY_STATUS_MAP",
+    "LOSSY_FORWARD_STATES",
     "STATE_ASSERTING_KINDS",
     "implied_state",
     "legacy_state",
+    "legacy_status",
 ]
 
 
@@ -94,6 +97,87 @@ LEGACY_STATUS_MAP: dict[str, WorkerState] = {
     "render_uncertain": WorkerState.DEGRADED,
     "error": WorkerState.EXITED,
 }
+
+
+#: The FORWARD map: what the projection publishes as a legacy ``TerminalStatus``
+#: string (WP-ARCH phase 2, D1).  Strings, never the legacy enum, for the reason
+#: the module docstring gives for :func:`legacy_state`; a test on the legacy side
+#: of the fence pins every value here against the real enum.
+#:
+#: Two rows are CONDITIONAL and therefore not in this table — see
+#: :func:`legacy_status`, which holds them:
+#:
+#: * ``IDLE`` reached by ``turn.ended`` publishes ``completed`` rather than
+#:   ``idle``.  ``completed`` is not a state the projection holds: it is a screen
+#:   classification the fork uses for "the turn finished", and adding an eighth
+#:   ``WorkerState`` for it would break the audit's frozen seven-member enum and
+#:   its 49-cell table for a distinction no consumer reads as a state.  The
+#:   discriminator is free — the publisher is called from the fold and so holds
+#:   the causing event's kind — and the leg it preserves is
+#:   ``agent_step.py``'s ``_CompletionOutcome.COMPLETED``.
+#: * ``DEGRADED`` publishes ``unknown`` for ``no_signal`` and ``render_uncertain``
+#:   for every other reason.  Both map back to ``DEGRADED``, so the round trip
+#:   holds either way; the split keeps the audit §3.1 pairing that ``degraded``
+#:   replaced.
+FORWARD_STATUS_MAP: dict[WorkerState, str] = {
+    # Lossy.  Legacy has no member for "booting", and the choice between the
+    # remaining ones is not free: ``idle`` would let ``inbox_service``'s
+    # admission paste into a worker that has not finished starting.
+    WorkerState.STARTING: "processing",
+    WorkerState.IDLE: "idle",
+    WorkerState.BUSY: "processing",
+    WorkerState.AWAITING_INPUT: "waiting_user_answer",
+    # Lossy, and the least obvious row in the table.  The cap's legacy carrier is
+    # the CONDITION LABEL (``legacy_egress.CAPPED_CONDITION_LABEL``), which is
+    # what the fleet row and the capped-lane policy actually read; the status is
+    # not the carrier and must not pretend to be.  ``error`` would be actively
+    # wrong — it maps back to ``EXITED`` and makes the fork raise
+    # ``TerminalInputBlockedError`` on a worker that is merely waiting out a
+    # usage window.
+    WorkerState.CAPPED: "processing",
+    WorkerState.DEGRADED: "render_uncertain",
+    WorkerState.EXITED: "error",
+}
+
+#: The two states with NO legacy preimage: ``LEGACY_STATUS_MAP``'s image is the
+#: other five, so a round trip through the legacy vocabulary cannot return them.
+#:
+#: This set is the blueprint §5b correction.  §5b asserts that
+#: ``WorkerState -> TerminalStatus -> WorkerState`` is the identity, and for
+#: these two it is unsatisfiable rather than unimplemented: both land on
+#: ``processing`` and come back as ``BUSY``.  A test that enumerated all seven
+#: and asserted identity would be asserting something false about the legacy
+#: enum, so the round trip is scoped to the five that have a preimage and these
+#: two are asserted lossy BY NAME, with the reason each lands where it does
+#: written beside its row above.
+LOSSY_FORWARD_STATES: frozenset[WorkerState] = frozenset({WorkerState.STARTING, WorkerState.CAPPED})
+
+
+def legacy_status(
+    state: WorkerState,
+    *,
+    causing_kind: AnyKind | None = None,
+    degraded_reason: DegradedReason | None = None,
+) -> str:
+    """The legacy ``TerminalStatus`` string the projection publishes for ``state``.
+
+    The forward direction of :func:`legacy_state`, and the function D1's publisher
+    calls with the state it just folded into, the kind of the event that caused
+    the fold, and the standing degraded reason.  Pure: it reads no projection, no
+    clock and no configuration, so the whole mapping is decidable from a table
+    plus two discriminators.
+
+    ``causing_kind`` and ``degraded_reason`` are both optional and both ignored
+    for every state that does not name them.  A caller with no causing kind — a
+    sweep, a re-publish, a test — gets the unconditional row, which for ``IDLE``
+    is ``idle``: the plain reading, and the safe one, since ``completed`` asserts
+    that a turn just finished.
+    """
+    if state is WorkerState.IDLE and causing_kind is EventKind.TURN_ENDED:
+        return "completed"
+    if state is WorkerState.DEGRADED and degraded_reason is DegradedReason.NO_SIGNAL:
+        return "unknown"
+    return FORWARD_STATUS_MAP[state]
 
 
 def implied_state(kind: AnyKind) -> WorkerState | None:

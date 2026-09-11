@@ -18,6 +18,7 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
     PaneDisagreementCheck,
     register_phase1_checks,
 )
+from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.core.events import (
     AnyKind,
@@ -41,6 +42,7 @@ class Rig:
     registry: CheckRegistry
     checks: PaneDisagreementCheck
     sources: StaticSourceRegistry
+    health: SourceHealth
     projector: Projector
 
     def emit(
@@ -144,5 +146,6 @@ def rig() -> Rig:
     events.set_checks(registry)
     events.bind_findings(findings)
     sources = StaticSourceRegistry()
-    projector = Projector(events, states, clock, sources, legacy_check=checks)
-    return Rig(clock, events, states, findings, registry, checks, sources, projector)
+    health = SourceHealth()
+    projector = Projector(events, states, clock, sources, legacy_check=checks, health=health)
+    return Rig(clock, events, states, findings, registry, checks, sources, health, projector)

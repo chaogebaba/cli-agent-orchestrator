@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
+from cli_agent_orchestrator.app.worker_truth.health import NullSourceHealth, SourceHealthWriter
 from cli_agent_orchestrator.app.worker_truth.mapping import (
     PANE_MISSING_REASON,
     implied_state,
@@ -249,11 +250,17 @@ class Projector:
         clock: Clock,
         sources: SourceRegistry | None = None,
         legacy_check: Callable[[str], bool] | None = None,
+        health: SourceHealthWriter | None = None,
     ) -> None:
         self._events = events
         self._states = states
         self._clock = clock
         self._sources = sources if sources is not None else NullSourceRegistry()
+        # D1e's gate, written here and read by the legacy status monitor.  A
+        # projector with no view still folds: the view is what the CUTOVER needs,
+        # and a projector must remain runnable without the thing that consumes
+        # it — which is also the shape of every phase before the cutover lands.
+        self._health: SourceHealthWriter = health if health is not None else NullSourceHealth()
         # ``DIAG-LEGACY-DISAGREE`` is durational, so it cannot ride the store's
         # on-append registry: during an append the projection is one event stale
         # by construction.  The projector drives it instead, after the fold.
@@ -275,6 +282,11 @@ class Projector:
             return ProjectionOutcome(event.terminal_id, rule="decision_row", applied=False)
 
         row = self._load(event.terminal_id, event.ingested_at)
+        # D1e — re-state the gate on EVERY fold, before any rule runs.  The mark
+        # is level rather than edge-triggered (see ``health``'s module docstring):
+        # an arriving event is the freshest moment the two inputs are both known,
+        # and re-stating an unchanged answer costs one dictionary write.
+        self._health.mark(event.terminal_id, projected=self._projected(event.terminal_id, row))
 
         if self._is_muted(row, event):
             self._states.upsert(replace(row, last_event_seq=event.seq))
@@ -316,7 +328,18 @@ class Projector:
             return False
         if event.kind in DERIVED_ALWAYS_KINDS:
             return False
-        if not self._sources.is_authoritative(event.terminal_id):
+        return self._projected(event.terminal_id, row)
+
+    def _projected(self, terminal_id: str, row: ProjectedState) -> bool:
+        """Does the projection own this terminal's status? (D1e.)
+
+        Deliberately the SAME predicate source-level precedence mutes a derived
+        event with.  Two spellings of "this terminal has a live authoritative
+        source" would eventually disagree, and the disagreement would read as the
+        pane path being suppressed for a terminal whose derived events still
+        apply — a terminal publishing nothing at all.
+        """
+        if not self._sources.is_authoritative(terminal_id):
             return False
         return self._source_healthy(row)
 
@@ -548,6 +571,17 @@ class Projector:
 
         for projection in self._states.all_terminals():
             row = ProjectedState.from_projection(projection)
+            # D1e — re-state the gate for EVERY terminal, before the guards below
+            # skip it.  This is the half of the mark that closes I7: a source
+            # that died quietly produces no event, so the fold can never lower a
+            # standing ``True``, and without this pass a terminal would stay
+            # projected for as long as it stayed silent — which is exactly the
+            # condition under which the projection has nothing to publish.  An
+            # exited terminal is marked by the same rule rather than forced to
+            # ``False``: while its source is still warm the projection has a real
+            # answer for it — ``error`` — and it is the row the sweep's own rules
+            # never revisit, so this pass is its only mark.
+            self._health.mark(row.terminal_id, projected=self._projected(row.terminal_id, row))
             if row.state is WorkerState.EXITED:
                 continue
             last_signal = self._last_signal(row)

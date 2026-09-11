@@ -72,6 +72,7 @@ __all__ = [
     "QueueStore",
     "ReceiverDirectory",
     "SeatCarrier",
+    "SourceHealthView",
     "StateFolder",
     "StateProjection",
     "StateStore",
@@ -212,6 +213,36 @@ class StateFolder(Protocol):
     """
 
     def project(self, event: WorkerEvent) -> object: ...
+
+
+@runtime_checkable
+class SourceHealthView(Protocol):
+    """Is this terminal's status published by the projection? (phase 2, D1e/I7.)
+
+    The ONE gate the status cutover is allowed to have.  Every suppression D1
+    performs — the pane path's publish, the sticky-ready rules, the revert
+    arming, the four read-time fusion rules — asks this and nothing else, so the
+    fallback decision lives in one predicate rather than scattered across the
+    call sites that act on it.  That concentration is what makes I7 amendable:
+    the herdr seam's §6 wants a certified cohort to keep the pane fallback OFF
+    for lifecycle kinds, and that is an edit to one implementation rather than a
+    hunt through the monitor.
+
+    **Absence means NOT projected.**  A terminal this view has never heard of, a
+    terminal whose source went quiet past ``NO_SIGNAL_S``, and every terminal at
+    all when the projector is not running, all answer ``False`` and keep today's
+    pane behaviour.  The predicate is therefore safe to consult from code that
+    runs before the projector exists, which is the state the monitor is in for
+    the whole of every boot.
+
+    Read-only on purpose.  The writer is the projector — it marks on every fold
+    and re-marks every terminal on every sweep — and it holds the concrete
+    implementation, not this port.  A view that could also be written would let a
+    consumer of the status path decide it was projected, which is precisely the
+    loop D5's ``fed_by`` field exists to keep open.
+    """
+
+    def is_projected(self, terminal_id: str) -> bool: ...
 
 
 class StateProjection(Protocol):

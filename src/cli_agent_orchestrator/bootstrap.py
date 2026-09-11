@@ -54,6 +54,7 @@ from cli_agent_orchestrator.app.worker_truth.checks import (
     PaneDisagreementCheck,
     register_phase1_checks,
 )
+from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.core.delivery import (
     GuardOutcome,
@@ -190,6 +191,12 @@ class WorkerTruthRuntime:
     state_store: StateStore | None = None
     projector: Projector | None = None
     sources: StaticSourceRegistry | None = None
+    #: D1e's gate (phase 2), written by the projector on every fold and sweep.
+    #: Held here because the composition root is what hands the READ side to the
+    #: legacy status monitor when the cutover is on, and because dropping the
+    #: runtime must drop the view with it: a stopped projector leaves marks
+    #: behind, and a fleet whose publisher is gone must fall back to the pane.
+    health: SourceHealth | None = None
     retention: RetentionTask | None = None
     #: The delivery queue's RESOLVED position (D9), and the guard's reasoning.
     #: Present whatever the ingestion switch says: the two are independent, and
@@ -545,6 +552,13 @@ async def start_worker_truth(
         # starting point: with no tailer running, every terminal falls back to
         # the pane, which is what phase 1 wants until a source proves itself.
         sources = StaticSourceRegistry()
+        # WP-ARCH phase 2, D1e: built HERE, beside the projector that writes it,
+        # because the composition root is the only module that may hand it to
+        # both halves — the projector as a writer, the legacy status monitor as
+        # a read-only ``core.ports.SourceHealthView``.  Empty at construction, so
+        # every terminal reads NOT projected until a fold says otherwise, which
+        # is the behaviour every arm before the cutover must have.
+        health = SourceHealth()
         projector = Projector(
             event_store,
             state_store,
@@ -553,6 +567,7 @@ async def start_worker_truth(
             legacy_check=PaneDisagreementCheck(
                 finding_store, event_store, state_store, resolved_clock
             ),
+            health=health,
         )
         retention = RetentionTask(event_store, resolved_clock)
         await retention.start()
@@ -614,6 +629,7 @@ async def start_worker_truth(
         state_store=state_store,
         projector=projector,
         sources=sources,
+        health=health,
         retention=retention,
         delivery=delivery,
         queue_store=queue_store,
