@@ -129,7 +129,18 @@ uv tool install --force --python 3.14 . >/dev/null 2>&1 || { echo "HARNESS: inst
 # the PREVIOUS arm's server and the A/B compares a build with itself.
 for pid in \$(pgrep -f cao-server 2>/dev/null || true); do kill "\$pid" 2>/dev/null || true; done
 sleep 2
+# The arm's OWN session by name first, then the server.  A bare ``kill-server``
+# alone left a session from a previous round alive on the box, and the only
+# symptom was ``cao launch`` answering 400 "Session already exists" — after
+# which the arm carried on with NO supervisor terminal and the round looked like
+# it ran.  Named kill, then server kill, then VERIFY.
+tmux kill-session -t "\$ARM_SESSION" 2>/dev/null || true
 tmux kill-server 2>/dev/null || true
+sleep 2
+if tmux has-session -t "\$ARM_SESSION" 2>/dev/null; then
+  echo "HARNESS: session \$ARM_SESSION survived cleanup; refusing to run a polluted arm"
+  exit 2
+fi
 
 # Seed providers.toml the way install.sh does — copy the default only when the
 # arm's fresh home has none — so the provider model defaults are the repo's
@@ -164,6 +175,15 @@ curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "HARNESS: ser
 cao launch --agents code_supervisor --provider claude_code \\
   --session-name \$ARM_SESSION --headless --yolo >>"\$ROUND/launch.log" 2>&1
 
+# The launch must actually have produced the session's first terminal.  It
+# answered 400 once (a stale session, above) and the arm ran on regardless, with
+# a lane list short by one and every comparison quietly narrower.  A launch that
+# did not launch is a harness failure, not a smaller round.
+if ! grep -q 'Terminal created:' "\$ROUND/launch.log" 2>/dev/null; then
+  echo "HARNESS: cao launch created no terminal; see \$ROUND/launch.log"
+  exit 2
+fi
+
 # Worker lanes through the API: ``assign`` is an MCP tool, not a CLI verb.
 # codex is the allowlisted provider and the only one with a rollout source;
 # kiro is the UNSOURCED control that proves the fallback was demoted rather than
@@ -176,6 +196,18 @@ for provider in $LANE_PROVIDERS; do
     "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/terminals?agent_profile=developer&provider=\$provider&working_directory=$BOXHOME/cli-subagents/cli-agent-orchestrator" \\
     -H 'content-type: application/json' -d '{}' >>"\$ROUND/launch.log" 2>&1
   echo " <- \$provider lane" >>"\$ROUND/launch.log"
+done
+# Same rule for the worker lanes.  ``pi_cli`` answered 500 ("startup error
+# banner") on a box where ``pi`` was installed but broken, and the round
+# continued with the control lane missing — which is precisely the lane the
+# unsourced comparisons need.
+for provider in $LANE_PROVIDERS; do
+  if ! grep -q '^201' "\$ROUND/lane-\$provider.json" 2>/dev/null &&
+     ! python3 -c "import json,sys; json.load(open(sys.argv[1]))['id']" \\
+       "\$ROUND/lane-\$provider.json" >/dev/null 2>&1; then
+    echo "HARNESS: lane \$provider did not start; \$(head -c 200 "\$ROUND/lane-\$provider.json" 2>/dev/null)"
+    exit 2
+  fi
 done
 sleep 20
 
@@ -211,12 +243,17 @@ SERIES_PID=\$!
 # ``/fleet`` answers an OBJECT with a ``terminals`` key, not a bare list — the
 # first run of this round drove nothing at all because the parser assumed a list
 # and silently produced no lanes.
-LANES=\$(curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
+# ONE fleet read feeds both the lane list and the provider map.  Two reads a
+# second apart disagreed on a live box: the first saw a transient id that was
+# gone by the second, and the turns loop then spent one send per turn on a
+# terminal that answered 404 for the whole arm.
+curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" > "\$ROUND/fleet-lanes.json" 2>/dev/null
+LANES=\$(python3 -c '
 import json, sys
-body = json.load(sys.stdin)
+body = json.load(open(sys.argv[1]))
 rows = body["terminals"] if isinstance(body, dict) else body
 print(" ".join(r["id"] for r in rows))
-' 2>/dev/null)
+' "\$ROUND/fleet-lanes.json" 2>/dev/null)
 if [ -z "\$LANES" ]; then echo "HARNESS: the session has no lanes; see launch.log"; exit 2; fi
 echo "lanes: \$LANES"
 
@@ -224,13 +261,13 @@ echo "lanes: \$LANES"
 # classifier is banner-only and each provider has its OWN banner regex
 # (providers/condition.py:760-772).  Driving the wrong one produces nothing and
 # the check SKIPs on a round that looked like it ran.
-curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
+python3 -c '
 import json, sys
-body = json.load(sys.stdin)
+body = json.load(open(sys.argv[1]))
 rows = body["terminals"] if isinstance(body, dict) else body
 for row in rows:
     print(row["id"], row.get("provider") or "")
-' > "\$ROUND/lane-providers.txt" 2>/dev/null || true
+' "\$ROUND/fleet-lanes.json" > "\$ROUND/lane-providers.txt" 2>/dev/null || true
 cat "\$ROUND/lane-providers.txt"
 ARM_STARTED=\$(date +%s)
 
