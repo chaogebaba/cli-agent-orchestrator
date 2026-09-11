@@ -344,8 +344,12 @@ async def test_check_protocol_accepts_the_pinned_version(socket_path: str) -> No
 
 async def test_check_protocol_refuses_a_drifted_protocol(socket_path: str) -> None:
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
-        # A future herdr on a different protocol.
-        await server.reply(request["id"], {"protocol": 23, "schema_version": 1})
+        # A future herdr on a different protocol, reporting it where 0.9.0 does:
+        # inside the ``session.snapshot`` body.
+        await server.reply(
+            request["id"],
+            {"snapshot": {"panes": [], "protocol": 23, "schema_version": 1}},
+        )
 
     async with FakeHerdrServer(socket_path) as server:
         server.on_request = handler
