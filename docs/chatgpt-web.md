@@ -41,3 +41,42 @@ the token firehose.
 Publishing is bound to the worker's own `X-CAO-Terminal-Token` — a write scope
 alone cannot inject a turn stream under a worker's name. Set
 `CAO_CHATGPT_TURN_RELAY=0` in the worker env to disable publishing entirely.
+
+## Pulling context instead of uploading it (F970)
+
+The lane's most fragile subsystem is the attachment path (upload-readiness
+calibration, chip identity, stall DOM dumps). The alternative, taken in shape
+from `XiaoDuoYa/codex-with-chatgpt` (MIT), is to let the model **pull** what it
+needs from the real tree instead of being handed a snapshot someone else chose.
+
+`cao-mcp-server` therefore carries an optional, **read-only** workspace group:
+
+```bash
+CAO_WORKSPACE_READ_TOOLS=1 CAO_WORKSPACE_ROOT=/path/to/repo   # then restart cao-server
+```
+
+Tools: `workspace_info`, `workspace_list_directory`, `workspace_read_file`,
+`workspace_search`, `workspace_git_status`, `workspace_git_diff`.
+
+- **Registration-time gating.** With the flag unset the tools do not exist, so
+  a disabled feature costs no tool-surface context on any worker's turn.
+- **Read-only by construction.** There is no write, patch, shell or commit tool
+  in the group — absent, not disabled — so prompt injection has nothing to
+  reach.
+- **Canonical containment.** Every path is realpath-resolved (deepest existing
+  ancestor first) and checked against the root, so `..`, absolute paths, a
+  symlink out of the tree and a symlinked parent with a missing leaf all fail
+  identically with `PATH_OUTSIDE_WORKSPACE`.
+- **Sensitive files are denied, not hidden**: `.env*` (except `.env.example`),
+  keys, `.ssh/`, `.aws/`, `.gnupg/`, netrc, credential JSON, cookie stores, plus
+  this fork's own `providers.toml` and `session-export.json`. `.caoignore` adds
+  rules; it cannot remove the built-ins. The same policy gates the ChatGPT-web
+  lane's **bundle** path, so "attach this file" is not a way around "you may not
+  read `.env`".
+- Refusals come back as `{ok: false, error_code: …}` data, never a traceback.
+
+Serving these to ChatGPT itself as a custom connector is a follow-up: it needs
+Settings → Security and login → **Developer mode** turned on by the account
+owner, then chatgpt.com/plugins → **+** → a streamable-HTTP endpoint whose URL
+ends in `/mcp`. Until then the group is a local MCP surface for CAO's own
+workers.

@@ -138,6 +138,23 @@ def run_production_review(
     run_id = new_run_id()
 
     if bundle_path:
+        # F970 (#819): the sensitive-file policy binds the EXPOSURE path, not
+        # just the pull tools. "Attach this file" must not be a way around
+        # "you may not read .env" — the bundle is chosen by a caller, and this
+        # lane ships it to a third party. Refuse before a byte is read.
+        from cli_agent_orchestrator.services.workspace_read import (
+            WorkspaceError,
+            assert_exposable,
+        )
+
+        try:
+            assert_exposable(bundle_path)
+        except WorkspaceError as exc:
+            raise RunnerError(
+                RunnerErrorCode.ACCESS_DENIED,
+                f"bundle refused by the sensitive-file policy ({exc.code})",
+                delivery_state=DeliveryState.NOTHING_SENT,
+            ) from exc
         data = Path(bundle_path).read_bytes()
         enforce_bundle_bounds(data)
         bundle_sha = sha256_bytes(data)

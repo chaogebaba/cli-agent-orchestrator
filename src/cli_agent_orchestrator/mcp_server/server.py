@@ -6452,6 +6452,160 @@ from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
 register_mcp_server_surfaces(mcp)
 
 
+# ---------------------------------------------------------------------------
+# F970 (#819) — read-only WORKSPACE PULL tools (optional group)
+#
+# Ported in shape from XiaoDuoYa/codex-with-chatgpt's MCP server: rather than
+# packing a snapshot into a prompt and uploading it, let the model PULL what it
+# needs from the real tree. The lane that wants this today is chatgpt_web (a
+# reviewer reading the actual file at the actual path beats a bundle someone
+# else chose, and it deletes the most fragile subsystem that lane owns), and
+# the same tools serve any worker on the local MCP surface.
+#
+# Registration is GATED (the _learning_tool precedent): the flag decides whether
+# the tools exist at all, so a disabled feature costs zero tool-surface context
+# on every worker's every turn. Set CAO_WORKSPACE_READ_TOOLS=1 and name the root
+# with CAO_WORKSPACE_ROOT (default: the server's cwd).
+#
+# Read-only BY CONSTRUCTION: there is no write, patch, shell or commit tool in
+# this group — not disabled, absent — so prompt injection has nothing to reach.
+# Containment is canonical (realpath of the deepest existing ancestor, then an
+# inside-the-root check), and the sensitive-file policy (.env*, keys, SSH/AWS/
+# GnuPG, netrc, credential stores, providers.toml, session exports) is denied
+# outright rather than merely hidden.
+# ---------------------------------------------------------------------------
+
+
+def _workspace_read_enabled() -> bool:
+    """Fail closed: the group exists only when explicitly switched on."""
+    import os as _os
+
+    return _os.environ.get("CAO_WORKSPACE_READ_TOOLS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _workspace_tool():
+    """Register a tool ONLY when the workspace-read group is enabled."""
+    if _workspace_read_enabled():
+        return mcp.tool()
+
+    def _skip(fn):
+        return fn
+
+    return _skip
+
+
+def _workspace():
+    """Build the contained workspace view for this call."""
+    import os as _os
+
+    from cli_agent_orchestrator.services.workspace_read import Workspace
+
+    return Workspace(_os.environ.get("CAO_WORKSPACE_ROOT") or _os.getcwd())
+
+
+def _workspace_result(fn, *args, **kwargs) -> Dict[str, Any]:
+    """Run a workspace read, turning a typed refusal into a typed result.
+
+    A refusal is DATA, not an exception: the model must be able to tell
+    "denied by policy" from "tool crashed", and must never be handed a
+    traceback that quotes the path it was denied.
+    """
+    from cli_agent_orchestrator.services.workspace_read import WorkspaceError
+
+    try:
+        return {"ok": True, **fn(*args, **kwargs)}
+    except WorkspaceError as exc:
+        return {"ok": False, "error_code": exc.code, "error": str(exc)}
+
+
+@_workspace_tool()
+async def workspace_info() -> Dict[str, Any]:
+    """Overview of the connected workspace: name, size, git-ness, top level.
+
+    Call this first. The workspace is READ-ONLY: there is no tool in this group
+    that can write, patch, run a command or commit, and sensitive files
+    (.env*, keys, credentials) are denied rather than returned.
+    """
+    return _workspace_result(lambda: _workspace().info())
+
+
+@_workspace_tool()
+async def workspace_list_directory(
+    path: str = Field(default=".", description="Workspace-relative path, e.g. 'src'"),
+    depth: int = Field(default=1, description="Recursion depth, 1-4"),
+    limit: int = Field(default=200, description="Max entries to return, 1-1000"),
+    offset: int = Field(default=0, description="Pagination offset"),
+) -> Dict[str, Any]:
+    """List files and directories under a workspace-relative path.
+
+    High-noise directories (.git, node_modules, build output, caches) are
+    omitted; sensitive files are never listed.
+    """
+    return _workspace_result(
+        lambda: _workspace().list_directory(path, depth=depth, limit=limit, offset=offset)
+    )
+
+
+@_workspace_tool()
+async def workspace_read_file(
+    path: str = Field(description="Workspace-relative file path"),
+    start_line: int = Field(default=1, description="1-based first line to return"),
+    end_line: int = Field(default=0, description="1-based last line (0 = start_line + 399)"),
+) -> Dict[str, Any]:
+    """Read a text file with line-range pagination (400 lines by default).
+
+    Binary files and files matching the sensitive-file policy are refused with
+    a typed error_code rather than partially returned.
+    """
+    return _workspace_result(
+        lambda: _workspace().read_file(path, start_line=start_line or 1, end_line=end_line or None)
+    )
+
+
+@_workspace_tool()
+async def workspace_search(
+    query: str = Field(description="Text to search for (literal unless regex=true)"),
+    path: str = Field(default=".", description="Restrict to this workspace-relative path"),
+    glob: str = Field(default="", description="Filename glob filter, e.g. '*.py'"),
+    limit: int = Field(default=50, description="Max matching lines, 1-200"),
+    regex: bool = Field(default=False, description="Treat query as a regular expression"),
+) -> Dict[str, Any]:
+    """Search file contents, returning matching lines with paths and numbers."""
+    return _workspace_result(
+        lambda: _workspace().search(query, path=path, glob=glob or None, limit=limit, regex=regex)
+    )
+
+
+@_workspace_tool()
+async def workspace_git_status() -> Dict[str, Any]:
+    """Structured git status: branch, staged, unstaged, untracked.
+
+    Sensitive paths are omitted even from the file NAMES, since a name alone
+    can disclose what a workspace holds.
+    """
+    return _workspace_result(lambda: _workspace().git_status())
+
+
+@_workspace_tool()
+async def workspace_git_diff(
+    mode: str = Field(default="unstaged", description="unstaged | staged | head"),
+    path: str = Field(default="", description="Limit to one workspace-relative path"),
+    offset: int = Field(default=0, description="Byte offset for pagination"),
+    max_bytes: int = Field(default=65536, description="Max bytes per call, up to 262144"),
+) -> Dict[str, Any]:
+    """Git diff with byte-offset pagination (call again with next_offset)."""
+    return _workspace_result(
+        lambda: _workspace().git_diff(
+            mode=mode, path=path or None, offset=offset, max_bytes=max_bytes
+        )
+    )
+
+
 from typing import Sequence as _Seq  # noqa: E402
 
 # --- Deterministic tools/list ordering (MCP 2026-07-28: servers SHOULD return
