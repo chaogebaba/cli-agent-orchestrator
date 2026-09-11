@@ -247,7 +247,11 @@ def test_codex_null_session_uses_fd_capture_only_and_never_overwrites_non_null(t
         update.assert_not_called()
 
 
-def test_codex_lazy_self_heal_uses_persisted_cas_winner(tmp_path):
+def test_codex_lazy_self_heal_uses_persisted_cas_winner(tmp_path, monkeypatch):
+    # F703 (#558): conftest pins CODEX_HOME and resolve_codex_home consults it
+    # BEFORE the Path.home() fallback, so patching Path.home alone no longer
+    # redirects the codex rollout lookup at the fake home written below.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
     metadata = {"id": "term", "provider": "codex", "provider_session_id": None}
     winner = tmp_path / ".codex/sessions/rollout-winner.jsonl"
     winner.parent.mkdir(parents=True)
@@ -298,6 +302,8 @@ def test_claude_allocated_session_launch_resolves_first_accepted_turn(tmp_path):
 
 def test_codex_fd_capture_owns_descendant_and_rejects_same_cwd_decoy(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # F703 (#558): CODEX_HOME outranks Path.home() in resolve_codex_home.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
     owned_id = "11111111-1111-1111-1111-111111111111"
     decoy_id = "22222222-2222-2222-2222-222222222222"
     owned = tmp_path / ".codex/sessions/2026/07/11" / f"rollout-{owned_id}.jsonl"

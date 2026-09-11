@@ -62,6 +62,12 @@ def test_typed_provider_validation_split(tmp_path, monkeypatch):
     from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # F703 (#558): conftest pins CODEX_HOME to a per-test temp dir, and
+    # persona_context.resolve_codex_home consults CODEX_HOME BEFORE the
+    # provider_home()/Path.home() fallback. Patching Path.home alone no
+    # longer redirects the codex artifact lookup, so pin CODEX_HOME at the
+    # same fake home the test writes its rollout files into.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
     codex = object.__new__(CodexProvider)
     with pytest.raises(RetryableArtifactValidation) as missing:
         codex.validate_session_artifact("u", "/work")

@@ -541,6 +541,18 @@ def test_d6_auto_responder_publishes_full_frame_then_reclassifies_region(
     monkeypatch.setattr(ar.time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(ar.threading, "Thread", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(engine, "_log", lambda *_args: None)
+    # F597 #454 pt2 (a) SETTLE (cf2d1888, landed after this test was written):
+    # ``_fire`` now gates the first send of an episode on the matched region
+    # being byte-stable across two ``_settle_capture`` samples. That seam reads
+    # the pyte composite (``status_monitor.get_rendered_screen``), not the
+    # backend viewport; on this freshly-constructed StatusMonitor the terminal
+    # is unregistered, so it returned None and every fire died as
+    # ``settle_capture_failed``. Serve the same static frame the backend serves
+    # (production reads one live pane through both paths) and skip the real
+    # 0.5s inter-sample wait. Neither touches ``order`` -- the evidence law this
+    # test binds (prove -> capture -> publish -> read -> effect) is unchanged.
+    monkeypatch.setattr(monitor, "get_rendered_screen", lambda _tid: ["1. Proceed", "Press enter"])
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
 
     _fire_region = ar.dialog_region(["1. Proceed", "Press enter"])
     _fire_digest = ar._digest_normalized(_fire_region.normalized)

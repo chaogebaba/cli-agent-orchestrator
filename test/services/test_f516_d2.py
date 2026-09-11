@@ -63,6 +63,24 @@ def _wire(monkeypatch, metadata, backend):
         "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
         lambda _op: False,
     )
+    # F597 #454 pt2 (a) SETTLE (cf2d1888, landed after this file was written):
+    # the FIRST send of an episode is gated on the matched region being
+    # byte-stable across two ``_settle_capture`` samples, and that seam reads the
+    # pyte composite via ``status_monitor.get_rendered_screen`` -- NOT the
+    # backend's ``capture_viewport``. Unstubbed it returns None for an
+    # unregistered terminal, so every fire here died as
+    # ``settle_capture_failed``. In production both paths read the same live
+    # pane, so mirror the backend capture here: the settle samples then see
+    # exactly the frame ``_backend`` serves, and a test that hands the barrier a
+    # DIFFERENT frame still exercises the barrier rather than short-circuiting on
+    # a missing composite.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+        lambda _tid: backend.capture_viewport(
+            metadata["tmux_session"], metadata["tmux_window"]
+        ).splitlines(),
+    )
+    monkeypatch.setattr(ar, "_clock_sleep", lambda _s: None)
 
 
 def _backend(screen):

@@ -18,7 +18,7 @@
 
 
 
- [1m[38;2;212;212;212m$ bash /home/chao/VScode_projects/cli-subagents/scripts/report-attest.sh --check /data/cao-scratch/briefs/ledger-f810-r5.md; echo CHECK_RC=$?; tail -1
+ [1m[38;2;212;212;212m$ bash /home/user/VScode_projects/cli-subagents/scripts/report-attest.sh --check /data/cao-scratch/briefs/ledger-f810-r5.md; echo CHECK_RC=$?; tail -1
 [0m[48;2;40;50;40m [1m[38;2;212;212;212m/data/cao-scratch/briefs/ledger-f810-r5.md; head -1 /data/cao-scratch/briefs/ledger-f810-r5.md[0m[48;2;40;50;40m
 
  [38;2;128;128;128mCRD=09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113 SELF=09ff947f030d49df930f030c144f5482e728465ad27bed78e97af95c84827113[39m

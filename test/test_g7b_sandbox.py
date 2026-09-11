@@ -322,6 +322,20 @@ def test_every_native_home_consumer_reads_the_injected_plane(
     )
     for module in (codex, fork_context_service, epoch_recovery_service, message_trace_service):
         monkeypatch.setattr(module, "provider_home", lambda _provider, p=codex_plane: p)
+    # F703 (01104f2b, 2026-09-01) taught persona_context.resolve_codex_home to
+    # honour an explicit absolute ``CODEX_HOME`` ahead of the production
+    # fallback, and pinned that variable suite-wide in conftest to
+    # ``tmp_path/codex-home`` so no unpersona'd test can write the operator's
+    # real ~/.codex.  That pin is MORE specific than the fallback by design, so
+    # ``codex._resolved_codex_home`` returns it verbatim and never reaches the
+    # injected-plane branch this test exists to pin — the rollout written above
+    # would not be globbed at all.  Drop the pin for this test so the fallback
+    # resolves to the production home, which is exactly the condition under
+    # which ``_resolved_codex_home`` hands off to ``provider_home("codex")``
+    # (codex.py:111-112) — the call the assertions below are about.  Nothing
+    # here can write to the real ~/.codex: every consumer exercised is a read
+    # path, and each one resolves to ``codex_plane`` via the patch above.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
     provider = codex.CodexProvider("tid", "session", "window")
     provider.validate_session_artifact(session_id, "/work")
@@ -497,13 +511,25 @@ def test_claude_launch_uses_exact_preflight_executable_with_divergent_pane_path(
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
 def test_real_bwrap_preflight_and_host_path_remains_production(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plane = _plane(tmp_path, "claude_code")
     assert plane.native_home is not None
     plane.native_home.mkdir(parents=True)
     (plane.native_home / "CLAUDE.md").write_text(f"{CLAUDE_SANDBOX_MARKER}\n", encoding="utf-8")
     (plane.native_home / "RTK.md").write_text("", encoding="utf-8")
+    # The host half of this acceptance used to read the OPERATOR's live
+    # ~/.claude/CLAUDE.md, an artifact CAO neither creates nor owns: on a fresh
+    # box (no such file) the test died with FileNotFoundError before reaching a
+    # single assertion.  Pin HOME to a hermetic host home carrying its own
+    # non-marker first line instead — ``preflight_claude_native_home`` resolves
+    # ``Path.home()`` at call time, so the bwrap mount point moves with it and
+    # the assertion still proves exactly what it claims: the pane-scoped mount
+    # never reaches the PARENT's view of $HOME/.claude/CLAUDE.md.
+    host_claude = tmp_path / "host-home" / ".claude"
+    host_claude.mkdir(parents=True)
+    (host_claude / "CLAUDE.md").write_text("# production host CLAUDE.md\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(host_claude.parent))
     host_first_line = (
         (Path.home() / ".claude" / "CLAUDE.md").read_text(encoding="utf-8").splitlines()[0]
     )

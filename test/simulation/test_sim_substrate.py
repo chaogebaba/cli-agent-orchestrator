@@ -171,7 +171,29 @@ class TestAC4VirtualTimeIsFree:
     """AC4: Virtual time advances at zero wall-clock cost."""
 
     def test_600_virtual_seconds_under_2_real_seconds(self):
-        """[LB] 600 virtual seconds with escalate_after_s=120 completes in < 2s wall."""
+        """[LB] 600 virtual seconds cost real time that is O(deadlines), not O(seconds).
+
+        The budget is expressed as a RATIO of the virtual time advanced rather
+        than a fixed 2.0s wall constant, which had almost no headroom. Timing
+        this body in isolation on 2026-09-11 (6 consecutive runs per condition,
+        ``time.monotonic`` around ``run_until`` only, imports excluded):
+
+          * idle laptop (loadavg 0.33): 0.98-1.50s wall, CPU within 1% of wall
+          * same laptop with one concurrent ``-n 2`` suite (loadavg ~4):
+            1.30-4.77s wall
+
+        CPU time tracking wall that closely says the 120 iterations are honest
+        CPU work, not sleeping — so the old 2.0s constant was only ~1.3-2x above
+        the idle cost and any co-tenant crosses it. That is scheduler noise, not
+        a regression in virtual time.
+
+        The invariant still bites: a driver that actually slept would burn at
+        least ``tick_s`` (5s) of real time per tick and ~600s over the run, so
+        the 1/20 ratio below (30s here) fails by a factor of 20 the moment
+        virtual time stops being free, while leaving ~6x headroom over the
+        slowest measured run. ``iteration_count`` pins the complexity claim
+        directly.
+        """
         clock = SimClock(initial_monotonic=1000.0)
         with install_clock(clock):
             from cli_agent_orchestrator.sim.driver import SimDriver, EventTrace
@@ -199,7 +221,12 @@ class TestAC4VirtualTimeIsFree:
 
             # Assertions
             assert clock.monotonic() >= 1600.0, "Should have advanced 600+ virtual seconds"
-            assert wall_elapsed < 2.0, f"Wall-clock cost {wall_elapsed:.2f}s exceeds 2s budget"
+            virtual_elapsed = clock.monotonic() - 1000.0
+            wall_budget = virtual_elapsed / 20.0
+            assert wall_elapsed < wall_budget, (
+                f"Wall-clock cost {wall_elapsed:.2f}s exceeds the {wall_budget:.1f}s budget "
+                f"for {virtual_elapsed:.0f} virtual seconds — virtual time is sleeping"
+            )
 
             # D13: iterations should equal distinct deadlines, not 600
             assert driver.iteration_count < 200, (

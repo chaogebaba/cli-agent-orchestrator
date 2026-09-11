@@ -1,5 +1,5 @@
 Do you trust the contents of this directory?
-/home/chao/VScode_projects/cli-subagents
+/home/user/VScode_projects/cli-subagents
 
 Grok Build may run or modify contents in this directory,
 posing security risks.

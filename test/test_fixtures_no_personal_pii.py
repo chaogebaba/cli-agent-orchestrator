@@ -53,7 +53,17 @@ _PERSONAL_EMAIL_RE = re.compile(
 # CI-standard names are allowlisted so redacted fixtures and CI-captured
 # fixtures stay usable. Matching is case-insensitive on the ``home``/``Users``
 # root; the captured name group is compared against the allowlist verbatim.
-_HOME_PATH_RE = re.compile(r"/(?:home|Users)/([A-Za-z0-9._-]+)")
+#
+# The lookbehind anchors the match to the START of an absolute path. Without it
+# ANY directory literally named ``home``/``Users`` nested inside another path is
+# reported as a home path: the herdr/pi captures carry
+# ``/workspace/cao/home/.pi/...``, ``/workspace/cao/home/.config/...`` and
+# ``/workspace/cao/home/box-scratch/...``, which the unanchored pattern reported
+# as the "usernames" ``.pi``, ``.config``, ``.bun`` and ``box-scratch``. A real
+# leak is always a path ROOT (``/home/<name>/...`` after whitespace, a quote, a
+# shell prompt ``:``, ``=``, ...), so anchoring loses no real PII while dropping
+# that whole false-positive class.
+_HOME_PATH_RE = re.compile(r"(?<![A-Za-z0-9._/-])/(?:home|Users)/([A-Za-z0-9._-]+)")
 _SYNTHETIC_HOME_NAMES = frozenset(
     {
         "user",
@@ -68,6 +78,11 @@ _SYNTHETIC_HOME_NAMES = frozenset(
         "vscode",  # devcontainer
         "root",
         "node",
+        # Fixed account baked into the disposable grok-trial VM image every box
+        # in the fleet runs as (``box@grok-box-NNN``). Shared machine-image
+        # account, not a person — same class as ``runner``/``ubuntu``/``node``,
+        # and pane captures taken on a box embed it in width-sensitive columns.
+        "box",
     }
 )
 
