@@ -259,9 +259,9 @@ class TestAC5W5NativeTierParking:
 # its ``supervisor.wake.ws_monitor`` dark-ship gate, and the root-repo doctrine
 # that told the seat to arm the socket. All three are deleted, the flag included
 # (``test_f747_native_default.test_ws_monitor_is_not_a_setting_any_more``): the
-# seat's single
-# carrier is the server-side delivery tick (``app/delivery/tick.py`` ->
-# ``services/queue_carrier.NativeSeatCarrier``). The root repo still carries the
-# now-dead ``doctrine/sections/shared/ws-arming.md``,
-# ``doctrine/hooks/ws-arming-check.sh`` and
-# ``.kiro/hooks/wpdt-ws-arming-reminder.json`` — root-repo cleanup, not this suite.
+# seat's single carrier is the server-side delivery tick
+# (``app/delivery/tick.py`` -> ``services/queue_carrier.NativeSeatCarrier``).
+#
+# The root-repo arming doctrine those arms read — ``ws-arming.md``,
+# ``ws-arming-check.sh`` and the kiro reminder hook — has since been deleted by
+# the root lane, so nothing is outstanding there either.

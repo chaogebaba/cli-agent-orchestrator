@@ -45,6 +45,7 @@ __all__ = [
     "EnqueueDraft",
     "GuardOutcome",
     "InjectionResult",
+    "LegacyAdoption",
     "MsgKind",
     "MsgState",
     "NON_DELIVERY_OUTCOMES",
@@ -308,6 +309,26 @@ class ReceiverResolution:
     @property
     def live(self) -> bool:
         return bool(self.terminal_id)
+
+
+@dataclass(frozen=True)
+class LegacyAdoption:
+    """One orphaned legacy ``inbox`` row, pulled into the queue (WP-ARCH 3c).
+
+    Reported by the adopter so the tick can log and count it WITHOUT reading the
+    inbox table.  Both ids travel together deliberately: the operator reading the
+    journal is holding a legacy id from a ``cao messages list`` and needs the
+    ``msg_id`` to follow the row into ``cao diag``, and the reverse.  An adoption
+    line naming only one of them forces a join nobody can do by hand.
+
+    ``receiver_id`` is the DURABLE mailbox id where the legacy row had one, for
+    the same reason ``LegacyEnqueue`` carries it: queue rows are addressed to the
+    mailbox, so a fresh incarnation inherits them (#33).
+    """
+
+    legacy_message_id: int
+    msg_id: str
+    receiver_id: str
 
 
 @dataclass(frozen=True)

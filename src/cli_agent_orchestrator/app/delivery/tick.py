@@ -11,8 +11,17 @@ which cannot cover an idle gap because an idle seat emits nothing to arm it.  A
 poll inside the server process has no such precondition: it runs while the
 server runs, and the server is what holds the rows.
 
-Two steps per tick, in this order:
+Three steps per tick, in this order:
 
+0. :meth:`DeliveryTick.adopt` — any PENDING legacy ``inbox`` row with no
+   ``delivery_msg`` counterpart is enqueued and the legacy row retired, in one
+   transaction on the legacy side.  It runs FIRST so a row adopted this tick is
+   served by the same tick rather than waiting ten seconds for the next one.
+   Before 3c such rows had two legacy carriers; that slice deletes both, and
+   this is what replaces them.  A row reaching the inbox at ``on`` is a
+   write-through that lost its ``BEGIN IMMEDIATE`` race, or a row that predates
+   the flip — neither is hypothetical, and with no adoption neither has any
+   carrier at all, which is #604.
 1. :meth:`DeliveryTick.reclaim` — expired leases back to ``ready``, ``attempts``
    incremented for the outcomes on that budget alone, rows past a bound moved to
    ``delivery_dead``.  Every death is reported, never counted: a time-bound death
@@ -50,6 +59,7 @@ from cli_agent_orchestrator.core.delivery import (
     DeadRow,
     DeliveryAttempt,
     EnqueueDraft,
+    LegacyAdoption,
     MsgKind,
     QueueMessage,
     QueueMode,
@@ -61,6 +71,7 @@ from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.ports import (
     Clock,
     FindingStore,
+    LegacyInboxAdopter,
     QueueStore,
     ReceiverDirectory,
 )
@@ -81,6 +92,12 @@ TICK_LEASE_OWNER = "delivery-tick"
 #: fleet.  Rows above it are claimed on the next tick, ten seconds later.
 CLAIM_LIMIT = 64
 
+#: How many orphaned legacy rows one tick adopts.  The same bound as
+#: ``CLAIM_LIMIT`` and for the same reason: adoption writes, and an unbounded
+#: pass over a large pre-flip backlog would hold the write lock for the fleet.
+#: Rows above it are adopted on the next tick.
+ADOPT_LIMIT = 64
+
 #: The deaths that mean a TIME bound ended the row rather than an attempt bound.
 #: ``max_attempts`` is deliberately absent: an operator reading
 #: ``DIAG-DELIVERY-TIME-BOUND`` learns something specific from it, and a code that
@@ -94,6 +111,7 @@ _TIME_BOUND_REASONS = frozenset(
 class TickReport:
     """What one tick did.  Returned so a test can assert rather than infer."""
 
+    adopted: tuple[LegacyAdoption, ...] = ()
     reoffered: int = 0
     incremented: int = 0
     dead: tuple[DeadRow, ...] = ()
@@ -121,6 +139,7 @@ class DeliveryTick:
         clock: Clock,
         position: SwitchPosition,
         interval_s: float = DELIVERY_TICK_S,
+        adopter: LegacyInboxAdopter | None = None,
     ) -> None:
         self._store = store
         self._wake = wake
@@ -128,6 +147,7 @@ class DeliveryTick:
         self._findings = findings
         self._clock = clock
         self._position = position
+        self._adopter = adopter
         self._interval_s = interval_s
         self._task: asyncio.Task[None] | None = None
         self._ticks = 0
@@ -170,13 +190,84 @@ class DeliveryTick:
     # -- one tick -----------------------------------------------------------
 
     def run_once(self, *, now: datetime | None = None) -> TickReport:
-        """Reclaim, then build or re-emit.  The order is the contract."""
-        stamp = now if now is not None else self._clock.now()
+        """Adopt, reclaim, then build or re-emit.  The order is the contract.
+
+        **The stamp is taken AFTER the adoption, and that ordering is load
+        bearing.** An adopted row is enqueued with the clock's reading at the
+        moment of the enqueue, so its ``available_at`` is later than a stamp read
+        at the top of the tick.  The claim filters on ``available_at <= now``, so
+        a stamp taken first makes every row this tick just adopted invisible to
+        the serve step that follows it — the row waits a full interval for a wake
+        it could have had immediately, and a one-shot ``run_once`` in a test
+        observes no emission at all.  Reading the clock after adoption keeps the
+        stamp at least as late as the newest row the tick created.
+        """
         report = TickReport()
+        self.adopt(report)
+        stamp = now if now is not None else self._clock.now()
         self.reclaim(stamp, report)
         self.serve(stamp, report)
         self._ticks += 1
         return report
+
+    def adopt(self, report: TickReport) -> None:
+        """Pull orphaned legacy ``inbox`` rows into the queue (WP-ARCH 3c).
+
+        The tick owns the schedule and the observability; the adopter owns the
+        transaction, because only legacy can read that table and the enqueue and
+        the retire have to commit together (see
+        :class:`~cli_agent_orchestrator.core.ports.LegacyInboxAdopter`).
+
+        One INFO line per adopted row, naming BOTH ids, because the operator
+        holding one of them has no way to reach the other by hand.  One finding
+        per receiver, counted rather than accumulated: adoption is the FALLBACK,
+        so the number is the signal — a count that climbs says the write-through
+        keeps losing its race, which is a defect to fix rather than a steady
+        state to tolerate.
+
+        No adopter wired is not an error: a tick built for a position that does
+        not serve, or by a test with doubles, simply has nothing to adopt.
+        """
+        if self._adopter is None:
+            return
+        try:
+            adoptions = tuple(self._adopter.adopt_orphans(limit=ADOPT_LIMIT))
+        except Exception:  # noqa: BLE001 — the net may not take the tick down
+            # Deliberately broad, and for the same reason ``_run`` is: an adopter
+            # that raises must cost this tick its adoptions, never its serve.
+            logger.exception("delivery tick: legacy adoption failed")
+            return
+        report.adopted = adoptions
+        for adoption in adoptions:
+            logger.info(
+                "delivery_adopt legacy_id=%s msg_id=%s receiver=%s",
+                adoption.legacy_message_id,
+                adoption.msg_id,
+                adoption.receiver_id,
+            )
+        self._raise_adoption_findings(adoptions)
+
+    def _raise_adoption_findings(self, adoptions: tuple[LegacyAdoption, ...]) -> None:
+        """``DIAG-LEGACY-ROW-ADOPTED``, once per receiver per tick.
+
+        The store dedupes on ``(code, terminal_id, dedupe_key)`` and increments,
+        so a receiver adopted from on many ticks holds ONE finding whose count is
+        the number of ticks that adopted for it. ``detail`` keeps the first
+        batch's size and a sample legacy id — the first occurrence is the one
+        whose surrounding timeline still explains anything.
+        """
+        if self._findings is None or not adoptions:
+            return
+        by_receiver: dict[str, list[LegacyAdoption]] = {}
+        for adoption in adoptions:
+            by_receiver.setdefault(adoption.receiver_id, []).append(adoption)
+        for receiver_id, rows in by_receiver.items():
+            self._findings.record(
+                FindingCode.DIAG_LEGACY_ROW_ADOPTED,
+                terminal_id=receiver_id,
+                dedupe_key=receiver_id,
+                detail=f"rows={len(rows)} first_legacy_id={rows[0].legacy_message_id}",
+            )
 
     def reclaim(self, now: datetime, report: TickReport) -> None:
         result = self._store.reclaim(now=now)

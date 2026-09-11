@@ -35,6 +35,7 @@ from typing import Any, Optional
 from cli_agent_orchestrator.core.delivery import (
     AttemptOutcome,
     InjectionResult,
+    LegacyAdoption,
     ReceiverResolution,
     WakeEmission,
 )
@@ -42,7 +43,9 @@ from cli_agent_orchestrator.core.delivery import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "LegacyInboxAdoption",
     "LegacyReceiverDirectory",
+    "adopt_enqueue",
     "forget_terminal_status",
     "legacy_enqueue_fact",
     "note_terminal_status",
@@ -152,6 +155,22 @@ def write_through_enqueue(fact: Any) -> tuple[int, str] | None:
         return None
 
 
+def adopt_enqueue(fact: Any) -> str | None:
+    """Forward one EXISTING legacy row to the queue's adoption path (3c).
+
+    The sibling of :func:`write_through_enqueue`, and here for the same reason:
+    ``clients/database.py`` reaches the new tree through THIS module only, so the
+    AC11 contact surface stays one file a reviewer can read end to end.
+    """
+    try:
+        from cli_agent_orchestrator.app.delivery.wiring import adopt_legacy_row
+
+        return adopt_legacy_row(fact)
+    except Exception:  # noqa: BLE001 — the net may never break the tick
+        logger.debug("wp_arch adopt_legacy_row unavailable", exc_info=True)
+        return None
+
+
 def legacy_enqueue_fact(**fields: Any) -> Any:
     """Build the fact the write-through takes, without naming the new tree.
 
@@ -197,46 +216,56 @@ def queue_owns_delivery() -> bool:
 
 
 def queue_owns_receiver_delivery(receiver_id: str | None) -> bool:
-    """Does the queue own EVERY undelivered row for this receiver? (#741)
+    """Does the queue own EVERY undelivered row for this receiver?
 
-    The row-scoped mute, and the predicate D6's surfaces must ask instead of
-    :func:`queue_owns_delivery`. The coarse switch answers "is the position
-    ``on``", and 3b wrote every legacy surface against it. That is too coarse in
-    exactly one direction, and it is the direction that loses messages: at ``on``
-    the legacy inbox stops accepting inserts but does not become empty, so a
-    terminal-wide mute strands every row still in it with NO carrier at all --
-    the silent seat this phase exists to remove.
+    WP-ARCH 3c COLLAPSED this to the coarse switch, and the collapse is the point
+    rather than a simplification.
 
-    Two families are stranded by the coarse mute, and both are EVIDENCED rather
-    than hypothesised. Rows that predate the flip are the case S6 names directly
-    ("existing rows drain through the old path"). Write-through fallbacks are the
-    case the box round produced: ``write_through`` opens the queue's own
-    connection and takes ``BEGIN IMMEDIATE`` while the caller still holds an open
-    write transaction on the SAME database file, which cannot resolve and times
-    out as ``database is locked``; the hook then returns ``None`` and its caller
-    writes the legacy row it was designed to fall back to.
+    3b needed the row-scoped form because the coarse mute was wrong in one
+    direction, and it was the direction that loses messages: at ``on`` the legacy
+    inbox stops accepting inserts but does not become EMPTY, so a terminal-wide
+    mute stranded every row still in it with no carrier at all. #741 answered
+    that by un-muting the legacy carriers for exactly those receivers.
 
-    **Un-muting for these rows cannot produce a second carrier over one id.**
-    ``write_through`` returns a DETACHED model and adds nothing to the inbox
-    table, so a row physically present there has no ``delivery_msg`` counterpart.
-    The tick and the legacy chain therefore serve DISJOINT row sets for the same
-    receiver, which is what keeps the single-emitter property a property of the
-    rows rather than of the switch.
+    3c answers it at the source instead. The tick's adoption pass
+    (:func:`clients.database.adopt_orphaned_legacy_rows`) pulls every orphaned
+    PENDING row into the queue and retires it, so the set the row-scoped
+    predicate existed to protect is emptied on a schedule rather than served by a
+    second carrier. With no such rows, "the queue owns every undelivered row" and
+    "the position is ``on``" are the same claim, and keeping two spellings of one
+    claim is how they drift apart.
 
-    Never raises: an unanswerable probe reports the coarse answer, which is the
-    behaviour before this fix.
+    ``receiver_id`` is accepted and ignored, deliberately: the callers are
+    legacy mute sites that pass what they have, and a signature change would
+    touch three modules that all die in slice 3 anyway.
+
+    Never raises: an unanswerable switch reports "not on", which leaves legacy
+    behaving as it does today.
     """
-    if not queue_owns_delivery():
-        return False
-    if not receiver_id:
-        return True
-    try:
-        from cli_agent_orchestrator.clients.database import has_pending_legacy_messages
+    return queue_owns_delivery()
 
-        return not has_pending_legacy_messages(receiver_id)
-    except Exception:  # pragma: no cover -- an unanswerable probe keeps the mute
-        logger.debug("wp_arch row-scoped mute probe failed for %s", receiver_id, exc_info=True)
-        return True
+
+class LegacyInboxAdoption:
+    """Satisfies :class:`core.ports.LegacyInboxAdopter` (WP-ARCH 3c).
+
+    A thin bridge, like the three beside it: the tick owns WHEN, this owns the
+    one thing ``app`` cannot do, which is read and write the legacy ``inbox``
+    table. All the ordering reasoning lives with the function it calls, in
+    ``clients/database.py``, because that is where the transactions are.
+    """
+
+    def adopt_orphans(self, *, limit: int) -> list[LegacyAdoption]:
+        from cli_agent_orchestrator.clients.database import adopt_orphaned_legacy_rows
+
+        try:
+            rows = adopt_orphaned_legacy_rows(limit=limit)
+        except Exception:  # noqa: BLE001 — a net that raises is not a net
+            logger.debug("wp_arch adoption pass failed", exc_info=True)
+            return []
+        return [
+            LegacyAdoption(legacy_message_id=legacy_id, msg_id=msg_id, receiver_id=receiver_id)
+            for legacy_id, msg_id, receiver_id in rows
+        ]
 
 
 class LegacyReceiverDirectory:

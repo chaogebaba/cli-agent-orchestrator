@@ -357,9 +357,14 @@ _F352_ENFORCEMENT_MODULES = frozenset(
     (
         "test_inbox_sender_token",
         "test_f352_sender_token_injection",
-        # F707 (#562): the inbox drain edges reuse verify_sender_token to bind
+        # F707 (#562): the per-seat hook edges reuse verify_sender_token to bind
         # the caller to the route terminal — that module exercises enforcement.
-        "test_f707_drain_authz",
+        # WP-ARCH 3c K1 deleted the drain edges the F707 module was named for;
+        # the GUARD survives on /native-unpublished, so the retargeted module
+        # takes the old one's place here. A module testing enforcement that is
+        # NOT on this list is bypassed into passing, which is why the rename had
+        # to reach this list as well as the file.
+        "test_f707_native_unpublished_authz",
     )
 )
 
