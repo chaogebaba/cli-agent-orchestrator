@@ -119,6 +119,19 @@ class FindingCode(StrEnum):
     #: previously carried by the legacy doorbell and the seat-wake reconcile,
     #: both deleted in this slice; without adoption it has no carrier at all.
     DIAG_LEGACY_ROW_ADOPTED = "DIAG-LEGACY-ROW-ADOPTED"
+    #: herdr answered ``pane get`` with ``agent_status: unknown`` for a pane CAO
+    #: owns, so the herdr backend has NO native status for that seat and the
+    #: caller silently falls back to pane scraping (F926 / #778).  Counted per
+    #: window because the number and the identity are both the question: which
+    #: seats have no native truth, and how often.  The cause measured on herdr
+    #: 0.9.0 is a gap in herdr's own bundled agent-detection manifests — ``pi``
+    #: ships ONE rule (``working``) and ``cline`` only ``working``/``blocked``,
+    #: so a pane of either at its prompt matches no rule and is reported
+    #: ``unknown``, while ``codex`` (which ships ``idle`` rules) resolves.  That
+    #: is not CAO's to fix, which is exactly why it must be counted rather than
+    #: swallowed: the fallback is silent, and a silent fallback on the cheap
+    #: lanes is indistinguishable from working native status.
+    DIAG_HERDR_STATUS_UNKNOWN = "DIAG-HERDR-STATUS-UNKNOWN"
 
 
 #: Codes that remain readable but which no code path raises any more (D9b).
