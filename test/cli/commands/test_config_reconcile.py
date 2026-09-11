@@ -247,9 +247,157 @@ _TEXT_PROCESSORS = frozenset(
     }
 )
 
+#: Verbs that would mean the installer *writes* the file it names. The
+#: reconcile command owns providers.toml end to end (seed, backup, publish);
+#: install.sh may name it in a message or an existence test, never author it.
+#: ``install`` is deliberately absent — every warning line here is prefixed
+#: ``[install]``.
+_FILE_MUTATORS = frozenset(
+    {"cp", "mv", "rm", "tee", "touch", "ln", "dd", "truncate", "mktemp", "chmod"}
+)
+
 #: TOML readers. Any of these anywhere in the script (shell *or* an embedded
 #: python heredoc) means install.sh re-grew the parser the fork already owns.
 _TOML_PARSERS = ("tomllib", "tomlkit", "import toml", "from toml", "toml.load")
+
+_ASSIGN_RE = re.compile(
+    r"^\s*(?:local\s+|export\s+|declare\s+(?:-\w+\s+)*|typeset\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$"
+)
+_FOR_IN_RE = re.compile(r"^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.*)$")
+_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+_CMD_SUB_RE = re.compile(r"\$\(|`")
+#: A redirection and its target word: ``> f``, ``>>"$f"``, ``2>/dev/null``.
+_REDIRECT_RE = re.compile(r">>?\s*(\"[^\"]*\"|'[^']*'|[^\s|&;<>]+)")
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
+
+def _taint_toml_vars(code_lines: "list[tuple[int, str]]") -> "dict[str, bool]":
+    """Single forward pass marking shell variables that *hold a TOML path*.
+
+    Returns ``{variable: names_providers_toml}``. A variable is tainted when it
+    is assigned a word containing ``.toml`` (``f="$d/_clauses.toml"``), or
+    assigned from another tainted variable (``g="$f"``); a ``for x in *.toml``
+    header taints the loop variable the same way. The flag distinguishes
+    providers.toml handles from the (legitimately copied) ``_clauses.toml`` /
+    ``routing.toml`` ones, so check (3) can stay pointed at providers.toml.
+
+    Deliberately NOT a shell parser. Known blind spots, each one a shape the
+    guard below cannot see (N4-class holes, named rather than left silent):
+
+    * command substitution — ``x=$(...)`` captures a command's *output*, not a
+      path, so it clears rather than spreads taint. That is what keeps the real
+      installer's ``_found=$(… "$_live")`` / ``printf … | sed`` warn block legal,
+      and it also breaks the chain at ``name=$(basename "$src")``: the derived
+      ``dst`` is untainted, so the herdr stage's ``grep -qF "$MARKER" "$dst"``
+      marker probe is not flagged. A mutant hiding a scrape behind
+      ``v=$(basename "$t"); awk … "$d/$v"`` would slip through.
+    * shell arrays (``a=(x.toml)``/``${a[@]}``), ``read``-into-variable
+      (``read -r f < list.toml``), positional parameters inside a function
+      (``_src="$1"``), and indirect expansion (``${!name}``/``eval``).
+    * heredoc bodies: an embedded interpreter is caught only by the TOML-reader
+      token check (2). Neither the shell-verb check (4) nor the write check (3)
+      reads python, so ``open(".../providers.toml", "w")`` inside a heredoc is
+      invisible to them.
+    * one forward pass in text order: a variable used above its assignment
+      (a function body called later) is not tracked.
+    """
+    tainted: "dict[str, bool]" = {}
+    for _lineno, raw in code_lines:
+        match = _ASSIGN_RE.match(raw) or _FOR_IN_RE.match(raw)
+        if not match:
+            continue
+        name, rhs = match.group(1), match.group(2)
+        lowered_rhs = rhs.lower()
+        if ".toml" in lowered_rhs:
+            tainted[name] = "providers.toml" in lowered_rhs
+        elif _CMD_SUB_RE.search(rhs):
+            tainted.pop(name, None)
+        else:
+            inherited = [v for v in _VAR_REF_RE.findall(rhs) if v in tainted]
+            if inherited:
+                tainted[name] = any(tainted[v] for v in inherited)
+            else:
+                tainted.pop(name, None)
+    return tainted
+
+
+def _assert_installer_delegates(contents: str) -> None:
+    """Four structural checks for F63 criterion 11 — see the test docstring."""
+    lowered = contents.lower()
+
+    # Comment lines may describe the delegation freely; only executable lines
+    # are constrained.
+    code_lines = [
+        (n, raw)
+        for n, raw in enumerate(contents.splitlines(), start=1)
+        if not raw.strip().startswith("#")
+    ]
+    code = "\n".join(raw for _, raw in code_lines).lower()
+
+    # (1) Exactly one delegation point (executable lines; the F937 warn block
+    #     explains reconcile's seeding rules in prose above it).
+    assert code.count("cao config reconcile") == 1, (
+        "install.sh must call `cao config reconcile` exactly once "
+        f"(found {code.count('cao config reconcile')} executable mentions)"
+    )
+
+    # (2) No TOML reader is constructed anywhere — shell or embedded heredoc.
+    for parser in _TOML_PARSERS:
+        assert parser not in lowered, (
+            f"install.sh re-grew a TOML parser ({parser!r}); "
+            "D6 delegates that to `cao config reconcile`"
+        )
+
+    tainted = _taint_toml_vars(code_lines)
+
+    # (4a) No provider-stanza reasoning anywhere in executable text.
+    assert ".profiles." not in code, "install.sh reasons about provider stanzas"
+
+    for lineno, raw in code_lines:
+        lowered_line = raw.lower()
+        refs = {v for v in _VAR_REF_RE.findall(raw) if v in tainted}
+        if "toml" not in lowered_line and not refs:
+            continue
+        tokens = {tok.lower() for tok in _WORD_RE.findall(raw)}
+
+        # (4b) No text-processing pointed at a TOML path — named literally on
+        #      this line, or reached through a variable holding one (the N4
+        #      indirection: `f="$d/x.toml"` on one line, `awk … "$f"` on the
+        #      next). Every executable `toml` touch must be a plain file op.
+        offenders = sorted(tokens & _TEXT_PROCESSORS)
+        assert not offenders, (
+            f"install.sh:{lineno} text-processes a TOML file with {offenders}: "
+            f"{raw.strip()!r} — parsing belongs to `cao config reconcile`"
+        )
+
+        # (3) providers.toml is the reconcile command's file: the installer may
+        #     test for it and name it in a warning, but never seeds, diffs,
+        #     backs up, copies or writes it.
+        if "providers.toml" not in lowered_line and not any(tainted[v] for v in refs):
+            continue
+        mutators = sorted(tokens & _FILE_MUTATORS)
+        assert not mutators, (
+            f"install.sh:{lineno} writes providers.toml with {mutators}: "
+            f"{raw.strip()!r} — that file is owned by `cao config reconcile`"
+        )
+        provider_vars = [f"${v}" for v in refs if tainted[v]]
+        provider_vars += [f"${{{v}}}" for v in refs if tainted[v]]
+        for target in _REDIRECT_RE.findall(raw):
+            lowered_target = target.lower()
+            hit = "providers.toml" in lowered_target or any(var in target for var in provider_vars)
+            assert not hit, (
+                f"install.sh:{lineno} redirects into providers.toml: "
+                f"{raw.strip()!r} — that file is owned by `cao config reconcile`"
+            )
+
+
+def _real_installer_text() -> str:
+    from test.conftest import ROOT_REPO
+
+    if ROOT_REPO is None:
+        pytest.skip("root repo not found (worktree without .git context)")
+    return (ROOT_REPO / "install.sh").read_text(encoding="utf-8")
 
 
 def test_root_installer_delegates_without_toml_or_stanza_parsing():
@@ -261,8 +409,9 @@ def test_root_installer_delegates_without_toml_or_stanza_parsing():
     ``python3 -c`` parser, ``grep``-based stanza scraping, a ``uv run`` shim
     around a hand-rolled reader) either breaks ``install.sh``'s contract or
     re-derives a parser the fork already owns. So the pin is: exactly one
-    ``cao config reconcile`` call, no TOML parser anywhere in the script, and
-    no stanza/text-processing aimed at a ``.toml`` file.
+    ``cao config reconcile`` call, no TOML parser anywhere in the script, no
+    stanza/text-processing aimed at a ``.toml`` file — directly or through a
+    variable holding one — and no writing of providers.toml.
 
     Copying a TOML file byte-for-byte is NOT parsing. Since 2026-09-11 the
     installer syncs ``profiles/<sub>/_clauses.toml`` (F613 #469 — without it
@@ -270,54 +419,61 @@ def test_root_installer_delegates_without_toml_or_stanza_parsing():
     ``orchestrator/routing.toml`` into the agent store via ``cp``/``mv``; the
     shell never interprets those bytes. The original blanket
     ``"toml" not in contents`` was a stale proxy for the invariant above and is
-    replaced by the four checks below, which still fail on every workaround D6
-    rejected.
+    replaced by the four checks in :func:`_assert_installer_delegates`, which
+    still fail on every workaround D6 rejected —
+    :func:`test_installer_guard_rejects_parsing_mutants` is the receipt.
+
+    Check (3) reads "never writes providers.toml", not "never names it": the
+    F937 warn block legitimately builds the live path, tests it with ``[ -f ]``
+    and prints its name in the remediation message. Every *use* of that path is
+    still constrained by (4) via the taint pass, so a scrape hidden behind the
+    variable is rejected.
     """
-    from test.conftest import ROOT_REPO
-    if ROOT_REPO is None:
-        pytest.skip("root repo not found (worktree without .git context)")
-    install_script = ROOT_REPO / "install.sh"
-    contents = install_script.read_text(encoding="utf-8")
-    lowered = contents.lower()
+    _assert_installer_delegates(_real_installer_text())
 
-    # (1) Exactly one delegation point.
-    assert contents.count("cao config reconcile") == 1
 
-    # (2) No TOML reader is constructed anywhere — shell or embedded heredoc.
-    for parser in _TOML_PARSERS:
-        assert parser not in lowered, (
-            f"install.sh re-grew a TOML parser ({parser!r}); "
-            "D6 delegates that to `cao config reconcile`"
-        )
+#: Workarounds D6 rejected, each appended to the real installer. The guard is
+#: only worth its line count if these are rejected, so they run as a test.
+_INSTALLER_MUTANTS = {
+    "n4_variable_indirection": (
+        '_f="$REPO_DIR/profiles/positions/_clauses.toml"\n'
+        "awk -F'=' '/^\\[/ {print $1}' \"$_f\"\n"
+    ),
+    "n4_two_hop_indirection": (
+        '_a="$REPO_DIR/orchestrator/routing.toml"\n_b="$_a"\nhead -n 20 "$_b"\n'
+    ),
+    "n4_loop_glob_indirection": (
+        'for _t in "$CAO_STORE_DIR"/*.toml; do\n    sed -n "1p" "$_t"\ndone\n'
+    ),
+    "inline_python_tomllib_parser": (
+        "python3 -c 'import tomllib,sys;"
+        ' print(tomllib.load(open(sys.argv[1], "rb")))\''
+        ' "$HOME/.aws/cli-agent-orchestrator/providers.toml"\n'
+    ),
+    "grep_stanza_scrape": (
+        "grep '^\\[codex.profiles.' \"$HOME/.aws/cli-agent-orchestrator/providers.toml\""
+        " | cut -d= -f2\n"
+    ),
+    "sed_on_template": ('sed -n "/^\\[codex\\]/,/^\\[/p" "$REPO_DIR/providers.toml.default"\n'),
+    "duplicate_reconcile": '(cd "$REPO_DIR" && cao config reconcile)\n',
+    "seed_providers_toml": (
+        'cp "$REPO_DIR/providers.toml.default" '
+        '"$HOME/.aws/cli-agent-orchestrator/providers.toml"\n'
+    ),
+    "redirect_into_providers_toml": (
+        '_lp="$HOME/.aws/cli-agent-orchestrator/providers.toml"\n'
+        "printf '[codex]\\n' > \"$_lp\"\n"
+    ),
+}
 
-    # Comment lines may describe the delegation freely; only executable lines
-    # are constrained.
-    code_lines = [
-        (n, raw)
-        for n, raw in enumerate(contents.splitlines(), start=1)
-        if not raw.strip().startswith("#")
-    ]
-    code = "\n".join(raw for _, raw in code_lines).lower()
 
-    # (3) providers.toml is the reconcile command's file; the installer neither
-    #     seeds, diffs, backs up nor names it.
-    assert "providers.toml" not in code, (
-        "install.sh touches providers.toml directly; that file is owned by "
-        "`cao config reconcile`"
-    )
-
-    # (4) No provider-stanza reasoning, and no text-processing pointed at a
-    #     TOML path — every executable `toml` mention must be a plain file op.
-    assert ".profiles." not in code, "install.sh reasons about provider stanzas"
-    for lineno, raw in code_lines:
-        if "toml" not in raw.lower():
-            continue
-        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", raw)}
-        offenders = sorted(tokens & _TEXT_PROCESSORS)
-        assert not offenders, (
-            f"install.sh:{lineno} text-processes a TOML file with {offenders}: "
-            f"{raw.strip()!r} — parsing belongs to `cao config reconcile`"
-        )
+@pytest.mark.parametrize("mutant", sorted(_INSTALLER_MUTANTS))
+def test_installer_guard_rejects_parsing_mutants(mutant: str) -> None:
+    """Non-vacuity: the guard rejects every shape D6 outlawed, including the
+    variable-indirection scrape that defeats a line-local check."""
+    mutated = _real_installer_text() + "\n" + _INSTALLER_MUTANTS[mutant]
+    with pytest.raises(AssertionError):
+        _assert_installer_delegates(mutated)
 
 
 def test_backup_failure_aborts_before_atomic_publish(reconcile_env, monkeypatch):
