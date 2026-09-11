@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
@@ -238,6 +238,19 @@ class BoundaryObservation:
     # idempotence to status and reason only.
     fusion_reason: Optional[str] = None
     fusion_changed: bool = False
+    # fx751 Slice A (AC-7, option B): the fleet ERROR overlays and the condition
+    # projection are FOLDED into the accepted observation at publication rather
+    # than applied post-hoc by fleet_service. Appended-and-defaulted after the
+    # F506 fields for the same positional-construction reason (~30 seven-arg
+    # test constructions and the two BoundaryObservation() sites in this module
+    # stay valid). ``condition`` is the single condition read (no separate
+    # get_condition at the fleet seam); ``health_overlay`` names which overlay
+    # forced ERROR (recovery_state / window_absent / init_health_failed) and
+    # ``terminal_error`` carries the typed code. The observation_epoch is the one
+    # accepted observation ID all consumers (fleet, API, MCP fleet, TUI) cite.
+    condition: Optional[str] = None
+    health_overlay: Optional[str] = None
+    terminal_error: Optional[str] = None
 
 
 # Stale-PROCESSING self-heal (#558). get_status()'s cheap re-check re-derives from the SAME
@@ -2547,6 +2560,60 @@ class StatusMonitor:
                 fusion_reason=fusion_reason,
                 fusion_changed=fusion_changed,
             )
+
+    def overlaid_observation(
+        self,
+        terminal_id: str,
+        *,
+        recovery_override: bool = False,
+        window_absent: bool = False,
+        init_health_failed: bool = False,
+        terminal_error: Optional[str] = None,
+    ) -> BoundaryObservation:
+        """fx751 Slice A (AC-7, option B): the ONE accepted observation with the
+        fleet ERROR overlays and the condition projection FOLDED IN.
+
+        Fleet's three ERROR overlays were applied post-hoc after
+        ``get_boundary_observation`` and the condition was read separately
+        (``get_condition``) — two independent reads that could disagree and a
+        status the fleet mutated after the fact. This method makes the fold part
+        of publication: the caller passes the row-derived overlay predicates
+        (their SOURCE stays in the fleet query, which is where that data lives —
+        option A's move of the source into the monitor is deferred to the
+        cross-consumer switch, Slice B/C, AC-19/AC-21/AC-22), and the monitor
+        returns ONE observation that already carries the overlaid status, the
+        folded condition, and the SAME ``observation_epoch`` every other consumer
+        cites for this tick. No post-hoc overlay and no separate condition read
+        remain at the fleet seam.
+
+        Overlay precedence matches the pre-fx751 fleet order exactly (recovery →
+        window-absent → init-health/terminal_error), each forcing ERROR, so the
+        behaviour delivery-gating consumers see is unchanged (they read
+        ``get_boundary_observation`` — the un-overlaid observation — exactly as
+        today; this method is the fleet-egress projection, not their input)."""
+        base = self.get_boundary_observation(terminal_id)
+        status = base.status
+        overlay: Optional[str] = None
+        if recovery_override:
+            status = TerminalStatus.ERROR
+            overlay = "recovery_state"
+        elif window_absent:
+            status = TerminalStatus.ERROR
+            overlay = "window_absent"
+        elif init_health_failed or terminal_error is not None:
+            status = TerminalStatus.ERROR
+            overlay = "init_health_failed"
+        # The single condition read, folded — taken with the OVERLAID status so a
+        # BUSY-class label never rides an idle/error row (F752), replacing the
+        # separate fleet_service get_condition call (D6).
+        condition = self.get_condition(terminal_id, status)
+        return replace(
+            base,
+            status=status,
+            condition=condition,
+            health_overlay=overlay,
+            terminal_error=terminal_error,
+        )
 
     def mark_injection_completed(self, terminal_id: str) -> BoundaryObservation:
         """Anchor a successful backend submit in the observation sequence."""

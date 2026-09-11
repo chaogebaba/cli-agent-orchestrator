@@ -405,54 +405,61 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             and parent.get("recovery_state") != "fallback_ready"
         )
         orphan = bool(parent_id and (parent is None or parent_dead))
-        observation = status_monitor.get_boundary_observation(row["id"])
+        # fx751 Slice A (AC-7, option B): compute the overlay predicates from the
+        # row FIRST, then fold them (and the condition) into ONE accepted
+        # observation via overlaid_observation. Fleet no longer reassigns
+        # ``status`` post-hoc nor makes a separate get_condition read — the
+        # observation it reads already carries the overlaid status, the folded
+        # condition and the one accepted observation_epoch every consumer cites.
+        # The overlay SOURCE stays here (the row data lives in the fleet query);
+        # option A's move of the source into the monitor is deferred to the
+        # cross-consumer switch (Slice B/C — AC-19/AC-21/AC-22).
+        in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
+        recovery_override = row.get("recovery_state") not in (None, "rebound")
+        window_absent = (
+            has_native_inventory and row["tmux_window"] not in windows and not in_teardown
+        )
+        init_health = _compute_init_health(row, now)
+        terminal_error = _terminal_error_code(row, init_health)
+        init_health_failed = init_health == "failed"
+
+        observation = status_monitor.overlaid_observation(
+            row["id"],
+            recovery_override=recovery_override,
+            window_absent=window_absent,
+            init_health_failed=init_health_failed,
+            terminal_error=terminal_error,
+        )
         status = observation.status
         # F506 §8: surface the fusion evidence, rendered by the `cao-fleet` TUI's
         # new columns (F702) — `*` when the fused status differs from what the
-        # provider published, and the reason in the row detail. fusion_changed is
-        # captured BEFORE the ERROR
-        # overrides below so the operator sees "the fusion demoted this", not the
-        # quarantine projection.
+        # provider published, and the reason in the row detail. fusion_changed
+        # reflects the pre-overlay fusion delta (the overlays are a fleet-egress
+        # projection, not a fusion), captured on the observation before overlay.
         fusion_changed = bool(getattr(observation, "fusion_changed", False))
         fusion_reason = getattr(observation, "fusion_reason", None)
-        if row.get("recovery_state") not in (None, "rebound"):
-            status = TerminalStatus.ERROR
-            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+        # WP-ARCH F725 #581 hook 2b: the legacy-egress audit records which
+        # overlay forced ERROR. The fold now happens inside the observation
+        # (health_overlay names it); the audit egress is preserved here so the
+        # WP-ARCH hook is unchanged.
+        if recovery_override:
+            _wt_legacy_egress.record_fleet_override(
                 row["id"], "recovery_state", str(row.get("recovery_state"))
             )
-        # F716 (#571): window absence under an ACTIVE teardown intent is the
-        # healthy delete ordering (intent → window kill → row purge), so keep
-        # the observed status instead of stamping ERROR; also expose the
-        # teardown state as an additive sibling key (`teardown`, mirroring
-        # `delegating`/`fusion_changed`) so the TUI can render `reaping`.
-        in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
-        if has_native_inventory and row["tmux_window"] not in windows and not in_teardown:
-            status = TerminalStatus.ERROR
-            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+        elif window_absent:
+            _wt_legacy_egress.record_fleet_override(
                 row["id"], "window_absent", str(row["tmux_window"])
             )
-        # F124 S1: compute init_health; failed health overrides status to ERROR.
-        init_health = _compute_init_health(row, now)
-        # F789 (#646): derive the typed terminal_error code for the row. When it
-        # is set the worker is dead/never-confirmed at init, so the projected
-        # status MUST NOT be `working` (PROCESSING) or any live class — force
-        # ERROR. This closes the gap where a deferred-init death (the reported
-        # `code=deferred_init_internal` TimeoutError) left the row rendering
-        # `● working` with a growing elapsed timer. The code is surfaced on the
-        # row below so the TUI can show *why*.
-        terminal_error = _terminal_error_code(row, init_health)
-        if init_health == "failed" or terminal_error is not None:
-            status = TerminalStatus.ERROR
-            _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
+        elif init_health_failed or terminal_error is not None:
+            _wt_legacy_egress.record_fleet_override(
                 row["id"], "init_health_failed", terminal_error or ""
             )
-        # F568 D12c: `delegating` is a projection over the FINAL status (computed
-        # here, AFTER all three ERROR overrides above) and the children ledger.
-        # An ERROR/quarantined seat never renders `delegating` (r11 S2); a
-        # PROCESSING seat keeps `working` (its own turn is open). Only an
+        # F568 D12c: `delegating` is a projection over the FINAL (overlaid) status
+        # and the children ledger. An ERROR/quarantined seat never renders
+        # `delegating` (r11 S2); a PROCESSING seat keeps `working`. Only an
         # IDLE/COMPLETED seat with children in flight is `delegating`. The status
-        # enum value is left untouched (r11 S3) — `delegating`/`children_count`
-        # are additive sibling keys, mirroring `fusion_changed`/`fusion_reason`.
+        # enum value is left untouched — `delegating`/`children_count` are
+        # additive sibling keys.
         children_count = _children_count_from_row(row)
         delegating = children_count > 0 and status in (
             TerminalStatus.IDLE,
@@ -464,13 +471,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         else:
             since_last_input = None
         window = windows.get(row["tmux_window"], {})
-        # F611 (#467) B2: project the live condition onto the fleet row so
-        # /sessions/{name}/fleet carries it (blueprint §3 surface 1). Additive
-        # sibling key like fusion_reason/delegating — SEPARATE from `status`
-        # (D1), never derived from or feeding fusion. None when no condition.
-        # F752 (#609): the fused status goes with the read so a BUSY-class label
-        # left over from the last working turn never rides an idle row.
-        condition = status_monitor.get_condition(row["id"], status)
+        # fx751 (AC-7): the condition is FOLDED into the accepted observation
+        # (one read, taken with the overlaid status so a BUSY-class label never
+        # rides an idle/error row — F752). No separate get_condition at the fleet
+        # seam. Additive sibling key, SEPARATE from `status` (D1).
+        condition = observation.condition
         # F826 (#683) D6: observe live model/effort for this terminal. Wrapped —
         # try/except + 50 ms deadline + bounded read + per-terminal isolation —
         # so one bad source never blocks the fleet (AC5). Returns two additive
