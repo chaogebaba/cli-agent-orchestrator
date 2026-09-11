@@ -81,25 +81,32 @@ def _backend(agent_status: str):
     return backend
 
 
+@pytest.fixture(autouse=True)
 def _reset_log_throttle():
+    """N2: the warn-once set is process-wide state.
+
+    Clearing it by hand in each test made a forgotten call silently suppress the
+    warning a later test asserted on. An autouse fixture removes the ordering
+    coupling entirely.
+    """
     from cli_agent_orchestrator.backends import herdr_backend as mod
 
+    mod._STATUS_UNKNOWN_WARNED.clear()
+    yield
     mod._STATUS_UNKNOWN_WARNED.clear()
 
 
 class TestUnknownIsCounted:
     def test_unknown_records_one_finding_keyed_on_the_window(self, findings):
-        _reset_log_throttle()
         _backend("unknown").fetch_native_status("cao", "w3-pi")
         assert len(findings.calls) == 1
         code, terminal_id, dedupe_key, detail = findings.calls[0]
         assert code is FindingCode.DIAG_HERDR_STATUS_UNKNOWN
         assert dedupe_key == "w3-pi", "the seat is the dedupe identity"
-        assert terminal_id == "", "fleet-wide row: never NULL, never a fake id"
+        assert terminal_id == "", "no 8-hex suffix in this window name -> no guess"
         assert "w1:p3" in detail and "unknown" in detail
 
     def test_repeats_are_counted_per_seat_not_merged_across_seats(self, findings):
-        _reset_log_throttle()
         backend = _backend("unknown")
         for _ in range(5):
             backend.fetch_native_status("cao", "w1-cline")
@@ -109,14 +116,12 @@ class TestUnknownIsCounted:
 
     @pytest.mark.parametrize("resolved", ["idle", "working", "blocked", "done"])
     def test_a_classified_pane_records_nothing(self, findings, resolved):
-        _reset_log_throttle()
         fetch = _backend(resolved).fetch_native_status("cao", "w2-codex")
         assert fetch.status is not None
         assert findings.calls == [], "codex resolves; only the gap is counted"
 
     def test_an_unrecognised_state_is_also_counted(self, findings):
         """Anything ``map_native_status`` cannot map leaves the seat without truth."""
-        _reset_log_throttle()
         _backend("wedged").fetch_native_status("cao", "w4")
         assert len(findings.calls) == 1
         assert "wedged" in findings.calls[0][3]
@@ -126,7 +131,6 @@ class TestTheFallbackContractIsUnchanged:
     """The counting must not alter what the poll returns."""
 
     def test_unknown_keeps_failure_cause_none(self, findings):
-        _reset_log_throttle()
         fetch = _backend("unknown").fetch_native_status("cao", "w3-pi")
         assert fetch.agent_status == "unknown"
         assert fetch.status is None
@@ -137,7 +141,6 @@ class TestTheFallbackContractIsUnchanged:
         )
 
     def test_a_broken_finding_store_never_breaks_the_poll(self):
-        _reset_log_throttle()
         exploding = MagicMock()
         exploding.record.side_effect = RuntimeError("store is down")
         wiring.install_producers(
@@ -151,7 +154,6 @@ class TestTheFallbackContractIsUnchanged:
         assert fetch.failure_cause is None
 
     def test_ingestion_off_is_silent_and_harmless(self):
-        _reset_log_throttle()
         wiring.reset_producers()
         fetch = _backend("unknown").fetch_native_status("cao", "w3-pi")
         assert fetch.agent_status == "unknown"
@@ -160,7 +162,6 @@ class TestTheFallbackContractIsUnchanged:
 
 class TestTheLogSaysItOnce:
     def test_warning_once_per_seat_then_debug(self, findings, caplog):
-        _reset_log_throttle()
         backend = _backend("unknown")
         with caplog.at_level("WARNING", logger="cli_agent_orchestrator.backends.herdr_backend"):
             for _ in range(4):
@@ -170,3 +171,82 @@ class TestTheLogSaysItOnce:
         assert "herdr_status_unknown" in warnings[0].getMessage()
         # ...but the finding still counted every one of them.
         assert findings.counts_by_key() == {"w3-pi": 4}
+
+
+class TestTheTwoConditionsAreDistinguishable:
+    """N1: herdr SAYING "unknown" is not the same as the field being absent."""
+
+    def test_a_missing_agent_status_field_says_so(self, findings):
+        backend = HerdrBackend.__new__(HerdrBackend)
+        backend._resolve_pane_id_from_window = MagicMock(return_value="w1:p3")  # type: ignore[method-assign]
+        backend._run_herdr = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(
+                returncode=0,
+                stdout='{"id":"x","result":{"pane":{"pane_id":"w1:p3"}}}',
+                stderr="",
+            )
+        )
+        fetch = backend.fetch_native_status("cao", "w9")
+
+        assert fetch.agent_status is None, "CAO never saw a status to report"
+        assert fetch.status is None
+        assert fetch.failure_cause is None, (
+            "protocol drift must not become a probe_failure — that is a delivery "
+            "VETO at inbox_service's safety gate"
+        )
+        assert len(findings.calls) == 1
+        detail = findings.calls[0][3]
+        assert "no agent_status field" in detail, detail
+        assert "'unknown'" not in detail, "must not claim herdr said unknown"
+
+    def test_herdr_saying_unknown_still_reads_as_herdr_saying_unknown(self, findings):
+        _backend("unknown").fetch_native_status("cao", "w9")
+        assert "herdr agent_status='unknown'" in findings.calls[0][3]
+
+
+class TestTheFindingCarriesTheTerminal:
+    """N4: `cao diag findings` renders `terminal_id or '-'`, so fill it."""
+
+    def test_a_window_name_yields_its_terminal_id(self, findings):
+        _backend("unknown").fetch_native_status("cao-x", "codex_general-919751d7")
+        _, terminal_id, dedupe_key, _ = findings.calls[0]
+        assert terminal_id == "919751d7"
+        assert dedupe_key == "codex_general-919751d7"
+
+    def test_a_profile_containing_dashes_still_resolves(self, findings):
+        _backend("unknown").fetch_native_status("cao-x", "developer-opus-cfe93884")
+        assert findings.calls[0][1] == "cfe93884"
+
+    @pytest.mark.parametrize(
+        "window",
+        [
+            "codex_general-abcd",  # legacy {profile}-{uuid4[:4]} form
+            "codex_general-91975XYZ",  # not hex
+            "nodashes",
+            "codex_general-919751D7",  # minted ids are lowercase
+        ],
+    )
+    def test_a_suffix_that_is_not_a_minted_id_is_never_guessed(self, findings, window):
+        _backend("unknown").fetch_native_status("cao-x", window)
+        assert findings.calls[0][1] == "", window
+
+
+class TestTheWarnSetIsBounded:
+    """N2: an unbounded module global with no owner is a slow leak."""
+
+    def test_the_set_clears_rather_than_growing_without_end(self, findings):
+        from cli_agent_orchestrator.backends import herdr_backend as mod
+
+        backend = _backend("unknown")
+        for i in range(mod._STATUS_UNKNOWN_WARNED_MAX + 5):
+            backend.fetch_native_status("cao", f"w{i}")
+        assert len(mod._STATUS_UNKNOWN_WARNED) <= mod._STATUS_UNKNOWN_WARNED_MAX
+
+    def test_two_sessions_sharing_a_window_name_each_get_a_line(self, findings, caplog):
+        backend = _backend("unknown")
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.backends.herdr_backend"):
+            backend.fetch_native_status("cao-a", "w1")
+            backend.fetch_native_status("cao-b", "w1")
+            backend.fetch_native_status("cao-a", "w1")
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2, "the seat is (session, window), not window alone"

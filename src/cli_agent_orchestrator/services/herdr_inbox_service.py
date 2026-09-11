@@ -261,6 +261,7 @@ class HerdrInboxService:
     def _remap_terminal_identity(
         self, terminal_id: str, old_pane_id: str, new_pane_id: str
     ) -> None:
+        from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
 
         with get_delivery_lock(terminal_id):
@@ -271,6 +272,18 @@ class HerdrInboxService:
                 self._pane_to_terminal[new_pane_id] = terminal_id
                 self._terminal_to_pane[terminal_id] = new_pane_id
                 self._invalidate_terminal_identity_locked(terminal_id)
+                # F930 (#782): the routing table has just moved this terminal to
+                # a different pane, so any backend-side cache still naming the
+                # old one is now wrong by construction. Invalidating HERE, at
+                # the mutation, keeps the two from drifting for whatever path
+                # reaches this remap — not only the reconcile that calls it
+                # today. Cheap (dict pops) and safe under the delivery lock.
+                try:
+                    get_backend().invalidate_pane(terminal_id)
+                except Exception:  # noqa: BLE001 — never break a remap over a cache poke
+                    logger.debug(
+                        "invalidate_pane after remap failed for %s", terminal_id, exc_info=True
+                    )
 
     def _drop_terminal_identity(self, terminal_id: str, pane_id: str) -> None:
         from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
@@ -588,12 +601,20 @@ class HerdrInboxService:
             # do we fall through to the delete path.
             if term_window and self._label_still_live(term_window):
                 try:
-                    # Invalidate pane cache so get_pane_id does a fresh label-based
-                    # lookup instead of returning the stale pane_id we just proved
-                    # is no longer live. See PR #309 review comment.
+                    # Invalidate every cached pane answer so get_pane_id
+                    # re-resolves against the live server instead of returning
+                    # the stale pane_id we just proved is no longer live. See PR
+                    # #309 review comment.
+                    #
+                    # F930 (#782): this used to reach into ``_pane_cache``
+                    # directly. That worked only while the durable pane-id map
+                    # in front of that cache never hit; once the map became
+                    # authoritative the poke stopped changing the answer, and
+                    # this branch could "re-map" the terminal onto the very id
+                    # it is here to replace. ``invalidate_pane`` is the named
+                    # contract, and it clears both layers.
                     backend = get_backend()
-                    if hasattr(backend, "_pane_cache"):
-                        backend._pane_cache.pop(terminal_id, None)
+                    backend.invalidate_pane(terminal_id, term_session or "", term_window)
                     new_pane_id = backend.get_pane_id(terminal_id, term_session or "", term_window)
                 except Exception as e:
                     logger.warning(

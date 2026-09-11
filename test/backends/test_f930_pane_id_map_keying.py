@@ -170,3 +170,120 @@ class TestRefreshStaysDefensive:
         backend._pane_id_map_ts = time.time() - (mod._PANE_ID_MAP_TTL + 1)
         backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7")
         assert sum(1 for c in calls if c[:2] == ["api", "snapshot"]) == 2
+
+
+class TestInvalidationBeatsTheMap:
+    """B1: the map became authoritative, so invalidation must reach it.
+
+    `herdr_inbox_service`'s reconcile invalidates a pane it has just PROVEN dead
+    (pane id gone, tab label still live) and then re-resolves. Before F930 it
+    poked `_pane_cache` directly and that worked only because the map in front
+    of the cache never hit. With the map live, a poke that misses it would let
+    `get_pane_id` hand back the very id the caller proved wrong — the reconcile
+    would "re-map" the terminal onto its own stale pane, count it repaired, and
+    leave the routing table naming a pane that may since belong to a different
+    terminal.
+    """
+
+    def test_after_invalidation_the_map_does_not_answer(self):
+        backend, calls = _backend()
+        assert backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7") == "w3:p1"
+
+        # The pane is now dead and herdr says so: the snapshot no longer lists
+        # it, and the label walk is the only source of the new id.
+        backend._run_herdr = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"result": {"workspaces": [], "tabs": [], "panes": []}}),
+                stderr="",
+            )
+        )
+        backend._resolve_pane_id_from_window = MagicMock(return_value="w3:p7")  # type: ignore[method-assign]
+
+        backend.invalidate_pane("919751d7", "cao-hfxB", "codex_general-919751d7")
+        assert backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7") == "w3:p7"
+
+    def test_invalidation_without_the_labels_still_disarms_the_map(self):
+        """`_remap_terminal_identity` knows only the terminal id."""
+        backend, _ = _backend()
+        backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7")
+        assert backend._pane_id_map, "precondition: the map is populated"
+
+        backend.invalidate_pane("919751d7")
+
+        backend._run_herdr = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(returncode=1, stdout="", stderr="socket closed")
+        )
+        backend._resolve_pane_id_from_window = MagicMock(return_value="w3:p9")  # type: ignore[method-assign]
+        # Refresh fails, so it leaves map and stamp untouched — the zeroed stamp
+        # is what stops the stale entry being served anyway.
+        assert backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7") == "w3:p9"
+
+    def test_invalidation_also_clears_the_create_time_cache(self):
+        backend, _ = _backend()
+        backend._pane_cache["919751d7"] = ("w3:p1", time.time())
+        backend.invalidate_pane("919751d7")
+        assert "919751d7" not in backend._pane_cache
+
+    def test_a_dead_pane_is_never_re_mapped_onto_itself(self):
+        """The reconcile's own shape, end to end.
+
+        Reproduces the regression the blocker names: proven-dead pane, live tab
+        label, and the assertion is that the newly resolved id DIFFERS from the
+        one just invalidated.
+        """
+        backend, _ = _backend()
+        stale = backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7")
+
+        # herdr has renumbered/re-created: the snapshot now names a new pane for
+        # the same tab, exactly as a live rebuild would see it.
+        moved = {
+            "result": {
+                "workspaces": [{"workspace_id": "w3", "label": "cao-hfxB"}],
+                "tabs": [
+                    {"tab_id": "w3:t1", "workspace_id": "w3", "label": "codex_general-919751d7"}
+                ],
+                "panes": [{"pane_id": "w3:p42", "tab_id": "w3:t1"}],
+            }
+        }
+        backend._run_herdr = MagicMock(  # type: ignore[method-assign]
+            return_value=MagicMock(returncode=0, stdout=json.dumps(moved), stderr="")
+        )
+
+        backend.invalidate_pane("919751d7", "cao-hfxB", "codex_general-919751d7")
+        fresh = backend.get_pane_id("919751d7", "cao-hfxB", "codex_general-919751d7")
+
+        assert fresh == "w3:p42"
+        assert fresh != stale, "re-mapping a terminal onto its own dead pane is the defect"
+
+
+class TestTheMapIsOnlyConsultedWhenItsKeyExists:
+    """N7: a caller with no labels cannot be answered from a label-keyed map."""
+
+    def test_a_keyless_lookup_does_not_pay_a_snapshot(self):
+        backend, calls = _backend()
+        backend._pane_cache["919751d7"] = ("w1:p1", time.time())
+        assert backend.get_pane_id("919751d7") == "w1:p1"
+        assert not [
+            c for c in calls if c[:2] == ["api", "snapshot"]
+        ], "rebuilding a map whose key the caller does not hold can only miss"
+
+
+class TestMultiPaneTabsResolveLikeTheFallback:
+    """N6: the two resolution paths must not disagree by snapshot order."""
+
+    def test_the_first_pane_of_a_tab_wins(self):
+        backend, _ = _backend(
+            {
+                "result": {
+                    "workspaces": [{"workspace_id": "w1", "label": "cao-x"}],
+                    "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "win-0"}],
+                    "panes": [
+                        {"pane_id": "w1:p1", "tab_id": "w1:t1"},
+                        {"pane_id": "w1:p2", "tab_id": "w1:t1"},
+                    ],
+                }
+            }
+        )
+        backend._refresh_pane_id_map()
+        assert backend._pane_id_map == {("cao-x", "win-0"): "w1:p1"}
