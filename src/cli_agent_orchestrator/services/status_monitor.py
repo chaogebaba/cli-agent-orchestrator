@@ -40,6 +40,7 @@ from cli_agent_orchestrator.models.native_publish import (
     SettlementFence,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers import status_contract
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -436,6 +437,17 @@ class StatusMonitor:
         # seam (D4); its sinks are wired lazily to avoid import cycles.
         self._last_condition: Dict[str, Optional[str]] = {}
         self._condition_delivery: Optional[Any] = None
+        # fx751 Slice A (AC-8): the reducer's lifecycle context, keyed by
+        # terminal_id — decision D-A1 (a StatusMonitor-owned map, NOT a reuse of
+        # app.worker_truth's DB-backed projector, which reads a Clock and is not
+        # pure). ``_fx751_lifecycle_gen`` is the per-terminal LIFECYCLE
+        # generation the invalidation path bumps; a candidate carrying an older
+        # generation cannot repopulate an evicted context (generation
+        # compare-and-commit). Both maps are evicted on the one idempotent
+        # invalidation path (clear_terminal) and are NOT touched by reset_buffer
+        # (D5: buffer reset is not cleanup).
+        self._fx751_reducer_ctx: Dict[str, "status_contract.ReducerContext"] = {}
+        self._fx751_lifecycle_gen: Dict[str, int] = {}
 
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
@@ -2466,6 +2478,51 @@ class StatusMonitor:
         # carries a pane_delta* reason.
         return status, "fx751_migrated"
 
+    def fx751_lifecycle_generation(self, terminal_id: str) -> int:
+        """Return the current fx751 lifecycle generation for a terminal (AC-8).
+
+        Bumped by the invalidation path (clear_terminal); a sample stamped with
+        an older value is rejected by :meth:`fx751_commit_candidate`."""
+        with self._lock:
+            return self._fx751_lifecycle_gen.get(terminal_id, 0)
+
+    def fx751_commit_candidate(
+        self,
+        terminal_id: str,
+        sample: "status_contract.StatusSample",
+        candidate: "status_contract.Candidate",
+    ) -> bool:
+        """Generation compare-and-commit for a reducer candidate (AC-8).
+
+        Commits the candidate's proposed next context to the monitor-owned map
+        ONLY when the sample's ``lifecycle_generation`` still matches the
+        terminal's current generation. An in-flight sample captured before an
+        invalidation carries the OLD generation and is rejected here, so it can
+        never repopulate the evicted context. Returns True on commit, False on
+        rejection. Idempotent: committing the same candidate twice is a no-op
+        beyond overwriting with the identical value."""
+        with self._lock:
+            current = self._fx751_lifecycle_gen.get(terminal_id, 0)
+            if sample.lifecycle_generation != current:
+                return False
+            if candidate.next_context is not None:
+                self._fx751_reducer_ctx[terminal_id] = candidate.next_context
+            return True
+
+    def fx751_reducer_context(self, terminal_id: str) -> "status_contract.ReducerContext":
+        """Return the retained reducer context for a terminal, seeded with the
+        current lifecycle generation when absent (AC-8). Never captures."""
+        with self._lock:
+            gen = self._fx751_lifecycle_gen.get(terminal_id, 0)
+            ctx = self._fx751_reducer_ctx.get(terminal_id)
+            if ctx is None:
+                return status_contract.ReducerContext(
+                    terminal_id=terminal_id,
+                    lifecycle_generation=gen,
+                    last_sequence=-1,
+                )
+            return ctx
+
     def get_boundary_observation(self, terminal_id: str) -> BoundaryObservation:
         """Return one status/cycle snapshot sampled under the monitor lock."""
         with self._lock:
@@ -2635,6 +2692,17 @@ class StatusMonitor:
             # deleted terminal keeps a process-lifetime entry, and an id reused
             # inside the 3 s window would have its first re-derivation skipped.
             self._last_rederive_check.pop(terminal_id, None)
+            # fx751 Slice A (AC-8): the reducer's lifecycle context is evicted on
+            # this ONE idempotent invalidation path, and the lifecycle generation
+            # is BUMPED so an in-flight sample captured before this invalidation
+            # (carrying the old generation) can no longer repopulate the context
+            # via _fx751_commit_candidate's compare-and-commit. Cardinality for
+            # this terminal returns to zero (the gen counter advances rather than
+            # being deleted so a reused id never re-uses a stale generation).
+            self._fx751_reducer_ctx.pop(terminal_id, None)
+            self._fx751_lifecycle_gen[terminal_id] = (
+                self._fx751_lifecycle_gen.get(terminal_id, 0) + 1
+            )
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
