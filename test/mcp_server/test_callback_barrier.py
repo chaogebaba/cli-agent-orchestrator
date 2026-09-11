@@ -52,6 +52,11 @@ def test_worker_cannot_create_callback_barrier_via_send_message(monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", "11111111")
     with (
         patch.object(server, "_barrier_dispatch_is_supervisor_owned", return_value=False),
+        # F893 (#745) H3: the refusal is now WORDED from the classification. This
+        # scenario is a live peer the sender does not own, so pin "not_owned" —
+        # otherwise the empty unit-test DB reports the peer as simply absent and
+        # the (correct, different) "not addressable" wording is returned.
+        patch.object(server, "_barrier_dispatch_permission", return_value="not_owned"),
         patch.object(server, "_send_barrier_to_inbox") as send,
     ):
         result = server._send_message_impl(

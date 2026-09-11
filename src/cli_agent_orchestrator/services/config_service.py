@@ -273,6 +273,16 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_LIVENESS_PANE_DELTA_MAX_HOLD_S": ("liveness.pane_delta_max_hold_s", "float", 300.0),
     "CAO_LIVENESS_RESYNC_INTERVAL_S": ("liveness.resync_interval_s", "float", 60.0),
     "CAO_LIVENESS_QUESTION_MARKER_TTL_S": ("liveness.question_marker_ttl_s", "float", 300.0),
+    # F899 (#751): child-process liveness probe on the pane-hold expiry arm.
+    # The TTL keeps the /proc walk off the fleet-wide hot read; the shell-comm
+    # list is the provider-agnostic discriminator between a tool subprocess
+    # (run through a shell) and a persistent stdio helper (exec'd directly).
+    "CAO_LIVENESS_CHILD_PROC_PROBE_TTL_S": ("liveness.child_proc_probe_ttl_s", "float", 5.0),
+    "CAO_LIVENESS_CHILD_PROC_SHELL_COMMS": (
+        "liveness.child_proc_shell_comms",
+        "str",
+        "bash,sh,zsh,fish,dash,ksh,ash",
+    ),
     "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
     "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
     "CAO_ALARM_DEGRADED_DISPLAY_MESSAGE": ("alarm.degraded_display_message", "bool", True),

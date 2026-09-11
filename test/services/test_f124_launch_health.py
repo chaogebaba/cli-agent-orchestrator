@@ -376,12 +376,18 @@ class TestProviderChildAlive:
             "cli_agent_orchestrator.services.fork_context_service.pane_pid",
             lambda sess, win: 100,
         )
-        # Baseline was "bash" but current command is "kiro-cli" → exec-replaced
-        mock_backend = MagicMock()
-        mock_backend.get_pane_current_command.return_value = "kiro-cli"
+        # Baseline was "bash" but current command is "kiro-cli" → exec-replaced.
+        # F880 (#733): the exec-replacement logic now lives in
+        # TmuxBackend.probe_provider_liveness, reached through the port. Use a
+        # real TmuxBackend with only its pane-command read stubbed so the moved
+        # logic is exercised end-to-end via the delegation.
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+
+        real_backend = TmuxBackend()
+        monkeypatch.setattr(real_backend, "get_pane_current_command", lambda sess, win: "kiro-cli")
         monkeypatch.setattr(
             "cli_agent_orchestrator.backends.registry.get_backend",
-            lambda: mock_backend,
+            lambda: real_backend,
         )
 
         provider = MagicMock()
@@ -415,11 +421,15 @@ class TestProviderChildAlive:
             "cli_agent_orchestrator.services.fork_context_service.pane_pid",
             lambda sess, win: 100,
         )
-        mock_backend = MagicMock()
-        mock_backend.get_pane_current_command.return_value = "bash"
+        # F880 (#733): empty-shell classification now lives in
+        # TmuxBackend.probe_provider_liveness, reached through the port.
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+
+        real_backend = TmuxBackend()
+        monkeypatch.setattr(real_backend, "get_pane_current_command", lambda sess, win: "bash")
         monkeypatch.setattr(
             "cli_agent_orchestrator.backends.registry.get_backend",
-            lambda: mock_backend,
+            lambda: real_backend,
         )
 
         provider = MagicMock()
@@ -454,11 +464,13 @@ class TestProviderChildAlive:
             "cli_agent_orchestrator.services.fork_context_service.pane_pid",
             lambda sess, win: 100,
         )
-        mock_backend = MagicMock()
-        mock_backend.get_pane_current_command.return_value = "bash"
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+
+        real_backend = TmuxBackend()
+        monkeypatch.setattr(real_backend, "get_pane_current_command", lambda sess, win: "bash")
         monkeypatch.setattr(
             "cli_agent_orchestrator.backends.registry.get_backend",
-            lambda: mock_backend,
+            lambda: real_backend,
         )
 
         # Provider has NO baseline captured
@@ -1139,11 +1151,13 @@ class TestMutationKillExecReplacement:
             "cli_agent_orchestrator.services.fork_context_service.pane_pid",
             lambda sess, win: 100,
         )
-        mock_backend = MagicMock()
-        mock_backend.get_pane_current_command.return_value = "kiro-cli"
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+
+        real_backend = TmuxBackend()
+        monkeypatch.setattr(real_backend, "get_pane_current_command", lambda sess, win: "kiro-cli")
         monkeypatch.setattr(
             "cli_agent_orchestrator.backends.registry.get_backend",
-            lambda: mock_backend,
+            lambda: real_backend,
         )
 
         provider = MagicMock()

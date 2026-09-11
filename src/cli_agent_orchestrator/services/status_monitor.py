@@ -323,6 +323,11 @@ class StatusMonitor:
         # sentinel is indistinguishable from a genuine reading and could rate-limit the
         # very first check before it ever runs.
         self._last_stale_capture_check: Dict[str, Optional[float]] = {}
+        # F899 (#751) r2: per-terminal clock for the pane-sample re-derivation on
+        # the two state-LOWERING arms. Separate from _last_stale_capture_check —
+        # that one bounds capture-pane forks, this one bounds detector calls on an
+        # already-captured sample — so neither can starve the other.
+        self._last_rederive_check: Dict[str, Optional[float]] = {}
         # Per-terminal monotonic timestamp of the last time _process_chunk actually
         # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
         # quiet gate reads this. Same None-vs-0.0 sentinel rule as above.
@@ -2171,7 +2176,9 @@ class StatusMonitor:
         call sites already holding it, and several sit outside it). IDEMPOTENT
         BY RE-DERIVATION: a second pass recomputes the same status and the same
         reason given unchanged inputs (AC21). Pure on the read path — it only
-        READS ``question_state`` and ``pane_liveness.peek`` (never captures, D2).
+        READS ``question_state``, ``pane_liveness.peek`` and (on the expired arm
+        alone, F899) ``child_proc_probe.probe``, a TTL-cached /proc read. It
+        never captures a pane (D2).
 
         Precondition (stated ONCE): the rules apply only when ``status is not
         None``; ``None ⇒ (None, None)`` — the none_behavior="none" pass-through
@@ -2182,6 +2189,13 @@ class StatusMonitor:
            LOWER out of it — keeps the fusion from fighting the 16 producers and
            specifically auto_responder.force_status (D5).
         2. a question marker is open ⇒ (WAITING_USER_ANSWER, "question_marker").
+        2b. status is ERROR (F899 #751): a live tool subprocess under the pane ⇒
+            (PROCESSING, "child_proc_live") — positive proof of work outranks a
+            stale-buffer ERROR. Otherwise re-derive from the pane sampler's fresh
+            rendered sample (r2): PROCESSING ⇒ (PROCESSING, "fresh_capture_working"),
+            IDLE/COMPLETED ⇒ (that, "fresh_capture_idle"), else (ERROR, None) —
+            today's behaviour. Scoped to the PROVIDER-published ERROR: the fleet's
+            own ERROR overrides are applied after this fusion and are untouched.
         3a. status in {IDLE, COMPLETED, PROCESSING}, a usable sample exists,
             unchanged_count < K (eligibility first — a stable pane is never
             tagged, AC4). Then, in order (F568 D12d, R3-B3/B5): children_count>0
@@ -2190,11 +2204,16 @@ class StatusMonitor:
             pane_hold_expired ⇒ (PROCESSING, "pane_delta"). The "usable sample"
             guard IS the whole no-evidence rule (R3-B1). PROCESSING⇒PROCESSING is
             a status no-op that reproduces the reason.
-        3b. same preconditions but pane_hold_expired ⇒ status UNCHANGED,
-            "pane_delta_expired" (fusion_changed stays False — the caller sets
-            it from the status delta). The expiry is a distinct outcome (R5-S3).
-            With a children/marker veto the clock was cleared, so expiry cannot
-            co-occur (AC-8).
+        3b. same preconditions but pane_hold_expired ⇒ F899 (#751) probes the
+            pane's process tree first: a live tool subprocess ⇒ (PROCESSING,
+            "child_proc_live"); then re-derives from the fresh pane sample (r2):
+            PROCESSING ⇒ (PROCESSING, "fresh_capture_working"); otherwise status
+            UNCHANGED, "pane_delta_expired"
+            (fusion_changed stays False — the caller sets it from the status
+            delta). The expiry is a distinct outcome (R5-S3). With a children/
+            marker veto the clock was cleared, so expiry cannot co-occur (AC-8).
+            The probe never raises: when it cannot answer, this arm is exactly
+            the pre-F899 expiry.
         4. else ⇒ (status, None).
         """
         if status is None:
@@ -2215,6 +2234,60 @@ class StatusMonitor:
             # Rule 2: a marker raises any other status into WAITING.
             if marker_open:
                 return TerminalStatus.WAITING_USER_ANSWER, "question_marker"
+
+            # Rule 2b (F899 #751, third sample 2026-09-10): a provider-published
+            # ERROR over a pane that is in fact working. The published status is
+            # re-derived from the ROLLING BUFFER, so when a worker goes quiet for
+            # long enough that the buffer stops advancing, a stale frame carrying
+            # neither the working spinner nor the idle composer chrome — but
+            # carrying an old `Error:` line (the ClinePass 429 banner, #700) —
+            # parses as a launch failure and the seat projects `error` while its
+            # pane still renders the live spinner (observed on two pi_cli lanes,
+            # since_last_input 3146 s / 2725 s, both with terminal_error and
+            # recovery_state null, so none of the fleet's own ERROR overrides
+            # fired). A live tool subprocess under the pane is positive proof the
+            # worker is running, so it outranks a stale-buffer ERROR exactly as
+            # it outranks a stale-buffer IDLE at rule 3b.
+            #
+            # Scope is deliberately the PROVIDER-published ERROR only: the fleet
+            # applies its own ERROR overrides (recovery_state, absent window,
+            # failed init) AFTER this fusion, so a genuinely quarantined or dead
+            # terminal still projects `error` regardless of what is running.
+            # A genuine startup failure has no tool subprocess to find, so the
+            # probe returns live=False and the ERROR stands.
+            if status is TerminalStatus.ERROR:
+                try:
+                    from cli_agent_orchestrator.services.child_proc_probe import (
+                        child_proc_probe,
+                    )
+
+                    error_probe = child_proc_probe.probe(terminal_id)
+                except Exception:
+                    error_probe = None
+                if error_probe is not None and error_probe.live:
+                    return TerminalStatus.PROCESSING, "child_proc_live"
+                # F899 r2 ruling 2: no live subprocess is NOT proof of a launch
+                # failure — a worker in model inference runs nothing (the third
+                # sample's own tree was pi + its MCP helper only). Before admitting
+                # a state-lowering ERROR, re-derive from the pane sampler's fresh
+                # rendered sample. Working ⇒ hold it PROCESSING; a fresh idle/
+                # completed verdict ⇒ admit THAT, not the stale ERROR; anything
+                # else (no verdict, still ERROR) ⇒ today's behaviour.
+                try:
+                    from cli_agent_orchestrator.services.pane_liveness import (
+                        pane_liveness as _pane_liveness,
+                    )
+
+                    error_obs = _pane_liveness.peek(terminal_id)
+                except Exception:
+                    error_obs = None
+                if error_obs is not None:
+                    fresh = self._rederive_from_pane_sample(terminal_id, error_obs.filtered_tail)
+                    if fresh is TerminalStatus.PROCESSING:
+                        return TerminalStatus.PROCESSING, "fresh_capture_working"
+                    if fresh in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                        return fresh, "fresh_capture_idle"
+                return status, None
 
             # Rules 3a/3b: pane-delta downgrade, bounded by the hold clock.
             if status in (
@@ -2270,6 +2343,42 @@ class StatusMonitor:
                         # outcome — PROCESSING/"pane_delta", or the expired admit.
                         if not observation.pane_hold_expired:
                             return TerminalStatus.PROCESSING, "pane_delta"
+                        # F899 (#751) rule 3b-pre: the pane bound expired, but a
+                        # churning pane is not the only evidence of work. A long
+                        # silent box command (grokfleet/pytest) renders only an
+                        # elapsed-time counter, so the hold clock never resets
+                        # and at 300 s the seat published `idle` with real work
+                        # in flight (observed twice 2026-09-10, since_last_input
+                        # 877 s / 1136 s). Probe the pane's process tree BEFORE
+                        # falling to idle: a live tool subprocess holds the seat
+                        # PROCESSING under a distinct reason. The probe never
+                        # raises and never captures the pane — it reads /proc,
+                        # TTL-cached, and only on this already-rare arm. When it
+                        # cannot answer (no metadata, pid gone, procfs denied)
+                        # `live` is False and the expiry behaves exactly as
+                        # before, reason unchanged.
+                        try:
+                            from cli_agent_orchestrator.services.child_proc_probe import (
+                                child_proc_probe,
+                            )
+
+                            child_probe = child_proc_probe.probe(terminal_id)
+                        except Exception:
+                            child_probe = None
+                        if child_probe is not None and child_probe.live:
+                            return TerminalStatus.PROCESSING, "child_proc_live"
+                        # F899 r2 ruling 2: same second gate as the ERROR arm. The
+                        # published IDLE came from the rolling buffer; re-derive
+                        # from the sampler's fresh rendered sample before lowering.
+                        # A working verdict holds the seat PROCESSING; anything
+                        # else falls through to the expiry admit unchanged. (Only
+                        # the RAISE is taken here — an idle verdict agrees with
+                        # what is about to be admitted anyway.)
+                        fresh = self._rederive_from_pane_sample(
+                            terminal_id, observation.filtered_tail
+                        )
+                        if fresh is TerminalStatus.PROCESSING:
+                            return TerminalStatus.PROCESSING, "fresh_capture_working"
                         # 3b: the bound expired — admit the published status but
                         # tag it so the withhold is explicable (AC22 second arm).
                         return status, "pane_delta_expired"
@@ -2450,9 +2559,25 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            # F899 r3 repair 3: the re-derivation rate-limit clock is per-terminal
+            # state like every map above it, so it goes with them. Left behind, a
+            # deleted terminal keeps a process-lifetime entry, and an id reused
+            # inside the 3 s window would have its first re-derivation skipped.
+            self._last_rederive_check.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
+        # F899 r3 repair 3: the child-process probe's TTL cache is the second
+        # per-terminal map this feature introduced. Evicted OUTSIDE the monitor
+        # lock — the probe owns its own lock and must never be entered under
+        # ours — and defensively, because clear_terminal is a teardown path that
+        # must not raise.
+        try:
+            from cli_agent_orchestrator.services.child_proc_probe import child_proc_probe
+
+            child_proc_probe.forget(terminal_id)
+        except Exception:
+            logger.debug("clear_terminal [%s]: child_proc_probe evict failed", terminal_id)
 
     def unregister(self, terminal_id: str) -> None:
         """Unregister a terminal from monitoring (called on delete).
@@ -2808,6 +2933,94 @@ class StatusMonitor:
             return False
         return bool(getattr(provider, "supports_direct_status_probe", False))
 
+    @staticmethod
+    def _snapshot_detector_mode(provider: Any) -> Optional[bool]:
+        """Which detector may read a RENDERED pane snapshot, if any.
+
+        Returns True to use ``get_status_from_screen``, False to use
+        ``get_status``, and None when this provider must not be fed a rendered
+        frame at all. Lifted out of ``_fresh_capture_pane_status`` (F899 r2) so
+        the pane-sample re-derivation applies the SAME opt-in routing rather than
+        a parallel copy of it: a capture-pane snapshot is rendered content, and
+        feeding it to a raw-stream-tuned detector produces systematic misreads,
+        not noise (kiro_cli/cursor_cli read a busy frame as COMPLETED). Opt-in
+        via either flag, never a guess; everything else fails CLOSED.
+        """
+        if not getattr(provider, "supports_stale_capture_selfheal", True):
+            return None
+        if getattr(provider, "supports_screen_detection", False):
+            return True
+        if getattr(provider, "supports_direct_status_probe", False):
+            return False
+        return None
+
+    def _rederive_from_pane_sample(
+        self, terminal_id: str, filtered_tail: str, *, now: Optional[float] = None
+    ) -> Optional[TerminalStatus]:
+        """Re-run the provider's snapshot-safe detector on the FRESH pane sample.
+
+        F899 (#751) r2 ruling 2: a state-LOWERING transition must never be taken
+        on the strength of the stale rolling buffer alone. Both lowering arms —
+        the expired pane-hold (published IDLE) and the provider-published ERROR —
+        call this before admitting, and a verdict of PROCESSING holds the seat
+        working under ``fresh_capture_working``.
+
+        The input is ``PaneObservation.filtered_tail``: the text of the pane
+        sampler's OWN ``capture-pane``, which is real rendered pane content and
+        is guaranteed fresh — ``pane_liveness.peek`` returns None once a sample
+        is older than two sampler passes. It is NOT the FIFO-fed rolling buffer
+        that produced the wrong verdict.
+
+        DELIBERATELY NOT a call into ``_fresh_capture_pane_status``. Three things
+        forbid a capture here, and the ruling's intent — a verdict from fresh
+        rendered pane content rather than the stale buffer — is met either way:
+          * ``fuse_status`` is the read-time fusion (F506 D2) and must not
+            capture; it is reached from every fleet row and every UI refresh, and
+            a capture-pane is a real subprocess fork (the fork-storm class
+            ``run()`` documents).
+          * the single-sampler invariant (AC1, the f295-half2 second-sampler ban)
+            allows exactly ONE ``capture-pane`` per terminal per tick, which the
+            pane sampler already spends — and whose output this reads.
+          * ``_fresh_capture_pane_status`` is built to CONFIRM a ready verdict for
+            the #558 stale-PROCESSING heal: it returns None on a PROCESSING read
+            (clearing its candidate), so it structurally cannot report "the pane
+            is working", which is the verdict both arms need here.
+        The detector ROUTING is shared with it via ``_snapshot_detector_mode``, so
+        a provider that must not see a rendered frame is skipped identically.
+
+        Rate-limited per terminal by ``STALE_PROCESSING_CAPTURE_INTERVAL_S`` (3 s,
+        the ruling's limit) on its own clock — the detector call, not a capture,
+        is what is being bounded. Returns None when skipped or on any failure, and
+        every caller treats None as "no new evidence", never as a signal to move.
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            last = self._last_rederive_check.get(terminal_id)
+            if last is not None and now - last < STALE_PROCESSING_CAPTURE_INTERVAL_S:
+                return None
+            self._last_rederive_check[terminal_id] = now
+
+        if not filtered_tail:
+            return None
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            return None
+        if provider is None:
+            return None
+        use_screen = self._snapshot_detector_mode(provider)
+        if use_screen is None:
+            return None
+        try:
+            if use_screen:
+                return provider.get_status_from_screen(filtered_tail.splitlines())
+            return provider.get_status(filtered_tail)
+        except Exception:
+            logger.debug(
+                "_rederive_from_pane_sample [%s]: detection failed", terminal_id, exc_info=True
+            )
+            return None
+
     def _fresh_capture_pane_status(
         self, terminal_id: str, generation: int
     ) -> Optional[TerminalStatus]:
@@ -2887,18 +3100,10 @@ class StatusMonitor:
         if provider is None:
             return None
 
-        if not getattr(provider, "supports_stale_capture_selfheal", True):
-            # Explicit opt-out: this provider's get_status is raw-stream tuned and
-            # misreads a rendered frame (see ProviderBase for the full rationale).
-            return None
-
-        use_screen = getattr(provider, "supports_screen_detection", False)
-        if not use_screen and not getattr(provider, "supports_direct_status_probe", False):
-            # Raw-stream-tuned detector with no snapshot-safe alternative (kiro_cli,
-            # cursor_cli): a rendered frame cannot be trusted as its input — see the
-            # docstring — so don't capture at all. Self-heal is opt-in via either flag,
-            # never a guess; these providers stay PROCESSING until the pipeline resolves
-            # them.
+        use_screen = self._snapshot_detector_mode(provider)
+        if use_screen is None:
+            # Opted out, or raw-stream-tuned with no snapshot-safe alternative —
+            # see _snapshot_detector_mode. No capture, no verdict.
             return None
 
         try:

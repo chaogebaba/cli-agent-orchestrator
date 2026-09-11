@@ -124,7 +124,10 @@ class TestF218RealOrmField:
             "cli_agent_orchestrator.clients.database.SessionLocal", SessionLocal
         ), patch(
             "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            side_effect=lambda k, default=None: default,
+            # F893 (#745) sweep: the F218 scope probe now resolves the CONFIGURED
+            # backend instead of hard-coding TmuxBackend(), so ConfigService.get is
+            # also called with the factory's override kwarg — the double must accept it.
+            side_effect=lambda k, default=None, **_kw: default,
         ), patch(
             "cli_agent_orchestrator.backends.tmux_backend.TmuxBackend.session_scope_probe",
             return_value=scope_probe,
@@ -171,7 +174,10 @@ class TestF218RealOrmField:
             "cli_agent_orchestrator.clients.database.SessionLocal", SessionLocal
         ), patch(
             "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            side_effect=lambda k, default=None: default,
+            # F893 (#745) sweep: the F218 scope probe now resolves the CONFIGURED
+            # backend instead of hard-coding TmuxBackend(), so ConfigService.get is
+            # also called with the factory's override kwarg — the double must accept it.
+            side_effect=lambda k, default=None, **_kw: default,
         ), patch(
             "cli_agent_orchestrator.backends.tmux_backend.TmuxBackend.session_scope_probe",
             return_value=scope_probe,

@@ -2325,6 +2325,17 @@ async def health_check():
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
+    # F882 (#735): the herdr component reflects real control-plane liveness via
+    # the backend port, not merely ``shutil.which("herdr")`` (which reported
+    # ``ok`` across a dead herdr socket — A3 in the live report). The tmux
+    # backend has no separate control plane and returns ``"ok"``; the ``claude``
+    # component stays a binary-presence probe.
+    try:
+        herdr_component = backend.backend_health() if backend_name == "herdr" else _probe("herdr")
+    except Exception:
+        logger.exception("backend_health probe failed during /health")
+        herdr_component = "unavailable"
+
     payload = {
         "status": "ok",
         "service": "cli-agent-orchestrator",
@@ -2332,7 +2343,7 @@ async def health_check():
         "ws_monitor": bool(ConfigService.get("supervisor.wake.ws_monitor", default=False)),
         "components": {
             "cao": "ok",
-            "herdr": _probe("herdr"),
+            "herdr": herdr_component,
             "claude": _probe("claude"),
         },
         # F497 AC2: advertise resolver support so `cao install` can refuse
@@ -4525,6 +4536,31 @@ def _f829_verify_caller_binding(request: Request, caller_id: Optional[str]) -> N
         )
 
 
+def _validate_resume_profile_loads(agent_profile: str) -> None:
+    """F874 (#730): mirror create_terminal's fail-closed profile load, PRE-claim.
+
+    Raises ``ProfileMissingError`` for a NAMED profile that will not load (no
+    flat, composed, or built-in store file) — the SAME check create_terminal
+    does at terminal_service.py:2107, lifted ahead of the resume CAS claim so a
+    position name with no composed file refuses cleanly with zero claim taken,
+    rather than failing deep in create_terminal after the claim (and wedging the
+    conversation for the claim TTL). A load that returns a non-AgentProfile (a
+    test double / malformed object) is treated as "loadable" here — create_terminal
+    coerces it to None (a bare native spawn), which is not a refusal.
+    """
+    from cli_agent_orchestrator.services.terminal_service import ProfileMissingError
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    try:
+        load_agent_profile(agent_profile)
+    except FileNotFoundError as exc:
+        raise ProfileMissingError(
+            f"E-PROFILE-MISSING: agent profile '{agent_profile}' could not be "
+            f"loaded (no flat, composed, or built-in store file); refusing to "
+            f"spawn profile-less."
+        ) from exc
+
+
 async def _f829_admit_resume(
     *,
     request: Request,
@@ -4618,6 +4654,42 @@ async def _f829_admit_resume(
                 "message": "resume_refused (missing profile): frozen pins would be dropped",
             },
         )
+
+    # (3b) F874 (#730): VALIDATE the resolved agent profile BEFORE the claim.
+    # `assign(resume_from=…, agent_profile=<position name>)` resolves the profile
+    # from requested_agent_profile-or-root (prepare_resume), and a position name
+    # with no composed store file would otherwise fail CLOSED with
+    # E-PROFILE-MISSING deep inside create_terminal (terminal_service.py:2107) —
+    # AFTER the CAS claim was taken, wedging the conversation as
+    # session_resume_in_progress for the full claim TTL. Load it here, before the
+    # claim, so a missing profile is a clean typed `missing=profile` refusal with
+    # ZERO claim ever taken. This changes NOTHING about which handles/profiles
+    # resume ACCEPTS (#712 stays separate) — it only moves the SAME fail-closed
+    # check ahead of the claim. A None resolved profile (a bare native spawn) is
+    # left to create_terminal, exactly as before.
+    _resolved_profile = prepared.get("agent_profile")
+    if _resolved_profile:
+        from cli_agent_orchestrator.services.terminal_service import ProfileMissingError
+
+        try:
+            _validate_resume_profile_loads(_resolved_profile)
+        except ProfileMissingError as _pm:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "resume_refused",
+                    "missing": "profile",
+                    "reason": "profile_missing",
+                    "retryable": False,
+                    "identity_key": prepared["identity_key"],
+                    "how": (
+                        f"the resolved agent profile '{_resolved_profile}' has no "
+                        f"flat, composed, or built-in store file; install/compose "
+                        f"it (or pass an agent_profile that resolves) and retry"
+                    ),
+                    "message": f"resume_refused (missing profile): {_pm}",
+                },
+            ) from _pm
 
     # (4) CLAIM (CAS) before any spawn effect. A lost CAS spawns nothing.
     admission = prepared["admission"]

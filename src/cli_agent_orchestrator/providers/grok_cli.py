@@ -892,9 +892,12 @@ class GrokCliProvider(BaseProvider):
             proc = psutil.Process(pid)
             # Check if it's a descendant of our pane
             try:
-                from cli_agent_orchestrator.services.fork_context_service import pane_pid
+                from cli_agent_orchestrator.backends.registry import get_backend
 
-                our_pane = pane_pid(self.session_name, self.window_name)
+                # F893 (#745): backend port, not tmux list-panes.
+                our_pane = get_backend().get_pane_process_id(
+                    self.session_name, self.window_name
+                )
                 if our_pane:
                     parent = proc.parent()
                     # Walk ancestry up to 10 levels
