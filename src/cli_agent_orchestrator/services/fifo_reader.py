@@ -742,13 +742,18 @@ class FifoManager:
                 samples = int(ConfigService.get("liveness.session_confirm_samples", 2))
                 timeout_s = float(ConfigService.get("liveness.scope_probe_timeout_s", 5.0))
 
-                from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
-                from cli_agent_orchestrator.clients.tmux import TmuxClient
+                # F893 (#745) bug-family sweep: this hard-coded TmuxBackend()
+                # instead of the configured backend, so the F218 scope probe
+                # asked tmux about a herdr seat. session_scope_probe is on the
+                # port (backends/base.py) — dispatch through it.
+                from cli_agent_orchestrator.backends.registry import get_backend
 
-                backend = TmuxBackend()
+                backend = get_backend()
+                # str() coercion: these locals are read off an ORM row, and the
+                # PORT's signature is stricter than TmuxBackend's override was.
                 scope_probe = backend.session_scope_probe(
-                    session_name,
-                    window_name=window_name,
+                    str(session_name),
+                    window_name=str(window_name),
                     samples=samples,
                     timeout_s=timeout_s,
                 )

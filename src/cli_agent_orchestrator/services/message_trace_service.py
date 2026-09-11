@@ -338,11 +338,16 @@ def normalized_confirmation_fingerprint(payload: str) -> tuple[str, int] | None:
 
 def _fd_codex_session(metadata: dict) -> str | None:
     try:
-        from cli_agent_orchestrator.services.fork_context_service import _descendants, pane_pid
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.services.fork_context_service import _descendants
 
         candidates = set()
         sessions_root = (_resolved_codex_home(metadata.get("id")) / "sessions").resolve()
-        for pid in _descendants(pane_pid(metadata["tmux_session"], metadata["tmux_window"])):
+        # F893 (#745): backend port, not tmux list-panes.
+        root_pid = get_backend().get_pane_process_id(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+        for pid in _descendants(root_pid):
             for fd in Path(f"/proc/{pid}/fd").iterdir():
                 try:
                     path = Path(os.readlink(fd)).resolve()

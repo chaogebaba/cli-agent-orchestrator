@@ -106,6 +106,59 @@ def test_m5_post_claim_failure_compensates_the_claim(client):
 
 
 # ---------------------------------------------------------------------------
+# F874 (#730) — a resume whose resolved agent_profile will not load refuses
+# BEFORE the claim: the route relays a typed missing=profile / profile_missing
+# 409 with ZERO spawn (create_terminal never called). This is the route-level
+# contract of the pre-claim validation in _f829_admit_resume.
+# ---------------------------------------------------------------------------
+def test_f874_resume_missing_profile_refused_zero_spawn(client):
+    from fastapi import HTTPException
+
+    svc = _mock_terminal_service()
+
+    async def _admit_refuses_profile(**_kw):
+        # Mirror the pre-claim missing=profile refusal (zero claim, zero spawn).
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "resume_refused",
+                "missing": "profile",
+                "reason": "profile_missing",
+                "retryable": False,
+                "identity_key": "idk-f874",
+                "how": "the resolved agent profile 'dev-kiro_cli' has no store file",
+                "message": "resume_refused (missing profile): E-PROFILE-MISSING",
+            },
+        )
+
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main._f829_admit_resume",
+            side_effect=_admit_refuses_profile,
+        ),
+        patch("cli_agent_orchestrator.api.main.terminal_service", svc),
+    ):
+        response = client.post(
+            _ROUTE,
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "dev-kiro_cli",
+                "caller_id": "abcd1234",
+            },
+            json={"resume_from": "old12345"},
+        )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["error"] == "resume_refused"
+    assert detail["missing"] == "profile"
+    assert detail["reason"] == "profile_missing"
+    assert detail["retryable"] is False
+    # ZERO spawn: the refusal precedes any create_terminal.
+    svc.create_terminal.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # M7 — a cold create never enters admission.
 # ---------------------------------------------------------------------------
 def test_m7_cold_create_never_enters_admission(client):

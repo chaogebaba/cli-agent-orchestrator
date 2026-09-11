@@ -636,10 +636,17 @@ def _prepare_provider_runtime_identity(
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise RuntimeError("terminal_metadata_missing")
-    from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
+    from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch
 
-    pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
-    cwd = get_backend().get_pane_working_directory(
+    # F893 (#745): resolve the identity-capture process root through the backend
+    # port. This used fork_context_service.pane_pid → `tmux list-panes`, which
+    # under the herdr backend raised CalledProcessError and failed deferred init
+    # for every supports_reauth_rebind provider (grok, live on grok-box-009).
+    # Same class as F880 (#733); same fix — ask the backend, like the cwd read
+    # on the very next line already does.
+    backend = get_backend()
+    pid = backend.get_pane_process_id(metadata["tmux_session"], metadata["tmux_window"])
+    cwd = backend.get_pane_working_directory(
         metadata["tmux_session"], metadata["tmux_window"]
     )
     if cwd is None:
@@ -5586,8 +5593,6 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
         None  — inconclusive (missing procfs/baseline) → degrade to F110 watchdog
     """
     from cli_agent_orchestrator.services.fork_context_service import (
-        _PROC_ROOT,
-        _descendants,
         _procfs_available,
     )
 
@@ -5608,50 +5613,48 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
         )
         return None
 
-    # Step 3: resolve pane PID
+    # Step 3: resolve terminal metadata
     metadata = get_terminal_metadata(terminal_id)
     if metadata is None:
         return False
 
-    from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
-
-    try:
-        pid = _pane_pid(metadata["tmux_session"], metadata["tmux_window"])
-    except Exception:
-        return False
-
-    # Verify the pane PID's /proc entry exists
-    if not (_PROC_ROOT / str(pid) / "stat").exists():
-        return False
-
-    # Step 4: full descendant tree
-    descendants = _descendants(pid)
-    if len(descendants) > 1:
-        return True
-
-    # Step 5: exec-replacement check (pane command != shell baseline)
+    # Steps 4-6 (F880 #733): the "is a provider child alive behind this seat"
+    # question is BACKEND-SPECIFIC and is answered through the terminal-backend
+    # port. tmux resolves a pane pid and walks procfs (its former in-line
+    # Steps 3-6, moved verbatim to TmuxBackend.probe_provider_liveness); herdr
+    # asks its own ``pane process-info`` instead of ``tmux list-panes`` on a
+    # workspace that has no tmux panes — the defect that made every herdr spawn
+    # die ``provider_launch_failed``. The port's three-valued verdict maps 1:1
+    # onto this function's (True/False/None) contract, so the retry/deadline
+    # semantics in _confirm_launch_health are unchanged for both backends.
     baseline = getattr(provider, "shell_baseline", None) or getattr(
         provider, "_shell_baseline", None
     )
     try:
         from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
 
-        current_command = _get_backend().get_pane_current_command(
-            metadata["tmux_session"], metadata["tmux_window"]
+        verdict = _get_backend().probe_provider_liveness(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            shell_baseline=baseline,
         )
     except Exception:
-        current_command = None
-
-    if not baseline or not current_command:
-        # Cannot compare — inconclusive
+        # A backend that raises (e.g. an unimplemented primitive, or a transient
+        # transport error mid-probe) is inconclusive, not a confirmed death:
+        # degrade to the F110 watchdog rather than failing a possibly-live seat.
+        logger.warning(
+            "f880_liveness_probe_error terminal=%s — degrading to F110 watchdog",
+            terminal_id,
+            exc_info=True,
+        )
         return None
 
-    if current_command != baseline:
-        # Shell was exec-replaced by the provider binary
+    if verdict == "alive":
         return True
-
-    # Step 6: current command equals baseline → confirmed empty shell
-    return False
+    if verdict == "dead":
+        return False
+    # "unknown" — inconclusive, non-fatal
+    return None
 
 
 # F163-a: module-level constants for _confirm_launch_health retry loop.
@@ -7931,25 +7934,38 @@ def _resolve_reap_resume_key(
         cwd = identity.get("cwd") or (metadata.get("working_directory") if metadata else None)
         supports = provider_supports_resume(provider) if provider else False
 
-        def _root_link_intact() -> bool:
-            # A2.4: never advertise resumable:true without root/link integrity —
-            # the terminal_identity row must be LINKED to a conversation root that
-            # actually exists. A dangling link (identity_key set but no root) or a
-            # missing link is honestly non-resumable.
+        def _root_resumable_reason() -> str:
+            # A2.4 (F865 B3): "resumable" iff the terminal_identity row is LINKED
+            # to a conversation root that exists AND that root carries a non-NULL
+            # owner_principal. A dangling/missing link or a NULL-owner
+            # (legacy_unknown_owner / top-level-spawn) root is honestly
+            # non-resumable — a NULL-owner root is refused at resume time with
+            # ``resume_not_owner`` (authorize_and_classify_resume), so advertising
+            # ``resumable:true`` for it is the dishonesty A2.4 is titled against;
+            # it becomes resumable only after an explicit ``cao identity claim``.
+            # Returns "resumable" | "identity_root_link_missing" |
+            # "identity_owner_unknown".
             _ikey = identity.get("identity_key") if identity else None
             if not _ikey:
-                return False
+                return "identity_root_link_missing"
             from cli_agent_orchestrator.clients.database import get_conversation_identity
 
-            return get_conversation_identity(_ikey) is not None
+            _root = get_conversation_identity(_ikey)
+            if _root is None:
+                return "identity_root_link_missing"
+            if _root.get("owner_principal") is None:
+                return "identity_owner_unknown"
+            return "resumable"
 
         if force:
             # Abandon: the caller is discarding the checkout; not resumable.
             return None, False, "abandoned_force_delete"
         existing_id = identity.get("provider_session_id")
         if existing_id:
-            if supports and not _root_link_intact():
-                return None, False, "identity_root_link_missing"
+            if supports:
+                _rr = _root_resumable_reason()
+                if _rr != "resumable":
+                    return None, False, _rr
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return None, bool(supports), reason
         if provider != "kiro_cli":
@@ -7973,6 +7989,11 @@ def _resolve_reap_resume_key(
                     _root = get_conversation_identity(_ikey)
                     _root_sid = _root.get("provider_session_id") if _root else None
                     if _root_sid:
+                        # F865 B3: a captured id on a NULL-owner root is still
+                        # NOT resumable — resume authorization refuses it. Fill
+                        # the row from the root but do not advertise resumable.
+                        if _root and _root.get("owner_principal") is None:
+                            return _root_sid, False, "identity_owner_unknown"
                         return _root_sid, True, "resumable"
                 return None, False, "provider_session_id_never_captured"
             # Non-kiro that does not support resume: nothing to do.
@@ -7999,8 +8020,10 @@ def _resolve_reap_resume_key(
             cwd, terminal_id, capture_nonce=_nonce
         )
         if captured:
-            if supports and not _root_link_intact():
-                return captured, False, "identity_root_link_missing"
+            if supports:
+                _rr = _root_resumable_reason()
+                if _rr != "resumable":
+                    return captured, False, _rr
             reason = "resumable" if supports else f"provider_{provider}_not_resumable"
             return captured, bool(supports), reason
         return None, False, f"capture_unknown_candidates_{count}"

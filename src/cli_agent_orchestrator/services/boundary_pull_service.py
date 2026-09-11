@@ -294,7 +294,17 @@ class BoundaryPullService:
         self._write_tmux_pending(tmux_session, pending_count)
 
     def _write_tmux_pending(self, tmux_session: str, count: int) -> None:
-        """Write @cao_pending user variable to tmux. Never touches status-right format."""
+        """Write @cao_pending user variable to tmux. Never touches status-right format.
+
+        F893 (#745) bug-family sweep: this is a tmux status-line decoration with
+        no equivalent on other backends. It used to run unconditionally, so a
+        herdr round logged an fx194 set-option warning on EVERY recount; it is
+        now gated on the backend capability and is a no-op elsewhere.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        if not get_backend().supports_status_decorations():
+            return
         try:
             import subprocess
 

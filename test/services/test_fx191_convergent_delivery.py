@@ -544,7 +544,10 @@ class TestAC8NudgeTextSafe:
             ),
             patch(
                 "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
-                side_effect=lambda sess, win, text: sent_text.append(text),
+                # F893 (#745) sweep: the nudge now reaches this client through
+                # TmuxBackend.send_keys, which forwards its signature defaults as
+                # keyword arguments — the double has to accept them.
+                side_effect=lambda sess, win, text, **_kw: sent_text.append(text),
             ),
         ):
             attempt_rung2(target, 42, oldest_age_s=7.0)
