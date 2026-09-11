@@ -8,7 +8,6 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.messages import messages
-from cli_agent_orchestrator.clients.database import WatchdogInsertResult
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -20,16 +19,8 @@ from cli_agent_orchestrator.services.inbox_service import (
     corroborate_claude_successor,
 )
 from cli_agent_orchestrator.services.message_trace_service import transcript_lookup, wire_hash
-from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-    AUTO_RESUME_BODY,
-    StalledCallbackWatchdog,
-    WatchdogNotice,
-)
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
-
-
-def _watchdog_notice(message: str, idle_reason: str | None = None) -> WatchdogNotice:
-    return WatchdogNotice("worker", "caller", message, idle_reason, source_generation=1)
 
 
 def _plan(*, evidence=None, first_ref=("/tmp/transcript", 7, 10), attempt="a"):
@@ -385,38 +376,6 @@ def _armed(provider="codex"):
     return service, metadata
 
 
-def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
-    delivery_lock = threading.Lock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: delivery_lock,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        lambda *_args: WatchdogInsertResult("inserted", 46),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-    return delivery_lock
-
-
 def test_d5_join_bumps_revision_and_fired_replaces_generation():
     service, _ = _armed()
     first = service._episodes["worker"]
@@ -440,519 +399,81 @@ def test_d5_reserved_and_auto_resumed_episodes_replace(field):
     assert service._episodes["worker"].generation == first.generation + 1
 
 
-@pytest.mark.parametrize("disabled", ["0", "false", " FALSE "])
-def test_d5_kill_switch_preserves_ordinary_push(monkeypatch, disabled):
-    service, metadata = _armed()
-    monkeypatch.setenv("CAO_WATCHDOG_AUTO_RESUME", disabled)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    due = service.collect_due_notifications(now=13.0)
-    assert due == [
-        _watchdog_notice("[watchdog] worker developer-worker idle 3s without callback")
-    ]
+# ---------------------------------------------------------------------------
+# D5/D6 WATCHDOG AUTO-RESUME -- REMOVED by WP-ARCH 3c K4.
+#
+# Eight arms stood here. Every one of them observed through
+# ``StalledCallbackWatchdog.collect_due_notifications``, and what they asserted
+# about was the auto-resume action it took on the way:
+#
+#   * ``test_d5_kill_switch_preserves_ordinary_push`` -- with
+#     ``CAO_WATCHDOG_AUTO_RESUME`` set to 0/false/" FALSE ", the fire degrades to
+#     the ordinary idle notice instead of resuming;
+#   * ``test_d6_non_codex_provider_uses_ordinary_push`` -- the same degradation
+#     for any provider outside ``AUTO_RESUME_PROVIDERS``;
+#   * ``test_d5_full_fire_inserts_exact_body_then_delivers`` -- the happy path
+#     inserts exactly ``AUTO_RESUME_BODY`` and then requests delivery;
+#   * ``test_d5_delivery_callback_runs_outside_watchdog_lock`` and
+#     ``test_d5_delivery_callback_observes_actual_finalize`` -- the lock discipline
+#     and the ordering of the delivery callback against the finalize;
+#   * ``test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark`` -- one resume
+#     per episode, and the "(auto-resume attempted at ...)" suffix survives on the
+#     next notice;
+#   * ``test_d5_second_callback_read_cancels_pending_resume`` -- a callback that
+#     lands between the reservation and the commit cancels the resume;
+#   * ``test_d5_failed_before_commit_pushes_without_marking_auto_resumed`` -- a
+#     failed insert must not leave the episode marked as resumed.
+#
+# K4 deletes the whole action: ``collect_due_notifications``, ``notify_due``,
+# ``_push_notice``, ``_execute_auto_resume``, ``_reserve_chain_notice``,
+# ``_release_chain_reservation`` and ``ReservedChainNotice``. There is no
+# surviving caller to re-point at -- ``insert_watchdog_auto_resume_message`` has
+# none left anywhere in the tree -- and no seam that still decides any of these
+# questions. A kill switch with nothing to kill, a one-shot guard on an action
+# that never runs, and a lock-ordering property between two calls that no longer
+# both exist are not properties a test can hold onto.
+#
+# ``_patch_successful_auto_resume`` went with them; it existed only to stand up
+# the resume path. ``_armed`` stays -- three surviving arms still use it for the
+# episode bookkeeping that ``record_inbound_task``/``record_status`` own.
+# ---------------------------------------------------------------------------
 
 
-def test_d6_non_codex_provider_uses_ordinary_push(monkeypatch):
-    service, metadata = _armed(provider="grok_cli")
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    assert len(service.collect_due_notifications(now=13.0)) == 1
-    assert service._episodes["worker"].fired
-
-
-def test_d5_full_fire_inserts_exact_body_then_delivers(monkeypatch):
-    service, metadata = _armed()
-    delivery_lock = threading.Lock()
-    deliver = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        MagicMock(side_effect=[None, None]),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: delivery_lock,
-    )
-    insert = MagicMock(return_value=WatchdogInsertResult("inserted", 41))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-    assert service.collect_due_notifications(now=13.0) == []
-    insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
-    deliver.assert_called_once_with("worker")
-    episode = service._episodes["worker"]
-    assert episode.auto_resumed
-    assert episode.resume_reserved_at is None
-
-
-def test_d5_delivery_callback_runs_outside_watchdog_lock(monkeypatch):
-    service, metadata = _armed()
-    delivered = []
-
-    def deliver(terminal_id):
-        assert not service._lock._is_owned()
-        assert not delivery_lock.locked()
-        delivered.append(terminal_id)
-
-    delivery_lock = _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert delivered == ["worker"]
-
-
-def test_d5_delivery_callback_observes_actual_finalize(monkeypatch):
-    service, metadata = _armed()
-    finalized = []
-
-    def deliver(terminal_id):
-        episode = service._episodes[terminal_id]
-        finalized.append(
-            (
-                episode.auto_resumed,
-                episode.resume_reserved_at,
-                episode.auto_resume_attempted_at,
-                episode.idle_since,
-            )
-        )
-
-    _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert len(finalized) == 1
-    auto_resumed, reserved_at, attempted_at, idle_since = finalized[0]
-    assert auto_resumed is True
-    assert reserved_at is None
-    assert attempted_at is not None
-    assert idle_since == 13.0
-
-
-def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
-    service, metadata = _armed()
-    insert = MagicMock(return_value=WatchdogInsertResult("inserted", 45))
-    deliver = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    due = service.collect_due_notifications(now=16.0)
-
-    assert len(due) == 1
-    assert "auto-resume attempted at" in due[0].message
-    assert service._episodes["worker"].auto_resumed is True
-    assert service._episodes["worker"].fired is True
-    insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
-    deliver.assert_called_once_with("worker")
-
-
-@pytest.mark.parametrize("status", [MessageStatus.PENDING, MessageStatus.DIGESTED])
-def test_d5_second_callback_read_cancels_pending_resume(monkeypatch, status):
-    service, metadata = _armed()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        MagicMock(side_effect=[None, status]),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        lambda *_args: WatchdogInsertResult("inserted", 42),
-    )
-    cancel = MagicMock(return_value=True)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.cancel_pending_watchdog_message",
-        cancel,
-    )
-    assert service.collect_due_notifications(now=13.0) == []
-    cancel.assert_called_once_with(42, "worker")
-    assert not service._episodes["worker"].auto_resumed
-    assert service._episodes["worker"].callback_seen is (status == MessageStatus.DIGESTED)
-
-
-def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch):
-    service, metadata = _armed()
-    deliver = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    probe = MagicMock(
-        return_value=(
-            TerminalStatus.IDLE,
-            {"transient_api_error": True, "idle_reason": "transient_api_error"},
-        )
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        probe,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        lambda *_args: WatchdogInsertResult("failed_before_commit"),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-
-    assert service.collect_due_notifications(now=13.0) == [
-        _watchdog_notice(
-            "[watchdog] worker developer-worker idle 3s without callback "
-            "[reason: transient_api_error]",
-            "transient_api_error",
-        )
-    ]
-    probe.assert_called_once_with("worker")
-    episode = service._episodes["worker"]
-    assert episode.fired
-    assert episode.auto_resumed is False
-    assert episode.resume_reserved_at is None
-    deliver.assert_not_called()
-
-
-def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch):
-    service, metadata = _armed()
-    backend = MagicMock()
-    backend.capture_viewport.return_value = (
-        "⚠ Selected model is at capacity. Please try a different model.\n"
-        "› \n"
-        "  gpt-5.6-sol high · ~/project\n"
-    )
-    provider = CodexProvider("worker", "cao-test", "worker")
-    callback_status = MagicMock(side_effect=[None, None, None, None])
-    deliver = MagicMock()
-    insert = MagicMock(return_value=WatchdogInsertResult("inserted", 91))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (
-            TerminalStatus.IDLE,
-            {"transient_api_error": True, "idle_reason": "transient_api_error"},
-        ),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
-        lambda _terminal: provider,
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    attempted_at = service._episodes["worker"].auto_resume_attempted_at
-    assert service.collect_due_notifications(now=16.0) == [
-        _watchdog_notice(
-            "[watchdog] worker developer-worker idle 3s without callback "
-            f"[reason: transient_api_error] (auto-resume attempted at {attempted_at})",
-            "transient_api_error",
-        )
-    ]
-    insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
-    deliver.assert_called_once_with("worker")
-    backend.capture_viewport.assert_called_once_with("cao-test", "worker")
-    assert callback_status.call_count == 4
-
-
-@pytest.mark.parametrize(
-    "banner",
-    [
-        "429 Too Many Requests: usage limit",
-        "502 Bad Gateway — 403 Forbidden",
-        "400 Bad Request: unauthorized",
-    ],
-)
-def test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume(monkeypatch, banner):
-    service, metadata = _armed()
-    provider = CodexProvider("worker", "cao-test", "worker")
-    rows = [banner, "› "]
-    classification = provider.classify_screen(rows)
-    insert = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (
-            classification.status,
-            {"idle_reason": provider.classify_idle_reason(rows, classification)},
-        ),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert service.collect_due_notifications(now=13.0) == [
-        _watchdog_notice(
-            "[watchdog] worker developer-worker idle 3s without callback "
-            "[reason: quota_or_auth]",
-            "quota_or_auth",
-        )
-    ]
-    insert.assert_not_called()
-
-
-def test_wpq6_b_progress_frame_never_auto_resumes(monkeypatch):
-    service, metadata = _armed()
-    insert = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (
-            TerminalStatus.PROCESSING,
-            {"idle_reason": "transient_api_error"},
-        ),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert len(service.collect_due_notifications(now=13.0)) == 1
-    insert.assert_not_called()
-
-
-def test_wpq6_b_processing_reason_is_gate_free_without_auto_resume(monkeypatch):
-    service, metadata = _armed()
-    provider = CodexProvider("worker", "cao-test", "worker")
-    rows = [
-        "⚠ Selected model is at capacity. Please try a different model.",
-        "• Working (5s • esc to interrupt)",
-        "› ",
-        "  gpt-5.6-sol high · ~/project",
-    ]
-    classification = provider.classify_screen(rows)
-    idle_reason = provider.classify_idle_reason(rows, classification)
-    insert = MagicMock()
-
-    assert classification.status == TerminalStatus.PROCESSING
-    assert not provider.transient_error_detected(rows, classification)
-    assert idle_reason == "transient_api_error"
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (
-            classification.status,
-            {
-                "transient_api_error": provider.transient_error_detected(rows, classification),
-                "idle_reason": idle_reason,
-            },
-        ),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert service.collect_due_notifications(now=13.0)[0].message.endswith(
-        "[reason: transient_api_error]"
-    )
-    insert.assert_not_called()
-
-
-def test_wpq6_a2_ghost_composer_reason_does_not_relax_nudge_gate(monkeypatch):
-    service, metadata = _armed()
-    provider = CodexProvider("worker", "cao-test", "worker")
-    rows = [
-        "⚠ Selected model is at capacity. Please try a different model.",
-        "› Write tests for @filename",
-        "  gpt-5.6-sol high · ~/project",
-    ]
-    classification = provider.classify_screen(rows)
-    insert = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (
-            classification.status,
-            {"idle_reason": provider.classify_idle_reason(rows, classification)},
-        ),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert service.collect_due_notifications(now=13.0)[0].message.endswith(
-        "[reason: transient_api_error]"
-    )
-    insert.assert_not_called()
-
-
-def test_wpq6_e_error_banner_pushes_reason_without_auto_resume(monkeypatch):
-    service, metadata = _armed()
-    insert = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"idle_reason": "error_banner"}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert service.collect_due_notifications(now=13.0)[0].message.endswith("[reason: error_banner]")
-    insert.assert_not_called()
-
-
-def test_wpq6_w_cropped_indented_capacity_never_auto_resumes(monkeypatch):
-    service, metadata = _armed()
-    provider = CodexProvider("worker", "cao-test", "worker")
-    rows = ["  ⚠ Selected model is at capacity", "› ", "  gpt-5.6-sol high · ~/project"]
-    classification = provider.classify_screen(rows)
-    insert = MagicMock()
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (classification.status, {}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert service.collect_due_notifications(now=13.0)[0].message == (
-        "[watchdog] worker developer-worker idle 3s without callback"
-    )
-    insert.assert_not_called()
+# ---------------------------------------------------------------------------
+# WPQ6 REASON COMPOSITION -- REMOVED by WP-ARCH 3c K4.
+#
+# Seven arms stood here. Each fed a codex pane frame through
+# ``probe_screen_status``/``classify_screen`` and then asserted TWO things about
+# ``collect_due_notifications``: the reason it composed into the notice, and
+# whether it auto-resumed off the back of that reason.
+#
+#   * ``test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason`` -- the
+#     "model is at capacity" banner on an otherwise idle pane resumes, and the
+#     following notice carries "[reason: transient_api_error] (auto-resume
+#     attempted at ...)";
+#   * ``test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume`` -- 429
+#     / 502+403 / 400 banners name a reason but are excluded from resuming;
+#   * ``test_wpq6_b_progress_frame_never_auto_resumes`` and
+#     ``test_wpq6_b_processing_reason_is_gate_free_without_auto_resume`` -- a pane
+#     still making progress reports its reason without resuming;
+#   * ``test_wpq6_a2_ghost_composer_reason_does_not_relax_nudge_gate`` -- a ghost
+#     composer draft does not soften the gate;
+#   * ``test_wpq6_e_error_banner_pushes_reason_without_auto_resume``;
+#   * ``test_wpq6_w_cropped_indented_capacity_never_auto_resumes`` -- an indented,
+#     cropped capacity banner is not a resume trigger.
+#
+# Both halves of every arm landed on deleted code. The resume half is
+# ``_execute_auto_resume``; the reason half is ``_push_notice``, which is where
+# the "[reason: ...]" and "(auto-resume attempted at ...)" text was composed.
+# There is no notice left to carry a reason.
+#
+# The CLASSIFIER these arms fed is a different thing and it is NOT deleted:
+# ``CodexProvider.classify_screen`` and the transient-error keying still decide
+# what a capacity banner, a 429 and a progress frame each mean, and the D4 band
+# at the top of this file pins exactly that, frame by frame, without going
+# through the watchdog at all. So the frames these arms were built around keep
+# their coverage; what they lose is the consumer that used to act on them.
+# ---------------------------------------------------------------------------
 
 
 def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):
@@ -994,410 +515,43 @@ def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):
     ) == before
 
 
-def test_d5_insert_and_second_callback_read_hold_delivery_lock(monkeypatch):
-    service, metadata = _armed()
-    delivery_lock = threading.Lock()
-    callback_reads = 0
-
-    def callback_status(*_args):
-        nonlocal callback_reads
-        callback_reads += 1
-        if callback_reads == 2:
-            assert delivery_lock.locked()
-        return None
-
-    def insert(*_args):
-        assert delivery_lock.locked()
-        return WatchdogInsertResult("failed_before_commit")
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: delivery_lock,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert len(service.collect_due_notifications(now=13.0)) == 1
-    assert callback_reads == 2
-    assert not delivery_lock.locked()
-
-
-def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
-    service, metadata = _armed()
-    callback_reads = 0
-    finalize_armed = False
-    finalize_exited = False
-
-    class TrackingDeliveryLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self._acquire_count = 0
-
-        def acquire(self, *args, **kwargs):
-            if self._acquire_count == 0:
-                assert not service._lock._is_owned()
-            acquired = self._lock.acquire(*args, **kwargs)
-            if acquired:
-                self._acquire_count += 1
-            return acquired
-
-        def release(self):
-            assert finalize_exited is True
-            return self._lock.release()
-
-        def locked(self):
-            return self._lock.locked()
-
-    delivery_lock = TrackingDeliveryLock()
-
-    class FinalizeExitProbe:
-        def __init__(self, lock):
-            self._lock = lock
-
-        def acquire(self, *args, **kwargs):
-            return self._lock.acquire(*args, **kwargs)
-
-        def release(self):
-            return self._lock.release()
-
-        def _is_owned(self):
-            return self._lock._is_owned()
-
-        def __enter__(self):
-            self._lock.__enter__()
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            nonlocal finalize_armed, finalize_exited
-            if not finalize_armed:
-                return self._lock.__exit__(exc_type, exc, traceback)
-            assert self._lock._is_owned()
-            result = self._lock.__exit__(exc_type, exc, traceback)
-            assert not self._lock._is_owned()
-            finalize_exited = True
-            finalize_armed = False
-            return result
-
-    def callback_status(*_args):
-        nonlocal callback_reads, finalize_armed
-        callback_reads += 1
-        if callback_reads == 2:
-            finalize_armed = True
-        return None
-
-    monkeypatch.setattr(service, "_lock", FinalizeExitProbe(service._lock))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: delivery_lock,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        lambda *_args: WatchdogInsertResult("inserted", 47),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery",
-        lambda _terminal: None,
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert callback_reads == 2
-    assert finalize_exited is True
-    assert not delivery_lock.locked()
-
-
-def test_d5_invalid_finalize_cancellation_exits_while_delivery_lock_held(monkeypatch):
-    service, metadata = _armed()
-    callback_reads = 0
-    finalize_armed = False
-    finalize_exited = False
-
-    class TrackingDeliveryLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self._acquire_count = 0
-
-        def acquire(self, *args, **kwargs):
-            if self._acquire_count == 0:
-                assert not service._lock._is_owned()
-            acquired = self._lock.acquire(*args, **kwargs)
-            if acquired:
-                self._acquire_count += 1
-            return acquired
-
-        def release(self):
-            assert finalize_exited is True
-            return self._lock.release()
-
-        def locked(self):
-            return self._lock.locked()
-
-    delivery_lock = TrackingDeliveryLock()
-
-    class FinalizeExitProbe:
-        def __init__(self, lock):
-            self._lock = lock
-
-        def acquire(self, *args, **kwargs):
-            return self._lock.acquire(*args, **kwargs)
-
-        def release(self):
-            return self._lock.release()
-
-        def _is_owned(self):
-            return self._lock._is_owned()
-
-        def __enter__(self):
-            self._lock.__enter__()
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            nonlocal finalize_armed, finalize_exited
-            if not finalize_armed:
-                return self._lock.__exit__(exc_type, exc, traceback)
-            assert self._lock._is_owned()
-            result = self._lock.__exit__(exc_type, exc, traceback)
-            assert not self._lock._is_owned()
-            finalize_exited = True
-            finalize_armed = False
-            return result
-
-    def callback_status(*_args):
-        nonlocal callback_reads, finalize_armed
-        callback_reads += 1
-        if callback_reads == 2:
-            finalize_armed = True
-            return MessageStatus.PENDING
-        return None
-
-    def cancel(message_id, terminal_id):
-        assert finalize_exited is False
-        assert delivery_lock.locked()
-        assert service._lock._is_owned()
-        assert (message_id, terminal_id) == (48, "worker")
-        return True
-
-    cancel_pending = MagicMock(side_effect=cancel)
-    deliver = MagicMock()
-    monkeypatch.setattr(service, "_lock", FinalizeExitProbe(service._lock))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: delivery_lock,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        lambda *_args: WatchdogInsertResult("inserted", 48),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.cancel_pending_watchdog_message",
-        cancel_pending,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery",
-        deliver,
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert callback_reads == 2
-    assert finalize_exited is True
-    cancel_pending.assert_called_once_with(48, "worker")
-    deliver.assert_not_called()
-    assert service._episodes["worker"].auto_resumed is False
-    assert service._episodes["worker"].resume_reserved_at is None
-    assert not delivery_lock.locked()
-
-
-def test_d5_insert_and_callback_reads_run_outside_watchdog_lock(monkeypatch):
-    service, metadata = _armed()
-    callback_reads = 0
-
-    def callback_status(*_args):
-        nonlocal callback_reads
-        callback_reads += 1
-        assert not service._lock._is_owned()
-        return None
-
-    def insert(*_args):
-        assert not service._lock._is_owned()
-        return WatchdogInsertResult("failed_before_commit")
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-
-    assert len(service.collect_due_notifications(now=13.0)) == 1
-    assert callback_reads == 2
-
-
-def test_d5_auto_resume_order_is_insert_finalize_then_deliver(monkeypatch):
-    service, metadata = _armed()
-    events = []
-    callback_reads = 0
-
-    def callback_status(*_args):
-        nonlocal callback_reads
-        callback_reads += 1
-        if callback_reads == 2:
-            events.append("finalize")
-        return None
-
-    def insert(*_args):
-        events.append("insert")
-        return WatchdogInsertResult("inserted", 44)
-
-    def deliver(*_args):
-        events.append("deliver")
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert events == ["insert", "finalize", "deliver"]
-
-
-def test_d5_second_callback_read_uses_frozen_episode_start_after_replace(monkeypatch):
-    service, metadata = _armed()
-    old_started = service._episodes["worker"].episode_started_wall_at
-    callback_starts = []
-    cancel = MagicMock(return_value=True)
-
-    def callback_status(_terminal, _caller, since):
-        callback_starts.append(since)
-        return None
-
-    def insert(*_args):
-        service.record_inbound_task("worker", "caller", "developer")
-        service._episodes["worker"].episode_started_wall_at = datetime(2030, 1, 1)
-        return WatchdogInsertResult("inserted", 43)
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-        lambda _terminal: metadata,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        callback_status,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-        lambda _terminal: None,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
-        insert,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.cancel_pending_watchdog_message",
-        cancel,
-    )
-
-    assert service.collect_due_notifications(now=13.0) == []
-    assert callback_starts == [old_started, old_started]
-    assert service._episodes["worker"].episode_started_wall_at != old_started
-    cancel.assert_called_once_with(43, "worker")
+# ---------------------------------------------------------------------------
+# D5 AUTO-RESUME LOCK AND ORDER CONTRACTS -- REMOVED by WP-ARCH 3c K4.
+#
+# Six arms stood here, the concurrency half of the auto-resume path:
+#
+#   * ``test_d5_insert_and_second_callback_read_hold_delivery_lock`` -- the insert
+#     and the re-read of callback state both happen under the terminal's
+#     delivery_lock;
+#   * ``test_d5_finalize_exits_while_delivery_lock_held`` and
+#     ``test_d5_invalid_finalize_cancellation_exits_while_delivery_lock_held`` --
+#     the finalize, and a cancellation of an invalid finalize, complete before the
+#     lock is dropped;
+#   * ``test_d5_insert_and_callback_reads_run_outside_watchdog_lock`` -- neither
+#     touches the DB while ``_lock`` is held;
+#   * ``test_d5_auto_resume_order_is_insert_finalize_then_deliver`` -- the three
+#     steps happen in that order and no other;
+#   * ``test_d5_second_callback_read_uses_frozen_episode_start_after_replace`` --
+#     the re-read uses the episode start frozen at reservation time, not the
+#     replacement episode's.
+#
+# These are the sharpest arms in the file and they are the most completely gone:
+# a lock-ordering contract is a statement about two operations, and K4 deletes
+# both operands. ``_execute_auto_resume`` was the only code that took the
+# delivery_lock outside ``_lock``, inserted, finalized and then delivered; with
+# it removed there is no sequence here to order and no lock interleaving to
+# forbid.
+#
+# Worth stating plainly, because it is the one thing a reader should NOT conclude
+# from this block: the delivery_lock itself is untouched and still contended.
+# What no longer exists is a SECOND writer -- the watchdog -- contending for it.
+# The rule these arms enforced (never hold ``_lock`` across a DB call) is now
+# enforced by the watchdog having no DB-writing path left in its tick at all.
+#
+# The callback-fence arms immediately below are the surviving neighbours and are
+# untouched: ``_bump_callback_fence`` is liveness bookkeeping, not part of the
+# resume action, and it keeps both its callers and its arms.
+# ---------------------------------------------------------------------------
 
 
 def test_d5_callback_fence_holds_lock_until_commit_resolution(monkeypatch):

@@ -1,27 +1,21 @@
-"""F228-b no-progress watchdog tests — AC1-AC17 + mutation kills."""
+"""F228-b no-progress watchdog tests — the CLOCK half, after WP-ARCH 3c K4.
+
+AC1/AC3/AC4/AC15/AC16/AC17 and mutant 3 survive because their subject is
+``record_status`` and the fingerprint bookkeeping. AC2 and AC5-AC14 drove
+``tick_no_progress``, which K4 deletes; see the notes where they stood.
+"""
 
 from __future__ import annotations
 
-import copy
-import re
 import time
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch, call
-
-import pytest
+from unittest.mock import patch
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-    StalledCallbackWatchdog,
-    _Episode,
-)
-
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-GRACE = 300.0  # default grace seconds
 
 
 def _make_watchdog(grace=3):
@@ -29,14 +23,11 @@ def _make_watchdog(grace=3):
     return StalledCallbackWatchdog(grace_seconds=grace)
 
 
-def _meta(terminal_id="worker1", caller_id="sup1"):
-    return {
-        "id": terminal_id,
-        "caller_id": caller_id,
-        "provider": "grok_cli",
-        "tmux_session": "cao-test",
-        "tmux_window": terminal_id,
-    }
+# WP-ARCH 3c K4: ``_meta``, ``_config_np_on_60``, ``_config_np_on_30`` and
+# ``_config_np_off`` are gone with the arms that used them. They existed to hand
+# ``tick_no_progress`` a terminal row and a ``supervisor.watchdog.no_progress*``
+# config, and the service reads neither key any more. ``_config_np_on`` stays:
+# one surviving arm still patches ConfigService through it.
 
 
 def _config_np_on(path, default=None, override=None):
@@ -49,35 +40,9 @@ def _config_np_on(path, default=None, override=None):
     return mapping.get(path, default)
 
 
-def _config_np_on_60(path, default=None, override=None):
-    """ConfigService.get mock with grace=60."""
-    mapping = {
-        "supervisor.watchdog.no_progress": True,
-        "supervisor.watchdog.no_progress_grace_s": 60.0,
-    }
-    return mapping.get(path, default)
-
-
-def _config_np_on_30(path, default=None, override=None):
-    """ConfigService.get mock with grace=30 (should clamp to 60)."""
-    mapping = {
-        "supervisor.watchdog.no_progress": True,
-        "supervisor.watchdog.no_progress_grace_s": 30.0,
-    }
-    return mapping.get(path, default)
-
-
-def _config_np_off(path, default=None, override=None):
-    """ConfigService.get mock with no-progress disabled."""
-    mapping = {
-        "supervisor.watchdog.no_progress": False,
-        "supervisor.watchdog.no_progress_grace_s": 300.0,
-    }
-    return mapping.get(path, default)
-
-
-def _setup_processing_worker(svc, terminal_id="worker1", caller_id="sup1",
-                             profile="grok_dev", processing_at=10.0):
+def _setup_processing_worker(
+    svc, terminal_id="worker1", caller_id="sup1", profile="grok_dev", processing_at=10.0
+):
     """Record assign and set PROCESSING."""
     svc.record_inbound_task(terminal_id, caller_id, profile)
     svc.record_status(terminal_id, TerminalStatus.PROCESSING, now=processing_at)
@@ -87,6 +52,7 @@ def _setup_processing_worker(svc, terminal_id="worker1", caller_id="sup1",
 def _fingerprint_with_tail(svc, terminal_id, tail_text, now, metadata_fn=None, patterns=None):
     """Simulate refresh_screen_fingerprints for a single terminal by exercising the real method."""
     import hashlib
+
     from cli_agent_orchestrator.services.stalled_callback_watchdog import _filtered_liveness_tail
 
     _patterns = patterns or []
@@ -112,8 +78,8 @@ def _fingerprint_with_tail(svc, terminal_id, tail_text, now, metadata_fn=None, p
         if episode.processing_since is not None and episode.np_fired_key is None:
             hint_lines = [ln.strip() for ln in filtered.splitlines() if ln.strip()]
             raw_hint = hint_lines[-1] if hint_lines else ""
-            sanitized_hint = raw_hint.replace('"', "'").replace('\n', ' ').replace('\r', ' ')
-            sanitized_hint = ''.join(c if c.isprintable() else '?' for c in sanitized_hint)
+            sanitized_hint = raw_hint.replace('"', "'").replace("\n", " ").replace("\r", " ")
+            sanitized_hint = "".join(c if c.isprintable() else "?" for c in sanitized_hint)
             if len(sanitized_hint) > 80:
                 sanitized_hint = sanitized_hint[:77] + "..."
             episode.last_np_hint = sanitized_hint if sanitized_hint else None
@@ -130,6 +96,7 @@ def _fingerprint_with_tail(svc, terminal_id, tail_text, now, metadata_fn=None, p
 # ---------------------------------------------------------------------------
 # AC1: Clock lifecycle — AWAITING_BASELINE -> CLOCK_RUNNING
 # ---------------------------------------------------------------------------
+
 
 class TestAC1ClockLifecycle:
     def test_processing_entry_sets_processing_since(self):
@@ -158,31 +125,25 @@ class TestAC1ClockLifecycle:
 # AC2: Changing fingerprint never alerts
 # ---------------------------------------------------------------------------
 
-class TestAC2NoAlertOnProgress:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    def test_changing_screen_never_alerts(self, mock_snapshot, mock_meta, mock_config):
-        """Worker at PROCESSING with fingerprint changing every tick for 600s -> no alert."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Simulate fingerprint changing every tick for 600s (120 ticks at 5s)
-        for i in range(120):
-            t = 5.0 + i * 5.0
-            _fingerprint_with_tail(svc, "worker1", f"output line {i}\n", now=t)
-
-        # Now tick at t=605
-        with patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message") as mock_create:
-            svc.tick_no_progress(now=605.0)
-            mock_create.assert_not_called()
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: ``TestAC2NoAlertOnProgress`` is GONE with the ALERT, not with
+# the clock
+# ---------------------------------------------------------------------------
+# Its one arm drove ``tick_no_progress`` over a screen whose fingerprint moved
+# every sample and asserted no advisory was ever created. The property — a pane
+# that is still changing is making progress — survives as the FINGERPRINT half:
+# ``refresh_screen_fingerprints`` still resets ``last_progress_at`` whenever the
+# filtered tail changes, and ``TestAC1ClockLifecycle`` below still pins that
+# reset. What cannot be asserted any more is the consequence, because K4 deletes
+# ``tick_no_progress`` and ``_evaluate_no_progress`` and nothing reads the clock
+# they read. See the block below where the firing classes stood.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # AC3: Transition to non-PROCESSING clears NP fields
 # ---------------------------------------------------------------------------
+
 
 class TestAC3ClearOnNonProcessing:
     def test_idle_clears_np_fields(self):
@@ -229,6 +190,7 @@ class TestAC3ClearOnNonProcessing:
 # AC4: Pause/resume shifts NP clocks
 # ---------------------------------------------------------------------------
 
+
 class TestAC4PauseResume:
     def test_pause_resume_shifts_np_clocks(self):
         """Worker paused for 60s during PROCESSING -> clocks shifted by 60s."""
@@ -260,247 +222,88 @@ class TestAC4PauseResume:
 # AC5: Alert fires with all diagnostic fields
 # ---------------------------------------------------------------------------
 
-class TestAC5AlertFires:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_alert_fires_after_grace(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Static screen for >= grace -> alert fires with all D6 diagnostic fields."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "running: uv pip install torch\n", now=5.0)
-
-        # Same fingerprint — clock running, stall accumulates
-        _fingerprint_with_tail(svc, "worker1", "running: uv pip install torch\n", now=100.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Tick at t=310 (stall_age = 310-5 = 305 >= 300)
-        svc.tick_no_progress(now=310.0)
-
-        mock_create.assert_called_once()
-        sender, receiver, message = mock_create.call_args[0]
-        assert sender == "watchdog:no_progress:worker1"
-        assert receiver == "sup1"
-        assert "grok_dev-worker1" in message
-        assert "no visible output change" in message
-        assert "gen=" in message
-        assert "last_visible=" in message
-        # Check hint from tail
-        assert "uv pip install torch" in message
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_alert_fires_with_persist_failure_retries(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """D2 ordering: persist failure -> fired key NOT set -> next tick retries (mutant 13)."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "output\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # First tick: persist fails
-        mock_create.side_effect = RuntimeError("DB error")
-        svc.tick_no_progress(now=310.0)
-
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.np_fired_key is None  # NOT set on failure
-
-        # Second tick: persist succeeds
-        mock_create.side_effect = None
-        mock_create.reset_mock()
-        svc.tick_no_progress(now=315.0)
-        mock_create.assert_called_once()
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.np_fired_key is not None
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: AC5-AC9, the FIRING half of F228-b, are GONE with
+# ``tick_no_progress``
+# ---------------------------------------------------------------------------
+# Five classes stood here and every one of them called ``tick_no_progress`` and
+# then read ``create_routed_inbox_message``:
+#
+#   * ``TestAC5AlertFires`` — the advisory fires once the no-progress grace has
+#     elapsed, and a failed ``_persist_notice`` does not swallow the retry.
+#   * ``TestAC6Dedup`` — exactly one advisory per processing episode, and no
+#     re-arm when the fingerprint moves AFTER the episode has fired.
+#   * ``TestAC7Reentry`` — leaving PROCESSING and re-entering it is a NEW
+#     episode and gets its own advisory.
+#   * ``TestAC8RecheckRace`` — a terminal that goes IDLE between candidacy and
+#     the recheck is dropped without an advisory.
+#   * ``TestAC9UnreadablePane`` — no baseline fingerprint means no advisory; an
+#     unreadable pane is not evidence of a stall.
+#
+# K4 deletes the tick and its evaluator, so there is no advisory to fire, dedup,
+# re-arm, drop or withhold. Repointing them was considered and rejected: every
+# one is a statement about the DECISION to notify, and the decision function is
+# what went. An arm that called the surviving clock writers and then asserted
+# "no message was sent" would pass on any build, broken or not.
+#
+# The state those decisions read is NOT gone and is still pinned below:
+# ``processing_since``, ``last_np_fp``, ``last_progress_at``, ``last_np_hint``
+# and ``np_fired_key`` are still written by ``record_status`` and
+# ``refresh_screen_fingerprints``, and ``TestAC1ClockLifecycle``,
+# ``TestAC3ClearOnNonProcessing``, ``TestAC4PauseResume`` and the surviving
+# ``TestAC17MessageFormat`` hint arms cover every transition of it.
+#
+# Reader's note, because the clock now outlives its only consumer: after K4 the
+# no-progress fields are written and never read. That is a property of the
+# shipped source, not of this file — the arms below assert what the code does,
+# they do not claim anything downstream still acts on it.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # AC6: Dedup — exactly one alert per processing episode
 # ---------------------------------------------------------------------------
 
-class TestAC6Dedup:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_exactly_one_alert_per_episode(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Same state held for 100 ticks after alert -> exactly one alert."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static output\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # First tick fires
-        svc.tick_no_progress(now=310.0)
-        assert mock_create.call_count == 1
-
-        # 100 more ticks — no additional alerts
-        for i in range(100):
-            svc.tick_no_progress(now=315.0 + i * 5.0)
-        assert mock_create.call_count == 1
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_no_rearm_after_fired_on_fingerprint_change(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 5: rearm after FIRED when fingerprint changes -> killed (still one alert)."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static output\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Fire
-        svc.tick_no_progress(now=310.0)
-        assert mock_create.call_count == 1
-
-        # Screen changes while in FIRED state (np_fired_key is set, so NP loop is skipped)
-        _fingerprint_with_tail(svc, "worker1", "new output after fire\n", now=320.0)
-
-        # Then screen goes static again for another grace period
-        for i in range(70):
-            _fingerprint_with_tail(svc, "worker1", "new output after fire\n", now=325.0 + i * 5.0)
-
-        # Tick again — should NOT fire a second alert (same episode)
-        svc.tick_no_progress(now=700.0)
-        assert mock_create.call_count == 1
-
 
 # ---------------------------------------------------------------------------
 # AC7: Reentry after non-PROCESSING produces new episode
 # ---------------------------------------------------------------------------
-
-class TestAC7Reentry:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_reentry_after_idle_produces_second_alert(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Alert fires; worker goes IDLE; re-enters PROCESSING -> new episode, second alert."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # First alert
-        svc.tick_no_progress(now=310.0)
-        assert mock_create.call_count == 1
-
-        # Worker goes IDLE -> np_fired_key cleared
-        svc.record_status("worker1", TerminalStatus.IDLE, now=320.0)
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.np_fired_key is None
-            assert ep.processing_since is None
-
-        # Worker re-enters PROCESSING (same generation)
-        svc.record_status("worker1", TerminalStatus.PROCESSING, now=330.0)
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.processing_since == 330.0
-
-        # Baseline
-        _fingerprint_with_tail(svc, "worker1", "static2\n", now=335.0)
-
-        # Second alert after grace
-        svc.tick_no_progress(now=640.0)
-        assert mock_create.call_count == 2
 
 
 # ---------------------------------------------------------------------------
 # AC8: D5 recheck — status transitions between grace and recheck
 # ---------------------------------------------------------------------------
 
-class TestAC8RecheckRace:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_recheck_idle_suppresses_alert(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Worker went IDLE between grace expiry and recheck -> no alert."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        # Recheck returns IDLE (status changed)
-        mock_snapshot.return_value = TerminalStatus.IDLE
-
-        svc.tick_no_progress(now=310.0)
-        mock_create.assert_not_called()
-
-        # NP fields should be cleared
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.processing_since is None
-
 
 # ---------------------------------------------------------------------------
 # AC9: Pane unreadable -> no alert (never exits AWAITING_BASELINE)
 # ---------------------------------------------------------------------------
-
-class TestAC9UnreadablePane:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.logger")
-    def test_no_baseline_no_alert(self, mock_logger, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Pane unreadable throughout -> no fingerprint -> stays AWAITING_BASELINE -> no alert.
-
-        S1 amendment: also asserts ZERO logger.exception calls during tick,
-        proving the last_progress_at-is-None guard prevents the outer fault path.
-        """
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        # Never call _fingerprint_with_tail -> last_np_fp stays None, last_progress_at stays None
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Tick well past grace — but no baseline means no alert
-        svc.tick_no_progress(now=600.0)
-        mock_create.assert_not_called()
-
-        # S1: guard must prevent any exception logging (kills M7 mutant)
-        mock_logger.exception.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
 # AC10: Routing — watchdog: prefix, no episode creation, no separate request_delivery
 # ---------------------------------------------------------------------------
 
+
 class TestAC10Routing:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_sender_has_watchdog_prefix(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Alert sender has watchdog:no_progress: prefix."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "output\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        svc.tick_no_progress(now=310.0)
-        sender = mock_create.call_args[0][0]
-        assert sender.startswith("watchdog:no_progress:")
+    # -----------------------------------------------------------------------
+    # WP-ARCH 3c K4: the two ROUTING arms are gone with the message they routed
+    # -----------------------------------------------------------------------
+    # ``test_sender_has_watchdog_prefix`` pinned the advisory's sender as
+    # ``watchdog:<terminal>`` so a watchdog message could never arm an episode
+    # of its own, and ``test_no_separate_request_delivery`` pinned that the
+    # advisory rides the caller's normal delivery rather than issuing a second
+    # ``request_delivery``. Both are statements about a message ``tick_no_progress``
+    # no longer composes.
+    #
+    # The invariant they protected — a watchdog-sent message must not arm an
+    # episode — is not asserted through the advisory. It is asserted at the
+    # guard itself, and that guard survives: ``record_inbound_task`` still
+    # refuses a ``watchdog:`` sender, which is what the arm kept below tests
+    # directly, and ``test_existing_nonarming_producer_classes_remain_nonarming``
+    # in ``test_stalled_callback_watchdog.py`` covers the same refusal at the
+    # inbox-service entry.
+    # -----------------------------------------------------------------------
 
     def test_watchdog_sender_creates_no_episode(self):
         """record_inbound_task with watchdog: sender returns immediately."""
@@ -509,218 +312,53 @@ class TestAC10Routing:
         with svc._lock:
             assert "w1" not in svc._episodes
 
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_no_separate_request_delivery(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """No explicit request_delivery call from evaluate path (mutant 11)."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "output\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        with patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_delivery:
-            svc.tick_no_progress(now=310.0)
-            # The watchdog evaluate path itself should NOT call request_delivery
-            # (create_routed_inbox_message does it internally, but we patched create_routed
-            # so its internals don't run)
-            mock_delivery.assert_not_called()
-
 
 # ---------------------------------------------------------------------------
 # AC11: Dead caller -> no alert, no exception
 # ---------------------------------------------------------------------------
 
-class TestAC11DeadCaller:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_dead_caller_no_alert(self, mock_create, mock_snapshot, mock_config):
-        """Dead caller -> no alert persisted, no exception."""
-        svc = _make_watchdog()
-
-        # Use real get_terminal_metadata patched to return None for caller
-        with patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata") as mock_meta:
-            # Allow record_inbound_task to work (terminal_exists is separate)
-            mock_meta.return_value = _meta()
-            _setup_processing_worker(svc, processing_at=0.0)
-            _fingerprint_with_tail(svc, "worker1", "output\n", now=5.0)
-
-            mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-            # Now make caller lookup return None (dead)
-            def meta_side_effect(tid):
-                if tid == "sup1":
-                    return None  # dead caller
-                return _meta(tid)
-
-            mock_meta.side_effect = meta_side_effect
-            svc.tick_no_progress(now=310.0)
-            mock_create.assert_not_called()
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: AC11-AC14 are GONE with ``tick_no_progress``
+# ---------------------------------------------------------------------------
+# ``TestAC11DeadCaller`` (a dead caller gets no advisory), ``TestAC12Isolation``
+# (two stalled terminals produce two independent advisories, and an exception
+# raised for one must not suppress the other), ``TestAC13ConfigFlag``
+# (``supervisor.watchdog.no_progress`` off means silence, and flipping it mid-run
+# is honoured on the next tick) and ``TestAC14GraceClamping`` (the configured
+# grace is honoured at 60s and clamped UP to 60s below it) are all properties of
+# the tick's own loop and config read. K4 deletes the loop and the config key is
+# no longer read anywhere in the service, so there is no flag to flip, no grace
+# to clamp and no per-terminal iteration to isolate.
+#
+# The isolation concern in particular has no heir here and should not be faked
+# into one: it was about one terminal's failure inside a SWEEP not stopping the
+# sweep, and there is no sweep left in this file's subject. The equivalent
+# guarantee for the surviving liveness half — one terminal's unreadable pane not
+# stopping the sampler — is ``refresh_screen_fingerprints``'s own per-terminal
+# ``continue``, exercised by ``test_forkA_widen_samples_live_terminal_with_no_armed_episode``
+# in ``test_stalled_callback_watchdog.py``.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # AC12: Per-terminal failure isolation
 # ---------------------------------------------------------------------------
 
-class TestAC12Isolation:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_two_terminals_two_alerts(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Two terminals stalled -> two separate alerts."""
-        svc = _make_watchdog()
-        svc.record_inbound_task("w1", "sup1", "grok_dev")
-        svc.record_status("w1", TerminalStatus.PROCESSING, now=0.0)
-        _fingerprint_with_tail(svc, "w1", "static1\n", now=5.0)
-
-        svc.record_inbound_task("w2", "sup1", "codex_dev")
-        svc.record_status("w2", TerminalStatus.PROCESSING, now=0.0)
-        _fingerprint_with_tail(svc, "w2", "static2\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        svc.tick_no_progress(now=310.0)
-        assert mock_create.call_count == 2
-
-        # Verify different terminal_ids in sender
-        senders = [c[0][0] for c in mock_create.call_args_list]
-        assert "watchdog:no_progress:w1" in senders
-        assert "watchdog:no_progress:w2" in senders
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_exception_in_one_doesnt_kill_other(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Exception in terminal A's evaluation does not suppress terminal B's alert (mutant 14)."""
-        svc = _make_watchdog()
-        svc.record_inbound_task("w1", "sup1", "grok_dev")
-        svc.record_status("w1", TerminalStatus.PROCESSING, now=0.0)
-        _fingerprint_with_tail(svc, "w1", "static1\n", now=5.0)
-
-        svc.record_inbound_task("w2", "sup1", "codex_dev")
-        svc.record_status("w2", TerminalStatus.PROCESSING, now=0.0)
-        _fingerprint_with_tail(svc, "w2", "static2\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        call_count = [0]
-        orig_evaluate = svc._evaluate_no_progress
-
-        def patched_evaluate(tid, ep, now, grace):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise RuntimeError("Simulated failure in first terminal")
-            return orig_evaluate(tid, ep, now, grace)
-
-        svc._evaluate_no_progress = patched_evaluate
-        svc.tick_no_progress(now=310.0)
-        # At least one alert should have succeeded
-        assert mock_create.call_count >= 1
-
 
 # ---------------------------------------------------------------------------
 # AC13: Config flag on/off
 # ---------------------------------------------------------------------------
-
-class TestAC13ConfigFlag:
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_flag_off_no_alerts(self, mock_create, mock_snapshot, mock_meta):
-        """Flag off -> no alerts regardless of stall age."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        with patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_off):
-            svc.tick_no_progress(now=600.0)
-        mock_create.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_flag_flipped_mid_test(self, mock_create, mock_snapshot, mock_meta):
-        """Flag flipped true mid-test -> alert fires on next tick (mutant 9)."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # First: flag off
-        with patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_off):
-            svc.tick_no_progress(now=310.0)
-        mock_create.assert_not_called()
-
-        # Flip to on
-        with patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on):
-            svc.tick_no_progress(now=315.0)
-        mock_create.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
 # AC14: Grace clamping
 # ---------------------------------------------------------------------------
 
-class TestAC14GraceClamping:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on_60)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_grace_60_alerts_at_60(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Grace 60s -> alert at 60s."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Not yet at grace
-        svc.tick_no_progress(now=64.0)
-        mock_create.assert_not_called()
-
-        # At grace
-        svc.tick_no_progress(now=66.0)
-        mock_create.assert_called_once()
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on_30)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_grace_30_clamped_to_60(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Grace 30s -> clamped to 60s minimum."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # 35s stall — would fire at 30 but clamped to 60
-        svc.tick_no_progress(now=40.0)
-        mock_create.assert_not_called()
-
-        # At 65s (past clamped 60)
-        svc.tick_no_progress(now=66.0)
-        mock_create.assert_called_once()
-
 
 # ---------------------------------------------------------------------------
 # AC15: Existing stalled-callback tests pass (regression guard)
 # ---------------------------------------------------------------------------
+
 
 class TestAC15IdleQuietUnchanged:
     """Filter predicate widening does not regress idle/quiet fingerprint paths."""
@@ -735,6 +373,7 @@ class TestAC15IdleQuietUnchanged:
 
         # Simulate a different fingerprint (processed by refresh_screen_fingerprints internally)
         import hashlib
+
         new_fp = hashlib.sha256(b"new content").hexdigest()
         with svc._lock:
             ep = svc._episodes["w1"]
@@ -763,6 +402,7 @@ class TestAC15IdleQuietUnchanged:
 # AC16: Existing FX181 quiescence tests pass (regression guard)
 # ---------------------------------------------------------------------------
 
+
 class TestAC16QuietUnchanged:
     """Quiescence quiet_since still works for ERROR members."""
 
@@ -782,33 +422,23 @@ class TestAC16QuietUnchanged:
 # AC17: Alert message format + hint sanitization
 # ---------------------------------------------------------------------------
 
+
 class TestAC17MessageFormat:
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_message_format_regex(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Alert message matches D6 format."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "running something\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        svc.tick_no_progress(now=310.0)
-        message = mock_create.call_args[0][2]
-
-        # Regex for D6 format
-        pattern = (
-            r"\[no-progress advisory\] worker \w+-\w+ has been processing for \d+s "
-            r"with no visible output change for \d+s "
-            r'\(gen=\d+, last_visible="[^"]*"\)\.'
-        )
-        assert re.search(pattern, message), f"Message doesn't match format: {message}"
-        assert "HEURISTIC" in message
-        assert "peek_terminal" in message
-        assert "delete_terminal" in message
+    # -----------------------------------------------------------------------
+    # WP-ARCH 3c K4: ``test_message_format_regex`` is gone with the message
+    # -----------------------------------------------------------------------
+    # It pinned the whole D6 advisory string — the ``[no-progress advisory]``
+    # prefix, both durations, ``gen=``, the quoted ``last_visible=`` hint, and
+    # the three operator affordances (HEURISTIC, peek_terminal, delete_terminal).
+    # ``tick_no_progress`` composed that string and K4 deletes it; there is no
+    # formatter left to hold to a format.
+    #
+    # The one INPUT to that string that is still produced lives on: the
+    # sanitized, bounded ``last_np_hint`` that ``refresh_screen_fingerprints``
+    # derives from the filtered tail. The three arms kept below are exactly the
+    # sanitizer's contract — quotes and control characters stripped, 80-character
+    # bound with an ellipsis, and an empty tail yielding None rather than "".
+    # -----------------------------------------------------------------------
 
     def test_hint_sanitization_no_quotes(self):
         """Hint sanitization removes quotes (mutant 16)."""
@@ -854,34 +484,48 @@ class TestAC17MessageFormat:
 # Additional mutant kills
 # ---------------------------------------------------------------------------
 
+
 class TestMutantKills:
     """Targeted tests for specific mutants not covered above."""
 
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
+    # -----------------------------------------------------------------------
+    # WP-ARCH 3c K4: five of the six mutant kills die with their mutants
+    # -----------------------------------------------------------------------
+    # Each named a mutation of ``tick_no_progress`` / ``_evaluate_no_progress``
+    # and killed it by observing the advisory:
+    #
+    #   * mutant 1  — fire even while the fingerprint is still changing.
+    #   * mutant 7  — fire before a baseline fingerprint has ever been taken.
+    #   * mutant 8  — include PAUSED terminals in the sweep.
+    #   * mutant 12 — omit ``last_np_hint`` from the composed message.
+    #   * mutant 15 — fail to clear ``np_fired_key`` on leaving PROCESSING, so a
+    #     second episode can never fire.
+    #
+    # A mutant kill is only meaningful while the line it mutates exists. All five
+    # of those lines are inside the deleted tick, so the kills have nothing left
+    # to kill — keeping them would mean keeping five arms that pass because the
+    # code is absent, which is the opposite of what a mutation ledger asserts.
+    #
+    # Mutant 15 is the one with a surviving half, and it is already covered:
+    # clearing ``np_fired_key`` (with the rest of the NP fields) on the
+    # transition out of PROCESSING is ``record_status``'s doing, and
+    # ``TestAC3ClearOnNonProcessing`` pins it for IDLE, COMPLETED and ERROR.
+    # Mutant 3, kept below, is the other survivor: it mutates ``record_status``
+    # itself, which K4 does not touch.
+    # -----------------------------------------------------------------------
+
+    @patch(
+        "cli_agent_orchestrator.services.config_service.ConfigService.get",
+        side_effect=_config_np_on,
+    )
     @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
+    @patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view"
+    )
     @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant1_fire_while_changing(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 1: Skip FP reset on change -> would fire while screen changes. AC2 kills."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Change screen every 50s for 350s total
-        for i in range(7):
-            _fingerprint_with_tail(svc, "worker1", f"line {i}\n", now=5.0 + i * 50.0)
-
-        # Tick at 360: last change was at 305, so stall_age = 360-305 = 55 < 300 grace
-        svc.tick_no_progress(now=360.0)
-        mock_create.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant3_no_clear_on_transition(self, mock_create, mock_snapshot, mock_meta, mock_config):
+    def test_mutant3_no_clear_on_transition(
+        self, mock_create, mock_snapshot, mock_meta, mock_config
+    ):
         """Mutant 3: Not clearing NP fields on non-PROCESSING. AC3 kills."""
         svc = _make_watchdog()
         _setup_processing_worker(svc, processing_at=0.0)
@@ -896,92 +540,3 @@ class TestMutantKills:
             assert ep.processing_since is None
             assert ep.last_np_fp is None
             assert ep.last_progress_at is None
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant7_fire_before_baseline(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 7: Fire before first fingerprint taken. AC9 kills."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        # NO fingerprint taken — last_progress_at is None
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        svc.tick_no_progress(now=600.0)
-        mock_create.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant8_includes_paused(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 8: Include paused terminals -> fires during pause. AC4 kills."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Pause
-        svc.pause_terminal("worker1")
-
-        # Tick past grace — should NOT fire (paused)
-        svc.tick_no_progress(now=310.0)
-        mock_create.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant12_hint_in_message(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 12: Omit last_np_hint from message. AC17 kills."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "running: build step\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        svc.tick_no_progress(now=310.0)
-        message = mock_create.call_args[0][2]
-        # The hint should be present in the message
-        assert "last_visible=" in message
-        # Not <none> because we have real output
-        assert '<none>' not in message
-
-    @patch("cli_agent_orchestrator.services.config_service.ConfigService.get", side_effect=_config_np_on)
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
-    @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_mutant15_not_clearing_fired_key(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Mutant 15: Not clearing np_fired_key on non-PROCESSING. AC7 kills."""
-        svc = _make_watchdog()
-        _setup_processing_worker(svc, processing_at=0.0)
-        _fingerprint_with_tail(svc, "worker1", "static\n", now=5.0)
-
-        mock_meta.return_value = _meta()
-        mock_snapshot.return_value = TerminalStatus.PROCESSING
-
-        # Fire
-        svc.tick_no_progress(now=310.0)
-        assert mock_create.call_count == 1
-        with svc._lock:
-            assert svc._episodes["worker1"].np_fired_key is not None
-
-        # Go IDLE -> fired_key must be cleared
-        svc.record_status("worker1", TerminalStatus.IDLE, now=320.0)
-        with svc._lock:
-            ep = svc._episodes["worker1"]
-            assert ep.np_fired_key is None
-
-        # Re-enter PROCESSING, new episode
-        svc.record_status("worker1", TerminalStatus.PROCESSING, now=330.0)
-        _fingerprint_with_tail(svc, "worker1", "static again\n", now=335.0)
-
-        # Second alert
-        svc.tick_no_progress(now=640.0)
-        assert mock_create.call_count == 2

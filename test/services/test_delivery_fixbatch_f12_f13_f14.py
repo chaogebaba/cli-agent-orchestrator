@@ -19,7 +19,6 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     InboxDeliveryAttemptModel,
     InboxModel,
-    ReadyBacklogObservation,
     begin_delivery_attempt,
     begin_delivery_attempt_if_no_other_delivering,
     create_inbox_message,
@@ -34,16 +33,12 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import draft_guard, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
-from cli_agent_orchestrator.services.inbox_service import InboxService
-from cli_agent_orchestrator.services.inbox_service import begin_delivery_attempt
+from cli_agent_orchestrator.services.inbox_service import InboxService, begin_delivery_attempt
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
     TranscriptResolution,
     transcript_ref,
     wire_hash,
-)
-from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-    StalledCallbackWatchdog,
 )
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
@@ -59,9 +54,7 @@ def delivery_db(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", sessions)
     database.create_terminal("caller", "s", "caller", "codex")
     database.create_terminal("sender", "s", "sender", "codex")
-    database.create_terminal(
-        "receiver", "s", "receiver", "grok_cli", caller_id="caller"
-    )
+    database.create_terminal("receiver", "s", "receiver", "grok_cli", caller_id="caller")
     yield sessions
     engine.dispose()
 
@@ -88,14 +81,10 @@ def _terminal_send(
     history,
 ):
     metadata = {"tmux_session": "cao-test", "tmux_window": "grok"}
-    observation = BoundaryObservation(
-        "epoch", TerminalStatus.IDLE, 1, 1, 2, None, 2
-    )
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 2, None, 2)
     backend.get_history.side_effect = history
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: metadata)
-    monkeypatch.setattr(
-        terminal_service.provider_manager, "get_provider", lambda _tid: provider
-    )
+    monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda _tid: provider)
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
     monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _tid: None)
@@ -132,9 +121,7 @@ def test_f12_provider_capability_is_codex_only():
     ],
     ids=["parser-none", "unchanged-clear", "failed-clear"],
 )
-def test_f12_grok_uncertainty_never_reaches_message_paste(
-    monkeypatch, history
-):
+def test_f12_grok_uncertainty_never_reaches_message_paste(monkeypatch, history):
     backend = MagicMock()
     monkeypatch.setattr(draft_guard, "DRAFT_CLEAR_MAX_ITERATIONS", 1)
 
@@ -197,9 +184,7 @@ def _deliver_with_fakes(
     lookup_results,
     confirm_result=("absent", {"kind": "transcript_absent"}),
 ):
-    observation = BoundaryObservation(
-        "epoch", TerminalStatus.IDLE, 3, 1, 4, 2, 4
-    )
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 3, 1, 4, 2, 4)
     monitor = MagicMock()
     monitor.get_boundary_observation.return_value = observation
     monitor.get_status.return_value = TerminalStatus.IDLE
@@ -395,8 +380,13 @@ def test_f14_pre_paste_successor_is_retryable_but_post_paste_has_no_sibling(deli
     prior = _ambiguous(message, "payload")
     first_proof = make_admission_proof("tagged_replay", [message.id], prior)
     first = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "tagged-1", 8,
-        prior_attempt_uuid=prior, admission_proof=first_proof,
+        [message],
+        "receiver",
+        "grok_cli",
+        "tagged-1",
+        8,
+        prior_attempt_uuid=prior,
+        admission_proof=first_proof,
     )
     assert first.kind == "opened"
     settle_delivery_attempt(
@@ -407,7 +397,11 @@ def test_f14_pre_paste_successor_is_retryable_but_post_paste_has_no_sibling(deli
     )
 
     retry = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "tagged-2", 8,
+        [message],
+        "receiver",
+        "grok_cli",
+        "tagged-2",
+        8,
         prior_attempt_uuid=prior,
         admission_proof=make_admission_proof("tagged_replay", [message.id], prior),
     )
@@ -420,7 +414,11 @@ def test_f14_pre_paste_successor_is_retryable_but_post_paste_has_no_sibling(deli
     )
 
     sibling = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "sibling", 7,
+        [message],
+        "receiver",
+        "grok_cli",
+        "sibling",
+        7,
         prior_attempt_uuid=prior,
         admission_proof=make_admission_proof("tagged_replay", [message.id], prior),
     )
@@ -431,286 +429,95 @@ def test_f14_three_ambiguities_atomically_block_fourth_tagged_open(delivery_db):
     message = create_inbox_message("sender", "receiver", "payload")
     first = _ambiguous(message, "payload")
     second = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "tagged-2", 8,
+        [message],
+        "receiver",
+        "grok_cli",
+        "tagged-2",
+        8,
         prior_attempt_uuid=first,
         admission_proof=make_admission_proof("tagged_replay", [message.id], first),
     )
     assert second.kind == "opened"
     settle_delivery_attempt(
-        second.attempt_uuid, MessageStatus.PENDING, "ambiguous",
+        second.attempt_uuid,
+        MessageStatus.PENDING,
+        "ambiguous",
         reason="confirmation_timeout",
     )
     third = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "tagged-3", 8,
+        [message],
+        "receiver",
+        "grok_cli",
+        "tagged-3",
+        8,
         prior_attempt_uuid=second.attempt_uuid,
-        admission_proof=make_admission_proof(
-            "tagged_replay", [message.id], second.attempt_uuid
-        ),
+        admission_proof=make_admission_proof("tagged_replay", [message.id], second.attempt_uuid),
     )
     assert third.kind == "opened"
     settle_delivery_attempt(
-        third.attempt_uuid, MessageStatus.PENDING, "ambiguous",
+        third.attempt_uuid,
+        MessageStatus.PENDING,
+        "ambiguous",
         reason="confirmation_timeout",
     )
 
     fourth = begin_delivery_attempt_if_no_other_delivering(
-        [message], "receiver", "grok_cli", "tagged-4", 8,
+        [message],
+        "receiver",
+        "grok_cli",
+        "tagged-4",
+        8,
         prior_attempt_uuid=third.attempt_uuid,
-        admission_proof=make_admission_proof(
-            "tagged_replay", [message.id], third.attempt_uuid
-        ),
+        admission_proof=make_admission_proof("tagged_replay", [message.id], third.attempt_uuid),
     )
     assert fourth.kind == "stale_admission"
     assert len(get_message_trace(message.id)["attempts"]) == 3
 
 
-def _backlog_observation(
-    fingerprint=(1, None, None, None), *, open_attempt=False, age=100.0
-):
-    return ReadyBacklogObservation(
-        receiver_id="receiver",
-        oldest_message_id=17,
-        oldest_pending_age_seconds=age,
-        has_open_delivering_attempt=open_attempt,
-        attempt_fingerprint=fingerprint,
-    )
-
-
-def _boundary_observation(status):
-    """F353: stub matching what the delivery busy-gate reads in inbox_service."""
-    return BoundaryObservation(
-        observation_epoch="epoch",
-        status=status,
-        status_gen=0,
-        input_gen=0,
-        seq=0,
-        last_non_ready_seq=None,
-        last_ready_seq=None,
-    )
-
-
-def test_f13_ready_backlog_alert_once_and_never_retries_receiver():
-    service = StalledCallbackWatchdog()
-    observation = _backlog_observation()
-    metadata = {"caller_id": "caller", "agent_profile": "grok_dev"}
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "list_ready_backlog_observations",
-            return_value=[observation],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.IDLE,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor."
-            "get_boundary_observation",
-            return_value=_boundary_observation(TerminalStatus.IDLE),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "CAO_WAITING_INBOX_GRACE_SECONDS",
-            10,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service."
-            "create_routed_inbox_message"
-        ) as create,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ) as deliver,
-    ):
-        service.tick_ready_backlog(now=100.0)
-        service.tick_ready_backlog(now=109.0)
-        service.tick_ready_backlog(now=110.0)
-        service.tick_ready_backlog(now=120.0)
-
-    create.assert_called_once()
-    sender, receiver, message = create.call_args.args
-    assert (sender, receiver) == ("watchdog:receiver", "caller")
-    assert "message 17 aged 100s" in message
-    assert "cao messages trace 17" in message
-    # Delivery is implicit via create_routed_inbox_message (F136-D17)
-    assert not any(call.args and call.args[0] == "receiver" for call in deliver.call_args_list)
-
-
-def test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock():
-    service = StalledCallbackWatchdog()
-    first = _backlog_observation((1, None, None, datetime(2030, 1, 1)))
-    progressed = _backlog_observation((1, None, None, datetime(2030, 1, 2)))
-    metadata = {"caller_id": "caller"}
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "list_ready_backlog_observations",
-            side_effect=[
-                [_backlog_observation(open_attempt=True)],
-                [first],
-                [progressed],
-                [progressed],
-                [progressed],
-                [],
-            ],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.COMPLETED,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor."
-            "get_boundary_observation",
-            return_value=_boundary_observation(TerminalStatus.COMPLETED),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "CAO_WAITING_INBOX_GRACE_SECONDS",
-            10,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service."
-            "create_routed_inbox_message"
-        ) as create,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.request_delivery"
-        ),
-    ):
-        service.tick_ready_backlog(now=90.0)
-        service.tick_ready_backlog(now=100.0)
-        service.tick_ready_backlog(now=105.0)
-        service.tick_ready_backlog(now=114.0)
-        service.tick_ready_backlog(now=115.0)
-        service.tick_ready_backlog(now=116.0)
-
-    create.assert_called_once()
-    assert service._ready_backlog_episodes == {}
-
-
-def test_f353_ready_backlog_no_alert_when_delivery_busy_gate_says_busy():
-    """F353 #208: busy terminal + aged pending message -> no alert.
-
-    The watchdog's status view can lag at IDLE while the provider pane runs a
-    long shell command; the delivery busy-gate (boundary observation) correctly
-    reports PROCESSING and holds delivery. An aged message with no attempt is
-    then normal queueing, not an incident.
-    """
-    service = StalledCallbackWatchdog()
-    observation = _backlog_observation()
-    metadata = {"caller_id": "caller", "agent_profile": "kiro"}
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "list_ready_backlog_observations",
-            return_value=[observation],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
-            return_value=metadata,
-        ),
-        # Watchdog's own (stale/lagging) status source says idle...
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.IDLE,
-        ),
-        # ...but the delivery busy-gate's source says the pane is busy.
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor."
-            "get_boundary_observation",
-            return_value=_boundary_observation(TerminalStatus.PROCESSING),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "CAO_WAITING_INBOX_GRACE_SECONDS",
-            10,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service."
-            "create_routed_inbox_message"
-        ) as create,
-    ):
-        # Well past the grace window — the alert would have fired pre-fix.
-        service.tick_ready_backlog(now=100.0)
-        service.tick_ready_backlog(now=200.0)
-        service.tick_ready_backlog(now=400.0)
-
-    create.assert_not_called()
-    # Episode stays retired while the terminal is busy; the clock restarts
-    # only once the terminal is actually deliverable again.
-    assert service._ready_backlog_episodes == {}
-
-
-def test_f353_ready_backlog_alert_fires_when_deliverable_and_unattempted():
-    """F353 #208: deliverable terminal + aged message + no attempt -> alert."""
-    service = StalledCallbackWatchdog()
-    observation = _backlog_observation()
-    metadata = {"caller_id": "caller", "agent_profile": "kiro"}
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "list_ready_backlog_observations",
-            return_value=[observation],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.IDLE,
-        ),
-        # Busy-gate agrees the terminal is genuinely deliverable.
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor."
-            "get_boundary_observation",
-            return_value=_boundary_observation(TerminalStatus.IDLE),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "CAO_WAITING_INBOX_GRACE_SECONDS",
-            10,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service."
-            "create_routed_inbox_message"
-        ) as create,
-    ):
-        service.tick_ready_backlog(now=100.0)
-        service.tick_ready_backlog(now=111.0)
-
-    create.assert_called_once()
-    sender, receiver, message = create.call_args.args
-    assert (sender, receiver) == ("watchdog:receiver", "caller")
-    assert "message 17 aged 100s" in message
+# ---------------------------------------------------------------------------
+# F13/F353 ready-backlog ALERT arms -- REMOVED by WP-ARCH 3c K4.
+#
+# Four arms stood here, all driving ``StalledCallbackWatchdog.tick_ready_backlog``:
+#
+#   * ``test_f13_ready_backlog_alert_once_and_never_retries_receiver`` -- the
+#     alert composes once per receiver past its grace and never re-fires for the
+#     same receiver;
+#   * ``test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock``
+#     -- an open delivering attempt suppresses the alert, and a fingerprint change
+#     (progress) restarts the grace clock;
+#   * ``test_f353_ready_backlog_no_alert_when_delivery_busy_gate_says_busy`` and
+#     ``test_f353_ready_backlog_alert_fires_when_deliverable_and_unattempted`` --
+#     the F353 busy gate, read through ``get_boundary_observation``, decides
+#     between silence and an alert.
+#
+# K4 deletes ``tick_ready_backlog`` with the other four muted ticks and takes
+# ``collect_due_notifications``/``_push_notice`` -- the composer every one of
+# these arms observed through -- with it. Nothing here survives the cut: the
+# grace clock, the once-per-receiver dedup key and the busy gate were all fields
+# and branches INSIDE the deleted tick, not shared helpers it called.
+#
+# What does survive is the OBSERVATION the tick consumed, and the arm below keeps
+# pinning it: ``list_ready_backlog_observations`` still reports the receiver, the
+# oldest pending row, its age, whether an attempt is open, and the coalescing
+# fingerprint. That is the half with a live reader today -- the delivery tick's
+# adoption pass (``test/app/delivery/test_adoption.py``) is what acts on a
+# stranded PENDING row now, and it acts by adopting the row rather than by
+# alerting a caller about it.
+#
+# ``_backlog_observation`` and ``_boundary_observation`` went with the arms. The
+# surviving arm builds real rows through ``begin_delivery_attempt`` rather than
+# stubbing an observation, so it never needed either.
+# ---------------------------------------------------------------------------
 
 
 def test_f13_backlog_fingerprint_observes_coalesced_deferred_last_at(delivery_db):
     message = create_inbox_message("sender", "receiver", "payload")
-    first = begin_delivery_attempt(
-        [message], "receiver", "grok_cli", "same", 4
-    )
-    settle_delivery_attempt(
-        first, MessageStatus.PENDING, "deferred", reason="delivery_deferred"
-    )
+    first = begin_delivery_attempt([message], "receiver", "grok_cli", "same", 4)
+    settle_delivery_attempt(first, MessageStatus.PENDING, "deferred", reason="delivery_deferred")
     before = list_ready_backlog_observations()[0].attempt_fingerprint
     time.sleep(0.001)
-    second = begin_delivery_attempt(
-        [message], "receiver", "grok_cli", "same", 4
-    )
-    settle_delivery_attempt(
-        second, MessageStatus.PENDING, "deferred", reason="delivery_deferred"
-    )
+    second = begin_delivery_attempt([message], "receiver", "grok_cli", "same", 4)
+    settle_delivery_attempt(second, MessageStatus.PENDING, "deferred", reason="delivery_deferred")
     after = list_ready_backlog_observations()[0].attempt_fingerprint
 
     assert before[:3] == after[:3]

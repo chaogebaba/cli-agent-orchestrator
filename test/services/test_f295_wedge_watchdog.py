@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.stalled_callback_watchdog import (
@@ -42,62 +39,31 @@ def _make_episode(
 
 
 class TestWedgeArmFiringAndDedup:
-    """A wedged grok_cli terminal fires exactly one notice per processing episode."""
+    """AC7's firing arm is gone with ``tick_wedge``; the provider pattern it
+    depended on is not, and is what this class still pins."""
 
-    def test_fires_once_on_grok_cli_after_age_threshold(self):
-        wd = _make_watchdog()
-        now = time.monotonic()
-        episode = _make_episode(processing_since=now - 1000, generation=1)
-
-        with wd._lock:
-            wd._episodes["t1"] = episode
-
-        # Mock dependencies
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                return_value={"provider": "grok_cli"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view"
-            ) as mock_rsv,
-            patch(
-                "cli_agent_orchestrator.clients.database.merge_terminal_system_metadata",
-                return_value=True,
-            ) as mock_merge,
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
-            ) as mock_msg,
-            patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda k, default=None: {
-                    "supervisor.watchdog.grok_wedge": True,
-                    "supervisor.watchdog.grok_wedge_age_s": 900.0,
-                }.get(k, default),
-            ),
-        ):
-            mock_rsv.snapshot_view.return_value = TerminalStatus.PROCESSING
-
-            wd.tick_wedge()
-
-            # Exactly one notice fired
-            assert mock_msg.call_count == 1
-            msg_text = mock_msg.call_args[0][2]
-            assert "peek_terminal" in msg_text
-            assert "delete_terminal" in msg_text
-
-            # wedge_suspect flagged
-            mock_merge.assert_called_once_with("t1", {"wedge_suspect": True})
-
-            # Second tick: no second notice (dedup)
-            mock_msg.reset_mock()
-            wd.tick_wedge()
-            assert mock_msg.call_count == 0
+    # -----------------------------------------------------------------------
+    # WP-ARCH 3c K4: ``test_fires_once_on_grok_cli_after_age_threshold`` is GONE
+    # -----------------------------------------------------------------------
+    # It was the arm for the whole AC7 contract: a grok_cli episode PROCESSING
+    # past ``grok_wedge_age_s`` with a fingerprint that has not moved fires
+    # exactly one notice, writes ``wedge_suspect: True`` onto the terminal's
+    # metadata once, and the SECOND tick of the same episode fires nothing. All
+    # three halves of that — the age predicate, the metadata write and the
+    # ``wedge_fired_key`` dedup — lived in ``tick_wedge`` and ``_evaluate_wedge``,
+    # which K4 deletes. Nothing sets ``wedge_flagged`` or ``wedge_fired_key`` any
+    # more, so there is no firing to count once.
+    #
+    # The dedup KEY itself is not orphaned in the same way: ``record_status``
+    # still clears both wedge fields on any transition out of PROCESSING, and
+    # ``TestWedgeFlagProjection.test_clears_on_status_transition`` below still
+    # pins that clear. What is gone is the producer, not the reset.
+    # -----------------------------------------------------------------------
 
     def test_f228b_arm_does_not_fire_while_spinner_animating(self):
         """With liveness_exclude_patterns, spinner animation = stable FP → NP never fires."""
         # This test verifies that GrokCliProvider.liveness_exclude_patterns is set
-        from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider, PROCESSING_PATTERN
+        from cli_agent_orchestrator.providers.grok_cli import PROCESSING_PATTERN, GrokCliProvider
 
         assert GrokCliProvider.liveness_exclude_patterns == [PROCESSING_PATTERN]
 
@@ -111,7 +77,7 @@ class TestLivenessExcludePatterns:
     """Spinner-only changes produce a stable fingerprint."""
 
     def test_grok_provider_has_processing_pattern(self):
-        from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider, PROCESSING_PATTERN
+        from cli_agent_orchestrator.providers.grok_cli import PROCESSING_PATTERN, GrokCliProvider
 
         assert PROCESSING_PATTERN in GrokCliProvider.liveness_exclude_patterns
 
@@ -119,62 +85,6 @@ class TestLivenessExcludePatterns:
 # ---------------------------------------------------------------------------
 # AC9: flag-and-notify only — no key, no status write, no reap
 # ---------------------------------------------------------------------------
-
-
-class TestFlagAndNotifyOnly:
-    """The wedge arm NEVER sends keys, writes status, or reaps."""
-
-    def test_no_send_keys_no_status_write_no_reap(self):
-        wd = _make_watchdog()
-        now = time.monotonic()
-        episode = _make_episode(processing_since=now - 1000, generation=1)
-
-        with wd._lock:
-            wd._episodes["t1"] = episode
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                return_value={"provider": "grok_cli"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view"
-            ) as mock_rsv,
-            patch(
-                "cli_agent_orchestrator.clients.database.merge_terminal_system_metadata",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda k, default=None: {
-                    "supervisor.watchdog.grok_wedge": True,
-                    "supervisor.watchdog.grok_wedge_age_s": 900.0,
-                }.get(k, default),
-            ),
-        ):
-            mock_rsv.snapshot_view.return_value = TerminalStatus.PROCESSING
-
-            # Patch backend to detect any send_keys calls
-            with (
-                patch(
-                    "cli_agent_orchestrator.backends.registry.get_backend"
-                ) as mock_backend_fn,
-            ):
-                mock_backend = MagicMock()
-                mock_backend_fn.return_value = mock_backend
-
-                wd.tick_wedge()
-
-                # No keys sent
-                mock_backend.send_keys.assert_not_called()
-                if hasattr(mock_backend, "send_key"):
-                    mock_backend.send_key.assert_not_called()
-
-        # Terminal status unchanged
-        assert episode.status == TerminalStatus.PROCESSING
 
 
 # ---------------------------------------------------------------------------
@@ -230,104 +140,45 @@ class TestWedgeFlagProjection:
 # ---------------------------------------------------------------------------
 
 
-class TestReapedTerminalNotFlagged:
-    """A terminal reaped between candidacy and recheck is silently dropped."""
-
-    def test_reaped_before_recheck_no_notice(self):
-        wd = _make_watchdog()
-        now = time.monotonic()
-        episode = _make_episode(processing_since=now - 1000, generation=1)
-
-        with wd._lock:
-            wd._episodes["t1"] = episode
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                return_value=None,  # terminal reaped
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.merge_terminal_system_metadata",
-                side_effect=AssertionError("must not write metadata"),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
-                side_effect=AssertionError("must not send notice"),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda k, default=None: {
-                    "supervisor.watchdog.grok_wedge": True,
-                    "supervisor.watchdog.grok_wedge_age_s": 900.0,
-                }.get(k, default),
-            ),
-        ):
-            # Should not raise, should not send anything
-            wd.tick_wedge()
-
-        # Episode state cleaned up
-        with wd._lock:
-            ep = wd._episodes.get("t1")
-            assert ep.wedge_fired_key is None
-
-
 # ---------------------------------------------------------------------------
 # D11: caller dead → fallback to supervisor
 # ---------------------------------------------------------------------------
 
 
-class TestCallerFallback:
-    """Dead caller falls back to supervisor mailbox."""
-
-    def test_dead_caller_notifies_supervisor(self):
-        wd = _make_watchdog()
-        now = time.monotonic()
-        episode = _make_episode(
-            caller_id="dead_caller", processing_since=now - 1000, generation=1
-        )
-
-        with wd._lock:
-            wd._episodes["t1"] = episode
-
-        call_count = {"metadata_calls": 0}
-
-        def mock_get_metadata(tid):
-            call_count["metadata_calls"] += 1
-            if tid == "t1":
-                return {"provider": "grok_cli"}
-            # dead_caller → None
-            return None
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                side_effect=mock_get_metadata,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view"
-            ) as mock_rsv,
-            patch(
-                "cli_agent_orchestrator.clients.database.merge_terminal_system_metadata",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
-            ) as mock_msg,
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-                return_value="supervisor1",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda k, default=None: {
-                    "supervisor.watchdog.grok_wedge": True,
-                    "supervisor.watchdog.grok_wedge_age_s": 900.0,
-                }.get(k, default),
-            ),
-        ):
-            mock_rsv.snapshot_view.return_value = TerminalStatus.PROCESSING
-            wd.tick_wedge()
-
-            # Notice went to supervisor, not dead caller
-            assert mock_msg.call_count == 1
-            assert mock_msg.call_args[0][1] == "supervisor1"
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: AC9, AC11 and D11 are GONE with ``tick_wedge``
+# ---------------------------------------------------------------------------
+# Three classes stood here and all three asserted something about what the wedge
+# TICK does when it fires, so all three die with the tick that K4 deletes:
+#
+#   * ``TestFlagAndNotifyOnly`` (AC9) — the arm that made the wedge detector
+#     safe to ship: on firing it may flag and notify, and may NEVER send keys,
+#     write a terminal status or reap. It patched the backend and asserted
+#     ``send_keys`` was not called. A deleted tick sends no keys, so the
+#     assertion is now true of every build, including a broken one; it is
+#     exactly the vacuous arm this sweep is meant not to leave behind.
+#   * ``TestReapedTerminalNotFlagged`` (AC11) — a terminal reaped between
+#     candidacy and recheck must be dropped silently: metadata lookup returns
+#     None, and neither the metadata write nor the notice may happen. Same
+#     shape, same reason.
+#   * ``TestCallerFallback`` (D11) — a wedge notice whose caller is dead is
+#     re-addressed to the current supervisor mailbox rather than dropped.
+#
+# The D11 fallback is the one with an heir worth naming. The rule it encodes —
+# a notice for a dead caller goes to the supervisor — belongs to the notice
+# path, not to the wedge probe, and the notice path that survives K4 is
+# ``emit_pre_delete_notice`` / ``_persist_notice``, covered by
+# ``TestF128DeleteBeforeCallbackGuard`` in
+# ``test/services/test_stalled_callback_watchdog.py``. The wedge-specific
+# fallback had no other caller and is withdrawn with the probe.
+#
+# What remains in this file is real and still passes against the shipped build:
+# the grok provider's ``liveness_exclude_patterns`` (AC8), the fleet projection
+# of ``wedge_suspect`` (AC10), and ``record_status`` clearing the wedge fields
+# on a status transition. NOTE for the reader: AC10's projection now has no
+# WRITER anywhere in the tree — ``fleet_service._is_wedge_suspect`` and the TUI
+# cell that ranks it survive K4, the only code that ever set the flag does not.
+# The arms below pin the projection as the pure function it is, which is honest,
+# but a wedged grok pane will not light it up until something writes the flag
+# again.
+# ---------------------------------------------------------------------------

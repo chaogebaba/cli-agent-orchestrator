@@ -456,6 +456,44 @@ class StalledCallbackWatchdog:
     # than chosen: it is the deleted function's ONLY driver, so leaving it would
     # leave an ImportError behind a try/except that swallows it silently.
 
+    def evict_vanished_episodes(self) -> list[str]:
+        """Drop episodes whose terminal no longer exists. Returns the evicted ids.
+
+        **This is a RESTORATION, not a new sweep.** Before WP-ARCH 3c K4 the
+        eviction lived inside ``collect_due_notifications``: that pass resolved
+        each candidate's metadata and, finding none, popped the episode (FX181 D3
+        retired it into the owed set first). K4 deletes the notifier, and the
+        eviction would have gone with it — leaving the episode map to grow
+        without bound.
+
+        The leak is not cosmetic. ``has_episode`` is read by
+        ``inbox_service`` to decide whether a terminal is mid-episode, so a
+        leaked entry answers True forever for a terminal that is gone. The two
+        survivors that also remove episodes -- ``clear_terminal`` and
+        ``_gc_fired_episodes`` -- are EVENT-driven: the first needs a delete to
+        be observed, the second needs the callback to arrive. A terminal that
+        vanishes without either event is exactly the case this covers, and it is
+        the case the old notifier happened to handle on its way past.
+
+        What is NOT restored is the owed-set retirement: ``_dead_owed`` existed
+        to let the quiescence notice still name a dead member, and that notice is
+        deleted. Eviction without it is the whole of the surviving behaviour.
+        """
+        with self._lock:
+            candidates = list(self._episodes)
+        vanished = [tid for tid in candidates if not terminal_exists(tid)]
+        if not vanished:
+            return []
+        with self._lock:
+            for terminal_id in vanished:
+                self._episodes.pop(terminal_id, None)
+        logger.info(
+            "watchdog evicted %d episode(s) whose terminal is gone: %s",
+            len(vanished),
+            ",".join(vanished),
+        )
+        return vanished
+
     def poll_unarmed_statuses(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self._lock:
@@ -826,6 +864,7 @@ class StalledCallbackWatchdog:
                 # two things and the fork was a fork over nothing. What is left is
                 # the liveness half of this watchdog, which has no idle case: an
                 # unarmed terminal still has a pane to sample.
+                await asyncio.to_thread(self.evict_vanished_episodes)
                 await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.refresh_screen_fingerprints)
                 parity_now = self._parity_clock()

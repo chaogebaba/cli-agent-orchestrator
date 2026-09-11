@@ -36,10 +36,7 @@ from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptResolution,
     transcript_ref,
 )
-from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-    StalledCallbackWatchdog,
-    WatchdogNotice,
-)
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
@@ -632,13 +629,43 @@ def test_wpm1_watchdog_callback_status_query_exact_matrix(wpm1_db):
         assert query("sender", "receiver", since) == expected
 
 
-def test_wpm1_watchdog_collect_due_uses_episode_scoped_inflight_query(wpm1_db):
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: the three arms below drove ``collect_due_notifications``, which
+# the slice deletes with the rest of the watchdog's tick-driven notice half.
+# None of them is dropped, because none of them was ABOUT that method.
+#
+# Their subject is ``get_callback_status_since`` -- the episode-scoped in-flight
+# query whose exact matrix the arm above pins at the DB layer -- and specifically
+# the RULING the watchdog takes from it: an in-flight or delivered callback
+# suppresses the fire, a callback that has gone FAILED/DELIVERY_FAILED does not,
+# and the fire happens exactly once per episode.
+#
+# That query has one caller left, ``emit_pre_delete_notice``, and it reaches the
+# identical ruling through the identical call (same terminal, same caller, same
+# ``episode_started_wall_at``), so the arms follow it there. Two differences are
+# deliberate and neither weakens the arm:
+#
+#   * the notice now carries the DELETION text and ``kind="deletion"`` rather
+#     than "idle Ns without callback", because the surviving emitter fires on a
+#     different trigger. The identity fields the arms actually turned on --
+#     terminal, caller, source_generation -- are asserted as before; pinning the
+#     deletion wording here would pin that emitter's message rather than this
+#     query's ruling, and ``test_wpm1_watchdog_callback_status_query_exact_matrix``
+#     above already owns the matrix itself.
+#   * the clock arguments go, because the deletion path has no grace window. The
+#     once-only property does NOT come from the clock -- it comes from
+#     ``episode.fired``, set under ``_lock`` atomically with the decision -- so a
+#     second call with no advanced clock is the same assertion it always was.
+# ---------------------------------------------------------------------------
+
+
+def test_wpm1_watchdog_notice_uses_episode_scoped_inflight_query(wpm1_db):
     watchdog = StalledCallbackWatchdog(grace_seconds=3)
     watchdog.record_inbound_task("sender", "receiver", "developer")
     _ambiguous(sender="sender", receiver="receiver")
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
     watchdog._episodes["sender"].last_screen_fp = "stable"
-    assert watchdog.collect_due_notifications(now=13) == []
+    assert watchdog.emit_pre_delete_notice("sender") is None
     assert not watchdog._episodes["sender"].fired
 
 
@@ -650,7 +677,7 @@ def test_wpm1_watchdog_pending_callback_failure_transition_fires_once(wpm1_db, f
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
     watchdog._episodes["sender"].last_screen_fp = "stable"
 
-    assert watchdog.collect_due_notifications(now=13) == []
+    assert watchdog.emit_pre_delete_notice("sender") is None
     episode = watchdog._episodes["sender"]
     assert not episode.callback_seen
     assert not episode.fired
@@ -658,16 +685,16 @@ def test_wpm1_watchdog_pending_callback_failure_transition_fires_once(wpm1_db, f
     with wpm1_db.begin() as db:
         db.get(InboxModel, message.id).status = failure_status.value
 
-    assert watchdog.collect_due_notifications(now=14) == [
-        WatchdogNotice(
-            terminal_id="sender",
-            caller_id="receiver",
-            message="[watchdog] worker developer-sender idle 4s without callback",
-            idle_reason=None,
-            source_generation=1,
-        )
-    ]
-    assert watchdog.collect_due_notifications(now=15) == []
+    notice = watchdog.emit_pre_delete_notice("sender")
+    assert notice is not None
+    assert (notice.terminal_id, notice.caller_id, notice.source_generation) == (
+        "sender",
+        "receiver",
+        1,
+    )
+    assert notice.idle_reason is None
+    assert episode.fired
+    assert watchdog.emit_pre_delete_notice("sender") is None
 
 
 @pytest.mark.parametrize("failure_status", [MessageStatus.FAILED, MessageStatus.DELIVERY_FAILED])
@@ -680,8 +707,8 @@ def test_wpm1_watchdog_terminal_failure_only_callback_fires_once(wpm1_db, failur
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
     watchdog._episodes["sender"].last_screen_fp = "stable"
 
-    assert len(watchdog.collect_due_notifications(now=13)) == 1
-    assert watchdog.collect_due_notifications(now=14) == []
+    assert watchdog.emit_pre_delete_notice("sender") is not None
+    assert watchdog.emit_pre_delete_notice("sender") is None
 
 
 def _gate_message() -> InboxMessage:

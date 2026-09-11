@@ -10,11 +10,15 @@ import pytest
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import base_digest_service
 from cli_agent_orchestrator.services import stalled_callback_watchdog as watchdog_module
 from cli_agent_orchestrator.services import terminal_guard_service
 from cli_agent_orchestrator.services import terminal_service as terminals
-from cli_agent_orchestrator.services import base_digest_service
-from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, SnapshotEntry, StalenessResult
+from cli_agent_orchestrator.services.fork_context_service import (
+    SnapshotDelta,
+    SnapshotEntry,
+    StalenessResult,
+)
 
 
 def _row(source_terminal_id="base-source"):
@@ -46,38 +50,39 @@ async def _inline(
 def _prepare_stale_refresh(monkeypatch, row):
     terminals._fork_refresh_locks.clear()
     monkeypatch.setattr(terminals, "_tracked_blocking", _inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
     monkeypatch.setattr(
-        terminals, "get_ready_provider_session", lambda _name: dict(row)
-    )
-    monkeypatch.setattr(
-        terminals, "fork_staleness", lambda _row: StalenessResult(
+        terminals,
+        "fork_staleness",
+        lambda _row: StalenessResult(
             SnapshotDelta("old", (SnapshotEntry("changed.py", "sha256", "a" * 64),)),
-            "[STALE]", 1,
-        )
+            "[STALE]",
+            1,
+        ),
     )
     monkeypatch.setattr(
-        terminals.base_digest_service, "evaluate",
+        terminals.base_digest_service,
+        "evaluate",
         lambda *_args: base_digest_service.DigestCovered(
             base_digest_service.BaseDigestArtifact(
                 path=Path("tmp/orch/digest.md"),
-                base="base", parent_artifact_sha="genesis", artifact_sha="a" * 64,
-                entries=(), body="context",
+                base="base",
+                parent_artifact_sha="genesis",
+                artifact_sha="a" * 64,
+                entries=(),
+                body="context",
             )
         ),
     )
 
 
 @pytest.mark.asyncio
-async def test_f10_dangling_source_exits_before_dispatch_with_one_warning(
-    monkeypatch, caplog
-):
+async def test_f10_dangling_source_exits_before_dispatch_with_one_warning(monkeypatch, caplog):
     row = _row()
     _prepare_stale_refresh(monkeypatch, row)
     dispatch = MagicMock()
     monkeypatch.setattr(terminals, "FORK_REFRESH_WAIT_BUDGET", 1.0)
-    monkeypatch.setattr(
-        terminals.status_monitor, "get_status", lambda _id: TerminalStatus.UNKNOWN
-    )
+    monkeypatch.setattr(terminals.status_monitor, "get_status", lambda _id: TerminalStatus.UNKNOWN)
     monkeypatch.setattr(terminals, "terminal_exists", lambda _id: False)
     monkeypatch.setattr(terminals, "_dispatch_base_refresh", dispatch)
 
@@ -100,18 +105,14 @@ async def test_f10_dangling_source_exits_before_dispatch_with_one_warning(
 
 
 @pytest.mark.asyncio
-async def test_f10_deletion_during_post_dispatch_wait_skips_snapshot(
-    monkeypatch, caplog
-):
+async def test_f10_deletion_during_post_dispatch_wait_skips_snapshot(monkeypatch, caplog):
     row = _row()
     _prepare_stale_refresh(monkeypatch, row)
     statuses = iter([TerminalStatus.IDLE, TerminalStatus.UNKNOWN])
     dispatch = MagicMock(return_value=True)
     snapshot = MagicMock()
     snapshot_write = MagicMock()
-    monkeypatch.setattr(
-        terminals.status_monitor, "get_status", lambda _id: next(statuses)
-    )
+    monkeypatch.setattr(terminals.status_monitor, "get_status", lambda _id: next(statuses))
     monkeypatch.setattr(terminals.status_monitor, "get_input_gen", lambda _id: 1)
     monkeypatch.setattr(terminals, "terminal_exists", lambda _id: False)
     monkeypatch.setattr(terminals, "_dispatch_base_refresh", dispatch)
@@ -138,29 +139,21 @@ async def test_f10_deletion_during_post_dispatch_wait_skips_snapshot(
 async def test_f10_live_unknown_source_recovers(monkeypatch):
     statuses = iter([TerminalStatus.UNKNOWN, TerminalStatus.IDLE])
     exists = MagicMock(return_value=True)
-    monkeypatch.setattr(
-        terminals.status_monitor, "get_status", lambda _id: next(statuses)
-    )
+    monkeypatch.setattr(terminals.status_monitor, "get_status", lambda _id: next(statuses))
     monkeypatch.setattr(terminals, "terminal_exists", exists)
     monkeypatch.setattr(asyncio, "sleep", MagicMock(return_value=asyncio.sleep(0)))
 
-    assert await terminals._wait_for_base_ready(
-        "base-source", time.monotonic() + 0.2
-    )
+    assert await terminals._wait_for_base_ready("base-source", time.monotonic() + 0.2)
     exists.assert_called_once_with("base-source")
 
 
 @pytest.mark.asyncio
 async def test_f10_live_unknown_source_remains_bounded(monkeypatch):
-    monkeypatch.setattr(
-        terminals.status_monitor, "get_status", lambda _id: TerminalStatus.UNKNOWN
-    )
+    monkeypatch.setattr(terminals.status_monitor, "get_status", lambda _id: TerminalStatus.UNKNOWN)
     monkeypatch.setattr(terminals, "terminal_exists", lambda _id: True)
 
     started = time.monotonic()
-    assert not await terminals._wait_for_base_ready(
-        "base-source", started + 0.02
-    )
+    assert not await terminals._wait_for_base_ready("base-source", started + 0.02)
     assert time.monotonic() - started >= 0.01
 
 
@@ -173,17 +166,13 @@ async def test_f10_busy_live_source_still_waits_for_budget(monkeypatch):
     monkeypatch.setattr(terminals, "terminal_exists", exists)
 
     started = time.monotonic()
-    assert not await terminals._wait_for_base_ready(
-        "base-source", started + 0.02
-    )
+    assert not await terminals._wait_for_base_ready("base-source", started + 0.02)
     assert time.monotonic() - started >= 0.01
     exists.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_f10_null_source_is_immediate_without_dead_source_warning(
-    monkeypatch, caplog
-):
+async def test_f10_null_source_is_immediate_without_dead_source_warning(monkeypatch, caplog):
     row = _row(source_terminal_id=None)
     _prepare_stale_refresh(monkeypatch, row)
     wait = MagicMock()
@@ -201,8 +190,7 @@ async def test_f10_null_source_is_immediate_without_dead_source_warning(
     wait.assert_not_called()
     dispatch.assert_not_called()
     assert not any(
-        "Fork refresh source terminal is gone" in record.message
-        for record in caplog.records
+        "Fork refresh source terminal is gone" in record.message for record in caplog.records
     )
 
 
@@ -224,17 +212,11 @@ def send_environment(monkeypatch):
     plugin_dispatch = MagicMock()
 
     monkeypatch.setattr(terminals, "get_terminal_metadata", lambda _id: metadata)
-    monkeypatch.setattr(
-        terminals.provider_manager, "get_provider", lambda _id: provider
-    )
+    monkeypatch.setattr(terminals.provider_manager, "get_provider", lambda _id: provider)
     monkeypatch.setattr(terminals, "get_backend", lambda: backend)
     monkeypatch.setattr(terminals, "update_last_active", update_last_active)
-    monkeypatch.setattr(
-        terminals, "preserve_draft_before_send", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        terminals, "_append_message_contract", lambda message, *_args: message
-    )
+    monkeypatch.setattr(terminals, "preserve_draft_before_send", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(terminals, "_append_message_contract", lambda message, *_args: message)
     monkeypatch.setattr(
         terminals, "inject_memory_context", lambda message, *_args, **_kwargs: message
     )
@@ -272,9 +254,7 @@ def test_f11_dispatch_marks_refresh_as_not_expecting_callback(monkeypatch):
     )
 
 
-def test_f11_refresh_preserves_sender_plugin_event_and_last_active(
-    monkeypatch, send_environment
-):
+def test_f11_refresh_preserves_sender_plugin_event_and_last_active(monkeypatch, send_environment):
     watcher = MagicMock()
     watcher.has_episode.return_value = True
     create_inbox = MagicMock()
@@ -304,9 +284,7 @@ def test_f11_refresh_preserves_sender_plugin_event_and_last_active(
 
 
 @pytest.mark.parametrize("callback_seen", [False, True])
-def test_f11_refresh_keeps_existing_episode_unchanged(
-    monkeypatch, send_environment, callback_seen
-):
+def test_f11_refresh_keeps_existing_episode_unchanged(monkeypatch, send_environment, callback_seen):
     watcher = watchdog_module.stalled_callback_watchdog
     watcher.clear_terminal("base-source")
     watcher.record_inbound_task("base-source", "caller", "codex_base")
@@ -329,10 +307,14 @@ def test_f11_refresh_keeps_existing_episode_unchanged(
             assert watcher._episodes["base-source"] is episode
             assert episode.callback_seen is callback_seen
         if callback_seen:
-            monkeypatch.setattr(
-                watchdog_module, "get_terminal_metadata", lambda _id: send_environment.metadata
-            )
-            assert watcher.collect_due_notifications(now=watcher.grace_seconds + 1) == []
+            # WP-ARCH 3c K4 deleted ``collect_due_notifications``, which this leg
+            # used to drive. It is re-pointed, not dropped: the property is that a
+            # refresh ``send_message`` leaves a SETTLED episode settled, and
+            # ``emit_pre_delete_notice`` is the surviving emitter that reads the
+            # same ``callback_seen`` flag to decide it owes no notice. The
+            # ``get_terminal_metadata`` stub went with the tick that consulted it;
+            # the deletion path reads the episode alone.
+            assert watcher.emit_pre_delete_notice("base-source") is None
     finally:
         watcher.clear_terminal("base-source")
 
@@ -365,8 +347,6 @@ def test_f11_default_callback_expectation_preserves_normal_arming(
     )
 
     if should_arm:
-        watcher.record_inbound_task.assert_called_once_with(
-            "base-source", "caller", "codex_base"
-        )
+        watcher.record_inbound_task.assert_called_once_with("base-source", "caller", "codex_base")
     else:
         watcher.record_inbound_task.assert_not_called()

@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as dbmod
-from cli_agent_orchestrator.clients.database import (
+from cli_agent_orchestrator.clients.database import (  # noqa: F401  (F893 seam)
     Base,
     CallbackBarrierMemberModel,
     CallbackBarrierModel,
@@ -28,7 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     _fire_open_barrier_in_db,
     _maybe_fire_completed_barrier,
     callback_barrier_dispatch_allowed,
-    callback_barrier_dispatch_permission,  # noqa: F401  (F893 seam)
+    callback_barrier_dispatch_permission,
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -320,9 +320,13 @@ def test_f92_one_member_barrier_records_callback_through_creation_wrapper(
         assert db.query(CallbackBarrierModel).one().state == "FIRED_COMPLETE"
         assert db.query(CallbackBarrierMemberModel).one().state == "ARRIVED"
 
-    watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
-    first_episode.last_screen_fp = "sample"
-    assert watchdog.collect_due_notifications(now=13.0) == []
+    # WP-ARCH 3c K4: this arm used to close by driving
+    # ``collect_due_notifications`` and asserting it stayed empty. That method is
+    # deleted with the rest of the watchdog's notice half. The deletion costs the
+    # arm nothing: the subject is that the CREATION WRAPPER records the callback,
+    # and ``first_episode.callback_seen`` above is where the wrapper writes it —
+    # the notice call only ever read that same flag back out one layer further on.
+    assert not first_episode.fired
 
 
 @pytest.mark.parametrize("wrapper", ["raw-terminal", "logical-mailbox"])
@@ -438,10 +442,18 @@ def test_f92_digested_callback_durably_suppresses_when_recorder_missed(barrier_d
     recorder.assert_called_once_with("worker-a", "owner")
     episode = watchdog._episodes["worker-a"]
     assert not episode.callback_seen
+
+    # WP-ARCH 3c K4: the durable F310 check MOVED rather than died. It used to run
+    # inside ``collect_due_notifications``; that method is deleted, and
+    # ``emit_pre_delete_notice`` is now the only caller of
+    # ``get_callback_status_since`` — the same query, against the same episode
+    # start, reaching the same ruling. So the arm follows it instead of being
+    # dropped: with the in-process recorder stubbed out, the DIGESTED row in the
+    # durable inbox must still be enough to suppress the loss notice and leave
+    # the episode un-fired.
     watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
     episode.last_screen_fp = "sample"
-    assert watchdog.collect_due_notifications(now=13.0) == []
-    assert episode.callback_seen
+    assert watchdog.emit_pre_delete_notice("worker-a") is None
     assert not episode.fired
 
 
@@ -461,16 +473,19 @@ def test_f92_combined_partial_barrier_row_does_not_clear_missing_worker(barrier_
     episode = watchdog._episodes["worker-b"]
     watchdog.record_status("worker-b", TerminalStatus.IDLE, now=10.0)
     episode.last_screen_fp = "sample"
-    monkeypatch.setattr(
-        watchdog,
-        "_fresh_frame_decides_running",
-        lambda _terminal_id: (False, None),
-    )
 
-    notices = watchdog.collect_due_notifications(now=13.0)
+    # WP-ARCH 3c K4: the observation point is ``emit_pre_delete_notice``, the
+    # notice emitter that survives K4's cut of the tick-driven half. Both halves
+    # of the arm's subject are still pinned here. The combined ``barrier:`` row
+    # that fired at 1/2 must NOT be mistaken for worker-b's own callback
+    # (``callback_seen`` stays False), and BECAUSE it is not, worker-b is still
+    # owed a notice — the emitter returns one naming worker-b rather than
+    # returning None. The ``_fresh_frame_decides_running`` stub went with the tick
+    # that consulted it; the deletion path takes no screen sample.
+    notice = watchdog.emit_pre_delete_notice("worker-b")
 
-    assert len(notices) == 1
-    assert notices[0].terminal_id == "worker-b"
+    assert notice is not None
+    assert notice.terminal_id == "worker-b"
     assert episode.fired
     assert not episode.callback_seen
 

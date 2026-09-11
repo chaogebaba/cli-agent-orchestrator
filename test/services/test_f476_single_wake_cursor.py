@@ -79,14 +79,24 @@ def _seed_mailbox(db: Any, *, cursor: int = 0, consumed: int = 0) -> None:
     """Insert a mailbox + incarnation for testing."""
     db.execute(
         text(
+            # WP-ARCH 3c K4: ``schema_version`` is no longer a column on
+            # ``MailboxModel`` and so is no longer created by
+            # ``Base.metadata.create_all`` above. It was the mailbox
+            # compatibility refusal's only field, K8 deleted that refusal, and
+            # K4 dropped the dead column from the model. This INSERT names its
+            # columns explicitly, so it was the one place in this file that
+            # still had to know the mailbox schema by hand — naming a column the
+            # ORM no longer declares turns every arm in this file into an
+            # OperationalError at seed time, which is exactly what happened.
+            # Nothing about the wake cursor is asserted through that field.
             "INSERT OR REPLACE INTO mailboxes "
             "(id, session_name, role, current_terminal_id, generation, "
             " consumed_through_id, callback_notified_through_id, "
-            " cc_inbox_path, cc_inbox_path_version, schema_version, "
+            " cc_inbox_path, cc_inbox_path_version, "
             " wake_notified_at, wake_streak, wake_notified_id, "
             " created_at, updated_at) "
             "VALUES (:id, :sn, :role, :tid, :gen, :consumed, :cursor, "
-            " :path, :pv, 1, NULL, 0, 0, :now, :now)"
+            " :path, :pv, NULL, 0, 0, :now, :now)"
         ),
         {
             "id": _MAILBOX_ID,

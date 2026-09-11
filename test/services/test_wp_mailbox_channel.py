@@ -57,7 +57,6 @@ def scratch_db(tmp_path, monkeypatch):
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    # Apply the schema_version migration for the mailboxes table
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
     monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
@@ -78,9 +77,11 @@ def _terminal(db, terminal_id: str, session: str = "cao-test") -> None:
     )
 
 
-def _mailbox(
-    db, terminal_id: str = "sup-001", *, generation: int = 1, schema_version: int = 1
-) -> MailboxModel:
+def _mailbox(db, terminal_id: str = "sup-001", *, generation: int = 1) -> MailboxModel:
+    # WP-ARCH 3c K8 deleted ``MailboxModel.schema_version``; the ``schema_version``
+    # keyword this helper used to accept went with it. No caller ever passed a
+    # value other than the default, because the only arm that varied it was AC#7
+    # (see its note below), so nothing about the rows these tests build changes.
     row = MailboxModel(
         id="mb_sup",
         session_name="cao-test",
@@ -88,7 +89,6 @@ def _mailbox(
         current_terminal_id=terminal_id,
         generation=generation,
         consumed_through_id=0,
-        schema_version=schema_version,
         created_at=datetime.now(),
         updated_at=datetime.now(),
     )
@@ -464,10 +464,12 @@ def test_ac6_drain_via_existing_list_ack(scratch_db):
 # precondition that can re-arm composer injection, which is the class of thing
 # K8 exists to remove.
 #
-# So the arm's subject is gone in both halves. Nothing reads ``schema_version``
-# any more: the column, its migration and its ``DEFAULT 1`` survive (the fixture
-# above still applies the migration, because the model still writes the field),
-# but there is no consumer left to refuse anything. Re-pointing the arm at the
+# So the arm's subject is gone in both halves, and K8's follow-through removed
+# the field from ``MailboxModel`` as well: nothing reads OR writes
+# ``schema_version`` now. The physical column and its ``DEFAULT 1`` are
+# deliberately left in place -- it is NOT NULL with a server default, so an
+# INSERT that omits it still succeeds and old databases stay readable -- but
+# there is no consumer left to refuse anything. Re-pointing the arm at the
 # column's default alone would assert that a SQLAlchemy default is its own
 # default, which pins no behaviour at all; if a future slice gives the field a
 # reader, the refusal it implements is what earns a new arm here.

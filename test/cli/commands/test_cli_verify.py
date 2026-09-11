@@ -15,7 +15,12 @@ def test_stamp_round_trip_and_stale_detection(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     log = tmp_path / "suite.log"
-    stamp = {"commit": "abc", "dirty": {"x.py": "123"}, "timestamp": "2026-07-11T12:00:00+00:00", "cwd": str(root)}
+    stamp = {
+        "commit": "abc",
+        "dirty": {"x.py": "123"},
+        "timestamp": "2026-07-11T12:00:00+00:00",
+        "cwd": str(root),
+    }
     with log.open("w") as stream:
         svc.write_stamp(stream, stamp)
         stream.write("12 passed, 2 skipped in 1.0s\n")
@@ -39,7 +44,12 @@ def test_verify_suite_log_command_failure(tmp_path):
 
 
 def _stamped_log(path, root, body, **overrides):
-    stamp = {"commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:00:00+00:00", "cwd": str(root)}
+    stamp = {
+        "commit": "abc",
+        "dirty": {},
+        "timestamp": "2026-07-11T12:00:00+00:00",
+        "cwd": str(root),
+    }
     stamp.update(overrides)
     with path.open("w") as stream:
         svc.write_stamp(stream, stamp)
@@ -50,9 +60,11 @@ def test_suite_log_rejects_errors_interruption_and_missing_summary(tmp_path, mon
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "later", "cwd": str(root)
-    })
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {"commit": "abc", "dirty": {}, "timestamp": "later", "cwd": str(root)},
+    )
     cases = {
         "error": "3 passed, 1 error in 1.0s\n",
         "errors": "3 passed, 2 errors in 1.0s\n",
@@ -71,10 +83,16 @@ def test_suite_log_rejects_adversarial_late_and_multiple_outcomes(tmp_path, monk
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:01:00+00:00",
-        "cwd": str(root),
-    })
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {
+            "commit": "abc",
+            "dirty": {},
+            "timestamp": "2026-07-11T12:01:00+00:00",
+            "cwd": str(root),
+        },
+    )
     adversarial = (
         "4 passed in 1.0s\nERROR collecting late.py\n1 error\n",
         "1 error in 0.2s\n4 passed in 1.0s\n",
@@ -91,10 +109,16 @@ def test_suite_log_rejects_pytest_failure_and_error_markers(tmp_path, monkeypatc
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:01:00+00:00",
-        "cwd": str(root),
-    })
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {
+            "commit": "abc",
+            "dirty": {},
+            "timestamp": "2026-07-11T12:01:00+00:00",
+            "cwd": str(root),
+        },
+    )
     marker_tampers = (
         "4 passed in 1.0s\nERROR collecting evil.py\n",
         "FAILED test_x.py::test_y - AssertionError\n4 passed in 1.0s\n",
@@ -111,14 +135,17 @@ def test_suite_log_allows_lowercase_error_words_in_passing_output(tmp_path, monk
     root = tmp_path / "repo"
     root.mkdir()
     stamp = {
-        "commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:01:00+00:00",
+        "commit": "abc",
+        "dirty": {},
+        "timestamp": "2026-07-11T12:01:00+00:00",
         "cwd": str(root),
     }
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
     monkeypatch.setattr(svc, "tree_stamp", lambda value: stamp)
     log = tmp_path / "passing-error-name.log"
     _stamped_log(
-        log, root,
+        log,
+        root,
         "test_error_handler.py::test_error_message PASSED\n"
         "warnings summary\n4 passed, 1 warning in 1.0s\n",
     )
@@ -128,20 +155,16 @@ def test_suite_log_allows_lowercase_error_words_in_passing_output(tmp_path, monk
 
 
 def test_pytest_summary_accepts_optional_wall_clock_suffix():
-    assert svc.pytest_summary_error(
-        "4481 passed, 13 skipped, 101 deselected in 60.03s (0:01:00)\n"
-    ) is None
-    assert svc.pytest_summary_error(
-        "4481 passed in 86400.00s (12:34:56)\n"
-    ) is None
+    assert (
+        svc.pytest_summary_error("4481 passed, 13 skipped, 101 deselected in 60.03s (0:01:00)\n")
+        is None
+    )
+    assert svc.pytest_summary_error("4481 passed in 86400.00s (12:34:56)\n") is None
 
 
 def test_suffixed_pytest_summary_still_rejects_failure_tampers():
     counted = "4481 passed, 2 failed in 60.03s (0:01:00)\n"
-    marker = (
-        "4481 passed in 60.03s (0:01:00)\n"
-        "FAILED test_x.py::test_y - AssertionError\n"
-    )
+    marker = "4481 passed in 60.03s (0:01:00)\n" "FAILED test_x.py::test_y - AssertionError\n"
     assert svc.pytest_summary_error(counted) == (
         "suite output contains a nonzero failed/error outcome"
     )
@@ -154,9 +177,11 @@ def test_suite_log_rejects_invalid_types_and_foreign_cwd(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "now", "cwd": str(root)
-    })
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {"commit": "abc", "dirty": {}, "timestamp": "now", "cwd": str(root)},
+    )
     invalid = tmp_path / "invalid.log"
     _stamped_log(invalid, root, "3 passed in 1.0s\n", dirty=[])
     passed, reasons, _ = svc.verify_suite_log(invalid)
@@ -189,10 +214,19 @@ def test_run_suite_success_atomically_writes_stamp(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:00:00+00:00", "cwd": str(root)
-    })
-    monkeypatch.setattr(svc.subprocess, "Popen", lambda *a, **k: FakeProcess(["3 passed in .1s\n"], 0))
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {
+            "commit": "abc",
+            "dirty": {},
+            "timestamp": "2026-07-11T12:00:00+00:00",
+            "cwd": str(root),
+        },
+    )
+    monkeypatch.setattr(
+        svc.subprocess, "Popen", lambda *a, **k: FakeProcess(["3 passed in .1s\n"], 0)
+    )
     output = __import__("io").StringIO()
     code, path, summary = svc.run_suite("demo", output)
     assert code == 0
@@ -208,10 +242,19 @@ def test_run_suite_failure_preserves_existing_log(tmp_path, monkeypatch):
     target.parent.mkdir(parents=True)
     target.write_text("old")
     monkeypatch.setattr(svc, "git_root", lambda cwd=None: root)
-    monkeypatch.setattr(svc, "tree_stamp", lambda value: {
-        "commit": "abc", "dirty": {}, "timestamp": "2026-07-11T12:00:00+00:00", "cwd": str(root)
-    })
-    monkeypatch.setattr(svc.subprocess, "Popen", lambda *a, **k: FakeProcess(["1 failed in .1s\n"], 1))
+    monkeypatch.setattr(
+        svc,
+        "tree_stamp",
+        lambda value: {
+            "commit": "abc",
+            "dirty": {},
+            "timestamp": "2026-07-11T12:00:00+00:00",
+            "cwd": str(root),
+        },
+    )
+    monkeypatch.setattr(
+        svc.subprocess, "Popen", lambda *a, **k: FakeProcess(["1 failed in .1s\n"], 1)
+    )
     code, _, _ = svc.run_suite("demo", __import__("io").StringIO())
     assert code == 1
     assert target.read_text() == "old"
@@ -221,10 +264,16 @@ def test_verify_deploy_reports_states(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "deployment_status", lambda root: {
-        "cli_path": "stale", "differing_files": 2, "server": "restart-needed",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        command,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "stale",
+            "differing_files": 2,
+            "server": "restart-needed",
+            "source_root": str(root),
+        },
+    )
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "CLI path: stale (2 files differ)" in result.output
@@ -235,10 +284,16 @@ def test_verify_deploy_current_is_only_success(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "deployment_status", lambda root: {
-        "cli_path": "current", "differing_files": 0, "server": "current",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        command,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "current",
+            "source_root": str(root),
+        },
+    )
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 0
     assert "server: current" in result.output
@@ -248,25 +303,36 @@ def test_verify_deploy_unknown_and_install_not_found_fail(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "deployment_status", lambda root: {
-        "cli_path": "current", "differing_files": 0, "server": "unknown",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        command,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "unknown",
+            "source_root": str(root),
+        },
+    )
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "server: unknown" in result.output
 
-    monkeypatch.setattr(command, "deployment_status", lambda root: {
-        "cli_path": "not-found", "differing_files": None, "server": "not-running",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        command,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "not-found",
+            "differing_files": None,
+            "server": "not-running",
+            "source_root": str(root),
+        },
+    )
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "CLI path: not-found" in result.output
     assert (
         "server: not-running (no listener on :9889 - check: "
-        "systemctl --user status cao-server; journalctl --user -u cao-server)"
-        in result.output
+        "systemctl --user status cao-server; journalctl --user -u cao-server)" in result.output
     )
 
 
@@ -284,7 +350,9 @@ def test_structured_deployment_status_current_stale_and_restart(tmp_path, monkey
     newest = (installed / "module.py").stat().st_mtime
     monkeypatch.setattr(svc, "process_start_time", lambda _pid: newest + 10)
     assert svc.deployment_status(root) == {
-        "cli_path": "current", "differing_files": 0, "server": "current",
+        "cli_path": "current",
+        "differing_files": 0,
+        "server": "current",
         "source_root": str(root.resolve()),
     }
 
@@ -298,7 +366,8 @@ def test_structured_deployment_status_current_stale_and_restart(tmp_path, monkey
 
 
 def test_cli_deploy_uses_installed_source_when_cwd_git_root_is_parent(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     import cli_agent_orchestrator.cli.commands.verify as command
 
@@ -370,10 +439,16 @@ def test_verify_deploy_cli_golden_bytes(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "deployment_status", lambda root: {
-        "cli_path": "current", "differing_files": 0, "server": "current",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        command,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "current",
+            "source_root": str(root),
+        },
+    )
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 0
     assert result.stdout.encode() == b"CLI path: current (0 files differ)\nserver: current\n"
@@ -413,27 +488,30 @@ def _trace_identity(row: str) -> tuple[str, str]:
     return path, symbol
 
 
-def test_verify_manifest_regen_preserves_identities_across_line_shift(
-    tmp_path, monkeypatch
-):
+def test_verify_manifest_regen_preserves_identities_across_line_shift(tmp_path, monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     root, manifest_path = _trace_manifest_tree(tmp_path)
     committed = manifest_path.read_text(encoding="utf-8")
     shifted_path = root / "src/cli_agent_orchestrator/services/inbox_service.py"
-    shifted_path.write_text(
-        "\n" + shifted_path.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    shifted_path.write_text("\n" + shifted_path.read_text(encoding="utf-8"), encoding="utf-8")
     monkeypatch.setattr(command, "git_root", lambda: root)
 
     result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
 
-    assert result.exit_code == 0
-    assert result.output == "Trace manifest: hits=40 files_touched=1 changed=yes\n"
-    regenerated = manifest_path.read_text(encoding="utf-8")
+    # WP-ARCH 3c: the hit count is DERIVED from the manifest this test just
+    # generated, not pinned as a literal. Every deletion slice moves it (the
+    # literal here said 40 while the tree generated 36, then 33), and a number
+    # that has to be hand-corrected after each slice pins the slice, not the
+    # property. The property is "regen reports exactly the rows it wrote".
     committed_rows = committed.splitlines()
+    expected_hits = len(committed_rows)
+    assert expected_hits > 0
+    assert result.exit_code == 0
+    assert result.output == f"Trace manifest: hits={expected_hits} files_touched=1 changed=yes\n"
+    regenerated = manifest_path.read_text(encoding="utf-8")
     regenerated_rows = regenerated.splitlines()
-    assert len(committed_rows) == len(regenerated_rows) == 40
+    assert len(regenerated_rows) == expected_hits
     assert [_trace_identity(row) for row in committed_rows] == [
         _trace_identity(row) for row in regenerated_rows
     ]
@@ -463,7 +541,10 @@ def test_verify_manifest_regen_unchanged_tree_does_not_write(tmp_path, monkeypat
     result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
 
     assert result.exit_code == 0
-    assert result.output == "Trace manifest: hits=40 files_touched=0 changed=no\n"
+    # Derived, for the reason given in the arm above.
+    expected_hits = len(committed.decode("utf-8").splitlines())
+    assert expected_hits > 0
+    assert result.output == f"Trace manifest: hits={expected_hits} files_touched=0 changed=no\n"
     assert writes == []
     assert manifest_path.read_bytes() == committed
 
@@ -491,7 +572,6 @@ def test_ledger_check_missing_file(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "HANDOFF.md not found" in result.output
     assert "orchestrator/HANDOFF.md" in result.output
-
 
 
 def test_ledger_check_finds_orchestrator_layout(tmp_path, monkeypatch):

@@ -7,121 +7,62 @@ watchdog only notified ("Reconciliation remains the retry owner"), the
 reconciliation daemon swallowed every fault at DEBUG, and ``deliver_pending``
 returned silently from three gates. Only a server restart cleared it.
 
-These tests pin the three halves of the hot fix:
-  1. the watchdog kicks ``deliver_pending`` once per stalled terminal and still
-     notifies;
+These tests pinned three halves of the hot fix. TWO of them survive:
   2. the reconciliation daemon logs a swallowed fault at WARNING with the
      receiver id and the message ids it was owed;
   3. each silent early return in ``deliver_pending`` emits one structured line
      naming its reason.
+
+Half 1 -- "the watchdog kicks ``deliver_pending`` once per stalled terminal and
+still notifies" -- is gone with WP-ARCH 3c K4, which deletes
+``tick_ready_backlog`` along with the other four muted ticks and the notice
+machinery they fed. See the note where its two arms stood.
+
+Note that the incident's own reading survives the deletion: the ready-backlog
+watchdog was never the retry OWNER (its own alert said so), and 3c answers the
+stranded-row class at the source instead, by having the delivery tick adopt
+orphaned PENDING rows on a schedule. The kick was a second retry path bolted to
+a notifier; halves 2 and 3, which are about faults NAMING themselves rather than
+dying silently, are what the incident actually turned on and they are untouched.
 """
 
 import ast
 import inspect
 import logging
 import threading
-from datetime import datetime
 from unittest.mock import patch
 
-from cli_agent_orchestrator.clients.database import ReadyBacklogObservation
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
-from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-    StalledCallbackWatchdog,
-)
-from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
-
-def _backlog_observation(fingerprint=(0, None, None, datetime(2030, 1, 1))):
-    return ReadyBacklogObservation(
-        receiver_id="receiver",
-        oldest_message_id=17,
-        oldest_pending_age_seconds=100,
-        has_open_delivering_attempt=False,
-        attempt_fingerprint=fingerprint,
-    )
-
-
-def _boundary_observation(status):
-    return BoundaryObservation(
-        observation_epoch="epoch",
-        status=status,
-        status_gen=0,
-        input_gen=0,
-        seq=0,
-        last_non_ready_seq=None,
-        last_ready_seq=None,
-    )
-
-
-def _fire_ready_backlog(service, deliver_side_effect=None):
-    """Drive tick_ready_backlog past its grace so the fire path runs once."""
-    observation = _backlog_observation()
-    metadata = {"caller_id": "caller", "agent_profile": "cline_general"}
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "list_ready_backlog_observations",
-            return_value=[observation],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-            return_value=TerminalStatus.COMPLETED,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor."
-            "get_boundary_observation",
-            return_value=_boundary_observation(TerminalStatus.COMPLETED),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "CAO_WAITING_INBOX_GRACE_SECONDS",
-            10,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message"
-        ) as create,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
-            side_effect=deliver_side_effect,
-        ) as deliver,
-    ):
-        service.tick_ready_backlog(now=100.0)
-        service.tick_ready_backlog(now=109.0)
-        service.tick_ready_backlog(now=110.0)
-        service.tick_ready_backlog(now=120.0)
-    return create, deliver
-
-
-def test_f721_watchdog_kicks_delivery_once_and_still_notifies():
-    """The fire path re-attempts delivery exactly once, then alerts as before."""
-    service = StalledCallbackWatchdog()
-    create, deliver = _fire_ready_backlog(service)
-
-    deliver.assert_called_once()
-    assert deliver.call_args.args[0] == "receiver"
-
-    create.assert_called_once()
-    sender, receiver, message = create.call_args.args
-    assert (sender, receiver) == ("watchdog:receiver", "caller")
-    assert "watchdog re-attempted delivery" in message
-    assert "reconciliation remains the retry owner" in message
-    assert "cao messages trace 17" in message
-
-
-def test_f721_watchdog_kick_failure_never_starves_the_notification():
-    """A delivery fault is reported in the alert, not raised into the tick."""
-    service = StalledCallbackWatchdog()
-    create, deliver = _fire_ready_backlog(service, deliver_side_effect=RuntimeError("boom"))
-
-    deliver.assert_called_once()
-    create.assert_called_once()
-    _, _, message = create.call_args.args
-    assert "watchdog delivery re-attempt failed (RuntimeError)" in message
+# ---------------------------------------------------------------------------
+# Half 1 -- REMOVED by WP-ARCH 3c K4.
+#
+# ``test_f721_watchdog_kicks_delivery_once_and_still_notifies`` asserted that the
+# ready-backlog fire path called ``inbox_service.deliver_pending`` exactly once
+# for the stalled receiver and still composed its alert (sender
+# ``watchdog:<receiver>``, the "reconciliation remains the retry owner" line, and
+# a ``cao messages trace <id>`` pointer). Its sibling,
+# ``test_f721_watchdog_kick_failure_never_starves_the_notification``, asserted
+# that a raising ``deliver_pending`` was reported INSIDE that alert
+# ("watchdog delivery re-attempt failed (RuntimeError)") rather than escaping
+# into the tick.
+#
+# Both drove ``StalledCallbackWatchdog.tick_ready_backlog``, which K4 deletes with
+# the other four muted ticks, together with ``collect_due_notifications`` and the
+# ``_push_notice`` machinery the alert half went through. There is no seam left to
+# re-point at: the kick had one caller and the alert had one composer, and the
+# slice removes both. Re-pointing the deliver-once half at ``deliver_pending``
+# directly would assert that a mock called once was called once -- the kick was
+# the subject, not the callee.
+#
+# The concern the kick existed to serve -- a PENDING row with no open attempt
+# sitting behind an idle terminal -- is now owned by the delivery tick's adoption
+# pass (DIAG-LEGACY-ROW-ADOPTED), whose arms live in
+# ``test/app/delivery/test_adoption.py``. The three helpers that stood here
+# (``_backlog_observation``, ``_boundary_observation``, ``_fire_ready_backlog``)
+# existed only to drive the deleted tick and go with it; the surviving arms below
+# build their own fixtures.
+# ---------------------------------------------------------------------------
 
 
 def test_f721_reconcile_daemon_logs_swallowed_fault_at_warning(caplog):

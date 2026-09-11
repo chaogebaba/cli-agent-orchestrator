@@ -6,8 +6,8 @@ note where the class stood.
 AC16 (D19): two-terminal ordering — _find_supervisor resolves correctly when
 the supervisor is NOT the first claude_code terminal in query order.
 
-R1 (D15): supervisor self-notify — a supervisor terminal with no caller_id gets
-a self-notify obligation instead of the invalid-caller refusal.
+R1 (D15): supervisor self-notify — deleted by WP-ARCH 3c K4 with its subject;
+see the note where the class stood.
 
 R2 (D19): role-based resolver — exemption at :393 and push target at :989 both
 use the same role-based identity.
@@ -15,7 +15,7 @@ use the same role-based identity.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # WP-ARCH 3c K7: ``TestAC13TickFrequency`` is GONE with its subject
@@ -110,132 +110,27 @@ class TestAC16TwoTerminalOrdering:
         )
 
 
-class TestR1SupervisorSelfNotify:
-    """R1 (D15): supervisor self-notify replaces invalid-caller refusal.
-
-    V1-c: invokes the REAL stalled_callback_watchdog.tick_waiting_inbox method
-    with a supervisor fixture — no inline branching reimplementation.
-    """
-
-    def test_supervisor_no_caller_gets_self_notify(self):
-        """R1 KILL: supervisor terminal with no caller_id triggers self-notify
-        via the real tick_waiting_inbox path.
-
-        Mocks external dependencies but calls the REAL watchdog method that
-        contains the D15 branching logic at stalled_callback_watchdog.py:1236.
-        """
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-            StalledCallbackWatchdog,
-            WaitingInboxEpisode,
-        )
-
-        watchdog = StalledCallbackWatchdog(grace_seconds=30)
-
-        # Pre-seed a waiting episode that has exceeded grace period
-        episode = WaitingInboxEpisode(waiting_since=0.0)  # ancient
-        watchdog._waiting_inbox_episodes["sup_r1"] = episode
-
-        supervisor_metadata = {
-            "caller_id": None,  # Supervisor has no caller
-            "agent_profile": "supervisor",
-            "tmux_session": "cao-test",
-        }
-
-        mock_self_notify = MagicMock()
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
-                return_value={"sup_r1"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                return_value=supervisor_metadata,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
-                return_value=TerminalStatus.WAITING_USER_ANSWER,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-                return_value=None,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog."
-                "_create_self_notify_obligation",
-                mock_self_notify,
-            ),
-            patch("time.monotonic", return_value=99999.0),
-        ):
-            watchdog.tick_waiting_inbox(registry=None, now=99999.0)
-
-        # The REAL D15 code must have called _create_self_notify_obligation.
-        # WP-ARCH 3c K7 RELOCATED that helper from ``delivery_service`` into the
-        # watchdog itself (unchanged), because the ladder module it lived in is
-        # reduced to one predicate and both of its call sites are in this file.
-        # The patch target follows it; the branch under test is the same one.
-        mock_self_notify.assert_called_once_with("sup_r1")
-
-        # Episode must NOT be latched fired=True (that's the refusal path)
-        assert episode.fired is not True, (
-            "R1 KILL: episode.fired was latched True — supervisor hit the "
-            "refusal path instead of self-notify"
-        )
-
-    def test_worker_still_refused(self):
-        """R1 negative: worker terminal with caller_id==terminal_id still gets
-        refused via the REAL tick_waiting_inbox path."""
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-            StalledCallbackWatchdog,
-            WaitingInboxEpisode,
-        )
-
-        watchdog = StalledCallbackWatchdog(grace_seconds=30)
-
-        # Pre-seed episode
-        episode = WaitingInboxEpisode(waiting_since=0.0)
-        watchdog._waiting_inbox_episodes["worker1"] = episode
-
-        worker_metadata = {
-            "caller_id": "worker1",  # Self-referential (corrupt)
-            "agent_profile": "developer",
-            "tmux_session": "cao-test",
-        }
-
-        mock_self_notify = MagicMock()
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
-                return_value={"worker1"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-                return_value=worker_metadata,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
-                return_value=TerminalStatus.WAITING_USER_ANSWER,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-                return_value=None,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.stalled_callback_watchdog."
-                "_create_self_notify_obligation",
-                mock_self_notify,
-            ),
-            patch("time.monotonic", return_value=99999.0),
-        ):
-            watchdog.tick_waiting_inbox(registry=None, now=99999.0)
-
-        # Worker must NOT trigger self-notify
-        mock_self_notify.assert_not_called()
-
-        # Episode must be latched fired=True (refusal path)
-        assert (
-            episode.fired is True
-        ), "Worker with corrupt caller_id must hit the refusal path (fired=True)"
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K4: ``TestR1SupervisorSelfNotify`` is GONE with its subject
+# ---------------------------------------------------------------------------
+# Both arms drove the REAL ``StalledCallbackWatchdog.tick_waiting_inbox`` — that
+# was the point of them, V1-c having rejected an inline reimplementation of the
+# D15 branch. The positive arm seeded a ``WaitingInboxEpisode`` past grace and
+# asserted the supervisor branch called ``_create_self_notify_obligation`` and
+# left ``episode.fired`` unlatched; the negative arm asserted a worker whose
+# ``caller_id`` equals its own id still took the refusal path and latched
+# ``fired=True``.
+#
+# K4 deletes all three of those things together: the tick, the episode type it
+# kept its state in, and the obligation helper — which lost both of its callers
+# here and, as its own docstring predicted, went with them. There is no
+# self-notify branch left to take and no refusal path to be preferred over, so
+# the R1 distinction the arms drew has no code to draw it about. Nothing of it
+# survives elsewhere: the waiting-inbox alert is not reimplemented under another
+# name, it is withdrawn, and a supervisor whose inbox goes unread is now the
+# delivery queue's problem rather than the watchdog's.
+#
+# What this file still owns is the resolver those arms shared with the rest of
+# F203: ``AutoResponder._find_supervisor`` resolving by ROLE rather than by query
+# order (M5/R2 above). That is untouched by K4 and still kills its mutants.
+# ---------------------------------------------------------------------------

@@ -380,7 +380,13 @@ def test_t3_composite_normalizes_orphan_and_rolls_back_on_injected_transaction(
         seam_activation.Promoted,
     )
 
-    other = "watchdog.ready_backlog_gate"
+    # WP-ARCH 3c K4 deleted ``watchdog.ready_backlog_gate``, the op this arm
+    # used to stand for "some OTHER op in the same composite transaction".
+    # Nothing about the rollback is specific to that op — the arm needs two
+    # distinct parity ops and a crash between them — so it moves to a
+    # surviving one. It must not be ``agent_step.status_reads``, which the
+    # orphan normalisation above has already promoted.
+    other = "delivery.admission_status"
     with parity_db() as db:
         other_nonce = db.get(database.SeamParityModel, other).window_nonce
     evidence_ref = f"parity:build-a:1:{other_nonce}"
@@ -461,7 +467,10 @@ def test_t3_evidence_epoch_parser_preserves_colon_build_id(parity_db) -> None:
 def test_t3_composite_entry_state_truth_table(
     parity_db, authority: str, orphaned: bool, promotes: bool
 ) -> None:
-    op = "watchdog.waiting_inbox_gate"
+    # WP-ARCH 3c K4 deleted ``watchdog.waiting_inbox_gate``. The truth table is
+    # over ENTRY STATE (authority x orphaned), not over which op it is run
+    # against, so it moves to a surviving op unchanged.
+    op = "watchdog.cached_status"
     with parity_db() as db:
         activation = db.get(database.SeamActivationModel, op)
         active_version = 0 if authority == "legacy" else 1
@@ -787,7 +796,7 @@ def test_t5b_subprocess_reset_clears_marker_failure_server_inhibition(
     home = tmp_path / "cao-home"
     initial = _run_seam_subprocess(home, "status", "--json")
     assert initial.returncode == 0, initial.stderr
-    assert len(json.loads(initial.stdout)) == 5
+    assert len(json.loads(initial.stdout)) == len(seam_parity.PARITY_CONSUMER_OPS)
 
     db_file = home / "db" / "cli-agent-orchestrator.db"
     engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
@@ -892,14 +901,12 @@ async def test_t5d_watchdog_sweep_first_deferred_and_event_storm_capped(monkeypa
         "cli_agent_orchestrator.services.stalled_callback_watchdog.bus.subscribe",
         lambda _topic: queue,
     )
-    for name in (
-        "record_status",
-        "poll_unarmed_statuses",
-        "refresh_screen_fingerprints",
-        "notify_due",
-        "tick_waiting_inbox",
-        "tick_ready_backlog",
-    ):
+    # WP-ARCH 3c K4: ``notify_due``, ``tick_waiting_inbox`` and
+    # ``tick_ready_backlog`` are deleted, so they are no longer silenced here.
+    # This list is not the subject — it is the set of per-iteration side effects
+    # the arm neutralises so that ``sweep`` is the only thing left to count. What
+    # run() still does each pass is the liveness pair, and that is what remains.
+    for name in ("record_status", "poll_unarmed_statuses", "refresh_screen_fingerprints"):
         monkeypatch.setattr(watchdog, name, MagicMock())
     sweep = MagicMock()
     monkeypatch.setattr(seam_parity, "sweep", sweep)
@@ -920,14 +927,8 @@ async def test_t5d_throwing_sweep_does_not_hot_retry_under_event_storm(monkeypat
         "cli_agent_orchestrator.services.stalled_callback_watchdog.bus.subscribe",
         lambda _topic: queue,
     )
-    for name in (
-        "record_status",
-        "poll_unarmed_statuses",
-        "refresh_screen_fingerprints",
-        "notify_due",
-        "tick_waiting_inbox",
-        "tick_ready_backlog",
-    ):
+    # Same three deleted ticks dropped from the silence list as above.
+    for name in ("record_status", "poll_unarmed_statuses", "refresh_screen_fingerprints"):
         monkeypatch.setattr(watchdog, name, MagicMock())
     sweep = MagicMock(side_effect=RuntimeError("sweep failed"))
     monkeypatch.setattr(seam_parity, "sweep", sweep)
@@ -958,7 +959,7 @@ def test_t6_cli_status_rollback_reset_and_no_promote(parity_db) -> None:
     runner = CliRunner()
     status = runner.invoke(cli, ["seam", "status", "--json"])
     assert status.exit_code == 0
-    assert len(json.loads(status.output)) == 5
+    assert len(json.loads(status.output)) == len(seam_parity.PARITY_CONSUMER_OPS)
     help_result = runner.invoke(cli, ["seam", "--help"])
     assert help_result.exit_code == 0
     assert "promote" not in help_result.output
@@ -973,7 +974,11 @@ def test_t6_cli_status_initializes_fresh_home(tmp_path) -> None:
     result = _run_seam_subprocess(tmp_path / "fresh-home", "status", "--json")
     assert result.returncode == 0, result.stderr
     rows = json.loads(result.stdout)
-    assert len(rows) == 5
+    # DERIVED, not a literal. The property is "status reports every parity op",
+    # and a literal states the length of ``PARITY_CONSUMER_OPS`` a second time —
+    # so K4 dropping two ops from that tuple broke three arms in this file that
+    # were not about the op count at all.
+    assert len(rows) == len(seam_parity.PARITY_CONSUMER_OPS)
     assert {row["phase"] for row in rows} == {"collecting"}
 
 
