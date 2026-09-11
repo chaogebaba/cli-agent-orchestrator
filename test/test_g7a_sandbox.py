@@ -166,7 +166,12 @@ def test_tmux_ast_guard_is_closed() -> None:
         ("clients/tmux.py", "delete-buffer"),
         ("backends/tmux_backend.py", "list-windows"),
         ("backends/tmux_backend.py", "attach-session"),
-        ("services/fork_context_service.py", "display-message"),
+        # ec872703 (F545, #401) replaced this module's only raw-tmux site:
+        # ``display-message -p -t <session>:<window> '#{pane_pid}'`` became
+        # ``list-panes -t ... -F '#{pane_index} #{pane_id} #{pane_pid}'`` so
+        # first_pane() keys on the window's FIRST pane, not its ACTIVE one.
+        # The ledger follows the site; the guard coverage is unchanged.
+        ("services/fork_context_service.py", "list-panes"),
         ("cli/commands/info.py", "display-message"),
         ("backends/tmux_backend.py", "-u"),
     ],

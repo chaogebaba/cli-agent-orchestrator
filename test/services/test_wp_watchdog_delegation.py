@@ -27,6 +27,12 @@ def test_legacy_inbox_migration_and_null_park_warm_are_false(tmp_path, monkeypat
     monkeypatch.setattr(database, "engine", engine)
     database._migrate_mailbox_columns()
     database._migrate_inbox_failure_reason()
+    # F618 #474 (ddd615f7): `InboxModel` gained the deferred `expire_after_s` /
+    # `supersede_key` columns, so any ORM read of a row on this hand-built legacy
+    # schema emits `SELECT inbox.expire_after_s` and dies with "no such column".
+    # `init_db()` runs this migration in production; this test enumerates the
+    # migrations it needs, so it has to name this one too.
+    database._migrate_f582_d23_inbox_expiry()
     database._migrate_callback_barrier_columns()
     columns = {
         row["name"]

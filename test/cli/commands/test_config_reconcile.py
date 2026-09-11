@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -237,15 +238,86 @@ def test_sandbox_guard_runs_before_reconcile_or_mutation(reconcile_env, monkeypa
     assert not list(target.parent.glob("providers.toml.bak.*"))
 
 
+#: Shell/text-processing verbs that would mean the installer is *reading into*
+#: a TOML document rather than moving its bytes around.
+_TEXT_PROCESSORS = frozenset(
+    {
+        "grep", "egrep", "fgrep", "sed", "awk", "gawk", "cut", "tr",
+        "head", "tail", "sort", "uniq", "xargs", "eval", "read", "source",
+    }
+)
+
+#: TOML readers. Any of these anywhere in the script (shell *or* an embedded
+#: python heredoc) means install.sh re-grew the parser the fork already owns.
+_TOML_PARSERS = ("tomllib", "tomlkit", "import toml", "from toml", "toml.load")
+
+
 def test_root_installer_delegates_without_toml_or_stanza_parsing():
+    """F63 criterion 11 (structural): the root installer *delegates* provider
+    config reconciliation instead of re-growing its own TOML reader.
+
+    D6's rationale: D5(b)/(c) need TOML parsing plus a key-level semantic diff,
+    which POSIX ``sh`` cannot express, and each workaround (an inline
+    ``python3 -c`` parser, ``grep``-based stanza scraping, a ``uv run`` shim
+    around a hand-rolled reader) either breaks ``install.sh``'s contract or
+    re-derives a parser the fork already owns. So the pin is: exactly one
+    ``cao config reconcile`` call, no TOML parser anywhere in the script, and
+    no stanza/text-processing aimed at a ``.toml`` file.
+
+    Copying a TOML file byte-for-byte is NOT parsing. Since 2026-09-11 the
+    installer syncs ``profiles/<sub>/_clauses.toml`` (F613 #469 — without it
+    every routing-driven assign fails "clause table not found") and
+    ``orchestrator/routing.toml`` into the agent store via ``cp``/``mv``; the
+    shell never interprets those bytes. The original blanket
+    ``"toml" not in contents`` was a stale proxy for the invariant above and is
+    replaced by the four checks below, which still fail on every workaround D6
+    rejected.
+    """
     from test.conftest import ROOT_REPO
     if ROOT_REPO is None:
         pytest.skip("root repo not found (worktree without .git context)")
     install_script = ROOT_REPO / "install.sh"
     contents = install_script.read_text(encoding="utf-8")
+    lowered = contents.lower()
 
+    # (1) Exactly one delegation point.
     assert contents.count("cao config reconcile") == 1
-    assert "toml" not in contents.lower()
+
+    # (2) No TOML reader is constructed anywhere — shell or embedded heredoc.
+    for parser in _TOML_PARSERS:
+        assert parser not in lowered, (
+            f"install.sh re-grew a TOML parser ({parser!r}); "
+            "D6 delegates that to `cao config reconcile`"
+        )
+
+    # Comment lines may describe the delegation freely; only executable lines
+    # are constrained.
+    code_lines = [
+        (n, raw)
+        for n, raw in enumerate(contents.splitlines(), start=1)
+        if not raw.strip().startswith("#")
+    ]
+    code = "\n".join(raw for _, raw in code_lines).lower()
+
+    # (3) providers.toml is the reconcile command's file; the installer neither
+    #     seeds, diffs, backs up nor names it.
+    assert "providers.toml" not in code, (
+        "install.sh touches providers.toml directly; that file is owned by "
+        "`cao config reconcile`"
+    )
+
+    # (4) No provider-stanza reasoning, and no text-processing pointed at a
+    #     TOML path — every executable `toml` mention must be a plain file op.
+    assert ".profiles." not in code, "install.sh reasons about provider stanzas"
+    for lineno, raw in code_lines:
+        if "toml" not in raw.lower():
+            continue
+        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", raw)}
+        offenders = sorted(tokens & _TEXT_PROCESSORS)
+        assert not offenders, (
+            f"install.sh:{lineno} text-processes a TOML file with {offenders}: "
+            f"{raw.strip()!r} — parsing belongs to `cao config reconcile`"
+        )
 
 
 def test_backup_failure_aborts_before_atomic_publish(reconcile_env, monkeypatch):
