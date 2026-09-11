@@ -744,12 +744,16 @@ async def test_subscribe_must_be_the_first_message_on_the_connection(socket_path
     rather than the server's reaction: on the STREAMING connection the client
     sends exactly one message before ``events.subscribe``, namely nothing.
     """
-    seen: list[tuple[int, str]] = []
+    seen: list[tuple[bool, str]] = []
 
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
-        # ``requests`` is ordered across every connection; the connection index
-        # is what distinguishes the stream from the one-shots.
-        seen.append((len(server._writers), str(request.get("method"))))
+        # The fake points ``_writer`` at the connection the request ARRIVED on,
+        # and ``_stream_writer`` at the first connection ever opened — the one
+        # ``client.connect()`` made and the one the client streams on. Counting
+        # connections instead would be wrong: ``check_protocol`` opens its
+        # one-shot BEFORE the subscribe, so the count is already 2 by then.
+        on_stream = server._writer is server._stream_writer
+        seen.append((on_stream, str(request.get("method"))))
         await FakeHerdrServer._default_handler(server, request)
 
     async with FakeHerdrServer(socket_path) as server:
@@ -764,11 +768,15 @@ async def test_subscribe_must_be_the_first_message_on_the_connection(socket_path
     # The protocol read and the snapshot each opened their OWN connection, so by
     # the time the stream's subscribe arrives more than one connection exists —
     # and the FIRST connection carried no request before it.
-    stream_methods = [method for conns, method in seen if conns == 1]
-    assert stream_methods and stream_methods[0] == "events.subscribe"
-    assert [m for _c, m in seen].count(
-        "session.snapshot"
-    ) == 2, "check_protocol and snapshot each take a one-shot connection"
+    stream_methods = [method for on_stream, method in seen if on_stream]
+    assert stream_methods == [
+        "events.subscribe"
+    ], "the streaming connection carries the subscribe and nothing else"
+    off_stream = [method for on_stream, method in seen if not on_stream]
+    assert off_stream == [
+        "session.snapshot",
+        "session.snapshot",
+    ], "check_protocol and snapshot each take a one-shot connection"
 
 
 async def test_an_absent_schema_version_does_not_auto_match_the_pin(socket_path: str) -> None:
