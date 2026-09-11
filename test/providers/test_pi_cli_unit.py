@@ -1751,12 +1751,17 @@ class TestFreshSessionOnSpawn:
                 p._purge_stale_sessions()
         assert foreign.exists(), f"{alias} alias let purge delete another terminal's transcript"
 
-    def test_purge_refuses_a_leaf_swapped_for_a_symlink_after_the_check(self, tmp_path) -> None:
-        """MUTANT GUARD (drop ``O_NOFOLLOW``): the resolve() check is
-        check-then-use. This races it — the session dir passes the check and is
-        THEN replaced by a symlink to another terminal's dir, exactly what a
-        concurrent filesystem mutation does. Opening no-follow turns that into a
-        refusal (ELOOP) instead of a foreign deletion."""
+    def test_purge_refuses_a_terminal_dir_swapped_after_the_root_fd(self, tmp_path) -> None:
+        """MUTANT GUARD (open the whole path in one call instead of walking it):
+        ``O_NOFOLLOW`` guards only the FINAL component, so a one-shot
+        ``os.open("<root>/<tid>/sessions", ...)`` follows a ``<tid>`` swapped for
+        a symlink after any earlier check. This fires the swap the moment the
+        root fd is taken — the exact window the r2 racer exploited — and the
+        component walk must turn it into a refusal.
+
+        Deterministic rehost of r2's ``Path.resolve``-hooked leaf-swap test,
+        which the r3 shape no longer calls (EMPIRICAL-GATE-NO r2, repair 2).
+        """
         import os as _os
 
         root = tmp_path / "pi"
@@ -1768,17 +1773,17 @@ class TestFreshSessionOnSpawn:
         foreign = foreign_dir / "2026-09-09T00-00-00-000Z_t-other.jsonl"
         foreign.write_text("x", encoding="utf-8")
 
-        real_resolve = Path.resolve
-        swapped = []
+        real_open = _os.open
+        swapped: list[bool] = []
 
-        def racing_resolve(self, strict=False):  # type: ignore[no-untyped-def]
-            out = real_resolve(self, strict=strict)
-            if self == ours and not swapped:
+        def racing_open(path, flags, mode=0o777, *, dir_fd=None):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, mode, dir_fd=dir_fd)
+            if not swapped and dir_fd is None and str(path) == str(root):
                 swapped.append(True)
-                # The check has just passed; now lose the race.
-                _os.rename(str(ours), str(root / "t1234567" / "sessions.moved"))
-                (root / "t1234567" / "sessions").symlink_to(foreign_dir, target_is_directory=True)
-            return out
+                # The root fd is open; now swap the terminal dir underneath it.
+                _os.rename(str(root / "t1234567"), str(root / "t1234567.moved"))
+                (root / "t1234567").symlink_to(root / "t-other", target_is_directory=True)
+            return fd
 
         with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
             p = PiCliProvider("t1234567", "sess", "win0")
@@ -1787,11 +1792,82 @@ class TestFreshSessionOnSpawn:
                     "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
                     return_value={},
                 ),
-                patch.object(Path, "resolve", racing_resolve),
+                patch.object(_os, "open", racing_open),
             ):
                 p._purge_stale_sessions()
         assert swapped, "the race never fired — test is not exercising the window"
-        assert foreign.exists(), "purge followed a symlink swapped in after the check"
+        assert foreign.exists(), "purge followed a terminal dir swapped in after the check"
+
+    def test_real_concurrent_racer_never_deletes_a_foreign_transcript(self, tmp_path) -> None:
+        """Bounded stress test with a REAL concurrent racer and no injection.
+
+        r2 shipped a one-shot ``os.open`` with ``O_NOFOLLOW``; the reviewer's
+        racer — a thread alternating ``PI_RUNTIME_ROOT/<tid>`` between a real
+        directory (so every prior check passes) and a symlink to another
+        terminal — produced 3 foreign deletions in 8627 attempts against it, and
+        0 in 423426 against the component walk. This is that racer, bounded so
+        it costs ~1.5s in the ordinary suite. Any foreign deletion fails.
+        """
+        import os as _os
+        import threading
+        import time
+
+        root = tmp_path / "pi"
+        root.mkdir(parents=True)
+        own = root / "t-own"
+        stash = root / "t-own.stash"
+        other = root / "t-other"
+        (stash / "sessions").mkdir(parents=True)
+        (other / "sessions").mkdir(parents=True)
+        foreign = other / "sessions" / "foreign.jsonl"
+        foreign.write_text("foreign\n", encoding="utf-8")
+        _os.rename(str(stash), str(own))  # start as the real directory
+
+        stop = threading.Event()
+
+        def racer() -> None:
+            while not stop.is_set():
+                try:
+                    _os.rename(str(own), str(stash))
+                    _os.symlink(str(other), str(own))
+                    _os.unlink(str(own))
+                    _os.rename(str(stash), str(own))
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=racer, daemon=True)
+        t.start()
+        attempts = 0
+        deletions = 0
+        try:
+            with (
+                patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root),
+                patch(
+                    "cli_agent_orchestrator.providers.pi_cli." "_resolve_pi_fresh_session_on_spawn",
+                    lambda: True,
+                ),
+            ):
+                p = PiCliProvider.__new__(PiCliProvider)
+                p.terminal_id = "t-own"
+                p.session_dir = own / "sessions"
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline:
+                    attempts += 1
+                    try:
+                        p._purge_stale_sessions()
+                    except Exception:  # noqa: BLE001 — the racer makes anything possible
+                        pass
+                    if not foreign.exists():
+                        deletions += 1
+                        foreign.write_text("foreign\n", encoding="utf-8")
+        finally:
+            stop.set()
+            t.join(timeout=3)
+        assert attempts > 50, f"racer starved the purge loop (attempts={attempts})"
+        assert deletions == 0, (
+            f"purge deleted another terminal's transcript {deletions} time(s) "
+            f"in {attempts} attempts"
+        )
 
     def test_unlink_uses_the_open_dir_fd_not_the_path(self, tmp_path) -> None:
         """MUTANT GUARD (``os.unlink(str(sd / name))`` instead of
@@ -1862,21 +1938,120 @@ class TestFreshSessionOnSpawn:
         assert (sd / "link.jsonl").is_symlink(), "the symlink itself is not ours to remove"
         assert not ours.exists(), "our own regular transcript must still be purged"
 
-    def test_purge_guard_refuses_paths_outside_our_runtime_dir(self, tmp_path) -> None:
-        """MUTANT GUARD (drop the containment guard): a session_dir that is not
-        PI_RUNTIME_ROOT/<our terminal id>/sessions is never touched."""
-        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", tmp_path):
+    def test_only_jsonl_transcripts_are_purged(self, tmp_path) -> None:
+        """MUTANT GUARD (r2 M15 survivor): dropping the ``endswith(".jsonl")``
+        filter makes the purge delete EVERY regular file in our sessions
+        directory. Only pi transcripts are ours to remove; anything an operator
+        or another tool left there survives."""
+        root = tmp_path / "pi"
+        sd = root / "t1234567" / "sessions"
+        sd.mkdir(parents=True)
+        transcript = sd / "2026-09-10T00-00-00-000Z_t1234567.jsonl"
+        transcript.write_text("transcript", encoding="utf-8")
+        keepers = [
+            sd / "notes.txt",
+            sd / "2026-09-10T00-00-00-000Z_t1234567.jsonl.tmp",
+            sd / "index.json",
+            sd / ".gitkeep",
+        ]
+        for k in keepers:
+            k.write_text("keep", encoding="utf-8")
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
             p = PiCliProvider("t1234567", "sess", "win0")
+            with patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={},
+            ):
+                p._purge_stale_sessions()
+        assert not transcript.exists(), "the stale transcript must still be purged"
+        for k in keepers:
+            assert k.exists(), f"purge deleted a non-transcript file: {k.name}"
+
+    def test_every_stale_transcript_is_purged_not_just_the_first(self, tmp_path) -> None:
+        """r2 H3 NIT 3: every purge test wrote a single file, so nothing pinned
+        that the loop drains the directory."""
+        root = tmp_path / "pi"
+        sd = root / "t1234567" / "sessions"
+        sd.mkdir(parents=True)
+        stale = [sd / f"2026-09-0{n}T00-00-00-000Z_t1234567.jsonl" for n in range(1, 6)]
+        for f in stale:
+            f.write_text("x", encoding="utf-8")
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            with patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={},
+            ):
+                p._purge_stale_sessions()
+        assert [f for f in stale if f.exists()] == []
+
+    def test_one_unlink_failure_does_not_abort_the_rest(self, tmp_path) -> None:
+        """r2 H3 NIT 4: the unlink-error path warns and continues to the next
+        file. A mutant that re-raises would strand later transcripts."""
+        import os as _os
+
+        root = tmp_path / "pi"
+        sd = root / "t1234567" / "sessions"
+        sd.mkdir(parents=True)
+        names = [f"2026-09-0{n}T00-00-00-000Z_t1234567.jsonl" for n in range(1, 4)]
+        for n in names:
+            (sd / n).write_text("x", encoding="utf-8")
+
+        real_unlink = _os.unlink
+
+        def failing_unlink(path, *, dir_fd=None):  # type: ignore[no-untyped-def]
+            if path == names[0]:
+                raise OSError(13, "Permission denied")
+            return real_unlink(path, dir_fd=dir_fd)
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            with (
+                patch(
+                    "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                    return_value={},
+                ),
+                patch.object(_os, "unlink", failing_unlink),
+            ):
+                p._purge_stale_sessions()
+        assert (sd / names[0]).exists(), "the failing unlink should have been skipped"
+        assert not (sd / names[1]).exists(), "a later transcript was stranded by the failure"
+        assert not (sd / names[2]).exists(), "a later transcript was stranded by the failure"
+
+    def test_purge_guard_refuses_paths_outside_our_runtime_dir(self, tmp_path) -> None:
+        """MUTANT GUARD (drop the lexical ownership guard): a ``session_dir``
+        reassigned away from ``PI_RUNTIME_ROOT/<tid>/sessions`` is never touched.
+
+        Both directories are populated on purpose. The walk derives its path
+        from ``terminal_id``, so without the lexical guard a provider pointed at
+        a foreign dir silently purges the terminal-id dir it was NOT pointed at
+        — observable, and the reason the guard is live code in r3 (r2 M12 was
+        equivalent only against the old check-then-use shape).
+        """
+        root = tmp_path / "pi"
+        ours = root / "t1234567" / "sessions"
+        ours.mkdir(parents=True)
+        not_pointed_at = ours / "2026-09-10T00-00-00-000Z_t1234567.jsonl"
+        not_pointed_at.write_text("x", encoding="utf-8")
         foreign = tmp_path / "somewhere-else"
-        foreign.mkdir(parents=True, exist_ok=True)
+        foreign.mkdir(parents=True)
         victim = foreign / "other.jsonl"
         victim.write_text("x", encoding="utf-8")
-        p.session_dir = foreign
-        with patch(
-            "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults", return_value={}
-        ):
-            p._purge_stale_sessions()
-        assert victim.exists()
+
+        with patch("cli_agent_orchestrator.providers.pi_cli.PI_RUNTIME_ROOT", root):
+            p = PiCliProvider("t1234567", "sess", "win0")
+            p.session_dir = foreign
+            with patch(
+                "cli_agent_orchestrator.providers.pi_cli.get_provider_defaults",
+                return_value={},
+            ):
+                p._purge_stale_sessions()
+        assert victim.exists(), "purge reached the reassigned foreign directory"
+        assert (
+            not_pointed_at.exists()
+        ), "purge deleted the terminal-id directory the provider was not pointed at"
 
 
 class TestFreshSessionKnob:

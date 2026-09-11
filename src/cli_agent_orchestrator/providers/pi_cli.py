@@ -105,6 +105,33 @@ PI_BINARY = str(Path.home() / ".bun" / "bin" / "pi")
 # system-prompt and MCP-config files.
 PI_RUNTIME_ROOT = CAO_HOME_DIR / "pi"
 
+
+def _open_nofollow_chain(base: Path, parts: tuple[str, ...]) -> int:
+    """Open ``base/*parts`` as a directory fd, refusing a symlink at EVERY component.
+
+    F908 (#760) r3. ``O_NOFOLLOW`` guards only the FINAL component of a path, so
+    ``os.open("<root>/<tid>/sessions", ...|O_NOFOLLOW)`` still follows a ``<tid>``
+    that was swapped for a symlink after an earlier check — the window a real
+    concurrent racer exploited 3 times in 8627 attempts (EMPIRICAL-GATE-NO r2).
+    Walking from a fd on ``base`` and opening each component ``O_NOFOLLOW``
+    relative to the previous fd leaves no component re-resolved from a path, so
+    the race turns into an ``OSError`` instead of a foreign directory.
+
+    Raises ``OSError`` (``ELOOP`` for a symlinked component) rather than
+    returning a fd the caller must re-validate. The caller owns the fd.
+    """
+    fd = os.open(str(base), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 # ─── Status detection ─────────────────────────────────────────────────────────
 # All patterns run against ``strip_terminal_escapes(buffer)`` output, which
 # normalizes the raw pipe-pane byte stream into clean, line-oriented text
@@ -528,11 +555,14 @@ class PiCliProvider(BaseProvider):
         ``[pi_cli] fresh_session_on_spawn = false``, and on a resume spawn
         (never called from that arm).
 
-        Containment is enforced in three layers so this can never reach another
-        terminal's transcripts: the path must lexically BE
-        ``PI_RUNTIME_ROOT/<terminal id>/sessions``; it must still resolve there
-        after symlinks; and the enumeration/unlinks run through a no-follow
-        directory fd so nothing swapped in afterwards can redirect them.
+        Containment: the configured ``session_dir`` must lexically be
+        ``PI_RUNTIME_ROOT/<terminal id>/sessions``, and the directory is then
+        opened by walking that path one component at a time from
+        ``PI_RUNTIME_ROOT``, every component no-follow.  Enumeration, stat and
+        unlink all go through that fd.  There is therefore no path re-resolution
+        after the check, at any component, so a concurrent rename of the
+        terminal dir or the sessions leaf makes the open fail rather than
+        redirect a deletion.  Only regular ``*.jsonl`` files are removed.
         """
         if not _resolve_pi_fresh_session_on_spawn():
             logger.info(
@@ -542,34 +572,31 @@ class PiCliProvider(BaseProvider):
             )
             return
         sd = self.session_dir
-        # Guard 1 (physical containment): a symlinked ``sessions`` leaf, or a
-        # symlinked terminal dir, aliases ANOTHER terminal's transcripts —
-        # ``is_dir()`` and ``glob()`` both follow directory symlinks, so r1's
-        # lexical-only check happily deleted them (EMPIRICAL-GATE-NO, H4).
-        # Resolve both sides and require the real paths to agree.  A purely
-        # lexical ``sd == PI_RUNTIME_ROOT/<tid>/sessions`` check is deliberately
-        # NOT kept alongside this: it is unkillable dead code, since any path
-        # that resolves here IS this directory (r2 mutant M12).
-        try:
-            resolved_root = PI_RUNTIME_ROOT.resolve(strict=True)
-            resolved_sd = sd.resolve(strict=True)
-        except OSError:
+        # Guard 1 (ownership): the configured dir must lexically BE ours. This
+        # is live, killable code — the walk below derives its path from
+        # ``terminal_id``, never from ``sd``, so this check is the only thing
+        # tying the directory we open to the one the provider was configured
+        # with.  ``test_purge_guard_refuses_paths_outside_our_runtime_dir``
+        # kills its deletion.
+        if sd != PI_RUNTIME_ROOT / self.terminal_id / "sessions":
             return
-        if resolved_sd != resolved_root / self.terminal_id / "sessions":
-            return
-        # Guard 2 (no TOCTOU): enumerate and unlink through a no-follow
-        # directory fd, so a symlink swapped in between the checks above and
-        # the unlinks below cannot redirect a single deletion. ``O_NOFOLLOW``
-        # refuses to open the dir at all if the final component became a
-        # symlink; ``unlink(dir_fd=...)`` never resolves through one.
+        # Guard 2 (no TOCTOU at ANY component): ``O_NOFOLLOW`` constrains only
+        # the FINAL component, so opening the whole path in one call still
+        # follows a terminal dir swapped for a symlink after any prior check —
+        # a real concurrent racer deleted another terminal's transcripts 3
+        # times in 8627 attempts against that shape (EMPIRICAL-GATE-NO r2, H4).
+        # Walking component-by-component from a fd on PI_RUNTIME_ROOT removes
+        # the window: every component is opened no-follow.
         try:
-            dir_fd = os.open(str(sd), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            dir_fd = _open_nofollow_chain(PI_RUNTIME_ROOT, (self.terminal_id, "sessions"))
         except OSError as exc:
             logger.warning("pi worker %s: refusing to purge %s: %s", self.terminal_id, sd, exc)
             return
         try:
             for name in sorted(os.listdir(dir_fd)):
                 if not name.endswith(".jsonl"):
+                    # Only pi transcripts are ours to delete; anything else an
+                    # operator or another tool left here survives.
                     continue
                 try:
                     st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -1174,4 +1201,13 @@ def _resolve_pi_fresh_session_on_spawn() -> bool:
             return True
         if token in ("false", "0", "no", "off"):
             return False
+    # r2 H4 NIT: an unrecognised value falls back to the default (deliberately —
+    # a typo must never silently DISABLE a correctness fix), but say so, or the
+    # operator can only infer their typo from behaviour.
+    logger.warning(
+        "providers.toml [pi_cli] fresh_session_on_spawn=%r is not a recognised "
+        "boolean; falling back to %s",
+        raw,
+        _PI_FRESH_SESSION_ON_SPAWN_DEFAULT,
+    )
     return _PI_FRESH_SESSION_ON_SPAWN_DEFAULT
