@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -71,6 +72,54 @@ def _install_python_version(source_root: Path) -> str:
     return f"{match.group(1)}.{match.group(2)}"
 
 
+def _atomic_copy(src: Path, dst: Path) -> None:
+    """Copy ``src`` over ``dst`` via a same-directory temp file + rename.
+
+    F838 (#695): a plain copy truncates then streams, so a concurrent resolver
+    (an assign resolving a composition stub) can read a half-written fragment.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _sync_composition_stores(workspace_root: Path) -> None:
+    """Mirror install.sh's F497 D3/D9 step: positions/, overlays/, routing.toml.
+
+    Without this, ``cao redeploy`` reinstalled profiles against a STALE store
+    (a new ``[budget]`` row or clause fragment in the repo never reached
+    ``agent-store/positions``), so every composition-bearing profile failed the
+    F497 lint on redeploy while ``./install.sh`` succeeded (2026-09-11).
+    """
+    from cli_agent_orchestrator.constants import (
+        local_agent_store_dir,
+        overlays_store_dir,
+        positions_store_dir,
+        routing_toml_path,
+    )
+
+    for sub, store_dir in (
+        ("positions", positions_store_dir()),
+        ("overlays", overlays_store_dir()),
+    ):
+        src_dir = workspace_root / "profiles" / sub
+        if not src_dir.is_dir():
+            continue
+        for frag in sorted(src_dir.glob("*.md")):
+            first = frag.read_text(encoding="utf-8").splitlines()[:1]
+            if first and first[0].startswith(_FROZEN_PROFILE_MARKER):
+                continue
+            _atomic_copy(frag, store_dir / frag.name)
+        clauses = src_dir / "_clauses.toml"
+        if clauses.is_file():
+            _atomic_copy(clauses, store_dir / clauses.name)
+    routing = workspace_root / "orchestrator" / "routing.toml"
+    if routing.is_file():
+        local_agent_store_dir().mkdir(parents=True, exist_ok=True)
+        _atomic_copy(routing, routing_toml_path())
+
+
 def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:
     workspace_root = source_root.parent
     subprocess.run(
@@ -90,6 +139,7 @@ def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> No
     if force_providers:
         reconcile_command.append("--force-providers")
     subprocess.run(reconcile_command, check=True)
+    _sync_composition_stores(workspace_root)
     for profile in _installable_profiles(workspace_root):
         # cao install derives the provider from the profile's own frontmatter.
         subprocess.run([cao, "install", str(profile)], check=True)

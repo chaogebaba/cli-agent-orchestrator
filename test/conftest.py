@@ -243,6 +243,17 @@ def _enable_memory_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_herdr_systemd_unit(monkeypatch):
+    """Never let a test start the REAL cao-herdr.service on the dev laptop.
+
+    HerdrBackend._ensure_session_running prefers the systemd user unit when it
+    is installed; an empty CAO_HERDR_UNIT disables that path so tests exercise
+    the plain-spawn fallback (which they mock via subprocess.Popen).
+    """
+    monkeypatch.setenv("CAO_HERDR_UNIT", "")
+
+
+@pytest.fixture(autouse=True)
 def _reset_backend_registry():
     """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
     from cli_agent_orchestrator.backends import registry

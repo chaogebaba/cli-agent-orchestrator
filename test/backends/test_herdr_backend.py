@@ -1100,6 +1100,91 @@ class TestEnsureSessionRunning:
                             HerdrBackend(herdr_session="cao")
 
 
+class TestEnsureSessionRunningViaUnit:
+    """The herdr server is started through cao-herdr.service when it exists.
+
+    Keeps herdr out of cao-server's cgroup: a cao-server restart used to SIGTERM
+    the child herdr server, wait out the 45s stop timeout, SIGABRT it and lose
+    every live worker pane (2026-09-11).
+    """
+
+    @staticmethod
+    def _live_then_true():
+        live_sequence = [False, True]
+
+        def side_effect(path):
+            return live_sequence.pop(0) if live_sequence else True
+
+        return side_effect
+
+    def test_starts_unit_instead_of_spawning(self, monkeypatch):
+        monkeypatch.setenv("CAO_HERDR_UNIT", "cao-herdr.service")
+        run_calls = []
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(HerdrBackend, "_socket_is_live", side_effect=self._live_then_true()):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch(
+                    "cli_agent_orchestrator.backends.herdr_backend.shutil.which",
+                    return_value="/usr/bin/systemctl",
+                ):
+                    with patch(
+                        "cli_agent_orchestrator.backends.herdr_backend.subprocess.run",
+                        side_effect=fake_run,
+                    ):
+                        with patch("subprocess.Popen") as mock_popen:
+                            with patch("time.sleep"):
+                                HerdrBackend(herdr_session="cao")
+
+        mock_popen.assert_not_called()
+        assert run_calls == [
+            ["systemctl", "--user", "cat", "cao-herdr.service"],
+            ["systemctl", "--user", "start", "cao-herdr.service"],
+        ]
+
+    def test_falls_back_to_spawn_when_unit_missing(self, monkeypatch):
+        monkeypatch.setenv("CAO_HERDR_UNIT", "cao-herdr.service")
+
+        def fake_run(cmd, **kwargs):
+            # `systemctl --user cat` fails: unit not installed.
+            return MagicMock(returncode=1, stdout="", stderr="No files found")
+
+        with patch.object(HerdrBackend, "_socket_is_live", side_effect=self._live_then_true()):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch(
+                    "cli_agent_orchestrator.backends.herdr_backend.shutil.which",
+                    return_value="/usr/bin/systemctl",
+                ):
+                    with patch(
+                        "cli_agent_orchestrator.backends.herdr_backend.subprocess.run",
+                        side_effect=fake_run,
+                    ):
+                        with patch("subprocess.Popen") as mock_popen:
+                            with patch("time.sleep"):
+                                HerdrBackend(herdr_session="cao")
+
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args[0][0] == ["herdr", "--session", "cao", "server"]
+
+    def test_default_unit_only_for_cao_session(self, monkeypatch):
+        monkeypatch.delenv("CAO_HERDR_UNIT", raising=False)
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
+            assert HerdrBackend(herdr_session="cao")._session_unit_name() == "cao-herdr.service"
+            assert HerdrBackend(herdr_session="other")._session_unit_name() is None
+        monkeypatch.setenv("CAO_HERDR_UNIT", "")
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
+            assert HerdrBackend(herdr_session="cao")._session_unit_name() is None
+
+
 # --- F882 (#735): socket-liveness health ---
 
 

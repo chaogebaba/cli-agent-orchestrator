@@ -206,7 +206,9 @@ def _finish_launch_after_start(terminal, *, headless, message, is_async):
                 )
             )
         get_backend().attach_session(terminal["session_name"])
-    elif message:
+    else:
+        click.echo(f"Attach with: cao session attach {terminal['session_name']}")
+    if headless and message:
         ready = wait_until_terminal_status(
             terminal["id"],
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

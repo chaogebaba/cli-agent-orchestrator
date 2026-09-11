@@ -123,8 +123,11 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
     result = install_agent(service_source, provider, parsed_env or None)
 
     if not result.success:
-        click.echo(f"Error: {result.message}", err=True)
-        return
+        # Exit non-zero: `cao redeploy` (subprocess check=True) and install.sh
+        # must see a failed profile install, not a green run that silently
+        # skipped it (2026-09-11: every composition profile failed the F497
+        # lint and redeploy still reported success).
+        raise click.ClickException(result.message)
 
     if copied_from_file:
         click.echo("✓ Copied agent from file to local store")

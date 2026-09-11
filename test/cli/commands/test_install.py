@@ -207,14 +207,18 @@ class TestInstallCommand:
         mock_install.assert_not_called()
 
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
-        """Service failures should be surfaced as CLI errors without raising."""
+        """Service failures surface as CLI errors AND a non-zero exit.
+
+        2026-09-11: exit 0 let `cao redeploy` / install.sh report success while
+        every composition profile had silently failed the F497 lint.
+        """
         with patch(
             "cli_agent_orchestrator.cli.commands.install.install_agent",
             return_value=InstallResult(success=False, message="Source not found: missing"),
         ):
             result = runner.invoke(install, ["missing"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "Error: Source not found: missing" in result.output
 
     def test_install_invalid_env_format_returns_click_error(self, runner: CliRunner) -> None:

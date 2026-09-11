@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -1363,6 +1364,58 @@ class HerdrBackend(TerminalBackend):
             return "unavailable"
         return "ok" if self._socket_is_live(socket_path) else "socket_closed"
 
+    def _session_unit_name(self) -> Optional[str]:
+        """Name of the systemd user unit that owns this session's herdr server.
+
+        ``CAO_HERDR_UNIT`` overrides (empty string disables). The default only
+        applies to the canonical ``cao`` session; other sessions have no unit.
+        """
+        env = os.environ.get("CAO_HERDR_UNIT")
+        if env is not None:
+            return env or None
+        return "cao-herdr.service" if self._herdr_session == "cao" else None
+
+    def _start_session_unit(self) -> bool:
+        """Start the herdr server through its systemd user unit, if one exists.
+
+        Keeps the herdr server OUT of cao-server's cgroup so a cao-server restart
+        never signals it (the pre-unit behaviour: 45s stop timeout + SIGABRT +
+        every live worker pane lost, 2026-09-11). Returns True when the unit was
+        started (or is already active), False when systemd or the unit is
+        unavailable so the caller can fall back to a plain spawn.
+        """
+        unit = self._session_unit_name()
+        if not unit or shutil.which("systemctl") is None:
+            return False
+        try:
+            probe = subprocess.run(
+                ["systemctl", "--user", "cat", unit],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if probe.returncode != 0:
+                return False
+            res = subprocess.run(
+                ["systemctl", "--user", "start", unit],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("herdr_unit_start_failed unit=%s error=%s", unit, exc)
+            return False
+        if res.returncode != 0:
+            logger.warning(
+                "herdr_unit_start_failed unit=%s rc=%s stderr=%s",
+                unit,
+                res.returncode,
+                (res.stderr or "").strip(),
+            )
+            return False
+        logger.info("Started herdr session '%s' via %s", self._herdr_session, unit)
+        return True
+
     def _ensure_session_running(self) -> None:
         """Start the herdr session server if it is not actually listening.
 
@@ -1404,12 +1457,17 @@ class HerdrBackend(TerminalBackend):
             f"Herdr session '{self._herdr_session}' not running "
             f"(socket {socket_path} not live) — starting server."
         )
-        subprocess.Popen(
-            ["herdr", "--session", self._herdr_session, "server"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        if not self._start_session_unit():
+            # Fallback (no systemd, or no cao-herdr.service installed): spawn the
+            # server as a detached child. NOTE: under systemd this lands the herdr
+            # server inside cao-server's cgroup, so a cao-server restart kills it
+            # and every live pane with it — install the unit to avoid that.
+            subprocess.Popen(
+                ["herdr", "--session", self._herdr_session, "server"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
 
         # Give herdr a moment to create the socket file before polling.
         time.sleep(0.5)

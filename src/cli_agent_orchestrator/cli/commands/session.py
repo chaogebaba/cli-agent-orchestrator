@@ -161,6 +161,7 @@ def start(
     else:
         click.echo(f"Session created: {payload['session']['name']}")
         click.echo(f"Terminal created: {payload['supervisor_terminal']['name']}")
+        click.echo(f"Attach with: cao session attach {payload['session']['name']}")
 
 
 @session.command("manifest")
@@ -366,6 +367,24 @@ def recover(
             )
     if result.get("manifest_error"):
         click.echo(f"manifest: failed [{result['manifest_error']}]", err=True)
+
+
+@session.command("attach")
+@click.argument("session_name")
+def attach(session_name):
+    """Attach this terminal to a session's multiplexer UI (herdr or tmux).
+
+    Backend-agnostic replacement for ``tmux attach -t <name>``: under the herdr
+    backend sessions are herdr workspaces, so tmux reports "no sessions".
+    """
+    from cli_agent_orchestrator.backends.registry import get_backend
+    from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
+
+    sync_backend_from_server()
+    try:
+        get_backend().attach_session(session_name)
+    except Exception as exc:  # backend raises its own TerminalBackendError family
+        raise click.ClickException(f"attach failed: {exc}")
 
 
 @session.command("close")
