@@ -193,7 +193,7 @@ def test_delivered_rung1_reschedules_on_backoff_not_tick(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 3600.0, "shadow")
+            _drive_one_obligation(db, obl, now, 3600.0)
             db.commit()
             refreshed = db.query(DeliveryObligationModel).one()
             nxt = refreshed.next_attempt_at
@@ -231,7 +231,7 @@ def test_first_ring_uses_legacy_text_repush_uses_count(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 3600.0, "shadow")
+            _drive_one_obligation(db, obl, now, 3600.0)
     assert captured["body"] is None  # legacy first-ring text path
 
     # Re-ring: one prior delivery recorded.
@@ -243,7 +243,7 @@ def test_first_ring_uses_legacy_text_repush_uses_count(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 3600.0, "shadow")
+            _drive_one_obligation(db, obl, now, 3600.0)
     assert captured["body"] is not None
     assert "re-push" in captured["body"]
 
@@ -275,7 +275,7 @@ def test_hold_waiting_user_answer_skips_ring_keeps_obligation(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 3600.0, "shadow")
+            _drive_one_obligation(db, obl, now, 3600.0)
             db.commit()
             refreshed = db.query(DeliveryObligationModel).one()
             assert refreshed.state == "OPEN"
@@ -371,7 +371,7 @@ def test_consolidated_pending_ids_on_repush(ds_db):
     ):
         with ds_db() as db:
             obl = db.query(DeliveryObligationModel).one()
-            _drive_one_obligation(db, obl, now, 3600.0, "shadow")
+            _drive_one_obligation(db, obl, now, 3600.0)
 
     assert captured["body"] is not None
     assert "1,2,3" in captured["body"]

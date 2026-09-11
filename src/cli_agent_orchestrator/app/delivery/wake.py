@@ -105,7 +105,7 @@ class WakeService:
     Holds the two ports side by side and hands each row to exactly one of them.
     Nothing here reads a switch position: the muting of D6's surfaces is the
     tick's business and the paste ban is the ROLE's, which is what makes the ban
-    hold under ``off``, ``shadow``, ``drain`` and ``on`` alike (§A1.5).
+    hold under ``off``, ``drain`` and ``on`` alike (§A1.5).
     """
 
     def __init__(

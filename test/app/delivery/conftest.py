@@ -119,8 +119,8 @@ class InMemoryQueueStore:
         receiver_id: str | None = None,
     ) -> list[QueueMessage]:
         # The mode filter is reproduced here for the same reason the real
-        # statement carries it: a double that could hand out a shadow row would
-        # let an app-level test pass against behaviour the store forbids.
+        # statement carries it: a double that could hand out a non-live row
+        # would let an app-level test pass against behaviour the store forbids.
         due = [
             row
             for row in self.rows.values()
@@ -149,13 +149,6 @@ class InMemoryQueueStore:
     def get_by_idempotency_key(self, key: str) -> QueueMessage | None:
         msg_id = self.by_key.get(key)
         return None if msg_id is None else self.rows[msg_id]
-
-    def get_by_legacy_id(self, legacy_message_id: int) -> QueueMessage | None:
-        self._guard("get_by_legacy_id")
-        for row in self.rows.values():
-            if row.legacy_message_id == legacy_message_id:
-                return row
-        return None
 
     def attempts_for(self, msg_id: str) -> list[DeliveryAttempt]:
         return list(self.attempts.get(msg_id, []))

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from cli_agent_orchestrator.app.worker_truth.agreement import build_agreement_report
+from cli_agent_orchestrator.adapters.truth.legacy_egress import fed_by
 from cli_agent_orchestrator.core.events import (
     PROJECTION_ORIGIN,
     Confidence,
@@ -114,7 +114,7 @@ def test_a_pre_cutover_finding_is_still_readable_after_the_rename(rig: Rig) -> N
     assert len(rig.findings.list_findings(code=FindingCode.DIAG_LEGACY_DISAGREE)) == 1
 
 
-# -- fed_by and the agreement report ----------------------------------------
+# -- fed_by, the field that keeps a publish from confirming itself ----------
 
 
 def _row(
@@ -142,57 +142,31 @@ def _row(
     )
 
 
-def test_the_agreement_report_drops_publishes_the_projection_fed() -> None:
-    """D5's exclusion, and the mutant §12 names: ``fed_by`` dropped from the publish.
+def test_a_publish_the_projection_fed_is_marked_as_an_echo() -> None:
+    """D5's exclusion, at the function that makes it.
 
-    With the field gone the report keeps counting, keeps comparing, and reports a
-    rising agreement rate as the cutover advances — for that reason alone.  The
-    property is the ABSENCE of an echo, which is why it is asserted as a
-    difference between two row sets rather than by a session case.
+    This used to be asserted through the AC10 agreement report's counters; the
+    report went with shadow-live mode (#738), so the rule is asserted where it
+    actually lives. The rule itself is unchanged and still load-bearing: once D1
+    publishes the projection through this same egress, a reader that treated the
+    echo as an independent legacy observation would be comparing the projection
+    with itself and reporting perfect agreement forever.
+
+    MUTANT: return ``Producer.PANE.value`` unconditionally and the first case
+    fails — every publish then looks pane-fed, which is the silent-agreement bug.
     """
-    transition = _row(
-        1,
-        DecisionKind.STATUS_TRANSITION,
-        {"from": "starting", "to": "busy"},
-        decision=DecisionKind.STATUS_TRANSITION,
-        producer=Producer.SERVER,
-        confidence=Confidence.AUTHORITATIVE,
-    )
-    echo = _row(
-        2,
-        EventKind.STATUS_LEGACY_PUBLISHED,
-        {"latched_status": "processing", "fed_by": PROJECTION_ORIGIN},
-    )
-    independent = _row(
-        3, EventKind.STATUS_LEGACY_PUBLISHED, {"latched_status": "idle", "fed_by": "pane"}
-    )
-
-    with_echo = build_agreement_report([transition, echo])
-    with_pane = build_agreement_report([transition, independent])
-
-    assert with_echo.total_legacy_publishes == 0
-    assert with_echo.total_comparisons == 0
-    assert with_pane.total_legacy_publishes == 1
-    assert with_pane.total_comparisons == 1
+    assert fed_by(PROJECTION_ORIGIN) == PROJECTION_ORIGIN
+    assert fed_by("pane") == Producer.PANE.value
+    assert fed_by("anything-else") == Producer.PANE.value
 
 
-def test_a_row_written_before_phase_2_still_counts() -> None:
-    """Rows from phase 1 carry no ``fed_by`` at all.
+def test_a_row_written_before_phase_2_is_read_as_pane_fed() -> None:
+    """Rows from phase 1 carry no ``fed_by`` at all, and absent must mean "pane".
 
-    Absent must mean "the pane fed it", which is what was true then.  Treating a
-    missing field as the projection would silently empty the report of its whole
-    history and fail the content floor for a reason nobody could see.
+    That is what was true then. Treating a missing field as the projection would
+    silently reclassify the whole of phase 1's history as echoes.
     """
-    transition = _row(
-        1,
-        DecisionKind.STATUS_TRANSITION,
-        {"from": "starting", "to": "busy"},
-        decision=DecisionKind.STATUS_TRANSITION,
-        producer=Producer.SERVER,
-        confidence=Confidence.AUTHORITATIVE,
-    )
-    legacy = _row(2, EventKind.STATUS_LEGACY_PUBLISHED, {"latched_status": "processing"})
+    legacy = _row(1, EventKind.STATUS_LEGACY_PUBLISHED, {"latched_status": "processing"})
 
-    report = build_agreement_report([transition, legacy])
-
-    assert report.total_legacy_publishes == 1
+    assert "fed_by" not in legacy.payload
+    assert fed_by(legacy.payload.get("fed_by", "pane")) == Producer.PANE.value

@@ -424,7 +424,7 @@ def test_case17_the_ban_does_not_consult_the_switch(queue: SqliteQueueStore, wak
     position D9's boot guard can impose without an operator asking for it, so a
     ban scoped to ``on`` would be false in the one position nobody chose.
     """
-    for position in (SwitchPosition.OFF, SwitchPosition.SHADOW, SwitchPosition.DRAIN):
+    for position in (SwitchPosition.OFF, SwitchPosition.DRAIN):
         carrier = RecordingCarrier()
         injector = RecordingInjector()
         directory = FakeDirectory()
@@ -835,23 +835,19 @@ def test_the_completion_cancel_reaches_a_steer_supersede_key_cannot(
     assert harness.queue.get(plain.msg_id).state is MsgState.READY  # type: ignore[union-attr]
 
 
-def test_the_flip_sweeps_an_unresolved_shadow_row(harness: Harness) -> None:
-    """§7a's stranded shadow row, ended rather than left open forever."""
-    stray = harness.queue.enqueue(
-        EnqueueDraft(idempotency_key="stray", receiver_id=SEAT, mode=QueueMode.SHADOW)
+def test_a_non_live_row_is_never_claimed_or_woken_about(harness: Harness) -> None:
+    """The ``mode='live'`` filter, from the tick's side of it.
+
+    The mode that wrote such rows is retired (#738) and the rows are not: a
+    deployment upgraded over a 3a database still holds them, and the tick must
+    walk past them exactly as it did before.
+    """
+    stray = harness.enqueue("obs")
+    harness.queue._pool.connection().execute(  # noqa: SLF001 — the condition IS the column
+        "UPDATE delivery_msg SET mode = 'shadow' WHERE msg_id = ?", (stray.msg_id,)
     )
-    swept = harness.queue.sweep_shadow(now=harness.clock.now())
+    harness.queue._pool.connection().commit()  # noqa: SLF001
 
-    assert swept == 1
-    row = harness.queue.get(stray.msg_id)
-    assert row is not None and row.state is MsgState.SUPERSEDED
-
-
-def test_a_shadow_row_is_never_claimed_or_woken_about(harness: Harness) -> None:
-    """The ``mode='live'`` filter, from the tick's side of it."""
-    harness.queue.enqueue(
-        EnqueueDraft(idempotency_key="obs", receiver_id=SEAT, mode=QueueMode.SHADOW)
-    )
     harness.tick.run_once(now=harness.clock.now())
 
     assert harness.carrier.writes == []

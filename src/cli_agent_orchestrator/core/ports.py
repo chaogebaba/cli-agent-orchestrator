@@ -117,8 +117,8 @@ class EventStore(Protocol):
     ) -> list[WorkerEvent]:
         """Read rows in ``(terminal_id, seq)`` order, oldest first.
 
-        ``terminal_id=None`` reads the whole fleet, which is what the agreement
-        report (AC10) and ``cao diag --session`` need.
+        ``terminal_id=None`` reads the whole fleet, which is what
+        ``cao diag --session`` needs.
         """
         ...
 
@@ -186,7 +186,7 @@ class CheckRunner(Protocol):
 
 @runtime_checkable
 class StateFolder(Protocol):
-    """Folds one appended event into the shadow projection (WP-ARCH phase 2, A1).
+    """Folds one appended event into the state projection (WP-ARCH phase 2, A1).
 
     The fold's driver, and it exists here for exactly the reason
     :class:`CheckRunner` does: the projector lives in ``app`` and the adapter that
@@ -215,7 +215,7 @@ class StateFolder(Protocol):
 
 
 class StateProjection(Protocol):
-    """The shadow projection row for one terminal (AC6).
+    """The state projection row for one terminal (AC6).
 
     Structural, not a model, so the adapter that owns the table decides its own
     representation.  ``last_probe_at`` and ``last_source_probe_at`` are the two
@@ -269,7 +269,7 @@ class StateProjection(Protocol):
 class StateStore(Protocol):
     """Read/write access to ``worker_state_shadow``.
 
-    Phase 1 keeps this projection SHADOW-ONLY: nothing in ``services/`` reads it,
+    Phase 1 keeps this projection UNPUBLISHED: nothing in ``services/`` reads it,
     which is what makes AC11's "no behaviour change with the switch ON" true by
     construction rather than by assertion.  The projector (AC6) is its only
     writer.
@@ -545,10 +545,6 @@ class QueueStore(Protocol):
 
     def all_terminal(self, msg_ids: tuple[str, ...]) -> bool:
         """True when every id has ended.  An empty set is terminal vacuously."""
-        ...
-
-    def sweep_shadow(self, *, now: datetime) -> int:
-        """End every surviving shadow row — the write-through flip's first act."""
         ...
 
     def cancel_on_complete(self, receiver_id: str, *, now: datetime) -> tuple[str, ...]:

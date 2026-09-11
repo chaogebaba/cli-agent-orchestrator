@@ -186,8 +186,8 @@ class SqliteEventStore:
 
         Ordering depends on the scope, and deliberately so: within one terminal
         the sequence IS the order, while a fleet-wide read has no single
-        sequence and orders by ``ingested_at`` — which is also the ordering the
-        agreement report (AC10) classifies disagreements by.
+        sequence and orders by ``ingested_at`` — the only ordering a fleet-wide
+        reader can compare two producers' rows by.
         """
         clauses: list[str] = []
         params: list[object] = []

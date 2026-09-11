@@ -468,7 +468,7 @@ def attempt_rung1(
 ) -> LadderResult:
     """Rung 1: native CC socket ring + cc_inbox_path write. Best-effort.
 
-    At S0 (shadow), this is purely additive — old transports still run.
+    This is purely additive — old transports still run.
     F203 D9: no_registry_records is a counted refusal → ejection after N.
 
     F547 #403: message_body, when provided, carries the re-push text (attempt
@@ -875,7 +875,6 @@ def convergence_tick() -> None:
         return
     from cli_agent_orchestrator.services.config_service import ConfigService
 
-    phase = ConfigService.get("delivery.phase", "shadow")
     tick_s = float(ConfigService.get("delivery.tick_s", 5.0))
     escalate_after_s = float(ConfigService.get("delivery.escalate_after_s", 120.0))
 
@@ -894,7 +893,7 @@ def convergence_tick() -> None:
 
         for obl in due:
             try:
-                _drive_one_obligation(db, obl, now, escalate_after_s, phase)
+                _drive_one_obligation(db, obl, now, escalate_after_s)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -1140,7 +1139,6 @@ def _drive_one_obligation(
     obl: DeliveryObligationModel,
     now: datetime,
     escalate_after_s: float,
-    phase: str,
 ) -> None:
     """Drive a single obligation one step down the ladder."""
     from cli_agent_orchestrator.services.config_service import ConfigService
@@ -1223,7 +1221,7 @@ def _drive_one_obligation(
         pending_ids = _pending_row_ids_for_mailbox(db, obl.mailbox_id)
         repush_body = _rung1_repush_body(delivered_count, msg_age_s, pending_ids)
 
-    # Attempt rung 1 (optimization — only in primary or shadow modes)
+    # Attempt rung 1 (optimization)
     r1 = attempt_rung1(target, obl.inbox_row_id, oldest_age_s=msg_age_s, message_body=repush_body)
     emit_trace_or_collapse(obl.inbox_row_id, r1.phase, r1.decision, r1.reason, db)
 

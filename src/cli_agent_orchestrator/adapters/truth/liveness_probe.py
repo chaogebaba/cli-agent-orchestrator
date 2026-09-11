@@ -102,8 +102,8 @@ class _Track:
     ``confirmed_present`` starts as ``None`` — "never yet judged".  That third
     value matters: ``pane.recovered`` fires when a pane that was confirmed ABSENT
     is listed again, and a terminal seen for the first time has not recovered
-    from anything.  Emitting a recovery row at startup would inflate the AC10
-    content floor with rows describing an event that did not happen.
+    from anything.  Emitting a recovery row at startup would fill the log with
+    rows describing an event that did not happen.
     """
 
     confirmed_present: bool | None = None
