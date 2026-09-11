@@ -390,13 +390,18 @@ def test_d5_join_bumps_revision_and_fired_replaces_generation():
     assert replacement.revision == 0
 
 
-@pytest.mark.parametrize("field", ["resume_reserved_at", "auto_resumed"])
-def test_d5_reserved_and_auto_resumed_episodes_replace(field):
-    service, _ = _armed()
-    first = service._episodes["worker"]
-    setattr(first, field, 1.0 if field == "resume_reserved_at" else True)
-    service.record_inbound_task("worker", "caller", "developer")
-    assert service._episodes["worker"].generation == first.generation + 1
+# ``test_d5_reserved_and_auto_resumed_episodes_replace`` stood here, and it went
+# with the fields it parametrised over. It asserted that a second inbound task
+# REPLACES an episode rather than joining it when that episode is mid-auto-resume
+# — ``resume_reserved_at`` set, or ``auto_resumed`` already true.
+#
+# WP-ARCH 3c slice 4 deletes the auto-resume machinery, and those two fields with
+# it: they were written only inside ``collect_due_notifications``, the notifier
+# K4 removes, so after the cut the join guard read them forever as None/False.
+# The replace-vs-join rule itself is NOT gone and is not left unguarded — the two
+# conditions that can still vary are covered by the arms immediately above
+# (``callback_seen`` and ``fired``). What is gone is a third input to that rule
+# that nothing can set any more.
 
 
 # ---------------------------------------------------------------------------
