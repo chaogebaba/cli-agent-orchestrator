@@ -431,3 +431,33 @@ def test_the_pane_path_has_the_same_edge_rule(monkeypatch: pytest.MonkeyPatch) -
         monitor._apply_detection(TERMINAL, TerminalStatus.PROCESSING)
 
     assert announce.call_count == 1
+
+
+def test_the_monitor_records_which_producer_wrote_the_status() -> None:
+    """N7's mechanism: one marker, written by both writers, read by the fleet."""
+    monitor = _monitor({TERMINAL})
+
+    with (
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=_metadata(),
+        ),
+        patch.object(monitor, "_announce_published"),
+    ):
+        monitor.publish_projection(TERMINAL, TerminalStatus.PROCESSING, event_id="01E")
+    assert monitor.status_written_by_projection(TERMINAL) is True
+
+    with (
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=_metadata(),
+        ),
+        patch.object(monitor, "_publish_observation"),
+        patch.object(monitor, "_announce_published"),
+    ):
+        monitor.disable_projection()  # the terminal falls back to the pane
+        # processing -> idle: a rise out of PROCESSING, which the sticky-ready
+        # latch does not refuse, so the pane path really does write the latch.
+        monitor._apply_detection(TERMINAL, TerminalStatus.IDLE)
+
+    assert monitor.status_written_by_projection(TERMINAL) is False

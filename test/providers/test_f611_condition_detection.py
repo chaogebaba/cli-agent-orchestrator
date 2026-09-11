@@ -527,7 +527,7 @@ def _run_pane(command: str, code: int) -> str:
 
 @pytest.mark.parametrize(
     "command",
-    ["rg foo src/", "grep -rn x .", "git grep needle", "uv run pytest -q", "diff a.txt b.txt"],
+    ["rg foo src/", "grep -rn x .", "git grep needle", "ag needle", "diff a.txt b.txt"],
 )
 def test_exit_1_from_a_search_is_not_a_condition(command: str) -> None:
     cond = classify_condition(_run_pane(command, 1), "cline_cli")
@@ -535,10 +535,17 @@ def test_exit_1_from_a_search_is_not_a_condition(command: str) -> None:
     assert cond is None or cond.kind is not ConditionKind.PROC_EXITED
 
 
-@pytest.mark.parametrize("command", ["ls /nope", "cargo build", "./deploy.sh"])
+@pytest.mark.parametrize(
+    "command", ["ls /nope", "cargo build", "./deploy.sh", "uv run pytest -q", "npx jest"]
+)
 def test_exit_1_from_anything_else_still_is(command: str) -> None:
     """The half of the criterion a broader rule would fail: the rule is about
-    searches reporting "no match", not about silencing process failures."""
+    searches reporting "no match", not about silencing process failures.
+
+    The TEST RUNNERS are in this list rather than the one above, and that is the
+    correction: pytest's exit 1 means tests failed — "no tests collected" is exit
+    5 — so a run that read it as "found nothing" would silence a real failure.
+    """
     cond = classify_condition(_run_pane(command, 1), "cline_cli")
 
     assert cond is not None

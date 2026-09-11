@@ -315,6 +315,11 @@ class StatusMonitor:
         # back as the worker's evidence.  One message per terminal, replaced on
         # each delivery.
         self._delivered_text: Dict[str, set[str]] = {}
+        # WP-ARCH phase 2 (D11 / N7): WHO wrote ``_last_status`` last — the
+        # projection or the pane.  The fleet row pairs a status with a moment,
+        # and the two must come from the same producer or the row reads as one
+        # fact while being two.
+        self._status_origin: Dict[str, str] = {}
         self._buffers: Dict[str, str] = {}
         # Monotonic per-terminal byte-buffer generation.  A provider that
         # remembers positions across get_status() calls needs an explicit reset
@@ -1351,6 +1356,7 @@ class StatusMonitor:
                             pass_outcome = pass_outcome_for_source(pass_source, "no_change")
                         else:
                             self._last_status[terminal_id] = detected
+                            self._status_origin[terminal_id] = "pane"
                             if pass_source == "inline":
                                 self._status_fusion_reason.pop(terminal_id, None)
                             if detected == TerminalStatus.PROCESSING:
@@ -2186,6 +2192,8 @@ class StatusMonitor:
         provider: Any,
         buffer: str,
         status: Optional[TerminalStatus] = None,
+        *,
+        clear_only_on_edge: bool = False,
     ) -> None:
         """F611 (#467): detection + ONE-event delivery at a status transition.
 
@@ -2245,6 +2253,23 @@ class StatusMonitor:
                     status.value if status is not None else None,
                 )
                 cond = None
+        if clear_only_on_edge and cond is None and self.get_condition(terminal_id) is None:
+            # D8's periodic driver, on the one branch with no de-dup of its own.
+            #
+            # ``deliver``'s clear arm writes a ``cleared`` decision row and a
+            # fleet write EVERY time it is called, which was bounded while
+            # F611's genuine-transition branch was its only caller.  A sweep
+            # calls it for every terminal on every tick, and "the classifier
+            # returns nothing" is the steady state of a healthy terminal — so
+            # the clear becomes one row per terminal per tick, for ever, into an
+            # append-only ledger that has no prune.
+            #
+            # There is nothing to clear when nothing is standing, so the sweep
+            # says nothing.  The guard is HERE and not in ``deliver`` on purpose:
+            # F611's transition path must keep clearing exactly as it does today,
+            # and a contract change there would be this phase reaching into a
+            # closed issue.
+            return
         with self._lock:
             epoch = self._buffer_epochs.get(terminal_id, 0)
         try:
@@ -2340,6 +2365,7 @@ class StatusMonitor:
                 self._delivered_text[terminal_id] = lines
             else:
                 self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
 
     def _without_delivered_text(self, terminal_id: str, buffer: str) -> str:
         """Drop rows the server itself delivered.  Projected terminals only.
@@ -2388,9 +2414,26 @@ class StatusMonitor:
                 provider = provider_manager.get_provider(terminal_id)
             except Exception:
                 provider = None
-            self._classify_and_deliver_condition(terminal_id, provider, buffer, status=status)
+            self._classify_and_deliver_condition(
+                terminal_id, provider, buffer, status=status, clear_only_on_edge=True
+            )
         except Exception:
             logger.debug("condition re-drive failed for %s", terminal_id, exc_info=True)
+
+    def status_written_by_projection(self, terminal_id: str) -> bool:
+        """Did the PROJECTION write the status this terminal is publishing? (N7.)
+
+        ``is_projected`` answers who OWNS the terminal now; this answers who
+        produced the value now being served, and after a fallback and back they
+        differ for one publish.  The projection keeps folding for an unprojected
+        terminal — only the publisher is gated — so a terminal that fell back to
+        the pane and became projected again carries the pane's last status beside
+        the projection's ``since`` until the next fold publishes.  One publish
+        wide, self-correcting, and still wrong to render: the fleet row would
+        pair a status with a moment that belongs to a different reading.
+        """
+        with self._lock:
+            return self._status_origin.get(terminal_id) == PROJECTION_ORIGIN
 
     def is_projected(self, terminal_id: str) -> bool:
         """The cutover's predicate, for a caller outside this module (D7).
@@ -2460,6 +2503,7 @@ class StatusMonitor:
                 # ``turn.started`` is the ordinary case rather than a corner.
                 previous = self._last_status.get(terminal_id)
                 self._last_status[terminal_id] = status
+                self._status_origin[terminal_id] = PROJECTION_ORIGIN
                 # Cleared HERE rather than at the moment the terminal became
                 # projected, so a pane-derived reason written before the cutover
                 # took over — ``resync_after_drop`` is written outside the fusion
@@ -2928,6 +2972,7 @@ class StatusMonitor:
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
@@ -3047,6 +3092,7 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._delivered_text.pop(terminal_id, None)
+            self._status_origin.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)

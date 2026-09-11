@@ -79,3 +79,36 @@ def test_a_broken_read_never_breaks_the_fleet() -> None:
     runtime.state_store.get.side_effect = RuntimeError("database unavailable")
 
     assert _read(projected=True, runtime=runtime) is None
+
+
+# ------------------------------- the status and the moment share a source (N7)
+
+
+def _read2(*, projected: bool, written_by_projection: bool, runtime: object) -> str | None:
+    monitor = MagicMock()
+    monitor.is_projected.return_value = projected
+    monitor.status_written_by_projection.return_value = written_by_projection
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor),
+        patch("cli_agent_orchestrator.bootstrap.current_runtime", return_value=runtime),
+    ):
+        return _status_since(TERMINAL)
+
+
+def test_a_projected_terminal_still_serving_the_panes_status_reports_nothing() -> None:
+    """N7.  Owning the terminal and having produced the value are two questions.
+
+    The projection keeps folding for an unprojected terminal — only the publisher
+    is gated — so a terminal that fell back to the pane and became projected
+    again carries the pane's last status beside the projection's ``since`` until
+    the next fold publishes.  One publish wide, and still wrong to render: the
+    row would pair a status with a moment from a different reading.
+    """
+    assert _read2(projected=True, written_by_projection=False, runtime=_runtime(SINCE)) is None
+
+
+def test_once_the_projection_has_published_the_pair_is_whole() -> None:
+    assert (
+        _read2(projected=True, written_by_projection=True, runtime=_runtime(SINCE))
+        == SINCE.isoformat()
+    )

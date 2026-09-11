@@ -110,7 +110,7 @@ def test_the_re_drive_passes_the_published_status_without_fusing() -> None:
         patch.object(
             monitor,
             "_classify_and_deliver_condition",
-            lambda terminal_id, provider, buffer, status=None: seen.append(status),
+            lambda terminal_id, provider, buffer, status=None, **kwargs: seen.append(status),
         ),
         patch.object(
             monitor, "fuse_status", side_effect=AssertionError("the re-drive must not fuse")
@@ -211,3 +211,96 @@ def test_an_empty_delivery_clears_rather_than_holds(message: str) -> None:
         monitor._buffers[TERMINAL] = "an earlier delivered line"
 
     assert _classified(monitor) == ["an earlier delivered line"]
+
+
+# --------------------------------------------- the clear is edge-shaped (B2)
+
+
+def _delivering(monitor: StatusMonitor, cond_for: object) -> list[object]:
+    """Run one re-drive, returning what actually reached ``deliver``."""
+    delivered: list[object] = []
+    provider = MagicMock()
+    provider.classify_condition.side_effect = lambda buffer: cond_for
+    delivery = MagicMock()
+    delivery.deliver.side_effect = lambda terminal_id, cond, **kw: delivered.append(cond)
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch.object(monitor, "_get_condition_delivery", return_value=delivery),
+    ):
+        monitor.reclassify_condition(TERMINAL)
+    return delivered
+
+
+def test_twenty_quiet_sweeps_write_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B2.  ``deliver``'s clear arm writes a ``cleared`` decision row and a fleet
+    write every time it is called, and it has no de-dup of its own.
+
+    That was bounded while F611's genuine-transition branch was its only caller.
+    A sweep calls it for every terminal on every tick and "the classifier returns
+    nothing" is a healthy terminal's steady state — one row per terminal per
+    ``PANE_HEARTBEAT_S``, for ever, into an append-only ledger with no prune.
+    """
+    monitor = _monitor({TERMINAL})
+    with monitor._lock:
+        monitor._buffers[TERMINAL] = "quiet pane"
+    monkeypatch.setattr(monitor, "get_condition", lambda terminal_id, status=None: None)
+
+    calls = [call for _ in range(20) for call in _delivering(monitor, None)]
+
+    assert calls == []
+
+
+def test_a_real_clear_still_fires_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interesting case is untouched: a label that really should be cleared
+    is cleared, once, and then there is nothing left to say."""
+    monitor = _monitor({TERMINAL})
+    with monitor._lock:
+        monitor._buffers[TERMINAL] = "quiet pane"
+    standing = {"label": "CAPPED"}
+    monkeypatch.setattr(
+        monitor, "get_condition", lambda terminal_id, status=None: standing["label"]
+    )
+
+    first = _delivering(monitor, None)
+    standing["label"] = None  # the delivery cleared it
+    rest = [call for _ in range(19) for call in _delivering(monitor, None)]
+
+    assert first == [None]
+    assert rest == []
+
+
+def test_a_standing_condition_still_reaches_delivery_every_sweep() -> None:
+    """The guard is about the CLEAR branch alone.
+
+    A live condition keeps being delivered — ``deliver`` de-dups it on
+    ``(kind, subtype, epoch)`` and re-affirms the fleet label idempotently, which
+    is what keeps the label true for a terminal that has gone quiet holding one.
+    """
+    monitor = _monitor({TERMINAL})
+    with monitor._lock:
+        monitor._buffers[TERMINAL] = "a pane with a banner"
+    cond = MagicMock()
+
+    calls = [call for _ in range(5) for call in _delivering(monitor, cond)]
+
+    assert calls == [cond] * 5
+
+
+def test_the_transition_path_clears_unconditionally() -> None:
+    """F611's own driver is untouched: #609 is closed and this phase does not
+    reach into it.  The sweep is edge-shaped; the transition is not."""
+    monitor = _monitor({TERMINAL})
+    delivered: list[object] = []
+    provider = MagicMock()
+    provider.classify_condition.side_effect = lambda buffer: None
+    delivery = MagicMock()
+    delivery.deliver.side_effect = lambda terminal_id, cond, **kw: delivered.append(cond)
+
+    with patch.object(monitor, "_get_condition_delivery", return_value=delivery):
+        monitor._classify_and_deliver_condition(TERMINAL, provider, "pane")
+        monitor._classify_and_deliver_condition(TERMINAL, provider, "pane")
+
+    assert delivered == [None, None]

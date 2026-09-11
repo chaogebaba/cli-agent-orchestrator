@@ -230,7 +230,15 @@ def _status_since(terminal_id: str) -> str | None:
         from cli_agent_orchestrator import bootstrap as _wt_bootstrap
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        # Both questions, and they are different ones (N7).  ``is_projected`` says
+        # the projection OWNS this terminal; ``status_written_by_projection``
+        # says it produced the value the row is about to render.  After a
+        # fallback to the pane and back they disagree for one publish, and
+        # pairing the pane's status with the projection's moment would make the
+        # fleet row read as one fact while being two.
         if not status_monitor.is_projected(terminal_id):
+            return None
+        if not status_monitor.status_written_by_projection(terminal_id):
             return None
         runtime = _wt_bootstrap.current_runtime()
         states = None if runtime is None else runtime.state_store
