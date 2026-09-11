@@ -25,6 +25,11 @@ from cli_agent_orchestrator.adapters.truth import herdr_runtime
 from cli_agent_orchestrator.adapters.truth.herdr_runtime import HerdrRuntimeSource
 from cli_agent_orchestrator.core.events import EventDraft, EventKind
 
+#: The CAO terminal id — a UUID, the id every emitted row is ATTRIBUTED to.  It
+#: appears in no herdr pane field, so it is never a match key (H1 slice 1).
+CAO_TID = "6b1d2c04-2f77-4f0a-b2f2-0f6c9b6e5a31"
+#: herdr's OWN terminal ids, before and after a herdr server restart.  These are
+#: what pane records are MATCHED on until a stable ``agent_session`` is bound.
 OLD_TID = "term_before_restart"
 NEW_TID = "term_after_restart"
 STABLE_SESSION = {
@@ -80,7 +85,7 @@ def push(source: HerdrRuntimeSource, record: dict[str, object]) -> None:
 
 
 def test_done_then_working_uses_only_a2_vocabulary(rows: list[EventDraft]) -> None:
-    source = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    source = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=OLD_TID, socket_path="/unused")
     push(source, pane("done"))
     push(source, pane("working"))
     assert kinds(rows) == [EventKind.TURN_ENDED.value, EventKind.TURN_STARTED.value]
@@ -88,7 +93,7 @@ def test_done_then_working_uses_only_a2_vocabulary(rows: list[EventDraft]) -> No
 
 
 def test_gap_mid_turn_emits_no_signal_then_resnapshot(rows: list[EventDraft]) -> None:
-    source = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    source = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=OLD_TID, socket_path="/unused")
     push(source, pane("working"))
     source._emit_gap_degraded()
     push(source, pane("idle"))
@@ -101,7 +106,7 @@ def test_gap_mid_turn_emits_no_signal_then_resnapshot(rows: list[EventDraft]) ->
 
 
 def test_restart_rebinds_by_stable_agent_session_not_terminal_id(rows: list[EventDraft]) -> None:
-    source = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    source = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=OLD_TID, socket_path="/unused")
     push(source, pane("working"))
     source._emit_gap_degraded()
     push(source, pane("idle", terminal_id=NEW_TID))
@@ -114,7 +119,7 @@ def test_restart_rebinds_by_stable_agent_session_not_terminal_id(rows: list[Even
 
 
 def test_blocked_burst_emits_nothing(rows: list[EventDraft]) -> None:
-    source = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    source = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=OLD_TID, socket_path="/unused")
     for _ in range(5):
         push(source, pane("blocked"))
     assert rows == []
@@ -126,7 +131,7 @@ def test_adj_s1_different_session_same_terminal_id_is_rejected(rows: list[EventD
     terminal — the bound branch must check the stable session, never the
     ephemeral terminal_id, first.  Verbatim from the reviewer probe
     /data/cao-scratch/herdr-adj-r2/probes/test_adj_r2_streams.py."""
-    src = HerdrRuntimeSource(OLD_TID, socket_path="/unused")
+    src = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=OLD_TID, socket_path="/unused")
     push(src, pane("working"))
     assert kinds(rows) == [EventKind.TURN_STARTED.value]
     push(src, pane("idle", session=S_B))  # same terminal_id, different session

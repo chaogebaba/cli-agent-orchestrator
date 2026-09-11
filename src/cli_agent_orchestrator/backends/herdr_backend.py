@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, cast
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, cast
 
 from cli_agent_orchestrator.backends.base import (
     LivenessVerdict,
@@ -31,6 +31,9 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cli_agent_orchestrator.app.worker_truth.projector import StaticSourceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,137 @@ def map_native_status(agent_status: str | None) -> TerminalStatus | None:
         "done": TerminalStatus.COMPLETED,
         "idle": TerminalStatus.IDLE,
     }.get(agent_status)
+
+
+def attach_herdr_runtime_source(
+    terminal_id: str, pane_id: Optional[str], herdr_session: str = "cao"
+) -> None:
+    """Bind the H1 herdr ``EventSource`` (seam A) to a freshly created terminal.
+
+    This is the AC11 hook point for WP-HERDR: the adapter is a LEAF and may not
+    reach the composition root, so the two things that must happen together —
+    starting the source and registering the terminal's authority — happen here,
+    in the legacy shim that AC11 already sanctions as an importer of the new
+    tree.
+
+    Three gates, in order, each of which is a different question:
+
+    * ``CAO_HERDR_RUNTIME`` — is the seam armed at all?  OFF by default, so this
+      whole path costs one environment read on ``main``.
+    * ``herdr_runtime.attach`` returns ``None`` when worker-truth ingestion is
+      off, or when no herdr-namespace key is available to match panes on.
+    * the composition root may have no runtime (ingestion off), in which case
+      there is no registry to register the authority with and the source is left
+      appending events that the projector will treat as coming from an
+      unregistered producer — strictly less information, never wrong information.
+
+    ``pane_id`` is herdr's OWN pane id, straight out of the tab-create response.
+    It is the only herdr-namespace key available at create time (herdr mints its
+    own ``term_*`` terminal id and does not return it here), and it is what the
+    source matches pane records on until it learns the rest.  The CAO terminal
+    id is passed too, but only as the id events are ATTRIBUTED to — the two are
+    different namespaces and the source never compares them.
+
+    Never raises: a diagnostic seam may not break terminal creation.
+    """
+    from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+        herdr_runtime_enabled,
+        terminal_certified,
+    )
+
+    if not herdr_runtime_enabled():
+        return
+    try:
+        from cli_agent_orchestrator.adapters.truth import herdr_runtime
+
+        # ``herdr_session`` selects the SOCKET the source subscribes to.  The
+        # backend may be running against a non-default session (``cao-server
+        # --terminal herdr`` reads ``terminal.herdr_session``), and a source that
+        # defaulted to "cao" would connect to a different herdr server — or to
+        # nothing — and report silence that looks exactly like an idle worker.
+        source = herdr_runtime.attach(terminal_id, pane_id=pane_id, herdr_session=herdr_session)
+        if source is None:
+            return
+        registry = _worker_truth_sources()
+        if registry is None:
+            return
+        if not terminal_certified(terminal_id):
+            # The source runs and appends events — that is what a live round
+            # observes — but it does NOT claim authority.  Registering an
+            # uncertified terminal would mute its scraped lifecycle behind a
+            # source no one has certified, and §1 is explicit that certification,
+            # not the backend setting, is what switches a terminal over.
+            return
+        registry.add(terminal_id)
+        # §6(ii): a CERTIFIED terminal's derived lifecycle stays muted even when
+        # this source is stale or gone — the cohort degrades rather than silently
+        # reverting to scraped lifecycle.  The flag rides on the registry because
+        # the projector may never ask an adapter anything.  The projector gates it
+        # on the source having actually delivered, so this mark alone cannot
+        # freeze a terminal on snapshot-only evidence.
+        registry.set_fallback_disabled(terminal_id)
+    except Exception:
+        logger.debug(
+            "herdr runtime source attach failed for %s (non-fatal)", terminal_id, exc_info=True
+        )
+
+
+def detach_herdr_runtime_source(terminal_id: str) -> None:
+    """Stop the H1 herdr source for a terminal and drop its authority.
+
+    Called from both teardown routes: ``kill_window`` (the backend's own) and
+    ``terminal_service.detach_observation`` (the kill-by-terminal route).  It is
+    idempotent, so both firing is correct rather than merely tolerated.
+
+    The ``fallback_disabled`` flag is cleared HERE and only here.  It is
+    deliberately NOT cleared when the source merely loses its stream: §6(ii)'s
+    whole point is that a certified cohort in a subscription gap keeps its
+    scraped lifecycle muted and degrades.  Teardown is the one moment the
+    terminal has no occupant to protect.
+    """
+    from cli_agent_orchestrator.utils.herdr_runtime_gate import forget_terminal
+
+    try:
+        from cli_agent_orchestrator.adapters.truth import herdr_runtime
+
+        herdr_runtime.detach(terminal_id)
+    except Exception:
+        logger.debug(
+            "herdr runtime source detach failed for %s (non-fatal)", terminal_id, exc_info=True
+        )
+    finally:
+        # In a FINALLY, and this is the load-bearing part: if stopping the source
+        # raises, the terminal must still lose its authority and its §6(ii) mute.
+        # The r1 ordering put these after the raise, so a deleted terminal stayed
+        # authoritative and fallback-muted for the life of the process — a
+        # terminal that publishes nothing, forever, from one failed teardown.
+        try:
+            registry = _worker_truth_sources()
+            if registry is not None:
+                # One transition, so no projection can observe the pair
+                # half-applied.
+                registry.forget(terminal_id)
+        except Exception:
+            logger.debug(
+                "herdr runtime registry cleanup failed for %s (non-fatal)",
+                terminal_id,
+                exc_info=True,
+            )
+        forget_terminal(terminal_id)
+
+
+def _worker_truth_sources() -> Optional["StaticSourceRegistry"]:
+    """The composition root's source registry, or None when ingestion is off.
+
+    Imported lazily: ``bootstrap`` is the composition root and pulls in the whole
+    new tree, which a backend module must not do at import time.
+    """
+    from cli_agent_orchestrator import bootstrap as _bootstrap
+
+    runtime = _bootstrap.current_runtime()
+    if runtime is None:
+        return None
+    return runtime.sources
 
 
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
@@ -498,6 +632,11 @@ class HerdrBackend(TerminalBackend):
         if new_pane_id:
             self._pane_cache[terminal_id] = (new_pane_id, time.time())
 
+        # The session's ROOT terminal is a terminal like any other; leaving it
+        # unattached would give the first worker of every session no lifecycle
+        # source at all.  Same gate, same idempotence as ``create_window``.
+        attach_herdr_runtime_source(terminal_id, new_pane_id, self._herdr_session)
+
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
 
@@ -645,6 +784,10 @@ class HerdrBackend(TerminalBackend):
             except TerminalBackendError as e:
                 logger.warning(f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}")
 
+        # WP-HERDR H1 seam A: bind the herdr lifecycle source to this terminal.
+        # Inert unless CAO_HERDR_RUNTIME is set.
+        attach_herdr_runtime_source(terminal_id, new_pane_id, self._herdr_session)
+
         logger.info(f"Created herdr tab in workspace {session_name}")
         return window_name
 
@@ -728,6 +871,29 @@ class HerdrBackend(TerminalBackend):
                     out.append(str(tid))
         return out
 
+    def _terminal_id_for_window(self, session_name: str, window_name: str) -> Optional[str]:
+        """Reverse-resolve a CAO terminal id from a (session, window) pair.
+
+        ``kill_window`` is addressed by label and never sees a terminal id, which
+        is why the H1 detach anchor is ``terminal_service.detach_observation``.
+        This is the belt to that suspenders: resolve the window's pane and look it
+        up in the durable map, which F930 keys by CAO terminal id. Best-effort —
+        ``None`` simply means the terminal-id-bearing teardown remains the only
+        detach, which is the r1 behaviour.
+        """
+        try:
+            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        except (TerminalBackendError, TerminalNotFoundError):
+            return None
+        # ``_pane_cache`` is the only structure keyed BY the CAO terminal id
+        # (F930 re-keyed ``_pane_id_map`` by (session, window), which is what we
+        # already hold and so cannot invert to a terminal). Seeded at create for
+        # every terminal this backend made, which is every terminal it can kill.
+        for terminal_id, (cached_pane_id, _cached_at) in dict(self._pane_cache).items():
+            if cached_pane_id == pane_id:
+                return terminal_id
+        return None
+
     def kill_window(self, session_name: str, window_name: str) -> bool:
         """Close a single terminal's TAB, collapsing the workspace only when it
         is the last tab (F881 #734, decision B).
@@ -750,6 +916,14 @@ class HerdrBackend(TerminalBackend):
         (``workspace close``) unchanged; this method only governs per-terminal
         teardown.
         """
+        # WP-HERDR H1 (N7): detach the lifecycle source here too, BEFORE the pane
+        # goes, while the pane id is still resolvable. Idempotent with the
+        # terminal-id-bearing teardown in ``terminal_service``, so both firing is
+        # correct rather than merely tolerated, and either one alone suffices.
+        _killed_terminal_id = self._terminal_id_for_window(session_name, window_name)
+        if _killed_terminal_id:
+            detach_herdr_runtime_source(_killed_terminal_id)
+
         # Resolve the workspace and this window's tab. If either cannot be
         # resolved the terminal/tab is already gone — nothing to close.
         try:

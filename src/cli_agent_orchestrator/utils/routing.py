@@ -89,9 +89,22 @@ E_COMPOSITION_MISSING = "E-COMPOSITION-MISSING"
 # scan and no E-ALIAS-MISSING path remain. The constant is kept (stable code,
 # still imported by tests asserting the old arm is gone) but is never raised.
 E_ALIAS_MISSING = "E-ALIAS-MISSING"
+# WP-HERDR D9 — the BACKEND axis. herdr is a backend, not a provider, so a cell
+# being certified for its provider says nothing about whether that cell has been
+# proven under the herdr runtime. A routing row naming ``backend = "herdr"`` is
+# refused unless the position file carries a PASS ``herdr_certification`` row for
+# the bound provider at the CURRENT sha pair AND the recorded ``herdr_sha256``
+# matches the herdr binary actually installed (D7's pin). Certification, not the
+# backend setting, is what moves a terminal onto the herdr lifecycle source.
+E_BACKEND_UNCERTIFIED = "E-BACKEND-UNCERTIFIED"
 
 # Valid ``kind`` discriminator values (D9).
 _KINDS = ("cao", "in_harness")
+
+# Valid ``backend`` values (WP-HERDR D9). ``tmux`` is the default and the
+# pre-herdr behaviour; a row omitting the key is a tmux row.
+_BACKENDS = ("tmux", "herdr")
+DEFAULT_BACKEND = "tmux"
 
 # The mandatory general position name (D12) and the ``<provider>_general`` spawn
 # profile shape the resolver substitutes for a non-PASS non-gate cell.
@@ -126,6 +139,10 @@ class Binding:
     provider: Optional[str]
     kind: str
     model: Optional[str] = None
+    #: WP-HERDR D9 — which terminal backend this lane runs on. Defaults to
+    #: ``"tmux"``, so every existing routing.toml keeps its exact meaning and the
+    #: backend check below is unreachable until a row opts in.
+    backend: str = DEFAULT_BACKEND
 
 
 @dataclass(frozen=True)
@@ -210,7 +227,26 @@ def load_routing_table(path: Path) -> RoutingTable:
         model = row.get("model")
         if model is not None and not isinstance(model, str):
             raise RoutingError(f"binding #{i} (position '{position}') model must be a string")
-        bindings.append(Binding(position=position, provider=provider, kind=kind, model=model))
+        backend = row.get("backend", DEFAULT_BACKEND)
+        if backend not in _BACKENDS:
+            raise RoutingError(
+                f"binding #{i} (position '{position}') has invalid backend {backend!r} "
+                f"(expected one of {_BACKENDS})"
+            )
+        if backend != DEFAULT_BACKEND and kind != "cao":
+            raise RoutingError(
+                f"binding #{i} (position '{position}') is kind={kind!r} but names "
+                f"backend {backend!r}; a non-CAO lane runs no terminal and has no backend"
+            )
+        bindings.append(
+            Binding(
+                position=position,
+                provider=provider,
+                kind=kind,
+                model=model,
+                backend=backend,
+            )
+        )
     return bindings_to_table(bindings)
 
 
@@ -289,6 +325,125 @@ def cell_certified(
         ):
             outcome = str(row.get("outcome", "UNCERTIFIED"))
             return outcome == "PASS", outcome
+    return False, "UNCERTIFIED"
+
+
+#: The fields a ``herdr_certification`` row carries (WP-HERDR D9). ``provider``
+#: plus the two shas are the MATCH key, exactly as the provider block's are;
+#: ``herdr_version``/``herdr_sha256``/``protocol`` are D7's binary+protocol pin;
+#: the rest is the audit trail a reviewer reads.
+HERDR_CERT_FIELDS = (
+    "provider",
+    "herdr_version",
+    "herdr_sha256",
+    "protocol",
+    "position_sha",
+    "overlay_sha",
+    "outcome",
+    "date",
+    "evidence",
+)
+
+#: Returned when the installed herdr binary cannot be found or hashed.
+_HERDR_BINARY_UNKNOWN = "BINARY-UNKNOWN"
+
+
+def installed_herdr_sha256() -> Optional[str]:
+    """The sha256 of the ``herdr`` binary on PATH, or ``None`` when there is none.
+
+    D7's pin, which the H1 plan recorded as unimplemented (N9): no herdr version
+    or protocol constant existed anywhere in the fork. This is the smallest
+    honest implementation — hash the file the backend would actually exec — and
+    it is what makes the recorded ``herdr_sha256`` a claim about THIS machine
+    rather than a note about the machine the certification ran on.
+
+    ``None`` is a refusal, not a pass: see :func:`herdr_cell_certified`.
+    """
+    import hashlib
+    import shutil
+
+    path = shutil.which("herdr")
+    if not path:
+        return None
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def herdr_cell_certified(
+    position: str,
+    provider: str,
+    positions_dir: Path,
+    *,
+    installed_sha256: Optional[str] = None,
+    resolve_installed: bool = True,
+) -> "tuple[bool, str]":
+    """Is the (position, provider) cell certified PASS **for the herdr backend**?
+
+    The backend axis of D9, and a strict addition to
+    :func:`cell_certified` rather than a variant of it: a cell can be perfectly
+    certified for its provider and wholly unproven under herdr, which is the
+    normal state of every cell today.
+
+    Match discipline is the provider block's, verbatim — a row counts only when
+    it names this ``provider`` at the CURRENT ``position_sha``/``overlay_sha``
+    pair, so a stale row is not a certification. On top of that, D7's pin: the
+    row's ``herdr_sha256`` must equal the sha256 of the herdr binary installed
+    here. Two ways that fails, both refusals rather than passes:
+
+    * the binary is absent or unreadable (``BINARY-UNKNOWN``) — a row certifying
+      a binary we cannot see is not evidence about this machine;
+    * the binary is present and DIFFERENT (``BINARY-MISMATCH``) — the certified
+      runtime is not the running one, which is the whole reason the pin exists.
+
+    ``installed_sha256`` injects the answer (tests, and a caller that already
+    hashed it); ``resolve_installed=False`` skips the pin entirely and is for
+    callers that only want the sha-pair question answered.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.utils.profile_composition import overlay_sha, position_sha
+
+    pos_path = positions_dir / f"{position}.md"
+    if not pos_path.exists():
+        return False, "UNCERTIFIED"
+    parsed = frontmatter.loads(pos_path.read_text(encoding="utf-8"))
+    pos_sha = position_sha(parsed.content, dict(parsed.metadata))
+
+    overlays_dir = positions_dir.parent / "overlays"
+    frags: List[str] = []
+    base = overlays_dir / f"{provider}.md"
+    if base.exists():
+        frags.append(base.read_text(encoding="utf-8"))
+    per_pos = overlays_dir / f"{provider}.{position}.md"
+    if per_pos.exists():
+        frags.append(per_pos.read_text(encoding="utf-8"))
+    ov_sha = overlay_sha(frags)
+
+    for row in parsed.metadata.get("herdr_certification") or []:
+        if not isinstance(row, dict):
+            continue
+        if (
+            row.get("provider") == provider
+            and row.get("position_sha") == pos_sha
+            and row.get("overlay_sha") == ov_sha
+        ):
+            outcome = str(row.get("outcome", "UNCERTIFIED"))
+            if outcome != "PASS":
+                return False, outcome
+            if not resolve_installed:
+                return True, outcome
+            live = installed_sha256 if installed_sha256 is not None else installed_herdr_sha256()
+            if live is None:
+                return False, _HERDR_BINARY_UNKNOWN
+            if str(row.get("herdr_sha256") or "") != live:
+                return False, "BINARY-MISMATCH"
+            return True, outcome
     return False, "UNCERTIFIED"
 
 
@@ -385,6 +540,13 @@ class RoutingResolution:
     fallback_position: Optional[str] = None
     fallback_cell: Optional[str] = None
     uncertified_cell: bool = False
+    #: WP-HERDR D9 — the bound row's backend, and whether this cell is certified
+    #: for it. ``herdr_certified`` is the runtime predicate §6(ii) and slice 3
+    #: read, resolved ONCE here at terminal create and stored on the terminal
+    #: record; §8 forbids re-deriving it mid-occupant, because that would move a
+    #: live worker between truth sources halfway through a turn.
+    backend: str = DEFAULT_BACKEND
+    herdr_certified: bool = False
 
 
 def resolve_routing_binding(
@@ -397,7 +559,7 @@ def resolve_routing_binding(
 ) -> RoutingResolution:
     """D9/D12 assign-time resolution for a bound (position, provider) cell.
 
-    Order (r10 S2 → r10 S1 → cell cert):
+    Order (r10 S2 → r10 S1 → cell cert → backend cert):
       1. Provider certification: the provider's ``general`` cell must be PASS,
          else ``E-PROVIDER-UNCERTIFIED`` (every row of that provider refused).
       2. Row clause satisfaction: ``[required].<position>`` ⊆ present, else
@@ -406,6 +568,11 @@ def resolve_routing_binding(
          NON-gate cell spawns its OWN ``<position>-<provider>`` composition
          (F870 #726 — the cross-position ``general-<provider>`` substitution is
          deleted) with ``uncertified_cell=True``.
+      4. BACKEND certification (WP-HERDR D9): a row naming ``backend="herdr"``
+         is refused ``E-BACKEND-UNCERTIFIED`` unless the cell carries a PASS
+         ``herdr_certification`` row at the current sha pair whose recorded
+         ``herdr_sha256`` matches the installed binary. A row on the default
+         ``tmux`` backend never reaches this check.
 
     Raises ``RoutingError`` (with ``.code``) on refusal; returns a
     ``RoutingResolution`` on a bindable or same-position uncertified cell.
@@ -453,12 +620,38 @@ def resolve_routing_binding(
 
     cell_pass, cell_outcome = cell_certified(position, provider, positions_dir)
     own_cell = _synthesise_position_profile_name(position, provider)
+
+    # (4) BACKEND certification (WP-HERDR D9). Fourth and last, so a backend
+    # refusal is only ever reported for a row that already cleared provider
+    # cert, row clauses and — for a gate — cell cert. A row that does not name
+    # ``backend = "herdr"`` never reaches the check at all, which is what keeps
+    # every existing routing.toml byte-identical in meaning.
+    bound_row = table.binding_for(position, provider)
+    backend = bound_row.backend if bound_row is not None else DEFAULT_BACKEND
+    herdr_certified = False
+    if backend == "herdr":
+        herdr_pass, herdr_outcome = herdr_cell_certified(position, provider, positions_dir)
+        if not herdr_pass:
+            raise RoutingError(
+                f"{E_BACKEND_UNCERTIFIED}: cell ({position}, {provider}) is bound to "
+                f"backend 'herdr' but has no PASS herdr_certification row at the "
+                f"current sha pair with a matching installed binary "
+                f"(outcome={herdr_outcome}) — refusing (no spawn)",
+                code=E_BACKEND_UNCERTIFIED,
+            )
+        herdr_certified = True
+
     if cell_pass:
         # F786 D2c — a certified cell resolves to the effective composed name
         # ``<position>-<provider>`` (was the bare position), which the D8 writer
         # materialises and the spawn loads. The bare-position emission is gone,
         # which is why the flat ``secretary.md`` becomes dead (D3 deletes it).
-        return RoutingResolution(spawn_profile=own_cell, provider=provider)
+        return RoutingResolution(
+            spawn_profile=own_cell,
+            provider=provider,
+            backend=backend,
+            herdr_certified=herdr_certified,
+        )
 
     # Non-PASS cell: gate → refusal (a gate cell is never spawned uncertified).
     if _is_gate_position(position, positions_dir, clause_table_path):
@@ -488,4 +681,6 @@ def resolve_routing_binding(
         fallback_position=position,
         fallback_cell=cell_outcome,
         uncertified_cell=True,
+        backend=backend,
+        herdr_certified=herdr_certified,
     )

@@ -2553,6 +2553,13 @@ def _assign_impl(
     # (no handle) is refused; resume_from together with fork_from/resume=True is
     # an input conflict. Plain fork_from (no resume) keeps fork semantics.
     _resume_prepared: Optional[Dict[str, Any]] = None
+    # WP-HERDR D9 backend axis. FUNCTION scope on purpose: the routing branch that
+    # resolves these is skipped entirely on the resume path, and the result is
+    # built for both — initialising them beside the other D9 locals left them
+    # unbound for every resume. "tmux" is the answer for every row that does not
+    # opt in, which is every row today.
+    _d9_backend = "tmux"
+    _d9_herdr_certified = False
     _resume_handle: Optional[str] = None
     if resume_from and (fork_from or resume):
         return {
@@ -2995,6 +3002,13 @@ def _assign_impl(
                 return _cell_uncertified_refusal(f"cell outcome={_res.fallback_cell}")
 
             agent_profile = _res.spawn_profile
+            # WP-HERDR D9: the resolution's backend axis is operator-visible, so
+            # a row bound to herdr says so in the assign result rather than being
+            # a silent property of the routing file. The runtime predicate is
+            # re-resolved server-side (the shim and the backend are different
+            # processes); this is the reporting half.
+            _d9_backend = _res.backend
+            _d9_herdr_certified = _res.herdr_certified
             if _res.fallback_profile:
                 _fallback_profile = _res.fallback_profile
                 _d9_position = _res.fallback_position
@@ -3330,6 +3344,9 @@ def _assign_impl(
                 + _get_cleanup_nudge()
             ),
         }
+        if _d9_backend != "tmux":
+            result["backend"] = _d9_backend
+            result["herdr_certified"] = _d9_herdr_certified
         if authority_files:
             result["frozen_pins"] = [
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}

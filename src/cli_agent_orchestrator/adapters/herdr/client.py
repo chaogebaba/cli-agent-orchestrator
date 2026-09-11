@@ -160,9 +160,7 @@ def _envelope_result(reply: dict[str, Any]) -> dict[str, Any]:
     """
     error = reply.get("error")
     if isinstance(error, dict):
-        raise HerdrRequestError(
-            str(error.get("code", "unknown")), str(error.get("message", ""))
-        )
+        raise HerdrRequestError(str(error.get("code", "unknown")), str(error.get("message", "")))
     result = reply.get("result")
     if not isinstance(result, dict):
         raise HerdrTransportError(f"herdr reply carries neither result nor error: {reply!r}")
@@ -288,9 +286,7 @@ class HerdrClient:
             raise HerdrTransportError("herdr client is not connected")
         while True:
             try:
-                line = await asyncio.wait_for(
-                    reader.readline(), timeout=self._request_timeout_s
-                )
+                line = await asyncio.wait_for(reader.readline(), timeout=self._request_timeout_s)
             except asyncio.TimeoutError as exc:
                 raise HerdrTransportError("timed out waiting for a herdr reply") from exc
             if not line:
@@ -331,9 +327,7 @@ class HerdrClient:
         """
         async with self._io_lock:
             request_id = self._next_id()
-            await self._write_message(
-                {"id": request_id, "method": method, "params": params or {}}
-            )
+            await self._write_message({"id": request_id, "method": method, "params": params or {}})
             while True:
                 reply = await self._read_line()
                 if reply.get("id") == request_id:
@@ -342,36 +336,117 @@ class HerdrClient:
                     self._event_buffer.append(reply)
                 # else: a stray line for another id — skip; see docstring.
 
-    async def check_protocol(self) -> dict[str, Any]:
-        """Read ``api schema`` and refuse a protocol/schema this build does not pin.
+    async def request_once(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Issue one request on its OWN short-lived connection.
 
-        Returns the schema ``result`` on a match so a caller may inspect it;
-        raises :class:`HerdrProtocolMismatch` otherwise.  This is the D7 pin made
+        herdr 0.9.0's API socket accepts ``events.subscribe`` only as the FIRST
+        message on a connection: once a plain request has gone down the wire, a
+        later subscribe is answered by resetting the connection.  So a client
+        that means to STREAM must keep its connection clean, and every
+        request/reply it also needs — the protocol read and the snapshot — has to
+        happen somewhere else.
+
+        This is that somewhere else.  It is also what the legacy inbox service
+        did without naming it: it subscribed first on its socket and read the
+        snapshot by shelling out to ``herdr api snapshot``, which is a separate
+        connection by construction.
+
+        The H1 live round on grok-box-002 is what surfaced the rule: with the
+        protocol read on the streaming connection, ``subscribe`` failed with
+        "Connection lost" on every attempt and the source never received an
+        event.
+        """
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(self._socket_path),
+            timeout=self._connect_timeout_s,
+        )
+        try:
+            request_id = self._next_id()
+            payload = (
+                json.dumps({"id": request_id, "method": method, "params": params or {}}).encode()
+                + b"\n"
+            )
+            writer.write(payload)
+            await writer.drain()
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=self._request_timeout_s)
+                if not line:
+                    raise HerdrTransportError("herdr socket closed")
+                text = line.strip()
+                if not text:
+                    continue
+                obj = json.loads(text)
+                if not isinstance(obj, dict):
+                    raise HerdrTransportError(f"herdr sent a non-object line: {obj!r}")
+                if obj.get("id") == request_id:
+                    return _envelope_result(obj)
+                # A one-shot connection carries no subscription, so anything else
+                # on it is noise; keep reading for our reply.
+        except (OSError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            raise HerdrTransportError(f"herdr one-shot request {method} failed: {exc}") from exc
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                logger.debug("herdr one-shot close raced a broken transport", exc_info=True)
+
+    async def check_protocol(self) -> dict[str, Any]:
+        """Read the live protocol number and refuse one this build does not pin.
+
+        Returns the snapshot body on a match so a caller may inspect it; raises
+        :class:`HerdrProtocolMismatch` otherwise.  This is the D7 pin made
         mechanical: the transport will not stream a wire format it was not
         certified against.
+
+        The number is read from ``session.snapshot``, which carries ``protocol``
+        and ``version`` alongside the pane records.  There is no separate schema
+        method: herdr 0.9.0's API socket rejects ``api.schema`` as an unknown
+        variant AND CLOSES THE CONNECTION, so a client that opened with it could
+        never reach ``events.subscribe`` at all — the live round on grok-box-002
+        found exactly that, as an unbroken run of subscription-gap events from a
+        source that had never once connected.
         """
-        result = await self.request("api.schema")
-        got_protocol = result.get("protocol")
-        got_schema = result.get("schema_version")
-        if got_protocol != HERDR_PROTOCOL or got_schema != HERDR_SCHEMA_VERSION:
+        snapshot = await self.snapshot()
+        got_protocol = snapshot.get("protocol")
+        # 0.9.0 reports no separate schema number, so an ABSENT one is not a
+        # mismatch — but it is not a match either, and defaulting it to the pin
+        # (r1) made the D7 check assert something it had not read. The pin is
+        # carried by ``protocol``; ``schema_version`` is compared only when the
+        # server actually sends it, so a future herdr that reintroduces it is
+        # still checked rather than silently accepted.
+        got_schema = snapshot.get("schema_version")
+        schema_mismatch = got_schema is not None and got_schema != HERDR_SCHEMA_VERSION
+        if got_protocol != HERDR_PROTOCOL or schema_mismatch:
             raise HerdrProtocolMismatch(
                 got_protocol=int(got_protocol) if isinstance(got_protocol, int) else -1,
                 got_schema=int(got_schema) if isinstance(got_schema, int) else -1,
             )
-        return result
+        return snapshot
 
     async def snapshot(self) -> dict[str, Any]:
-        """Return the ``snapshot`` body of ``api snapshot``.
+        """Return the ``snapshot`` body of herdr's ``session.snapshot``.
 
         The recipe's second step: after subscribing, a caller snapshots to get the
         current pane/agent records, then applies buffered events in order.  Kept
         here because it is a plain request/reply on the same socket; the mapping
         of its records onto ``WorkerState`` is Seam A's, not this leaf's.
+
+        The method name is ``session.snapshot``.  ``api.snapshot`` — which reads
+        like the CLI's ``herdr api snapshot`` and is what this client shipped
+        with — is not a method herdr 0.9.0 accepts; it is the CLI SUBCOMMAND that
+        invokes this one, and the legacy inbox service reached the snapshot by
+        shelling out to that subcommand rather than over the socket, which is why
+        the difference went unnoticed until the H1 live round.
         """
-        result = await self.request("api.snapshot")
+        # On its OWN connection: a snapshot request on the streaming connection
+        # would poison a later ``events.subscribe`` (see :meth:`request_once`).
+        result = await self.request_once("session.snapshot")
         snapshot = result.get("snapshot")
         if not isinstance(snapshot, dict):
-            raise HerdrTransportError(f"herdr api.snapshot carried no snapshot: {result!r}")
+            raise HerdrTransportError(f"herdr session.snapshot carried no snapshot: {result!r}")
         return snapshot
 
     async def subscribe(self, subscriptions: list[dict[str, Any]]) -> dict[str, Any]:

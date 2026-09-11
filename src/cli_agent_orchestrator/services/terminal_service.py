@@ -1457,6 +1457,77 @@ def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
     return issuance_ticks, issuance_boot_id
 
 
+def _active_backend_is_herdr() -> bool:
+    """Is this server actually running the herdr backend?
+
+    Read from the same ConfigService key the backend factory resolves
+    (``terminal.backend``), not from the routing row: the row states intent, and
+    the server's own backend is the fact.
+    """
+    try:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        return str(ConfigService.get("terminal.backend", default="tmux")) == "herdr"
+    except Exception:
+        return False
+
+
+def _bind_herdr_certification(
+    terminal_id: Optional[str], agent_profile: Optional[str], provider: Optional[str]
+) -> None:
+    """Decide, once per terminal, whether its cell is herdr-certified (D9, §8).
+
+    The MCP shim already ran ``resolve_routing_binding`` and knows the answer,
+    but it runs in a DIFFERENT PROCESS from the backend that will attach the
+    lifecycle source, so its answer cannot reach the attach point. This resolves
+    it again in the server process, from the same two inputs and through the same
+    ``herdr_cell_certified`` function, and records it where the backend shim and
+    the two certified-path gates read it.
+
+    The position comes from the composed spawn name ``<position>-<provider>``
+    (``split_effective_name`` is D2b's inverse); a legacy passthrough profile
+    name has no position and is therefore never certified — which is correct, and
+    is also every terminal today.
+
+    Never raises: a terminal must not fail to launch because a certification file
+    is malformed. An unresolvable answer is ``False``, i.e. the pre-H1 behaviour.
+    """
+    from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+        bind_terminal,
+        herdr_runtime_enabled,
+    )
+
+    if not terminal_id or not herdr_runtime_enabled():
+        return
+    certified = False
+    try:
+        from cli_agent_orchestrator.constants import positions_store_dir
+        from cli_agent_orchestrator.utils.agent_profiles import split_effective_name
+        from cli_agent_orchestrator.utils.routing import herdr_cell_certified
+
+        # The BACKEND has to be herdr, and this is not a formality. A cell
+        # certified for herdr but spawned on tmux has no herdr source at all; a
+        # predicate that ignored the backend would still gate pi's scraper off
+        # and skip the pane sampler, leaving that terminal with no lifecycle
+        # producer whatsoever. Certification names the pair (cell, backend), so
+        # the predicate has to read both.
+        if _active_backend_is_herdr():
+            split = split_effective_name(agent_profile or "")
+            if split is not None:
+                position, name_provider = split
+                certified = herdr_cell_certified(
+                    position, name_provider or provider or "", positions_store_dir()
+                )[0]
+    except Exception:
+        logger.debug(
+            "herdr certification could not be resolved for %s; treating as uncertified",
+            terminal_id,
+            exc_info=True,
+        )
+        certified = False
+    bind_terminal(terminal_id, certified)
+
+
 def _resolve_working_directory(working_directory: Optional[str]) -> str:
     """Resolve launch cwd exactly as the tmux backend does before creation."""
     return resolve_and_validate_path(
@@ -2552,6 +2623,12 @@ async def create_terminal(
             stay False (they are assigned only from a successful return).
             """
             assert session_name is not None  # narrowed by the caller
+            # WP-HERDR D9/§8: resolve this terminal's herdr certification ONCE,
+            # here, BEFORE the backend creates the pane — the backend shim reads
+            # the answer when it attaches the lifecycle source, and §8 forbids
+            # re-deriving it later, because a position file edited mid-turn would
+            # otherwise move a live occupant between truth sources.
+            _bind_herdr_certification(terminal_id, agent_profile, provider)
             _created_session = False
             _created_window = False
             _created_window_name = window_name
@@ -8439,6 +8516,19 @@ def _delete_terminal_under_lease(
             status_monitor.unregister(terminal_id)
         except Exception as exc:
             logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
+        # WP-HERDR H1 seam A: stop this terminal's herdr lifecycle source and
+        # drop both its authority and its §6(ii) fallback mute.  This is the
+        # terminal-id-bearing teardown; the backend's own ``kill_window`` takes
+        # (session, window) and never sees a terminal id, so it cannot be the
+        # detach anchor.  Inert unless CAO_HERDR_RUNTIME is set.
+        try:
+            from cli_agent_orchestrator.backends.herdr_backend import (
+                detach_herdr_runtime_source,
+            )
+
+            detach_herdr_runtime_source(terminal_id)
+        except Exception as exc:
+            logger.warning(f"Failed to detach herdr runtime source for {terminal_id}: {exc}")
 
     persona_retention_error = None
     try:

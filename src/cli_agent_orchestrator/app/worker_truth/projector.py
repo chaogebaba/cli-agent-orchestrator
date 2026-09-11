@@ -33,10 +33,21 @@ silent, which is the failure mode this work package exists to end.  The
 ``DIAG-BAD-TRANSITION`` finding fires from the appended transition row, in
 ``checks.py``.
 
-**Silence is noticed by a sweep, not by the projector.**  A projector only ever
-runs when something arrives, so it cannot by itself observe that nothing has
-(r8 N5).  :meth:`Projector.sweep` runs every ``PANE_HEARTBEAT_S`` and is the only
-producer of ``degraded(no_signal)``.
+**Silence is noticed by a sweep, or declared by the source itself.**  A
+projector only ever runs when something arrives, so it cannot by itself observe
+that nothing has (r8 N5).  :meth:`Projector.sweep` runs every
+``PANE_HEARTBEAT_S`` and turns observed silence into ``degraded(no_signal)``.
+
+It is no longer the ONLY producer of that state, and the amendment is WP-HERDR
+§6(i) (H1): an authoritative source that loses its own subscription KNOWS it has
+gone blind, and saying so is strictly better than waiting a sweep window for
+someone else to infer it.  ``adapters/truth/herdr_runtime`` emits
+``pane.missing`` at ``authoritative`` confidence carrying
+``degraded_reason: no_signal``, and :meth:`Projector._payload_reason` — which
+already lets a producer override the kind-default reason — projects it as
+``degraded(no_signal)``.  No projector branch was added for it; the mechanism
+that carries it is the one the liveness probe already uses to say
+``producer_error``.
 """
 
 from __future__ import annotations
@@ -157,6 +168,22 @@ class SourceRegistry(Protocol):
 
     def is_authoritative(self, terminal_id: str) -> bool: ...
 
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        """Is the DERIVED lifecycle fallback switched off for this terminal?
+
+        WP-HERDR §6(ii).  Distinct from :meth:`is_authoritative` in exactly the
+        case that matters: a CERTIFIED herdr terminal whose source has gone stale
+        or detached.  Source-level precedence alone would hand such a terminal
+        back to the scraped pane, silently, which is the failure §6(ii) names —
+        the cohort must DEGRADE (``no_signal``, delivery-ineligible) instead, so
+        the operator sees that the authoritative source is gone rather than
+        reading a plausible state derived from pixels.
+
+        ``False`` for every terminal on every pre-H1 path, which is what keeps
+        this additive.
+        """
+        ...
+
 
 class NullSourceRegistry:
     """No terminal has an authoritative source.
@@ -169,6 +196,9 @@ class NullSourceRegistry:
     def is_authoritative(self, terminal_id: str) -> bool:
         return False
 
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        return False
+
 
 class StaticSourceRegistry:
     """A fixed set of terminals with authoritative sources.
@@ -178,17 +208,60 @@ class StaticSourceRegistry:
     terminal without running a tailer.
     """
 
-    def __init__(self, terminal_ids: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        terminal_ids: frozenset[str] = frozenset(),
+        fallback_disabled_ids: frozenset[str] = frozenset(),
+    ) -> None:
         self._terminal_ids = set(terminal_ids)
+        self._fallback_disabled_ids = set(fallback_disabled_ids)
+        # Writers are legacy WORKER THREADS (the backend shim, at terminal create
+        # and teardown); the reader is the projector, on the server loop.  A bare
+        # ``set`` is not the race a reviewer worries about — CPython's GIL makes
+        # ``add``/``discard``/``in`` individually atomic — but the pair
+        # ``discard`` + ``clear_fallback_disabled`` must not be observed
+        # half-applied, or a terminal reads unauthoritative AND fallback-muted
+        # for one projection, i.e. publishing nothing.  One lock, so teardown is
+        # one transition.
+        self._lock = threading.RLock()
 
     def add(self, terminal_id: str) -> None:
-        self._terminal_ids.add(terminal_id)
+        with self._lock:
+            self._terminal_ids.add(terminal_id)
 
     def discard(self, terminal_id: str) -> None:
-        self._terminal_ids.discard(terminal_id)
+        with self._lock:
+            self._terminal_ids.discard(terminal_id)
+
+    def forget(self, terminal_id: str) -> None:
+        """Drop BOTH marks as one transition — the teardown verb."""
+        with self._lock:
+            self._terminal_ids.discard(terminal_id)
+            self._fallback_disabled_ids.discard(terminal_id)
+
+    def set_fallback_disabled(self, terminal_id: str) -> None:
+        """Mark a certified herdr terminal (WP-HERDR §6(ii))."""
+        with self._lock:
+            self._fallback_disabled_ids.add(terminal_id)
+
+    def clear_fallback_disabled(self, terminal_id: str) -> None:
+        """Unmark it.  Called at TEARDOWN only.
+
+        Not on a source detach and not on a subscription gap: §6(ii) is precisely
+        the rule that a certified cohort keeps its derived lifecycle muted while
+        its source is gone.  Clearing this on a gap would reinstate the silent
+        revert the rule exists to prevent.
+        """
+        with self._lock:
+            self._fallback_disabled_ids.discard(terminal_id)
 
     def is_authoritative(self, terminal_id: str) -> bool:
-        return terminal_id in self._terminal_ids
+        with self._lock:
+            return terminal_id in self._terminal_ids
+
+    def fallback_disabled(self, terminal_id: str) -> bool:
+        with self._lock:
+            return terminal_id in self._fallback_disabled_ids
 
 
 @dataclass(frozen=True)
@@ -416,7 +489,22 @@ class Projector:
         return ProjectedState(terminal_id=terminal_id, since=at)
 
     def _is_muted(self, row: ProjectedState, event: WorkerEvent) -> bool:
-        """Source-level precedence: is this derived event logged but not applied?"""
+        """Source-level precedence: is this derived event logged but not applied?
+
+        WP-HERDR §6(ii) adds ONE clause, and its position in the sequence is the
+        whole of its meaning.  It sits AFTER the ``DERIVED_ALWAYS_KINDS``
+        exemption, so a certified terminal keeps applying exactly the kinds an
+        authoritative source cannot know — ``prompt.awaiting``,
+        ``prompt.answered``, ``usage.capped``, ``process.exited``,
+        ``pane.recovered`` — which is AC6's existing carve-out, untouched.  It
+        sits BEFORE the authority and health checks, and that is the part that
+        does work: a certified herdr terminal whose source has gone STALE, or
+        detached entirely, would otherwise fall through both and hand its
+        lifecycle back to the scraped pane, silently.  §6(ii) says it must not —
+        the cohort degrades (``no_signal``, delivery-ineligible) instead, so the
+        operator sees a missing source rather than a plausible state derived from
+        pixels.
+        """
         if event.confidence is not Confidence.DERIVED:
             return False
         if event.kind in DERIVED_ALWAYS_KINDS:
@@ -491,10 +579,42 @@ class Projector:
         source" would eventually disagree, and the disagreement would read as the
         pane path being suppressed for a terminal whose derived events still
         apply — a terminal publishing nothing at all.
+
+        WP-HERDR §6(ii) is the one addition, and it goes HERE rather than in
+        :meth:`_is_muted` precisely because of the paragraph above: a certified
+        herdr terminal whose source has gone stale or detached must neither have
+        its lifecycle handed back to the scraped pane NOR have the legacy path
+        start publishing for it again.  One predicate, both consequences.
+
+        **§6(ii) is conditional on the source having EVER delivered**, and that
+        condition is what keeps it from being a false-idle generator.  A herdr
+        subscription can be ACKed and permanently silent — measured, on the wrong
+        subscription — and a cohort muted on that evidence freezes at whatever the
+        connect-time snapshot said while reporting it as authoritative truth.  So
+        a certified terminal whose source has never produced a pushed frame keeps
+        the pane fallback, exactly as it would have before H1; only a source that
+        has proven its stream earns the right to mute the alternative to itself.
+        ``last_source_probe_at`` IS that proof, because the herdr source now bumps
+        it from one place only: a pushed frame that belongs to it.
         """
+        if row.last_source_probe_at is not None and self._fallback_disabled(terminal_id):
+            return True
         if not self._sources.is_authoritative(terminal_id):
             return False
         return self._source_healthy(row)
+
+    def _fallback_disabled(self, terminal_id: str) -> bool:
+        """Read §6(ii) from the registry, tolerating a registry that predates it.
+
+        Every registry in the tree implements the method.  The ``getattr`` is for
+        the ad-hoc duck-typed fakes a test may hand the projector: a registry
+        that only answers ``is_authoritative`` is a pre-H1 registry, and pre-H1
+        means no terminal is certified, which is exactly ``False``.
+        """
+        probe = getattr(self._sources, "fallback_disabled", None)
+        if probe is None:
+            return False
+        return bool(probe(terminal_id))
 
     def _source_healthy(self, row: ProjectedState) -> bool:
         """A source is healthy while its tailer stat-ed the file within ``NO_SIGNAL_S``.
@@ -734,9 +854,16 @@ class Projector:
     def sweep(self) -> list[ProjectionOutcome]:
         """Degrade terminals whose source AND probe have both gone silent.
 
-        Runs every ``PANE_HEARTBEAT_S``.  ``degraded(no_signal)`` has no other
-        producer: silence is not an event, and a projector that only runs on
-        arrival can never observe it.
+        Runs every ``PANE_HEARTBEAT_S``.  It is the only producer of
+        ``degraded(no_signal)`` from OBSERVED silence: silence is not an event,
+        and a projector that only runs on arrival can never observe it.
+
+        It is not the only producer of the STATE.  WP-HERDR §6(i): a source that
+        loses its own subscription declares the loss itself, as a ``pane.missing``
+        carrying ``degraded_reason: no_signal`` at ``authoritative`` confidence
+        (``adapters/truth/herdr_runtime._emit_gap_degraded``).  That path reaches
+        the same state through :meth:`_payload_reason`, not through this sweep,
+        and it reaches it immediately rather than a window later.
 
         Two guards keep the sweep from inventing degradations:
 

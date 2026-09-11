@@ -47,20 +47,43 @@ Handler = Callable[["FakeHerdrServer", dict[str, Any]], Awaitable[None]]
 
 
 class FakeHerdrServer:
-    """A scriptable herdr socket server for one connection.
+    """A scriptable herdr socket server, correct across MULTIPLE connections.
+
+    It used to serve one connection and keep a single ``_writer``, which every
+    reply went to.  That is wrong now that the client opens a second, short-lived
+    connection for each request/reply (``HerdrClient.request_once``, forced by
+    herdr 0.9.0 accepting a subscription only as a connection's first message):
+    the second connection clobbered ``_writer``, so the STREAMING connection's
+    next reply was written to a socket its client was not reading, and the client
+    waited forever.  Under ``-n 2`` that surfaced as a worker parked in
+    ``asyncio.run`` and an xdist run stuck at 99% — the tests themselves passed
+    when run alone, because the clobber is a race.
+
+    So: replies go to the connection the request ARRIVED on, and every
+    connection's handler task and writer is tracked so teardown closes them all
+    (a handler left parked on ``readline`` is what kept the interpreter alive).
+    ``push_stream`` writes to the FIRST connection — the one a test subscribed on
+    — for the cases that need an unsolicited event to reach the event stream.
 
     ``on_request`` is called for every JSON-RPC line the client sends; the
     handler writes whatever replies/pushes the test wants via :meth:`reply`,
-    :meth:`error` and :meth:`push`.  The default handler answers ``api.schema``
-    with the pinned protocol and acks ``events.subscribe`` — enough for the happy
-    path — and a test overrides it for the edge cases.
+    :meth:`error` and :meth:`push`.  The default handler acks
+    ``events.subscribe`` and answers ``session.snapshot`` with the pinned
+    protocol — enough for the happy path, since 0.9.0 carries the protocol in the
+    snapshot and has no schema method — and a test overrides it for the edge
+    cases.
     """
 
     def __init__(self, socket_path: str) -> None:
         self._socket_path = socket_path
         self._server: asyncio.AbstractServer | None = None
+        #: The connection the request being handled arrived on.  ``reply`` /
+        #: ``error`` / ``push`` target it, which is what every handler means.
         self._writer: asyncio.StreamWriter | None = None
-        self._serve_task: asyncio.Task[None] | None = None
+        #: The FIRST connection — the streaming one in every test that subscribes.
+        self._stream_writer: asyncio.StreamWriter | None = None
+        self._writers: list[asyncio.StreamWriter] = []
+        self._serve_tasks: list[asyncio.Task[None]] = []
         self.requests: list[dict[str, Any]] = []
         self.on_request: Handler = FakeHerdrServer._default_handler
 
@@ -74,25 +97,32 @@ class FakeHerdrServer:
         # connection handler returns, and ``_serve`` is parked on ``readline()``
         # — so a plain ``close()``/``wait_closed()`` hangs the test.  Cancel the
         # handler and close the writer, THEN close the server.
-        if self._serve_task is not None:
-            self._serve_task.cancel()
+        for task in self._serve_tasks:
+            task.cancel()
             try:
-                await self._serve_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
-            self._serve_task = None
-        if self._writer is not None:
+        self._serve_tasks.clear()
+        for writer in self._writers:
             try:
-                self._writer.close()
+                writer.close()
             except Exception:
                 pass
+        self._writers.clear()
+        self._writer = None
+        self._stream_writer = None
         if self._server is not None:
             self._server.close()
             self._server = None
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        self._writer = writer
-        self._serve_task = asyncio.current_task()
+        self._writers.append(writer)
+        if self._stream_writer is None:
+            self._stream_writer = writer
+        task = asyncio.current_task()
+        if task is not None:
+            self._serve_tasks.append(task)
         while True:
             line = await reader.readline()
             if not line:
@@ -102,6 +132,9 @@ class FakeHerdrServer:
                 continue
             request = json.loads(text)
             self.requests.append(request)
+            # Per REQUEST, not per connection: a handler's ``reply`` must reach
+            # the client that asked, even while another connection is open.
+            self._writer = writer
             await self.on_request(self, request)
 
     async def reply(self, request_id: str, result: dict[str, Any]) -> None:
@@ -111,11 +144,31 @@ class FakeHerdrServer:
         await self._write({"id": request_id, "error": {"code": code, "message": message}})
 
     async def push(self, event: dict[str, Any]) -> None:
+        """Push an unsolicited event on the connection being handled."""
         await self._write(event)
 
+    async def push_stream(self, event: dict[str, Any]) -> None:
+        """Push on the FIRST connection — the one the client subscribed on.
+
+        A handler running for a ``request_once`` connection has to name the
+        stream explicitly; ``push`` would send the event to a socket the client
+        is about to close and never read.
+        """
+        writer = self._stream_writer
+        if writer is None:
+            return
+        writer.write(json.dumps(event).encode() + b"\n")
+        await writer.drain()
+
     async def close_connection(self) -> None:
+        """Drop the connection being handled."""
         if self._writer is not None:
             self._writer.close()
+
+    async def close_stream(self) -> None:
+        """Drop the FIRST connection — the one the client is streaming on."""
+        if self._stream_writer is not None:
+            self._stream_writer.close()
 
     async def _write(self, obj: dict[str, Any]) -> None:
         assert self._writer is not None
@@ -125,17 +178,37 @@ class FakeHerdrServer:
     async def _default_handler(self, request: dict[str, Any]) -> None:
         method = request.get("method")
         request_id = request["id"]
-        if method == "api.schema":
+        if method == "events.subscribe":
+            await self.reply(request_id, {"type": "subscription_started"})
+        elif method == "session.snapshot":
+            # herdr 0.9.0 carries the protocol number IN the snapshot; there is
+            # no separate schema method, so ``check_protocol`` reads this reply.
             await self.reply(
                 request_id,
-                {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION},
+                {
+                    "snapshot": {
+                        "panes": [],
+                        "protocol": HERDR_PROTOCOL,
+                        "schema_version": HERDR_SCHEMA_VERSION,
+                    }
+                },
             )
-        elif method == "events.subscribe":
-            await self.reply(request_id, {"type": "subscription_started"})
-        elif method == "api.snapshot":
-            await self.reply(request_id, {"snapshot": {"panes": []}})
         else:
             await self.reply(request_id, {})
+
+
+def _snapshot_body(panes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A ``session.snapshot`` body carrying the pinned protocol numbers.
+
+    herdr 0.9.0 reports the protocol IN the snapshot and has no separate schema
+    method, so every fake that answers ``session.snapshot`` must carry the pin or
+    ``check_protocol`` — which now reads it from here — sees a mismatch.
+    """
+    return {
+        "panes": list(panes or []),
+        "protocol": HERDR_PROTOCOL,
+        "schema_version": HERDR_SCHEMA_VERSION,
+    }
 
 
 @pytest.fixture
@@ -199,8 +272,8 @@ async def test_request_returns_result_body(socket_path: str) -> None:
     async with FakeHerdrServer(socket_path):
         client = HerdrClient(socket_path)
         await client.connect()
-        result = await client.request("api.snapshot")
-        assert result == {"snapshot": {"panes": []}}
+        result = await client.request("session.snapshot")
+        assert result == {"snapshot": _snapshot_body()}
         await client.close()
 
 
@@ -255,11 +328,14 @@ async def test_event_between_subscribe_and_snapshot_is_delivered_once_in_order(
             await server.reply(request_id, {"type": "subscription_started"})
             # An event races in AFTER the ack but BEFORE the snapshot request.
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-        elif method == "api.snapshot":
-            await server.reply(request_id, {"snapshot": {"panes": []}})
-            # A live event that arrives AFTER the snapshot.
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.close_connection()
+        elif method == "session.snapshot":
+            await server.reply(request_id, {"snapshot": _snapshot_body()})
+            # A live event that arrives AFTER the snapshot, ON THE STREAM. The
+            # snapshot now travels on its own short-lived connection
+            # (``request_once``), so an event meant for the subscriber has to
+            # name the stream rather than reply-channel.
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_stream()
         else:
             await server.reply(request_id, {})
 
@@ -288,7 +364,7 @@ async def test_request_times_out_when_server_never_answers(socket_path: str) -> 
         client = HerdrClient(socket_path, request_timeout_s=0.3)
         await client.connect()
         with pytest.raises(HerdrTransportError):
-            await client.request("api.snapshot")
+            await client.request("session.snapshot")
         await client.close()
 
 
@@ -301,7 +377,7 @@ async def test_reply_with_neither_result_nor_error_is_a_transport_error(socket_p
         client = HerdrClient(socket_path)
         await client.connect()
         with pytest.raises(HerdrTransportError):
-            await client.request("api.snapshot")
+            await client.request("session.snapshot")
         await client.close()
 
 
@@ -322,8 +398,12 @@ async def test_check_protocol_accepts_the_pinned_version(socket_path: str) -> No
 
 async def test_check_protocol_refuses_a_drifted_protocol(socket_path: str) -> None:
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
-        # A future herdr on a different protocol.
-        await server.reply(request["id"], {"protocol": 23, "schema_version": 1})
+        # A future herdr on a different protocol, reporting it where 0.9.0 does:
+        # inside the ``session.snapshot`` body.
+        await server.reply(
+            request["id"],
+            {"snapshot": {"panes": [], "protocol": 23, "schema_version": 1}},
+        )
 
     async with FakeHerdrServer(socket_path) as server:
         server.on_request = handler
@@ -336,7 +416,12 @@ async def test_check_protocol_refuses_a_drifted_protocol(socket_path: str) -> No
 
 
 async def test_check_protocol_matches_the_fixture_schema_head() -> None:
-    """The pin equals what the real 0.9.0 ``api schema`` reported (fixture)."""
+    """The pin equals what the real 0.9.0 schema head reported (fixture).
+
+    The fixture is kept as the record of where the numbers came from; the LIVE
+    read is now ``session.snapshot``, because 0.9.0's API socket has no
+    ``api.schema`` method and closes the connection on one.
+    """
     head = json.loads((FIXTURES / "api-schema-head.json").read_text())
     assert head["protocol"] == HERDR_PROTOCOL
     assert head["schema_version"] == HERDR_SCHEMA_VERSION
@@ -511,17 +596,13 @@ async def test_adj_r4_event_pushed_BEFORE_the_subscribe_ack_is_buffered(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
             await server.reply(rid, {"type": "subscription_started"})
-        elif method == "api.snapshot":
-            await server.reply(rid, {"snapshot": {"panes": []}})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.close_connection()
+        elif method == "session.snapshot":
+            await server.reply(rid, {"snapshot": _snapshot_body()})
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
@@ -550,18 +631,14 @@ async def test_adj_r1_event_arrives_during_the_snapshot_response_itself(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
-        elif method == "api.snapshot":
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
-            await server.reply(rid, {"snapshot": {"panes": []}})
-            await server.push({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
-            await server.close_connection()
+        elif method == "session.snapshot":
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 2}}})
+            await server.reply(rid, {"snapshot": _snapshot_body()})
+            await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": 3}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
@@ -590,21 +667,17 @@ async def test_adj_r2_burst_of_fifty_interleaved_events_no_drop_dup_or_reorder(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
+        if method == "events.subscribe":
             await server.reply(rid, {"type": "subscription_started"})
             for i in range(1, 21):  # 20 between ack and snapshot request
                 await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-        elif method == "api.snapshot":
+        elif method == "session.snapshot":
             for i in range(21, 41):  # 20 more inside the snapshot round trip
-                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-            await server.reply(rid, {"snapshot": {"panes": []}})
+                await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+            await server.reply(rid, {"snapshot": _snapshot_body()})
             for i in range(41, 51):  # 10 live, after the snapshot
-                await server.push({"event": "pane_updated", "data": {"pane": {"seq": i}}})
-            await server.close_connection()
+                await server.push_stream({"event": "pane_updated", "data": {"pane": {"seq": i}}})
+            await server.close_stream()
         else:
             await server.reply(rid, {})
 
@@ -629,20 +702,25 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
     socket_path: str,
 ) -> None:
     """The buffer must not survive a close() (no cross-connection replay).
-    Verbatim from the reviewer probe test_adj_r2_race.py."""
+    From the reviewer probe test_adj_r2_race.py.
+
+    The racing push moved AHEAD of the subscribe ack, and the snapshot call is
+    gone.  Both follow from the snapshot travelling on its own short-lived
+    connection now (``request_once``): only a request on the STREAM connection
+    can race a pushed event into ``_event_buffer``, and ``subscribe`` is the one
+    such request.  An event pushed after the ack simply waits in the socket until
+    ``events()`` reads it — correct, and not what this test is about.  The
+    property under test is unchanged: whatever the buffer holds, ``close()``
+    drops it.
+    """
 
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         method = request.get("method")
         rid = request["id"]
-        if method == "api.schema":
-            await server.reply(
-                rid, {"protocol": HERDR_PROTOCOL, "schema_version": HERDR_SCHEMA_VERSION}
-            )
-        elif method == "events.subscribe":
-            await server.reply(rid, {"type": "subscription_started"})
+        if method == "events.subscribe":
+            # AHEAD of the ack, so ``subscribe`` buffers it on the way past.
             await server.push({"event": "pane_updated", "data": {"pane": {"seq": 1}}})
-        elif method == "api.snapshot":
-            await server.reply(rid, {"snapshot": {"panes": []}})
+            await server.reply(rid, {"type": "subscription_started"})
         else:
             await server.reply(rid, {})
 
@@ -651,7 +729,88 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
         client = HerdrClient(socket_path)
         await client.connect()
         await client.subscribe([{"type": "pane.updated"}])
-        await client.snapshot()
         assert len(client._event_buffer) == 1
         await client.close()
         assert len(client._event_buffer) == 0
+
+
+async def test_subscribe_must_be_the_first_message_on_the_connection(socket_path: str) -> None:
+    """N5: the rule ``request_once`` exists for, pinned.
+
+    herdr 0.9.0 accepts ``events.subscribe`` only as a connection's FIRST
+    message; after a plain request it answers by resetting the connection. So a
+    client that means to stream must keep its connection clean, and the protocol
+    read and the snapshot have to happen somewhere else. This asserts the shape
+    rather than the server's reaction: on the STREAMING connection the client
+    sends exactly one message before ``events.subscribe``, namely nothing.
+    """
+    seen: list[tuple[bool, str]] = []
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        # The fake points ``_writer`` at the connection the request ARRIVED on,
+        # and ``_stream_writer`` at the first connection ever opened — the one
+        # ``client.connect()`` made and the one the client streams on. Counting
+        # connections instead would be wrong: ``check_protocol`` opens its
+        # one-shot BEFORE the subscribe, so the count is already 2 by then.
+        on_stream = server._writer is server._stream_writer
+        seen.append((on_stream, str(request.get("method"))))
+        await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.check_protocol()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        await client.close()
+
+    # The protocol read and the snapshot each opened their OWN connection, so by
+    # the time the stream's subscribe arrives more than one connection exists —
+    # and the FIRST connection carried no request before it.
+    stream_methods = [method for on_stream, method in seen if on_stream]
+    assert stream_methods == [
+        "events.subscribe"
+    ], "the streaming connection carries the subscribe and nothing else"
+    off_stream = [method for on_stream, method in seen if not on_stream]
+    assert off_stream == [
+        "session.snapshot",
+        "session.snapshot",
+    ], "check_protocol and snapshot each take a one-shot connection"
+
+
+async def test_an_absent_schema_version_does_not_auto_match_the_pin(socket_path: str) -> None:
+    """N6: 0.9.0 sends no ``schema_version``, and r1 defaulted the missing value
+    TO the pin — so the D7 check asserted something it had never read. An absent
+    schema is not a mismatch, but the pin it satisfies is ``protocol`` alone."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        await server.reply(request["id"], {"snapshot": {"panes": [], "protocol": HERDR_PROTOCOL}})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        snapshot = await client.check_protocol()
+        assert snapshot["protocol"] == HERDR_PROTOCOL
+        assert "schema_version" not in snapshot
+        await client.close()
+
+
+async def test_a_present_but_wrong_schema_version_still_refuses(socket_path: str) -> None:
+    """The other half of N6: a future herdr that reintroduces the field is still
+    checked, rather than silently accepted."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        await server.reply(
+            request["id"],
+            {"snapshot": {"panes": [], "protocol": HERDR_PROTOCOL, "schema_version": 99}},
+        )
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        with pytest.raises(HerdrProtocolMismatch):
+            await client.check_protocol()
+        await client.close()

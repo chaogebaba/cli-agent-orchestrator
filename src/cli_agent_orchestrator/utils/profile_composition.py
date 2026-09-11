@@ -494,7 +494,12 @@ def composed_profile_hash(layers: List[Layer]) -> str:
 # would change the sha and invalidate the very row just written (self-
 # invalidation). Everything else in the position frontmatter is merge-relevant
 # (role, skills, mcpServers, requires, contextPolicy, …) and IS hashed.
-_POSITION_SHA_EXCLUDE = ("certification",)
+# Both certification blocks are excluded so a recorded PASS row never
+# invalidates the very sha pair it recorded.  ``herdr_certification`` (WP-HERDR
+# D9) is the BACKEND axis beside the provider one: herdr is a backend, not a
+# provider, so it needs its own rows, and it needs the same self-exclusion for
+# the same reason.
+_POSITION_SHA_EXCLUDE = ("certification", "herdr_certification")
 
 
 def position_sha(body: str, frontmatter_meta: Dict[str, Any], length: int = 16) -> str:

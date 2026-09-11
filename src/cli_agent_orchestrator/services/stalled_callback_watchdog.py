@@ -705,8 +705,20 @@ class StalledCallbackWatchdog:
         # capture -> filter -> sha256 pipeline (net sampler count stays 1).
         from cli_agent_orchestrator.services.pane_liveness import pane_liveness
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+            herdr_lifecycle_authoritative,
+        )
 
         for terminal_id in sample_ids:
+            # WP-HERDR H1 §8 / F506 Do-NOT #1: a CERTIFIED terminal's lifecycle
+            # comes from the herdr EventSource, and ``observe`` is the tree's one
+            # pane sampler. Registering a certified terminal here would make seam
+            # A a SECOND sampler for the same fact — the exact thing F506 was
+            # built to end (net sampler count stays 1). So the certified cohort
+            # is skipped: no capture, no fingerprint, no resync from the pane
+            # tail. Everything for an uncertified terminal is unchanged.
+            if herdr_lifecycle_authoritative(terminal_id):
+                continue
             observation = pane_liveness.observe(terminal_id, now=now, monitor=status_monitor)
             if observation is None:
                 # No usable sample this tick (capture outage / unreadable pane).
