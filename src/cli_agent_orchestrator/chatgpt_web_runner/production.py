@@ -114,6 +114,7 @@ def run_production_review(
     verify_pin: Any = _verify_pin_real,
     browser_turn: Any = None,
     on_stream_event: Any = None,
+    relay: Any = None,
 ) -> RunnerOutcome:
     """Drive one production review turn through the D2 anchor sequence.
 
@@ -194,6 +195,20 @@ def run_production_review(
         deadline_at=time.time() + _ATTEMPT_DEADLINE_S,
     )
 
+    # F970 (#819) step 2 — forward the stream. The relay publishes this turn's
+    # allow-listed progress to cao-server (``/chatgpt/turns/<id>/events``) so it
+    # can be followed live with seq ids and replay. Best-effort and bounded: it
+    # never blocks, slows or fails the turn, and ``relay_from_env`` returns None
+    # outside a CAO worker or when CAO_CHATGPT_TURN_RELAY=0.
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import relay_from_env
+
+    _relay = relay if relay is not None else relay_from_env(run_id)
+    if _relay is not None:
+        _relay.started({"artifact_path": artifact_path, "bundle_sha256": bundle_sha})
+    _sink = on_stream_event
+    if _sink is None and _relay is not None:
+        _sink = _relay.publish_stream_event
+
     def _default_browser_turn() -> AcceptedAnswer:
         # Append the terminal sentinel instruction with THIS run's id + bundle
         # sha so the gate's strip_sentinel finds exactly one terminal
@@ -214,7 +229,7 @@ def run_production_review(
                 observed_holder=_observed_attachment,
                 intent_log=_intent_log,
                 stream_holder=_stream_facts,
-                on_stream_event=on_stream_event,
+                on_stream_event=_sink,
             )
         )
 
@@ -242,6 +257,23 @@ def run_production_review(
         ),
         stream_snapshot=(_stream_facts or None),
     )
+
+    # F970: close the turn's relayed stream with a terminal event, so every
+    # follower's SSE connection ends instead of idling to its deadline. This
+    # happens BEFORE the worker callback, mirroring report-before-callback: a
+    # watcher must never see the turn still "running" after the caller has been
+    # told it finished.
+    if _relay is not None:
+        summary = {
+            "ok": outcome.ok,
+            "delivery_state": outcome.delivery_state.value,
+            "error_code": outcome.error_code.value if outcome.error_code else None,
+            "report_path": outcome.report_path,
+            "conversation_url": outcome.conversation_url,
+            "quota": (_stream_facts or {}).get("quota"),
+        }
+        (_relay.finished if outcome.ok else _relay.failed)(summary)
+        _relay.close()
 
     # Worker-scoped callback AFTER publication (report-before-callback, D10/AC-1).
     if outcome.ok and outcome.report_path:

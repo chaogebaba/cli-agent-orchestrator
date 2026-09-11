@@ -2506,6 +2506,191 @@ async def events_history(
     return {"events": events}
 
 
+# ---------------------------------------------------------------------------
+# F970 (#819) — ChatGPT-web turn relay: forward the backend's own SSE
+#
+# The chatgpt_web runner consumes the app's ``POST /backend-api/f/conversation``
+# stream inside a worker subprocess driving a headful browser. These two routes
+# make that stream watchable: the worker PUSHES its allow-listed progress events
+# (authenticated by its own terminal token), and any reader FOLLOWS them live
+# with per-turn seq ids and replay-from-seq. Conversation-GET stays the
+# authority for the final answer (D6) — this surface carries progress, quota and
+# lifecycle only, which is why a relayed stream can never publish a result.
+# ---------------------------------------------------------------------------
+
+#: Cap on one ingest batch, so a runaway publisher cannot blow the ring in one
+#: request. The runner batches on a short interval, never in bulk.
+_CHATGPT_TURN_MAX_BATCH = 200
+
+
+def _chatgpt_turn_id_or_400(turn_id: str) -> str:
+    from cli_agent_orchestrator.services.chatgpt_turn_stream import TURN_ID_RE
+
+    if not TURN_ID_RE.match(turn_id or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="turn_id must be 1-128 chars of [A-Za-z0-9._-] starting alphanumeric",
+        )
+    return turn_id
+
+
+@app.post("/terminals/{terminal_id}/chatgpt/turns/{turn_id}/events")
+async def chatgpt_turn_publish(
+    terminal_id: str,
+    turn_id: str,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Ingest a batch of turn events from the worker that owns the turn.
+
+    Identity, not scope (the F707/F829 rule this file already follows): a
+    write-scope holder is not thereby the worker it names, so the publisher must
+    present that terminal's ``X-CAO-Terminal-Token``. Otherwise any client on the
+    box could inject a fabricated token stream under a worker's name.
+
+    Body: ``{"events": [{"kind": str, "payload": {...}}, ...]}``. Payload keys
+    that are credential-shaped are dropped by the store, and ``kind`` values in
+    ``LIFECYCLE_KINDS`` are additionally mirrored onto the fleet SSE bus so a
+    fleet watcher sees turn start/quota/end without the token firehose.
+    """
+    from cli_agent_orchestrator.services.chatgpt_turn_stream import (
+        LIFECYCLE_KINDS,
+        get_turn_streams,
+    )
+
+    _chatgpt_turn_id_or_400(turn_id)
+    _f829_verify_caller_binding(request, terminal_id)
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="body must be an object"
+        )
+    raw_events = body.get("events")
+    if not isinstance(raw_events, list) or not raw_events:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="events must be a non-empty list"
+        )
+    if len(raw_events) > _CHATGPT_TURN_MAX_BATCH:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"at most {_CHATGPT_TURN_MAX_BATCH} events per request",
+        )
+
+    store = get_turn_streams()
+    accepted = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "").strip()
+        if not kind:
+            continue
+        event = store.append(turn_id, kind, raw.get("payload"), terminal_id=terminal_id)
+        accepted.append(event.seq)
+        if kind in LIFECYCLE_KINDS:
+            try:
+                from cli_agent_orchestrator.services.sse_bus import get_bus
+
+                get_bus().publish(
+                    {
+                        "kind": "chatgpt_turn",
+                        "terminal_id": terminal_id,
+                        "detail": event.to_dict(),
+                    }
+                )
+            except Exception:  # pragma: no cover - the mirror is best-effort
+                logger.debug("chatgpt turn lifecycle mirror failed", exc_info=True)
+    return {
+        "turn_id": turn_id,
+        "accepted": len(accepted),
+        "last_seq": accepted[-1] if accepted else None,
+    }
+
+
+@app.get("/chatgpt/turns/{turn_id}/events")
+async def chatgpt_turn_events(
+    turn_id: str,
+    after_seq: Optional[int] = Query(default=None, ge=0),
+    stream: bool = Query(default=True),
+    last_event_id: Optional[str] = Header(default=None, alias="Last-Event-ID"),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Follow one ChatGPT-web turn's relayed events (SSE), or read a snapshot.
+
+    ``id:`` on every frame is the per-turn seq — the sole ordering authority —
+    so a native ``EventSource`` reconnect resumes exactly after the last event
+    it received. ``?after_seq=`` wins over ``Last-Event-ID`` when both are
+    present (an explicit cursor beats an implicit one). A reader whose cursor is
+    older than the bounded ring still holds is handed an explicit ``event: gap``
+    frame rather than a silently discontiguous stream.
+
+    The stream CLOSES once a terminal event (``turn_finished`` / ``turn_failed``)
+    has been delivered, so a follower never hangs on a turn that has ended. A
+    turn id that never appears closes after a short grace window — a reader may
+    legitimately connect a moment before the worker's first publish, but an id
+    that simply does not exist (a typo, or a turn whose ring aged out) must not
+    pin a connection and a poll loop for the whole idle deadline.
+
+    ``?stream=false`` returns the same events as JSON for a non-SSE caller.
+    """
+    from cli_agent_orchestrator.services.chatgpt_turn_stream import (
+        gap_frame,
+        get_turn_streams,
+        sse_frame,
+    )
+
+    _chatgpt_turn_id_or_400(turn_id)
+    store = get_turn_streams()
+
+    cursor = after_seq
+    if cursor is None and last_event_id:
+        try:
+            cursor = int(last_event_id)
+        except ValueError:
+            cursor = None
+
+    if not stream:
+        snapshot = store.snapshot(turn_id)
+        if cursor:
+            snapshot["events"] = [e for e in snapshot["events"] if e["seq"] > cursor]
+        return snapshot
+
+    from fastapi.responses import StreamingResponse
+
+    async def event_generator():
+        local_cursor = cursor
+        declared_gap = False
+        # Poll the store rather than subscribing: the writer is an HTTP handler
+        # on this same process and a 0.25s tail keeps this loop cancel-safe with
+        # no cross-thread wakeup machinery (the workflow-run stream's pattern).
+        idle_deadline = 900.0
+        unknown_grace = 30.0
+        waited = 0.0
+        while True:
+            events, gap = store.read_after(turn_id, local_cursor)
+            if gap and not declared_gap:
+                declared_gap = True
+                yield gap_frame(gap)
+            for event in events:
+                yield sse_frame(event)
+                local_cursor = event.seq
+            if events:
+                waited = 0.0
+                if store.is_ended(turn_id):
+                    return
+            else:
+                if store.is_ended(turn_id):
+                    return
+                waited += 0.25
+                if not store.exists(turn_id) and waited >= unknown_grace:
+                    return
+                if waited >= idle_deadline:
+                    return
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
