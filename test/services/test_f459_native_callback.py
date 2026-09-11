@@ -4,18 +4,14 @@ Tests:
   1. Payload content: bridge message body = worker's actual callback text
   2. From-name: uses worker display name (not "cao-" prefixed)
   3. Truncation: bodies > 8KB are defensively truncated with tail pointer
-  4. Marker suppression: socket-delivered rows are recorded in trace
-  5. Fallback on socket failure: socket failure → no marker, row stays pending
+
+Groups 4 and 5 (marker suppression, socket fallback) are deleted in WP-ARCH 3c
+with the doorbell that owned them — see the block at the foot of the file.
 """
 
 from __future__ import annotations
 
 import json
-import uuid
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 # ===========================================================================
 # 1. Payload content: build_wake_payload carries actual message body
@@ -193,245 +189,34 @@ class TestF459Truncation:
 
 
 # ===========================================================================
-# 4. Marker suppression: socket-delivered rows recorded in trace
+# 4 + 5. WP-ARCH 3c K3: marker suppression and socket fallback are GONE
 # ===========================================================================
-
-
-class TestF459MarkerSuppression:
-    """Socket-delivered rows are marked so drain hook skips them."""
-
-    def test_mark_socket_delivered_creates_trace(self):
-        """_mark_socket_delivered writes an f459.socket_delivered trace event."""
-        from cli_agent_orchestrator.services.doorbell_service import (
-            _mark_socket_delivered,
-            is_socket_delivered,
-        )
-
-        mock_db = MagicMock()
-        mock_session = MagicMock()
-        mock_db.__enter__ = MagicMock(return_value=mock_session)
-        mock_db.__exit__ = MagicMock(return_value=False)
-
-        with patch(
-            "cli_agent_orchestrator.clients.database.SessionLocal",
-            return_value=mock_db,
-        ):
-            _mark_socket_delivered(42)
-
-        # Verify a trace event was added
-        mock_session.add.assert_called_once()
-        added = mock_session.add.call_args[0][0]
-        assert added.kind == "f459.socket_delivered"
-        assert added.message_id == 42
-        mock_session.commit.assert_called_once()
-
-    def test_is_socket_delivered_true(self):
-        """is_socket_delivered returns True when trace exists."""
-        from cli_agent_orchestrator.services.doorbell_service import is_socket_delivered
-
-        mock_db = MagicMock()
-        mock_session = MagicMock()
-        mock_db.__enter__ = MagicMock(return_value=mock_session)
-        mock_db.__exit__ = MagicMock(return_value=False)
-        # Simulate query returning a result
-        mock_session.query.return_value.filter.return_value.first.return_value = (1,)
-
-        with patch(
-            "cli_agent_orchestrator.clients.database.SessionLocal",
-            return_value=mock_db,
-        ):
-            result = is_socket_delivered(42)
-
-        assert result is True
-
-    def test_is_socket_delivered_false(self):
-        """is_socket_delivered returns False when no trace exists."""
-        from cli_agent_orchestrator.services.doorbell_service import is_socket_delivered
-
-        mock_db = MagicMock()
-        mock_session = MagicMock()
-        mock_db.__enter__ = MagicMock(return_value=mock_session)
-        mock_db.__exit__ = MagicMock(return_value=False)
-        # Simulate query returning None
-        mock_session.query.return_value.filter.return_value.first.return_value = None
-
-        with patch(
-            "cli_agent_orchestrator.clients.database.SessionLocal",
-            return_value=mock_db,
-        ):
-            result = is_socket_delivered(42)
-
-        assert result is False
-
-    def test_ring_marks_delivered_on_success(self):
-        """Successful native ring calls _mark_socket_delivered."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService.get",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
-            ) as mock_mark,
-        ):
-            result = ring_supervisor_doorbell(
-                "term-01",
-                100,
-                written_count=1,
-                message_body="hello world",
-                sender_display_name="kiro_dev-abc123",
-            )
-
-        assert result == "rang"
-        mock_mark.assert_called_once_with(100)
-
-    def test_ring_ids_only_records_one_marker_row_stays_pending(self):
-        """Ids-only successful ring: f459.socket_delivered is TRANSPORT truth.
-
-        F803 #660 r3 ruling: the marker is recorded on EVERY successful native
-        ring, body or not — exactly ONE marker for an ids-only ring. The
-        consumption side stays body-gated and lives inside
-        `_attempt_native_ring` (keyed on `body_carried`): an ids-only ring
-        records a non-muting `wake_only` NATIVE emission there, so the outer
-        `rang` branch attaches NO consumption and the row stays PENDING for
-        the drain hook.
-        """
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService.get",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
-                return_value=True,
-            ) as mock_pending,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
-            ) as mock_mark,
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.consume_on_native_delivery"
-            ) as mock_consume,
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.record_native_wake_only"
-            ) as mock_wake_only,
-        ):
-            result = ring_supervisor_doorbell(
-                "term-01",
-                100,
-                written_count=1,
-                # Ids-only wake — no message_body, no carried text.
-            )
-
-        assert result == "rang"
-        # Transport truth: exactly ONE marker on a successful ids-only ring.
-        mock_mark.assert_called_once_with(100)
-        # The outer rang branch settles nothing: consumption is body-gated
-        # inside `_attempt_native_ring`, so the row stays pending (an ids-only
-        # ring records `wake_only` there, which does not mute the hook).
-        mock_consume.assert_not_called()
-        mock_wake_only.assert_not_called()
-        # The ring fired only because the row was still pending.
-        mock_pending.assert_called_once_with(100)
-
-
-# ===========================================================================
-# 5. Fallback on socket failure: no marker, row stays pending
-# ===========================================================================
-
-
-class TestF459Fallback:
-    """Socket write fails → row NOT marked, fallback path unchanged."""
-
-    def test_socket_failure_no_marker(self):
-        """When native ring fails, _mark_socket_delivered is NOT called."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService.get",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="socket_econnrefused",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
-            ) as mock_mark,
-        ):
-            result = ring_supervisor_doorbell(
-                "term-01",
-                100,
-                written_count=1,
-                message_body="hello",
-                sender_display_name="dev-x",
-            )
-
-        # Fell back to pane nudge
-        assert result == "fallback"
-        # No socket-delivered marker
-        mock_mark.assert_not_called()
-
-    def test_native_ring_passes_body_and_name(self):
-        """_attempt_native_ring receives message_body and sender_display_name kwargs."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService.get",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-            ) as mock_native,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._mark_socket_delivered",
-            ),
-        ):
-            mock_native.return_value = "rang"
-            ring_supervisor_doorbell(
-                "term-01",
-                100,
-                written_count=1,
-                message_body="callback text here",
-                sender_display_name="kiro_dev-abc",
-            )
-
-        mock_native.assert_called_once_with(
-            "term-01",
-            100,
-            message_body="callback text here",
-            sender_display_name="kiro_dev-abc",
-        )
+#
+# Two groups stood here, twelve arms between them, and both were about the
+# doorbell's native ring rather than about the payload this file is named for.
+#
+# Group 4 pinned the SUPPRESSION MARKER: ``doorbell_service._mark_socket_delivered``
+# wrote a trace row when a socket write succeeded, ``is_socket_delivered`` read
+# it back, and ``ring_supervisor_doorbell`` was required to write exactly one
+# marker per row on success and to leave the row PENDING. Group 5 pinned the
+# other side — a socket failure writes NO marker, so the row is retried — and
+# drove ``_attempt_native_ring`` to show the body and display name reach the
+# wire.
+#
+# The marker existed because the ring was FIRE-AND-FORGET: nothing durable
+# recorded that a row had already gone out over the socket, so a second ring
+# would re-present it and the trace row was the only dedupe available. The
+# delivery queue removes the premise. A row's attempt state is a column the
+# store owns, taken under a lease and advanced in the same transaction as the
+# emit, so "already delivered over the socket" is a fact about the row rather
+# than a marker written beside it. ``grep -rn socket_delivered src/`` returns
+# nothing — there is no marker to write, read, or count.
+#
+# Their replacement is ``test/adapters/test_queue_store.py`` for the lease and
+# attempt accounting, and ``test/app/delivery/test_seat_wake.py`` for what the
+# tick does with a refused emission — both asserting a durable transition rather
+# than the presence of a trace row.
+#
+# Groups 1-3 above SURVIVE untouched: ``build_wake_payload`` is a
+# ``cc_session_registry`` function, not a doorbell one, and the carrier still
+# renders a worker-named, payload-carrying wake.

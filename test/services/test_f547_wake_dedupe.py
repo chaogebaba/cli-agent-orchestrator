@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import patch
 
 import pytest
 
@@ -149,13 +148,18 @@ def test_dedupe_window_evicts_beyond_20(monkeypatch):
     """
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.config_service.ConfigService.get",
-        lambda path, default=None, override=None: 20 if path == "supervisor.wake.dedupe_window" else default,
+        lambda path, default=None, override=None: (
+            20 if path == "supervisor.wake.dedupe_window" else default
+        ),
     )
     first = _payload("bridge:cao-S", "content-0")
     assert cc_session_registry._is_duplicate_in_window(first) is False
     # Push 20 distinct further payloads → window (size 20) evicts `first`.
     for i in range(1, 21):
-        assert cc_session_registry._is_duplicate_in_window(_payload("bridge:cao-S", f"content-{i}")) is False
+        assert (
+            cc_session_registry._is_duplicate_in_window(_payload("bridge:cao-S", f"content-{i}"))
+            is False
+        )
     # `first` fell out → no longer a duplicate.
     assert cc_session_registry._is_duplicate_in_window(first) is False
 
@@ -221,94 +225,29 @@ def test_write_to_socket_dupe_returns_none_no_connect(monkeypatch):
     assert connects == ["/tmp/does-not-matter.sock"]  # no new connect
 
 
-
 # ---------------------------------------------------------------------------
-# Point 1 (integration): _attempt_native_ring binds msg_id to the receiver's
-# live process incarnation (procStart).
+# Point 1 (integration) — WP-ARCH 3c K3: the arm is deleted with its caller.
+#
+# ``test_native_ring_threads_incarnation_from_record`` drove
+# ``doorbell_service._attempt_native_ring`` end to end and captured what it
+# passed as ``incarnation`` into ``build_wake_payload``, proving the msg_id was
+# bound to the receiver's live ``procStart`` so the same row rung by two
+# incarnations of the seat produced two different ids.
+#
+# This is NOT a repoint to the new carrier, and the difference matters.
+# ``NativeSeatCarrier`` does not call ``build_wake_payload``: its ``_envelope``
+# is a deliberately thin wrapper whose docstring says why — A1.1 keys the digest
+# by receiver, epoch and wake ordinal and carries no inbox row id at all, so the
+# msg_id arrives as a parameter from the tick instead of being derived from the
+# record. Binding the id to ``procStart`` was the doorbell's answer to a
+# fire-and-forget ring having no durable identity; the queue's epoch is the
+# durable identity, and it supersedes the binding rather than relocating it.
+#
+# The unit half of point 1 is untouched: ``build_wake_msg_id``'s determinism in
+# ``(worker, row, incarnation)`` is still pinned by the four arms at the top of
+# this file, and the live-evidence regression below still re-derives ids through
+# it.
 # ---------------------------------------------------------------------------
-
-
-def test_native_ring_threads_incarnation_from_record(monkeypatch):
-    """_attempt_native_ring passes incarnation=record.proc_start into
-    build_wake_payload, so the same row rung by two different receiver
-    incarnations produces two different msg_ids.
-
-    Mutation: revert doorbell_service to `build_wake_payload(terminal_id,
-    max_written_row_id, message_body=..., sender_display_name=...)` (no
-    incarnation) → captured incarnation is None for both → the two ids collide
-    → fail.
-    """
-    from types import SimpleNamespace
-
-    from cli_agent_orchestrator.services import doorbell_service
-
-    captured = {}
-
-    def _fake_build(worker_name, row_id, *, priority=None, message_body=None,
-                    sender_display_name=None, incarnation=None):
-        captured["incarnation"] = incarnation
-        # Return a minimal valid wake line; do NOT call the (patched) real
-        # build_wake_payload — that would recurse.
-        return json.dumps(
-            {
-                "msgV": 1,
-                "msg_id": build_wake_msg_id(worker_name, row_id, incarnation),
-                "type": "user",
-                "message": {"role": "user", "content": "x"},
-                "priority": "next",
-                "from": f"bridge:cao-{worker_name}",
-            },
-            separators=(",", ":"),
-        )
-
-    def _run_with_proc_start(proc_start: int) -> str:
-        record = SimpleNamespace(
-            pid=proc_start + 1,
-            proc_start=proc_start,
-            status_updated_at="t0",
-            messaging_socket_path="/tmp/x.sock",
-            version="2.1.5",
-        )
-        with (
-            patch.object(
-                doorbell_service, "get_terminal_metadata",
-                return_value={"tmux_session": "s", "tmux_window": "w"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.resolve_target",
-                return_value=SimpleNamespace(refusal_reason=None, record=record),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.check_version_guard",
-                return_value=None,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.build_wake_payload",
-                side_effect=_fake_build,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.read_peer_token",
-                return_value=None,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.write_to_socket",
-                return_value=None,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.verify_wake",
-                return_value=True,
-            ),
-        ):
-            decision = doorbell_service._attempt_native_ring("sup1", 42)
-        assert decision == "rang"
-        return captured["incarnation"]
-
-    inc_a = _run_with_proc_start(1000)
-    inc_b = _run_with_proc_start(2000)
-    assert inc_a == "1000"
-    assert inc_b == "2000"
-    assert build_wake_msg_id("sup1", 42, inc_a) != build_wake_msg_id("sup1", 42, inc_b)
-
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +311,7 @@ def test_live_evidence_one_write_per_sender_row_within_60s(monkeypatch):
 
     def _ring(row: int, *, message_body=None):
         # Mirrors what _attempt_native_ring builds and writes for one ring.
-        payload = build_wake_payload(
-            sender, row, message_body=message_body, incarnation="pid:4242"
-        )
+        payload = build_wake_payload(sender, row, message_body=message_body, incarnation="pid:4242")
         return write_to_socket("/tmp/60d393b2.sock", payload)
 
     # Interleaved first-ring frames, all unacked within the first 60 s:

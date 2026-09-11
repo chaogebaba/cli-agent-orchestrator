@@ -11,12 +11,23 @@ re-pointed here, and the two that were genuinely about transport arbitration
 ``test_ws_armed_but_send_fails_falls_back_to_native``) are correctly gone.
 
 **The observation seam changed; the property did not.** A claim that emits
-nothing is still a claim: the runner reports ``written``, the mailbox row carries
-``callback_notified_through_id``, and the K2 content channel writes a file when
-one is configured. Those three are what the cursor actually controls, and they
-are what these arms count now. Counting a transport was always one level removed
-from the invariant — the deleted file could not have distinguished "the cursor
-held the row back" from "the doorbell happened not to ring".
+nothing is still a claim: the runner reports ``written`` and the mailbox row
+carries ``callback_notified_through_id``. Those two are what the cursor actually
+controls, and they are what these arms count. Counting a transport was always one
+level removed from the invariant — the deleted file could not have distinguished
+"the cursor held the row back" from "the doorbell happened not to ring".
+
+**A third observable was dropped a slice later, not weakened.** This file was
+written against the K2 CONTENT channel as well: each arm read the JSON inbox at
+``cc_inbox_path`` and asserted how many entries the carrier had appended. WP-ARCH
+3c K2 deletes that writer with ``teammate_push_service``; ``written`` is now
+purely the cursor's count of claimed rows and ``_f136_post_delivery`` emits
+nothing at all. Re-pointing those assertions at the file would have been
+asserting an empty list against an empty list in every direction, which is the
+vacuity this file's opening note exists to refuse — so the file leg is removed
+and the cursor column carries the paired direction alone. ``cc_inbox_path`` stays
+in the seed because the mailbox row still has the column and a claim must be
+shown not to depend on it.
 
 The #388 sample is preserved verbatim in the replay arm: the bridge replayed
 seven already-acked ids in one batch at 07:47Z.
@@ -24,9 +35,7 @@ seven already-acked ids in one batch at 07:47Z.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -148,25 +157,16 @@ def _cursor(env: Any) -> int:
         return int(mb.callback_notified_through_id or 0)
 
 
-def _read_inbox(path: str) -> list[dict]:
-    p = Path(path)
-    if not p.exists():
-        return []
-    raw = p.read_text(encoding="utf-8")
-    return json.loads(raw) if raw.strip() else []
-
-
 class TestOneWakePerId:
     def test_single_wake_and_cursor_advance(self, r3_env: Any) -> None:
         """The baseline: one claimable row is written once and moves the cursor."""
-        path = _seed(r3_env, cursor=0)
+        _seed(r3_env, cursor=0)
         _row(r3_env, 1)
 
         outcome = _run(r3_env)
 
         assert outcome.written == 1
         assert _cursor(r3_env) == 1
-        assert len(_read_inbox(path)) == 1
 
     def test_second_run_same_row_no_reemit(self, r3_env: Any) -> None:
         """A rewake poll of the same still-pending row must NOT re-emit.
@@ -175,20 +175,20 @@ class TestOneWakePerId:
         arm that makes the cursor observable at all: without the advance, the
         second pass would write the row a second time.
         """
-        path = _seed(r3_env, cursor=0)
+        _seed(r3_env, cursor=0)
         _row(r3_env, 1)
 
         first = _run(r3_env)
         assert first.written == 1
 
         second = _run(r3_env)
-        assert second.written == 0
-        assert len(_read_inbox(path)) == 1, "the same row was carried twice"
+        assert second.written == 0, "the same row was claimed twice"
+        assert _cursor(r3_env) == 1, "the cursor moved a second time for one row"
 
 
 class TestAckedIdNeverReemitted:
     def test_ack_then_rerun_zero_emits(self, r3_env: Any) -> None:
-        path = _seed(r3_env, cursor=0)
+        _seed(r3_env, cursor=0)
         _row(r3_env, 1)
 
         first = _run(r3_env)
@@ -199,7 +199,7 @@ class TestAckedIdNeverReemitted:
 
         second = _run(r3_env)
         assert second.written == 0
-        assert len(_read_inbox(path)) == 1
+        assert _cursor(r3_env) == 1
 
     def test_cursor_already_past_reconnect_no_emit(self, r3_env: Any) -> None:
         """Reconnect: the row was acked before this incarnation ever polls.
@@ -207,13 +207,13 @@ class TestAckedIdNeverReemitted:
         A fresh runner pass emits nothing — an acked id never re-surfaces on
         reconnect, which is the half of #388 a restart could otherwise undo.
         """
-        path = _seed(r3_env, cursor=0, consumed=5)
+        _seed(r3_env, cursor=0, consumed=5)
         _row(r3_env, 3)  # id at/below the consumed (acked) cursor
 
         outcome = _run(r3_env)
 
         assert outcome.written == 0
-        assert _read_inbox(path) == []
+        assert _cursor(r3_env) == 0, "an acked id moved the wake cursor on reconnect"
 
     def test_bridge_replay_of_acked_ids_zero_emits(self, r3_env: Any) -> None:
         """#388, the 07:47Z sample: the bridge replayed 7 acked ids in one batch.
@@ -222,7 +222,7 @@ class TestAckedIdNeverReemitted:
         three redundant replay attempts, as observed.
         """
         acked_ids = [2726, 2727, 2730, 2733, 2734, 2735, 2736]
-        path = _seed(r3_env, cursor=0)
+        _seed(r3_env, cursor=0)
         for rid in acked_ids:
             _row(r3_env, rid)
 
@@ -239,12 +239,13 @@ class TestAckedIdNeverReemitted:
         assert written == len(acked_ids), written
 
         ack_messages("t1", up_to_id=max(acked_ids))
-        carried = len(_read_inbox(path))
+        settled = _cursor(r3_env)
+        assert settled == max(acked_ids)
 
         for _ in range(3):  # three redundant replay attempts, as observed
             out = _run(r3_env)
             assert out.written == 0
-        assert len(_read_inbox(path)) == carried, "a replayed acked id was carried again"
+        assert _cursor(r3_env) == settled, "a replayed acked id was claimed again"
 
 
 class TestMutantLedger:

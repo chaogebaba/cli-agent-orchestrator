@@ -13,18 +13,11 @@ Tests that PASS document invariants already guarded (or guardrails added here).
 
 from __future__ import annotations
 
-import subprocess
-import time
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.services.boundary_pull_service import (
-    BoundaryPullService,
-    InterruptState,
-)
-
+from cli_agent_orchestrator.services.boundary_pull_service import BoundaryPullService
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -46,45 +39,34 @@ def boundary_service() -> BoundaryPullService:
 class TestF203ClassA_SwallowedFailures:
     """Class (a): bare except blocks that eat delivery-critical errors."""
 
-    def test_update_pending_indicators_logs_warning_on_exception(self):
-        """_update_pending_indicators must emit at WARNING or higher when the
-        DB query fails, not silently swallow via debug-level logging."""
-        import logging
-        from unittest.mock import patch
-
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service.SessionLocal"
-        ) as mock_session_local:
-            # Make the DB session raise an AttributeError (mimics the .id bug)
-            mock_session_local.return_value.__enter__ = MagicMock(
-                side_effect=AttributeError(
-                    "type object 'DeliveryObligationModel' has no attribute 'id'"
-                )
-            )
-            mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
-
-            from cli_agent_orchestrator.services.delivery_service import (
-                _update_pending_indicators,
-            )
-
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service.logger"
-            ) as mock_logger:
-                _update_pending_indicators()
-
-                # The invariant: exceptions on a delivery-critical path must
-                # surface at WARNING or above, never only at debug
-                assert mock_logger.warning.called or mock_logger.error.called, (
-                    "Exception in _update_pending_indicators was swallowed at debug "
-                    "level — delivery-critical paths must surface failures at WARNING+"
-                )
+    # WP-ARCH 3c K7: ``test_update_pending_indicators_logs_warning_on_exception``
+    # is GONE with its subject. It drove ``delivery_service.
+    # _update_pending_indicators`` with a poisoned ``SessionLocal`` and asserted
+    # the failure surfaced at WARNING rather than debug. K7 deletes that function
+    # along with the rest of the ladder; the pending indicator it maintained was
+    # a display of obligation state, and obligations are no longer the authority
+    # over what is undelivered — the queue's own rows are. There is no
+    # delivery-critical except block left in this module to hold to the
+    # warn-don't-swallow rule: what remains is ``is_target_confirmed_dead``,
+    # fourteen lines with no try at all.
+    #
+    # The class (a) rule itself is NOT retired — ``test_f721_delivery_kick``
+    # holds the surviving daemons to it.
 
     def test_pending_count_query_uses_valid_column(self):
-        """D23: The pending-count GROUP BY query must reference a column that exists
-        on DeliveryObligationModel. After the H1 fix, the counted column is
-        inbox_row_id (not the non-existent 'id')."""
-        from cli_agent_orchestrator.clients.database import DeliveryObligationModel
+        """D23: an obligation row is keyed by inbox_row_id, never by an 'id'.
+
+        This arm was written for the pending-count GROUP BY inside the deleted
+        ``_update_pending_indicators``, but its subject is the MODEL, not that
+        caller: ``DeliveryObligationModel``'s primary key IS ``inbox_row_id`` and
+        it has no ``id`` column at all. The watchdog's surviving
+        ``_create_self_notify_obligation`` and ``mailbox_service`` both still
+        construct and query these rows by that key, so a reintroduced ``.id``
+        would still raise on a live path — which is why the arm keeps both
+        directions rather than following its old caller into the deletion."""
         from sqlalchemy import inspect
+
+        from cli_agent_orchestrator.clients.database import DeliveryObligationModel
 
         mapper = inspect(DeliveryObligationModel)
         column_names = {col.key for col in mapper.column_attrs}
@@ -147,14 +129,16 @@ class TestF203ClassB_DeadWiring:
 
         # Verify the wiring exists in mailbox_service source
         import inspect
+
         from cli_agent_orchestrator.services import mailbox_service
+
         source = inspect.getsource(mailbox_service)
-        assert "boundary_pull_service" in source, (
-            "mailbox_service must import boundary_pull_service (D5 primary producer)"
-        )
-        assert "notify_boundary" in source, (
-            "mailbox_service must call notify_boundary on the cursor-advance path"
-        )
+        assert (
+            "boundary_pull_service" in source
+        ), "mailbox_service must import boundary_pull_service (D5 primary producer)"
+        assert (
+            "notify_boundary" in source
+        ), "mailbox_service must call notify_boundary on the cursor-advance path"
 
         # Cleanup
         boundary_pull_service.unregister_terminal(terminal_id)
@@ -185,8 +169,7 @@ class TestF203ClassB_DeadWiring:
         # Second call with no new boundary → False
         result2 = boundary_pull_service.reset_boundary_counter(terminal_id)
         assert result2 is False, (
-            "reset_boundary_counter must return False when no boundary arrived "
-            "since last reset"
+            "reset_boundary_counter must return False when no boundary arrived " "since last reset"
         )
 
         # Cleanup
@@ -230,9 +213,7 @@ class TestF203ClassC_ThresholdAliasing:
 class TestF203ClassD_UncheckedSideEffects:
     """Class (d): subprocess return codes ignored on delivery paths."""
 
-    def test_tmux_set_option_failure_is_observable(
-        self, boundary_service: BoundaryPullService
-    ):
+    def test_tmux_set_option_failure_is_observable(self, boundary_service: BoundaryPullService):
         """When tmux set-option fails (rc != 0), the failure must be observable
         (logged at WARNING+ or raised), not silently discarded."""
         import logging
@@ -263,212 +244,33 @@ class TestF203ClassD_UncheckedSideEffects:
 # ---------------------------------------------------------------------------
 
 
-class TestF203ClassE_SilentForeverDeferral:
-    """Class (e): retry/defer loops that can stall indefinitely."""
-
-    def test_escalated_obligation_produces_observable_escalation_attempt(self):
-        """Every delivery obligation that reaches ESCALATED state must have
-        produced at least one observable escalation attempt (banner injection
-        or equivalent). F206b: display-message fires as visible floor."""
-        from cli_agent_orchestrator.services.delivery_service import (
-            _escalate,
-            resolve_supervisor_target,
-        )
-
-        from cli_agent_orchestrator.clients.database import (
-            DeliveryObligationModel,
-            _utcnow,
-        )
-        from datetime import datetime, timezone
-
-        now = _utcnow()
-        mock_obl = MagicMock()
-        mock_obl.inbox_row_id = 5521
-        mock_obl.mailbox_id = "mb_test"
-        mock_obl.attempts = 6
-
-        mock_db = MagicMock()
-
-        # Simulate: target exists but draft guard vetoes
-        mock_target = MagicMock()
-        mock_target.terminal_id = "test_sup"
-        mock_target.tmux_session = "test_session"
-        mock_target.tmux_window = "test_window"
-
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target",
-            return_value=mock_target,
-        ):
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
-            ) as mock_r2:
-                # Draft guard vetoes the escalation injection
-                from cli_agent_orchestrator.services.delivery_service import LadderResult
-
-                mock_r2.return_value = LadderResult(
-                    delivered=False,
-                    phase="transport_attempt",
-                    decision="defer",
-                    reason="user_draft_present",
-                )
-
-                with patch(
-                    "cli_agent_orchestrator.services.delivery_service.emit_trace_or_collapse"
-                ):
-                    with patch(
-                        "cli_agent_orchestrator.services.delivery_service.subprocess.run"
-                    ) as mock_subprocess:
-                        mock_subprocess.return_value.returncode = 0
-                        _escalate(mock_db, mock_obl, now, 34.0)
-
-        # F206b invariant: even when injection fails (user_draft_present),
-        # a visible signal (display-message) must fire as a floor.
-        # subprocess.run must have been called with display-message.
-        assert mock_subprocess.called, (
-            "Obligation escalated with user_draft_present but NO visible signal "
-            "was produced — _fire_escalation_display_message must fire as H2 floor"
-        )
-        display_calls = [
-            c for c in mock_subprocess.call_args_list
-            if any("display-message" in str(arg) for arg in c[0])
-        ]
-        assert len(display_calls) >= 1, (
-            "tmux display-message was not called — escalation with no injection "
-            "must produce a visible floor signal"
-        )
-
-    def test_transport_always_defer_trips_warn_within_n_attempts(self):
-        """A transport that always defers (no_registry_records) must trip a
-        counted-failure WARN within a bounded number of attempts so the operator
-        knows the transport is permanently broken for this terminal.
-
-        F203 D9: After 3 consecutive no_registry_records refusals, exactly one
-        WARN is emitted via the transport ejection service."""
-        from cli_agent_orchestrator.services.delivery_service import attempt_rung1, LadderResult
-        from cli_agent_orchestrator.services.transport_ejection import (
-            transport_ejection_service,
-        )
-
-        # Clear any prior state
-        transport_ejection_service.clear("test_sup_defer")
-
-        mock_target = MagicMock()
-        mock_target.has_registry = False
-        mock_target.terminal_id = "test_sup_defer"
-
-        with patch(
-            "cli_agent_orchestrator.services.transport_ejection.logger"
-        ) as mock_logger:
-            # Simulate 5 consecutive transport deferrals
-            results = []
-            for i in range(5):
-                result = attempt_rung1(mock_target, inbox_row_id=100 + i)
-                results.append(result)
-
-            # All deferred with no_registry_records
-            assert all(r.reason == "no_registry_records" for r in results)
-
-            # D9: exactly one WARN emitted (at the 3rd refusal)
-            assert mock_logger.warning.call_count == 1, (
-                f"Expected exactly 1 WARN after 5 deferrals, got "
-                f"{mock_logger.warning.call_count}"
-            )
-
-        # Cleanup
-        transport_ejection_service.clear("test_sup_defer")
-
-    def test_escalated_obligation_has_followup_delivery_path(self):
-        """An ESCALATED obligation with no successful banner injection must have
-        at least one follow-up delivery mechanism. F206a/H3: _reresolve_escalated
-        picks up ESCALATED obligations in the convergence tick."""
-        from cli_agent_orchestrator.services.delivery_service import (
-            _reresolve_escalated,
-            DeliveryTarget,
-            LadderResult,
-        )
-        from cli_agent_orchestrator.clients.database import (
-            Base,
-            DeliveryObligationModel,
-            InboxModel,
-            MailboxModel,
-            MailboxIncarnationModel,
-            TerminalModel,
-            _utcnow,
-        )
-        from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-
-        # Set up in-memory DB
-        engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(bind=engine)
-        TestSession = sessionmaker(bind=engine)
-
-        now = _utcnow()
-
-        with TestSession() as db:
-            db.add(TerminalModel(
-                id="sup_h3", tmux_session="cao-h3",
-                tmux_window="supervisor", provider="claude_code",
-                agent_profile="developer",
-            ))
-            db.add(MailboxModel(
-                id="mb_h3", session_name="cao-h3", role="worker",
-                current_terminal_id="sup_h3", generation=1,
-                consumed_through_id=0,
-                cc_inbox_path="/tmp/test.json",
-            ))
-            db.add(MailboxIncarnationModel(
-                mailbox_id="mb_h3", generation=1, terminal_id="sup_h3",
-            ))
-            msg = InboxModel(
-                sender_id="w1", receiver_id="sup_h3",
-                logical_receiver_id="mb_h3",
-                message="test followup", status=MessageStatus.PENDING.value,
-                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-            )
-            db.add(msg)
-            db.flush()
-            db.add(DeliveryObligationModel(
-                inbox_row_id=msg.id, mailbox_id="mb_h3",
-                state="ESCALATED",
-                accepted_at=now - timedelta(seconds=90),
-                first_attempt_at=now - timedelta(seconds=89),
-                terminal_at=now - timedelta(seconds=60),
-                terminal_reason="user_draft_present",
-                next_attempt_at=now - timedelta(seconds=1),  # due now
-                attempts=6,
-            ))
-            db.commit()
-            msg_id = msg.id
-
-        # Patch SessionLocal to use our test DB, then run _reresolve_escalated
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession
-        ):
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
-            ) as mock_rung2:
-                with patch(
-                    "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target"
-                ) as mock_resolve:
-                    mock_resolve.return_value = DeliveryTarget(
-                        terminal_id="sup_h3", tmux_session="cao-h3",
-                        tmux_window="supervisor", cc_inbox_path=None,
-                    )
-                    # Simulate draft cleared — injection succeeds
-                    mock_rung2.return_value = LadderResult(
-                        delivered=True, phase="surface",
-                        decision="proceed", reason=None,
-                    )
-                    _reresolve_escalated(30.0)
-
-        # The invariant: ESCALATED obligation must have been picked up and
-        # re-resolved — it should now be ACKED (delivered via re-resolve).
-        with TestSession() as db:
-            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
-            assert obl.state == "ACKED", (
-                f"ESCALATED obligation was not re-resolved — state is still {obl.state}. "
-                "H3 guarantees ESCALATED obligations get a follow-up delivery path."
-            )
-            assert obl.terminal_reason == "f206_reresolve_delivered"
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K7: CLASS (e) is GONE with its subject
+# ---------------------------------------------------------------------------
+# ``TestF203ClassE_SilentForeverDeferral`` had three arms and every one of them
+# drove the obligation ladder directly:
+#
+#   * ``test_escalated_obligation_produces_observable_escalation_attempt`` —
+#     ``_escalate`` + ``resolve_supervisor_target`` + ``attempt_rung2``, asserting
+#     the tmux ``display-message`` floor still fired when the draft guard vetoed
+#     the injection (F206b).
+#   * ``test_transport_always_defer_trips_warn_within_n_attempts`` —
+#     ``attempt_rung1`` against a registry-less target, asserting exactly one WARN
+#     at the third consecutive ``no_registry_records`` refusal (D9).
+#   * ``test_escalated_obligation_has_followup_delivery_path`` —
+#     ``_reresolve_escalated`` + ``DeliveryTarget`` + ``LadderResult``, asserting an
+#     ESCALATED obligation was picked up again by the convergence tick (F206a/H3).
+#
+# K7 deletes ``_escalate``, ``attempt_rung1``, ``attempt_rung2``,
+# ``_reresolve_escalated``, ``resolve_supervisor_target``, ``DeliveryTarget``,
+# ``LadderResult`` and ``convergence_tick``. Every symbol these arms name is gone.
+#
+# The class (e) CONCERN — a retry loop that can defer forever with no counted
+# ejection — is not retired with them, and it is the reason the ladder went: the
+# queue answers it structurally rather than by counting refusals in process
+# memory. A queue row is re-offered on a lease and dies on an attempt budget, and
+# each re-offer is a durable row, so "deferred forever" is a state an operator can
+# query rather than a WARN that has to be remembered to fire. Those bounds are
+# asserted in ``test/adapters/test_queue_store.py`` and ``test/app/delivery/``,
+# against the store that now owns them. Re-pointing these arms would have meant
+# re-testing that code a third time from the wrong module.

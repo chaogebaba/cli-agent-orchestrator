@@ -40,8 +40,16 @@ SOURCE = REPO / "src" / "cli_agent_orchestrator"
 def _plane(tmp_path: Path, provider: str = "codex") -> ProviderHome:
     native = tmp_path / "native"
     native.mkdir(parents=True)
-    _cred_names = {"codex": "auth.json", "claude_code": ".credentials.json", "grok_cli": "auth.json"}
-    _home_envs = {"codex": "CODEX_HOME", "claude_code": "CLAUDE_CONFIG_DIR", "grok_cli": "GROK_HOME"}
+    _cred_names = {
+        "codex": "auth.json",
+        "claude_code": ".credentials.json",
+        "grok_cli": "auth.json",
+    }
+    _home_envs = {
+        "codex": "CODEX_HOME",
+        "claude_code": "CLAUDE_CONFIG_DIR",
+        "grok_cli": "GROK_HOME",
+    }
     credential_name = _cred_names[provider]
     source = native / credential_name
     source.write_text('{"token":"seed"}', encoding="utf-8")
@@ -193,7 +201,14 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         "providers/grok_cli.py",
         "utils/grok_config.py",
         "cli/commands/doctor.py",
-        "services/teammate_push_service.py",
+        # WP-ARCH 3c K2: the entry here used to name
+        # ``services/teammate_push_service.py``. That file is deleted, and the
+        # literal the guard sees — ``Path.home() / ".claude"`` in
+        # ``derive_cc_team_inbox_path`` — moved UNCHANGED into
+        # ``services/native_delivery_health.py`` with the rest of the native
+        # half. It is the same read-only derivation of the seat's native socket
+        # address, so the allow-set follows the literal rather than the filename.
+        "services/native_delivery_health.py",
     }
     # F894 (#746): hooks/status_emit.py runs INSIDE the Claude pane as its
     # statusLine command, so Path.home() there is the pane's own HOME — the
@@ -211,9 +226,9 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         ):
             continue
         relative = path.relative_to(SOURCE).as_posix()
-        assert relative in allowed | grok_binary_config_allowed | pane_local_home_allowed, (
-            f"{relative} has a native-home literal but is not in the allowed set"
-        )
+        assert (
+            relative in allowed | grok_binary_config_allowed | pane_local_home_allowed
+        ), f"{relative} has a native-home literal but is not in the allowed set"
 
     roster = {
         "providers/codex.py",
@@ -787,9 +802,7 @@ def _configure_failing_sync_create(
     )
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _terminal: None)
     # F138: bypass process-liveness check in unit tests
-    monkeypatch.setattr(
-        terminal_service, "_confirm_launch_health", AsyncMock()
-    )
+    monkeypatch.setattr(terminal_service, "_confirm_launch_health", AsyncMock())
     return events
 
 

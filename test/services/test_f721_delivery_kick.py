@@ -136,7 +136,11 @@ def test_f721_reconcile_daemon_logs_swallowed_fault_at_warning(caplog):
         patch.object(service, "reconcile_pending_orphans"),
         patch.object(service, "surface_stalled_direct_deliveries"),
         patch.object(service, "recover_stale_deliveries"),
-        patch.object(service, "reconcile_pull_mode_notifications"),
+        # WP-ARCH 3c K2 deleted ``reconcile_pull_mode_notifications`` (the legacy
+        # pull-mode reconciler), so it is no longer among the sweeps that have to
+        # be silenced to isolate the fault path. The arm's subject — a swallowed
+        # ``deliver_pending`` fault surfacing at WARNING with receiver and row ids
+        # — is unchanged.
         patch.object(service, "deliver_pending", side_effect=RuntimeError("wedged")),
         patch(
             "cli_agent_orchestrator.services.inbox_service." "list_pending_receiver_ids_older_than",

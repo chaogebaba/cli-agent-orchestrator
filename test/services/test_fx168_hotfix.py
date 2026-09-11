@@ -3,7 +3,9 @@
 (a) POST insert to idle mailbox-pull supervisor arms the F136 runner
 (b) Stale cc_inbox_path + fresh metadata path → runner reconciles
 (c) Startup reconciler refreshes stale row when metadata differs
-(d) Dead D9 doorbell call removed from deliver_pending
+
+(d) Dead D9 doorbell call removed from deliver_pending — deleted in WP-ARCH 3c
+    with the branch it watched; see the block at the foot of the file.
 """
 
 from __future__ import annotations
@@ -263,9 +265,6 @@ class TestFix2StalePathSelfHeal:
             patch("cli_agent_orchestrator.clients.database.claim_unnotified_wake") as mock_claim,
             patch("cli_agent_orchestrator.clients.database.commit_wake") as mock_commit,
             patch("cli_agent_orchestrator.clients.database.get_terminal_metadata") as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.write_supervisor_callback_notification"
-            ) as mock_write,
         ):
             mock_lock = MagicMock()
             mock_lock.acquire.return_value = True
@@ -298,11 +297,13 @@ class TestFix2StalePathSelfHeal:
                 "metadata": {"cc_team_inbox_path": _FRESH_PATH},
             }
 
-            mock_write.return_value = MagicMock(kind="written")
-
             outcome = service._f136_run_callback_delivery(_TERMINAL_ID)
 
-            # Should proceed to normal write, not stale_path_detected
+            # Should proceed past the stale check, not stale_path_detected.
+            # WP-ARCH 3c K2 deleted the writer this arm used to patch; ``written``
+            # is now the cursor's own count of wake-eligible rows (the runner
+            # emits nothing), so the count below still reads 1 and still fails if
+            # the claim/commit protocol regresses.
             assert outcome.reason == "ok"
             assert outcome._fx168_stale_heal is None
             assert outcome.written == 1
@@ -440,61 +441,27 @@ class TestFix3StartupReconciler:
 
 
 # ===========================================================================
-# (d) FIX 4: Dead D9 doorbell removed from deliver_pending
+# (d) FIX 4 — WP-ARCH 3c K2/K3/K8: deleted, and the behaviour it pinned is gone
 # ===========================================================================
-
-
-class TestFix4DeadD9Removed:
-    """deliver_pending's mailbox-pull branch routes through the wake cursor
-    (request_delivery), never a direct teammate push or doorbell ring (F476 r3)."""
-
-    def test_deliver_pending_mailbox_pull_no_doorbell(self):
-        """F476 r3 (#388): when the seat's role probe says supervisor, the gate
-        signals request_delivery (cursor path) and calls neither attempt_teammate_push
-        (the closed bypass) nor ring_supervisor_doorbell directly."""
-        from cli_agent_orchestrator.services.inbox_service import InboxService
-
-        service = InboxService.__new__(InboxService)
-        service._delivery_loop = MagicMock()
-        service._delivery_tasks = set()
-        service._tnf_lock = threading.Lock()
-        service._terminal_not_found_streaks = {}
-
-        with (
-            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.get_pending_messages"
-            ) as mock_pending,
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role"
-            ) as mock_pull,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push"
-            ) as mock_push,
-            patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_req_del,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell"
-            ) as mock_doorbell,
-            patch("cli_agent_orchestrator.services.inbox_service._delivery_wake_seq", {}),
-            patch(
-                "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
-                MagicMock(),
-            ),
-        ):
-            mock_lock = MagicMock()
-            mock_lock.acquire.return_value = True
-            mock_dl.return_value = mock_lock
-
-            mock_meta.return_value = {"recovery_state": None}
-            mock_pending.return_value = [_msg()]
-            mock_pull.return_value = True
-
-            service.deliver_pending(_TERMINAL_ID)
-
-            # r3: route through the cursor, not the direct bypass or a direct ring.
-            mock_req_del.assert_called_once_with(_TERMINAL_ID)
-            mock_push.assert_not_called()
-            mock_doorbell.assert_not_called()
+#
+# ``TestFix4DeadD9Removed`` drove ``deliver_pending`` with the role probe
+# answering "supervisor" and asserted three things about that branch: it signals
+# ``request_delivery``, it does NOT call ``attempt_teammate_push`` (the bypass
+# F476 r3 closed), and it does NOT ring the doorbell (the dead D9 call fx168
+# removed).
+#
+# Two of the three are now unwritable — ``teammate_push_service`` and
+# ``doorbell_service`` are deleted, so neither patch target imports. The THIRD
+# is not merely unwritable but FALSE: 3c removed the ``request_delivery`` arming
+# from that branch on purpose. The comment at the call site states the reason —
+# the arming existed to wake the F136 runner so it would emit, the runner emits
+# nothing now that K2's writer is gone, and the seat's wake belongs to the
+# delivery tick, which observes the durable rows on its own schedule. The branch
+# returns unconditionally for a supervisor-role receiver and arms nothing.
+#
+# So this is a retirement, not a relocation, and keeping the arm by dropping its
+# two dead patches would have left a green test asserting a call the slice
+# deliberately deleted. What the branch DOES guarantee now — the seat is never
+# pasted, whatever the switch position — is asserted in
+# ``test/app/delivery/test_adoption.py`` against the role probe directly, and
+# the row it leaves PENDING is picked up by the adoption arms in the same file.

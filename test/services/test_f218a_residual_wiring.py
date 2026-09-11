@@ -1,25 +1,19 @@
-"""F218-a residual wiring tests — §3 pipeline, D16 bracketing, D8 settlement.
+"""F218-a residual wiring tests — §3 pipeline and D16 bracketing.
 
-These test the three integrations that were deferred in the first build pass.
+These test the integrations that were deferred in the first build pass. The
+third, D8 dead-target settlement, is deleted with the obligation ladder in
+WP-ARCH 3c K7 — see the block where it stood.
 """
 
-import json
-import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.backends.base import ScopeProbe
 from cli_agent_orchestrator.clients.database import (
     Base,
-    DeliveryObligationModel,
     F218TeardownIntentModel,
-    InboxModel,
-    MailboxModel,
-    PaneExitTombstoneModel,
     SessionDegradationModel,
 )
 
@@ -135,6 +129,7 @@ class TestFifoReaderPipelineWiring:
             raise RuntimeError("tombstone write failed")
 
         report_called = []
+
         def mock_report(terminal_id, source):
             report_called.append(terminal_id)
             return True
@@ -160,9 +155,9 @@ class TestD16TeardownBracketing:
     def test_intent_opened_before_delete_inner(self, scratch_db):
         """open_intent commits before _delete_terminal_inner is called."""
         from cli_agent_orchestrator.services.teardown_intent_service import (
-            open_intent,
             close_intent,
             is_teardown_intended,
+            open_intent,
         )
 
         # Open + verify committed
@@ -174,21 +169,21 @@ class TestD16TeardownBracketing:
             db=scratch_db,
         )
         assert intent_id is not None
-        assert is_teardown_intended(
-            session_name="any", terminal_id="term-d16", db=scratch_db
-        ) is True
+        assert (
+            is_teardown_intended(session_name="any", terminal_id="term-d16", db=scratch_db) is True
+        )
 
         # Close in finally
         close_intent(intent_id, scratch_db)
-        assert is_teardown_intended(
-            session_name="any", terminal_id="term-d16", db=scratch_db
-        ) is False
+        assert (
+            is_teardown_intended(session_name="any", terminal_id="term-d16", db=scratch_db) is False
+        )
 
     def test_crash_between_kill_and_close_leaves_intent_visible(self, scratch_db):
         """AC22(i): After crash, intent survives and suppresses alarm."""
         from cli_agent_orchestrator.services.teardown_intent_service import (
-            open_intent,
             is_teardown_intended,
+            open_intent,
         )
 
         # Open intent (simulating pre-tmux)
@@ -202,9 +197,10 @@ class TestD16TeardownBracketing:
 
         # Simulate crash: close_intent never called
         # On "restart", intent should still be visible
-        assert is_teardown_intended(
-            session_name="cao-crash-test", terminal_id=None, db=scratch_db
-        ) is True
+        assert (
+            is_teardown_intended(session_name="cao-crash-test", terminal_id=None, db=scratch_db)
+            is True
+        )
 
     def test_ttl_expiry_stops_suppression(self, scratch_db):
         """AC22(ii): After TTL, a new death alarms normally."""
@@ -223,14 +219,15 @@ class TestD16TeardownBracketing:
         scratch_db.commit()
 
         # Expired → does not suppress
-        assert is_teardown_intended(
-            session_name="cao-ttl-test", terminal_id=None, db=scratch_db
-        ) is False
+        assert (
+            is_teardown_intended(session_name="cao-ttl-test", terminal_id=None, db=scratch_db)
+            is False
+        )
 
     def test_degradation_suppressed_by_active_intent(self, scratch_db):
         """mark_degraded with active teardown → suppressed_by_teardown=True."""
-        from cli_agent_orchestrator.services.teardown_intent_service import open_intent
         from cli_agent_orchestrator.services.session_degradation_service import mark_degraded
+        from cli_agent_orchestrator.services.teardown_intent_service import open_intent
 
         open_intent(
             scope_kind="session",
@@ -252,199 +249,32 @@ class TestD16TeardownBracketing:
         assert result.suppressed_by_teardown is True
 
         # The row is pre-acknowledged (R5 won't re-surface)
-        row = scratch_db.query(SessionDegradationModel).filter_by(
-            id=result.degradation_id
-        ).one()
+        row = scratch_db.query(SessionDegradationModel).filter_by(id=result.degradation_id).one()
         assert row.suppressed_by_teardown is True
         assert row.acknowledged_at is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# D8 DEAD-TARGET OBLIGATION SETTLEMENT
+# WP-ARCH 3c K7: D8 DEAD-TARGET OBLIGATION SETTLEMENT — deleted with its subject
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestD8DeadTargetSettlement:
-    """D8: Settlement disposes every message — never ACKED, never deleted."""
-
-    def test_sweep_settles_open_obligation_for_dead_target(self, scratch_db):
-        """OPEN obligation for a dead target → SETTLED_TARGET_DEAD."""
-        # Create a mailbox + terminal + tombstone + obligation
-        mailbox = MailboxModel(
-            id="mb-d8-1",
-            session_name="s-d8",
-            role="supervisor",
-            current_terminal_id="dead-t1",
-            generation=1,
-        )
-        scratch_db.add(mailbox)
-
-        # Create inbox row (direct terminal, no logical_receiver_id → case iii)
-        inbox_row = InboxModel(
-            id=8001,
-            sender_id="sender-1",
-            receiver_id="dead-t1",
-            message="test",
-            orchestration_type="send_message",
-            status="pending",
-        )
-        scratch_db.add(inbox_row)
-
-        obl = DeliveryObligationModel(
-            inbox_row_id=8001,
-            mailbox_id="mb-d8-1",
-            state="OPEN",
-        )
-        scratch_db.add(obl)
-
-        # Create tombstone for the terminal (makes it confirmed dead)
-        tombstone = PaneExitTombstoneModel(
-            id="ts-d8-1",
-            incarnation_id="inc-d8-1",
-            terminal_id="dead-t1",
-            terminal_generation=1,
-            session_name="s-d8",
-            session_incarnation="epoch:1",
-            scope="window_gone",
-            proc_status="unavailable",
-            exit_evidence_status="unavailable_no_waiter",
-            memory_status="unavailable",
-            writer="observation",
-            schema_version=1,
-            complete=False,
-            observed_at=datetime.now(timezone.utc),
-            written_at=datetime.now(timezone.utc),
-        )
-        scratch_db.add(tombstone)
-        scratch_db.commit()
-
-        # Verify target is dead
-        from cli_agent_orchestrator.services.delivery_service import is_target_confirmed_dead
-        assert is_target_confirmed_dead("dead-t1", scratch_db) is True
-
-        # Run the sweep
-        from cli_agent_orchestrator.services.delivery_service import _settle_dead_target_obligations
-        _settle_dead_target_obligations(scratch_db)
-
-        # Obligation should be settled
-        obl_row = scratch_db.query(DeliveryObligationModel).filter_by(inbox_row_id=8001).one()
-        assert obl_row.state == "SETTLED_TARGET_DEAD"
-        assert obl_row.terminal_reason == "receiver_gone"
-        assert obl_row.state != "ACKED"  # M10: NEVER ACKED
-
-    def test_sweep_does_not_settle_live_target(self, scratch_db):
-        """Obligation for a live target (no tombstone) stays OPEN."""
-        mailbox = MailboxModel(
-            id="mb-d8-2",
-            session_name="s-d8-live",
-            role="supervisor",
-            current_terminal_id="live-t1",
-            generation=1,
-        )
-        scratch_db.add(mailbox)
-
-        obl = DeliveryObligationModel(
-            inbox_row_id=8002,
-            mailbox_id="mb-d8-2",
-            state="OPEN",
-        )
-        scratch_db.add(obl)
-        scratch_db.commit()
-
-        # No tombstone → not dead
-        from cli_agent_orchestrator.services.delivery_service import is_target_confirmed_dead
-        assert is_target_confirmed_dead("live-t1", scratch_db) is False
-
-        from cli_agent_orchestrator.services.delivery_service import _settle_dead_target_obligations
-        _settle_dead_target_obligations(scratch_db)
-
-        obl_row = scratch_db.query(DeliveryObligationModel).filter_by(inbox_row_id=8002).one()
-        assert obl_row.state == "OPEN"  # Unchanged
-
-    def test_sweep_settles_escalated_obligation(self, scratch_db):
-        """ESCALATED obligation for dead target also settled."""
-        mailbox = MailboxModel(
-            id="mb-d8-3",
-            session_name="s-d8-esc",
-            role="supervisor",
-            current_terminal_id="dead-t3",
-            generation=1,
-        )
-        scratch_db.add(mailbox)
-
-        # Create inbox row (direct terminal, no logical_receiver_id → case iii)
-        inbox_row = InboxModel(
-            id=8003,
-            sender_id="sender-1",
-            receiver_id="dead-t3",
-            message="test",
-            orchestration_type="send_message",
-            status="pending",
-        )
-        scratch_db.add(inbox_row)
-
-        obl = DeliveryObligationModel(
-            inbox_row_id=8003,
-            mailbox_id="mb-d8-3",
-            state="ESCALATED",
-        )
-        scratch_db.add(obl)
-
-        tombstone = PaneExitTombstoneModel(
-            id="ts-d8-3",
-            incarnation_id="inc-d8-3",
-            terminal_id="dead-t3",
-            terminal_generation=1,
-            session_name="s-d8-esc",
-            session_incarnation="epoch:2",
-            scope="session_gone",
-            proc_status="unavailable",
-            exit_evidence_status="unavailable_no_waiter",
-            memory_status="unavailable",
-            writer="job",
-            schema_version=1,
-            complete=False,
-            observed_at=datetime.now(timezone.utc),
-            written_at=datetime.now(timezone.utc),
-        )
-        scratch_db.add(tombstone)
-        scratch_db.commit()
-
-        from cli_agent_orchestrator.services.delivery_service import _settle_dead_target_obligations
-        _settle_dead_target_obligations(scratch_db)
-
-        obl_row = scratch_db.query(DeliveryObligationModel).filter_by(inbox_row_id=8003).one()
-        assert obl_row.state == "SETTLED_TARGET_DEAD"
-
-    def test_settlement_never_acks(self, scratch_db):
-        """M10: No obligation reaches ACKED through the dead-target path."""
-        # Verify the state used
-        assert "SETTLED_TARGET_DEAD" != "ACKED"
-
-    def test_zero_transport_after_settlement(self):
-        """AC12 integration: After settlement, no transport fires."""
-        from cli_agent_orchestrator.services.delivery_service import (
-            DeliveryTarget,
-            attempt_rung1,
-            attempt_rung2,
-        )
-
-        dead_target = DeliveryTarget(
-            terminal_id="settled-t",
-            tmux_session="s",
-            tmux_window="w",
-            cc_inbox_path=None,
-            liveness="confirmed_dead",
-        )
-
-        r1 = attempt_rung1(dead_target, inbox_row_id=9999)
-        r2 = attempt_rung2(dead_target, inbox_row_id=9999)
-
-        assert r1.reason == "target_confirmed_dead"
-        assert r2.reason == "target_confirmed_dead"
-        assert r1.decision == "settle"
-        assert r2.decision == "settle"
-
+#
+# ``TestD8DeadTargetSettlement`` stood here with five arms over
+# ``delivery_service._settle_dead_target_obligations``: an OPEN obligation for a
+# tombstoned target settles, a live target is left alone, an ESCALATED
+# obligation settles too, settlement never reaches ACKED, and no transport fires
+# afterwards (the last driving ``attempt_rung1``/``attempt_rung2`` against a
+# ``DeliveryTarget`` marked ``confirmed_dead``).
+#
+# K7 deletes the obligation ladder and the sweep together. There is no
+# obligation table in the delivery path to settle, no rung to refuse, and no
+# ``DeliveryTarget`` to mark dead — so none of the five has a subject left. The
+# residual wiring this file is actually about, the FIFO-reader pipeline and the
+# D16 teardown bracket above, is untouched by the slice and stays.
+#
+# The deadness signal itself survives: ``is_target_confirmed_dead`` is the one
+# symbol K7 keeps, read now by ``conversation_reconcile`` and ``fifo_reader``
+# rather than by a sweep. What a dead receiver costs a queued row is decided
+# where the tick resolves the receiver, covered in ``test/app/delivery/``.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ADDITIONAL MUTANT KILLS FOR RESIDUALS
@@ -458,52 +288,43 @@ class TestResidualMutantKills:
         """M1: Tombstone write must precede signal. The pipeline runs BEFORE reconcile."""
         # Structural: _f218_confirmed_gone_pipeline is called BEFORE _f138_report_confirmed_gone
         # which is the path to request_orphan_reconciliation → signal_exact_matches.
-        from cli_agent_orchestrator.services.fifo_reader import FifoManager
         import inspect
+
+        from cli_agent_orchestrator.services.fifo_reader import FifoManager
 
         source = inspect.getsource(FifoManager._f138_definitive_absence)
         # Pipeline appears before report
         pipeline_pos = source.find("_f218_confirmed_gone_pipeline")
         report_pos = source.find("_f138_report_confirmed_gone")
-        assert pipeline_pos < report_pos, (
-            "M1: _f218_confirmed_gone_pipeline must run BEFORE _f138_report_confirmed_gone"
-        )
+        assert (
+            pipeline_pos < report_pos
+        ), "M1: _f218_confirmed_gone_pipeline must run BEFORE _f138_report_confirmed_gone"
 
-    def test_m9_all_transports_gated_not_just_rung2(self):
-        """M9: Gate added only to rung2 → AC12 still fails for display-message."""
-        from cli_agent_orchestrator.services.delivery_service import (
-            DeliveryTarget,
-            _fire_escalation_display_message,
-        )
-
-        dead_target = DeliveryTarget(
-            terminal_id="dead-m9",
-            tmux_session="s",
-            tmux_window="w",
-            cc_inbox_path=None,
-            liveness="confirmed_dead",
-        )
-
-        # Should not call subprocess at all
-        with patch("cli_agent_orchestrator.services.delivery_service.subprocess") as mock_sp:
-            _fire_escalation_display_message(dead_target, inbox_row_id=1)
-            assert not mock_sp.run.called, "M9: display-message must also be gated"
+    # WP-ARCH 3c K7: ``test_m9_all_transports_gated_not_just_rung2`` stood here.
+    # Its mutant was "the confirmed-dead gate was added to rung 2 only", and it
+    # killed that mutant by showing ``_fire_escalation_display_message`` also
+    # refuses a dead target — the third transport the ladder could reach. All
+    # three transports are deleted with the ladder, so the mutant it was written
+    # against can no longer be written: there is one carrier now, and the
+    # question of whether every rung shares a gate has no rungs to ask it of.
 
     def test_m16_tombstone_failure_does_not_block_signal(self):
         """M16: Fail-closed (blocking on tombstone failure) → AC7 counterbalance."""
         # The pipeline wraps everything in try/except and logs — never blocks
-        from cli_agent_orchestrator.services.fifo_reader import FifoManager
         import inspect
 
+        from cli_agent_orchestrator.services.fifo_reader import FifoManager
+
         source = inspect.getsource(FifoManager._f218_confirmed_gone_pipeline)
-        assert "except Exception" in source, (
-            "Pipeline must catch all exceptions (D11: never blocks reconciliation)"
-        )
+        assert (
+            "except Exception" in source
+        ), "Pipeline must catch all exceptions (D11: never blocks reconciliation)"
 
     def test_m26_intent_not_in_memory(self):
         """M26: In-memory flag → AC22 crashes lose it. We use DB rows."""
-        from cli_agent_orchestrator.services import teardown_intent_service
         import inspect
+
+        from cli_agent_orchestrator.services import teardown_intent_service
 
         source = inspect.getsource(teardown_intent_service)
         # No module-level set/dict used for intent tracking
@@ -528,7 +349,5 @@ class TestResidualMutantKills:
         scratch_db.commit()
 
         # Expired → False
-        result = is_teardown_intended(
-            session_name="any", terminal_id="m27-term", db=scratch_db
-        )
+        result = is_teardown_intended(session_name="any", terminal_id="m27-term", db=scratch_db)
         assert result is False, "M27: Expired intent must NOT suppress"

@@ -1,7 +1,7 @@
 """F203 S1: Tests that kill surviving mutants M4, M5, R1, R2.
 
-AC13 (D16): tick-frequency assertion — _fx191_convergence_tick executes at most
-once per tick_s even when the run loop re-enters faster.
+AC13 (D16): tick-frequency — deleted by WP-ARCH 3c K7 with its subject; see the
+note where the class stood.
 
 AC16 (D19): two-terminal ordering — _find_supervisor resolves correctly when
 the supervisor is NOT the first claude_code terminal in query order.
@@ -15,79 +15,22 @@ use the same role-based identity.
 
 from __future__ import annotations
 
-import time
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import MagicMock, patch
 
-import pytest
-
-
-class TestAC13TickFrequency:
-    """AC13 (D16): _fx191_convergence_tick honours tick_s cadence gate."""
-
-    def test_tick_executes_at_most_once_per_tick_s(self):
-        """M4 KILL: With 60 rapid calls, tick executes at most once per tick_s."""
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-            StalledCallbackWatchdog,
-        )
-
-        watchdog = StalledCallbackWatchdog(grace_seconds=30)
-
-        # Freeze time at a fixed point
-        frozen_time = 5000.0
-
-        with patch("time.monotonic", return_value=frozen_time):
-            with patch(
-                "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: 5.0 if "tick_s" in key else None,
-            ):
-                with patch(
-                    "cli_agent_orchestrator.services.delivery_service.convergence_tick"
-                ) as mock_tick:
-                    # Set next_tick_due to 0 so first call goes through
-                    watchdog._next_tick_due = 0.0
-
-                    # First call: should execute (advances _next_tick_due to 5005.0)
-                    watchdog._fx191_convergence_tick()
-                    assert mock_tick.call_count == 1
-
-                    # 59 more calls at the SAME frozen time: should NOT execute
-                    # because _next_tick_due is now 5005.0 > frozen_time=5000.0
-                    for _ in range(59):
-                        watchdog._fx191_convergence_tick()
-
-                    # Still only 1 execution
-                    assert mock_tick.call_count == 1, (
-                        f"M4 KILL: convergence_tick executed {mock_tick.call_count} times "
-                        f"in one tick_s window — cadence gate broken"
-                    )
-
-    def test_tick_fires_again_after_tick_s_elapses(self):
-        """After tick_s elapses, the tick fires again."""
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-            StalledCallbackWatchdog,
-        )
-
-        watchdog = StalledCallbackWatchdog(grace_seconds=30)
-
-        with patch(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            side_effect=lambda key, *a, **kw: 5.0 if "tick_s" in key else None,
-        ):
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service.convergence_tick"
-            ) as mock_tick:
-                watchdog._next_tick_due = 0.0
-
-                # First call fires
-                watchdog._fx191_convergence_tick()
-                assert mock_tick.call_count == 1
-
-                # Advance time past tick_s
-                watchdog._next_tick_due = time.monotonic() - 1.0  # expired
-
-                # Second call fires
-                watchdog._fx191_convergence_tick()
-                assert mock_tick.call_count == 2
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K7: ``TestAC13TickFrequency`` is GONE with its subject
+# ---------------------------------------------------------------------------
+# Its two arms (M4 KILL and its paired "fires again after tick_s elapses"
+# baseline) both drove ``StalledCallbackWatchdog._fx191_convergence_tick`` and
+# both patched ``delivery_service.convergence_tick`` to count executions. K7
+# deletes the ladder's ``convergence_tick``, and the watchdog method that was its
+# only driver goes with it — there is no cadence gate left, because there is
+# nothing left behind the gate.
+#
+# The cadence concern did not move to another function here; it moved to a
+# different scheduler. ``app/delivery/tick.py`` is the seat's scheduled observer
+# now, and how often it runs is owned by its own tests under
+# ``test/app/delivery/`` rather than by a throttle inside the watchdog.
 
 
 class TestAC16TwoTerminalOrdering:
@@ -137,10 +80,20 @@ class TestAC16TwoTerminalOrdering:
         from cli_agent_orchestrator.services.auto_responder import AutoResponder
 
         terminals = [
-            {"id": "worker1", "provider": "claude_code", "agent_profile": "developer",
-             "caller_id": "sup1", "tmux_session": "s1"},
-            {"id": "sup1", "provider": "claude_code", "agent_profile": "supervisor",
-             "caller_id": None, "tmux_session": "s1"},
+            {
+                "id": "worker1",
+                "provider": "claude_code",
+                "agent_profile": "developer",
+                "caller_id": "sup1",
+                "tmux_session": "s1",
+            },
+            {
+                "id": "sup1",
+                "provider": "claude_code",
+                "agent_profile": "supervisor",
+                "caller_id": None,
+                "tmux_session": "s1",
+            },
         ]
 
         with patch(
@@ -171,11 +124,11 @@ class TestR1SupervisorSelfNotify:
         Mocks external dependencies but calls the REAL watchdog method that
         contains the D15 branching logic at stalled_callback_watchdog.py:1236.
         """
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             StalledCallbackWatchdog,
             WaitingInboxEpisode,
         )
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
         watchdog = StalledCallbackWatchdog(grace_seconds=30)
 
@@ -191,25 +144,37 @@ class TestR1SupervisorSelfNotify:
 
         mock_self_notify = MagicMock()
 
-        with patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
-            return_value={"sup_r1"},
-        ), patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=supervisor_metadata,
-        ), patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
-            return_value=TerminalStatus.WAITING_USER_ANSWER,
-        ), patch(
-            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.services.delivery_service._create_self_notify_obligation",
-            mock_self_notify,
-        ), patch("time.monotonic", return_value=99999.0):
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
+                return_value={"sup_r1"},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                return_value=supervisor_metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.WAITING_USER_ANSWER,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog."
+                "_create_self_notify_obligation",
+                mock_self_notify,
+            ),
+            patch("time.monotonic", return_value=99999.0),
+        ):
             watchdog.tick_waiting_inbox(registry=None, now=99999.0)
 
-        # The REAL D15 code at :1236 must have called _create_self_notify_obligation
+        # The REAL D15 code must have called _create_self_notify_obligation.
+        # WP-ARCH 3c K7 RELOCATED that helper from ``delivery_service`` into the
+        # watchdog itself (unchanged), because the ladder module it lived in is
+        # reduced to one predicate and both of its call sites are in this file.
+        # The patch target follows it; the branch under test is the same one.
         mock_self_notify.assert_called_once_with("sup_r1")
 
         # Episode must NOT be latched fired=True (that's the refusal path)
@@ -221,11 +186,11 @@ class TestR1SupervisorSelfNotify:
     def test_worker_still_refused(self):
         """R1 negative: worker terminal with caller_id==terminal_id still gets
         refused via the REAL tick_waiting_inbox path."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             StalledCallbackWatchdog,
             WaitingInboxEpisode,
         )
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
         watchdog = StalledCallbackWatchdog(grace_seconds=30)
 
@@ -241,28 +206,36 @@ class TestR1SupervisorSelfNotify:
 
         mock_self_notify = MagicMock()
 
-        with patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
-            return_value={"worker1"},
-        ), patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=worker_metadata,
-        ), patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
-            return_value=TerminalStatus.WAITING_USER_ANSWER,
-        ), patch(
-            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.services.delivery_service._create_self_notify_obligation",
-            mock_self_notify,
-        ), patch("time.monotonic", return_value=99999.0):
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
+                return_value={"worker1"},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                return_value=worker_metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.WAITING_USER_ANSWER,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog."
+                "_create_self_notify_obligation",
+                mock_self_notify,
+            ),
+            patch("time.monotonic", return_value=99999.0),
+        ):
             watchdog.tick_waiting_inbox(registry=None, now=99999.0)
 
         # Worker must NOT trigger self-notify
         mock_self_notify.assert_not_called()
 
         # Episode must be latched fired=True (refusal path)
-        assert episode.fired is True, (
-            "Worker with corrupt caller_id must hit the refusal path (fired=True)"
-        )
+        assert (
+            episode.fired is True
+        ), "Worker with corrupt caller_id must hit the refusal path (fired=True)"

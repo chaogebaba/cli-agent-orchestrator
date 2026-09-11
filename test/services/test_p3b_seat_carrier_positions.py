@@ -17,13 +17,22 @@ positive emission they used to own lives with the carrier that does it:
   sole position), and ``CAO_DELIVERY_QUEUE=on`` is what ships today.
 
 What survives here unchanged is the CURSOR: claim/commit must still advance so an
-acked or aged id is never re-emitted (#388), and the K2 content-channel write,
-which dies in slice 3.
+acked or aged id is never re-emitted (#388).
+
+**Slice 3 then took the last two seams these arms could count.** K3a deletes
+``doorbell_service`` outright, so the ring the recorder patched is not a seam that
+can be observed to stay silent — it is not a seam. K2 deletes the content-channel
+writer, so the ``team-lead.json`` arm's whole subject is gone. What is left to
+count at the seat is the PASTE seam, which still exists and is still reachable
+from ``deliver_pending``'s worker branch: asserting that a supervisor-role
+receiver never reaches it is K8 stated behaviourally, and it is the one seam here
+whose silence is a property rather than an absence of code. The structural half —
+that no import of the deleted modules survives — is owned by
+``test_3c_slice3_surfaces_gone.py``.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -132,15 +141,16 @@ def _callback(db, *, sender: str = WORKER_TERMINAL) -> InboxModel:
 
 
 class _Recorder:
-    """Counts what each seam did, so an arm can assert an emission happened."""
+    """Counts what each seam did, so an arm can assert an emission happened.
+
+    The doorbell ring was the second seam counted here until 3c K3a deleted
+    ``doorbell_service``; a ``patch`` of a module that does not exist raises at
+    setup rather than proving anything, and a deleted function needs no runtime
+    arm to prove it did not fire.
+    """
 
     def __init__(self) -> None:
-        self.native_rings: list[tuple[str, int]] = []
         self.pane_writes: list[str] = []
-
-    def ring(self, terminal_id: str, max_row_id: int, **_kwargs: Any) -> str:
-        self.native_rings.append((terminal_id, max_row_id))
-        return "rang"
 
     def paste(self, terminal_id: str, *_args: Any, **_kwargs: Any) -> None:
         self.pane_writes.append(terminal_id)
@@ -149,20 +159,16 @@ class _Recorder:
 def _drive(position: SwitchPosition, recorder: _Recorder) -> None:
     """Run one delivery cycle at ``position`` and record what emitted.
 
-    Counted at the SEAMS — the doorbell ring and the pane write — and never from a
-    rendered transcript, which #613 showed can report zero emitters on a seat
-    where emitters had in fact fired. (The coalesce seam that used to sit between
-    the runner and the ring is deleted; 3c K3c.)
+    Counted at the SEAM — the pane write — and never from a rendered transcript,
+    which #613 showed can report zero emitters on a seat where emitters had in
+    fact fired. (The coalesce seam that used to sit between the runner and the
+    ring went in 3c K3c; the ring itself went in K3a.)
     """
     service = InboxService()
     with (
         patch(
             "cli_agent_orchestrator.app.delivery.wiring.queue_position",
             return_value=position,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
-            side_effect=recorder.ring,
         ),
         patch(
             "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
@@ -193,12 +199,15 @@ def _wake_cursor(sessions) -> int:
 
 @pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
 def test_the_legacy_chain_emits_nothing_in_any_position(seat_db, position: SwitchPosition) -> None:
-    """WP-ARCH 3c K3c: the F136 chain rings NOBODY.
+    """WP-ARCH 3c K8: the F136 chain never types into the seat's input box.
 
-    Its ring ran through the coalescer, which is deleted, and the delivery tick
-    is the seat's single carrier. So the assertion that used to demand an
-    emission here now demands its absence — a ring reintroduced on this path is
-    the duplicate delivery over one id that 3c exists to remove.
+    The ring half of this arm is gone with K3a — ``ring_supervisor_doorbell`` is
+    deleted, so there is no function left that could fire and no patch that could
+    watch it. What remains is the seam that DOES still exist: ``deliver_pending``
+    reaches ``send_prepared_input`` on its worker branch, and K8 makes the
+    supervisor branch return before that call can be reached. Driving the full
+    runner with a pending row for a supervisor-role receiver and finding the paste
+    seam untouched is that unreachability observed rather than grepped.
 
     This is NOT a silence certificate for the seat: the positive emission is
     owned by ``test/app/delivery/test_seat_wake.py`` (``DeliveryTick.serve`` ->
@@ -212,11 +221,10 @@ def test_the_legacy_chain_emits_nothing_in_any_position(seat_db, position: Switc
     recorder = _Recorder()
     _drive(position, recorder)
 
-    assert recorder.native_rings == [], (
-        f"the legacy F136 chain rang the seat under {position.value}: "
-        "that is a second carrier over a row the tick owns"
+    assert recorder.pane_writes == [], (
+        f"a supervisor-role receiver was pasted under {position.value}: "
+        "K8 removes the seat's reachability of the paste seam"
     )
-    assert recorder.pane_writes == [], "a supervisor-role receiver is never pasted (K8)"
 
 
 @pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
@@ -243,41 +251,20 @@ def test_the_run_advances_the_cursor_so_an_acked_id_is_never_reclaimed(
     second = _Recorder()
     _drive(position, second)
     assert _wake_cursor(seat_db) == before, "a re-run must not re-claim an id below the cursor"
-    assert second.native_rings == []
     assert second.pane_writes == []
 
 
-def test_a_seat_with_a_content_channel_still_writes_the_file(seat_db, tmp_path) -> None:
-    """The K2 path is UNCHANGED where it is configured.
-
-    The r2 fix makes the file optional, not gone: a deployment that opted into
-    ``supervisor.mailbox_pull`` still gets its ``team-lead.json`` written, and
-    the wake still rings. K2 dies in 3c, not here.
-    """
-    inbox_path = tmp_path / "team-lead.json"
-    with seat_db.begin() as db:
-        _seat(db, cc_inbox_path=str(inbox_path))
-        _callback(db)
-
-    recorder = _Recorder()
-    written: list[Any] = []
-
-    # Patched on the module the runner imports FROM, since the import is inside
-    # the function body.
-    with patch(
-        "cli_agent_orchestrator.services.teammate_push_service."
-        "write_supervisor_callback_notification",
-        side_effect=lambda **kwargs: written.append(kwargs) or _WrittenResult(),
-    ):
-        _drive(SwitchPosition.DRAIN, recorder)
-
-    assert written, "a configured content channel must still be written"
-    assert recorder.native_rings == [], "but 3c K3c leaves the wake to the tick"
-
-
-class _WrittenResult:
-    kind = "written"
-    reason = ""
+# WP-ARCH 3c K2: ``test_a_seat_with_a_content_channel_still_writes_the_file`` and
+# its ``_WrittenResult`` stub are GONE with their subject. The arm pinned that a
+# deployment which had opted into ``supervisor.mailbox_pull`` still got its
+# ``team-lead.json`` written by ``teammate_push_service.
+# write_supervisor_callback_notification`` on the runner's way through. K2 deletes
+# that writer, its lockfile and the flag that selected it; the runner's ``written``
+# is now the cursor's count of claimed rows and ``_f136_post_delivery`` writes
+# nothing at all. There is no configured channel left for a seat to opt into, so
+# the arm has no weaker form that would still be about something — re-pointing it
+# at the native socket would be a different subject (``NativeSeatCarrier``, covered
+# under ``test/app/delivery/``), not this one made smaller.
 
 
 # ---------------------------------------------------------------------------

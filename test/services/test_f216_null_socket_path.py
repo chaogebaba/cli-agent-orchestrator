@@ -3,13 +3,14 @@
 Revert-sensitive tests: reverting the F216 fix makes these fail (not flake).
 
 - Registry record with messagingSocketPath:null → normalized to ""
-- Resolution/ring refuses with "socket_unpublished" BEFORE any socket connect attempt
+- Resolution/emission refuses with "socket_unpublished" BEFORE any socket connect attempt
 - Verdict fields are computed (not constant-assigned) — tested via distinct inputs
 """
 
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -157,57 +158,89 @@ class TestF216NullSocketPathParsing:
 
 
 # ===========================================================================
-# Test: _attempt_native_ring refuses with socket_unpublished, zero connects
+# Test: the seat carrier refuses with socket_unpublished, zero connects
 # ===========================================================================
+#
+# WP-ARCH 3c K3: these three arms drove ``doorbell_service._attempt_native_ring``
+# when they were written. That function is deleted, but the gate it held is not
+# retired — it MOVED. ``queue_carrier.NativeSeatCarrier.emit`` is the seat's only
+# native emitter now, and it reaches the same four steps through the same
+# ``cc_session_registry`` functions: resolve, version guard, socket check, write.
+# So the arms are re-pointed at the new owner rather than deleted; what they pin
+# is unchanged — an unpublished socket is refused BEFORE any connect, and the
+# refusal string is computed from the input rather than constant.
+#
+# The carrier's own suite (``test/app/delivery/test_seat_wake.py``) stubs the
+# carrier and sets ``reason`` by hand, so it asserts what the tick does WITH a
+# refusal. These are the only arms that assert the real ``emit`` PRODUCES one.
+
+
+def _emit(terminal_id: str):
+    """Drive the real carrier and hand back its refusal reason."""
+    from cli_agent_orchestrator.services.queue_carrier import NativeSeatCarrier
+
+    return NativeSeatCarrier().emit(
+        terminal_id=terminal_id,
+        line="wake",
+        sender_key="w1",
+        sender_name="worker-1",
+        msg_id="msg-f216",
+    )
+
+
+@contextmanager
+def _carrier_patches(sessions_dir: Path, proc_root: Path, pane_pid: int = 400):
+    """The resolution context ``emit`` runs in: one pane, one synthetic /proc."""
+    patches = (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.cc_session_registry.first_pane",
+            return_value=("%0", pane_pid),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
+            proc_root,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.cc_session_registry._sessions_dir",
+            return_value=sessions_dir,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
+            return_value="@0",
+        ),
+    )
+    with ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
 
 
 class TestF216SocketUnpublishedGate:
-    """Ring refuses before any socket.connect when socket path is empty."""
+    """The carrier refuses before any socket.connect when the socket path is empty."""
 
     def test_ring_returns_socket_unpublished_on_null_path(self, sessions_dir, proc_root):
-        """_attempt_native_ring returns 'socket_unpublished' for null socket path.
+        """A null socket path yields 'socket_unpublished', not a connect error.
 
         Revert-sensitive: without the gate, the code would call sock.connect("")
         → OSError EINVAL, returning "socket_error:22" (not "socket_unpublished").
         """
-        # Create a valid record with null socket path
         _make_record_json(sessions_dir, 500, messaging_socket_path=None)
         # Create proc tree: pane_pid=400 → child=500
         _make_proc_entry(proc_root, 400, ppid=1, starttime=88888)
         _make_proc_entry(proc_root, 500, ppid=400, starttime=99999)
 
         mock_socket = MagicMock()
-
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
-                return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
-                return_value=("%0", 400),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
-                proc_root,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._sessions_dir",
-                return_value=sessions_dir,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
-                return_value="@0",
-            ),
+            _carrier_patches(sessions_dir, proc_root),
             patch("socket.socket", mock_socket),
         ):
-            from cli_agent_orchestrator.services.doorbell_service import (
-                _attempt_native_ring,
-            )
+            emission = _emit("term-f216")
 
-            result = _attempt_native_ring("term-f216", 42)
-
-        assert result == "socket_unpublished"
+        assert emission.reason == "socket_unpublished"
         # CRITICAL: zero socket.connect() attempts
         mock_socket.return_value.connect.assert_not_called()
 
@@ -218,37 +251,13 @@ class TestF216SocketUnpublishedGate:
         _make_proc_entry(proc_root, 600, ppid=400, starttime=99999)
 
         mock_socket = MagicMock()
-
         with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
-                return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
-                return_value=("%0", 400),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
-                proc_root,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._sessions_dir",
-                return_value=sessions_dir,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
-                return_value="@0",
-            ),
+            _carrier_patches(sessions_dir, proc_root),
             patch("socket.socket", mock_socket),
         ):
-            from cli_agent_orchestrator.services.doorbell_service import (
-                _attempt_native_ring,
-            )
+            emission = _emit("term-f216-empty")
 
-            result = _attempt_native_ring("term-f216-empty", 43)
-
-        assert result == "socket_unpublished"
+        assert emission.reason == "socket_unpublished"
         mock_socket.return_value.connect.assert_not_called()
 
     def test_verdict_fields_computed_not_constant(self, sessions_dir, proc_root):
@@ -262,33 +271,8 @@ class TestF216SocketUnpublishedGate:
         _make_proc_entry(proc_root, 400, ppid=1, starttime=88888)
         _make_proc_entry(proc_root, 700, ppid=400, starttime=99999)
 
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
-                return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
-                return_value=("%0", 400),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
-                proc_root,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._sessions_dir",
-                return_value=sessions_dir,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
-                return_value="@0",
-            ),
-        ):
-            from cli_agent_orchestrator.services.doorbell_service import (
-                _attempt_native_ring,
-            )
-
-            result_null_socket = _attempt_native_ring("term-f216-v", 44)
+        with _carrier_patches(sessions_dir, proc_root):
+            result_null_socket = _emit("term-f216-v").reason
 
         # Case 2: bad version → version_out_of_band
         # Use a sessions_dir2 to avoid cross-contamination
@@ -302,29 +286,8 @@ class TestF216SocketUnpublishedGate:
         )
         _make_proc_entry(proc_root, 800, ppid=400, starttime=99999)
 
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
-                return_value={"tmux_session": "cao-test", "tmux_window": "win-0"},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry.first_pane",
-                return_value=("%0", 400),
-            ),
-            patch(
-                "cli_agent_orchestrator.services.fork_context_service._PROC_ROOT",
-                proc_root,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._sessions_dir",
-                return_value=sessions_dir2,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id",
-                return_value="@0",
-            ),
-        ):
-            result_bad_version = _attempt_native_ring("term-f216-v2", 45)
+        with _carrier_patches(sessions_dir2, proc_root):
+            result_bad_version = _emit("term-f216-v2").reason
 
         # Different inputs → different verdicts (computed, not constant)
         assert result_null_socket == "socket_unpublished"

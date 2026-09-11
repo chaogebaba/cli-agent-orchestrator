@@ -6,12 +6,13 @@ hook now ONLY signals request_delivery, deduped per terminal; the cursor-gated
 F136 runner emits at most one wake transport (WS or native). These tests pin the
 new behavior:
 
-AC1: 4-tuple stash entry → request_delivery fires; no direct ring.
-AC2: (WP-ARCH 3c K3b) the WS plane is deleted; the hook still only signals
-     request_delivery.
+AC1: 4-tuple stash entry → request_delivery fires.
 AC3: legacy 3-tuple entry → still resolves a terminal and signals request_delivery.
 AC5: multiple entries → one request_delivery per distinct terminal (deduped).
-AC4/AC6 (below) are unchanged by r3.
+AC6 (below) is unchanged by r3.
+
+WP-ARCH 3c: AC2 and AC4 are gone with the two transports they watched — see the
+comment blocks where each stood.
 """
 
 from __future__ import annotations
@@ -35,50 +36,46 @@ class TestF158AfterCommitFallback:
         return session
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
-    @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    def test_ac1_ws_unarmed_triggers_fallback(self, mock_ring, mock_req):
-        """AC1 (r3): 4-tuple entry → request_delivery fires; hook never fires WS
-        or rings directly (the cursor-gated runner owns the wake)."""
+    def test_ac1_ws_unarmed_triggers_fallback(self, mock_req):
+        """AC1 (r3): 4-tuple entry → request_delivery fires (the cursor-gated
+        runner owns the wake; the hook only signals)."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session([("term123", 42, "sender", "hello")])
         _f413_after_commit(session)
 
-        mock_ring.assert_not_called()
         mock_req.assert_called_once_with("term123")
 
+    # WP-ARCH 3c K3/K8: ``test_ac2_hook_never_rings_directly`` stood here. It
+    # asserted the after-commit hook does not itself carry the wake, and it said
+    # so by patching ``doorbell_service.ring_supervisor_doorbell`` and requiring
+    # that mock stay untouched. Both doorbell modules are deleted, so there is
+    # no ring left to refrain from: with the import gone the arm can only be
+    # rewritten as "request_delivery fired", which is verbatim what AC1 above
+    # already pins. Keeping it would buy a second copy of AC1 under a name that
+    # promises a guarantee it no longer tests.
+    #
+    # The guarantee itself did not evaporate — it moved from "this hook declines
+    # to ring" to "no second emitter exists", which is what
+    # ``test_3c_slice3_surfaces_gone.py`` asserts against the whole source tree
+    # rather than against one call site.
+
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
-    @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    def test_ac2_hook_never_rings_directly(self, mock_ring, mock_req):
-        """AC2 (r3, 3c K3b): the hook never carries the wake itself — it only
-        signals request_delivery, whatever else is armed."""
-        from cli_agent_orchestrator.clients.database import _f413_after_commit
-
-        session = self._make_session([("term123", 42, "sender", "hello")])
-        _f413_after_commit(session)
-
-        mock_ring.assert_not_called()
-        mock_req.assert_called_once_with("term123")
-
-    @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
-    @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    def test_ac3_3tuple_handled_gracefully(self, mock_ring, mock_req):
+    def test_ac3_3tuple_handled_gracefully(self, mock_req):
         """AC3 (r3): Legacy 3-tuple entry resolves its terminal and signals
-        request_delivery; no WS frame, no direct ring."""
+        request_delivery."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         # 3-tuple: (logical_receiver_id/terminal_id, row_id, preview)
         session = self._make_session([("mb_abc123", 99, "preview text")])
         _f413_after_commit(session)
 
-        mock_ring.assert_not_called()
         mock_req.assert_called_once_with("mb_abc123")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
-    @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    def test_ac5_multiple_entries_all_processed(self, mock_ring, mock_req):
+    def test_ac5_multiple_entries_all_processed(self, mock_req):
         """AC5 (r3): entries for distinct terminals → one request_delivery each
-        (deduped per terminal); no WS frame, no direct ring."""
+        (deduped per terminal)."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit
 
         session = self._make_session(
@@ -89,14 +86,12 @@ class TestF158AfterCommitFallback:
         )
         _f413_after_commit(session)
 
-        mock_ring.assert_not_called()
         assert mock_req.call_count == 2
         mock_req.assert_any_call("term1")
         mock_req.assert_any_call("term2")
 
     @patch("cli_agent_orchestrator.services.inbox_service.request_delivery")
-    @patch("cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell")
-    def test_malformed_entry_skipped(self, mock_ring, mock_req):
+    def test_malformed_entry_skipped(self, mock_req):
         """Entries with wrong arity are skipped without crashing the loop; the
         valid entry still yields one request_delivery."""
         from cli_agent_orchestrator.clients.database import _f413_after_commit

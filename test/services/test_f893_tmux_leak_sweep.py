@@ -96,22 +96,19 @@ class TestRuntimeIdentityUsesThePort:
         provider.capture_session_uuid.assert_called_once_with(4242, 4342.0, "/work")
 
 
-class TestDeliveryNudgeUsesThePort:
-    """The rung-2 nudge injected through clients.tmux, bypassing the backend."""
-
-    def test_nudge_goes_through_backend_send_keys(self, monkeypatch):
-        from cli_agent_orchestrator.services import delivery_service
-
-        backend = MagicMock()
-        monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
-        tree = ast.parse(_source_of(delivery_service.attempt_rung2).lstrip())
-        senders = {
-            ast.unparse(node.func)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("send_keys")
-        }
-        assert senders == {"get_backend().send_keys"}, senders
-        assert backend is not None
+# WP-ARCH 3c K7: ``TestDeliveryNudgeUsesThePort`` is GONE with its subject. It
+# parsed the AST of ``delivery_service.attempt_rung2`` and asserted that every
+# ``send_keys`` call inside it went through ``get_backend()`` rather than through
+# ``clients.tmux`` directly — the #745 family rule applied to the rung-2 nudge.
+# K7 deletes the whole ladder: ``attempt_rung2`` is gone, and with it the only
+# ``send_keys`` this module ever issued. ``delivery_service`` is now 52 lines
+# holding one DB predicate, with no subprocess call, no backend call and no tmux
+# import of any kind.
+#
+# The family rule is untouched and is asserted on every site that still has a
+# pane to write to — the arms above and below this note. An arm re-pointed at the
+# reduced module would be asserting that a file which calls nothing calls nothing
+# through the wrong door, which is the vacuity the family guard exists to avoid.
 
 
 class TestFifoScopeProbeUsesTheConfiguredBackend:

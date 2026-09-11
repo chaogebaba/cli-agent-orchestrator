@@ -8,14 +8,12 @@ AC27: F166 notify path has a real-sqlite test proving one notification and no re
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # AC25: orphan_reconcile_service.run() end-to-end
@@ -25,7 +23,9 @@ import pytest
 class TestF165OrphanReconcileRealSqlite:
     """Drive orphan_reconcile_service dispatcher against real sqlite."""
 
-    def _seed_job(self, TestSession, *, state="pending", attempt=0, failure_code=None, notify_count=None):
+    def _seed_job(
+        self, TestSession, *, state="pending", attempt=0, failure_code=None, notify_count=None
+    ):
         """Seed an orphan reconcile job + incarnation into real DB."""
         from cli_agent_orchestrator.clients.database import (
             OrphanReconcileJobModel,
@@ -79,9 +79,9 @@ class TestF165OrphanReconcileRealSqlite:
 
         # Mock the actual reconciliation to simulate a failure at max retries
         from cli_agent_orchestrator.services.orphan_reconcile_service import (
+            _RETRY_DELAYS,
             OrphanReconcileService,
             ReconcileAttemptResult,
-            _RETRY_DELAYS,
         )
 
         mock_result = ReconcileAttemptResult(
@@ -95,15 +95,19 @@ class TestF165OrphanReconcileRealSqlite:
             detail="pid=1224",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
-            return_value=mock_result,
-        ), patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-        ) as mock_notify:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
+                return_value=mock_result,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ) as mock_notify,
+        ):
             # Drive the dispatcher for one batch
             from cli_agent_orchestrator.clients.database import f138_claim_jobs
 
@@ -117,9 +121,7 @@ class TestF165OrphanReconcileRealSqlite:
 
             loop = asyncio.new_event_loop()
             try:
-                loop.run_until_complete(
-                    svc._execute_job(seed["job_id"], seed["inc_id"])
-                )
+                loop.run_until_complete(svc._execute_job(seed["job_id"], seed["inc_id"]))
             finally:
                 loop.close()
 
@@ -138,8 +140,13 @@ class TestF165OrphanReconcileRealSqlite:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        seed = self._seed_job(TestSession, state="attention_required", attempt=8,
-                              failure_code="permission_denied_server_ancestor", notify_count=1)
+        seed = self._seed_job(
+            TestSession,
+            state="attention_required",
+            attempt=8,
+            failure_code="permission_denied_server_ancestor",
+            notify_count=1,
+        )
 
         from cli_agent_orchestrator.clients.database import f138_claim_jobs
 
@@ -160,18 +167,22 @@ class TestF165OrphanReconcileRealSqlite:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        seed = self._seed_job(TestSession, state="attention_required", attempt=8,
-                              failure_code=None, notify_count=0)
+        seed = self._seed_job(
+            TestSession, state="attention_required", attempt=8, failure_code=None, notify_count=0
+        )
 
         # Call notify-once helper with a failure code
         from cli_agent_orchestrator.services.orphan_reconcile_service import _f166_notify_once
 
-        with patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-        ) as mock_send:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ) as mock_send,
+        ):
             # First call: should emit
             result1 = _f166_notify_once(
                 job_id=seed["job_id"],
@@ -195,17 +206,21 @@ class TestF165OrphanReconcileRealSqlite:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        seed = self._seed_job(TestSession, state="attention_required", attempt=8,
-                              failure_code=None, notify_count=0)
+        seed = self._seed_job(
+            TestSession, state="attention_required", attempt=8, failure_code=None, notify_count=0
+        )
 
         from cli_agent_orchestrator.services.orphan_reconcile_service import _f166_notify_once
 
-        with patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-        ) as mock_send:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ) as mock_send,
+        ):
             # Three distinct codes should all emit
             for i in range(3):
                 result = _f166_notify_once(
@@ -231,17 +246,21 @@ class TestF165OrphanReconcileRealSqlite:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        seed = self._seed_job(TestSession, state="attention_required", attempt=8,
-                              failure_code=None, notify_count=0)
+        seed = self._seed_job(
+            TestSession, state="attention_required", attempt=8, failure_code=None, notify_count=0
+        )
 
         from cli_agent_orchestrator.services.orphan_reconcile_service import _f166_notify_once
 
-        with patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-            side_effect=RuntimeError("send_failed"),
+        with (
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+                side_effect=RuntimeError("send_failed"),
+            ),
         ):
             result = _f166_notify_once(
                 job_id=seed["job_id"],
@@ -262,11 +281,18 @@ class TestF165OrphanReconcileRealSqlite:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        seed = self._seed_job(TestSession, state="attention_required", attempt=8,
-                              failure_code="perm_denied", notify_count=2)
+        seed = self._seed_job(
+            TestSession,
+            state="attention_required",
+            attempt=8,
+            failure_code="perm_denied",
+            notify_count=2,
+        )
 
         from cli_agent_orchestrator.clients.database import f138_force_reconcile_incarnation
-        from cli_agent_orchestrator.services.orphan_reconcile_service import orphan_reconcile_service
+        from cli_agent_orchestrator.services.orphan_reconcile_service import (
+            orphan_reconcile_service,
+        )
 
         # Mock the signal_dirty to avoid starting a real async dispatcher
         with patch.object(orphan_reconcile_service, "signal_dirty"):
@@ -339,18 +365,27 @@ class TestF165SweepOverdueDeferredInits:
 
         # Patch has_deferred_init to return True for overdue1
         monkeypatch.setattr(
-            terminal_service, "has_deferred_init",
+            terminal_service,
+            "has_deferred_init",
             lambda tid: tid == "overdue1",
         )
 
         # Patch get_terminal_metadata to return data for both
         def fake_metadata(tid):
             if tid == "overdue1":
-                return {"id": "overdue1", "tmux_session": "test-sess",
-                        "init_state": "init_pending", "metadata": {}}
+                return {
+                    "id": "overdue1",
+                    "tmux_session": "test-sess",
+                    "init_state": "init_pending",
+                    "metadata": {},
+                }
             if tid == "ready01":
-                return {"id": "ready01", "tmux_session": "test-sess",
-                        "init_state": "ready", "metadata": {}}
+                return {
+                    "id": "ready01",
+                    "tmux_session": "test-sess",
+                    "init_state": "ready",
+                    "metadata": {},
+                }
             return None
 
         monkeypatch.setattr(terminal_service, "get_terminal_metadata", fake_metadata)
@@ -369,131 +404,22 @@ class TestF165SweepOverdueDeferredInits:
 
 
 # ---------------------------------------------------------------------------
-# AC28: Migrated fx158 test on shared fixture
+# WP-ARCH 3c K2: ``TestF165MigratedFx158`` is GONE with its subject
 # ---------------------------------------------------------------------------
-
-
-class TestF165MigratedFx158:
-    """The fx158 real-sqlite test migrated onto the shared fixture.
-
-    Uses the same real_sqlite_env from conftest.py rather than its own inline fixture.
-    """
-
-    def test_pull_mode_push_delivered_on_shared_fixture(self, real_sqlite_env, monkeypatch):
-        """AC28: migrated fx158 test on shared fixture — proves fixture faithfulness."""
-        env = real_sqlite_env
-        TestSession = env["TestSession"]
-        tmp_path = env["tmp_path"]
-
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel,
-            MailboxModel,
-            TerminalModel,
-        )
-
-        now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=120)
-        inbox_path = tmp_path / "inbox.json"
-
-        with TestSession.begin() as db:
-            terminal = TerminalModel(
-                id="sup00001",
-                tmux_session="test-sess",
-                tmux_window="win-sup",
-                provider="kiro_cli",
-                agent_profile="developer",
-                lifecycle="sticky",
-                init_state="ready",
-                lifecycle_generation=1,
-                metadata_json=json.dumps({"cc_team_inbox_path": str(inbox_path)}),
-            )
-            db.add(terminal)
-
-            mailbox = MailboxModel(
-                id="mb_sup_f165",
-                session_name="test-sess",
-                role="supervisor",
-                current_terminal_id="sup00001",
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-            )
-            db.add(mailbox)
-
-            inbox_msg = InboxModel(
-                sender_id="worker01",
-                receiver_id="sup00001",
-                logical_receiver_id="mb_sup_f165",
-                message="task result from worker",
-                orchestration_type="send_message",
-                status="pending",
-                created_at=old,
-            )
-            db.add(inbox_msg)
-
-        # Same patches as original test
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-                "supervisor.teammate_push": True,
-                "supervisor.wake.native": True,
-            }.get(key, default)),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-            lambda tid: tid == "sup00001",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-            lambda tid: True,
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            lambda tid: {
-                "id": "sup00001",
-                "tmux_session": "test-sess",
-                "tmux_window": "win-sup",
-                "provider": "kiro_cli",
-                "agent_profile": "developer",
-                "metadata": {"cc_team_inbox_path": str(inbox_path)},
-            } if tid == "sup00001" else None,
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._resolve_inbox_path",
-            lambda tid: inbox_path if tid == "sup00001" else None,
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
-            lambda tid: None,
-        )
-        from cli_agent_orchestrator.services import inbox_service as _is_mod
-
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_with_terminal", lambda: [])
-
-        from cli_agent_orchestrator.services.inbox_service import InboxService
-
-        monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
-
-        svc = InboxService()
-        svc.reconcile_orphaned_messages()
-
-        # Assertions
-        assert inbox_path.exists(), (
-            "Inbox file NOT written — push delivery failed"
-        )
-        inbox_content = json.loads(inbox_path.read_text())
-        assert len(inbox_content) >= 1
-        assert "worker01" in json.dumps(inbox_content)
-
-        from cli_agent_orchestrator.clients.database import InboxDeliveryAttemptModel
-
-        with TestSession() as db:
-            attempts = (
-                db.query(InboxDeliveryAttemptModel)
-                .filter_by(receiver_terminal_id="sup00001", provider="reconciler")
-                .all()
-            )
-            assert len(attempts) == 1
-            assert attempts[0].outcome == "push_written"
+# Its one arm (``test_pull_mode_push_delivered_on_shared_fixture``) was the fx158
+# end-to-end: seed a supervisor mailbox with a pending row, turn on
+# ``supervisor.mailbox_pull`` + ``supervisor.teammate_push``, run
+# ``reconcile_orphaned_messages``, and assert the JSON inbox FILE was written and
+# a ``provider="reconciler"`` attempt row settled ``push_written``/``pushed``.
+#
+# Every load-bearing name in that list is deleted: both flags, the reconciler
+# (``InboxService.reconcile_pull_mode_notifications``), the writer
+# (``teammate_push_service.write_supervisor_callback_notification``), its
+# ``_should_teammate_push`` gate and ``_resolve_inbox_path``. There is no file for
+# a push to land in and no push to settle, so nothing here has a smaller honest
+# form. The seat's carrier is now ``NativeSeatCarrier`` driven by the delivery
+# tick, whose end-to-end lives under ``test/app/delivery/``.
+#
+# The REST of this file is untouched: the F165 orphan-reconcile daemon and the
+# F166 notification cap above are about claim/dispatch and notification dedup,
+# neither of which is pull-mode.

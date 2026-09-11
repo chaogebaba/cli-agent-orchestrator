@@ -31,7 +31,7 @@ built to the countermanded instruction, then was delivered stale on idle.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -296,9 +296,12 @@ class TestF524ReconcilerWiring:
         monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
         monkeypatch.setattr(InboxService, "reconcile_pending_orphans", lambda self: None)
         monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
-        monkeypatch.setattr(InboxService, "reconcile_pull_mode_notifications", lambda self: None)
-        # ConfigService.get above returns None for supervisor.mailbox_pull, so the
-        # mailbox-quarantine branch of reconcile is skipped.
+        # WP-ARCH 3c K2: ``reconcile_pull_mode_notifications`` was silenced here
+        # too; the method is deleted with the legacy pull-mode carrier, so there
+        # is nothing left to no-op. ``supervisor.mailbox_pull`` went with it, so
+        # the mailbox-quarantine branch it gated is likewise gone rather than
+        # skipped. ``surface_stalled_direct_deliveries`` — the code under test —
+        # is still deliberately NOT patched.
 
         svc = InboxService()
         svc.reconcile_orphaned_messages()  # DEPLOYED entry point, not the sweep method
@@ -552,8 +555,9 @@ class TestF524UpgradePathMigration:
             }
 
     def test_init_db_creates_index_and_dedupes_on_existing_db(self, tmp_path, monkeypatch):
-        import cli_agent_orchestrator.clients.database as db_mod
         from sqlalchemy import text
+
+        import cli_agent_orchestrator.clients.database as db_mod
 
         eng, TS, _ = self._build_pre_index_db(tmp_path)
         monkeypatch.setattr(db_mod, "engine", eng)

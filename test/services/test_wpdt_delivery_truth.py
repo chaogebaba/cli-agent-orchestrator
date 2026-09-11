@@ -3,14 +3,15 @@
 AC1/AC2/AC3: the WebSocket doorbell plane — deleted by WP-ARCH 3c K3b; see the
      note at the foot of this file.
 AC4: F152 producer — fresh pane has cc_team_inbox_path; self-heal fills missing.
-AC5: Supervisor targets never receive rung2 composer injection (code path
-     unreachable for role=supervisor).
+     The derivation survived WP-ARCH 3c K2 in ``services/native_delivery_health``;
+     the arms follow it there.
+AC5: the obligation ladder's supervisor exemption — deleted by WP-ARCH 3c K7; see
+     the note at the foot of this file.
 AC6: F136/F276 regression tests (ordering + full drain).
 AC7/AC8: doctrine arming + flag-flip rollback for that same deleted plane; see
      the note at the foot of this file.
 """
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,15 +21,23 @@ from unittest.mock import MagicMock, patch
 
 
 class TestAC4F152Producer:
-    """AC4: fresh pane has cc_team_inbox_path; self-heal fills missing."""
+    """AC4: fresh pane has cc_team_inbox_path; self-heal fills missing.
+
+    WP-ARCH 3c K2 deleted ``teammate_push_service``, but NOT this pair. The
+    socket-path derivation and its F152 self-heal were the NATIVE half of that
+    file and moved unchanged to ``services/native_delivery_health`` (losing only
+    their leading underscores, since they are now the module's public surface).
+    The subject is the same address derivation, so the arms move with it rather
+    than being retired.
+    """
 
     def test_derive_cc_team_inbox_path_returns_valid_path(self):
-        """_derive_cc_team_inbox_path builds ~/.claude/projects/{key}/team-lead.json."""
-        from cli_agent_orchestrator.services.teammate_push_service import (
-            _derive_cc_team_inbox_path,
+        """derive_cc_team_inbox_path builds ~/.claude/projects/{key}/team-lead.json."""
+        from cli_agent_orchestrator.services.native_delivery_health import (
+            derive_cc_team_inbox_path,
         )
 
-        result = _derive_cc_team_inbox_path("/home/user/project")
+        result = derive_cc_team_inbox_path("/home/user/project")
         assert result is not None
         assert "team-lead.json" in str(result)
         assert ".claude/projects/" in str(result)
@@ -36,126 +45,64 @@ class TestAC4F152Producer:
         assert "-home-user-project" in str(result)
 
     def test_resolve_inbox_path_self_heal(self):
-        """_resolve_inbox_path derives path when metadata is missing."""
-        from cli_agent_orchestrator.services.teammate_push_service import _resolve_inbox_path
+        """resolve_inbox_path derives path when metadata is missing."""
+        from cli_agent_orchestrator.services.native_delivery_health import resolve_inbox_path
 
         mock_metadata = {
             "metadata": {},
             "provider": "claude_code",
-            "working_directory": "/tmp/test_project",
+            "working_directory": "/data/claude-scratch/worker-scratch/test_project",
         }
         with (
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
+                "cli_agent_orchestrator.services.native_delivery_health.get_terminal_metadata",
                 return_value=mock_metadata,
             ),
             patch(
                 "cli_agent_orchestrator.clients.database.update_terminal_metadata",
-            ) as mock_update,
+            ),
         ):
-            result = _resolve_inbox_path("test_terminal")
+            result = resolve_inbox_path("test_terminal")
             assert result is not None
             assert "team-lead.json" in str(result)
 
     def test_resolve_inbox_path_returns_existing(self):
-        """_resolve_inbox_path returns the stored path when present."""
-        from cli_agent_orchestrator.services.teammate_push_service import _resolve_inbox_path
+        """resolve_inbox_path returns the stored path when present."""
+        from cli_agent_orchestrator.services.native_delivery_health import resolve_inbox_path
 
         mock_metadata = {
             "metadata": {"cc_team_inbox_path": "/home/u/.claude/inbox.json"},
             "provider": "claude_code",
-            "working_directory": "/tmp/test",
+            "working_directory": "/data/claude-scratch/worker-scratch/test",
         }
         with patch(
-            "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
+            "cli_agent_orchestrator.services.native_delivery_health.get_terminal_metadata",
             return_value=mock_metadata,
         ):
-            result = _resolve_inbox_path("test_terminal")
+            result = resolve_inbox_path("test_terminal")
             assert result == Path("/home/u/.claude/inbox.json")
 
 
 # ---------------------------------------------------------------------------
-# AC5: Supervisor targets never receive rung2 composer injection
+# WP-ARCH 3c K7: AC5's two arms are GONE with their subject
 # ---------------------------------------------------------------------------
-
-
-class TestAC5SupervisorNudgeExemption:
-    """AC5: supervisor role targets are exempt from rung2 AND escalation rung2."""
-
-    def test_attempt_rung2_supervisor_role_exempt(self):
-        """attempt_rung2 returns supervisor_role_exempt for supervisor targets."""
-        from cli_agent_orchestrator.services.delivery_service import (
-            DeliveryTarget,
-            attempt_rung2,
-        )
-
-        target = DeliveryTarget(
-            terminal_id="sup_term",
-            tmux_session="cao-session",
-            tmux_window="sup_window",
-            cc_inbox_path=None,
-            liveness="presumed_live",
-        )
-
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service._is_supervisor_role_target",
-            return_value=True,
-        ):
-            result = attempt_rung2(target, 100)
-            assert result.delivered is False
-            assert result.reason == "supervisor_role_exempt"
-
-    def test_escalate_skips_rung2_for_supervisor(self):
-        """_escalate does not call attempt_rung2 for supervisor targets."""
-        from cli_agent_orchestrator.services.delivery_service import _escalate
-
-        # Mock all dependencies
-        mock_obl = MagicMock()
-        mock_obl.inbox_row_id = 1
-        mock_obl.mailbox_id = "mb1"
-        mock_obl.attempts = 5
-        mock_obl.accepted_at = None
-
-        mock_target = MagicMock()
-        mock_target.terminal_id = "sup_term"
-        mock_target.tmux_session = "cao-session"
-        mock_target.tmux_window = "sup_window"
-        mock_target.cc_inbox_path = None
-        mock_target.liveness = "presumed_live"
-
-        mock_db = MagicMock()
-        from datetime import datetime, timezone
-
-        now = datetime.now(timezone.utc)
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target",
-                return_value=mock_target,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.delivery_service._is_supervisor_role_target",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.delivery_service.emit_trace_or_collapse",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.delivery_service._fire_escalation_display_message",
-            ) as mock_display,
-            patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2",
-            ) as mock_rung2,
-        ):
-            _escalate(mock_db, mock_obl, now, 200.0)
-
-            # rung2 should NOT be called for supervisor targets
-            mock_rung2.assert_not_called()
-            # display-message floor SHOULD fire
-            mock_display.assert_called_once()
-            # Obligation should be ESCALATED
-            assert mock_obl.state == "ESCALATED"
-            assert mock_obl.terminal_reason == "supervisor_role_exempt"
+# ``TestAC5SupervisorNudgeExemption`` pinned an exemption INSIDE the obligation
+# ladder: that ``attempt_rung2`` refused a supervisor target with
+# ``supervisor_role_exempt``, and that ``_escalate`` therefore skipped rung 2 and
+# fell through to the display-message floor. K7 deletes the ladder whole —
+# ``attempt_rung1``/``attempt_rung2``, ``_escalate``, ``convergence_tick``,
+# ``DeliveryTarget`` and ``resolve_supervisor_target`` — leaving
+# ``delivery_service`` with only ``is_target_confirmed_dead``. There is no rung to
+# be exempt from and no escalation to skip it.
+#
+# The concern the exemption served — that nothing may type into the seat's input
+# box — is NOT retired with it, and is asserted more strongly than these arms did.
+# K8 removes the seat's reachability of the paste seam outright rather than
+# guarding it with a role check: ``InboxService.deliver_pending``'s supervisor
+# branch returns before ``prepare_input`` can be reached at all, which
+# ``test_p3b_seat_carrier_positions`` pins behaviourally in every switch position.
+# An unreachable seam needs no exemption, so re-pointing these arms at the new
+# code would mean asserting a predicate that no longer decides anything.
 
 
 # ---------------------------------------------------------------------------

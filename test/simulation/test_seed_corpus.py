@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from cli_agent_orchestrator.sim.clock import SimClock, install as install_clock
+from cli_agent_orchestrator.sim.clock import SimClock
+from cli_agent_orchestrator.sim.clock import install as install_clock
 from cli_agent_orchestrator.sim.faults import Fault, FaultKind
 from cli_agent_orchestrator.sim.world import SimWorld
 
@@ -70,7 +71,19 @@ def test_corpus_seed_replay(seed: int, tag: str):
                 world.driver.run_until(max_virtual_seconds=150.0)
                 world.heal_all()
 
-                # Real convergence_tick drives delivery (S2: no manual mark_delivered)
+                # The real scheduled delivery step drives delivery (S2: no
+                # manual mark_delivered).
+                #
+                # WP-ARCH 3c K7: this used to spy on
+                # ``delivery_service.convergence_tick``, the function the
+                # roster's first Tick drove. Both are deleted; the roster's
+                # first Tick is now ``delivery_tick``, which resolves
+                # ``bootstrap.current_runtime().delivery_tick`` at call time.
+                # The spy follows the roster to that seam, leaving
+                # ``sim/driver``'s own closure unpatched so the corpus still
+                # replays against the driver production runs.
+                from types import SimpleNamespace
+
                 _tick_count = [0]
 
                 def _tick_delivers():
@@ -78,16 +91,20 @@ def test_corpus_seed_replay(seed: int, tag: str):
                     if _tick_count[0] >= 2:
                         world.mark_delivered(seed)
 
+                _fake_runtime = SimpleNamespace(
+                    delivery_tick=SimpleNamespace(run_once=_tick_delivers)
+                )
+
                 with _patch(
-                    "cli_agent_orchestrator.services.delivery_service.convergence_tick",
-                    side_effect=_tick_delivers,
+                    "cli_agent_orchestrator.bootstrap.current_runtime",
+                    return_value=_fake_runtime,
                 ):
                     world.driver.run_until(max_virtual_seconds=30.0)
 
             verdict = world.check_liveness(bound_seconds=50.0)
             assert verdict.passed, (
                 f"Corpus seed {seed} ({tag}) FAILED: {verdict}\n"
-                f"Reproduce: make test-full ARGS=\"-m sim -k test_corpus_seed_replay[{seed}_{tag}]\" "
+                f'Reproduce: make test-full ARGS="-m sim -k test_corpus_seed_replay[{seed}_{tag}]" '
                 f"CAO_SIM_SEED={seed}"
             )
         finally:

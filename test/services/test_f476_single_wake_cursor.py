@@ -769,21 +769,23 @@ class TestAC5WakeHierarchy:
 # ---------------------------------------------------------------------------
 # AC6: Legacy cursor grep counts
 # ---------------------------------------------------------------------------
-
-
-class TestAC6LegacyCursorRemoval:
-    def test_no_service_references(self) -> None:
-        """Legacy dedup functions fully removed from services (AC6)."""
-        import cli_agent_orchestrator.services.doorbell_service as ds
-        import cli_agent_orchestrator.services.teammate_push_service as tps
-
-        # Verify the removed functions and dicts don't exist
-        assert not hasattr(ds, "_get_last_doorbell_row_id")
-        assert not hasattr(ds, "_persist_last_doorbell_row_id")
-        assert not hasattr(ds, "_last_doorbell_row_id")
-        assert not hasattr(tps, "_get_last_notified_id")
-        assert not hasattr(tps, "_persist_last_notified_id")
-        assert not hasattr(tps, "_last_notified")
+#
+# WP-ARCH 3c K2/K3: ``TestAC6LegacyCursorRemoval`` stood here. F476 replaced two
+# per-module dedup cursors — ``doorbell_service._last_doorbell_row_id`` and
+# ``teammate_push_service._last_notified``, each with its own getter and
+# persister — with the single wake cursor this file is about, and the arm held
+# the replacement in place by asserting the six old names were gone from those
+# two modules.
+#
+# Both modules are now deleted whole, which makes the arm unwritable rather than
+# merely redundant: it opened with ``import ...doorbell_service`` and
+# ``import ...teammate_push_service``, so there is nothing left to ask
+# ``hasattr`` of. Rewriting it as "these modules do not import" would be a test
+# of the deletion, not of the cursor — and ``test_3c_slice3_surfaces_gone.py``
+# already asserts exactly that, against the whole source tree and paired with
+# live controls.
+#
+# The single cursor itself is untouched; every arm above still drives it.
 
 
 # ---------------------------------------------------------------------------

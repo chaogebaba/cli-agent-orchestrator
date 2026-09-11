@@ -16,23 +16,14 @@ AC6: Cursor semantics untouched: replay after supervisor restart resumes from
 
 from __future__ import annotations
 
-import subprocess
-import time
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
-from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.boundary_pull_service import (
     BoundaryPullService,
     InterruptState,
-    _TerminalPullState,
-    boundary_pull_service,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -106,9 +97,7 @@ class TestAC2MaskedInterrupt:
     """AC2: Thinking-stuck (no boundaries for E): exactly ONE interrupt fires,
     then re-arms on boundary."""
 
-    def test_interrupt_fires_when_no_boundary_and_age_exceeds_e(
-        self, service: BoundaryPullService
-    ):
+    def test_interrupt_fires_when_no_boundary_and_age_exceeds_e(self, service: BoundaryPullService):
         """Interrupt fires when: ARMED, no boundary, obligation age >= E."""
         service.register_terminal("sup1", "mb1")
 
@@ -145,9 +134,7 @@ class TestAC2MaskedInterrupt:
         service.notify_boundary("sup1", "mb1")
         assert service.get_state("sup1").interrupt_state == InterruptState.ARMED
 
-    def test_second_fire_requires_fresh_boundary_free_window(
-        self, service: BoundaryPullService
-    ):
+    def test_second_fire_requires_fresh_boundary_free_window(self, service: BoundaryPullService):
         """A second fire requires a fresh boundary-free E-window after re-arm."""
         service.register_terminal("sup1", "mb1")
 
@@ -190,9 +177,7 @@ class TestAC2MaskedInterrupt:
 class TestAC3CoalescedSignal:
     """AC3: Multiple obligations produce a single interrupt carrying the count."""
 
-    def test_single_interrupt_regardless_of_obligation_count(
-        self, service: BoundaryPullService
-    ):
+    def test_single_interrupt_regardless_of_obligation_count(self, service: BoundaryPullService):
         """N obligations share one coalesced interrupt, not N separate interrupts.
 
         The should_interrupt check is per-terminal (not per-obligation),
@@ -207,22 +192,15 @@ class TestAC3CoalescedSignal:
         # Second check (same terminal, different obligation concept) — MASKED
         assert service.should_interrupt("sup1", "mb1", 130.0, 120.0) is False
 
-    def test_coalesced_signal_format(self):
-        """D3: The nudge text carries count and oldest id in the expected format.
-
-        Verifies the format: '[cao] N waiting, oldest <id> <age>'
-        """
-        # This is tested via the delivery_service._fire_due_nudges integration
-        # which uses this exact format. We verify the format string exists
-        # in the source code.
-        import inspect
-
-        from cli_agent_orchestrator.services.delivery_service import _fire_due_nudges
-
-        source = inspect.getsource(_fire_due_nudges)
-        assert "[cao]" in source
-        assert "waiting" in source
-        assert "oldest" in source
+    # WP-ARCH 3c K7: ``test_coalesced_signal_format`` is GONE with its subject.
+    # It read the source of ``delivery_service._fire_due_nudges`` and asserted the
+    # literals of the coalesced nudge line ("[cao] N waiting, oldest <id>"). The
+    # nudge is deleted with the ladder that scheduled it, and so is the text: no
+    # carrier types that line at a seat any more, so there is no format left to
+    # hold stable. The COALESCING half of AC3 — that N obligations produce one
+    # interrupt and not N — is not deleted with it; the arm above owns it, and it
+    # asks ``BoundaryPullService`` directly rather than reading a format string,
+    # which is the stronger of the two anyway.
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +213,9 @@ class TestAC4TmuxPending:
 
     def test_set_on_count_change(self, service: BoundaryPullService):
         """@cao_pending is set when pending count > 0."""
-        with patch("subprocess.run") as mock_run, patch(
-            "cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None),
         ):
             service.update_pending_count("sup1", "cao-session", 3)
 
@@ -248,8 +227,9 @@ class TestAC4TmuxPending:
 
     def test_unset_on_drain(self, service: BoundaryPullService):
         """@cao_pending is unset (-u) when count drops to 0."""
-        with patch("subprocess.run") as mock_run, patch(
-            "cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None),
         ):
             # First set to non-zero
             service.update_pending_count("sup1", "cao-session", 2)
@@ -265,8 +245,9 @@ class TestAC4TmuxPending:
 
     def test_no_write_on_same_count(self, service: BoundaryPullService):
         """No tmux write when count hasn't changed (no per-tick churn)."""
-        with patch("subprocess.run") as mock_run, patch(
-            "cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None),
         ):
             service.update_pending_count("sup1", "cao-session", 3)
             mock_run.reset_mock()
@@ -277,8 +258,9 @@ class TestAC4TmuxPending:
 
     def test_never_writes_status_right(self, service: BoundaryPullService):
         """D4: NEVER writes the status-right format string."""
-        with patch("subprocess.run") as mock_run, patch(
-            "cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None),
         ):
             service.update_pending_count("sup1", "cao-session", 5)
 
@@ -289,8 +271,9 @@ class TestAC4TmuxPending:
 
     def test_count_change_triggers_write(self, service: BoundaryPullService):
         """Count changes trigger writes."""
-        with patch("subprocess.run") as mock_run, patch(
-            "cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli_agent_orchestrator.utils.tmux_command.tmux_socket_name", return_value=None),
         ):
             service.update_pending_count("sup1", "cao-session", 1)
             service.update_pending_count("sup1", "cao-session", 3)
@@ -304,78 +287,21 @@ class TestAC4TmuxPending:
 # ---------------------------------------------------------------------------
 
 
-class TestAC5EBoundRegression:
-    """AC5: Escalation timing unchanged under the new pull-first path.
-
-    The escalation path runs off obligation age (not nudge count or
-    boundary state). This is a structural guarantee: _escalate in
-    delivery_service is completely independent of boundary_pull_service.
-    """
-
-    def test_escalation_independent_of_boundary_state(self):
-        """Escalation fires regardless of whether boundaries occurred."""
-        from cli_agent_orchestrator.clients.database import (
-            Base,
-            DeliveryObligationModel,
-            MailboxModel,
-            TerminalModel,
-        )
-        from cli_agent_orchestrator.services.delivery_service import (
-            LadderResult,
-            _escalate,
-        )
-
-        engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(bind=engine)
-        TestSession = sessionmaker(bind=engine)
-
-        with TestSession() as db:
-            db.add(
-                TerminalModel(
-                    id="sup1",
-                    tmux_session="cao-test",
-                    tmux_window="supervisor",
-                    provider="kiro_cli",
-                    agent_profile="supervisor",
-                )
-            )
-            db.add(
-                MailboxModel(
-                    id="mb1",
-                    session_name="cao-test",
-                    role="supervisor",
-                    current_terminal_id="sup1",
-                    generation=1,
-                    consumed_through_id=0,
-                )
-            )
-            db.add(
-                DeliveryObligationModel(
-                    inbox_row_id=300,
-                    mailbox_id="mb1",
-                    state="OPEN",
-                    accepted_at=datetime.now(timezone.utc) - timedelta(seconds=200),
-                    attempts=10,
-                )
-            )
-            db.commit()
-
-        now = datetime.now(timezone.utc)
-
-        def fake_rung2(target, inbox_row_id, **kwargs):
-            return LadderResult(delivered=True, phase="surface", decision="proceed", reason=None)
-
-        with (
-            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
-            patch("cli_agent_orchestrator.services.delivery_service.attempt_rung2", fake_rung2),
-        ):
-            with TestSession() as db:
-                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=300).one()
-                _escalate(db, obl, now, 200.0)
-                db.commit()
-
-                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=300).one()
-                assert obl.state == "ESCALATED"
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K7: AC5's ``TestAC5EBoundRegression`` is GONE with its subject
+# ---------------------------------------------------------------------------
+# Its single arm built an OPEN obligation aged past E and drove
+# ``delivery_service._escalate`` (with ``attempt_rung2`` stubbed through
+# ``LadderResult``) to assert the row reached ESCALATED whether or not a boundary
+# had been observed — i.e. that escalation timing was independent of
+# ``boundary_pull_service``. K7 deletes ``_escalate``, ``attempt_rung2`` and
+# ``LadderResult``: there is no escalation for a boundary to be independent OF.
+#
+# The independence itself is now structural rather than asserted. The queue's
+# lease and attempt budget are the only re-offer authority, and they read a row's
+# clock, not a terminal's boundary state — ``boundary_pull_service`` is not
+# reachable from ``app/delivery/tick.py`` at all. An arm that re-stated this
+# against the tick would be asserting the absence of an import.
 
 
 # ---------------------------------------------------------------------------
@@ -383,76 +309,27 @@ class TestAC5EBoundRegression:
 # ---------------------------------------------------------------------------
 
 
-class TestAC6CursorSemantics:
-    """AC6: Cursor semantics untouched — consumption cursor still governs replay."""
-
-    def test_settle_obligation_acked_unchanged(self):
-        """settle_obligation_acked still works via cursor advance."""
-        from cli_agent_orchestrator.clients.database import (
-            Base,
-            DeliveryObligationModel,
-            InboxMessageTraceEventModel,
-            MailboxModel,
-            TerminalModel,
-        )
-        from cli_agent_orchestrator.services.delivery_service import settle_obligation_acked
-
-        engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(bind=engine)
-        TestSession = sessionmaker(bind=engine)
-
-        with TestSession() as db:
-            db.add(
-                TerminalModel(
-                    id="sup1",
-                    tmux_session="cao-test",
-                    tmux_window="supervisor",
-                    provider="kiro_cli",
-                    agent_profile="supervisor",
-                )
-            )
-            db.add(
-                MailboxModel(
-                    id="mb1",
-                    session_name="cao-test",
-                    role="supervisor",
-                    current_terminal_id="sup1",
-                    generation=1,
-                    consumed_through_id=0,
-                )
-            )
-            db.add(
-                DeliveryObligationModel(
-                    inbox_row_id=400,
-                    mailbox_id="mb1",
-                    state="OPEN",
-                    accepted_at=datetime.now(timezone.utc),
-                    attempts=1,
-                )
-            )
-            db.commit()
-
-        with (
-            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
-        ):
-            settle_obligation_acked(400)
-
-            with TestSession() as db:
-                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=400).one()
-                assert obl.state == "ACKED"
-                assert obl.terminal_reason == "consumed"
-
-    def test_consumption_cursor_advance_disarms_nudge(self):
-        """Cursor advance still disarms nudge state (fx193 behavior preserved)."""
-        from cli_agent_orchestrator.services.nudge_discipline import NudgeDiscipline
-
-        discipline = NudgeDiscipline()
-        discipline.arm_or_coalesce("sup1", "mb1", 1, 500)
-        assert discipline.has_armed("sup1")
-
-        # Cursor advances — nudge disarmed
-        discipline.on_cursor_advance("sup1", "mb1")
-        assert not discipline.has_armed("sup1")
+# ---------------------------------------------------------------------------
+# WP-ARCH 3c K7: AC6's ``TestAC6CursorSemantics`` is GONE with its subject
+# ---------------------------------------------------------------------------
+# Both arms named deleted machinery, and the second names a deleted module:
+#
+#   * ``test_settle_obligation_acked_unchanged`` drove
+#     ``delivery_service.settle_obligation_acked`` and asserted an OPEN obligation
+#     became ACKED with ``terminal_reason="consumed"``. That function is gone with
+#     the ladder — the obligation table is no longer the record of what has been
+#     delivered, so there is no settle step to keep unchanged.
+#   * ``test_consumption_cursor_advance_disarms_nudge`` drove
+#     ``services/nudge_discipline.NudgeDiscipline``, which is DELETED WHOLE with
+#     the nudge it scheduled. A disarm is a property of an arm, and there is no
+#     longer anything to arm.
+#
+# AC6's heading — "cursor semantics untouched" — is the part worth keeping, and it
+# is: the wake cursor (``claim_unnotified_wake``/``commit_wake``,
+# ``callback_notified_through_id``) survives 3c intact and is asserted in
+# ``test_f476_wake_cursor.py``, which counts the cursor column directly rather
+# than through an obligation row's terminal_reason. What died here is the
+# OBLIGATION's bookkeeping around the cursor, not the cursor.
 
 
 # ---------------------------------------------------------------------------
@@ -546,52 +423,15 @@ class TestD2StateMachine:
 
 
 # ---------------------------------------------------------------------------
-# Integration: _fire_due_nudges with boundary pull gating
+# WP-ARCH 3c K7: ``TestFireDueNudgesIntegration`` is GONE with its subject
 # ---------------------------------------------------------------------------
-
-
-class TestFireDueNudgesIntegration:
-    """Integration test: _fire_due_nudges respects boundary pull gating."""
-
-    def test_nudge_suppressed_when_boundary_observed(self):
-        """When boundaries have been observed, nudge does not fire."""
-        from unittest.mock import patch
-
-        from cli_agent_orchestrator.services.boundary_pull_service import BoundaryPullService
-        from cli_agent_orchestrator.services.nudge_discipline import (
-            NudgeDiscipline,
-            NudgeFireIntent,
-        )
-
-        mock_bps = BoundaryPullService()
-        mock_bps.register_terminal("sup1", "mb1")
-        mock_bps.notify_boundary("sup1", "mb1")  # boundary occurred
-
-        # Create a nudge intent that would fire
-        mock_discipline = NudgeDiscipline()
-
-        intents = [
-            NudgeFireIntent(
-                terminal_id="sup1",
-                mailbox_id="mb1",
-                message_count=2,
-                oldest_inbox_row_id=100,
-                is_first=False,
-            )
-        ]
-
-        from cli_agent_orchestrator.services.delivery_service import (
-            DeliveryTarget,
-            _fire_due_nudges,
-        )
-
-        target = DeliveryTarget(
-            terminal_id="sup1",
-            tmux_session="cao-test",
-            tmux_window="supervisor",
-            cc_inbox_path=None,
-        )
-
-        # should_interrupt returns False because boundary was observed
-        result = mock_bps.should_interrupt("sup1", "mb1", 130.0, 120.0)
-        assert result is False  # Boundary blocks interrupt
+# The arm named ``_fire_due_nudges``, ``DeliveryTarget``, ``NudgeDiscipline`` and
+# ``NudgeFireIntent`` — every one deleted — to set up a nudge that "would fire",
+# and then asserted ``BoundaryPullService.should_interrupt(...) is False``.
+#
+# That last line is worth naming, because it is why this is a deletion and not a
+# re-point: the assertion never touched the nudge path at all. It re-asked the
+# boundary predicate that ``TestAC1BoundaryPullPrimacy.test_boundary_blocks_
+# interrupt`` already owns, with a page of dead scaffolding in front of it.
+# Stripping the deleted imports would leave a byte-for-byte duplicate of that arm,
+# so what is lost here is the scaffolding, and the coverage was never here.

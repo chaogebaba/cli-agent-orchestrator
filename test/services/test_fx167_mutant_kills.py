@@ -14,7 +14,6 @@ import json
 import os
 import subprocess
 import tempfile
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -408,244 +407,70 @@ exit 0
 
 
 # ---------------------------------------------------------------------------
-# M12: fx158 gate5 WARN rate-limiting (60s suppression with fake clock)
+# M12: the native_fallback_engaged WARN rate-limit (60s window, fake clock)
 # ---------------------------------------------------------------------------
+# WP-ARCH 3c K2 took M12's DRIVER and its state, but not its subject.
+#
+# Both arms used to seed an unregistered supervisor, turn on
+# ``supervisor.mailbox_pull`` + ``supervisor.teammate_push``, and tick
+# ``InboxService.reconcile_pull_mode_notifications`` three times, counting WARNs
+# against ``inbox_service._fx158_gate5_last_warn``. The reconciler, both flags and
+# that dict are all deleted with the legacy pull-mode carrier.
+#
+# The RATE LIMIT itself survived K2: it moved, with the rest of the native health
+# probe, into ``services/native_delivery_health.log_native_fallback_engaged``,
+# keyed by ``_native_fallback_last_warn`` and bounded by
+# ``NATIVE_FALLBACK_WARN_INTERVAL_S``. Its production caller is the
+# ``/terminals/{id}/native-delivery`` probe. So M12 follows the mechanism to its
+# new home rather than dying with the sweep that used to drive it.
+#
+# ONE of the two arms survives here, and deliberately only one.
+# ``test_warn_once_then_suppressed_within_60s`` asserted "emit on transition, then
+# suppress inside the window" — exactly what
+# ``test_f747_native_default.test_engagement_warn_is_rate_limited`` already
+# asserts against the surviving function, and keeping a second copy of it would be
+# the duplicate this file's mutant-kill framing has no use for. What that arm does
+# NOT cover is the other direction, and it is the direction M12's mutant lives in:
+# an "emit once per terminal, ever" mutant passes a suppression-only test and
+# fails this one.
 
 
-class TestM12Gate5WarnRateLimit:
-    """M12: native_fallback_engaged WARN is emitted on transition then
-    suppressed inside 60s. An every-tick mutant (no rate-limit) fails.
+class TestM12WarnRateLimit:
+    """M12: the engagement WARN re-emits once the 60s window expires.
+
+    The paired direction (emit on transition, suppress inside the window) is
+    owned by ``test_f747_native_default.test_engagement_warn_is_rate_limited``.
+    Together they pin a RATE LIMIT rather than a one-shot latch.
     """
 
-    def test_warn_once_then_suppressed_within_60s(self, real_sqlite_env, monkeypatch):
-        """Drive reconcile_pull_mode_notifications across 3 ticks with an
-        unregistered supervisor. Assert 1 WARN (transition) then suppression.
-        Uses a fake time.monotonic to control the clock.
-        """
-        env = real_sqlite_env
-        TestSession = env["TestSession"]
+    def test_warn_re_emits_after_the_window(self, monkeypatch):
+        """MUTANT: a latch that never re-emits survives a suppression-only test."""
+        from cli_agent_orchestrator.services import native_delivery_health as ndh
 
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel,
-            MailboxModel,
-            TerminalModel,
-        )
-
-        now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=120)
-
-        with TestSession.begin() as db:
-            terminal = TerminalModel(
-                id="unreg_sup",
-                tmux_session="test-sess",
-                tmux_window="win-unreg",
-                provider="kiro_cli",
-                agent_profile="developer",
-                lifecycle="sticky",
-                init_state="ready",
-                lifecycle_generation=1,
-                metadata_json="{}",  # NO cc_team_inbox_path → unregistered
-            )
-            db.add(terminal)
-
-            mailbox = MailboxModel(
-                id="mb_unreg",
-                session_name="test-sess",
-                role="supervisor",
-                current_terminal_id="unreg_sup",
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-            )
-            db.add(mailbox)
-
-            inbox_msg = InboxModel(
-                sender_id="worker01",
-                receiver_id="unreg_sup",
-                logical_receiver_id="mb_unreg",
-                message="pending task result",
-                orchestration_type="send_message",
-                status="pending",
-                created_at=old,
-            )
-            db.add(inbox_msg)
-
-        # Patch: pull-mode on, supervisor is pull-mode, teammate_push returns False (unregistered)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(
-                lambda key, default=None, override=None: {
-                    "supervisor.mailbox_pull": True,
-                    "supervisor.teammate_push": True,
-                }.get(key, default)
-            ),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-            lambda tid: tid == "unreg_sup",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-            lambda tid: False,  # Unregistered
-        )
-
-        # Fake clock: starts at 1000.0, can be advanced
-        fake_time = [1000.0]
-
-        from cli_agent_orchestrator.services import inbox_service as _is_mod
-
-        # WP-ARCH 3c K2: the fx158 gate-5 rate-limit dict is deleted with the
-        # pull-mode reconciler that was its only writer, so there is no
-        # pre-existing state to clear here.
-
-        monkeypatch.setattr(time, "monotonic", lambda: fake_time[0])
-
-        # Patch list_pending helpers to prevent other code paths
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_with_terminal", lambda: [])
-
-        # Capture log warnings
-        warn_calls: list[str] = []
-        original_warning = _is_mod.logger.warning
-
-        def capture_warning(msg, *args):
-            formatted = msg % args if args else msg
-            warn_calls.append(formatted)
-
-        monkeypatch.setattr(_is_mod.logger, "warning", capture_warning)
-
-        from cli_agent_orchestrator.services.inbox_service import InboxService
-
-        monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
-
-        svc = InboxService()
-
-        # Tick 1: first observation → should WARN (transition)
-        svc.reconcile_pull_mode_notifications()
-        tick1_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert (
-            len(tick1_warns) == 1
-        ), f"Tick 1: expected 1 WARN, got {len(tick1_warns)}: {tick1_warns}"
-
-        # Tick 2: +30s (within 60s window) → suppressed
-        fake_time[0] = 1030.0
-        warn_calls.clear()
-        svc.reconcile_pull_mode_notifications()
-        tick2_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert len(tick2_warns) == 0, (
-            f"Tick 2 (+30s): expected 0 WARN (suppressed within 60s), got {len(tick2_warns)}. "
-            "M12 mutant (every-tick emit) would emit here."
-        )
-
-        # Tick 3: +59s (still within 60s window) → suppressed
-        fake_time[0] = 1059.0
-        warn_calls.clear()
-        svc.reconcile_pull_mode_notifications()
-        tick3_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert (
-            len(tick3_warns) == 0
-        ), f"Tick 3 (+59s): expected 0 WARN (suppressed), got {len(tick3_warns)}"
-
-    def test_warn_re_emits_after_60s(self, real_sqlite_env, monkeypatch):
-        """After 60s elapse, the WARN is emitted again (rate-limit window expired)."""
-        env = real_sqlite_env
-        TestSession = env["TestSession"]
-
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel,
-            MailboxModel,
-            TerminalModel,
-        )
-
-        now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=120)
-
-        with TestSession.begin() as db:
-            terminal = TerminalModel(
-                id="unreg_s2",
-                tmux_session="test-sess",
-                tmux_window="win-unreg2",
-                provider="kiro_cli",
-                agent_profile="developer",
-                lifecycle="sticky",
-                init_state="ready",
-                lifecycle_generation=1,
-                metadata_json="{}",
-            )
-            db.add(terminal)
-
-            mailbox = MailboxModel(
-                id="mb_unreg2",
-                session_name="test-sess",
-                role="supervisor",
-                current_terminal_id="unreg_s2",
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-            )
-            db.add(mailbox)
-
-            inbox_msg = InboxModel(
-                sender_id="worker02",
-                receiver_id="unreg_s2",
-                logical_receiver_id="mb_unreg2",
-                message="pending msg",
-                orchestration_type="send_message",
-                status="pending",
-                created_at=old,
-            )
-            db.add(inbox_msg)
-
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(
-                lambda key, default=None, override=None: {
-                    "supervisor.mailbox_pull": True,
-                }.get(key, default)
-            ),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-            lambda tid: tid == "unreg_s2",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-            lambda tid: False,
-        )
+        ndh._native_fallback_last_warn.clear()
 
         fake_time = [2000.0]
-
-        from cli_agent_orchestrator.services import inbox_service as _is_mod
-
-        _is_mod._fx158_gate5_last_warn.clear()
-
-        monkeypatch.setattr(time, "monotonic", lambda: fake_time[0])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_with_terminal", lambda: [])
+        monkeypatch.setattr(ndh.time, "monotonic", lambda: fake_time[0])
 
         warn_calls: list[str] = []
 
         def capture_warning(msg, *args):
-            formatted = msg % args if args else msg
-            warn_calls.append(formatted)
+            warn_calls.append(msg % args if args else msg)
 
-        monkeypatch.setattr(_is_mod.logger, "warning", capture_warning)
+        monkeypatch.setattr(ndh.logger, "warning", capture_warning)
 
-        from cli_agent_orchestrator.services.inbox_service import InboxService
+        # Transition: the WARN is emitted.
+        assert ndh.log_native_fallback_engaged("unreg_sup", "no_inbox_path") is True
 
-        monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
+        # Inside the window: suppressed, and nothing reached the logger.
+        fake_time[0] = 2000.0 + ndh.NATIVE_FALLBACK_WARN_INTERVAL_S - 1.0
+        assert ndh.log_native_fallback_engaged("unreg_sup", "no_inbox_path") is False
+        assert len(warn_calls) == 1, warn_calls
 
-        svc = InboxService()
-
-        # Tick 1: transition WARN
-        svc.reconcile_pull_mode_notifications()
-        assert any("native_fallback_engaged" in w for w in warn_calls)
-
-        # Tick 2: +61s → re-emit (window expired)
-        fake_time[0] = 2061.0
-        warn_calls.clear()
-        svc.reconcile_pull_mode_notifications()
-        tick2_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert (
-            len(tick2_warns) == 1
-        ), f"After 61s: expected WARN re-emission, got {len(tick2_warns)}"
+        # Past the window: re-emitted. A one-shot latch fails HERE.
+        fake_time[0] = 2000.0 + ndh.NATIVE_FALLBACK_WARN_INTERVAL_S + 1.0
+        assert ndh.log_native_fallback_engaged("unreg_sup", "no_inbox_path") is True
+        reemits = [w for w in warn_calls if "native_fallback_engaged" in w]
+        assert len(reemits) == 2, f"expected a re-emission past the window, got {warn_calls}"
+        assert "terminal=unreg_sup" in reemits[1]
+        assert "reason=no_inbox_path" in reemits[1]

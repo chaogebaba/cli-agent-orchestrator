@@ -244,12 +244,25 @@ class TestAC3BuildAuthFrame:
 
 
 # ===========================================================================
-# AC4: _attempt_native_ring passes auth_token
+# AC4: the seat carrier passes auth_token
 # ===========================================================================
+#
+# WP-ARCH 3c K3: these two arms drove ``doorbell_service._attempt_native_ring``.
+# That function is deleted; ``queue_carrier.NativeSeatCarrier.emit`` is the
+# seat's only native emitter now and takes the same four steps through the same
+# ``cc_session_registry`` helpers, ``read_peer_token`` included. So the arms are
+# re-pointed rather than dropped — the handshake they pin is the transport's,
+# not the doorbell's, and nothing else in the suite drives it end to end
+# (``test/app/delivery/test_seat_wake.py`` stubs the carrier out).
+#
+# One assertion changed with the owner: the carrier's envelope is keyed ``v``
+# where the doorbell's ``build_wake_payload`` used ``msgV``, because A1.1 keys
+# the digest by receiver/epoch/ordinal instead of by an inbox row. The auth
+# frame — the actual subject — is byte-identical either way.
 
 
 class TestAC4NativeRingPassesAuth:
-    """_attempt_native_ring reads the key file and passes token to write_to_socket."""
+    """The carrier reads the key file and passes the token to write_to_socket."""
 
     def test_native_ring_passes_token(self, sessions_dir, socket_stub, tmp_path):
         """Full flow: resolve → read key → write with auth."""
@@ -300,7 +313,7 @@ class TestAC4NativeRingPassesAuth:
 
         with (
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
                 return_value={
                     "tmux_session": "cao-test",
                     "tmux_window": "test-win",
@@ -323,11 +336,17 @@ class TestAC4NativeRingPassesAuth:
                 return_value=sessions_dir,
             ),
         ):
-            from cli_agent_orchestrator.services.doorbell_service import _attempt_native_ring
+            from cli_agent_orchestrator.services.queue_carrier import NativeSeatCarrier
 
-            result = _attempt_native_ring("test-terminal-id", 42)
+            emission = NativeSeatCarrier().emit(
+                terminal_id="test-terminal-id",
+                line="wake",
+                sender_key="w1",
+                sender_name="worker-1",
+                msg_id="msg-ac4-token",
+            )
 
-        assert result == "rang"
+        assert emission.reason is None
         # Verify auth frame was sent
         lines = socket_stub.lines
         assert len(lines) == 2
@@ -376,7 +395,7 @@ class TestAC4NativeRingPassesAuth:
 
         with (
             patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
                 return_value={
                     "tmux_session": "cao-test",
                     "tmux_window": "test-win",
@@ -399,103 +418,86 @@ class TestAC4NativeRingPassesAuth:
                 return_value=sessions_dir,
             ),
         ):
-            from cli_agent_orchestrator.services.doorbell_service import _attempt_native_ring
+            from cli_agent_orchestrator.services.queue_carrier import NativeSeatCarrier
 
-            result = _attempt_native_ring("test-terminal-id", 42)
+            emission = NativeSeatCarrier().emit(
+                terminal_id="test-terminal-id",
+                line="wake",
+                sender_key="w1",
+                sender_name="worker-1",
+                msg_id="msg-ac4-nokey",
+            )
 
-        assert result == "rang"
+        assert emission.reason is None
         # Only one line (payload, no auth frame)
         lines = socket_stub.lines
         assert len(lines) == 1
         msg = json.loads(lines[0])
-        assert msg["msgV"] == 1
+        assert msg["v"] == 1
 
 
 # ===========================================================================
-# AC5: wake.native=false gates terminal_service cc_team_inbox_path
+# AC5: terminal_service derives cc_team_inbox_path for every claude_code seat
 # ===========================================================================
+#
+# WP-ARCH 3c: AC5 was a two-arm CONTRAST — the same call with
+# ``supervisor.wake.native`` False and then True — because the F337 gate made
+# the derivation conditional on it. F747 (#747) had already inverted the False
+# arm: gating the METADATA on the push flag left a seat born flag-off
+# permanently unreachable, so the path is derived unconditionally and the flags
+# decide only whether we push. 3c then deletes the flag outright, which leaves
+# the two arms identical inputs to an unconditional helper.
+#
+# So the contrast collapses to the single arm below. It keeps what F747 made
+# the real claim — ``_maybe_derive_cc_team_inbox_path`` derives for a
+# claude_code terminal, full stop — and it is re-pointed at
+# ``native_delivery_health.derive_cc_team_inbox_path``, which is where K2 moved
+# the deriving helper when ``teammate_push_service`` was deleted (it lost its
+# leading underscore in the move; the function is otherwise unchanged).
 
 
-class TestAC5WakeNativeGateTerminalService:
+class TestAC5DeriveCcTeamInboxPath:
     """S2 r4: exercises the REAL production helper _maybe_derive_cc_team_inbox_path
-    from terminal_service.py.
+    from terminal_service.py."""
 
-    F747 (#747) SUPERSEDES the AC5 gate. The derivation is now unconditional for
-    a claude_code terminal: the flags decide whether we PUSH, the metadata only
-    records WHERE a push would go. Gating the metadata on the flag is what made a
-    seat born flag-off permanently unreachable by native delivery, so the former
-    "not derived when native disabled" assertion is inverted below.
-    """
-
-    def test_inbox_path_derived_even_when_native_disabled(self, monkeypatch):
-        """F747: wake.native=false no longer suppresses the derivation."""
+    def test_inbox_path_derived_for_claude_code(self, monkeypatch):
+        """F747: the derivation is unconditional for a claude_code terminal."""
         from unittest.mock import MagicMock
 
-        from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.terminal_service import (
             _maybe_derive_cc_team_inbox_path,
         )
 
         mock_derive = MagicMock(return_value=Path("/fake/inbox"))
-
-        config_values = {
-            "supervisor.teammate_push": True,
-            "supervisor.wake.native": False,
-        }
-
-        @staticmethod
-        def mock_get(key, default=None, **_kw):
-            if key in config_values:
-                return config_values[key]
-            return default
-
-        monkeypatch.setattr(ConfigService, "get", mock_get)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._derive_cc_team_inbox_path",
+            "cli_agent_orchestrator.services.native_delivery_health.derive_cc_team_inbox_path",
             mock_derive,
         )
 
         # Call the PRODUCTION gate helper
         result = _maybe_derive_cc_team_inbox_path("claude_code", None, "/tmp")
 
-        # F747: derivation is unconditional for claude_code.
         mock_derive.assert_called_once()
         assert result == {"cc_team_inbox_path": "/fake/inbox"}
 
-    def test_inbox_path_derived_when_native_enabled(self, monkeypatch):
-        """Production helper: wake.native=true → _derive IS called."""
+    def test_non_claude_code_provider_is_left_alone(self, monkeypatch):
+        """The negative control: only claude_code publishes a native inbox path."""
         from unittest.mock import MagicMock
 
-        from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.terminal_service import (
             _maybe_derive_cc_team_inbox_path,
         )
 
         mock_derive = MagicMock(return_value=Path("/fake/inbox"))
-
-        config_values = {
-            "supervisor.teammate_push": True,
-            "supervisor.wake.native": True,
-        }
-
-        @staticmethod
-        def mock_get(key, default=None, **_kw):
-            if key in config_values:
-                return config_values[key]
-            return default
-
-        monkeypatch.setattr(ConfigService, "get", mock_get)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._derive_cc_team_inbox_path",
+            "cli_agent_orchestrator.services.native_delivery_health.derive_cc_team_inbox_path",
             mock_derive,
         )
 
-        # Call the PRODUCTION gate helper
-        result = _maybe_derive_cc_team_inbox_path("claude_code", None, "/tmp")
+        result = _maybe_derive_cc_team_inbox_path("codex", None, "/tmp")
 
-        # Gate must allow derivation when native=True
-        mock_derive.assert_called_once()
-        assert result == {"cc_team_inbox_path": "/fake/inbox"}
+        mock_derive.assert_not_called()
+        assert result is None
 
 
 # ===========================================================================
@@ -503,127 +505,32 @@ class TestAC5WakeNativeGateTerminalService:
 # ===========================================================================
 
 
-class TestF337R2DefaultDark:
-    """B1's shape, re-aimed by WP-ARCH 3b / A1.5: the default is now True.
-
-    F337 B1 shipped ``supervisor.wake.native`` DARK, and these tests were the
-    regression that held it there. The amendment flips it, and the reason is
-    that removing the seat's composer paste from every switch position is only
-    half the job: with the paste role-gated away and this default False, the
-    seat would be NEITHER pasted NOR woken under ``off``, ``shadow`` and
-    ``drain`` — which is #604, not a fix. A paste is an ugly carrier; silence is
-    the bug the phase exists to remove.
-
-    What B1's regression was really protecting — that the gate is READ from one
-    canonical constant, and that every call site obeys it rather than deciding
-    for itself — is preserved: the tests below still drive the constant through
-    the gates, and now assert the native path IS taken. A test that pinned the
-    VALUE alone would have been a test of a decision rather than of a mechanism.
-    """
-
-    def test_absent_setting_doorbell_service_takes_the_native_path(self):
-        """With no setting, ring_supervisor_doorbell takes the NATIVE path (A1.5)."""
-        from unittest.mock import MagicMock, patch
-
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-
-        assert WAKE_NATIVE_DEFAULT is True, "A1.5: the canonical default is True from 3b"
-
-        # Simulate ConfigService returning the canonical default for wake.native,
-        # and True for supervisor.doorbell (so it doesn't bail out early).
-        mock_attempt_native_ring = MagicMock()
-
-        def config_side_effect(key, default=None):
-            if key == "supervisor.wake.native":
-                return WAKE_NATIVE_DEFAULT
-            if key == "supervisor.doorbell":
-                return True
-            return default
-
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.ConfigService.get",
-                side_effect=config_side_effect,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                mock_attempt_native_ring,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._is_row_still_pending",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=False,
-            ),
-        ):
-            from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-            result = ring_supervisor_doorbell("term-1", 1, written_count=1)
-        # The native ring IS the carrier now, and it is the only one: the pane
-        # fallback below it stays unreachable because supervisor.teammate_push
-        # remains False, which is what A1.5 keeps it for.
-        # The CALL is the assertion. What the ring then returns is decided by
-        # the mock, and the fallback below it stays unreachable regardless
-        # because supervisor.teammate_push remains False — which is exactly what
-        # A1.5 keeps that flag for.
-        mock_attempt_native_ring.assert_called_once()
-        assert result != ""
-
-    def test_absent_setting_delivery_service_attempts_native(self, tmp_path):
-        """With no setting, rung1 no longer declines on the flag (A1.5).
-
-        It may still defer for its own reasons — an unresolvable target, a
-        socket that is not there — and that is the point: the decision moves
-        from a config value to the carrier's own typed answer.
-        """
-        from unittest.mock import patch
-
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-        from cli_agent_orchestrator.services.delivery_service import (
-            DeliveryTarget,
-            attempt_rung1,
-        )
-
-        # cc_inbox_path must have an existing parent dir to pass the path_usable check
-        inbox_path = str(tmp_path / "inbox")
-        target = DeliveryTarget(
-            terminal_id="t1",
-            tmux_session="s",
-            tmux_window="w",
-            cc_inbox_path=inbox_path,
-            has_registry=True,
-            liveness="presumed_live",
-        )
-
-        with patch(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            return_value=WAKE_NATIVE_DEFAULT,
-        ):
-            result = attempt_rung1(target, 99)
-        assert result.decision != "skipped_disabled"
-
-    def test_the_registry_and_the_canonical_constant_agree(self):
-        """The property B1 was really defending: ONE spelling of the default.
-
-        The value is duplicated because the config registry dict is evaluated at
-        import time, before service imports resolve. A duplicated default that
-        can drift is how a flag comes to mean two things, so this asserts the
-        two agree rather than asserting either one's value in isolation.
-        """
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-        from cli_agent_orchestrator.services.config_service import ENV_REGISTRY
-
-        entry = ENV_REGISTRY["CAO_SUPERVISOR_WAKE_NATIVE"]
-        # entry = (key_path, type, default)
-        assert entry[2] is WAKE_NATIVE_DEFAULT
-
-    def test_the_shipped_default_is_true_from_sub_phase_3b(self):
-        """A1.5, stated once so a reader finds the decision from the test."""
-        from cli_agent_orchestrator.services.cc_session_registry import WAKE_NATIVE_DEFAULT
-
-        assert WAKE_NATIVE_DEFAULT is True
+# WP-ARCH 3c K3/K7 + flag deletion: ``TestF337R2DefaultDark`` stood here with
+# four arms over ``supervisor.wake.native``.
+#
+# Its history is the point. F337 B1 shipped the flag DARK and these arms were
+# the regression that held it there; WP-ARCH 3b/A1.5 flipped the default to True
+# and re-aimed them at the MECHANISM instead of the value — that the gate is
+# read from one canonical constant and that every call site obeys it rather than
+# deciding for itself. Two arms drove that through the two call sites
+# (``doorbell_service.ring_supervisor_doorbell`` and
+# ``delivery_service.attempt_rung1``), a third pinned that
+# ``ENV_REGISTRY["CAO_SUPERVISOR_WAKE_NATIVE"]`` and
+# ``cc_session_registry.WAKE_NATIVE_DEFAULT`` carry the same value so the
+# duplicated default cannot drift, and the fourth restated the shipped value.
+#
+# 3c deletes the flag, both of its call sites and its registry entry. A gate
+# obeyed by every call site has no call sites left; a default that cannot drift
+# from a registry entry has no entry to drift from. ``WAKE_NATIVE_DEFAULT``
+# itself is retained in ``cc_session_registry``, but the comment above it says
+# plainly that nothing reads it — it is a note to an operator holding an old
+# settings.json, and asserting the value of a note is not a test.
+#
+# What the arms were ultimately defending — that the seat is never left with no
+# carrier at all — is now structural rather than configured, and
+# ``test_3c_slice3_surfaces_gone.py`` holds it: it asserts the four flags are
+# unresolvable AND names two wake keys that must still resolve, so the absence
+# is proved against a live control rather than against itself.
 
 
 class TestF337R2ProcStartBinding:

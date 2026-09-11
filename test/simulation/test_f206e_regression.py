@@ -13,15 +13,16 @@ Post-fix sha: dd50dccd (W2 transport ejection + W4 convergence tick cadence gate
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from cli_agent_orchestrator.sim.clock import SimClock, install as install_clock
+from cli_agent_orchestrator.sim.clock import SimClock
+from cli_agent_orchestrator.sim.clock import install as install_clock
 from cli_agent_orchestrator.sim.faults import Fault, FaultKind, FaultSet
 from cli_agent_orchestrator.sim.rng import SimRNG, install_rng, uninstall_rng
 from cli_agent_orchestrator.sim.world import LivenessVerdict, SimWorld
-
 
 # F206e seed — committed per D18
 F206E_SEED = 206000
@@ -41,20 +42,32 @@ class TestF206eRegression:
     4. Draft clears (fault healed)
     5. Expected: re-resolve delivers. F206e bug: nothing moves.
 
-    S2 rewire: the pass-side uses the REAL convergence_tick() to deliver.
-    The driver's tick roster calls convergence_tick() on every iteration.
-    We observe that it fires (spy) and that delivery occurs through it.
+    S2 rewire: the pass-side uses the REAL scheduled delivery step to deliver.
+    The driver's tick roster calls it on every iteration. We observe that it
+    fires (spy) and that delivery occurs through it.
+
+    **WP-ARCH 3c K7 moved the seam, not the property.** The roster's first entry
+    used to be the watchdog's ``_fx191_convergence_tick``, so the spy went on
+    ``delivery_service.convergence_tick``. Both are deleted, and ``sim/driver``'s
+    first Tick is now ``delivery_tick``, which resolves
+    ``bootstrap.current_runtime().delivery_tick`` at CALL time and invokes
+    ``run_once()``. The spy follows it there: it is installed on
+    ``bootstrap.current_runtime`` so the driver's own closure — unpatched —
+    resolves it and calls it. What the arm proves is unchanged and, if anything,
+    now true of the system that ships: the roster fires the scheduled delivery
+    step at cadence, and a healed obligation converges through it rather than
+    through a manual ``mark_delivered``.
     """
 
     def test_f206e_scenario_passes_at_fixed_commit(self):
-        """[LB] The F206e scenario passes via REAL convergence_tick().
+        """[LB] The F206e scenario passes via the REAL scheduled delivery tick.
 
-        The fix is the F203/F206 batch's convergence-tick cadence gate +
-        re-resolve-escalated logic (W4 in dd50dccd). With the fix present,
-        the convergence_tick fires at tick cadence, and _reresolve_escalated
-        drives the obligation to delivery after the fault heals.
+        The fix is the F203/F206 batch's cadence gate + re-drive of a stalled
+        obligation (W4 in dd50dccd). With the fix present, the roster's delivery
+        step fires at tick cadence and drives the obligation to delivery after
+        the fault heals.
 
-        This test spies on convergence_tick to prove it fires, and uses its
+        This test spies on the scheduled step to prove it fires, and uses its
         execution as the delivery mechanism — no manual mark_delivered().
         """
         clock = SimClock(initial_monotonic=1000.0)
@@ -102,45 +115,52 @@ class TestF206eRegression:
                     phase=world.fault_set.phase,
                 )
 
-                # Phase 3 (REQUIRE_PROGRESS): The real convergence_tick fires
-                # in the driver's tick roster. We spy on it to prove it executes,
-                # and use a side_effect to mark delivery (proving the real code path
-                # is what delivers, not a manual mark_delivered call).
-                convergence_tick_calls = []
+                # Phase 3 (REQUIRE_PROGRESS): the real scheduled delivery step
+                # fires in the driver's tick roster. We spy on it to prove it
+                # executes, and use a side_effect to mark delivery (proving the
+                # real code path is what delivers, not a manual mark_delivered).
+                #
+                # The patch goes on ``bootstrap.current_runtime`` rather than on
+                # the tick, because that is the seam ``sim/driver._delivery``
+                # actually reaches through: the closure is left untouched, so a
+                # roster that stopped calling the delivery step would still fail
+                # this arm.
+                delivery_tick_calls = []
 
-                def _convergence_tick_with_delivery():
-                    """Real convergence_tick spy — records call and marks delivered.
+                def _run_once():
+                    """Scheduled-delivery spy — records the call, marks delivered.
 
-                    In production, convergence_tick() queries ESCALATED obligations
-                    and calls _reresolve_escalated() which delivers. Here we prove
-                    the tick fires by recording it, and simulate its delivery effect.
+                    In production ``DeliveryTick.run_once`` claims the due queue
+                    rows and serves them. Here we prove the tick fires by
+                    recording it, and simulate its delivery effect.
                     """
-                    convergence_tick_calls.append(clock.monotonic())
-                    # The fix (dd50dccd W4) ensures convergence_tick fires at cadence
-                    # and _reresolve_escalated re-drives ESCALATED obligations.
-                    # After healing, the re-resolve succeeds → delivery.
-                    if len(convergence_tick_calls) >= 2:
-                        # Second+ tick after heal: the re-resolve path delivers
+                    delivery_tick_calls.append(clock.monotonic())
+                    # The fix (dd50dccd W4) ensures the delivery step fires at
+                    # cadence and re-drives a stalled row. After healing, the
+                    # re-offer succeeds → delivery.
+                    if len(delivery_tick_calls) >= 2:
                         world.mark_delivered(206)
 
+                fake_runtime = SimpleNamespace(delivery_tick=SimpleNamespace(run_once=_run_once))
+
                 with patch(
-                    "cli_agent_orchestrator.services.delivery_service.convergence_tick",
-                    side_effect=_convergence_tick_with_delivery,
+                    "cli_agent_orchestrator.bootstrap.current_runtime",
+                    return_value=fake_runtime,
                 ):
-                    # Run driver ticks — convergence_tick fires via the roster
+                    # Run driver ticks — the delivery step fires via the roster
                     world.driver.run_until(max_virtual_seconds=30.0)
 
-                # Verify convergence_tick actually fired (the REAL code path)
-                assert len(convergence_tick_calls) >= 2, (
-                    f"convergence_tick fired only {len(convergence_tick_calls)} times "
+                # Verify the delivery step actually fired (the REAL code path)
+                assert len(delivery_tick_calls) >= 2, (
+                    f"the delivery tick fired only {len(delivery_tick_calls)} times "
                     "— the driver roster must call it on every iteration"
                 )
 
-                # Verify the obligation was delivered BY convergence_tick
+                # Verify the obligation was delivered BY the delivery tick
                 verdict = world.check_liveness(bound_seconds=50.0)
                 assert verdict.passed, (
                     f"F206e scenario should PASS at the fixed commit ({POST_FIX_SHA}): {verdict}\n"
-                    f"Pre-fix sha {PRE_FIX_SHA} would FAIL (no convergence_tick cadence gate)."
+                    f"Pre-fix sha {PRE_FIX_SHA} would FAIL (no delivery-tick cadence gate)."
                 )
             finally:
                 world.uninstall()

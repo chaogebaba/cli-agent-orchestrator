@@ -12,13 +12,11 @@ F166-F1: Permanently-unprovable scans fast-track to attention_required on first
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # F165-F1: D9 surfaces programming errors (real ORM detachment, no mock)
@@ -26,286 +24,31 @@ import pytest
 
 
 @pytest.mark.xdist_group("real_sqlite")
-class TestF165F1D9ProgrammingErrorSurface:
-    """Prove that D9 records a durable 'programming_error' attempt row when a
-    non-transient exception (e.g., DetachedInstanceError) hits the reconciler.
-
-    The test induces a REAL DetachedInstanceError by detaching ORM instances from
-    their session, then driving the reconciler. No ORM seam mocking.
-    """
-
-    def test_detached_instance_error_produces_durable_attempt_row(
-        self, real_sqlite_env, monkeypatch
-    ):
-        """F165-F1 AC: DetachedInstanceError on reconciler loop writes a
-        'programming_error' delivery attempt row instead of silently swallowing.
-
-        Regression: reverting the F165-F1 fix makes D9 only log.exception(),
-        producing zero attempt rows → assertion fails.
-        """
-        env = real_sqlite_env
-        TestSession = env["TestSession"]
-        tmp_path = env["tmp_path"]
-
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel,
-            MailboxModel,
-            TerminalModel,
-        )
-
-        now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=120)
-        inbox_path = tmp_path / "inbox.json"
-
-        with TestSession.begin() as db:
-            terminal = TerminalModel(
-                id="sup_f1_1",
-                tmux_session="test-sess",
-                tmux_window="win-sup",
-                provider="kiro_cli",
-                agent_profile="developer",
-                lifecycle="sticky",
-                init_state="ready",
-                lifecycle_generation=1,
-                metadata_json=json.dumps({"cc_team_inbox_path": str(inbox_path)}),
-            )
-            db.add(terminal)
-
-            mailbox = MailboxModel(
-                id="mb_f165f1",
-                session_name="test-sess",
-                role="supervisor",
-                current_terminal_id="sup_f1_1",
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-            )
-            db.add(mailbox)
-
-            inbox_msg = InboxModel(
-                sender_id="worker01",
-                receiver_id="sup_f1_1",
-                logical_receiver_id="mb_f165f1",
-                message="task result",
-                orchestration_type="send_message",
-                status="pending",
-                created_at=old,
-            )
-            db.add(inbox_msg)
-
-        # Enable pull-mode
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-                "supervisor.teammate_push": True,
-                "supervisor.wake.native": True,
-            }.get(key, default)),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-            lambda tid: tid == "sup_f1_1",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-            lambda tid: True,
-        )
-
-        # Induce a REAL DetachedInstanceError: patch the push function to
-        # access a deferred attribute on a detached ORM row.
-        # We inject a function that queries a row, closes its session, then
-        # accesses a deferred column — reproducing the original F165 bug.
-        def _induce_detached_error(terminal_id, messages):
-            """Trigger a real DetachedInstanceError by accessing a deferred
-            attribute on a row whose session is closed."""
-            from sqlalchemy.orm import Session
-
-            with TestSession() as db:
-                row = db.query(InboxModel).filter_by(receiver_id="sup_f1_1").first()
-            # Session is now closed. Accessing a deferred column raises
-            # DetachedInstanceError (the EXACT original F165 bug mechanism).
-            _ = row.logical_receiver_id  # noqa: F841
-            raise AssertionError("Should have raised DetachedInstanceError")
-
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push_reported",
-            _induce_detached_error,
-        )
-
-        # Bypass other reconcile sub-paths
-        from cli_agent_orchestrator.services import inbox_service as _is_mod
-        from cli_agent_orchestrator.services.inbox_service import InboxService
-
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_with_terminal", lambda: [])
-        monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
-
-        # Also patch resolve inbox path so the pre-push code proceeds
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._resolve_inbox_path",
-            lambda tid: inbox_path if tid == "sup_f1_1" else None,
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
-            lambda tid: None,
-        )
-
-        # Run the reconciler — should NOT crash (D9 isolation), but should
-        # record the error durably.
-        svc = InboxService()
-        svc.reconcile_orphaned_messages()
-
-        # --- ASSERTIONS ---
-        # 1. No crash (we got here)
-        # 2. A 'programming_error' attempt row was written
-        from cli_agent_orchestrator.clients.database import InboxDeliveryAttemptModel
-
-        with TestSession() as db:
-            error_attempts = (
-                db.query(InboxDeliveryAttemptModel)
-                .filter_by(
-                    receiver_terminal_id="sup_f1_1",
-                    provider="reconciler",
-                    outcome="programming_error",
-                )
-                .all()
-            )
-            assert len(error_attempts) == 1, (
-                f"Expected 1 programming_error attempt row, got {len(error_attempts)}. "
-                "D9 likely swallowed the error silently (F165-F1 fix reverted?)."
-            )
-            attempt = error_attempts[0]
-            assert "DetachedInstanceError" in (attempt.reason or ""), (
-                f"Expected DetachedInstanceError in reason, got: {attempt.reason}"
-            )
-
-    @pytest.mark.parametrize("error_factory,label", [
-        (lambda: OSError("Connection reset by peer"), "OSError"),
-        (lambda: __import__("sqlalchemy.exc", fromlist=["InterfaceError"]).InterfaceError(
-            "connection closed", None, None
-        ), "InterfaceError"),
-    ], ids=["OSError", "InterfaceError"])
-    def test_transient_error_does_not_record_programming_error(
-        self, real_sqlite_env, monkeypatch, error_factory, label
-    ):
-        """Transient errors (OSError, OperationalError, InterfaceError) do NOT
-        produce a programming_error row — D9 isolation still swallows them gracefully.
-
-        S1: InterfaceError (network dropout mid-query) was mislabelled as
-        programming_error before the fold."""
-        env = real_sqlite_env
-        TestSession = env["TestSession"]
-        tmp_path = env["tmp_path"]
-
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel,
-            MailboxModel,
-            TerminalModel,
-        )
-
-        now = datetime.now(timezone.utc)
-        old = now - timedelta(seconds=120)
-
-        with TestSession.begin() as db:
-            terminal = TerminalModel(
-                id="sup_f1_2",
-                tmux_session="test-sess",
-                tmux_window="win-sup2",
-                provider="kiro_cli",
-                agent_profile="developer",
-                lifecycle="sticky",
-                init_state="ready",
-                lifecycle_generation=1,
-                metadata_json="{}",
-            )
-            db.add(terminal)
-
-            mailbox = MailboxModel(
-                id="mb_f165f1t",
-                session_name="test-sess",
-                role="supervisor",
-                current_terminal_id="sup_f1_2",
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-            )
-            db.add(mailbox)
-
-            inbox_msg = InboxModel(
-                sender_id="worker02",
-                receiver_id="sup_f1_2",
-                logical_receiver_id="mb_f165f1t",
-                message="task result transient",
-                orchestration_type="send_message",
-                status="pending",
-                created_at=old,
-            )
-            db.add(inbox_msg)
-
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-                "supervisor.teammate_push": True,
-                "supervisor.wake.native": True,
-            }.get(key, default)),
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-            lambda tid: tid == "sup_f1_2",
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-            lambda tid: True,
-        )
-
-        # Inject a transient error (parametrized: OSError or InterfaceError)
-        def _raise_transient(terminal_id, messages):
-            raise error_factory()
-
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push_reported",
-            _raise_transient,
-        )
-
-        from cli_agent_orchestrator.services import inbox_service as _is_mod
-        from cli_agent_orchestrator.services.inbox_service import InboxService
-
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_older_than", lambda seconds: [])
-        monkeypatch.setattr(_is_mod, "list_pending_receiver_ids_with_terminal", lambda: [])
-        monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service._resolve_inbox_path",
-            lambda tid: None,
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
-            lambda tid: None,
-        )
-
-        svc = InboxService()
-        svc.reconcile_orphaned_messages()
-
-        # No programming_error row should exist
-        from cli_agent_orchestrator.clients.database import InboxDeliveryAttemptModel
-
-        with TestSession() as db:
-            error_attempts = (
-                db.query(InboxDeliveryAttemptModel)
-                .filter_by(
-                    receiver_terminal_id="sup_f1_2",
-                    provider="reconciler",
-                    outcome="programming_error",
-                )
-                .all()
-            )
-            assert len(error_attempts) == 0, (
-                f"Transient error should NOT produce programming_error row, got {len(error_attempts)}"
-            )
-
-
 # ---------------------------------------------------------------------------
-# F166-F1: permanently-unprovable scans fast-track to attention_required
+# WP-ARCH 3c K2: ``TestF165F1D9ProgrammingErrorSurface`` is GONE with its subject
+# ---------------------------------------------------------------------------
+# Its three arms all drove the SAME deleted loop. Each turned on
+# ``supervisor.mailbox_pull`` + ``supervisor.teammate_push``, replaced
+# ``teammate_push_service.attempt_teammate_push_reported`` with a raiser, ran
+# ``reconcile_orphaned_messages``, and asked what the D9 isolation recorded:
+#
+#   * a REAL ``DetachedInstanceError`` (the original F165 mechanism, reproduced by
+#     touching a deferred column on a detached row) must leave a durable
+#     ``outcome="programming_error"`` attempt row naming the exception;
+#   * ``OSError`` and ``sqlalchemy.exc.InterfaceError`` — both transient — must
+#     leave NO such row (S1: InterfaceError was mislabelled before the fold).
+#
+# K2 deletes ``teammate_push_service`` entirely, including
+# ``attempt_teammate_push_reported``, and with it
+# ``InboxService.reconcile_pull_mode_notifications`` — the loop whose except
+# clause classified those exceptions. The classification WAS the subject; there is
+# no surviving caller to re-point at, because the seat's carrier no longer runs
+# inside a reconciler sweep at all.
+#
+# ``TestF166F1PermanentFastTrack`` and ``TestF165F1FamilySweep`` below are
+# untouched: the permanent-vs-transient fast-track they pin lives on the
+# send/retry path, which 3c does not change.
+
 # ---------------------------------------------------------------------------
 
 
@@ -356,9 +99,7 @@ class TestF166F1PermanentFastTrack:
 
         return {"job_id": job_id, "inc_id": inc_id, "terminal_id": terminal_id}
 
-    def test_permanent_failure_fast_tracks_on_first_attempt(
-        self, real_sqlite_env, monkeypatch
-    ):
+    def test_permanent_failure_fast_tracks_on_first_attempt(self, real_sqlite_env, monkeypatch):
         """F166-F1 AC: a scan returning ONLY 'permission_denied_server_ancestor'
         errors fast-tracks to attention_required on attempt 1, not attempt 8.
 
@@ -387,15 +128,19 @@ class TestF166F1PermanentFastTrack:
             detail="permission_denied_server_ancestor:pid=1224",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
-            return_value=permanent_result,
-        ), patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-        ) as mock_notify:
+        with (
+            patch(
+                "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
+                return_value=permanent_result,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ) as mock_notify,
+        ):
             svc = OrphanReconcileService()
             loop = asyncio.new_event_loop()
             try:
@@ -416,9 +161,7 @@ class TestF166F1PermanentFastTrack:
         # Notification should have been sent
         assert mock_notify.call_count == 1
 
-    def test_multiple_permanent_errors_fast_track(
-        self, real_sqlite_env, monkeypatch
-    ):
+    def test_multiple_permanent_errors_fast_track(self, real_sqlite_env, monkeypatch):
         """Multiple permanent error prefixes in detail still fast-track."""
         env = real_sqlite_env
         TestSession = env["TestSession"]
@@ -442,14 +185,18 @@ class TestF166F1PermanentFastTrack:
             detail="permission_denied_server_ancestor:pid=1224; permission_denied_uid_unknown:pid=999",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
-            return_value=result,
-        ), patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
+                return_value=result,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ),
         ):
             svc = OrphanReconcileService()
             loop = asyncio.new_event_loop()
@@ -464,9 +211,7 @@ class TestF166F1PermanentFastTrack:
             job = db.query(OrphanReconcileJobModel).filter_by(id=seed["job_id"]).one()
             assert job.state == "attention_required"
 
-    def test_non_permanent_failure_still_retries(
-        self, real_sqlite_env, monkeypatch
-    ):
+    def test_non_permanent_failure_still_retries(self, real_sqlite_env, monkeypatch):
         """A scan_incomplete with non-permanent errors retries normally."""
         env = real_sqlite_env
         TestSession = env["TestSession"]
@@ -491,14 +236,18 @@ class TestF166F1PermanentFastTrack:
             detail="permission_denied_same_uid:pid=5678",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
-            return_value=result,
-        ), patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
+                return_value=result,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ),
         ):
             svc = OrphanReconcileService()
             loop = asyncio.new_event_loop()
@@ -511,13 +260,11 @@ class TestF166F1PermanentFastTrack:
 
         with TestSession() as db:
             job = db.query(OrphanReconcileJobModel).filter_by(id=seed["job_id"]).one()
-            assert job.state == "retry_wait", (
-                f"Expected retry_wait for non-permanent failure, got '{job.state}'"
-            )
+            assert (
+                job.state == "retry_wait"
+            ), f"Expected retry_wait for non-permanent failure, got '{job.state}'"
 
-    def test_mixed_permanent_and_transient_still_retries(
-        self, real_sqlite_env, monkeypatch
-    ):
+    def test_mixed_permanent_and_transient_still_retries(self, real_sqlite_env, monkeypatch):
         """A detail with BOTH permanent and non-permanent errors retries
         (only ALL-permanent triggers fast-track)."""
         env = real_sqlite_env
@@ -542,14 +289,18 @@ class TestF166F1PermanentFastTrack:
             detail="permission_denied_server_ancestor:pid=1224; permission_denied_same_uid:pid=4567",
         )
 
-        with patch(
-            "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
-            return_value=result,
-        ), patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor01",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.orphan_reconcile_service.run_reconciliation_attempt_sync",
+                return_value=result,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor01",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+            ),
         ):
             svc = OrphanReconcileService()
             loop = asyncio.new_event_loop()
@@ -562,9 +313,9 @@ class TestF166F1PermanentFastTrack:
 
         with TestSession() as db:
             job = db.query(OrphanReconcileJobModel).filter_by(id=seed["job_id"]).one()
-            assert job.state == "retry_wait", (
-                f"Mixed permanent+transient should retry, got '{job.state}'"
-            )
+            assert (
+                job.state == "retry_wait"
+            ), f"Mixed permanent+transient should retry, got '{job.state}'"
 
 
 # ---------------------------------------------------------------------------
@@ -584,9 +335,12 @@ class TestF165F1FamilySweep:
         # Permanent cases
         assert _is_permanent_failure("permission_denied_server_ancestor:pid=1224") is True
         assert _is_permanent_failure("permission_denied_uid_unknown:pid=999") is True
-        assert _is_permanent_failure(
-            "permission_denied_server_ancestor:pid=1224; permission_denied_uid_unknown:pid=2"
-        ) is True
+        assert (
+            _is_permanent_failure(
+                "permission_denied_server_ancestor:pid=1224; permission_denied_uid_unknown:pid=2"
+            )
+            is True
+        )
 
         # Non-permanent cases
         assert _is_permanent_failure("permission_denied_same_uid:pid=5678") is False
@@ -595,6 +349,9 @@ class TestF165F1FamilySweep:
         assert _is_permanent_failure(None) is False
 
         # Mixed (one permanent + one non-permanent) → not permanent
-        assert _is_permanent_failure(
-            "permission_denied_server_ancestor:pid=1; permission_denied_same_uid:pid=2"
-        ) is False
+        assert (
+            _is_permanent_failure(
+                "permission_denied_server_ancestor:pid=1; permission_denied_same_uid:pid=2"
+            )
+            is False
+        )

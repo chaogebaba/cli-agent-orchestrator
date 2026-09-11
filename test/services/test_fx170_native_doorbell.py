@@ -1,11 +1,16 @@
-"""FX170 — Native wake doorbell acceptance tests.
+"""FX170 — Native wake transport acceptance tests.
 
 V1: Unit tests per blueprint ACs (no CAO server, no tmux, no live CC).
 - AC2-AC4: Wire format / sanitization / no auth frame / no read
-- AC5-AC7: Target resolution (descendant tree, procStart, ambiguity, no teammate_push gate)
+- AC5/AC6: Target resolution (descendant tree, procStart, ambiguity)
 - AC10: Wake verification
-- AC11-AC13: Version guard + fallback fan-in + socket errors
-- AC14-AC15: Dedup + config matrix
+- AC11/AC13: Version guard + socket errors
+
+The surviving arms all drive ``services/cc_session_registry`` — the registry
+reader, the resolver and the socket sink — which WP-ARCH 3c keeps: the phase
+changes the CARRIER of the seat's wake, not its transport. The arms that drove
+``doorbell_service`` (AC7, AC12, AC14, AC15) are deleted with it; each has a
+block below saying what it asserted and where the concern went.
 """
 
 from __future__ import annotations
@@ -13,15 +18,13 @@ from __future__ import annotations
 import json
 import os
 import socketserver
-import struct
 import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -160,16 +163,6 @@ def socket_stub():
     stub.start()
     yield stub
     stub.stop()
-
-
-@pytest.fixture(autouse=True)
-def _reset_doorbell_state():
-    """Reset doorbell module state between tests."""
-    import cli_agent_orchestrator.services.doorbell_service as ds
-
-    ds._last_warn_time.clear()
-    yield
-    ds._last_warn_time.clear()
 
 
 # ===========================================================================
@@ -782,43 +775,17 @@ class TestF545FirstPaneResolution:
 
 
 # ===========================================================================
-# AC7: Native ring does NOT gate on cc_team_inbox_path or _should_teammate_push
+# AC7 — WP-ARCH 3c K3: deleted with the ring it was about
 # ===========================================================================
-
-
-class TestAC7NativeRingIndependentOfTeammatePush:
-    """The native ring path succeeds without cc_team_inbox_path or teammate_push."""
-
-    def test_native_ring_succeeds_without_teammate_push(self):
-        """Resolution works with _should_teammate_push=False and no cc_team_inbox_path."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ) as mock_native,
-        ):
-            # doorbell on, native on
-            def cfg_side_effect(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return True
-                return default
-
-            mock_cfg.get.side_effect = cfg_side_effect
-            mock_meta.return_value = {"metadata": {}}  # NO cc_team_inbox_path
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "rang"
-        mock_native.assert_called_once()
-
+#
+# ``TestAC7NativeRingIndependentOfTeammatePush`` proved the native ring did NOT
+# gate on ``cc_team_inbox_path`` or on
+# ``teammate_push_service._should_teammate_push`` — that the socket wake was
+# reachable even when the FILE carrier was off. Both sides of that independence
+# are deleted: there is no second carrier to be independent OF, and no flag that
+# could couple them. The property now holds by construction rather than by
+# assertion.
+#
 
 # ===========================================================================
 # AC10: Wake verification — stub that never updates => fallback;
@@ -1137,69 +1104,21 @@ class TestAC11VersionGuard:
 
 
 # ===========================================================================
-# AC12: Every native refusal falls back to exactly one _attempt_gated_ring call
+# AC12 — WP-ARCH 3c K3/K8: deleted with the fallback it counted
 # ===========================================================================
-
-
-class TestAC12FallbackFanIn:
-    """Each native refusal results in exactly one fallback attempt."""
-
-    @pytest.mark.parametrize(
-        "native_reason",
-        [
-            "no_registry_records",
-            "no_descendant_record",
-            "target_ambiguous",
-            "proc_start_mismatch",
-            "record_stale",
-            "version_out_of_band",
-            "version_absent",
-            "peer_protocol",
-            "socket_enoent",
-            "socket_econnrefused",
-            "socket_eperm",
-            "socket_timeout",
-            "wake_unverified",
-        ],
-    )
-    def test_native_refusal_triggers_one_fallback(self, native_reason):
-        """Each native reason triggers exactly one _attempt_gated_ring call."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value=native_reason,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring",
-                return_value="rang",
-            ) as mock_gated,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=True,
-            ),
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return True
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "fallback"
-        mock_gated.assert_called_once_with("term-01", 100, caller_holds_no_delivery_lock=False)
-
+#
+# ``TestAC12FallbackFanIn`` parametrized every native refusal reason and
+# required each to produce exactly ONE ``_attempt_gated_ring`` call — the
+# doorbell's pane fallback, which pasted ``DOORBELL_NUDGE_TEXT`` into the seat's
+# composer. K8 names that paste as its second anchor and K3 deletes the module
+# that performed it, so a refusal has no fallback to fan into any more: the seat
+# has exactly one carrier, and a refused emission is simply refused.
+#
+# What answers the concern now is refusal ACCOUNTING rather than a second
+# transport. ``test/app/delivery/test_seat_wake.py`` asserts what the tick does
+# with each refusal reason — retry, deadline, dead letter — which is the
+# question AC12 was really asking once the wake has nowhere else to go.
+#
 
 # ===========================================================================
 # AC13: Socket errors fall back, never propagate to _f136_post_delivery
@@ -1264,245 +1183,28 @@ class TestAC13SocketErrorsFallback:
 
 
 # ===========================================================================
-# AC14: Dedup carried over — one attempt per run, high-water advances on either transport
+# AC14 + AC15 — WP-ARCH 3c: deleted with the doorbell and its two flags
 # ===========================================================================
-
-
-class TestAC14Dedup:
-    """F476 D8: Cursor dedup removed — doorbell is transport of path 2's claim."""
-
-    def test_native_ring_advances_cursor(self):
-        """F476 D8: No cursor dedup — doorbell rings on each call with written_count>0."""
-        from cli_agent_orchestrator.services.doorbell_service import (
-            ring_supervisor_doorbell,
-        )
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ),
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return True
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "rang"
-        # F476 D8: Second call at same row now ALSO rings (no cursor dedup)
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ) as mock_native,
-        ):
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-            result2 = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result2 == "rang"
-        mock_native.assert_called_once()
-
-    def test_fallback_ring_advances_cursor(self):
-        """F476 D8: No cursor dedup on fallback path either."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="version_out_of_band",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=True,
-            ),
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return True
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "fallback"
-
-        # F476 D8: Second call at same row also rings
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
-                return_value="rang",
-            ) as mock_native,
-        ):
-
-            def cfg_side2(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return True
-                return default
-
-            mock_cfg.get.side_effect = cfg_side2
-            mock_meta.return_value = {"metadata": {}}
-            result2 = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result2 == "rang"
-
-
-# ===========================================================================
-# AC15: Config matrix — supervisor.wake.native=false => no socket writes,
-#        supervisor.doorbell=false => neither transport
-# ===========================================================================
-
-
-class TestAC15ConfigMatrix:
-    """Config flags control transport selection."""
-
-    def test_wake_native_false_no_socket_write(self):
-        """supervisor.wake.native=false => zero native attempts, gated ring only."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
-            ) as mock_native,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=True,
-            ),
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return False  # disabled!
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        # When native is disabled, gated ring is primary — returns "rang" not "fallback"
-        assert result == "rang"
-        mock_native.assert_not_called()
-
-    def test_wake_native_false_logs_f170_transport_nudge(self, caplog):
-        """S1: native disabled path emits f170_doorbell transport=nudge log line."""
-        import logging
-
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
-            ) as mock_meta,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
-            ) as mock_native,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring",
-                return_value="rang",
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-                return_value=True,
-            ),
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return True
-                if path == "supervisor.wake.native":
-                    return False
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-            mock_meta.return_value = {"metadata": {}}
-
-            with caplog.at_level(
-                logging.INFO, logger="cli_agent_orchestrator.services.doorbell_service"
-            ):
-                result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "rang"
-        mock_native.assert_not_called()
-        # S1: must emit f170_doorbell with transport=nudge and reason=native_disabled
-        f170_lines = [r.message for r in caplog.records if "f170_doorbell" in r.message]
-        assert any(
-            "transport=nudge" in line and "reason=native_disabled" in line for line in f170_lines
-        ), f"Expected f170_doorbell transport=nudge reason=native_disabled, got: {f170_lines}"
-
-    def test_doorbell_false_no_transport(self):
-        """supervisor.doorbell=false => neither transport fires."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        with (
-            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring"
-            ) as mock_native,
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring"
-            ) as mock_gated,
-        ):
-
-            def cfg_side(path, default=None):
-                if path == "supervisor.doorbell":
-                    return False  # outer switch off
-                return default
-
-            mock_cfg.get.side_effect = cfg_side
-
-            result = ring_supervisor_doorbell("term-01", 100, written_count=1)
-
-        assert result == "skipped_disabled"
-        mock_native.assert_not_called()
-        mock_gated.assert_not_called()
-
+#
+# ``TestAC14Dedup`` pinned that ``ring_supervisor_doorbell`` advances the wake
+# high-water on EITHER transport, native or fallback. There is one transport
+# now, and the cursor it advanced is driven directly by
+# ``test_f476_single_wake_cursor.py``, so the two-transport claim has lost its
+# second term.
+#
+# ``TestAC15ConfigMatrix`` was the truth table for ``supervisor.wake.native``
+# and ``supervisor.doorbell``: native off → gated ring only; doorbell off →
+# neither transport. Both keys are deleted, and the reason is written at
+# ``cc_session_registry.WAKE_NATIVE_DEFAULT``, a constant kept only as a note to
+# an operator holding an old settings.json. After K8 the native channel is the
+# seat's ONLY carrier, so a switch that turns it off buys silence rather than a
+# different carrier — and silence at the seat is #604, the bug the phase exists
+# to remove. A matrix whose "off" row is a defect is not a matrix.
+#
+# ``test_3c_slice3_surfaces_gone.py`` holds the flags gone, pairing the absence
+# with two wake keys that must still resolve so it is proved against a live
+# control rather than against itself.
+#
 
 # ===========================================================================
 # Registry reader tests
