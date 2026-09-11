@@ -193,6 +193,24 @@ def _is_wedge_suspect(row: dict[str, Any]) -> bool | None:
     return None
 
 
+def _child_procs(terminal_id: str) -> list[str] | None:
+    """F899 (#751): comms of the live tool subprocesses under this pane, or None.
+
+    PURE — reads only the probe's cache (``peek``), so building a fleet row never
+    walks /proc. Returns None when the probe has never run for this terminal (it
+    runs on the pane-hold expiry arm alone) or when it could not answer.
+    """
+    try:
+        from cli_agent_orchestrator.services.child_proc_probe import child_proc_probe
+
+        result = child_proc_probe.peek(terminal_id)
+    except Exception:
+        return None
+    if result is None or result.status != "ok" or not result.comms:
+        return None
+    return list(result.comms)
+
+
 def _children_count_from_row(row: dict[str, Any]) -> int:
     """F568 D12a/D12c + F579 D17: length of the children ledger on the fleet row.
 
@@ -492,6 +510,14 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 # in the row detail.
                 "fusion_changed": fusion_changed,
                 "fusion_reason": fusion_reason,
+                # F899 (#751): the process-tree evidence behind a
+                # `child_proc_live` reason — the comms of the live tool
+                # subprocesses under this pane, capped at 5. Additive sibling
+                # key like fusion_reason; None when the probe has not run for
+                # this terminal (it runs only on the pane-hold expiry arm) or
+                # when it could not answer. PURE read of the probe's cache —
+                # this never triggers a /proc scan of its own.
+                "child_procs": _child_procs(row["id"]),
                 # F568 D12c: additive sibling keys — the raw `status` enum is
                 # unchanged (no new persisted status value). Rendered by the
                 # `cao-fleet` TUI's new columns (F702): `DELEG`, and
