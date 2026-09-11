@@ -692,9 +692,7 @@ def _prepare_provider_runtime_identity(
     # on the very next line already does.
     backend = get_backend()
     pid = backend.get_pane_process_id(metadata["tmux_session"], metadata["tmux_window"])
-    cwd = backend.get_pane_working_directory(
-        metadata["tmux_session"], metadata["tmux_window"]
-    )
+    cwd = backend.get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
     if cwd is None:
         # F26 D5: a deleted/unavailable pane cwd must fail through this site's
         # own failure channel (a recognized _PERSIST_FAILURE_CODES code), never
@@ -7769,6 +7767,73 @@ def _f913_live_resumable(
     return alive, bool(resumable), provider, reason
 
 
+def _f917_hibernate_refused_hint(
+    terminal_id: str, *, provider: str | None, reason: str | None
+) -> str:
+    """F917 (#769a): build the hibernate-refused hint WITHOUT recommending
+    force when a resumable rollout actually exists.
+
+    The old hint was unconditionally "delete_terminal(force=True) reaps and
+    marks unrecoverable". For a RESUMED codex terminal whose persona namespace
+    was reaped, the hibernate decision could refuse with
+    ``session_artifact_missing`` even though the rollout is intact under the
+    DEFAULT ~/.codex home — and steering the operator to force there destroys a
+    resumable session (the #765 loss, one hop later). With ``_resolve_codex``
+    now falling back to the default home (#769a), such a terminal usually
+    ALLOWS hibernate and never reaches here; this hint is the belt-and-braces
+    guarantee: if an artifact is resolvable, recommend the RESUME path; only
+    when nothing is recoverable does force (which marks unrecoverable) apply.
+
+    Never raises — on any resolution error it degrades to the resume-first
+    guidance (the conservative, non-destructive recommendation).
+    """
+    resume_hint = (
+        f"session artifact for {terminal_id} appears recoverable — do NOT force. "
+        f"interrupt, delete WITHOUT force (preserves the session), then "
+        f"assign(resume_from={terminal_id})"
+    )
+    force_hint = (
+        "no recoverable session artifact found; delete_terminal(force=True) reaps "
+        "and marks unrecoverable"
+    )
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            get_conversation_identity,
+            get_terminal_identity,
+        )
+        from cli_agent_orchestrator.services.session_artifact import resolve_artifact
+
+        identity = get_terminal_identity(terminal_id)
+        if not identity:
+            return force_hint
+        _prov = identity.get("provider") or provider
+        sid = identity.get("provider_session_id")
+        namespace = identity.get("provider_namespace")
+        cwd = identity.get("cwd")
+        ikey = identity.get("identity_key")
+        if not sid and ikey:
+            root = get_conversation_identity(ikey)
+            if root:
+                sid = root.get("provider_session_id")
+                namespace = namespace or root.get("provider_namespace")
+        if not sid or not _prov:
+            return force_hint
+        status = resolve_artifact(
+            _prov,
+            provider_session_id=sid,
+            provider_namespace=namespace,
+            cwd=cwd,
+        )
+        from cli_agent_orchestrator.services.session_artifact import ArtifactState
+
+        if status.state == ArtifactState.VALID:
+            return resume_hint
+        return force_hint
+    except Exception:
+        logger.debug("f917 hibernate hint resolution failed for %s", terminal_id, exc_info=True)
+        return resume_hint
+
+
 def delete_terminal(
     terminal_id: str,
     registry: PluginRegistry | None = None,
@@ -7856,7 +7921,11 @@ def delete_terminal(
                         "reason": _f829_hib_decision.reason,
                         "detail": _f829_hib_decision.detail,
                         "identity_key": _f829_hib_decision.identity_key,
-                        "hint": "delete_terminal(force=True) reaps and marks unrecoverable",
+                        "hint": _f917_hibernate_refused_hint(
+                            terminal_id,
+                            provider=_f829_hib_decision.provider,
+                            reason=_f829_hib_decision.reason,
+                        ),
                     }
                 ],
                 "uncertain": [],
@@ -8035,6 +8104,32 @@ def _close_cascade_teardown_intents(intent_ids: list[str], marked: list[str]) ->
             logger.warning("f218_teardown_intent_close_failed cascade id=%s: %s", intent_id, e)
     for node_id in marked:
         unmark_teardown(node_id)
+
+
+def _provider_cleanup_destroys_sessions(provider: Optional[str]) -> bool:
+    """F917 (#769b) / astra D1 correction: does this provider's ``cleanup()``
+    rmtree its OWN session store?
+
+    The reap path calls ``provider_manager.cleanup_provider`` (a per-worker
+    teardown) BEFORE it resolves the reap resume facts. For most providers this
+    is harmless because their sessions live in a provider-GLOBAL store that
+    cleanup never touches (codex ~/.codex/sessions; kiro ~/.kiro/sessions;
+    claude ~/.claude/projects). But two providers keep sessions INSIDE the
+    per-worker directory that cleanup rmtree's:
+      * pi_cli.cleanup  -> shutil.rmtree(runtime_dir), and
+        session_dir = runtime_dir/"sessions" (providers/pi_cli.py).
+      * grok_cli.cleanup -> shutil.rmtree(private GROK_HOME), which contains
+        sessions/ (providers/grok_cli.py).
+    For those, resolving resumability AFTER cleanup reads a store that cleanup
+    just deleted, so the reap wrongly reports resumable=false. The reaper
+    resolves the resume facts BEFORE cleanup for exactly this set.
+
+    Kept as an explicit, small, auditable set rather than a per-provider probe:
+    it names the two rmtree sites the recon pinned, and a new provider that
+    rmtree's its sessions must be added here deliberately (the
+    session-preservation matrix has a row per provider to catch a miss).
+    """
+    return provider in {"pi_cli", "grok_cli"}
 
 
 def _resolve_reap_resume_key(
@@ -8758,6 +8853,26 @@ def _delete_terminal_under_lease(
                     if worktree_terminal_id == terminal_id:
                         worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
+        # F917 (#769b) / astra D1 correction: for a provider whose cleanup()
+        # rmtree's its OWN session store (pi_cli, grok_cli), resolve and retain
+        # the reap resume facts BEFORE cleanup runs — otherwise the resolution
+        # below (post-cleanup) reads a store cleanup just deleted and reports a
+        # false resumable=false, the #769 loss pattern. For providers with a
+        # global store this pre-computation is unnecessary; leave it None so the
+        # existing post-cleanup resolution runs unchanged.
+        _f917_precomputed_resume: Optional[tuple[Optional[str], bool, str]] = None
+        _f917_provider = metadata.get("provider") if metadata else None
+        if _provider_cleanup_destroys_sessions(_f917_provider):
+            try:
+                _f917_precomputed_resume = _resolve_reap_resume_key(
+                    terminal_id, metadata, force=force
+                )
+            except Exception:
+                logger.debug(
+                    "f917 pre-cleanup resume resolution failed for %s", terminal_id, exc_info=True
+                )
+                _f917_precomputed_resume = None
+
         # Grok cleanup can be deferred when a private-home owner cannot yet be
         # inspected/stopped.  Keep both the provider mapping and DB metadata so
         # a subsequent DELETE can retry; reporting success here would turn a
@@ -8912,9 +9027,15 @@ def _delete_terminal_under_lease(
                 # RESUME HOT-FIX (addendum r1 #4): compute the reap resume facts
                 # (kiro store capture by positive attribution + provider
                 # capability). force=True abandons → not resumable.
-                _cap_id, _resumable, _reason = _resolve_reap_resume_key(
-                    terminal_id, metadata, force=force
-                )
+                # F917 (#769b): if the provider's cleanup would have destroyed
+                # its sessions, reuse the facts resolved BEFORE cleanup ran;
+                # otherwise resolve now (global-store providers are unaffected).
+                if _f917_precomputed_resume is not None:
+                    _cap_id, _resumable, _reason = _f917_precomputed_resume
+                else:
+                    _cap_id, _resumable, _reason = _resolve_reap_resume_key(
+                        terminal_id, metadata, force=force
+                    )
                 if _cap_id is not None:
                     deletion_kwargs["captured_provider_session_id"] = _cap_id
                 deletion_kwargs["resumable"] = _resumable

@@ -120,14 +120,43 @@ def _resolve_codex(uuid: str, namespace: Optional[str], cwd: Optional[str]) -> A
     artifact lives in). Falls back to the default provider home when unset. Uses
     the same rollout shape the provider's ``validate_session_artifact`` checks
     (``session_meta`` first line with ``payload.id == uuid``).
+
+    F917 (#769a): a RESUMED codex terminal keeps the reaped ORIGINAL terminal's
+    persona home as ``provider_namespace``; that persona dir is removed at the
+    first reap, so a namespaced lookup finds ``no sessions dir`` even though the
+    rollout is intact under the DEFAULT ``~/.codex/sessions`` (codex personas
+    symlink ``sessions -> ~/.codex/sessions``). So when a namespaced home yields
+    a non-authoritative negative (MISSING / INACCESSIBLE — the dir is gone or
+    unreadable, NOT a real identity mismatch), retry against the default home
+    before returning. A default-home VALID is the truth; a namespaced INVALID
+    (rollout present but identity mismatch) is authoritative and never masked.
     """
-    home: Optional[Path]
+    default_home = _provider_home("codex")
+    namespaced: Optional[Path] = None
     if namespace and not namespace.startswith("default:"):
-        home = Path(namespace)
-    else:
-        home = _provider_home("codex")
-    if home is None:
+        namespaced = Path(namespace)
+
+    if namespaced is not None:
+        status = _resolve_codex_in_home(uuid, namespaced)
+        if status.state == ArtifactState.VALID or status.state == ArtifactState.INVALID:
+            # VALID = found here; INVALID = rollout present but identity mismatch
+            # (authoritative — do not mask by re-scanning the default home).
+            return status
+        # MISSING / INACCESSIBLE under the namespaced home: the persona dir is
+        # gone/unreadable (reaped-original case). Fall back to the default home.
+        if default_home is not None and default_home != namespaced:
+            fallback = _resolve_codex_in_home(uuid, default_home)
+            if fallback.state == ArtifactState.VALID:
+                return fallback
+        return status
+
+    if default_home is None:
         return ArtifactStatus(ArtifactState.INACCESSIBLE, detail="codex home unresolved")
+    return _resolve_codex_in_home(uuid, default_home)
+
+
+def _resolve_codex_in_home(uuid: str, home: Path) -> ArtifactStatus:
+    """Resolve a codex rollout for ``uuid`` under one concrete CODEX_HOME."""
     sessions = home / "sessions"
     try:
         if not sessions.is_dir():

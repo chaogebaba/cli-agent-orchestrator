@@ -507,6 +507,10 @@ def format_drift_notice(sender_id: str, validation: FrozenPinValidation) -> str:
     lines.append(
         "Authority-pinned files have drifted since this worker was assigned.\n"
         "The worker's callback payload has been suppressed (stale verdict).\n"
-        "Action required: delete this worker and cold-assign a fresh reviewer."
+        "Action required: PRESERVE this worker's conversation. Do NOT reap it and "
+        "spawn a fresh replacement. Interrupt it, checkpoint its edits, delete "
+        "WITHOUT force (which preserves the resumable session), then "
+        f"assign(resume_from={sender_id}, inherit_pins=False, authority_files=<new pins>). "
+        "Keep the old verdict suppressed and request a fresh review under the new pins."
     )
     return "\n".join(lines)

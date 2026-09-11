@@ -40,7 +40,7 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Run F913 session-preservation tests
+      - name: Run F913/F917 session-preservation tests
         shell: bash
         run: |
           set -o pipefail
@@ -52,10 +52,11 @@ jobs:
             test/services/test_f913_force_delete_guard.py \
             test/api/test_f913_delete_confirm_discard.py \
             test/mcp_server/test_f913_delete_confirm_discard.py \
+            test/services/test_f917_session_preservation_matrix.py \
             --strict-markers \
             --tb=short \
             -q \
           || {
-            echo "::error title=session-preservation::F913 (#765) session-preservation guard regressed — force-delete of a LIVE, resumable provider session must be refused unless confirm_discard=True. See https://github.com/chaogebaba/cli-agent-orchestrator/issues/765" >&2
+            echo "::error title=session-preservation::F913 (#765) / F917 (#769) session-preservation guard regressed — force-delete of a LIVE, resumable provider session must be refused unless confirm_discard=True, session-destroying-provider cleanup must not precede the resumable decision, and codex namespace/drift hints must never steer to force when a rollout exists. See https://github.com/chaogebaba/cli-agent-orchestrator/issues/765 and /769" >&2
             exit 1
           }

@@ -169,6 +169,43 @@ def provider_supports_resume(provider: str) -> bool:
 # --------------------------------------------------------------------------
 # Reap-time kiro session-id capture from the on-disk store (brief deliverable 3a)
 # --------------------------------------------------------------------------
+def _f917_reseed_codex_namespace(namespace: Optional[str], session_uuid: str) -> Optional[str]:
+    """F917 (#769a): return the namespace a codex resume should be keyed by.
+
+    If ``namespace`` names a persona CODEX_HOME whose ``sessions`` dir is gone
+    (the reaped-original case) but the DEFAULT codex home resolves the rollout,
+    return the default home so the resumed conversation is keyed by the durable
+    store. Otherwise return ``namespace`` unchanged (a live namespace, an unset
+    namespace, or a rollout not found in the default home are all left alone).
+
+    Never raises — on any error it returns the input namespace unchanged.
+    """
+    try:
+        if not namespace or namespace.startswith("default:"):
+            return namespace
+        from pathlib import Path as _P
+
+        from cli_agent_orchestrator.services.session_artifact import (
+            ArtifactState,
+            _provider_home,
+            _resolve_codex_in_home,
+        )
+
+        ns_sessions = _P(namespace) / "sessions"
+        if ns_sessions.is_dir():
+            return namespace  # namespaced home still present — leave it
+        default_home = _provider_home("codex")
+        if default_home is None or _P(default_home) == _P(namespace):
+            return namespace
+        if _resolve_codex_in_home(session_uuid, default_home).state == ArtifactState.VALID:
+            # Re-seed to the durable default home (rollout confirmed there).
+            return str(default_home)
+        return namespace
+    except Exception:
+        logger.debug("f917 codex namespace re-seed check failed", exc_info=True)
+        return namespace
+
+
 def _kiro_sessions_root() -> Path:
     """Root of the kiro on-disk session store.
 
@@ -645,6 +682,18 @@ def _build_launch_spec(
     artifact_locator = root.get("artifact_locator") or (
         manifest.get("worktree_path") if manifest else None
     )
+
+    # F917 (#769a): a RESUMED codex terminal carries the reaped ORIGINAL
+    # terminal's persona home as ``provider_namespace``. That persona dir is
+    # removed at the first reap, so continuing to key the resumed conversation
+    # by the dead namespace makes the NEXT reap's artifact resolution refuse
+    # ``session_artifact_missing`` even though the rollout is intact under the
+    # DEFAULT ~/.codex home (codex personas symlink sessions -> ~/.codex/
+    # sessions). Re-seed the namespace to the durable default home when the
+    # recorded namespaced sessions dir is gone but the default home resolves the
+    # rollout. Non-codex providers and a still-live namespace are untouched.
+    if provider == "codex" and session_uuid:
+        namespace = _f917_reseed_codex_namespace(namespace, session_uuid)
 
     # D10 runtime admission for the resume operation. This is the PRODUCTION
     # seam (blueprint D10): it enforces declaration (provider_declares) AND reads
