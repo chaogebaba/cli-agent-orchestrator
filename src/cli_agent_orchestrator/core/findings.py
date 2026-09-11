@@ -128,6 +128,17 @@ class FindingCode(StrEnum):
     #: previously carried by the legacy doorbell and the seat-wake reconcile,
     #: both deleted in this slice; without adoption it has no carrier at all.
     DIAG_LEGACY_ROW_ADOPTED = "DIAG-LEGACY-ROW-ADOPTED"
+    #: A CERTIFIED terminal's source went silent for ``NO_SIGNAL_S`` and the
+    #: sweep degraded it to ``no_signal`` (WP-HERDR §6(ii) / WP-ARCH 2b).  It
+    #: exists because §6(ii) makes that state STICKY: the terminal stays
+    #: projected, publishes ``unknown``, and the pane is never handed the
+    #: lifecycle back — which is the right trade (see ``publisher``'s module
+    #: docstring) but is indistinguishable, from outside, from a worker that is
+    #: simply quiet.  Delivery to it withholds for as long as it lasts, so hours
+    #: of a dead certified stream would otherwise be a status outage with no
+    #: name.  Deduped PER TERMINAL, because one stale source is one problem however
+    #: many sweeps re-confirm it; the count is how long it has been going on.
+    DIAG_CERTIFIED_SOURCE_STALE = "DIAG-CERTIFIED-SOURCE-STALE"
     #: herdr answered ``pane get`` with ``agent_status: unknown`` for a pane CAO
     #: owns, so the herdr backend has NO native status for that seat and the
     #: caller silently falls back to pane scraping (F926 / #778).  Counted per

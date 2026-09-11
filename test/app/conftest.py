@@ -156,5 +156,6 @@ def rig() -> Rig:
         legacy_check=checks,
         health=health,
         producer_check=ProducerDisagreementCheck(findings),
+        findings=findings,
     )
     return Rig(clock, events, states, findings, registry, checks, sources, health, projector)

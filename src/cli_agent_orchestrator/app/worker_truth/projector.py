@@ -76,7 +76,14 @@ from cli_agent_orchestrator.core.events import (
     Producer,
     WorkerEvent,
 )
-from cli_agent_orchestrator.core.ports import Clock, EventStore, StateProjection, StateStore
+from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.ports import (
+    Clock,
+    EventStore,
+    FindingStore,
+    StateProjection,
+    StateStore,
+)
 from cli_agent_orchestrator.core.states import (
     DegradedReason,
     TransitionClass,
@@ -373,11 +380,18 @@ class Projector:
         producer_check: Callable[[WorkerEvent, ProjectedState], bool] | None = None,
         publisher: PublishTransition | None = None,
         reclassify: Callable[[str], None] | None = None,
+        findings: FindingStore | None = None,
     ) -> None:
         self._events = events
         self._states = states
         self._clock = clock
         self._sources = sources if sources is not None else NullSourceRegistry()
+        # Optional for the same reason every other seam here is: the projector
+        # must stay constructible — and testable — with nothing but the two
+        # stores.  When it is absent the finding is simply not written; it is a
+        # diagnostic, and a diagnostic that could break the fold would be worse
+        # than no diagnostic.
+        self._findings = findings
         # One writer at a time.  Folds arrive on whatever thread called ``emit``
         # — the status monitor's detection threads, a tailer's thread, the
         # liveness probe's executor thread — and since sub-phase 2b the sweep runs
@@ -611,6 +625,22 @@ class Projector:
         has proven its stream earns the right to mute the alternative to itself.
         ``last_source_probe_at`` IS that proof, because the herdr source now bumps
         it from one place only: a pushed frame that belongs to it.
+
+        **This clause OVERRIDES AC-2b case 7 for the certified cohort**, and the
+        override is the point rather than a side effect.  Case 7 says a terminal
+        the sweep degraded to ``no_signal`` stops being projected and the pane
+        resumes publishing for it.  Here a certified terminal whose stream has
+        proven itself stays projected THROUGH that degradation: the publisher
+        keeps writing, the status becomes ``unknown``, and the pane never gets
+        the lifecycle back.  ``publisher``'s module docstring carries the full
+        argument; the short form is that withholding delivery is observable,
+        bounded and reversible, while a scraper's false ``idle`` pasted into a
+        mid-turn worker is none of the three.
+
+        The cost is a status that can stand at ``unknown`` indefinitely, so the
+        sweep writes ``DIAG-CERTIFIED-SOURCE-STALE`` (deduped per terminal) when
+        it degrades one of these, and that finding — not a timeout — is the
+        bound.
         """
         if row.last_source_probe_at is not None and self._fallback_disabled(terminal_id):
             return True
@@ -1018,6 +1048,54 @@ class Projector:
         ]
         return rows[-1] if rows else None
 
+    def _note_certified_stale(self, row: ProjectedState, last_event: WorkerEvent) -> None:
+        """WP-HERDR §6(ii)'s bound: a certified source that has gone quiet.
+
+        §6(ii) keeps such a terminal PROJECTED through ``degraded(no_signal)``:
+        it publishes ``unknown``, the pane never gets the lifecycle back, and
+        inbox admission withholds for as long as it lasts.  That is the right
+        trade (see ``publisher``'s module docstring) but it is invisible from
+        outside, because a terminal nobody can deliver to looks exactly like a
+        quiet one.  This finding is what makes it visible.
+
+        Called from BOTH sweep branches — the one that first degrades and the
+        one that merely re-confirms an existing degradation — and that is the
+        whole design rather than an oversight.  The store dedupes on
+        ``(code, terminal, dedupe_key)``, so the row stays one row; what each
+        re-confirmation buys is a bumped ``count`` and a fresh ``last_seen_at``.
+        Raising only on the first degrade would leave an operator a finding with
+        a count of one whether the source had been dead for a minute or for six
+        hours, and "how long has this been going on" is the question the finding
+        exists to answer.
+
+        Gated on the SAME condition ``_projected`` short-circuits on, not on
+        certification alone: a certified terminal whose stream has never
+        delivered keeps the pane fallback, so it is not stuck and there is
+        nothing to report.
+        """
+        if self._findings is None:
+            return
+        if row.last_source_probe_at is None or not self._fallback_disabled(row.terminal_id):
+            return
+        try:
+            self._findings.record(
+                FindingCode.DIAG_CERTIFIED_SOURCE_STALE,
+                terminal_id=row.terminal_id,
+                # Per TERMINAL: one dead source is one problem however many
+                # sweeps see it.  The COUNT is the duration.
+                dedupe_key=row.terminal_id,
+                detail=(
+                    f"certified source silent since {last_event.ingested_at.isoformat()}; "
+                    f"projected state held at {WorkerState.DEGRADED.value}"
+                    f"({DegradedReason.NO_SIGNAL.value})"
+                ),
+                sample_event_id=last_event.event_id,
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic must not break the fold
+            logger.warning(
+                "certified-source-stale finding failed for %s", row.terminal_id, exc_info=True
+            )
+
     def _degrade_no_signal(
         self, row: ProjectedState, last_event: WorkerEvent, now: datetime
     ) -> ProjectionOutcome:
@@ -1031,6 +1109,9 @@ class Projector:
             # source of truth for which reason wins.
             if not reason_rises(row.degraded_reason, reason):
                 self._states.upsert(row)
+                # The re-confirmation is what makes the finding's count a
+                # duration rather than a flag.  See :meth:`_note_certified_stale`.
+                self._note_certified_stale(row, last_event)
                 return ProjectionOutcome(
                     row.terminal_id,
                     rule="no_signal_already_degraded",
@@ -1066,6 +1147,7 @@ class Projector:
             },
             observed_at=now,
         )
+        self._note_certified_stale(row, last_event)
         return ProjectionOutcome(
             row.terminal_id,
             rule="no_signal_sweep",
