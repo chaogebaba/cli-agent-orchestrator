@@ -547,9 +547,13 @@ def check_certified_pane_silence(db: Path, report: Report) -> None:
     eventually disagree with the projector's, and then this check would be
     testing the harness.
     """
+    # ``first_seen_at``/``last_seen_at`` come back too: their difference is how
+    # long the source has been stale.  ``count`` is only how many sweeps saw it,
+    # and it under-reports across missed ticks and restarts, so the report
+    # prints the span rather than the tally.
     stale = _rows(
         db,
-        "SELECT terminal_id FROM finding WHERE code = ?",
+        "SELECT terminal_id, count, first_seen_at, last_seen_at FROM finding WHERE code = ?",
         ("DIAG-CERTIFIED-SOURCE-STALE",),
     )
     if not stale:
@@ -594,9 +598,15 @@ def check_certified_pane_silence(db: Path, report: Report) -> None:
     if offending:
         report.bad("certified-pane-silence", "; ".join(offending))
     else:
+        spans = []
+        for row in stale:
+            first, last = _when(row["first_seen_at"]), _when(row["last_seen_at"])
+            span = (last - first).total_seconds() if first and last else 0.0
+            spans.append(f"{row['terminal_id']} stale {span:.0f}s over {row['count']} sweep(s)")
         report.ok(
             "certified-pane-silence",
-            f"{len(stale)} certified terminal(s) degraded, no pane publish after",
+            f"{len(stale)} certified terminal(s) degraded, no pane publish after "
+            f"({'; '.join(spans)})",
         )
 
 
