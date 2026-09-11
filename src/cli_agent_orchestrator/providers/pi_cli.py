@@ -97,9 +97,37 @@ from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
-# Absolute path is required because cao-server runs from systemd, where the
-# user's shell PATH (with ~/.bun/bin) is not present (memory rule 2026-09-07).
-PI_BINARY = str(Path.home() / ".bun" / "bin" / "pi")
+
+def _resolve_pi_binary() -> str:
+    """The absolute path cao-server execs for a pi worker.
+
+    Absolute is required because cao-server runs from systemd, where the user's
+    shell PATH (with ``~/.bun/bin``) is not present — that constraint is
+    unchanged and is why this resolves to a path rather than a bare name.
+
+    What IS new is that the bun-managed path cannot be overridden in place. herdr
+    binds an agent by the basename of ``argv[0]``, so a host whose node is too
+    old for pi's shebang (box node 20 vs pi 0.85.1's ``globSync`` requirement)
+    needs a wrapper that runs pi under bun while presenting ``argv[0] == "pi"``.
+    That wrapper cannot live at ``~/.bun/bin/pi``: bun resolves its own global
+    shims BY ``argv[0]``, so a wrapper there makes bun re-resolve to itself and
+    print its own version instead of running pi — measured on grok-box-010.
+
+    So the path is resolvable, in precedence order: an explicit
+    ``CAO_PI_BINARY``, then ``pi`` on PATH (which finds a wrapper in
+    ``~/.local/bin`` on such a host), then the bun-managed default. On a host
+    where the default works, PATH finds exactly that file and nothing changes.
+    """
+    override = os.environ.get("CAO_PI_BINARY", "").strip()
+    if override:
+        return override
+    found = shutil.which("pi")
+    if found:
+        return found
+    return str(Path.home() / ".bun" / "bin" / "pi")
+
+
+PI_BINARY = _resolve_pi_binary()
 
 # Per-worker runtime root under CAO_HOME_DIR (NOT /data — see module docstring
 # and the F797 lesson).  One subdirectory per terminal holds the transient

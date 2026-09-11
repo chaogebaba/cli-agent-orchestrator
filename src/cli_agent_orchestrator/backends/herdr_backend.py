@@ -161,13 +161,24 @@ def attach_herdr_runtime_source(
         # --terminal herdr`` reads ``terminal.herdr_session``), and a source that
         # defaulted to "cao" would connect to a different herdr server — or to
         # nothing — and report silence that looks exactly like an idle worker.
-        source = herdr_runtime.attach(terminal_id, pane_id=pane_id, herdr_session=herdr_session)
+        # The certification answer decides whether a PUSHED lifecycle frame is
+        # authoritative, and it has to be passed IN: herdr's pushed frames carry
+        # no field the adapter could read it from, and an adapter is a leaf that
+        # may not ask ``utils``. Resolved once at create, like everything else
+        # this terminal's occupant is bound to.
+        certified = terminal_certified(terminal_id)
+        source = herdr_runtime.attach(
+            terminal_id,
+            pane_id=pane_id,
+            herdr_session=herdr_session,
+            lifecycle_authoritative=certified,
+        )
         if source is None:
             return
         registry = _worker_truth_sources()
         if registry is None:
             return
-        if not terminal_certified(terminal_id):
+        if not certified:
             # The source runs and appends events — that is what a live round
             # observes — but it does NOT claim authority.  Registering an
             # uncertified terminal would mute its scraped lifecycle behind a

@@ -266,6 +266,12 @@ class HerdrRuntimeSource:
         # "has the subscription gone dead", not "is the worker busy".  Past it
         # the source stops asserting health rather than asserting a stale one.
         stream_proof_ttl_s: float = NO_SIGNAL_S * 10.0,
+        # Does this terminal's cell carry a PASS herdr_certification row for this
+        # backend?  The shim knows (it resolves the predicate at create); the
+        # adapter must not ask, since `utils` is legacy and an adapter is a leaf.
+        # It decides only one thing: whether a PUSHED lifecycle frame is
+        # authoritative — see :meth:`_confidence_for`.
+        lifecycle_authoritative: bool = False,
     ) -> None:
         if not herdr_terminal_id and not pane_id:
             raise ValueError(
@@ -326,6 +332,7 @@ class HerdrRuntimeSource:
         #: makes "never received a frame" distinguishable from "quiet worker".
         self._last_push_at: float | None = None
         self._stream_proof_ttl_s = stream_proof_ttl_s
+        self._lifecycle_authoritative = lifecycle_authoritative
 
     # -- EventSource ---------------------------------------------------------
 
@@ -844,16 +851,54 @@ class HerdrRuntimeSource:
             self._bound_pane_id = str(pane_id)
 
     def _confidence_for(self, pane: dict[str, Any]) -> Confidence:
-        """Hook-backed panes are authoritative; screen-manifest panes are derived.
+        """How much authority this particular reading carries.
 
         ``screen_detection_skipped`` is herdr's own signal that a pane's status
-        came from a lifecycle hook rather than a screen manifest (H0 round 2:
-        pi carries ``screen_detection_skipped=true`` /
-        ``full_lifecycle_hook_authority``; claude does not).  Absent the field,
-        confidence defaults to ``derived`` — the conservative choice, since a
-        producer should not claim authority it cannot demonstrate.
+        came from a lifecycle hook rather than a screen manifest, and where it
+        appears it still decides — that is the SNAPSHOT case and it is unchanged.
+
+        **It cannot decide the pushed case, because pushed frames do not carry
+        it.**  A ``pane.agent_status_changed`` frame carries exactly four keys —
+        ``agent``, ``agent_status``, ``pane_id``, ``workspace_id`` — in all 43
+        frames of this repo's verbatim pi capture
+        (``test/fixtures/herdr/pi-events.jsonl``) and in a fresh live capture on
+        herdr 0.9.0 (grok-box-010, four driven transitions, union of keys
+        identical, field absent from `pane get`, `agent get` and `api snapshot`
+        for that pane too).  After the r2 subscription fix those frames are the
+        ONLY lifecycle carrier, so reading the field off them returns ``derived``
+        every time, by construction.
+
+        That default is not merely conservative on a CERTIFIED terminal, it is
+        fatal: §6(ii) mutes the scraped lifecycle, ``turn.*`` is not in
+        ``DERIVED_ALWAYS_KINDS``, and the first pushed frame bumps the probe
+        column BEFORE its event reaches the projector — so the terminal's own
+        authority mutes the terminal's own events and it projects the connect
+        snapshot and then nothing, forever, with a perfectly working stream.  The
+        same false-idle freeze the health rule was written to kill, reached from
+        the other side.
+
+        So on a terminal whose cell is CERTIFIED for this backend, the answer
+        comes from the certification rather than from a field herdr does not
+        send.  That is not a weaker claim, it is the claim certification makes: a
+        PASS row says this source is the authority for this terminal's lifecycle.
+        An UNCERTIFIED terminal keeps the field-based reading and stays
+        ``derived`` — and nothing mutes its pane, so derived is right there.
+
+        **Authority does not key on whether the record was PUSHED**, and that
+        distinction cost a recovery path.  §6 says the only safe recovery from a
+        subscription gap is a resnapshot, because events are not receipts.  While
+        authority required ``pushed``, a resnapshot's records were DERIVED, so on
+        a certified terminal they were muted — the terminal degraded on the gap
+        and then stayed degraded through the very resnapshot meant to recover it,
+        waiting for a pushed edge that an edge-triggered stream may never send if
+        the status did not change across the gap.  ``pushed`` still decides
+        proof-of-stream (:meth:`_touch_source_probe`), which is a different
+        question: whether the subscription is delivering, not whether this source
+        is the authority.
         """
         if pane.get("screen_detection_skipped") is True:
+            return Confidence.AUTHORITATIVE
+        if self._lifecycle_authoritative:
             return Confidence.AUTHORITATIVE
         return Confidence.DERIVED
 
@@ -978,6 +1023,7 @@ def attach(
     herdr_session: str = "cao",
     socket_path: str | None = None,
     client: HerdrClient | None = None,
+    lifecycle_authoritative: bool = False,
 ) -> HerdrRuntimeSource | None:
     """Create (or return) the herdr runtime source for one CAO terminal.
 
@@ -1014,6 +1060,7 @@ def attach(
             herdr_session=herdr_session,
             socket_path=socket_path,
             client=client,
+            lifecycle_authoritative=lifecycle_authoritative,
         )
         _sources[cao_terminal_id] = source
     _schedule(source)
