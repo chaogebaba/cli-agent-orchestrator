@@ -26,7 +26,7 @@ def _clean_flags(monkeypatch):
 
 
 @pytest.fixture()
-def _apps_disabled(monkeypatch):
+def _apps_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """F747 (#747): ``apps.enabled`` now SHIPS ON, and ``_agui_enabled()`` ORs it
     with ``CAO_AGUI_ENABLED``. So "no flags set" no longer means "no surface" --
     the shipped default is a flag. The negative cases below must therefore turn
@@ -80,19 +80,22 @@ def test_either_flag_enables_the_agui_stream(monkeypatch, flag, value, _terminat
         assert resp.status_code != 404
 
 
-def test_no_flags_means_no_surface(_apps_disabled, _terminating_stream):
+def test_no_flags_means_no_surface(_apps_disabled: None, _terminating_stream: None) -> None:
     assert client.get("/agui/v1/stream").status_code == 404
 
 
 @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
 def test_agui_flag_falsey_values_do_not_enable(
-    monkeypatch, value, _apps_disabled, _terminating_stream
-):
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    _apps_disabled: None,
+    _terminating_stream: None,
+) -> None:
     monkeypatch.setenv("CAO_AGUI_ENABLED", value)
     assert client.get("/agui/v1/stream").status_code == 404
 
 
-def test_apps_enabled_default_exposes_the_surface(_terminating_stream):
+def test_apps_enabled_default_exposes_the_surface(_terminating_stream: None) -> None:
     """F747 (#747): with no env at all, the shipped ``apps.enabled=True`` is
     itself the enabling flag. Pinning this makes the coupling visible instead of
     leaving it to be rediscovered as a suite hang."""

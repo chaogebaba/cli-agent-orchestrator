@@ -410,17 +410,24 @@ def _try_acquire_lockfile(lock_path: Path) -> Optional[int]:
     try:
         return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
-        pass
-    except OSError as e:
-        logger.debug("f747_trylock_error: %s", e)
-        return None
+        pass  # held by someone else -- a race, handled below
+    # F747 (#747) r7: every OTHER OSError PROPAGATES. A PermissionError or
+    # ENOSPC on the lock path is PERMANENT: retrying cannot fix it, and a
+    # permanently unwritable inbox is a BROKEN native channel, not a busy one.
+    # Swallowing it here returned None, the caller read that as
+    # ``inbox_contended``, the write-failure ledger was never armed, and
+    # ``native_fallback_reason`` kept answering healthy -- so the r7 hook gate
+    # suppressed the fallback surface indefinitely for a seat that could never
+    # receive anything. The parent-mkdir guard does not cover it: the directory
+    # can be creatable while the lock file is not.
     # Present: reclaim only if stale, and verify we own what we opened (TOCTOU).
     try:
         if (time.time() - os.stat(str(lock_path)).st_mtime) <= _LOCK_STALE_SECONDS:
             return None
         os.unlink(str(lock_path))
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except (FileNotFoundError, FileExistsError, OSError):
+    except (FileNotFoundError, FileExistsError):
+        # The holder vanished or beat us to the reclaim: a race, not a fault.
         return None
     try:
         fd_stat = os.fstat(fd)
@@ -630,13 +637,13 @@ def log_native_fallback_engaged(terminal_id: str, reason: str) -> bool:
 
 
 #: Row ids already reported as contended, so the log carries one line per row.
-_inbox_contended_logged: set = set()
+_inbox_contended_logged: set[int] = set()
 
 #: Bound on the above, so a long-lived server cannot grow it without limit.
 _INBOX_CONTENDED_LOG_CAP = 4096
 
 
-def _log_inbox_contended_once(terminal_id: str, message_ids: tuple) -> None:
+def _log_inbox_contended_once(terminal_id: str, message_ids: tuple[int, ...]) -> None:
     """Log a contended push once per ROW (F747 #747).
 
     Per row, not per attempt: the reconciler retries a contended row every tick,
@@ -832,10 +839,20 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> Optional[bool
     # F656: "before" stat taken before lock acquisition (never in-lock).
     size_before, mtime_before = _stat_size_mtime(inbox_path)
     # F747 (#747): try-lock, one retry, never a blocking wait.
-    fd = _try_acquire_lockfile(lock_path)
-    if fd is None:
-        time.sleep(INBOX_LOCK_RETRY_PAUSE_S)
+    # r7: a PERMANENT lock error propagates out of the helper and is converted
+    # to a write FAILURE here (False), never to contention (None). That is what
+    # arms the write-failure ledger, so a seat whose inbox cannot be written
+    # reports native_write_failed and the fallback surface engages.
+    try:
         fd = _try_acquire_lockfile(lock_path)
+        if fd is None:
+            time.sleep(INBOX_LOCK_RETRY_PAUSE_S)
+            fd = _try_acquire_lockfile(lock_path)
+    except OSError as e:
+        logger.warning(
+            "teammate_push: inbox lock %s permanently unwritable: %s", lock_path, e
+        )
+        return False
     if fd is None:
         # None (not False) means CONTENDED, not failed. The caller must not
         # treat a transient lock as a broken native channel, and the row is
@@ -932,7 +949,7 @@ class PushOutcome:
     # closed set: empty_batch, no_inbox_path, already_notified, consumed,
     # write_failed, inbox_contended, pushed
     reason: str
-    message_ids: tuple  # diagnostic only (N1)
+    message_ids: tuple[int, ...]  # diagnostic only (N1)
 
 
 def attempt_teammate_push_reported(

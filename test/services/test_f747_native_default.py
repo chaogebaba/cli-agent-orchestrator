@@ -13,7 +13,10 @@ is restored.
 """
 
 import json
+import os
+import time
 from pathlib import Path
+from typing import Any, Iterator, cast
 
 import pytest
 
@@ -24,7 +27,9 @@ from cli_agent_orchestrator.services.terminal_service import _maybe_derive_cc_te
 
 
 @pytest.fixture(autouse=True)
-def _isolated_settings(tmp_path, monkeypatch):
+def _isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[dict[str, Path]]:
     """Same isolation as test_config_service: no real settings.json, no env."""
     fake_settings = tmp_path / "settings.json"
     fake_legacy = tmp_path / "config.json"
@@ -55,16 +60,16 @@ FLIPPED_ON = [
 
 
 @pytest.mark.parametrize("path", FLIPPED_ON)
-def test_flipped_keys_default_true(path):
+def test_flipped_keys_default_true(path: str) -> None:
     assert ConfigService.get(path) is True, f"{path} must ship enabled"
 
 
-def test_doorbell_defaults_false():
+def test_doorbell_defaults_false() -> None:
     """The seat prompt is never a message tunnel."""
     assert ConfigService.get("supervisor.doorbell") is False
 
 
-def test_memory_stays_off():
+def test_memory_stays_off() -> None:
     assert ConfigService.get("memory.enabled") is False
 
 
@@ -76,7 +81,7 @@ def test_memory_stays_off():
         ("CAO_WORKER_TRUTH_INGEST", None),
     ],
 )
-def test_untouched_keys_keep_their_table_value(env_name, expected):
+def test_untouched_keys_keep_their_table_value(env_name: str, expected: object) -> None:
     """ws_monitor stays ship-dark and F883 owns delivery.phase.
 
     Asserted against the table rather than ``get()``: these paths are not in
@@ -89,7 +94,7 @@ def test_untouched_keys_keep_their_table_value(env_name, expected):
     assert cs.ENV_REGISTRY[env_name][2] == expected
 
 
-def test_shipped_default_beats_call_site_default():
+def test_shipped_default_beats_call_site_default() -> None:
     """The shipped default wins over whatever a call site happens to pass.
 
     MUTANT (ruling 4): drop the flipped keys from ``_OWNED_DEFAULTS`` and
@@ -101,13 +106,15 @@ def test_shipped_default_beats_call_site_default():
 
 
 @pytest.mark.parametrize("path", FLIPPED_ON + ["supervisor.doorbell"])
-def test_owned_default_agrees_with_the_env_registry_tuple(path):
+def test_owned_default_agrees_with_the_env_registry_tuple(path: str) -> None:
     """The two tables must not drift: get() reads one, `cao config list` the other."""
     env_name = cs._PATH_TO_ENV[path]
     assert cs._OWNED_DEFAULTS[path] is cs.ENV_REGISTRY[env_name][2]
 
 
-def test_file_and_env_still_beat_the_registry_default(monkeypatch, _isolated_settings):
+def test_file_and_env_still_beat_the_registry_default(
+    monkeypatch: pytest.MonkeyPatch, _isolated_settings: dict[str, Path]
+) -> None:
     _isolated_settings["settings"].write_text(json.dumps({"supervisor": {"teammate_push": False}}))
     assert ConfigService.get("supervisor.teammate_push") is False
     monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "true")
@@ -119,7 +126,7 @@ def test_file_and_env_still_beat_the_registry_default(monkeypatch, _isolated_set
 # ---------------------------------------------------------------------------
 
 
-def _flags_off(monkeypatch):
+def _flags_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ConfigService,
         "get",
@@ -127,7 +134,7 @@ def _flags_off(monkeypatch):
     )
 
 
-def test_inbox_path_derived_with_every_flag_off(monkeypatch):
+def test_inbox_path_derived_with_every_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """MUTANT (ruling 2): restore the flag-gated derivation and this fails."""
     _flags_off(monkeypatch)
     md = _maybe_derive_cc_team_inbox_path("claude_code", None, "/home/x/repo")
@@ -136,13 +143,13 @@ def test_inbox_path_derived_with_every_flag_off(monkeypatch):
     assert "-home-x-repo" in md["cc_team_inbox_path"]
 
 
-def test_inbox_path_derived_into_existing_metadata(monkeypatch):
+def test_inbox_path_derived_into_existing_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     _flags_off(monkeypatch)
     md = _maybe_derive_cc_team_inbox_path("claude_code", {"group": "a"}, "/home/x/repo")
     assert md is not None and "cc_team_inbox_path" in md and md["group"] == "a"
 
 
-def test_inbox_path_derived_when_working_directory_is_none(monkeypatch):
+def test_inbox_path_derived_when_working_directory_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """A seat created with working_directory=None still gets a usable path."""
     _flags_off(monkeypatch)
     monkeypatch.setattr("os.getcwd", lambda: "/srv/fallback")
@@ -150,18 +157,20 @@ def test_inbox_path_derived_when_working_directory_is_none(monkeypatch):
     assert md is not None and "-srv-fallback" in md["cc_team_inbox_path"]
 
 
-def test_existing_inbox_path_never_overwritten(monkeypatch):
+def test_existing_inbox_path_never_overwritten(monkeypatch: pytest.MonkeyPatch) -> None:
     _flags_off(monkeypatch)
     md = _maybe_derive_cc_team_inbox_path("claude_code", {"cc_team_inbox_path": "/keep.json"}, "/x")
     assert md == {"cc_team_inbox_path": "/keep.json"}
 
 
-def test_non_claude_code_provider_gets_no_path(monkeypatch):
+def test_non_claude_code_provider_gets_no_path(monkeypatch: pytest.MonkeyPatch) -> None:
     _flags_off(monkeypatch)
     assert _maybe_derive_cc_team_inbox_path("codex", None, "/home/x/repo") is None
 
 
-def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(monkeypatch):
+def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Read-path re-derivation for a row that has a cwd but no persisted path."""
     monkeypatch.setattr(
         tps,
@@ -172,7 +181,7 @@ def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(monkeypatch):
             "metadata": {},
         },
     )
-    persisted: dict = {}
+    persisted: dict[str, object] = {}
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.update_terminal_metadata",
         lambda tid, md: persisted.update(md),
@@ -182,7 +191,7 @@ def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(monkeypatch):
     assert "cc_team_inbox_path" in persisted
 
 
-def test_resolve_inbox_path_never_invents_a_shared_path(monkeypatch):
+def test_resolve_inbox_path_never_invents_a_shared_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """MUTANT: restore the os.getcwd() fallback and every pathless terminal
     derives the SAME inbox file, so unrelated seats serialise on one lockfile."""
     monkeypatch.setattr(
@@ -199,7 +208,7 @@ def test_resolve_inbox_path_never_invents_a_shared_path(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _healthy_terminal(monkeypatch, tmp_path):
+def _healthy_terminal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         tps,
         "get_terminal_metadata",
@@ -211,24 +220,30 @@ def _healthy_terminal(monkeypatch, tmp_path):
     )
 
 
-def test_should_teammate_push_is_true_by_default(monkeypatch, tmp_path):
+def test_should_teammate_push_is_true_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Ruling 1: no settings.json, no env, and the seat still pushes natively."""
     _healthy_terminal(monkeypatch, tmp_path)
     assert tps._should_teammate_push("t1") is True
 
 
-def test_native_fallback_reason_none_when_healthy(monkeypatch, tmp_path):
+def test_native_fallback_reason_none_when_healthy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     _healthy_terminal(monkeypatch, tmp_path)
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_reason_push_disabled_by_operator(monkeypatch, tmp_path, _isolated_settings):
+def test_reason_push_disabled_by_operator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_settings: dict[str, Path]
+) -> None:
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "false")
     assert tps.native_fallback_reason("t1") == "push_disabled_by_operator"
 
 
-def test_reason_no_inbox_path(monkeypatch):
+def test_reason_no_inbox_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         tps, "get_terminal_metadata", lambda tid: {"provider": "claude_code", "metadata": {}}
     )
@@ -236,7 +251,9 @@ def test_reason_no_inbox_path(monkeypatch):
     assert tps.native_fallback_reason("t1") == "no_inbox_path"
 
 
-def test_health_probe_never_writes_metadata(monkeypatch, tmp_path):
+def test_health_probe_never_writes_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """MUTANT (perf): drop ``persist=False`` and the probe writes the DB on every
     seat tool call, which serialized the whole suite behind one SQLite lock."""
     monkeypatch.setattr(
@@ -244,16 +261,20 @@ def test_health_probe_never_writes_metadata(monkeypatch, tmp_path):
         "get_terminal_metadata",
         lambda tid: {"provider": "claude_code", "working_directory": str(tmp_path), "metadata": {}},
     )
-    writes: list = []
+    writes: list[str] = []
+
+    def _record_persist(tid: str, md: object) -> None:
+        writes.append(tid)
+
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.update_terminal_metadata",
-        lambda tid, md: writes.append(tid),
+        _record_persist,
     )
     tps.native_fallback_reason("t1")
     assert writes == []
 
 
-def test_reason_native_write_failed(monkeypatch, tmp_path):
+def test_reason_native_write_failed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _healthy_terminal(monkeypatch, tmp_path)
     tps.record_native_write_failure("t1")
     assert tps.native_fallback_reason("t1") == "native_write_failed"
@@ -261,32 +282,34 @@ def test_reason_native_write_failed(monkeypatch, tmp_path):
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_reason_no_native_driver(monkeypatch, tmp_path):
+def test_reason_no_native_driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
     monkeypatch.setenv("CAO_DELIVERY_SEAT_WAKE_RECONCILE", "false")
     assert tps.native_fallback_reason("t1") == "no_native_driver"
 
 
-def test_reason_provider_not_native(monkeypatch):
+def test_reason_provider_not_native(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tps, "get_terminal_metadata", lambda tid: {"provider": "codex"})
     assert tps.native_fallback_reason("t1") == "provider_not_native"
 
 
 @pytest.mark.parametrize("reason", list(tps.NATIVE_FALLBACK_REASONS))
-def test_every_reason_is_in_the_closed_set(reason):
+def test_every_reason_is_in_the_closed_set(reason: str) -> None:
     assert isinstance(reason, str) and reason
 
 
-def test_write_failure_ttl_expires(monkeypatch, tmp_path):
+def test_write_failure_ttl_expires(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _healthy_terminal(monkeypatch, tmp_path)
     tps.record_native_write_failure("t1")
-    base = tps.time.monotonic()
-    monkeypatch.setattr(tps.time, "monotonic", lambda: base + tps.NATIVE_WRITE_FAILURE_TTL_S + 1)
+    base = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: base + tps.NATIVE_WRITE_FAILURE_TTL_S + 1)
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_push_outcome_arms_and_disarms_the_fallback(monkeypatch, tmp_path):
+def test_push_outcome_arms_and_disarms_the_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """MUTANT (ruling 3): drop the record/clear calls and the fallback either
     never arms on a broken write or never disarms after a good one."""
     _healthy_terminal(monkeypatch, tmp_path)
@@ -299,17 +322,19 @@ def test_push_outcome_arms_and_disarms_the_fallback(monkeypatch, tmp_path):
         logical_receiver_id = "mb1"
 
     monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: False)
-    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
     assert out.reason == "write_failed"
     assert tps.native_fallback_reason("t1") == "native_write_failed"
 
     monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: True)
-    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
     assert out.pushed is True
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_engagement_warn_is_rate_limited(monkeypatch, caplog):
+def test_engagement_warn_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     import logging
 
     caplog.set_level(logging.WARNING, logger=tps.logger.name)
@@ -325,37 +350,39 @@ def test_engagement_warn_is_rate_limited(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 
 
-def _fake_response(payload, ok=True):
+def _fake_response(payload: object, ok: bool = True) -> Any:
     class _R:
-        def raise_for_status(self):
+        def raise_for_status(self) -> None:
             if not ok:
                 raise RuntimeError("boom")
 
-        def json(self):
+        def json(self) -> object:
             return payload
 
     return _R()
 
 
-def test_rewake_hook_does_not_wake_when_native_is_healthy(monkeypatch):
+def test_rewake_hook_does_not_wake_when_native_is_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
     from cli_agent_orchestrator.hooks import rewake
 
     monkeypatch.setattr(rewake.cao_http, "get", lambda *a, **k: _fake_response({"healthy": True}))
     assert rewake._native_delivery_healthy("t1", "http://x", {}) is True
 
 
-def test_rewake_hook_fails_open_to_the_fallback(monkeypatch):
+def test_rewake_hook_fails_open_to_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """A probe error must arm the net, never silence it."""
     from cli_agent_orchestrator.hooks import rewake
 
-    def _boom(*a, **k):
+    def _boom(*a: Any, **k: Any) -> Any:
         raise RuntimeError("server down")
 
     monkeypatch.setattr(rewake.cao_http, "get", _boom)
     assert rewake._native_delivery_healthy("t1", "http://x", {}) is False
 
 
-def test_drain_hook_skips_the_digest_when_native_is_healthy(monkeypatch):
+def test_drain_hook_skips_the_digest_when_native_is_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cli_agent_orchestrator.hooks import supervisor_drain
 
     monkeypatch.setattr(
@@ -371,7 +398,7 @@ def test_drain_hook_skips_the_digest_when_native_is_healthy(monkeypatch):
     assert supervisor_drain._native_delivery_healthy("t1", "http://x", {}) is False
 
 
-def test_session_start_always_sends_a_cwd():
+def test_session_start_always_sends_a_cwd() -> None:
     """MUTANT: restore the ``if working_directory:`` guard and the server
     persists its own cwd for a seat launched without --cwd."""
     src = Path("src/cli_agent_orchestrator/cli/commands/session.py").read_text(encoding="utf-8")
@@ -393,7 +420,7 @@ def test_session_start_always_sends_a_cwd():
 # ---------------------------------------------------------------------------
 
 
-def test_mailbox_addressed_row_keeps_the_mailbox_as_logical_receiver():
+def test_mailbox_addressed_row_keeps_the_mailbox_as_logical_receiver() -> None:
     """The mb_ indirection does NOT bypass the reconciler's selection axis."""
     import inspect
 
@@ -405,12 +432,19 @@ def test_mailbox_addressed_row_keeps_the_mailbox_as_logical_receiver():
     assert "cast(str, mailbox.id)" in src
 
 
-def test_push_reports_consumed_when_the_hook_already_acked(monkeypatch, tmp_path):
+def test_push_reports_consumed_when_the_hook_already_acked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The exact live failure: nothing is written and the reason is `consumed`."""
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: 5647)
-    wrote: list = []
-    monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: wrote.append(p) or True)
+    wrote: list[Path] = []
+
+    def _record_write(path: Path, entry: object) -> bool:
+        wrote.append(path)
+        return True
+
+    monkeypatch.setattr(tps, "_write_inbox_entry", _record_write)
 
     class _Msg:
         id = 5644
@@ -418,28 +452,33 @@ def test_push_reports_consumed_when_the_hook_already_acked(monkeypatch, tmp_path
         message = "callback"
         logical_receiver_id = "mb_d176ebe0"
 
-    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
     assert out.pushed is False and out.reason == "consumed"
     assert wrote == []
 
 
-def _run(coro):
+def _run(coro: Any) -> Any:
     import asyncio
 
     return asyncio.run(coro)
 
 
-def test_hook_claim_is_suppressed_while_native_is_healthy(monkeypatch):
+def test_hook_claim_is_suppressed_while_native_is_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
     """MUTANT (#747 follow-up): drop the server-side gate and the drain hook
     keeps claiming + acking inside the grace window, so the native push always
     recounts to `consumed` and the seat never gets an agent message."""
     from cli_agent_orchestrator.api import main as api_main
     from cli_agent_orchestrator.security.auth import SCOPE_WRITE
 
-    called: list = []
+    called: list[object] = []
+
+    def _record_args(*a: Any, **k: Any) -> dict[str, Any]:
+        called.append(a)
+        return {"items": [{"id": 1}]}
+
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.mailbox_service.list_messages",
-        lambda *a, **k: called.append(a) or {"items": [{"id": 1}]},
+        _record_args,
     )
     monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: None)
 
@@ -448,14 +487,19 @@ def test_hook_claim_is_suppressed_while_native_is_healthy(monkeypatch):
     assert called == [], "the hook must not claim while native owns the seat"
 
 
-def test_hook_claim_passes_through_when_native_is_broken(monkeypatch):
+def test_hook_claim_passes_through_when_native_is_broken(monkeypatch: pytest.MonkeyPatch) -> None:
     from cli_agent_orchestrator.api import main as api_main
     from cli_agent_orchestrator.security.auth import SCOPE_WRITE
 
-    called: list = []
+    called: list[object] = []
+
+    def _record_claim(*a: Any, **k: Any) -> dict[str, Any]:
+        called.append(k.get("claim"))
+        return {"items": [{"id": 1}]}
+
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.mailbox_service.list_messages",
-        lambda *a, **k: called.append(k.get("claim")) or {"items": [{"id": 1}]},
+        _record_claim,
     )
     monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: "no_inbox_path")
 
@@ -464,7 +508,7 @@ def test_hook_claim_passes_through_when_native_is_broken(monkeypatch):
     assert called == ["hook"]
 
 
-def test_hook_claim_gate_resolves_a_mailbox_address(monkeypatch):
+def test_hook_claim_gate_resolves_a_mailbox_address(monkeypatch: pytest.MonkeyPatch) -> None:
     """The drain may address the mailbox; the gate must probe the SEAT."""
     from cli_agent_orchestrator.api import main as api_main
     from cli_agent_orchestrator.security.auth import SCOPE_WRITE
@@ -473,8 +517,13 @@ def test_hook_claim_gate_resolves_a_mailbox_address(monkeypatch):
         "cli_agent_orchestrator.clients.database.get_current_mailbox_terminal",
         lambda mbid: "c244d80b",
     )
-    probed: list = []
-    monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: probed.append(tid) or None)
+    probed: list[str] = []
+
+    def _record_probe(tid: str) -> str | None:
+        probed.append(tid)
+        return None
+
+    monkeypatch.setattr(tps, "native_fallback_reason", _record_probe)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.mailbox_service.list_messages",
         lambda *a, **k: {"items": [{"id": 1}]},
@@ -487,14 +536,19 @@ def test_hook_claim_gate_resolves_a_mailbox_address(monkeypatch):
     assert out["items"] == []
 
 
-def test_non_hook_claims_are_never_gated(monkeypatch):
+def test_non_hook_claims_are_never_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     from cli_agent_orchestrator.api import main as api_main
     from cli_agent_orchestrator.security.auth import SCOPE_WRITE
 
-    seen: list = []
+    seen: list[object] = []
+
+    def _record_seen(*a: Any, **k: Any) -> dict[str, Any]:
+        seen.append(k.get("claim"))
+        return {"items": []}
+
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.mailbox_service.list_messages",
-        lambda *a, **k: seen.append(k.get("claim")) or {"items": []},
+        _record_seen,
     )
     monkeypatch.setattr(tps, "native_fallback_reason", lambda tid: None)
     _run(api_main.list_messages_endpoint(to="c244d80b", claim="mcp", _scopes=[SCOPE_WRITE]))
@@ -506,7 +560,7 @@ def test_non_hook_claims_are_never_gated(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_inbox_file_is_capped(tmp_path):
+def test_inbox_file_is_capped(tmp_path: Path) -> None:
     """MUTANT: drop the trim and the file grows without bound, so every push
     re-reads and re-serialises a longer array -- O(M**2) over M pushes."""
     inbox = tmp_path / "team-lead.json"
@@ -516,7 +570,7 @@ def test_inbox_file_is_capped(tmp_path):
     assert len(entries) == tps.INBOX_ENTRIES_CAP
 
 
-def test_trim_drops_oldest_and_keeps_newest(tmp_path):
+def test_trim_drops_oldest_and_keeps_newest(tmp_path: Path) -> None:
     """Trimming is oldest-first: the newest entry is always still there."""
     inbox = tmp_path / "team-lead.json"
     for i in range(tps.INBOX_ENTRIES_CAP + 10):
@@ -527,7 +581,7 @@ def test_trim_drops_oldest_and_keeps_newest(tmp_path):
     assert "m0" not in ids
 
 
-def test_under_the_cap_nothing_is_dropped(tmp_path):
+def test_under_the_cap_nothing_is_dropped(tmp_path: Path) -> None:
     inbox = tmp_path / "team-lead.json"
     for i in range(5):
         tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
@@ -535,7 +589,9 @@ def test_under_the_cap_nothing_is_dropped(tmp_path):
     assert [e["msg_id"] for e in entries] == ["m0", "m1", "m2", "m3", "m4"]
 
 
-def test_contended_push_is_transient_not_a_broken_channel(monkeypatch, tmp_path):
+def test_contended_push_is_transient_not_a_broken_channel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A contended lock must not be conflated with a failed write."""
     _healthy_terminal(monkeypatch, tmp_path)
     monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
@@ -548,12 +604,12 @@ def test_contended_push_is_transient_not_a_broken_channel(monkeypatch, tmp_path)
         message = "hi"
         logical_receiver_id = "mb1"
 
-    out = tps.attempt_teammate_push_reported("t1", [_Msg()])
+    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
     assert out.pushed is False and out.reason == "inbox_contended"
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_contended_row_is_logged_once_not_once_per_tick(caplog):
+def test_contended_row_is_logged_once_not_once_per_tick(caplog: pytest.LogCaptureFixture) -> None:
     """The reconciler retries a contended row every tick; the log must not."""
     import logging
 
@@ -569,7 +625,9 @@ def test_contended_row_is_logged_once_not_once_per_tick(caplog):
 # --- the three probes the r3 ruling names ------------------------------------
 
 
-def test_a_one_push_lands_the_other_is_contended_and_left_for_the_reconciler(tmp_path):
+def test_a_one_push_lands_the_other_is_contended_and_left_for_the_reconciler(
+    tmp_path: Path,
+) -> None:
     """(a) Two concurrent pushes to one inbox: one lands, one is contended.
 
     The contended one writes NOTHING, which is what leaves its row PENDING for
@@ -600,7 +658,7 @@ def test_a_one_push_lands_the_other_is_contended_and_left_for_the_reconciler(tmp
     assert [e["msg_id"] for e in json.loads(inbox.read_text())] == ["a", "b"]
 
 
-def test_b_a_contended_push_never_blocks(tmp_path):
+def test_b_a_contended_push_never_blocks(tmp_path: Path) -> None:
     """(b) MUTANT: restore the 1s blocking acquire and this wall-clock bound fails.
 
     Two attempts plus one short pause, so the whole contended path is bounded by
@@ -625,7 +683,7 @@ def test_b_a_contended_push_never_blocks(tmp_path):
     assert elapsed < budget, f"contended push took {elapsed:.3f}s, budget {budget:.3f}s"
 
 
-def test_c_an_uncontended_push_is_still_synchronous(tmp_path):
+def test_c_an_uncontended_push_is_still_synchronous(tmp_path: Path) -> None:
     """The ruling keeps the fast path fast: no pause when nothing contends."""
     import time as _time
 
@@ -641,7 +699,7 @@ def test_c_an_uncontended_push_is_still_synchronous(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_invalidate_does_not_scan_the_whole_terminal_cache():
+def test_invalidate_does_not_scan_the_whole_terminal_cache() -> None:
     """MUTANT: put the __session__ keys back in the shared dict and restore the
     `for k in list(cache)` scan, and this cost curve bends with cache size.
 
@@ -682,7 +740,7 @@ def test_invalidate_does_not_scan_the_whole_terminal_cache():
     )
 
 
-def test_invalidate_still_drops_the_terminal_and_session_entries():
+def test_invalidate_still_drops_the_terminal_and_session_entries() -> None:
     """The O(1) split must not change what an invalidation actually evicts."""
     import time as _time
 
@@ -699,3 +757,77 @@ def test_invalidate_still_drops_the_terminal_and_session_entries():
         assert db_mod._session_metadata_cache == {}
     finally:
         db_mod.clear_terminal_metadata_cache()
+
+
+# ---------------------------------------------------------------------------
+# A permanent lock error is a BROKEN channel, not a busy one (r7 repair 1).
+# ---------------------------------------------------------------------------
+
+
+def test_permanent_lock_error_is_a_write_failure_not_contention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MUTANT: swallow the PermissionError back into `return None` and this fails.
+
+    Verdict r1's blocker: every OSError from os.open became None, the caller read
+    that as inbox_contended, the write-failure ledger was never armed, and
+    native_fallback_reason kept answering healthy -- so the hook gate suppressed
+    the fallback indefinitely for a seat whose inbox can never be written.
+    """
+    _healthy_terminal(monkeypatch, tmp_path)
+    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
+    tps.clear_native_write_failure("t1")
+
+    real_open = os.open
+
+    def _deny(path: Any, *a: Any, **k: Any) -> Any:
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", _deny)
+
+    class _Msg:
+        id = 11
+        sender_id = "w1"
+        message = "hi"
+        logical_receiver_id = "mb1"
+
+    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
+    assert out.pushed is False
+    assert out.reason == "write_failed", f"permanent error reported as {out.reason!r}"
+
+    monkeypatch.setattr(os, "open", real_open)
+    assert tps.native_fallback_reason("t1") == "native_write_failed"
+
+
+def test_permanent_lock_error_returns_false_from_the_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer's own contract: False (failure), never None (contention)."""
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    real_open = os.open
+
+    def _deny(path: Any, *a: Any, **k: Any) -> Any:
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", _deny)
+    assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is False
+
+
+def test_a_held_lock_is_still_only_contention(tmp_path: Path) -> None:
+    """The repair must not turn an ordinary race into a failure."""
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(inbox.resolve()) + ".lock")
+    import os as _os
+
+    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
+    try:
+        assert tps._write_inbox_entry(inbox, {"msg_id": "y"}) is None
+    finally:
+        _os.close(held)
+        lock.unlink(missing_ok=True)

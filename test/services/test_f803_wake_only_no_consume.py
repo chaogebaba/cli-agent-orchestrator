@@ -479,9 +479,7 @@ def _seat_meta_and_flags(monkeypatch):
     monkeypatch.setattr(
         _dbs.ConfigService,
         "get",
-        staticmethod(
-            lambda key, default=None: True if key == "supervisor.doorbell" else default
-        ),
+        staticmethod(lambda key, default=None: True if key == "supervisor.doorbell" else default),
         raising=False,
     )
 
