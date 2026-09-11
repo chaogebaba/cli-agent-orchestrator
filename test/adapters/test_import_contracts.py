@@ -40,16 +40,12 @@ AC11_LEGACY_IMPORTERS = {
     "services/fleet_service.py",
     "services/terminal_service.py",
     "cli/main.py",
-    # WP-ARCH phase 3a (#584) adds ONE entry. The five delivery hook points sit in
-    # ``clients/database.py``, ``services/mailbox_service.py`` and
-    # ``services/inbox_service.py``, but each is a legacy-to-legacy call into
-    # ``services/delivery_mirror.py``, which is the only phase-3a file that names
-    # the new tree. That is lane C's phase-1 pattern applied again, and for the
-    # same reason: the contact surface a reviewer has to read stays at one file
-    # instead of spreading across the two largest legacy packages.
-    "services/delivery_mirror.py",
+    # WP-ARCH phase 3a (#584) added ONE entry, ``services/delivery_mirror.py``,
+    # for the five observational hook points. Shadow-live mode is retired (#738)
+    # and the bridge went with it; the PATTERN did not, and the two entries below
+    # are its later applications.
     # WP-ARCH phase 2a (#583) adds ONE entry, and it is a shim for the same
-    # reason ``services/delivery_mirror.py`` is. D3b puts the hook producer's
+    # reason phase 3a's bridge was. D3b puts the hook producer's
     # append inside the two shipped route handlers (``api/main.py:4788`` and
     # ``:4830``), which is the right place for the APPEND and an impossible one
     # for the IMPORT: the ``adapters-only-via-composition-root`` contract forbids

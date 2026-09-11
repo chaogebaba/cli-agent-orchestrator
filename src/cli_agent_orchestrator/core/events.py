@@ -67,13 +67,15 @@ FLEET_TERMINAL_ID = "__fleet__"
 #: caused, and the value its ``fed_by`` payload field then carries (D5).
 #:
 #: It lives here for the same reason ``FLEET_TERMINAL_ID`` does: the producer that
-#: writes it is an adapter and the agreement classifier that must drop rows
-#: carrying it sits in ``app``, which the ``adapters-only-via-composition-root``
-#: contract forbids from importing ``adapters`` at all.  A constant both sides
-#: must agree on, with no import path between them, is a core vocabulary constant.
+#: writes it is an adapter, while any reader that must drop the rows carrying it
+#: sits in ``app``, which the ``adapters-only-via-composition-root`` contract
+#: forbids from importing ``adapters`` at all.  A constant both sides must agree
+#: on, with no import path between them, is a core vocabulary constant.  The AC10
+#: agreement classifier was that reader until #738 retired it; D1's publisher is
+#: what makes the field load-bearing again, so the spelling is pinned now.
 #: A second spelling would be exactly the defect D5 exists to prevent, arriving by
-#: a different door: the classifier would stop recognising the echoes and the
-#: agreement report would go back to comparing the projection with itself.
+#: a different door: a reader would stop recognising the echoes and go back to
+#: comparing the projection with itself.
 PROJECTION_ORIGIN = "worker_truth"
 
 
@@ -280,8 +282,8 @@ class EventDraft(BaseModel):
         """Timestamps are aware UTC, fork-wide convention.
 
         A naive timestamp here would sort correctly against other naive ones and
-        wrongly against everything else, which is exactly the class of bug the
-        agreement report (AC10) must not have to explain away.
+        wrongly against everything else, which is exactly the class of bug a
+        fleet-wide read must not have to explain away.
         """
         if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
             raise ValueError("observed_at must be timezone-aware (UTC)")

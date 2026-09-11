@@ -3,18 +3,18 @@
 **These assert an EMISSION, not merely the absence of a paste.** An arm that
 checks only for silence certifies silence, and silence at the seat is #604 — the
 failure this whole phase exists to remove. The gate's r1 round found exactly that
-hole: the `shadow` position produced no paste AND no native write, and the unit
+hole: a non-serving position produced no paste AND no native write, and the unit
 suite of the day was satisfied because it counted pastes.
 
-The four positions do not share a carrier, and that is the design rather than an
+The positions do not share a carrier, and that is the design rather than an
 accident:
 
 * **`on`** — the queue's tick owns the seat and emits through ``wake_seat``.
   That path is covered in ``test/app/delivery/test_seat_wake.py``.
-* **`off`, `shadow`, `drain`** — the queue does not serve the seat, so the only
-  remaining carrier is the F136 chain into ``ring_supervisor_doorbell``, which is
-  why A1.5 flips ``supervisor.wake.native``'s shipped default to True. THIS file
-  covers those three.
+* **`off`, `drain`** — the queue does not serve the seat, so the only remaining
+  carrier is the F136 chain into ``ring_supervisor_doorbell``, which is why A1.5
+  flips ``supervisor.wake.native``'s shipped default to True. THIS file covers
+  those two.
 
 The break r1 shipped was in that chain: ``cc_inbox_path`` is K2's pull-mode file,
 ``supervisor.mailbox_pull`` ships False, so the runner returned ``no_path``,
@@ -48,9 +48,10 @@ from cli_agent_orchestrator.services.inbox_service import InboxService
 SEAT_TERMINAL = "sup-p3b01"
 WORKER_TERMINAL = "wrk-p3b01"
 
-#: The three positions where the QUEUE does not serve the seat. ``on`` is absent
+#: The positions where the QUEUE does not serve the seat. ``on`` is absent
 #: because there the tick is the carrier and its coverage lives with the tick.
-NON_QUEUE_POSITIONS = [SwitchPosition.OFF, SwitchPosition.SHADOW, SwitchPosition.DRAIN]
+#: ``shadow`` was a third until #738 retired it.
+NON_QUEUE_POSITIONS = [SwitchPosition.OFF, SwitchPosition.DRAIN]
 
 
 @pytest.fixture
@@ -213,8 +214,8 @@ def test_the_seat_is_woken_natively_in_every_non_queue_position(
     """An EMISSION per position, at the shipped defaults (§A1.5).
 
     The gate's r1 round is the reason this is parametrised over positions rather
-    than asserted once: the `on` arm passed, `shadow` produced nothing at all,
-    and no unit case noticed because every one of them counted pastes.
+    than asserted once: the `on` arm passed, a non-serving position produced
+    nothing at all, and no unit case noticed because every one counted pastes.
 
     A run where the ring count is zero fails, and it fails in the direction that
     matters — a paste is an ugly carrier, silence is the bug.
@@ -279,7 +280,7 @@ def test_a_seat_with_a_content_channel_still_writes_the_file(seat_db, tmp_path) 
         "write_supervisor_callback_notification",
         side_effect=lambda **kwargs: written.append(kwargs) or _WrittenResult(),
     ):
-        _drive(SwitchPosition.SHADOW, recorder)
+        _drive(SwitchPosition.DRAIN, recorder)
 
     assert written, "a configured content channel must still be written"
     assert recorder.native_rings, "and the wake still rings"
@@ -293,7 +294,7 @@ class _WrittenResult:
 # ---------------------------------------------------------------------------
 # §6 — the legacy inbox is READ-ONLY from the flip.
 #
-# "At the shadow-to-on flip the legacy inbox goes read-only: it stops accepting
+# "At the flip to `on` the legacy inbox goes read-only: it stops accepting
 # inserts, existing rows drain through the old path, and new rows go to
 # delivery_msg. Dual-write is excluded, a dual-written row being a fifth carrier
 # that would reproduce #506 inside the fix."
@@ -309,7 +310,6 @@ def flip_env(tmp_path, monkeypatch):
     from cli_agent_orchestrator.adapters.store.migrator import migrate
     from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
     from cli_agent_orchestrator.app.delivery import wiring
-    from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
 
     db_file = tmp_path / "flip.sqlite"
     engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
@@ -338,11 +338,7 @@ def flip_env(tmp_path, monkeypatch):
     store = SqliteQueueStore(pool, clock=clock)
 
     def install(position: SwitchPosition) -> None:
-        wiring.install_delivery(
-            wiring.DeliveryRuntime(
-                store=store, clock=clock, position=position, mirror=MirrorWriter(store, clock)
-            )
-        )
+        wiring.install_delivery(wiring.DeliveryRuntime(store=store, clock=clock, position=position))
 
     yield sessions, store, install
     wiring.reset_delivery()
@@ -387,17 +383,16 @@ def test_on_produces_zero_legacy_inbox_inserts(flip_env) -> None:
 
     assert _legacy_row_count(sessions) == before, "the legacy inbox must accept no inserts at `on`"
     assert store.count(mode=QueueMode.LIVE) == 1
-    assert store.count(mode=QueueMode.SHADOW) == 0, "no mirror on top of the authority row"
     assert message_id > 0, "the caller still gets an integer handle"
 
 
 @pytest.mark.parametrize(
     "position",
-    [SwitchPosition.OFF, SwitchPosition.SHADOW, SwitchPosition.DRAIN],
+    [SwitchPosition.OFF, SwitchPosition.DRAIN],
     ids=lambda p: p.value,
 )
 def test_the_other_positions_still_write_the_legacy_row(flip_env, position) -> None:
-    """`off` and `drain` write legacy only; `shadow` writes legacy plus a mirror.
+    """`off` and `drain` write the legacy row and no queue row.
 
     `drain` is deliberately in this list rather than with `on`. §6: "the tick
     keeps claiming, injecting and reclaiming the mode='live' rows already in
@@ -413,11 +408,7 @@ def test_the_other_positions_still_write_the_legacy_row(flip_env, position) -> N
 
     assert _legacy_row_count(sessions) == 1
     assert store.count(mode=QueueMode.LIVE) == 0, "only `on` writes the authority row"
-    # 3a's shadow MIRROR is deliberately not asserted here. It fires from
-    # `_create_inbox_message_unfenced`, one level above the choke point this
-    # test drives directly, and it has its own coverage in
-    # test/app/delivery/test_mirror.py. What matters at this seam is that the
-    # legacy row is still written and no LIVE row appears.
+    assert store.count() == 0, "and no other row: #738 left no observational writer"
 
 
 def test_the_window_dedup_is_carried_with_all_five_conjuncts(flip_env) -> None:
@@ -557,12 +548,16 @@ def test_the_seat_drains_the_queue_at_on_and_the_ack_closes_the_epoch(flip_env) 
     listed = list_messages("mb_p3b_sup")
     assert [item["id"] for item in listed["items"]] == [message_id]
     assert listed["items"][0]["message"] == "FLIP_PROBE"
-    assert listed["items"][0]["msg_id"], "a listed row names its queue id for cao diag"
+    msg_id = listed["items"][0]["msg_id"]
+    assert msg_id, "a listed row names its queue id for cao diag"
 
     result = ack_messages(SEAT_TERMINAL, message_id)
     assert result["consumed_through_id"] == message_id
 
-    settled = store.get_by_legacy_id(message_id)
+    # Read by the queue id the listing itself carried. The legacy-id lookup this
+    # used to go through was the mirror's join key and went with it (#738); the
+    # id a seat is handed is the one a reader has.
+    settled = store.get(msg_id)
     assert settled is not None and settled.state is MsgState.DELIVERED
     closed = store.digest_at("mb_p3b_sup", digest.epoch)
     assert closed is not None and closed.consumed_via == "mcp_ack"
@@ -723,172 +718,5 @@ def test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery(flip_env
 
     # And it is NOT muted in the positions where the queue does not serve the
     # seat, because there it is still part of the legacy chain.
-    install(SwitchPosition.SHADOW)
+    install(SwitchPosition.DRAIN)
     assert seat_wake_reconcile._queue_owns_delivery() is False
-
-
-# ---------------------------------------------------------------------------
-# I5 — an emission the stored rows cannot see is the failure I5 exists to end.
-#
-# The r2 gate's blocker: at the exact head the shadow live arm wrote 500 bytes
-# to the seat's socket, left the pane byte-identical, and recorded
-# `delivery_attempt=0`. The carrier fired and `cao diag <msg_id>` said nothing
-# was ever attempted, which is the pane archaeology #604 was diagnosed through.
-#
-# This case drives the PRODUCTION chain — the real `_f136_post_delivery`, the
-# real `ring_supervisor_doorbell`, the real `_attempt_native_ring` — and stubs
-# only the socket itself, so it fails if either the attempt insert or the
-# emission is removed.
-# ---------------------------------------------------------------------------
-
-
-class _SocketCapture:
-    """Stands in for the seat's Unix socket, and for nothing else."""
-
-    def __init__(self) -> None:
-        self.writes: list[tuple[str, str]] = []
-
-    def write(self, socket_path: str, payload: str, auth_token: Any = None) -> None:
-        self.writes.append((socket_path, payload))
-        return None
-
-
-def _registry_record() -> Any:
-    from cli_agent_orchestrator.services.cc_session_registry import RegistryRecord
-
-    return RegistryRecord(
-        pid=4242,
-        session_id="sess-p3b",
-        cwd="/tmp/p3b",
-        tmux=f"cao-p3b:{SEAT_TERMINAL}.%1",
-        version="2.1.5",
-        peer_protocol=1,
-        messaging_socket_path="/run/p3b/seat.sock",
-        proc_start=99,
-        status="idle",
-        status_updated_at="2026-09-05T00:00:00Z",
-        updated_at="2026-09-05T00:00:00Z",
-        raw={},
-    )
-
-
-def _drive_shadow_production(capture: _SocketCapture, pastes: list[str]) -> None:
-    """One real delivery cycle at `shadow`, with only the socket stubbed.
-
-    `ring_supervisor_doorbell` is deliberately NOT patched here, unlike the
-    position arms above: the row this case is about is written inside it, so a
-    recorder standing in for the ring would assert against a double and prove
-    nothing about the production chain.
-    """
-    from cli_agent_orchestrator.services import cc_session_registry
-    from cli_agent_orchestrator.services.cc_session_registry import ResolveResult
-
-    service = InboxService()
-    coalesce = MagicMock()
-
-    def _submit(terminal_id: str, max_row_id: int, **kwargs: Any) -> None:
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-
-        ring_supervisor_doorbell(terminal_id, max_row_id, **kwargs)
-
-    coalesce.submit.side_effect = _submit
-    metadata = {
-        "tmux_session": "cao-p3b",
-        "tmux_window": SEAT_TERMINAL,
-        "lifecycle_generation": 1,
-        "recovery_state": None,
-        "metadata": {},
-    }
-    with (
-        patch(
-            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service",
-            coalesce,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch.object(
-            cc_session_registry, "resolve_target", return_value=ResolveResult(_registry_record())
-        ),
-        patch.object(cc_session_registry, "check_version_guard", return_value=None),
-        patch.object(cc_session_registry, "read_peer_token", return_value="tok"),
-        patch.object(cc_session_registry, "verify_wake", return_value=True),
-        patch.object(cc_session_registry, "write_to_socket", side_effect=capture.write),
-        patch(
-            "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
-            side_effect=lambda terminal_id, *a, **k: pastes.append(terminal_id),
-        ),
-        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
-        patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
-    ):
-        outcome = service._f136_run_callback_delivery(SEAT_TERMINAL)
-        service._f136_post_delivery(SEAT_TERMINAL, outcome)
-
-
-def _seat_wake_attempts(store: Any, msg_id: str) -> list[Any]:
-    from cli_agent_orchestrator.core.delivery import CARRIER_SEAT_WAKE
-
-    return [a for a in store.attempts_for(msg_id) if a.carrier == CARRIER_SEAT_WAKE]
-
-
-def test_the_shadow_seat_wake_writes_exactly_one_attempt_row(
-    flip_env: Any, monkeypatch: Any
-) -> None:
-    """One emitted epoch, one socket write, one `delivery_attempt` row, no paste.
-
-    All four are asserted together on purpose. Counting the row alone would pass
-    on a build that recorded an attempt nothing emitted, and counting the bytes
-    alone is the r2 head — which emitted and recorded nothing, so the emission
-    was true and unreadable.
-    """
-    from cli_agent_orchestrator.clients.database import _create_inbox_message_unfenced
-    from cli_agent_orchestrator.core.delivery import AttemptOutcome
-
-    # F747 (#747): this case drives the REAL ring_supervisor_doorbell (see
-    # _drive_shadow_production), and supervisor.doorbell now SHIPS OFF, so the
-    # ring returns skipped_disabled and writes nothing. The test is about the
-    # doorbell's production chain, so it states the posture it needs rather than
-    # inheriting a shipped default that has since flipped.
-    monkeypatch.setenv("CAO_SUPERVISOR_DOORBELL", "true")
-
-    sessions, store, install = flip_env
-    with sessions.begin() as db:
-        _seat(db)
-        db.add(
-            TerminalModel(
-                id=WORKER_TERMINAL,
-                tmux_session="cao-p3b",
-                tmux_window=WORKER_TERMINAL,
-                provider="claude_code",
-                agent_profile="grunt",
-                init_state="ready",
-            )
-        )
-    install(SwitchPosition.SHADOW)
-
-    sent = _create_inbox_message_unfenced(WORKER_TERMINAL, SEAT_TERMINAL, "SHADOW_ATTEMPT_PROBE")
-    assert store.count(mode=QueueMode.SHADOW) == 1, "3a's mirror must have written the shadow row"
-    # Read by the LEGACY id rather than through `pending_for_receiver`, which
-    # serves `mode='live'` rows only — a shadow row is unclaimable by
-    # construction (D9), and that filter is the reason the r2 arm's row was
-    # invisible to every consumer that looked for it the delivery way.
-    shadow = store.get_by_legacy_id(int(sent.id))
-    assert shadow is not None
-
-    capture = _SocketCapture()
-    pastes: list[str] = []
-    _drive_shadow_production(capture, pastes)
-
-    assert len(capture.writes) == 1, "the seat's carrier must emit exactly once per epoch"
-    attempts = _seat_wake_attempts(store, shadow.msg_id)
-    assert len(attempts) == 1, (
-        "one emitted epoch owes exactly one delivery_attempt row (I5); "
-        f"got {len(attempts)} for msg_id={shadow.msg_id}"
-    )
-    assert attempts[0].outcome is AttemptOutcome.DELIVERED
-    assert pastes == [], "a supervisor-role receiver is never pasted (K8)"

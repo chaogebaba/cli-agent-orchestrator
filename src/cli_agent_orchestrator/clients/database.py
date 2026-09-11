@@ -1906,82 +1906,6 @@ event.listen(SessionLocal, "after_rollback", _f413_after_rollback)
 # Snapshot stash before each nested transaction so rollback can restore it.
 event.listen(SessionLocal, "after_begin", _f413_after_begin)
 
-# ---------------------------------------------------------------------------
-# WP-ARCH phase 3a — the shadow queue's observation seam.
-#
-# ``clients/database.py`` deliberately does NOT import the new tree.  Every hook
-# here calls ``services/delivery_mirror.py``, which is the one legacy module that
-# knows both halves; that keeps the whole phase-3a contact surface at one file a
-# reviewer can read, exactly as lane C did for the diag CLI in phase 1.
-#
-# The import is inside the accessor rather than at module scope because
-# ``delivery_mirror`` imports ``app.delivery``, and this module is imported by
-# essentially everything: a module-scope import here would put the new tree on
-# the critical path of every CLI invocation, including ``cao doctor``.
-# ---------------------------------------------------------------------------
-
-_SHADOW_OBSERVE_STASH_KEY = "_wp_arch_p3a_observe"
-
-
-def _delivery_mirror() -> Any:
-    """The phase-3a mirror module, or a no-op stand-in if it cannot be imported.
-
-    A stand-in rather than a raise: the mirror is observational, and an import
-    failure inside it must not be able to stop a message being inserted or
-    settled.  Callers here are written as if the module is always present.
-    """
-    try:
-        from cli_agent_orchestrator.services import delivery_mirror
-
-        return delivery_mirror
-    except Exception:  # noqa: BLE001 — an observational import may never break delivery
-        logger.debug("phase-3a delivery mirror unavailable", exc_info=True)
-        return _NULL_DELIVERY_MIRROR
-
-
-class _NullDeliveryMirror:
-    """Every mirror entry point, doing nothing."""
-
-    @staticmethod
-    def record_inbox_row(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    @staticmethod
-    def observe_messages(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    @staticmethod
-    def observe_veto(*args: Any, **kwargs: Any) -> None:
-        return None
-
-
-_NULL_DELIVERY_MIRROR = _NullDeliveryMirror()
-
-
-def _stash_shadow_observation(db: Any, message_ids: "Iterable[int]") -> None:
-    """Remember ids to re-read once the caller's transaction commits."""
-    try:
-        db.info.setdefault(_SHADOW_OBSERVE_STASH_KEY, []).extend(int(m) for m in message_ids)
-    except Exception:  # noqa: BLE001
-        logger.debug("phase-3a observation stash failed", exc_info=True)
-
-
-@event.listens_for(Session, "after_commit")
-def _wp_arch_p3a_after_commit(session: Session) -> None:
-    """Drain the stash once the terminal transition is durable.
-
-    ``pop`` rather than read-and-clear: a session is reused across transactions,
-    and an id left in the stash would be re-observed on every later commit of
-    that session.  The mirror is idempotent, so that would be harmless and
-    wasteful rather than wrong — but wasteful on the single writer §10 names as a
-    contention risk is not free.
-    """
-    ids = session.info.pop(_SHADOW_OBSERVE_STASH_KEY, None)
-    if not ids:
-        return
-    _delivery_mirror().observe_messages(ids)
-
-
 _READY_COMMIT_CALLBACK = "_cao_ready_commit_callback"
 
 
@@ -4833,23 +4757,58 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, 
     return receiver_id, mailbox_id, cast(int | None, generation)
 
 
+def callback_barrier_dispatch_permission_in_db(
+    db: Any,
+    sender_id: str,
+    receiver_id: str,
+) -> str:
+    """Classify a barrier dispatch in the caller's transaction.
+
+    Returns one of:
+
+    * ``"allowed"`` — the sender owns the receiver's callback route.
+    * ``"receiver_unresolvable"`` — the receiver address does not resolve to a
+      live terminal row at all (deleted, never existed, unknown mailbox).
+    * ``"not_owned"`` — the receiver exists but its callback route belongs to
+      someone else.
+
+    F893 (#745) H3: these three were collapsed into one boolean, so a barrier
+    aimed at a terminal that had ALREADY DIED came back as "callback barriers
+    require supervisor ownership of the receiver". On grok-box-009 that
+    misdiagnosis cost a whole live round: two of three barrier members
+    succeeded from the same sender while the third had 404'd on the send one
+    step earlier, and the refusal text sent the investigation after a
+    non-existent ownership bug instead of the dead worker. A refusal has to
+    name the condition it actually found.
+    """
+    try:
+        receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
+    except ValueError:
+        return "receiver_unresolvable"
+    receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
+    if receiver is None:
+        return "receiver_unresolvable"
+    if receiver.caller_id == sender_id:
+        return "allowed"
+    sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+    if sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id:
+        return "allowed"
+    return "not_owned"
+
+
 def callback_barrier_dispatch_allowed_in_db(
     db: Any,
     sender_id: str,
     receiver_id: str,
 ) -> bool:
     """Return whether sender owns the receiver route in the caller's transaction."""
-    try:
-        receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
-    except ValueError:
-        return False
-    receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
-    if receiver is None:
-        return False
-    if receiver.caller_id == sender_id:
-        return True
-    sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
-    return bool(sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id)
+    return callback_barrier_dispatch_permission_in_db(db, sender_id, receiver_id) == "allowed"
+
+
+def callback_barrier_dispatch_permission(sender_id: str, receiver_id: str) -> str:
+    """Classify a barrier dispatch against the target worker's callback route."""
+    with SessionLocal() as db:
+        return callback_barrier_dispatch_permission_in_db(db, sender_id, receiver_id)
 
 
 def callback_barrier_dispatch_allowed(sender_id: str, receiver_id: str) -> bool:
@@ -8109,9 +8068,7 @@ def delete_terminal_and_warm_intent(
         prefix = f"[released from {terminal_id} ({profile or 'unknown'}) — terminal reaped]\n"
         _reap_flipped_rows: list[tuple[str, int, str | None]] = []
         _f642_reparented_ids: list[int] = []  # moved to target receiver
-        _p3a_reaped_ids: list[int] = []
         for row in held.all():
-            _p3a_reaped_ids.append(int(row.id))
             row.message = prefix + row.message
             if target_id is None:
                 row.status = MessageStatus.CANCELLED.value
@@ -8126,12 +8083,6 @@ def delete_terminal_and_warm_intent(
                     (MessageStatus.PENDING.value, int(row.id), target_mailbox_id)
                 )
                 _f642_reparented_ids.append(int(row.id))
-        # WP-ARCH phase 3a, hook point 4b — reaping ends or moves these rows and
-        # does NOT pass through write_through_terminal_state, so without this the
-        # shadow copies would sit ready and read as legacy-early disagreements
-        # for the life of the queue. Sub-phase 3b carries the re-parent itself
-        # (§13c); here the ids are only re-read after commit.
-        _stash_shadow_observation(db, _p3a_reaped_ids)
         # F413 D7b: create obligations for flipped rows
         if _reap_flipped_rows:
             db.flush()
@@ -9974,19 +9925,6 @@ def _close_barrier_owner_gone_in_db(db: Any, barrier: Any, now: datetime) -> Non
     )
     if changed != 1:
         return
-    # WP-ARCH phase 3a, hook point 4c — the ids are read BEFORE the bulk update,
-    # because a bulk UPDATE with synchronize_session=False returns a count and
-    # not the rows it touched, and after it runs the predicate no longer matches.
-    _stash_shadow_observation(
-        db,
-        [
-            int(row_id)
-            for (row_id,) in db.query(InboxModel.id).filter(
-                InboxModel.barrier_id == barrier.id,
-                InboxModel.status == MessageStatus.HELD.value,
-            )
-        ],
-    )
     db.query(InboxModel).filter(
         InboxModel.barrier_id == barrier.id,
         InboxModel.status == MessageStatus.HELD.value,
@@ -10278,8 +10216,8 @@ def _queue_write_through(
     """Hand one new message to the queue instead of the inbox (§6, WP-ARCH 3b).
 
     Returns ``(surrogate_id, msg_id)`` at position ``on``, and ``None``
-    everywhere else — ``off`` and ``shadow`` write their legacy row exactly as
-    they do today, and ``shadow`` additionally mirrors it. Never raises: a queue
+    everywhere else — ``off`` and ``drain`` write their legacy row exactly as
+    they do today. Never raises: a queue
     that cannot be written returns ``None`` and the caller falls back to the
     legacy insert, which degrades to the pre-flip behaviour rather than losing
     the message.
@@ -10514,7 +10452,7 @@ def _insert_routed_inbox_row(
         )
     # WP-ARCH 3b / §6: at `on` the legacy inbox is READ-ONLY.
     #
-    # "At the shadow-to-on flip the legacy inbox goes read-only: it stops
+    # "At the flip to `on` the legacy inbox goes read-only: it stops
     # accepting inserts, existing rows drain through the old path, and new rows
     # go to delivery_msg. Dual-write is excluded, a dual-written row being a
     # fifth carrier that would reproduce #506 inside the fix."
@@ -11127,16 +11065,6 @@ def _create_inbox_message_unfenced(
         )
         db.commit()
         _refresh_if_persistent(db, inbox_msg)
-        # WP-ARCH phase 3a, hook point 1 — the shadow queue mirrors this row.
-        # POST-COMMIT deliberately: the queue's store holds its own connection to
-        # this same SQLite file, so writing from inside the transaction above
-        # would contend for the write lock it holds and would leave a shadow row
-        # behind for a legacy row that then rolled back. Behind the switch and
-        # non-raising; see services/delivery_mirror.py.
-        _delivery_mirror().record_inbox_row(
-            inbox_msg,
-            logical_receiver_id=logical_receiver_id if mailbox_schema else None,
-        )
         result = _inbox_message_from_row(inbox_msg)
         if result.barrier_id is not None and result.barrier_member_key is not None:
             from cli_agent_orchestrator.services.stalled_callback_watchdog import (
@@ -11207,10 +11135,6 @@ def cancel_pending_watchdog_message(message_id: int, terminal_id: str) -> bool:
                 synchronize_session=False,
             )
         )
-        # WP-ARCH phase 3a, hook point 4d — the third cancel writer. The id is
-        # known here, so no pre-read is needed.
-        if changed == 1:
-            _stash_shadow_observation(db, [message_id])
         return changed == 1
 
 
@@ -12240,12 +12164,6 @@ def settle_delivery_attempt(
             raise RuntimeError("delivery confirmation compare-and-set lost")
         if status == MessageStatus.DELIVERED and on_confirmed is not None:
             on_confirmed()
-        _settled_ids = list(ids)
-    # WP-ARCH phase 3a, hook point 3 — outside the ``with``, so the settlement
-    # has committed before the mirror re-reads it. The mirror reads each row's
-    # CURRENT status rather than trusting this edge, which is what makes a missed
-    # edge self-correcting. Behind the switch and non-raising.
-    _delivery_mirror().observe_messages(_settled_ids)
     return True
 
 
@@ -15594,13 +15512,6 @@ def write_through_terminal_state(
     ids = [int(m) for m in message_ids]
     if not ids:
         return
-    # WP-ARCH phase 3a, hook point 4. This function is the seam every non-delivery
-    # terminal transition passes through — expiry, digest and F578 supersession all
-    # call it — but it runs inside the CALLER's transaction, so the shadow row
-    # cannot be advanced here. The ids are stashed and drained after commit by
-    # ``_wp_arch_p3a_after_commit`` below, which is the same shape the F413
-    # doorbell stash already uses.
-    _stash_shadow_observation(db, ids)
     rows = db.query(DeliveryLedgerModel).filter(DeliveryLedgerModel.message_id.in_(ids)).all()
     for row in rows:
         # Never clobber an ack (a consumed message stays consumed).

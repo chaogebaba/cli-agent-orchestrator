@@ -14,13 +14,12 @@ ignored" is therefore not expressible as a missing ``if`` in a hook; it would
 have to be a deleted install guard in the composition root, where the A/B suite
 sees it.
 
-**Ingestion never breaks the thing it observes.**  §7a states it for this
-sub-phase directly: the enqueue call sits behind the switch and does not raise
-into its caller.  Every function here swallows ``Exception`` and returns.  The
-stake is higher than phase 1's, because the thing being observed is message
-delivery: a shadow write that could raise into ``_create_inbox_message_unfenced``
-would turn a diagnostic into lost messages, which is the failure class the whole
-phase exists to remove.
+**A queue write never breaks the send it serves.**  §7a states it directly: the
+enqueue call sits behind the switch and does not raise into its caller.  Every
+function here swallows ``Exception`` and returns.  The stake is higher than
+phase 1's, because what is at risk is message delivery: a write that could raise
+into ``_create_inbox_message_unfenced`` would turn a queue fault into lost
+messages, which is the failure class the whole phase exists to remove.
 
 ``BaseException`` is deliberately NOT swallowed: a ``KeyboardInterrupt`` or a
 ``CancelledError`` arriving inside a hook belongs to the caller's control flow.
@@ -37,13 +36,7 @@ import logging
 import threading
 from dataclasses import dataclass
 
-from cli_agent_orchestrator.app.delivery.facts import (
-    LegacyEnqueue,
-    LegacyOutcome,
-    LegacySeatWake,
-    LegacyVeto,
-)
-from cli_agent_orchestrator.app.delivery.mirror import MirrorWriter
+from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
 from cli_agent_orchestrator.core.delivery import (
     EnqueueDraft,
     MsgKind,
@@ -64,18 +57,9 @@ __all__ = [
     "queue_owns_new_traffic",
     "queue_position",
     "record_completion",
-    "record_enqueue",
-    "record_outcome",
-    "record_seat_wake",
-    "record_veto",
     "reset_delivery",
     "write_through",
 ]
-
-#: How many hook failures are logged with a traceback before the logger falls
-#: silent.  A queue that is broken is broken for every subsequent write, and a
-#: warning per message would drown the log an operator needs to read.
-_MAX_LOGGED_FAILURES = 3
 
 
 @dataclass(frozen=True)
@@ -91,20 +75,17 @@ class DeliveryRuntime:
     store: QueueStore
     clock: Clock
     position: SwitchPosition
-    mirror: MirrorWriter
 
 
 _lock = threading.Lock()
 _runtime: DeliveryRuntime | None = None
-_failure_count = 0
 
 
 def install_delivery(runtime: DeliveryRuntime) -> None:
     """Arm the delivery hooks.  Called by ``bootstrap.py`` only."""
-    global _runtime, _failure_count
+    global _runtime
     with _lock:
         _runtime = runtime
-        _failure_count = 0
 
 
 def reset_delivery() -> None:
@@ -113,10 +94,9 @@ def reset_delivery() -> None:
     Used at shutdown, on the migrator-failed path, and by every test that
     installed a fake.
     """
-    global _runtime, _failure_count
+    global _runtime
     with _lock:
         _runtime = None
-        _failure_count = 0
 
 
 def delivery_runtime() -> DeliveryRuntime | None:
@@ -168,84 +148,6 @@ def queue_owns_new_traffic() -> bool:
     return queue_position() is SwitchPosition.ON
 
 
-def record_enqueue(fact: LegacyEnqueue) -> None:
-    """Mirror one committed legacy insert as a SHADOW row (3a's hook).
-
-    Sub-phase 3a's observational copy, and it stays exactly that. Two positions
-    write nothing at all:
-
-    * ``drain`` accepts no new queue rows — that is the position's whole point,
-      since it empties on its own budget while new traffic goes back to the
-      legacy inbox (§6);
-    * ``on`` has no legacy insert to mirror. There the queue is the AUTHORITY and
-      :func:`write_through` is what wrote the row, before the caller reached its
-      own insert. Mirroring here as well would produce the second row for one
-      message that §6 excludes as a fifth carrier — the exact defect the flip is
-      supposed to remove.
-
-    Returns ``None`` always, and callers in legacy code are written to ignore it.
-    """
-    runtime = _runtime
-    if runtime is None:
-        return
-    if runtime.position in (SwitchPosition.DRAIN, SwitchPosition.ON):
-        return
-    _guarded(
-        lambda: runtime.mirror.enqueue(fact, mode=QueueMode.SHADOW),
-        "enqueue",
-        str(fact.legacy_message_id),
-    )
-
-
-def record_outcome(fact: LegacyOutcome) -> None:
-    """Advance one SHADOW row from the legacy row's current status.
-
-    Inert once the queue owns delivery: at ``on`` the queue's own attempt rows
-    and states are the authority (I5), and letting a legacy edge settle a live
-    row would give one id two authorities — which is the defect D13 scopes the
-    legacy ledger out for.
-    """
-    runtime = _runtime
-    if runtime is None or runtime.position is SwitchPosition.ON:
-        return
-    _guarded(lambda: runtime.mirror.observe(fact), "outcome", str(fact.legacy_message_id))
-
-
-def record_seat_wake(fact: LegacySeatWake) -> None:
-    """Record the attempt row for one native seat wake legacy emitted (§A1.5).
-
-    ``off``, ``shadow`` and ``drain`` are the positions where the F136 chain IS
-    the seat's carrier, and this is what puts that emission on the record. At
-    ``on`` it is inert twice over: the doorbell is muted there (D6/K3) so nothing
-    calls this, and the tick's own attempt rows are the authority for a live row
-    (I5) — a legacy edge writing one would give a single id two authorities,
-    which is the defect D13 scopes the legacy ledger out for.
-
-    Inert at ``off`` by construction rather than by a position test: nothing is
-    installed there, so there is no shadow row to file an attempt against.
-    """
-    runtime = _runtime
-    if runtime is None or runtime.position is SwitchPosition.ON:
-        return
-    _guarded(
-        lambda: runtime.mirror.observe_seat_wake(fact),
-        "seat_wake",
-        str(fact.legacy_message_id),
-    )
-
-
-def record_veto(fact: LegacyVeto) -> None:
-    """Record an injection the legacy path declined.  Inert at ``on``, as above."""
-    runtime = _runtime
-    if runtime is None or runtime.position is SwitchPosition.ON:
-        return
-    _guarded(
-        lambda: runtime.mirror.observe_veto(fact),
-        "veto",
-        ",".join(str(mid) for mid in fact.legacy_message_ids),
-    )
-
-
 def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
     """Enqueue new traffic into the QUEUE instead of the legacy inbox (§6).
 
@@ -255,9 +157,8 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
 
     This is the flip §6 describes: "the legacy inbox goes read-only: it stops
     accepting inserts, existing rows drain through the old path, and new rows go
-    to ``delivery_msg``". Sub-phase 3a's ``record_enqueue`` mirror still exists
-    and still runs at ``shadow``; the difference here is authority, so the two
-    are deliberately separate functions rather than one with a mode flag.
+    to ``delivery_msg``".  It is the ONLY path from a legacy send into the queue.
+    Sub-phase 3a had a second, observational one; it is retired (#738).
 
     Dual-write is excluded, and the reason is in the same paragraph: a
     dual-written row is a fifth carrier and would reproduce #506 inside the fix.
@@ -342,21 +243,3 @@ def record_completion(receiver_id: str) -> tuple[str, ...]:
     except Exception:  # noqa: BLE001 — a cancel that cannot run must not break completion
         logger.warning("delivery: completion-cancel failed for %s", receiver_id, exc_info=True)
         return ()
-
-
-def _guarded(call: object, hook: str, subject: str) -> None:
-    global _failure_count
-    try:
-        call()  # type: ignore[operator]
-    except Exception:  # noqa: BLE001 — a shadow write may never break delivery
-        with _lock:
-            _failure_count += 1
-            should_log = _failure_count <= _MAX_LOGGED_FAILURES
-        if should_log:
-            logger.warning(
-                "delivery shadow %s failed for %s (the queue is observational in "
-                "this sub-phase; legacy delivery is unaffected)",
-                hook,
-                subject,
-                exc_info=True,
-            )

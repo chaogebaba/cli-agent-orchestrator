@@ -982,7 +982,12 @@ def mark_ready(
     session_uuid: str
     provider = terminal["provider"]
     if provider == "codex":
-        pid = pane_pid(terminal["tmux_session"], terminal["tmux_window"])
+        # F893 (#745): backend port, not this module's tmux-only pane_pid().
+        from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+        pid = _get_backend().get_pane_process_id(
+            terminal["tmux_session"], terminal["tmux_window"]
+        )
         session_uuid = capture_codex_uuid(pid, pane_launch_epoch(pid), cwd, terminal_id=terminal_id)
     elif provider == "grok_cli":
         candidate_uuid = terminal.get("provider_session_id")

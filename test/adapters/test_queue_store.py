@@ -11,7 +11,7 @@ Four of the phase's named mutants are killed in this file:
 * ``dead_by`` recomputed from the current ``available_at`` on re-offer (D12);
 * ``claim``'s ``mode='live'`` filter moved out of the statement (D9/B20);
 * the re-parent that rewrites ``receiver_id`` without the digest (§5 item 6);
-* the boot occupancy predicate counting shadow rows (D9/B16).
+* the boot occupancy predicate counting non-live rows (D9/B16).
 
 The last one is measured through :meth:`SqliteQueueStore.occupancy`, which is
 where a store can get it wrong; the pure half is in ``test/core/test_delivery.py``.
@@ -65,10 +65,18 @@ def live(key: str, receiver: str = "mb_super", **extra: object) -> EnqueueDraft:
     )
 
 
-def shadow(key: str, receiver: str = "mb_super", **extra: object) -> EnqueueDraft:
-    return EnqueueDraft(
-        idempotency_key=key, receiver_id=receiver, mode=QueueMode.SHADOW, **extra  # type: ignore[arg-type]
-    )
+def demote_to_legacy_mode(queue: SqliteQueueStore, msg_id: str) -> None:
+    """Rewrite one row's ``mode`` to the value #738 retired.
+
+    The enum has one member now, so a row in the old observational mode cannot be
+    ENQUEUED — but rows written by a build that had it are still on disk, and the
+    ``mode='live'`` conjunct exists for exactly them.  Writing the column
+    directly is the only way to present that condition, and it is honest: it is
+    what the database holds after an upgrade.
+    """
+    conn = queue._pool.connection()  # noqa: SLF001 — the condition IS the column
+    conn.execute("UPDATE delivery_msg SET mode = 'shadow' WHERE msg_id = ?", (msg_id,))
+    conn.commit()
 
 
 # ------------------------------------------------------------------- schema
@@ -110,12 +118,11 @@ def test_enqueue_stamps_the_deadline_once_at_creation(
 def test_a_replayed_enqueue_returns_the_existing_row(queue: SqliteQueueStore) -> None:
     """Replay-safety, which is what makes the mirror hook idempotent.
 
-    The same legacy insert observed twice must not produce two shadow rows, or
-    every doubly-observed message would read as a duplicate in the report the
-    phase exists to make trustworthy.
+    The same enqueue replayed must not produce two rows, or every retried send
+    would read as a duplicate.
     """
-    first = queue.enqueue(shadow("legacy-inbox:41", payload="hello"))
-    again = queue.enqueue(shadow("legacy-inbox:41", payload="hello"))
+    first = queue.enqueue(live("legacy-inbox:41", payload="hello"))
+    again = queue.enqueue(live("legacy-inbox:41", payload="hello"))
     assert again.msg_id == first.msg_id
     assert queue.count() == 1
 
@@ -140,14 +147,16 @@ def test_a_caller_expiry_shortens_the_stored_deadline(queue: SqliteQueueStore) -
 # -------------------------------------------------------------------- claim
 
 
-def test_claim_never_returns_a_shadow_row(queue: SqliteQueueStore, clock: FakeClock) -> None:
+def test_claim_never_returns_a_non_live_row(queue: SqliteQueueStore, clock: FakeClock) -> None:
     """The mutant: the ``mode='live'`` conjunct removed from the statement.
 
-    A surviving shadow row claimable at the flip means the tick injects a copy of
-    a message the legacy path already delivered — a second carrier over one id.
-    The row here is READY and DUE, so nothing but the mode conjunct excludes it.
+    A leftover observational row (#738 retired the mode that wrote them; the rows
+    outlive it) claimable here means the tick injects a copy of a message the
+    legacy path already delivered — a second carrier over one id.  The row is
+    READY and DUE, so nothing but the mode conjunct excludes it.
     """
-    queue.enqueue(shadow("legacy-inbox:1"))
+    row = queue.enqueue(live("legacy-inbox:1"))
+    demote_to_legacy_mode(queue, row.msg_id)
     clock.advance(seconds=1)
     assert queue.claim(lease_owner="tick", now=clock.now(), limit=10) == []
 
@@ -313,13 +322,13 @@ def test_occupancy_counts_live_non_terminal_rows_only(
 ) -> None:
     """B16 at the store level: the number the boot guard is handed.
 
-    Shadow rows and terminal rows both present as zero, and for different
-    reasons: a shadow row is an observational copy the queue must never serve,
-    and a terminal row is finished.  Counting either would demote a deployment
-    that has nothing outstanding.
+    Non-live rows and terminal rows both present as zero, and for different
+    reasons: a non-live row is a leftover the queue must never serve (#738), and
+    a terminal row is finished.  Counting either would demote a deployment that
+    has nothing outstanding.
     """
-    queue.enqueue(shadow("legacy-inbox:1"))
-    queue.enqueue(shadow("legacy-inbox:2"))
+    for key in ("legacy-inbox:1", "legacy-inbox:2"):
+        demote_to_legacy_mode(queue, queue.enqueue(live(key)).msg_id)
     assert queue.occupancy().live_non_terminal == 0
 
     row = queue.enqueue(live("k1"))
@@ -347,11 +356,10 @@ def test_occupancy_survives_a_database_with_no_barrier_table(
 def test_a_terminal_row_is_not_re_settled(queue: SqliteQueueStore, clock: FakeClock) -> None:
     """First terminal observation wins.
 
-    The mirror writer observes several legacy edges per message and they do not
-    arrive in a guaranteed order, so a late edge must not be able to rewrite a
-    recorded outcome — otherwise the agreement report measures arrival order.
+    Several writers can end a row and they do not fire in a guaranteed order, so
+    a late one must not be able to rewrite a recorded outcome.
     """
-    row = queue.enqueue(shadow("legacy-inbox:1"))
+    row = queue.enqueue(live("legacy-inbox:1"))
     assert queue.settle(row.msg_id, state=MsgState.DELIVERED, now=clock.now()) is True
     assert queue.settle(row.msg_id, state=MsgState.SUPERSEDED, now=clock.now()) is False
     final = queue.get(row.msg_id)
@@ -376,8 +384,8 @@ def test_settling_to_a_non_terminal_state_is_refused(
 
 
 def test_an_attempt_row_is_written_once_per_key(queue: SqliteQueueStore, clock: FakeClock) -> None:
-    """Re-observing one legacy attempt is a no-op, not a second row."""
-    row = queue.enqueue(shadow("legacy-inbox:1"))
+    """Recording one attempt twice is a no-op, not a second row."""
+    row = queue.enqueue(live("legacy-inbox:1"))
     attempt = DeliveryAttempt(
         msg_id=row.msg_id,
         claim_id=1,

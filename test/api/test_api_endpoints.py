@@ -54,10 +54,35 @@ class TestHealthCheck:
         from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
         mock_herdr = MagicMock(spec=HerdrBackend)
+        mock_herdr.backend_health.return_value = "ok"
         with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
             response = client.get("/health")
         data = response.json()
         assert data["terminal_backend"] == "herdr"
+
+    def test_health_herdr_component_reflects_socket_liveness(self, client):
+        """F882 (#735): the herdr component comes from backend_health(), not
+        shutil.which — a dead socket must surface, not read 'ok'."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        mock_herdr = MagicMock(spec=HerdrBackend)
+        mock_herdr.backend_health.return_value = "socket_closed"
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
+            response = client.get("/health")
+        data = response.json()
+        assert data["components"]["herdr"] == "socket_closed"
+        mock_herdr.backend_health.assert_called_once()
+
+    def test_health_herdr_component_ok_when_socket_live(self, client):
+        """F882: a live herdr socket → components.herdr == 'ok'."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        mock_herdr = MagicMock(spec=HerdrBackend)
+        mock_herdr.backend_health.return_value = "ok"
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
+            response = client.get("/health")
+        data = response.json()
+        assert data["components"]["herdr"] == "ok"
 
 
 # ── Agent profiles endpoint ──────────────────────────────────────────

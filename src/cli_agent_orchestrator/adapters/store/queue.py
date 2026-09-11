@@ -13,9 +13,9 @@ design rests on and each has exactly one line of defence:
 * **``mode='live'`` is a conjunct of the CLAIM statement itself**, not something
   a caller adds.  Every consumer of the queue inherits it that way — the boot
   occupancy test, the drain tick and the ordinary tick — and no future caller can
-  forget it.  Sub-phase 3a writes shadow rows into this table before there is a
-  claimer at all, so the rule is in force before there is anything for it to
-  guard, which is the only ordering that could have caught it.
+  forget it.  The rule was in force before there was anything for it to guard,
+  which is the only ordering that could have caught it; it outlives the
+  observational rows it was written for (#738).
 * **No ``UPDATE`` in this module names ``dead_by``.**  The column is written once,
   by ``enqueue``, from :func:`~core.delivery.compute_dead_by`.  ``reclaim``
   rewrites ``available_at`` on every re-offer, so a deadline recomputed from the
@@ -203,11 +203,10 @@ class SqliteQueueStore:
         """Lease deliverable rows and issue each a fresh fencing token.
 
         The ``mode='live'`` conjunct is in this statement and nowhere else.  A
-        shadow row is therefore unclaimable by construction: the boot guard's
-        occupancy test and the drain tick's own mode condition are redundant
-        defence, and the write-through flip's sweep of unresolved shadow rows is
-        a third, independent one.  Removing the conjunct here makes a surviving
-        shadow row claimable at the flip, so the tick would inject a copy of a
+        non-live row — one written by a build that still had the observational
+        mode retired in #738 — is therefore unclaimable by construction, and the
+        boot guard's occupancy test is redundant defence.  Removing the conjunct
+        here makes such a row claimable, so the tick would inject a copy of a
         message the legacy path already delivered — a second carrier over one
         id.  That is the mutant the empirical gate kills.
 
@@ -393,18 +392,6 @@ class SqliteQueueStore:
         row = (
             self._pool.connection()
             .execute(f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE idempotency_key = ?", (key,))
-            .fetchone()
-        )
-        return None if row is None else _row_to_message(row)
-
-    def get_by_legacy_id(self, legacy_message_id: int) -> QueueMessage | None:
-        """The shadow row mirroring one legacy inbox row (sub-phase 3a only)."""
-        row = (
-            self._pool.connection()
-            .execute(
-                f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE legacy_message_id = ?",
-                (int(legacy_message_id),),
-            )
             .fetchone()
         )
         return None if row is None else _row_to_message(row)
@@ -867,9 +854,9 @@ class SqliteQueueStore:
 
         ``mode='live'`` here as well as in ``claim``: the filter's home is the
         claim statement, and this is the redundant defence D9 names rather than
-        the enforcement.  A receiver whose only rows are shadow copies must not
-        have an epoch opened for it, or the tick would wake a seat about
-        messages the legacy path already delivered.
+        the enforcement.  A receiver whose only rows are non-live leftovers
+        (#738) must not have an epoch opened for it, or the tick would wake a
+        seat about messages the legacy path already delivered.
         """
         rows = (
             self._pool.connection()
@@ -941,26 +928,6 @@ class SqliteQueueStore:
             .fetchone()
         )
         return row is None or int(row["n"]) == 0
-
-    def sweep_shadow(self, *, now: datetime) -> int:
-        """The write-through flip's first act: end every surviving shadow row.
-
-        A shadow row the mirror writer never resolved stays ``ready`` with no
-        terminal state — unclaimable through ``claim``'s ``mode`` filter, but
-        still a durable row with no ending.  This and the filter are
-        INDEPENDENT: either alone prevents the delivery, and together they also
-        stop the row sitting open forever (§7a).
-        """
-        conn = self._pool.connection()
-        stamp = render_timestamp(now)
-        with immediate_transaction(conn):
-            cursor = conn.execute(
-                "UPDATE delivery_msg SET state = 'superseded', terminated_at = ?, "
-                "lease_owner = NULL, lease_expires_at = NULL, held_since = NULL "
-                f"WHERE mode = 'shadow' AND state NOT IN ({','.join('?' for _ in _TERMINAL_VALUES)})",
-                (stamp, *_TERMINAL_VALUES),
-            )
-            return int(cursor.rowcount)
 
     def cancel_on_complete(self, receiver_id: str, *, now: datetime) -> tuple[str, ...]:
         """D8's completion-cancel: supersede this receiver's flagged READY rows.

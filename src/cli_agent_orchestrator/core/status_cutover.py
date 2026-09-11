@@ -1,6 +1,6 @@
 """The status cutover's switch, resolved at boot (WP-ARCH phase 2, D9).
 
-``CAO_WORKER_TRUTH_STATUS ∈ {off, shadow, on}``, default ``off``, sitting beside
+``CAO_WORKER_TRUTH_STATUS ∈ {off, on}``, default ``off``, sitting beside
 phase 1's ingestion gate and phase 3's delivery gate in ``bootstrap.py`` and read
 ONCE per boot.  A THIRD switch rather than a third spelling of the first: one
 master strangler flag would couple a phase-1 rollback to a phase-2 rollback, and
@@ -10,15 +10,18 @@ The positions:
 
 ===========  ==========================================================
 ``off``      exactly phase-1 behaviour
-``shadow``   the new producers and the fold run; nothing is published
 ``on``       the projection publishes through the legacy egress
 ===========  ==========================================================
 
-``shadow`` is a real position rather than a formality.  The claude_code source
-has never run, so its disagreement profile against the pane classifier is unknown
-in a way the codex source's no longer is, and ``shadow`` is where that evidence is
-produced.  The kill switch at every point is to move the position DOWN; nothing
-is deleted until sub-phase 2c, which is a separate commit for that reason.
+There was a third position between them.  ``shadow`` ran the new producers and
+the fold and published nothing, and it was where the claude_code source's
+disagreement profile against the pane classifier was to be measured.  It is
+RETIRED (#738, user ruling 2026-09-09): that evidence comes from a grok-box live
+round now, and :func:`parse_status_switch` answers
+:class:`~core.switches.Rejected` for the value rather than running a mode that no
+longer exists.  The kill switch is still to move the position DOWN — to ``off``,
+which is exactly phase-1 behaviour; nothing is deleted until sub-phase 2c, which
+is a separate commit for that reason.
 
 Boot-time resolution and an ordered maturity ladder are Kubernetes' feature-gate
 shape: gates are set by a process flag, and activating a change means restarting
@@ -43,8 +46,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from cli_agent_orchestrator.core.findings import FindingCode
+from cli_agent_orchestrator.core.switches import Rejected, retired_position
 
 __all__ = [
+    "RETIRED_STATUS_VALUES",
+    "STATUS_FIX_HINT",
     "StatusGuardOutcome",
     "StatusPosition",
     "parse_providers",
@@ -52,25 +58,34 @@ __all__ = [
     "resolve_status_switch",
 ]
 
+#: What an operator must be told to type instead of a retired position.
+STATUS_FIX_HINT = "set CAO_WORKER_TRUTH_STATUS=off|on"
+
+#: The positions this build removed (#738).
+RETIRED_STATUS_VALUES = frozenset({"shadow"})
+
 
 class StatusPosition(StrEnum):
-    """``CAO_WORKER_TRUTH_STATUS``, three positions.
+    """``CAO_WORKER_TRUTH_STATUS``, two positions.
 
-    Three and not phase 3's four.  Phase 3 needs a ``drain`` because a row
-    enqueued while ``on`` exists in its queue and nowhere else, so demoting
-    straight to ``shadow`` would strand it.  Status has no such row: the one
+    Two, and phase 3's delivery switch has three.  Phase 3 needs a ``drain``
+    because a row enqueued while ``on`` exists in its queue and nowhere else, so
+    demoting straight to ``off`` would strand it.  Status has no such row: the one
     durable artefact is the projection itself, which is rebuilt from the log
     rather than consumed, so there is nothing to orphan and no ``drain`` to reach.
-    Carrying the fourth position anyway would be machinery for a hazard that does
-    not exist here.
+
+    The third position this switch DID have, ``shadow``, is retired with the mode
+    (#738) rather than kept as a member nothing may select.  A member that only
+    exists to be refused is a mode a future caller can reach for; the refusal
+    lives in :func:`parse_status_switch`, where an operator's typed value arrives,
+    and nowhere else.
     """
 
     OFF = "off"
-    SHADOW = "shadow"
     ON = "on"
 
 
-def parse_status_switch(value: str | None) -> StatusPosition:
+def parse_status_switch(value: str | None) -> StatusPosition | Rejected:
     """Read the environment variable.  Unknown or unset means ``off``.
 
     Permissive about case and surrounding whitespace, and deliberately not
@@ -78,11 +93,19 @@ def parse_status_switch(value: str | None) -> StatusPosition:
     and the guard's finding is what tells them the cutover is not running.
     Guessing at an intended position would be a worse failure than the default,
     because the default is the safe one.
+
+    ``shadow`` is the one value that is REFUSED rather than defaulted, and the
+    asymmetry is the point: it shipped, so an operator carrying it typed something
+    that used to work, and silently starting them in ``off`` would leave them
+    believing a mode was running.  See :mod:`~core.switches`.
     """
     if value is None:
         return StatusPosition.OFF
+    cleaned = value.strip().lower()
+    if cleaned in RETIRED_STATUS_VALUES:
+        return retired_position(env_var="CAO_WORKER_TRUTH_STATUS", value=cleaned, accepted="off|on")
     try:
-        return StatusPosition(value.strip().lower())
+        return StatusPosition(cleaned)
     except ValueError:
         return StatusPosition.OFF
 
@@ -90,7 +113,7 @@ def parse_status_switch(value: str | None) -> StatusPosition:
 def parse_providers(value: str | None) -> frozenset[str]:
     """Read ``CAO_WORKER_TRUTH_STATUS_PROVIDERS`` — a comma-separated allowlist.
 
-    Empty by default, which under ``on`` is what demotes the boot to ``shadow``:
+    Empty by default, which under ``on`` is what demotes the boot to ``off``:
     ``on`` with no provider to publish for is indistinguishable from a
     misconfiguration, and a phase that read it as "publish for everything" would
     turn a typo into a fleet-wide cutover.
@@ -140,12 +163,15 @@ def resolve_status_switch(
     Requested   Ingestion   Allowlist       Resolves to   Finding
     ==========  ==========  ==============  ============  ====================
     ``off``     either      either          ``off``       —
-    ``shadow``  off         either          ``off``       ``DIAG-STATUS-GUARD``
-    ``shadow``  on          either          ``shadow``    —
     ``on``      off         either          ``off``       ``DIAG-STATUS-GUARD``
-    ``on``      on          empty           ``shadow``    ``DIAG-STATUS-GUARD``
+    ``on``      on          empty           ``off``       ``DIAG-STATUS-GUARD``
     ``on``      on          non-empty       ``on``        —
     ==========  ==========  ==============  ============  ====================
+
+    Four cells rather than the six it had: the two ``shadow`` rows went with the
+    mode (#738), and the empty-allowlist cell now lands on ``off`` because ``off``
+    is where a refused cutover goes when there is no dark position left to hold
+    it at.
 
     Ingestion-off DEMOTES rather than proceeds because a fold whose events reach
     no consumer is a silent status outage: the producers would run, the projection
@@ -174,21 +200,16 @@ def resolve_status_switch(
             context={"requested": requested.value, "ingest": "off"},
         )
 
-    if requested is StatusPosition.SHADOW:
-        return StatusGuardOutcome(
-            requested=requested, position=StatusPosition.SHADOW, providers=providers
-        )
-
     if not providers:
         return StatusGuardOutcome(
             requested=requested,
-            position=StatusPosition.SHADOW,
+            position=StatusPosition.OFF,
             providers=providers,
             finding=FindingCode.DIAG_STATUS_GUARD,
             detail=(
                 "CAO_WORKER_TRUTH_STATUS=on with an empty "
                 "CAO_WORKER_TRUTH_STATUS_PROVIDERS is indistinguishable from a "
-                "misconfiguration; the cutover resolved to shadow"
+                "misconfiguration; the cutover resolved to off"
             ),
             context={"requested": requested.value, "providers": ""},
         )

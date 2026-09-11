@@ -21,7 +21,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
 from cli_agent_orchestrator.services.box_plane import refuse_recovery_on_box_plane
-from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
+from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch
 from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
 from cli_agent_orchestrator.services.rebind_lease import (
     acquire_rebind_lease,
@@ -314,7 +314,11 @@ async def rebind_terminal(
         baseline = metadata.get("shell_command")
         if not baseline:
             return _result(terminal_id, "unresumable", error_code="shell_baseline_missing", interrupt=interrupt)
-        pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+        # F893 (#745): backend port, not tmux list-panes — the rebind path is
+        # backend-neutral and this raised uncaught under herdr.
+        pid = get_backend().get_pane_process_id(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
         cwd = get_backend().get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
         if cwd is None:
             # F26 D5: a deleted/unavailable pane cwd must mark the rebind
@@ -445,7 +449,10 @@ async def rebind_terminal(
                 candidate_death_confirmed = False
                 try:
                     exit_terminal_cli(terminal_id)
-                    candidate_pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+                    # F893 (#745): backend port, not tmux list-panes.
+                    candidate_pid = get_backend().get_pane_process_id(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
                     candidate_death_confirmed = (
                         await _wait_for_shell_baseline(
                             metadata, baseline, candidate, candidate_pid
@@ -542,7 +549,10 @@ async def rebind_terminal(
                 if candidate:
                     from cli_agent_orchestrator.services.terminal_service import exit_terminal_cli
                     exit_terminal_cli(terminal_id)
-                    candidate_pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+                    # F893 (#745): backend port, not tmux list-panes.
+                    candidate_pid = get_backend().get_pane_process_id(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
                     candidate_death = await _wait_for_shell_baseline(
                         metadata, baseline, candidate, candidate_pid
                     )
