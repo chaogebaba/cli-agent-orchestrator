@@ -355,7 +355,7 @@ sleep 60
 # record instead of guessing from absence.  An empty result whose precondition
 # says the workload SHOULD have produced something is a FAIL.
 python3 - "\$ROUND" "\$cappable_lanes" <<'PRECONDITIONS'
-import json, os, subprocess, sys, urllib.request
+import json, os, sys
 
 round_dir, cappable = sys.argv[1], sys.argv[2].split()
 providers = {}
@@ -364,43 +364,65 @@ for line in open(os.path.join(round_dir, "lane-providers.txt")):
     if len(parts) == 2:
         providers[parts[0]] = parts[1]
 
-# The spawn command per lane, from the terminal row.  A lane whose command
-# carries a permissions-skip flag cannot raise a real dialog, and that is the
-# precondition behind prompt-awaiting's scope — recorded, not assumed.
-spawn = {}
-for terminal_id in providers:
+# Dialog capability is read from the PROCESS TABLE, not from the terminal row.
+# The row's ``shell_command`` comes back EMPTY for every lane on a live box —
+# measured — and an empty string is not evidence that a lane lacks a
+# permissions-skip flag; it is evidence that we could not tell.  Treating it as
+# "not capable" would be the same silent-inapplicable defect this record exists
+# to remove, so the flags are read from the spawned processes themselves.
+# Matched on a TOKEN's basename, exactly.  A substring match is not good
+# enough and was measured wrong: "/pi" matches ``box-picom`` and
+# ``/tmp/picom:1.log``, which put six unrelated desktop processes into the
+# dialog-capable list and would have failed ``prompt-awaiting`` on a round that
+# was fine.
+PROVIDER_BASENAMES = {"claude", "cline", "codex", "kiro", "pi"}
+SKIP_FLAGS = (
+    "--dangerously-skip-permissions",
+    "--yolo",
+    "--skip-permissions",
+    "--auto-approve",          # cline
+    "--full-auto",             # codex
+    "--trust-all-tools",       # kiro
+)
+processes = []
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:$PORT/terminals/{terminal_id}", timeout=20
-        ) as response:
-            spawn[terminal_id] = json.load(response).get("shell_command") or ""
-    except Exception as exc:
-        spawn[terminal_id] = f"<unreadable: {exc}>"
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            command = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        continue
+    if not command:
+        continue
+    if not any(
+        os.path.basename(token) in PROVIDER_BASENAMES for token in command.split()
+    ):
+        continue
+    processes.append(command[:200])
 
-skip_flags = ("--dangerously-skip-permissions", "--yolo", "--skip-permissions")
-dialog_capable = [
-    terminal_id
-    for terminal_id, command in spawn.items()
-    if command and not command.startswith("<unreadable")
-    and not any(flag in command for flag in skip_flags)
-]
-unreadable = [t for t, c in spawn.items() if c.startswith("<unreadable")]
+unguarded = [c for c in processes if not any(flag in c for flag in SKIP_FLAGS)]
+unreadable = []
+if not processes:
+    # No provider process visible at all: capability is UNKNOWN, not absent.
+    unreadable.append("no provider process found in /proc")
 
 json.dump(
     {
         "lane_providers": providers,
-        "spawn_commands": spawn,
+        "provider_processes": processes,
         "spawn_unreadable": unreadable,
         # Lanes the cap drive actually targeted, i.e. whose provider has a
         # banner the CAPPED classifier knows.
         "cappable_lanes": cappable,
-        # Lanes that could raise a REAL permission card.  Empty means the round
-        # structurally cannot exercise prompt-awaiting.
-        "dialog_capable_lanes": dialog_capable,
+        # Provider processes running WITHOUT any permissions-skip flag.  A
+        # non-empty list means a real card was reachable in this arm, so an
+        # absent ``prompt.awaiting`` is a failure rather than an unreachable
+        # criterion.
+        "dialog_capable_lanes": unguarded,
         # A terminal can only be certified when the H1 seam is armed, so an
-        # unarmed seam means no cohort can exist and certified-pane-silence has
-        # nothing to arm on.  Certification itself lives in server memory and is
-        # not readable from here; the seam is.
+        # unarmed seam is proof no cohort could exist.  Certification itself
+        # lives in server memory and is not readable from a post-mortem.
         "herdr_seam_armed": os.environ.get("CAO_HERDR_RUNTIME", "").strip().lower()
         in {"1", "true", "yes", "on"},
     },
