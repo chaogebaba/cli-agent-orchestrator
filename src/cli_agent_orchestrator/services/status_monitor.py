@@ -2235,6 +2235,19 @@ class StatusMonitor:
             if marker_open:
                 return TerminalStatus.WAITING_USER_ANSWER, "question_marker"
 
+            # fx751 Slice A (AC-5a): MIGRATED providers (pi_cli, codex) are
+            # decided by the typed reducer from the fresh pane sample BEFORE the
+            # pane-delta fusion arms see the lane. The reducer takes NO pane-delta
+            # input, so a migrated lane never reaches rule 2b's child_proc_live /
+            # fresh-capture arm, nor rules 3a/3b's pane_delta / child_proc_live /
+            # pane_delta_expired returns. Those arms are left in force for
+            # UNMIGRATED providers (AC-5b) and are removed by AC-21 in Slice C —
+            # NOT deleted here (deleting the expired-admit at rule 3b would drop
+            # grok/Claude/kiro to rule 4 and lose the pane_delta_expired tag).
+            migrated = self._fx751_migrated_fusion(terminal_id, status)
+            if migrated is not None:
+                return migrated
+
             # Rule 2b (F899 #751, third sample 2026-09-10): a provider-published
             # ERROR over a pane that is in fact working. The published status is
             # re-derived from the ROLLING BUFFER, so when a worker goes quiet for
@@ -2394,6 +2407,64 @@ class StatusMonitor:
             return int(ConfigService.get("liveness.stable_samples", 3))
         except Exception:
             return 3
+
+    def _fx751_migrated_fusion(
+        self, terminal_id: str, status: TerminalStatus
+    ) -> Optional[Tuple[TerminalStatus, Optional[str]]]:
+        """fx751 Slice A (AC-5a): the fusion decision for a MIGRATED provider.
+
+        Returns ``None`` for an UNMIGRATED provider (fall through to the legacy
+        pane-delta arms, AC-5b) or when the provider cannot be resolved. For a
+        migrated provider it returns a ``(status, reason)`` pair derived from the
+        typed reducer path and NEVER consulting pane-delta churn:
+
+          * A fresh re-derivation of the pane sample that reads PROCESSING holds
+            the seat PROCESSING (``fx751_working``). ``_rederive_from_pane_sample``
+            routes through the migrated provider's ``get_status`` /
+            ``get_status_from_screen``, which are now thin routes onto the reducer
+            (AC-2), so this verdict is the reducer's.
+          * A fresh IDLE/COMPLETED verdict is admitted as-is
+            (``fx751_reducer``) — the provider's reducer route already applied D1
+            precedence to the fresh frame.
+          * No fresh evidence (rate-limited, no sample, or a non-lowering
+            verdict) admits the PUBLISHED status under ``fx751_migrated``. The
+            published value came from the scheduled sampler's own reducer-routed
+            publication, so this is a hold, not a stale-buffer lowering — pane
+            churn is never consulted, which is the whole point of AC-5a.
+
+        Pure on the read path exactly like the arms it replaces: it reads the
+        provider registry and the retained pane sample (``peek``), never
+        captures, and ``_rederive_from_pane_sample`` is itself rate-limited and
+        capture-free (it reads the sampler's retained tail).
+        """
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            return None
+        if provider is None or not getattr(provider, "fx751_status_migrated", False):
+            return None
+
+        # A migrated lane's PROCESSING/IDLE/COMPLETED/ERROR is decided from the
+        # fresh pane sample by the reducer route; WAITING was already handled by
+        # rules 1/2 above and never reaches here.
+        try:
+            from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+            observation = pane_liveness.peek(terminal_id)
+        except Exception:
+            observation = None
+
+        if observation is not None and observation.filtered_tail:
+            fresh = self._rederive_from_pane_sample(terminal_id, observation.filtered_tail)
+            if fresh is TerminalStatus.PROCESSING:
+                return TerminalStatus.PROCESSING, "fx751_working"
+            if fresh in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                return fresh, "fx751_reducer"
+        # No fresh lowering evidence: HOLD the published status (never lower into
+        # idle on a stale buffer, D4). The reason marks the migrated path so the
+        # withhold is explicable and a test can assert a migrated lane never
+        # carries a pane_delta* reason.
+        return status, "fx751_migrated"
 
     def get_boundary_observation(self, terminal_id: str) -> BoundaryObservation:
         """Return one status/cycle snapshot sampled under the monitor lock."""

@@ -323,6 +323,9 @@ class PiCliProvider(BaseProvider):
     # same detector _resolve_buffer already runs on a live pane read).
     supports_direct_status_probe: bool = True
 
+    # fx751 Slice A (AC-2/AC-5a): pi is migrated onto the typed reducer.
+    fx751_status_migrated: bool = True
+
     # F843 (#700): opt into the F611 condition classifier so pi's ClinePass 429
     # INFERENCE_CAP_ERROR banner is detected as a CAPPED condition and the ONE
     # [CONDITION] notice reaches the supervisor seat (the same delivery seam

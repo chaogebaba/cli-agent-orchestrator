@@ -451,6 +451,16 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # fx751 Slice A (AC-2/AC-5a/AC-10): whether this provider's status is driven
+    # by the typed fx751 reducer (providers/status_contract.py) rather than the
+    # legacy fusion arms. A MIGRATED provider's lane is decided from the typed
+    # facts BEFORE fusion sees the pane, so it never reaches the pane-delta arms
+    # (rule 2b/3a/3b) or their child_proc_live / pane_delta_expired returns
+    # (AC-5a). Default False (legacy adapter); only pi_cli and codex set it True
+    # in Slice A. Must agree with status_contract.MIGRATION_REGISTRY — a runtime
+    # check asserts that (AC-10, no divergent authority).
+    fx751_status_migrated: bool = False
+
     # Opt OUT of the stale-PROCESSING self-heal (upstream #712). That fallback reruns
     # ``get_status`` against a RENDERED capture-pane snapshot, and routes on
     # ``supports_screen_detection``. In this fork that flag also means "the

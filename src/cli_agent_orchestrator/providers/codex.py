@@ -2134,6 +2134,9 @@ class ProviderError(Exception):
 
 class CodexProvider(BaseProvider):
     condition_provider_key = "codex"  # F611 #467
+
+    # fx751 Slice A (AC-2/AC-5a): codex is migrated onto the typed reducer.
+    fx751_status_migrated = True
     supports_fork_context = True
     # RESUME HOT-FIX (r1 #6 / r2 #2): codex resumes via a resume-mode
     # fork_context (the proven path); opt into the resume capability explicitly.
