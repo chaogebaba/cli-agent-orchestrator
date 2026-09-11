@@ -1142,6 +1142,11 @@ class HerdrBackend(TerminalBackend):
             data = self._parse_herdr_json(result.stdout)
             pane_info = data.get("pane", data) if isinstance(data, dict) else data
             agent_status = pane_info.get("agent_status", _AGENT_STATUS_ABSENT)
+            # F926 (#778) detection half: herdr names the agent it RECOGNISED in
+            # this pane. Its ABSENCE is what separates "no provider process is
+            # alive here" from "the provider is there, not yet classified" —
+            # see _record_status_unknown for the measurements.
+            detected_agent = pane_info.get("agent")
         except (json.JSONDecodeError, AttributeError, TypeError):
             return NativeFetch(None, None, "parse_error")
         absent = agent_status is _AGENT_STATUS_ABSENT
@@ -1161,7 +1166,14 @@ class HerdrBackend(TerminalBackend):
         reported: str | None = None if absent else cast(str, agent_status)
         status = None if absent else map_native_status(reported)
         if status is None:
-            self._record_status_unknown(session_name, window_name, pane_id, reported, absent=absent)
+            self._record_status_unknown(
+                session_name,
+                window_name,
+                pane_id,
+                reported,
+                absent=absent,
+                detected_agent=detected_agent if isinstance(detected_agent, str) else None,
+            )
         return NativeFetch(reported, status, None)
 
     @staticmethod
@@ -1172,6 +1184,7 @@ class HerdrBackend(TerminalBackend):
         agent_status: str | None,
         *,
         absent: bool = False,
+        detected_agent: str | None = None,
     ) -> None:
         """F926 (#778): count the silent fall-back to pane scraping.
 
@@ -1192,9 +1205,34 @@ class HerdrBackend(TerminalBackend):
         native truth while codex does. The gap is herdr's, not CAO's, so what
         CAO owes is a counted row instead of silence.
 
-        ``absent`` separates the two conditions this diagnostic exists to tell
-        apart: herdr SAYING ``unknown`` (the manifest gap) versus the pane
-        response carrying no ``agent_status`` field at all (protocol drift).
+        ``absent`` separates herdr SAYING ``unknown`` from the pane response
+        carrying no ``agent_status`` field at all (protocol drift).
+
+        ``detected_agent`` separates the two conditions that actually matter
+        operationally, and they are not the same problem. Measured on herdr
+        0.9.0 by polling three panes once a second from the moment the command
+        was sent:
+
+            live pane   None/unknown (0s) -> pi/unknown (1s) -> pi/idle (4s)
+            crashed     None/unknown, agent field NEVER present, indefinitely
+            bare shell  None/unknown, agent field NEVER present, indefinitely
+
+        An ``unknown`` WITH an agent named is a classification gap and is
+        transient — herdr holds the process and is still deciding. An
+        ``unknown`` with NO agent named means herdr recognised no provider
+        process in the pane at all: it crashed, never started, or already
+        exited. That one is permanent, and it is a LIVENESS fact wearing a
+        status field's clothes, which is why it is named in the row rather than
+        counted as one more unclassifiable seat.
+
+        It is NOT a launch-shape problem, and the row should not send anyone
+        hunting for one. Five shapes were measured — ``exec`` with an absolute
+        path, absolute path without ``exec`` (CAO's actual shape, since
+        ``create_window`` passes no ``window_shell`` and the provider is typed
+        in afterwards), a bare name on PATH, a ``bash -lc`` wrapper, and with
+        and without arguments — and herdr detected the agent in every one, even
+        though the foreground process reads as ``bun``. herdr keys on the
+        basename of argv[0], not the foreground command name.
 
         Deduplicated per seat: the row's ``count`` is how often this seat fell
         back, and its ``dedupe_key`` is which seat did. ``terminal_id`` is the
@@ -1208,11 +1246,19 @@ class HerdrBackend(TerminalBackend):
             from cli_agent_orchestrator.adapters.truth.wiring import record_finding
             from cli_agent_orchestrator.core.findings import FindingCode
 
-            observed = (
-                "no agent_status field in the pane response"
-                if absent
-                else f"herdr agent_status={agent_status!r}"
-            )
+            if absent:
+                observed = "no agent_status field in the pane response"
+            elif detected_agent:
+                observed = (
+                    f"herdr agent_status={agent_status!r} for detected agent "
+                    f"{detected_agent!r} (classification gap; usually transient)"
+                )
+            else:
+                observed = (
+                    f"herdr agent_status={agent_status!r} and NO agent detected "
+                    f"(no provider process alive in this pane: crashed, never "
+                    f"started, or already exited)"
+                )
             record_finding(
                 FindingCode.DIAG_HERDR_STATUS_UNKNOWN,
                 terminal_id=terminal_id,
@@ -1239,13 +1285,15 @@ class HerdrBackend(TerminalBackend):
                 _STATUS_UNKNOWN_WARNED.add(seat)
         log = logger.warning if first_for_seat else logger.debug
         log(
-            "herdr_status_unknown session=%s window=%s pane=%s agent_status=%s — "
-            "no native status for this seat; falling back to pane scraping "
-            "(herdr agent-detection manifest gap, F926 #778)",
+            "herdr_status_unknown session=%s window=%s pane=%s agent_status=%s "
+            "detected_agent=%s — no native status for this seat; falling back to "
+            "pane scraping. No detected agent means no provider process is alive "
+            "in the pane, NOT a launch-shape or manifest problem (F926 #778)",
             session_name,
             window_name,
             pane_id,
             "<absent>" if absent else agent_status,
+            detected_agent or "<none>",
         )
 
     def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
