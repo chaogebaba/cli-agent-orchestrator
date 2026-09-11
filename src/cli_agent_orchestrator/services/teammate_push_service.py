@@ -433,11 +433,25 @@ def _try_acquire_lockfile(lock_path: Path) -> Optional[int]:
         fd_stat = os.fstat(fd)
         path_stat = os.stat(str(lock_path))
         if fd_stat.st_ino != path_stat.st_ino or fd_stat.st_dev != path_stat.st_dev:
+            # Someone re-created the lock between our unlink and our open: a
+            # race, so the caller retries rather than giving up on the seat.
             os.close(fd)
             return None
-    except OSError:
+    except FileNotFoundError:
+        # The path we just created is already gone -- another writer reclaimed
+        # it. Still a race.
         os.close(fd)
         return None
+    except OSError:
+        # F747 (#747) r9: anything else here is PERMANENT (EACCES on the parent
+        # directory, EIO, ...). r7 fixed the first acquisition attempt but this
+        # branch still swallowed every OSError into None, so a permission
+        # failure reaching the TOCTOU verify was still classified as transient
+        # contention -- the same blocker as r7's, one code path further in.
+        # Close our fd, then let it propagate: the writer converts it to False,
+        # which arms the write-failure ledger.
+        os.close(fd)
+        raise
     return fd
 
 

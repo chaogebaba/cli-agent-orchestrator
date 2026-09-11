@@ -831,3 +831,131 @@ def test_a_held_lock_is_still_only_contention(tmp_path: Path) -> None:
     finally:
         _os.close(held)
         lock.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# r9 repair 1: the TOCTOU verify must classify permanent errors as failures.
+# r9 repair 2: the vanished-holder path is a race, and is now pinned.
+# ---------------------------------------------------------------------------
+
+
+def test_a_real_unwritable_directory_is_a_write_failure(tmp_path: Path) -> None:
+    """A REAL filesystem permission denial -- chmod, no patching.
+
+    The parent directory is made unwritable, so the very first O_CREAT raises
+    EACCES from the kernel. That is permanent, so the writer must report False
+    (write failure), never None (contention).
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+    d = tmp_path / "locked"
+    d.mkdir()
+    inbox = d / "team-lead.json"
+    inbox.write_text("[]", encoding="utf-8")
+    os.chmod(d, 0o500)  # r-x: traversable and readable, NOT writable
+    try:
+        assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is False
+    finally:
+        os.chmod(d, 0o700)
+
+
+def test_permanent_error_on_the_toctou_verify_is_a_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MUTANT target: restore `except OSError: return None` on the verify and
+    this fails.
+
+    This branch is only reachable after a STALE lock is reclaimed, so a real
+    chmod cannot deterministically fail exactly here without also failing the
+    unlink or the re-open before it. The permission error is therefore injected
+    at the one call the branch guards, which is the narrowest way to pin the
+    classification the verdict found wrong.
+    """
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(inbox.resolve()) + ".lock")
+    lock.write_text("", encoding="utf-8")
+    # Backdate it past the stale threshold so the reclaim path is taken.
+    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+
+    real_stat = os.stat
+
+    def _deny_stat(path: Any, *a: Any, **k: Any) -> Any:
+        if str(path).endswith(".lock"):
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *a, **k)
+
+    seen: list[str] = []
+
+    def _stat_after_reclaim(path: Any, *a: Any, **k: Any) -> Any:
+        # Call 1 is the stale check; call 2 is the TOCTOU verify that follows
+        # the reclaim. Fail ONLY call 2 and let every later call succeed.
+        #
+        # That exactness is the point. An earlier version failed call 2 AND
+        # every call after it, so under the mutation the retry's stale-check
+        # stat raised instead and the writer still returned False -- the test
+        # passed on mutated code and the variant patch survived. Isolating the
+        # single call is what makes this witness discriminating.
+        if str(path).endswith(".lock"):
+            seen.append("x")
+            if len(seen) == 2:
+                raise PermissionError(13, "Permission denied")
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(os, "stat", _stat_after_reclaim)
+    assert tps._write_inbox_entry(inbox, {"msg_id": "y"}) is False
+    monkeypatch.setattr(os, "stat", real_stat)
+    lock.unlink(missing_ok=True)
+
+
+def test_a_vanished_holder_is_a_race_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r9 repair 2: the holder disappearing mid-reclaim is contention.
+
+    The verdict noted this behaviour was right but untested. If the lock the
+    stale check saw is already gone by the time we unlink it, another writer
+    reclaimed it: a race. The writer must report None so the reconciler carries
+    the row, NOT False, which would engage the fallback surface on a healthy
+    seat.
+    """
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(inbox.resolve()) + ".lock")
+    lock.write_text("", encoding="utf-8")
+    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+
+    def _vanished(path: Any, *a: Any, **k: Any) -> None:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(os, "unlink", _vanished)
+    assert tps._write_inbox_entry(inbox, {"msg_id": "z"}) is None
+
+
+def test_a_holder_that_beats_us_to_the_reclaim_is_a_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the vanished-holder path: we unlink, someone else
+    re-creates before our open. Also a race, also None."""
+    inbox = tmp_path / "team-lead.json"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(inbox.resolve()) + ".lock")
+    lock.write_text("", encoding="utf-8")
+    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
+    os.utime(lock, (old, old))
+
+    real_open = os.open
+    calls: list[str] = []
+
+    def _taken(path: Any, *a: Any, **k: Any) -> Any:
+        if str(path).endswith(".lock"):
+            calls.append("x")
+            raise FileExistsError(17, "File exists")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os, "open", _taken)
+    assert tps._write_inbox_entry(inbox, {"msg_id": "w"}) is None
+    monkeypatch.setattr(os, "open", real_open)
+    lock.unlink(missing_ok=True)
