@@ -91,17 +91,12 @@ def real_sqlite_env(tmp_path, monkeypatch):
     # keyed by terminal id. Tests here reuse ids like "sup00001", so a cache
     # left behind by an earlier test in the same worker suppresses this test's
     # delivery ("already_notified") even though its DB is empty. Clear them.
-    from cli_agent_orchestrator.services import (
-        delivery_service,
-        doorbell_service,
-        inbox_service,
-    )
+    # WP-ARCH 3c K3a/K7 deleted two of the three: ``doorbell_service`` and the
+    # ladder's health-warning dedup went with their modules. The remaining cache
+    # is the F136 runner's failure streak.
+    from cli_agent_orchestrator.services import inbox_service
 
-    _shadow_caches = (
-        doorbell_service._last_warn_time,
-        inbox_service._failure_streaks,
-        delivery_service._health_warning_dedup,
-    )
+    _shadow_caches = (inbox_service._failure_streaks,)
     for cache in _shadow_caches:
         cache.clear()
 

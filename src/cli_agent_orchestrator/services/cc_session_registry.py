@@ -55,23 +55,15 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 
-# Canonical default for supervisor.wake.native. All call sites and the
-# config-registry entry MUST reference this constant.
+# WP-ARCH 3c: ``supervisor.wake.native`` is DELETED, and this constant with it —
+# nothing reads it any more.
 #
-# F337 B1 shipped it DARK (False). WP-ARCH 3b / A1.5 flips it to True, and the
-# reason is that removing the paste from every position is only half the job.
-# The seat's composer injection is now role-gated rather than flag-gated, so it
-# is gone under `off`, `drain` and `on` alike. In the two non-`on`
-# positions the queue does not serve the seat, so the only remaining carrier is
-# the F136 chain into ring_supervisor_doorbell — and with this default False
-# that chain emits NOTHING: supervisor.doorbell True passes the outer gate,
-# wake.native False skips the native ring, and teammate_push False declines the
-# fallback. The seat would then be neither pasted nor woken in three positions
-# including the shipped default. A paste is an ugly carrier; silence is the bug
-# the phase exists to remove.
-#
-# The cost is stated rather than buried: a deployment that never opted into the
-# queue gets a native seat ring it did not ask for (blueprint §10).
+# Kept as a one-line record of why there is no flag: after K8 the native
+# cross-session channel is the seat's ONLY carrier, so a switch that can turn it
+# off buys silence rather than a different carrier, and silence at the seat is
+# #604. The question the flag used to answer ("is native on?") now has one
+# answer for every deployment.
+#: Retained only so an operator reading an old settings.json finds the answer.
 WAKE_NATIVE_DEFAULT = True
 
 

@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from cli_agent_orchestrator.clients.database import (
+    DeliveryObligationModel,
+    InboxModel,
+    MailboxModel,
+    SessionLocal,
     _utcnow,
     cancel_pending_watchdog_message,
     create_inbox_message,
@@ -243,6 +247,64 @@ def _queue_owns_delivery() -> bool:
         return queue_owns_delivery()
     except Exception:  # pragma: no cover — an unimportable switch is "not on"
         return False
+
+
+def _create_self_notify_obligation(terminal_id: str) -> None:
+    """F203 D15: a delivery obligation targeting the supervisor's OWN mailbox.
+
+    Fired when this watchdog sees a supervisor terminal holding pending messages
+    with no ``caller_id``, so delivery is routed to its own mailbox instead of
+    permanently latching ``fired=True``.
+
+    **Relocated from ``delivery_service`` by WP-ARCH 3c K7, unchanged.** That
+    module is reduced to a single DB predicate, and this function's only two call
+    sites are both in this file. Moving it here rather than exempting it from K7
+    keeps the reduction honest: a helper whose sole callers live in one module
+    belongs in that module. It dies with those callers when slice 4 cuts
+    ``tick_waiting_inbox`` and ``tick_ready_backlog``.
+    """
+    try:
+        with SessionLocal() as db:
+            mailbox = db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).first()
+            if mailbox is None:
+                return
+
+            # Check if there's already an OPEN obligation for this mailbox
+            existing = (
+                db.query(DeliveryObligationModel)
+                .filter_by(mailbox_id=mailbox.id, state="OPEN")
+                .first()
+            )
+            if existing is not None:
+                return  # Already has an obligation
+
+            # Find the oldest pending message for this mailbox
+            oldest = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.logical_receiver_id == mailbox.id,
+                    InboxModel.status.in_(["pending", "held"]),
+                )
+                .order_by(InboxModel.id)
+                .first()
+            )
+            if oldest is None:
+                return  # No pending messages
+
+            now = _utcnow()
+            obl = DeliveryObligationModel(
+                inbox_row_id=oldest.id,
+                mailbox_id=mailbox.id,
+                state="OPEN",
+                accepted_at=now,
+                first_attempt_at=now,
+                next_attempt_at=now,
+                attempts=0,
+            )
+            db.add(obl)
+            db.commit()
+    except Exception:
+        logger.debug("f203 self-notify obligation failed for %s", terminal_id, exc_info=True)
 
 
 class StalledCallbackWatchdog:
@@ -571,13 +633,8 @@ class StalledCallbackWatchdog:
                     episode.wedge_fired_key = None
             # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
-        # FX193 D2: notify nudge discipline of status change (outside lock)
-        try:
-            from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
-
-            nudge_discipline.record_status(terminal_id, status)
-        except Exception:
-            pass
+        # WP-ARCH 3c K7: the FX193 status feed into nudge discipline is gone with
+        # the nudge. There is no scheduled pane nudge to coalesce or cancel.
 
         # FX194 D1: notify boundary pull service on consumption boundaries
         # (idle transition = a consumption boundary where pull can deliver)
@@ -604,28 +661,14 @@ class StalledCallbackWatchdog:
         for tid in dead:
             del self._episodes[tid]
 
-    def _fx191_convergence_tick(self) -> None:
-        """FX191 D5: convergence loop — first sibling tick in the run loop.
-
-        F203 D16: guarded by a monotonic next-due stamp of delivery.tick_s.
-        The run loop re-enters faster than tick_s because asyncio.wait_for
-        returns early on every status event — the loop is correct, the
-        unconditional tick call was the defect.
-        """
-        now = time.monotonic()
-        if now < self._next_tick_due:
-            return
-        try:
-            from cli_agent_orchestrator.services.config_service import ConfigService
-
-            tick_s = float(ConfigService.get("delivery.tick_s", 5.0))
-            self._next_tick_due = now + tick_s
-
-            from cli_agent_orchestrator.services.delivery_service import convergence_tick
-
-            convergence_tick()
-        except Exception:
-            logger.debug("fx191 convergence_tick error", exc_info=True)
+    # WP-ARCH 3c K7: ``_fx191_convergence_tick`` is gone. Its entire body was a
+    # throttled call into ``delivery_service.convergence_tick``, and that function
+    # is deleted with the obligation ladder — it had already returned immediately
+    # whenever the queue owned delivery, so at the shipped position this tick did
+    # nothing but read the clock. The scheduled observer is
+    # ``app/delivery/tick.py``. Removing the method here is forced by K7 rather
+    # than chosen: it is the deleted function's ONLY driver, so leaving it would
+    # leave an ImportError behind a try/except that swallows it silently.
 
     def poll_unarmed_statuses(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -1479,10 +1522,6 @@ class StalledCallbackWatchdog:
                 ):
                     # Supervisor self-notify: create obligation targeting own mailbox
                     try:
-                        from cli_agent_orchestrator.services.delivery_service import (
-                            _create_self_notify_obligation,
-                        )
-
                         _create_self_notify_obligation(terminal_id)
                         logger.debug(
                             "waiting-inbox watchdog: supervisor self-notify for %s",
@@ -1620,10 +1659,6 @@ class StalledCallbackWatchdog:
                         "chao_supervisor",
                     ):
                         try:
-                            from cli_agent_orchestrator.services.delivery_service import (
-                                _create_self_notify_obligation,
-                            )
-
                             _create_self_notify_obligation(terminal_id)
                             logger.debug(
                                 "ready-backlog watchdog: supervisor self-notify for %s",
@@ -2344,7 +2379,6 @@ class StalledCallbackWatchdog:
                     else:
                         _idle_consecutive = 0
 
-                await asyncio.to_thread(self._fx191_convergence_tick)
                 await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.refresh_screen_fingerprints)
                 await asyncio.to_thread(self.notify_due, registry)

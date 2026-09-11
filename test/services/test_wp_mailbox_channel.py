@@ -1,7 +1,18 @@
-"""WP-MAILBOX-CHANNEL acceptance tests (AC#1–AC#9).
+"""WP-MAILBOX-CHANNEL acceptance tests (AC#1-AC#9).
 
-Feature-flagged supervisor-inbound pull channel. Tests use scratch_db fixture
-and monkeypatch the supervisor.mailbox_pull flag.
+The durable supervisor mailbox: its rows, its incarnations, its ack watermark
+and its quarantine. What this file no longer covers is the FLAG the feature
+shipped behind.
+
+WP-ARCH 3c K2/K8 deleted ``supervisor.mailbox_pull`` together with the helper
+that read it (``mailbox_service.is_supervisor_mailbox_pull_terminal``) and the
+legacy pusher it selected between. The mailbox itself is untouched -- the rows
+are still durable, ``list_messages``/``ack_messages`` are still the drain, the
+watermark still settles exactly once -- so every arm about the STORE survives
+here unchanged. The arms about the SWITCH are re-pointed at
+``mailbox_service.probe_supervisor_role``, the fail-closed role probe that the
+delivery gate actually consults now, or deleted where the switch was the whole
+subject; each deletion is recorded in place below.
 """
 
 from __future__ import annotations
@@ -10,7 +21,6 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,14 +38,14 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     get_pending_messages,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.services import mailbox_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.mailbox_service import (
     MailboxDomainError,
     ack_messages,
-    is_supervisor_mailbox_pull_terminal,
     list_messages,
+    probe_supervisor_role,
     quarantine_malformed_mailbox_rows,
 )
 
@@ -125,55 +135,9 @@ def _inbox_row(
     return row
 
 
-# ---------------------------------------------------------------------------
-# AC#1 — flag-off byte-identical push
-# ---------------------------------------------------------------------------
-
-
-def test_ac1_flag_off_gate_still_holds_the_row_by_role(scratch_db, monkeypatch):
-    """WP-ARCH 3b / A1.5 INVERTS this case, and the inversion is the decision.
-
-    AC#1 used to prove that with ``supervisor.mailbox_pull`` off, a supervisor
-    mailbox terminal fell through the gate and took the push path. That
-    fall-through is the path that produced the pasted ``[Message from ...]``
-    blocks in the seat's composer (#613, emitter 3), and the user ended it.
-
-    The gate now asks the fail-closed ROLE probe instead of the flag, so the ban
-    holds under ``off``, ``shadow``, ``drain`` and ``on`` alike — muting follows
-    the switch position and the ban does not. A config-gated ban is exactly what
-    F210 declined to build when it made the rung-2 exemption role-based.
-
-    What is still asserted here: the flag helper is unchanged and still reports
-    False (the flag did not silently flip), and the row is held PENDING for the
-    seat to drain rather than settled by the gate.
-    """
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
-    with scratch_db.begin() as db:
-        _terminal(db, "sup-001")
-        _mailbox(db)
-        row = _inbox_row(db, "sup-001", logical="mb_sup")
-        row_id = row.id
-
-    # The flag helper is untouched by the amendment and still reports False.
-    # What changed is which predicate the GATE consults.
-    assert is_supervisor_mailbox_pull_terminal("sup-001") is False
-
-    # Trace the predicate the gate actually consults now.
-    from cli_agent_orchestrator.services.mailbox_service import probe_supervisor_role
-
-    gate_called = []
-    original_fn = probe_supervisor_role
-
-    def traced_fn(tid):
-        result = original_fn(tid)
-        gate_called.append((tid, result))
-        return result
-
-    with (
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
-            traced_fn,
-        ),
+def _seat_delivery_patches():
+    """The patch set every deliver_pending arm below shares."""
+    return (
         patch(
             "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
             return_value={
@@ -183,25 +147,73 @@ def test_ac1_flag_off_gate_still_holds_the_row_by_role(scratch_db, monkeypatch):
                 "recovery_state": None,
             },
         ),
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
+        patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
+    )
+
+
+def _bare_service() -> InboxService:
+    svc = InboxService.__new__(InboxService)
+    svc._gone_lock = threading.Lock()
+    svc._gone_streaks = {}
+    svc._tnf_lock = threading.Lock()
+    svc._terminal_not_found_streaks = {}
+    return svc
+
+
+# ---------------------------------------------------------------------------
+# AC#1 — the gate holds the row by ROLE
+# ---------------------------------------------------------------------------
+
+
+def test_ac1_gate_holds_the_row_by_role(scratch_db):
+    """WP-ARCH 3b / A1.5 INVERTED this case, and the inversion is the decision.
+
+    AC#1 used to prove that with ``supervisor.mailbox_pull`` off, a supervisor
+    mailbox terminal fell through the gate and took the push path. That
+    fall-through is the path that produced the pasted ``[Message from ...]``
+    blocks in the seat's composer (#613, emitter 3), and the user ended it.
+
+    The gate asks the fail-closed ROLE probe, so the ban holds under every switch
+    position alike -- muting follows the position and the ban does not. A
+    config-gated ban is exactly what F210 declined to build when it made the
+    rung-2 exemption role-based, and WP-ARCH 3c then deleted the flag outright,
+    which is why the flag half of this arm is gone and the probe half is all
+    that is left to assert.
+
+    What is asserted: the gate is REACHED and reports SUPERVISOR, and the row is
+    held PENDING for the seat to drain rather than settled by the gate.
+    """
+    with scratch_db.begin() as db:
+        _terminal(db, "sup-001")
+        _mailbox(db)
+        row = _inbox_row(db, "sup-001", logical="mb_sup")
+        row_id = row.id
+
+    # Trace the predicate the gate actually consults.
+    gate_called = []
+    original_fn = probe_supervisor_role
+
+    def traced_fn(tid):
+        result = original_fn(tid)
+        gate_called.append((tid, result))
+        return result
+
+    meta, monitor, pm = _seat_delivery_patches()
+    with (
         patch(
-            "cli_agent_orchestrator.services.inbox_service.status_monitor",
-            MagicMock(),
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
+            traced_fn,
         ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.provider_manager",
-            MagicMock(),
-        ),
+        meta,
+        monitor,
+        pm,
         patch(
             "cli_agent_orchestrator.services.inbox_service.terminal_service",
             MagicMock(),
         ),
     ):
-        svc = InboxService.__new__(InboxService)
-        svc._gone_lock = threading.Lock()
-        svc._gone_streaks = {}
-        svc._tnf_lock = threading.Lock()
-        svc._terminal_not_found_streaks = {}
-        svc.deliver_pending("sup-001")
+        _bare_service().deliver_pending("sup-001")
 
     # The gate was reached and reported SUPERVISOR, so the row was short-circuited
     # by role rather than falling through to the composer.
@@ -213,55 +225,42 @@ def test_ac1_flag_off_gate_still_holds_the_row_by_role(scratch_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC#2 — flag-on skips push, leaves PENDING
+# AC#2 — the ban leaves the push machinery untouched
 # ---------------------------------------------------------------------------
 
 
-def test_ac2_flag_on_skips_push_leaves_pending(scratch_db, monkeypatch):
-    """With flag true, deliver_pending on a supervisor mailbox terminal returns
-    WITHOUT calling send_keys / begin_delivery_attempt; row stays PENDING."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
+def test_ac2_seat_row_never_opens_an_attempt_or_a_send(scratch_db):
+    """deliver_pending on a supervisor mailbox terminal returns WITHOUT opening a
+    delivery attempt or calling send_prepared_input; the row stays PENDING.
+
+    AC#2 asked this of the ``supervisor.mailbox_pull=true`` position. WP-ARCH 3c
+    deleted the flag, so the question it was asking about ONE position is now the
+    unconditional contract, and the arm asserts it with no flag set at all. The
+    two negatives are load-bearing rather than vacuous: ``begin_delivery_attempt``
+    is the row that would make the push auditable and ``send_prepared_input`` is
+    the keystroke itself, so between them they pin that the gate returns before
+    the seam and not merely that the row survived.
+    """
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
         row = _inbox_row(db, "sup-001", logical="mb_sup")
         row_id = row.id
 
-    backend = MagicMock()
-    backend.supports_event_inbox.return_value = False
-
+    meta, monitor, pm = _seat_delivery_patches()
     with (
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
-            return_value={
-                "tmux_session": "cao-test",
-                "tmux_window": "sup-001",
-                "lifecycle_generation": 1,
-                "recovery_state": None,
-            },
-        ),
+        meta,
         patch(
             "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
         ) as mock_attempt,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.status_monitor",
-            MagicMock(),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.provider_manager",
-            MagicMock(),
-        ),
+        monitor,
+        pm,
         patch(
             "cli_agent_orchestrator.services.inbox_service.terminal_service",
             MagicMock(),
         ) as mock_ts,
     ):
-        svc = InboxService.__new__(InboxService)
-        svc._gone_lock = threading.Lock()
-        svc._gone_streaks = {}
-        svc._tnf_lock = threading.Lock()
-        svc._terminal_not_found_streaks = {}
-        svc.deliver_pending("sup-001")
+        _bare_service().deliver_pending("sup-001")
 
     # Push path NOT exercised
     mock_attempt.assert_not_called()
@@ -278,10 +277,9 @@ def test_ac2_flag_on_skips_push_leaves_pending(scratch_db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ac3_ack_settles_drained_rows_exactly_once(scratch_db, monkeypatch):
-    """After flag-on delivery + ack_messages(up_to_id), drained rows are DELIVERED
+def test_ac3_ack_settles_drained_rows_exactly_once(scratch_db):
+    """After delivery + ack_messages(up_to_id), drained rows are DELIVERED
     with failure_reason=mailbox_pull_acked. Concurrent ack has exactly one winner."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -344,18 +342,25 @@ def test_ac3_ack_settles_drained_rows_exactly_once(scratch_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC#4 — mailbox-write-failure falls back to push, exactly once
+# AC#4 — a superseded incarnation is not the seat
 # ---------------------------------------------------------------------------
 
 
-def test_ac4_mailbox_unresolvable_falls_back_to_push(scratch_db, monkeypatch):
-    """With flag on but the mailbox's current incarnation doesn't match (superseded),
-    is_supervisor_mailbox_pull_terminal returns False → push path proceeds.
+def test_ac4_superseded_incarnation_is_not_the_seat(scratch_db):
+    """The gate answers for the CURRENT incarnation only.
 
-    Verifies: flag ON but mailbox.current_terminal_id != terminal_id (incarnation
-    superseded) → gate returns False → delivery falls through to push, exactly once.
+    AC#4 asked this of ``is_supervisor_mailbox_pull_terminal``: a terminal whose
+    mailbox has moved on is not in pull mode, so delivery fell back to push. The
+    helper is deleted and the question moved intact to ``probe_supervisor_role``,
+    which resolves the mailbox by ``current_terminal_id`` -- so the stale
+    generation-1 terminal answers False and the live generation-2 terminal
+    answers True.
+
+    The property matters as much under the ban as it did under the flag: it is
+    what keeps the ban scoped to the live seat instead of to every pane that was
+    ever published as one. Both directions are asserted, because a probe that
+    answered True for everything would pass the first assertion alone.
     """
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _terminal(db, "sup-002")
@@ -390,11 +395,11 @@ def test_ac4_mailbox_unresolvable_falls_back_to_push(scratch_db, monkeypatch):
         )
         _inbox_row(db, "sup-001", logical="mb_sup", message="fallback msg")
 
-    # The gate helper returns False — mailbox exists but terminal is superseded
-    assert is_supervisor_mailbox_pull_terminal("sup-001") is False
+    # The stale incarnation is not the seat — the gate does not protect it.
+    assert probe_supervisor_role("sup-001") is False
 
-    # Contrast: sup-002 (the current incarnation) WOULD activate the gate
-    assert is_supervisor_mailbox_pull_terminal("sup-002") is True
+    # Contrast: sup-002 (the current incarnation) IS the seat.
+    assert probe_supervisor_role("sup-002") is True
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +407,9 @@ def test_ac4_mailbox_unresolvable_falls_back_to_push(scratch_db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ac5_malformed_row_quarantined(scratch_db, monkeypatch):
+def test_ac5_malformed_row_quarantined(scratch_db):
     """A row whose body fails validation is quarantined as DELIVERY_FAILED /
     mailbox_payload_malformed; no attempt row is left unsettled."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -433,9 +437,8 @@ def test_ac5_malformed_row_quarantined(scratch_db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ac6_drain_via_existing_list_ack(scratch_db, monkeypatch):
+def test_ac6_drain_via_existing_list_ack(scratch_db):
     """list_messages + ack_messages drive D2 end-to-end with no new CLI/tool."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -456,46 +459,49 @@ def test_ac6_drain_via_existing_list_ack(scratch_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC#7 — schema_version default + compatibility
+# AC#7 — REMOVED by WP-ARCH 3c K8.
+#
+# ``test_ac7_schema_version_default_and_compatibility`` pinned a compatibility
+# refusal: a mailbox stamped with a schema_version the drain does not understand
+# fell out of pull mode, and ``is_supervisor_mailbox_pull_terminal`` was where
+# that comparison lived. K8 rewrote the surviving probe as
+# ``is_supervisor_role_terminal`` and its docstring states the drop as a ruling,
+# not an accident -- "a schema-mismatched supervisor is still a supervisor" --
+# because a version check that can silently un-protect the seat's pane is a
+# precondition that can re-arm composer injection, which is the class of thing
+# K8 exists to remove.
+#
+# So the arm's subject is gone in both halves. Nothing reads ``schema_version``
+# any more: the column, its migration and its ``DEFAULT 1`` survive (the fixture
+# above still applies the migration, because the model still writes the field),
+# but there is no consumer left to refuse anything. Re-pointing the arm at the
+# column's default alone would assert that a SQLAlchemy default is its own
+# default, which pins no behaviour at all; if a future slice gives the field a
+# reader, the refusal it implements is what earns a new arm here.
 # ---------------------------------------------------------------------------
 
 
-def test_ac7_schema_version_default_and_compatibility(scratch_db, monkeypatch):
-    """Existing mailboxes read schema_version=1; drain refuses to operate on
-    an unsupported future version."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
-    with scratch_db.begin() as db:
-        _terminal(db, "sup-001")
-        _mailbox(db, schema_version=1)
-
-    # Version 1 is compatible — pull gate activates
-    assert is_supervisor_mailbox_pull_terminal("sup-001") is True
-
-    # Bump to unsupported version 99
-    with scratch_db.begin() as db:
-        mb = db.query(MailboxModel).filter_by(id="mb_sup").one()
-        mb.schema_version = 99
-
-    # Version 99 is incompatible — pull gate deactivates (falls back to push)
-    assert is_supervisor_mailbox_pull_terminal("sup-001") is False
-
-
 # ---------------------------------------------------------------------------
-# AC#8 — reconciliation sweep does not fight pull mode
+# AC#8 — the reconcile sweep does not re-drive the seat into a push
 # ---------------------------------------------------------------------------
 
 
-def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypatch):
-    """With flag on, a PENDING supervisor row older than the reconcile grace is
-    re-gated (no push). A row YOUNGER than INBOX_RECONCILE_GRACE_SECONDS is never
-    passed to deliver_pending by the reconcile sweep.
+def test_ac8_reconciliation_sweep_does_not_fight_the_seat(scratch_db):
+    """A PENDING supervisor row older than the reconcile grace is re-gated (no
+    push). A row YOUNGER than INBOX_RECONCILE_GRACE_SECONDS is never passed to
+    deliver_pending by the reconcile sweep.
+
+    AC#8 named "pull mode" because the flag was what made the seat's rows sit
+    PENDING long enough for the sweep to see them. WP-ARCH 3c deleted the flag
+    and the role ban makes those rows sit there unconditionally, so the sweep now
+    meets them on EVERY deployment rather than on a flagged one -- which makes
+    this arm more load-bearing after the deletion, not less.
 
     Test-comment note (empirical N1): the sweep query also JOINs on terminal
-    existence in addition to the age filter — a pull-mode row on a live terminal
+    existence in addition to the age filter — a seat row on a live terminal
     still appears once past the grace, and the re-driven deliver_pending no-ops
-    via the gate; the join is a secondary filter, not a pull-mode protection.
+    via the gate; the join is a secondary filter, not a protection of its own.
     """
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     from cli_agent_orchestrator.clients.database import list_pending_receiver_ids_older_than
     from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
 
@@ -522,6 +528,7 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
     # The older_than filter excludes young rows
     receiver_ids = list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS)
     # If sup-001 appears, it's because the OLD row qualifies
+    assert "sup-001" in receiver_ids
     # The young row alone should NOT trigger inclusion
     with scratch_db.begin() as db:
         # Remove the old row to test young-only
@@ -529,49 +536,32 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
 
     receiver_ids_young_only = list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS)
     assert "sup-001" not in receiver_ids_young_only
+    assert young_id is not None
 
-    # Re-add old row and verify deliver_pending no-ops via pull gate (no push)
+    # Re-add old row and verify deliver_pending no-ops via the role gate (no push)
     with scratch_db.begin() as db:
         _inbox_row(db, "sup-001", logical="mb_sup", message="re-old", created_at=old_time)
 
+    meta, monitor, pm = _seat_delivery_patches()
     with (
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
-            return_value={
-                "tmux_session": "cao-test",
-                "tmux_window": "sup-001",
-                "lifecycle_generation": 1,
-                "recovery_state": None,
-            },
-        ),
+        meta,
         patch(
             "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
         ) as mock_attempt,
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.status_monitor",
-            MagicMock(),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.provider_manager",
-            MagicMock(),
-        ),
+        monitor,
+        pm,
         patch(
             "cli_agent_orchestrator.services.inbox_service.terminal_service",
             MagicMock(),
         ) as mock_ts,
     ):
-        svc = InboxService.__new__(InboxService)
-        svc._gone_lock = threading.Lock()
-        svc._gone_streaks = {}
-        svc._tnf_lock = threading.Lock()
-        svc._terminal_not_found_streaks = {}
-        svc.deliver_pending("sup-001")
+        _bare_service().deliver_pending("sup-001")
 
-    # Pull gate skipped the push — no attempt opened
+    # The role gate skipped the push — no attempt opened
     mock_attempt.assert_not_called()
     mock_ts.send_prepared_input.assert_not_called()
 
-    # Rows still PENDING (waiting for supervisor's own drain)
+    # Rows still PENDING (waiting for the seat's own drain)
     with scratch_db() as db:
         pending = (
             db.query(InboxModel)
@@ -586,11 +576,10 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
+def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db):
     """A row with an existing OPEN attempt from a pre-flag-flip push era, now acked
-    under pull mode, has that attempt settled confirmed via the D2 safety net.
+    by the seat, has that attempt settled confirmed via the D2 safety net.
     No attempt row is left with settled_at=NULL."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "true")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -623,7 +612,7 @@ def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
             )
         )
 
-    # Ack the row under pull mode
+    # Ack the row
     result = ack_messages("sup-001", row_id)
     assert result["changed"] is True
 
@@ -641,81 +630,31 @@ def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# P0 hotfix (2026-08-09): supervisor-addressed pending rows must push by default
+# P0 hotfix (2026-08-09) — REMOVED by WP-ARCH 3c K8.
+#
+# ``test_p0_hotfix_supervisor_row_pushes_when_receiver_idle`` asserted the exact
+# behaviour K8 forbids: with the flag off, the gate resolved False and a
+# supervisor-addressed row was allowed to reach the push path. It was written as
+# a #123 regression guard at a moment when the seat's callbacks arrived only by
+# paste, and the fix it guarded is the emitter #613 later named.
+#
+# Both of its premises are now gone. There is no flag to read off, and there is
+# no False answer to observe -- ``probe_supervisor_role`` is fail-closed, so a
+# supervisor-role receiver answers True and an unanswerable probe answers True
+# as well. Keeping the arm would require asserting that the seat CAN be pasted
+# into, which is the one outcome the phase exists to make unreachable; inverting
+# it in place would just duplicate AC#1 and AC#2 above, which already pin the
+# True answer and the untouched push machinery. The callback the hotfix cared
+# about is delivered by the native channel and drained by list/ack, covered by
+# AC#6.
 # ---------------------------------------------------------------------------
 
 
-def test_p0_hotfix_supervisor_row_pushes_when_receiver_idle(scratch_db, monkeypatch):
-    """F123 surface: with the CAO_SUPERVISOR_MAILBOX_PULL flag absent/false (the
-    new deployed default), a supervisor-addressed pending row is NOT skipped by
-    the pull gate — deliver_pending proceeds past it (the push path is entered)
-    instead of returning early at the gate. This restores push delivery for
-    supervisor callbacks."""
-    # Ensure the flag is off (absent env → default, or explicitly empty).
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
-    with scratch_db.begin() as db:
-        _terminal(db, "sup-001")
-        _mailbox(db)
-        row = _inbox_row(db, "sup-001", logical="mb_sup", message="F123 supervisor callback")
-        row_id = row.id
-
-    gate_called = []
-    original_fn = is_supervisor_mailbox_pull_terminal
-
-    def traced_fn(tid):
-        result = original_fn(tid)
-        gate_called.append((tid, result))
-        return result
-
-    with (
-        patch(
-            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
-            traced_fn,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
-            return_value={
-                "tmux_session": "cao-test",
-                "tmux_window": "sup-001",
-                "lifecycle_generation": 1,
-                "recovery_state": None,
-            },
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.status_monitor",
-            MagicMock(),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.provider_manager",
-            MagicMock(),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.terminal_service",
-            MagicMock(),
-        ),
-    ):
-        svc = InboxService.__new__(InboxService)
-        svc._gone_lock = threading.Lock()
-        svc._gone_streaks = {}
-        svc._tnf_lock = threading.Lock()
-        svc._terminal_not_found_streaks = {}
-        svc.deliver_pending("sup-001")
-
-    # The pull gate was evaluated and resolved False (push not short-circuited).
-    assert any(tid == "sup-001" and result is False for tid, result in gate_called)
-    # The row was NOT settled by the pull gate (it is not acked/DELIVERED here);
-    # it remains PENDING for the ordinary push path to pick up.
-    with scratch_db() as db:
-        msg = db.get(InboxModel, row_id)
-        assert msg.status == MessageStatus.PENDING.value
-
-
-def test_p0_hotfix_list_messages_since_utc_returns_row_created_now(scratch_db, monkeypatch):
+def test_p0_hotfix_list_messages_since_utc_returns_row_created_now(scratch_db):
     """F130 surface: list_messages with an aware-UTC `since` (e.g. the ISO the
     supervisor passes) returns a row created "now" (UTC). The stored created_at
     is written timezone-aware UTC and the since filter is normalized to
     aware-UTC, so the comparison is correct."""
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)

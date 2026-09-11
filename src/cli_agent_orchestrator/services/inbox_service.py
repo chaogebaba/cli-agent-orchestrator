@@ -139,10 +139,6 @@ def _f642_record_blocked_awaiting_idle(message_ids: list[int]) -> None:
         logger.debug("f642_record_blocked_failed", exc_info=True)
 
 
-# F162 D10: rate-limited gate5 WARN state — {terminal_id: last_warn_time}
-_fx158_gate5_last_warn: dict[str, float] = {}
-_FX158_GATE5_WARN_INTERVAL_S: float = 60.0
-
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
@@ -522,9 +518,12 @@ class CallbackRunOutcome:
     max_written_row_id: int = 0  # F168 D4: highest row id written this run
     # fx168 FIX-2: stale path heal data (mailbox_id, terminal_id, generation, new_path)
     _fx168_stale_heal: tuple[str, str, int, str] | None = None
-    # F459: last written row's message body and sender display name for native bridge
-    _f459_message_body: str | None = None
-    _f459_sender_display_name: str | None = None
+    # WP-ARCH 3c K2: F459's body/sender pair is GONE. It existed so the legacy
+    # native bridge could render a worker-named, payload-carrying callback, and
+    # the loop that filled it was the deleted file writer's. Keeping the fields
+    # would have shipped two attributes that are None by construction and that a
+    # future reader would take for "no body this time" rather than "never a body".
+    # The wake carries ids and a count; the seat drains bodies by ack.
 
 
 def _get_backoff_delay(terminal_id: str) -> float:
@@ -887,11 +886,6 @@ class InboxService:
         )
         from cli_agent_orchestrator.services.mailbox_service import (
             get_mailbox_authority_lock,
-            is_supervisor_mailbox_pull_terminal,
-        )
-        from cli_agent_orchestrator.services.teammate_push_service import (
-            NativeInboxWriteResult,
-            write_supervisor_callback_notification,
         )
 
         MAX_ROWS_PER_RUN = 50
@@ -933,37 +927,17 @@ class InboxService:
                     mb = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
                     inbox_path_str = mb.cc_inbox_path if mb else None
 
-        # WP-ARCH 3b / A1.5: a missing CC inbox path is no longer a REFUSAL.
+        # WP-ARCH 3c K2: there is no content channel any more. The file this
+        # runner used to write was ``teammate_push_service``'s, and that module is
+        # deleted — its writer, its flag and its pull-mode reconciler with it.
         #
-        # ``cc_inbox_path`` is K2's on-disk ``team-lead.json`` — the pull-mode
-        # CONTENT channel — and it is configured only when ``supervisor.mailbox_pull``
-        # is on. A1.5 keeps that flag at its shipped ``False``, because the seat's
-        # paste ban no longer depends on it. So on a default deployment a
-        # supervisor mailbox has no path, and returning ``no_path`` here left
-        # ``written`` at zero, which left ``_f136_post_delivery``'s
-        # ``outcome.written > 0`` gate shut and the doorbell silent.
-        #
-        # That is the whole of the failure: the role gate routes the seat
-        # here, this returned ``no_path``, and the seat was NEITHER pasted NOR
-        # woken — #604 arriving through the amendment written to end it. A1.5
-        # says the carrier in the non-``on`` positions IS this chain into
-        # ``ring_supervisor_doorbell``, so the chain has to reach it.
-        #
-        # The cursor is what matters and it is kept: ``claim_unnotified_wake``
-        # and ``commit_wake`` still run, so an acked or aged id is still gated
-        # and #388 stays closed. What is dropped when there is no path is only
-        # the FILE — which D6 deletes as K2 anyway, and which A1 replaces with
-        # the seat draining ids by ``list_messages``/``ack_messages``.
-        content_channel = bool(inbox_path_str)
-        if not content_channel:
-            logger.info(
-                "f136 wake without a content channel terminal=%s mailbox=%s: "
-                "no cc_inbox_path (supervisor.mailbox_pull is off), so the wake "
-                "carries ids and the seat drains bodies by ack",
-                terminal_id,
-                mailbox_id,
-            )
-
+        # The cursor is what mattered and it is kept: ``claim_unnotified_wake``
+        # and ``commit_wake`` still run, so an acked or aged id is still gated and
+        # #388 stays closed. What the runner no longer does is carry a BODY. A1's
+        # wake is ids and a count, the seat drains bodies by
+        # ``list_messages``/``ack_messages``, and #613's first observation was a
+        # full body riding the native message — which the context-hygiene rule
+        # files as a defect rather than a feature.
         # D10: acquire delivery_lock (authority lock is inside claim/commit)
         delivery_lock = get_delivery_lock(terminal_id)
         if not delivery_lock.acquire(timeout=0.5):
@@ -1066,57 +1040,19 @@ class InboxService:
                     _fx168_stale_heal=_fx168_stale_heal,
                 )
 
-            # F476 D3: EMIT — write CC inbox entries AFTER commit
-            inbox_path = Path(os.path.expanduser(inbox_path_str)) if content_channel else None
+            # F476 D3: the claim is committed; record WHICH ids it covered.
+            # ``written`` is the cursor's own count of wake-eligible rows, not a
+            # count of files: K2's writer is deleted and nothing here emits.
             deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
             written = 0
             _max_written_row_id = 0
-            _f459_last_body: str | None = None
-            _f459_last_sender: str | None = None
 
             for row in claim.rows:
                 if time.monotonic() >= deadline_mono:
                     break
-
-                if not content_channel:
-                    # WP-ARCH 3b / A1.5: no K2 file, and the row is still
-                    # WAKE-ELIGIBLE. ``written`` is the doorbell's gate, not a
-                    # count of files, and the cursor above has already decided
-                    # this id is unacked and unaged. The body is deliberately
-                    # NOT carried: A1's wake is ids and a count, and #613's
-                    # first observation was a full body riding the native
-                    # message, which the context-hygiene rule files as a defect.
-                    written += 1
-                    if row.inbox_row_id > _max_written_row_id:
-                        _max_written_row_id = row.inbox_row_id
-                    continue
-
-                msg = InboxMessage(
-                    id=row.inbox_row_id,
-                    sender_id=row.sender_id,
-                    receiver_id=terminal_id,
-                    message=row.message,
-                    orchestration_type=OrchestrationType.SEND_MESSAGE,
-                    status=MessageStatus.PENDING,
-                    created_at=row.created_at,
-                )
-                result = write_supervisor_callback_notification(
-                    inbox_path=inbox_path,
-                    mailbox_id=mailbox_id,
-                    message=msg,
-                    deadline_mono=deadline_mono,
-                )
-
-                if result.kind == "written":
-                    written += 1
-                    if row.inbox_row_id > _max_written_row_id:
-                        _max_written_row_id = row.inbox_row_id
-                    _f459_last_body = row.message
-                    _f459_last_sender = row.sender_id
-                elif result.kind == "already_present":
-                    written += 1  # Count as success for doorbell
-                    if row.inbox_row_id > _max_written_row_id:
-                        _max_written_row_id = row.inbox_row_id
+                written += 1
+                if row.inbox_row_id > _max_written_row_id:
+                    _max_written_row_id = row.inbox_row_id
 
             _failure_streaks.pop(terminal_id, None)
 
@@ -1129,8 +1065,6 @@ class InboxService:
                 needs_immediate_wake=False,
                 reason="ok",
                 max_written_row_id=_max_written_row_id,
-                _f459_message_body=_f459_last_body,
-                _f459_sender_display_name=_f459_last_sender,
             )
         except Exception as exc:
             logger.exception("f476_delivery_run_error terminal=%s", terminal_id)
@@ -2404,60 +2338,37 @@ class InboxService:
             if not messages:
                 return
 
-            # --- WP-MAILBOX-CHANNEL: pull-mode gate (D6) ---
-            # WP-ARCH 3b / K8 anchor 1 (§A1.3, §A1.5). This branch used to ask
-            # is_supervisor_mailbox_pull_terminal, which returns False before it
-            # looks at the terminal at all whenever supervisor.mailbox_pull is
-            # unset — so with the shipped defaults the branch was NOT taken and a
-            # supervisor-mailbox row fell straight through to prepare_input and
-            # send_prepared_input. THAT is the path that produced the pasted
-            # "[Message from ...]" blocks in the seat's composer (#613 emitter 3),
-            # and #613 is the evidence: with only wake.native set, the paste
-            # fired anyway.
+            # --- the seat is never pasted (WP-ARCH 3c K8) ---
+            # K8 kills the seat's REACHABILITY of the paste seam, not the seam.
+            # A supervisor-role receiver returns HERE, unconditionally, before
+            # ``prepare_input``/``send_prepared_input`` can be reached. That is
+            # the whole of the ban and it is a property of the RECEIVER'S ROLE,
+            # never of a switch position or a config flag:
             #
-            # It now asks is_supervisor_role_terminal — the same fail-closed
-            # probe D7's dispatch and the rung-2 exemption already use. The ban
-            # is therefore a property of the RECEIVER'S ROLE, not of a switch
-            # position or a config flag:
+            #   * muting follows the switch position and the ban must not. Under
+            #     a non-serving position this path still handles worker traffic,
+            #     and D9's boot guard can impose such a position without an
+            #     operator asking. A ban scoped to the position would be false in
+            #     two of three of them (#488).
+            #   * a config-gated ban is what F210 declined to build when it made
+            #     the rung-2 exemption role-based: an operator could unset the
+            #     flag and the user's decision would evaporate.
             #
-            #   * muting follows the switch position and the ban does not. Under
-            #     `off` and `drain` this path still serves new traffic,
-            #     and `drain` is a position D9's boot guard can impose without an
-            #     operator asking for it. Scoping the ban to CAO_DELIVERY_QUEUE=on
-            #     would leave it false in two of three positions (#488).
-            #   * a config-gated ban is exactly what F210 declined to build when
-            #     it made the rung-2 exemption role-based; an operator could
-            #     unset the flag and the user's decision would evaporate.
+            # The probe is the fail-closed ``is_supervisor_role_terminal`` that
+            # D7's dispatch and the rung-2 exemption already use, so an
+            # unanswerable probe reports *supervisor* and refuses to paste.
             #
-            # Rows stay PENDING; the seat drains them via list_messages/ack, and
-            # the wake reaches it over the native cross-session channel.
+            # 3c drops the ``request_delivery`` arming that used to sit here. It
+            # armed the F136 runner to emit; the runner no longer emits anything
+            # (K2's writer is deleted) and the seat's wake belongs to the
+            # delivery tick, which observes the durable rows on its own schedule
+            # and needs no arming from this path. Rows stay PENDING and are
+            # adopted into the queue by that tick.
             from cli_agent_orchestrator.services.mailbox_service import (
                 probe_supervisor_role,
             )
 
             if probe_supervisor_role(terminal_id):
-                # F476 r3 (#388): the supervisor teammate-push wake MUST route
-                # through the single wake cursor, never attempt_teammate_push
-                # directly. Calling attempt_teammate_push here bypassed
-                # claim_unnotified_wake/commit_wake, so an already-acked id was
-                # re-emitted as a "Message N ready. Drain" teammate replay
-                # (issue #388 samples 3-17). Instead signal request_delivery,
-                # which arms the F136 runner: it claims wake-eligible rows above
-                # the cursor, commits, then emits ONCE (teammate/native) and
-                # rings the doorbell from _f136_post_delivery. Acked/aged ids are
-                # gated by the cursor and never re-surface.
-                #
-                # The prior wake.native / _should_teammate_push / F457
-                # pending-recheck gates are now enforced inside the runner and
-                # ring_supervisor_doorbell, so they are not duplicated here.
-                try:
-                    request_delivery(terminal_id)
-                except Exception as _rd_exc:  # best-effort, mirrors prior contract
-                    logger.debug(
-                        "f476r3_request_delivery_failed terminal=%s: %s",
-                        terminal_id,
-                        _rd_exc,
-                    )
                 return
             # --- end WP-MAILBOX-CHANNEL gate ---
 
@@ -3653,268 +3564,33 @@ class InboxService:
         except Exception as e:
             logger.debug("f524 stall surface sweep failed: %s", e)
         self.recover_stale_deliveries(recurring=True)
-        # fx158 D1/D2: pull-mode pending-push reconciler (bypasses deliver_pending).
-        self.reconcile_pull_mode_notifications()
         # WP-MAILBOX-CHANNEL: quarantine malformed mailbox rows on daemon heartbeat.
-        from cli_agent_orchestrator.services.config_service import ConfigService
+        # WP-ARCH 3c K2 removed the ``supervisor.mailbox_pull`` gate that used to
+        # wrap this sweep. The quarantine is not a pull-mode feature -- it repairs
+        # malformed MAILBOX rows, which every position needs whether or not a
+        # legacy pull carrier exists -- so it was gated on the wrong thing and now
+        # runs unconditionally on the daemon heartbeat.
+        from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
+        from cli_agent_orchestrator.clients.database import SessionLocal as _SL
         from cli_agent_orchestrator.services.mailbox_service import (
             quarantine_malformed_mailbox_rows,
         )
 
-        if ConfigService.get("supervisor.mailbox_pull"):
-            from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
-            from cli_agent_orchestrator.clients.database import SessionLocal as _SL
-
-            with _SL() as _db:
-                supervisor_mailboxes = _db.query(_MBModel).filter_by(role="supervisor").all()
-                for mb in supervisor_mailboxes:
-                    try:
-                        quarantine_malformed_mailbox_rows(mb.id)
-                    except Exception as e:
-                        logger.debug(f"Mailbox quarantine sweep failed for {mb.id}: {e}")
-
-    def reconcile_pull_mode_notifications(self) -> None:
-        """fx158 D1: Push notifications for pull-mode supervisor mailboxes.
-
-        Bypasses deliver_pending entirely — routes directly to the push path.
-        D3 selection: mailbox-driven, cursor-aware, grace-windowed.
-        D9: per-mailbox failure isolation.
-        """
-        import hashlib
-
-        from cli_agent_orchestrator.clients.database import InboxModel as _InboxModel
-        from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
-        from cli_agent_orchestrator.clients.database import SessionLocal as _SL
-        from cli_agent_orchestrator.clients.database import TerminalModel as _TModel
-        from cli_agent_orchestrator.clients.database import (
-            begin_delivery_attempt,
-            settle_delivery_attempt,
-        )
-        from cli_agent_orchestrator.services.config_service import ConfigService
-        from cli_agent_orchestrator.services.mailbox_service import (
-            is_supervisor_mailbox_pull_terminal,
-        )
-        from cli_agent_orchestrator.services.teammate_push_service import (
-            PushOutcome,
-            _should_teammate_push,
-            attempt_teammate_push_reported,
-            native_fallback_reason,
-        )
-
-        # D3 condition 1: flag must be on
-        if not ConfigService.get("supervisor.mailbox_pull"):
-            return
-
-        cutoff = _utcnow() - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS)
-
-        with _SL() as db:
-            supervisor_mailboxes = db.query(_MBModel).filter_by(role="supervisor").all()
-
-        for mb in supervisor_mailboxes:
-            try:
-                # D3 condition 2: current_terminal_id non-empty and pull-mode
-                if not mb.current_terminal_id:
-                    continue
-                if not is_supervisor_mailbox_pull_terminal(mb.current_terminal_id):
-                    continue
-
-                # D3 condition 3: live terminals row exists
-                with _SL() as db:
-                    terminal_row = (
-                        db.query(_TModel).filter_by(id=mb.current_terminal_id).one_or_none()
-                    )
-                if terminal_row is None:
-                    continue
-
-                # D3 condition 5: teammate_push flag gate
-                if not _should_teammate_push(mb.current_terminal_id):
-                    # F162 D10: rate-limited WARN, one line per engagement.
-                    # F747 (#747): the line now NAMES why native delivery is
-                    # unusable for this terminal, because the legacy fallback
-                    # surface engaging at all is a filed quirk, not a posture.
-                    # F747 (#747) r6: SQLAlchemy types this Column[str]; the typed
-                    # reason helper takes a plain str, so narrow once here rather
-                    # than casting at each use.
-                    tid = str(mb.current_terminal_id)
-                    now_ts = time.monotonic()
-                    last = _fx158_gate5_last_warn.get(tid)
-                    if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:
-                        with _SL() as db:
-                            pending_count = (
-                                db.query(_InboxModel)
-                                .filter(
-                                    _InboxModel.logical_receiver_id == mb.id,
-                                    _InboxModel.status == MessageStatus.PENDING.value,
-                                    _InboxModel.id > mb.consumed_through_id,
-                                )
-                                .count()
-                            )
-                        if pending_count > 0:
-                            logger.warning(
-                                "native_fallback_engaged terminal=%s reason=%s pending=%d",
-                                tid,
-                                native_fallback_reason(tid) or "unknown",
-                                pending_count,
-                            )
-                            _fx158_gate5_last_warn[tid] = now_ts
-                    continue
-
-                # D3 condition 4: pending rows older than grace, above consumed_through_id
-                # F165-a: copy all needed scalars INSIDE the session to avoid
-                # DetachedInstanceError on deferred columns (logical_receiver_id).
-                with _SL() as db:
-                    pending_rows = (
-                        db.query(_InboxModel)
-                        .filter(
-                            _InboxModel.logical_receiver_id == mb.id,
-                            _InboxModel.status == MessageStatus.PENDING.value,
-                            _InboxModel.id > mb.consumed_through_id,
-                            _InboxModel.created_at < cutoff,
-                        )
-                        .order_by(_InboxModel.id)
-                        .limit(100)
-                        .all()
-                    )
-                    # Materialise scalars while session is open (deferred cols
-                    # like logical_receiver_id trigger DetachedInstanceError
-                    # after session close).
-                    pending_scalars = [
-                        {
-                            "id": row.id,
-                            "sender_id": row.sender_id,
-                            "receiver_id": row.receiver_id,
-                            "message": row.message,
-                            "orchestration_type": row.orchestration_type,
-                            "status": row.status,
-                            "created_at": row.created_at,
-                            "logical_receiver_id": getattr(row, "logical_receiver_id", None),
-                        }
-                        for row in pending_rows
-                    ]
-
-                if not pending_scalars:
-                    continue
-
-                # Convert to InboxMessage for the push function
-                messages = [
-                    InboxMessage(
-                        id=s["id"],
-                        sender_id=s["sender_id"],
-                        receiver_id=s["receiver_id"],
-                        message=s["message"],
-                        orchestration_type=OrchestrationType(s["orchestration_type"]),
-                        status=MessageStatus(s["status"]),
-                        created_at=s["created_at"],
-                        logical_receiver_id=s["logical_receiver_id"],
-                    )
-                    for s in pending_scalars
-                ]
-
-                # F457-r2 B1: unified gate — wake.native=false suppresses reconciler push
-                # (mirrors the deliver_pending gate at :2315).
-                from cli_agent_orchestrator.services.cc_session_registry import (
-                    WAKE_NATIVE_DEFAULT as _WND,
-                )
-
-                if not ConfigService.get("supervisor.wake.native", default=_WND):
-                    logger.debug(
-                        "f457_reconciler_push_suppressed terminal=%s "
-                        "reason=wake_native_disabled",
-                        mb.current_terminal_id,
-                    )
-                    continue
-
-                # D4: call the reported form directly
-                outcome: PushOutcome = attempt_teammate_push_reported(
-                    mb.current_terminal_id, messages
-                )
-
-                # WP-ARCH 3c K3c: the reconciler used to ring an F461-coalesced
-                # doorbell after its push write. The coalescer is deleted and the
-                # seat's wake belongs to the delivery tick, so the reconciler now
-                # only records its attempt below.
-
-                # D5: instrumentation — record attempt row
-                if outcome.reason == "pushed":
-                    db_outcome = "push_written"
-                elif outcome.reason in ("no_inbox_path", "write_failed"):
-                    db_outcome = "push_failed"
-                else:
-                    db_outcome = "push_suppressed"
-
-                # S2: deterministic payload hash from sorted message ids
-                payload_hash = hashlib.sha256(
-                    json.dumps(sorted(m.id for m in messages)).encode()
-                ).hexdigest()
-
+        with _SL() as _db:
+            supervisor_mailboxes = _db.query(_MBModel).filter_by(role="supervisor").all()
+            for mb in supervisor_mailboxes:
                 try:
-                    attempt_uuid = begin_delivery_attempt(
-                        messages,
-                        mb.current_terminal_id,
-                        provider="reconciler",
-                        payload_hash=payload_hash,
-                        payload_length=len(messages),
-                    )
-                    settle_delivery_attempt(
-                        attempt_uuid,
-                        MessageStatus.PENDING,  # rows stay PENDING (pull-mode)
-                        outcome=db_outcome,
-                        reason=outcome.reason,
-                    )
+                    quarantine_malformed_mailbox_rows(mb.id)
                 except Exception as e:
-                    logger.debug(f"fx158 instrumentation write failed for {mb.id}: {e}")
+                    logger.debug(f"Mailbox quarantine sweep failed for {mb.id}: {e}")
 
-            except Exception as e:
-                # D9: per-mailbox failure isolation.
-                # F165-F1: distinguish transient errors (network/DB) from
-                # programming errors (ORM detachment, type errors) that indicate
-                # broken code and would silently kill every tick forever.
-                from sqlalchemy.exc import InterfaceError as _SAInterfaceError
-
-                _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError, _SAInterfaceError)
-                if isinstance(e, _D9_TRANSIENT_TYPES):
-                    logger.warning(
-                        "fx158_reconciler_transient mailbox=%s: %s",
-                        mb.id,
-                        e,
-                    )
-                else:
-                    # Programming error — surface loudly so it is not invisible.
-                    logger.error(
-                        "fx158_reconciler_programming_error mailbox=%s: %s",
-                        mb.id,
-                        e,
-                        exc_info=True,
-                    )
-                    # Record a durable marker so the failure is observable in
-                    # delivery_attempts even if logs rotate.
-                    try:
-                        import uuid as _uuid
-
-                        from cli_agent_orchestrator.clients.database import (
-                            InboxDeliveryAttemptModel as _AttemptModel,
-                        )
-                        from cli_agent_orchestrator.clients.database import SessionLocal as _ErrSL
-
-                        _now = _utcnow()
-                        _err_row = _AttemptModel(
-                            attempt_uuid=str(_uuid.uuid4()),
-                            receiver_terminal_id=mb.current_terminal_id or "unknown",
-                            provider="reconciler",
-                            started_at=_now,
-                            settled_at=_now,
-                            outcome="programming_error",
-                            reason=f"{type(e).__name__}: {e}"[:200],
-                            payload_hash="error",
-                            payload_length=0,
-                            sender_id="system",
-                            orchestration_type="reconciler_error",
-                            evidence="{}",
-                        )
-                        with _ErrSL.begin() as _err_db:
-                            _err_db.add(_err_row)
-                    except Exception:
-                        pass  # best-effort instrumentation
+    # WP-ARCH 3c K2: ``reconcile_pull_mode_notifications`` is deleted. It was the
+    # fx158 pull-mode reconciler, and all three of its gates are gone —
+    # ``supervisor.mailbox_pull``, ``is_supervisor_mailbox_pull_terminal`` and
+    # ``_should_teammate_push`` — so it could never have run again. What it did
+    # for a seat holding rows the queue does not own is now done by the tick's
+    # adoption pass, which hands those rows to the queue instead of pushing them
+    # down a second carrier.
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""

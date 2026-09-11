@@ -5381,11 +5381,11 @@ async def get_native_delivery_health(terminal_id: TerminalId) -> Dict[str, Any]:
     digest -- consult this before surfacing anything. ``healthy: true`` means
     the native channel is the ONLY surface and the fallback must stay silent;
     ``healthy: false`` names the reason from the closed set in
-    ``teammate_push_service.NATIVE_FALLBACK_REASONS`` and arms the fallback,
+    ``native_delivery_health.NATIVE_FALLBACK_REASONS`` and arms the fallback,
     logging one rate-limited ``native_fallback_engaged`` WARNING server-side so
     each engagement is a filed quirk rather than an invisible default.
     """
-    from cli_agent_orchestrator.services.teammate_push_service import (
+    from cli_agent_orchestrator.services.native_delivery_health import (
         log_native_fallback_engaged,
         native_fallback_reason,
     )
@@ -9437,7 +9437,7 @@ async def list_messages_endpoint(
                     )
 
                     _seat = get_current_mailbox_terminal(to) or to
-                from cli_agent_orchestrator.services.teammate_push_service import (
+                from cli_agent_orchestrator.services.native_delivery_health import (
                     native_fallback_reason,
                 )
 

@@ -10,13 +10,21 @@ P0
 
 P1
   8. _resolve_stale_binding_prior_hits refreshed == "hit"
-  9. reconcile_pull_mode_notifications logical_receiver_id == mb.id
+
+WP-ARCH 3c K2 deleted ``teammate_push_service`` -- the legacy FILE carrier, its
+``PushOutcome``, its ``NativeInboxWriteResult`` writer and the pull-mode
+reconciler that drove it. Every kill above whose predicate lives in
+``inbox_service`` survives and is asserted here unchanged; the kills that named
+the writer's ``result.kind`` or the reconciler's mailbox filter lost their
+predicate with it, and each removal is recorded in place below. Where an arm
+merely referenced the deleted module to reach a surviving predicate (the
+``_patch_delivery`` seat gate, the F136 claim/commit translation) it is
+re-pointed, not removed.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -49,7 +57,6 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import (
     InboxService,
-    _fx158_gate5_last_warn,
     _IdentityAuthorityEpisode,
 )
 from cli_agent_orchestrator.services.message_trace_service import (
@@ -57,10 +64,6 @@ from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptResolution,
 )
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
-from cli_agent_orchestrator.services.teammate_push_service import (
-    NativeInboxWriteResult,
-    PushOutcome,
-)
 
 _NOW = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -91,11 +94,9 @@ def f424_db(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services import inbox_service as inbox_mod
 
     inbox_mod._failure_streaks.clear()
-    _fx158_gate5_last_warn.clear()
     yield sessions
     clear_terminal_metadata_cache()
     inbox_mod._failure_streaks.clear()
-    _fx158_gate5_last_warn.clear()
     engine.dispose()
 
 
@@ -183,10 +184,15 @@ def _patch_delivery(svc: InboxService, *, lookup=("unresolved", {}), merge=False
         ),
         patch.object(svc, "_commit_watchdog_ops"),
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager") as pm,
+        # WP-ARCH 3c K8: deliver_pending's seat gate asks the fail-closed role
+        # probe, not the deleted ``is_supervisor_mailbox_pull_terminal`` flag
+        # helper. It is forced False so these arms exercise the WORKER path --
+        # a True answer returns before the scan/inject seam and would make every
+        # send-count assertion below trivially true.
         patch(
-            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
             return_value=False,
-        ) as pull_gate,
+        ) as role_gate,
     ):
         pm.get_provider.return_value = provider
         observation = _idle_observation()
@@ -203,7 +209,7 @@ def _patch_delivery(svc: InboxService, *, lookup=("unresolved", {}), merge=False
             settle=settle,
             settle_calls=settle_calls,
             monitor=monitor,
-            pull_gate=pull_gate,
+            role_gate=role_gate,
         )
 
 
@@ -362,7 +368,7 @@ def test_deliver_pending_stop_does_not_inject(f424_db):
     assert gate_states == ["stop"], gate_states
     # Scan-loop abort must not fall through to the mailbox-channel / inject path.
     # (Inject has its own stop check at 2356, so send-count alone cannot kill 2285.)
-    assert ctx.pull_gate.call_count == 0
+    assert ctx.role_gate.call_count == 0
     assert ctx.send.call_count == 0
     with f424_db() as db:
         assert db.get(InboxModel, message.id).status == MessageStatus.PENDING.value
@@ -414,7 +420,7 @@ def test_deliver_pending_confirmation_timeout_groups_multi_sender_batch(f424_db)
     assert gate_batches, "gate was not invoked"
     assert sorted(gate_batches[0]) == sorted(m.id for m in messages)
     assert gate_states[0] == "stop"
-    assert ctx.pull_gate.call_count == 0
+    assert ctx.role_gate.call_count == 0
     assert ctx.send.call_count == 0
 
 
@@ -438,25 +444,23 @@ class _FakeMailbox:
     cc_inbox_path: str | None = "/tmp/f424-inbox.json"
 
 
-def _f136_run_with_batch(
-    batch,
-    *,
-    write_results=None,
-    progress=None,
-    heal=False,
-    inbox_meta_path=None,
-):
-    """Drive _f136_run_callback_delivery with a controlled batch/write/commit.
+def _f136_run_with_batch(batch, *, progress=None, heal=False):
+    """Drive _f136_run_callback_delivery with a controlled batch/commit.
 
     Translates legacy CallbackBatchResult inputs into the F476
     claim_unnotified_wake / commit_wake API.
+
+    WP-ARCH 3c K2 removed the third input this helper used to take. The runner's
+    emit phase called ``teammate_push_service.write_supervisor_callback_notification``
+    once per claimed row and counted the ``written`` kinds it returned; that
+    module is deleted and the loop now counts the claimed rows themselves, so
+    there is no writer left to seed with a ``write_results`` script.
     """
     from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
 
     svc = InboxService()
     mock_lock = MagicMock()
     mock_lock.acquire.return_value = True
-    write_iter = iter(write_results or [])
     mock_db = MagicMock()
     mock_session = MagicMock()
     mock_session.__enter__ = MagicMock(return_value=mock_db)
@@ -514,12 +518,6 @@ def _f136_run_with_batch(
             reason="ok",
         )
 
-    def _next_write(*_a, **_k):
-        try:
-            return next(write_iter)
-        except StopIteration:
-            return NativeInboxWriteResult(kind="written")
-
     with (
         patch(
             "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
@@ -540,13 +538,7 @@ def _f136_run_with_batch(
         ),
         patch(
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            return_value=(
-                {"metadata": {"cc_team_inbox_path": inbox_meta_path}} if inbox_meta_path else None
-            ),
-        ),
-        patch(
-            "cli_agent_orchestrator.services.teammate_push_service.write_supervisor_callback_notification",
-            side_effect=_next_write,
+            return_value=None,
         ),
         patch.object(svc, "_f150_self_heal_inbox_path", return_value=heal) as heal_spy,
     ):
@@ -625,12 +617,20 @@ def test_f136_no_path_kind_invokes_f150_self_heal():
     assert outcome.retryable_failure_count == 0
 
 
-def test_f136_written_kind_increments_outcome_written():
-    """Kill [985,31] result.kind == 'written'."""
+def test_f136_committed_claim_counts_its_rows_and_reports_the_high_id():
+    """Was: kill [985,31] ``result.kind == 'written'`` on the K2 writer.
+
+    The writer is deleted, so that equality is gone -- but the two counters it
+    fed are not, and they are what the rest of the system reads. ``written`` is
+    the wake's own count of committed, wake-eligible rows (the doorbell gate
+    used to read it; the delivery tick reads it now) and ``max_written_row_id``
+    is the id the wake reports as covered. A mutant that drops either -- leaving
+    ``written`` at zero, or the high id at zero -- still passes commit and still
+    reports ``ok``, and a seat with rows would go unwoken, so the counters are
+    asserted rather than the vanished equality.
+    """
     batch = _ok_batch(rows=[_row(10, "forward")], cursor=0)
-    outcome, _heal = _f136_run_with_batch(
-        batch, write_results=[NativeInboxWriteResult(kind="written")]
-    )
+    outcome, _heal = _f136_run_with_batch(batch)
     assert outcome.written == 1
     assert outcome.reason == "ok"
     assert outcome.max_written_row_id == 10
@@ -641,7 +641,6 @@ def test_f136_path_changed_sets_needs_wake_and_reason():
     batch = _ok_batch(rows=[_row(10, "forward")], cursor=0)
     outcome, _heal = _f136_run_with_batch(
         batch,
-        write_results=[NativeInboxWriteResult(kind="written")],
         progress=CallbackProgressResult(kind="path_changed", reason="path_version_mismatch"),
     )
     assert outcome.reason == "path_changed_during_run"
@@ -661,43 +660,48 @@ def test_f136_replay_tag_counts_only_replay_rows():
         rows=[_row(1, "forward"), _row(2, "forward"), _row(3, "replay")],
         cursor=5,
     )
-    outcome, _heal = _f136_run_with_batch(
-        batch,
-        write_results=[
-            NativeInboxWriteResult(kind="written"),
-            NativeInboxWriteResult(kind="written"),
-            NativeInboxWriteResult(kind="written"),
-        ],
-    )
-    # All rows (including replay) are processed and written
+    outcome, _heal = _f136_run_with_batch(batch)
+    # All rows (including replay) are processed and counted
     assert outcome.written == 3
     assert outcome.selected == 3
 
 
-def test_f136_retryable_failures_do_not_immediate_wake():
-    """Kill [1043,63] retryable_failures == 0 → wakes on failure instead of success.
+# WP-ARCH 3c K2 removes ``test_f136_retryable_failures_do_not_immediate_wake``.
+#
+# Its whole premise was a PARTIAL run: one of the claimed rows fails to reach the
+# carrier, so ``written < selected`` while the outcome still reports ``ok`` and
+# declines an immediate re-wake. The only thing that could fail that way was
+# ``write_supervisor_callback_notification`` returning ``retryable_failure`` --
+# a lock timeout on K2's ``team-lead.json``. That file, its lockfile and its
+# writer are deleted, and the emit loop that consumed the result is now a counter
+# over rows the commit already accepted.
+#
+# So the divergence the arm existed to pin cannot arise: after a successful
+# commit ``written`` equals ``selected`` by construction (the deadline break is
+# the sole remaining gap, and it is a timing property, not an outcome kind).
+# Keeping the arm would mean asserting ``written == selected`` and calling the
+# tautology a mutation kill. What the arm genuinely guarded on the failure side
+# -- that a retryable claim reports ``retryable_failure_count`` and does not
+# advance -- is pinned by ``test_f136_retryable_failure_kind_returns_retryable_outcome``
+# above, which survives because its failure comes from the claim, not the writer.
 
-    F476: The new claim/commit/emit pipeline processes all claimed rows.
-    A retryable write failure in the emit phase does not stop the pipeline;
-    the row is simply not counted as written. The outcome is always 'ok'
-    with needs_immediate_wake=False after a successful commit.
+
+def test_f136_written_counter_on_the_real_persistence_path(f424_db, tmp_path):
+    """Production-path written counter: real mailbox, real claim, real commit.
+
+    This arm is the mocked helper's counterweight -- it drives
+    ``claim_unnotified_wake``/``commit_wake`` against an actual SQLite mailbox
+    instead of a translated ``CallbackBatchResult``, so it is the only place the
+    counter is checked against the real cursor.
+
+    It used to end on ``assert inbox_path.exists()``, because the run wrote K2's
+    ``team-lead.json``. WP-ARCH 3c deleted that writer, so the file assertion is
+    inverted rather than dropped: the mailbox still CARRIES a ``cc_inbox_path``
+    (the column and its self-heal survive, and fx168 still compares it against
+    terminal metadata), and the point worth pinning is that carrying the path no
+    longer causes anything to be written to it. A rebuilt file carrier that
+    quietly re-enabled itself would fail here.
     """
-    batch = _ok_batch(rows=[_row(10), _row(11), _row(12)], cursor=0, has_more=False)
-    outcome, _heal = _f136_run_with_batch(
-        batch,
-        write_results=[NativeInboxWriteResult(kind="retryable_failure", reason="lock_timeout")],
-    )
-    # F476: retryable write failures are absorbed in the emit phase;
-    # processed == selected (all rows attempted); written < selected.
-    assert outcome.processed == 3
-    assert outcome.needs_immediate_wake is False
-    assert outcome.reason == "ok"
-    # The retryable row wasn't written
-    assert outcome.written < outcome.selected
-
-
-def test_f136_written_kind_on_real_inbox_file(f424_db, tmp_path):
-    """Production-path written counter: real batch + real native-inbox write."""
     inbox_path = tmp_path / "cc-inbox.json"
     terminal_id = "t-f424-write"
     mailbox_id = "mb_f424_write"
@@ -752,7 +756,9 @@ def test_f136_written_kind_on_real_inbox_file(f424_db, tmp_path):
     outcome = InboxService()._f136_run_callback_delivery(terminal_id)
     assert outcome.written == 1
     assert outcome.reason == "ok"
-    assert inbox_path.exists()
+    assert outcome.max_written_row_id == 42
+    # K2's carrier is gone: the path is configured and nothing writes to it.
+    assert not inbox_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -849,159 +855,31 @@ def test_stale_binding_refresh_token_hit_vs_miss():
 
 
 # ---------------------------------------------------------------------------
-# P1 #9 — pull-mode reconcile mailbox filter
+# P1 #9 — REMOVED by WP-ARCH 3c K2.
+#
+# Two arms lived here, plus the ``_seed_supervisor_mailbox`` helper that built
+# their two-mailbox fixture:
+#
+#   * ``test_reconcile_pull_mode_pending_count_filters_by_mailbox_id`` killed
+#     [3401,68] ``logical_receiver_id == mb.id`` on the gate-5 pending count --
+#     the mutant that made mailbox A's WARN report mailbox B's backlog.
+#   * ``test_reconcile_pull_mode_push_selects_only_own_mailbox_rows`` was its
+#     sibling on the push payload: rows selected for terminal A must be A's.
+#
+# Both drove ``InboxService.reconcile_pull_mode_notifications``, and that method
+# is deleted. It was the fx158 pull-mode reconciler and all three of its gates
+# went with K2 -- ``supervisor.mailbox_pull``, ``is_supervisor_mailbox_pull_terminal``
+# and ``teammate_push_service._should_teammate_push`` -- so on top of the method
+# being gone, every monkeypatch target these arms installed no longer resolves.
+# The push they asserted (``attempt_teammate_push_reported`` returning a
+# ``PushOutcome``) was the legacy second carrier, which is the thing the phase
+# exists to remove; ``PushOutcome`` itself is deleted.
+#
+# There is no surviving predicate to re-point at. The equality these kills
+# protected was a per-mailbox scoping filter inside the reconciler's own query,
+# and the work the reconciler did for a seat holding rows the queue does not own
+# is now done by the delivery tick's adoption pass, which hands those rows to
+# the queue rather than pushing them down a second carrier. That pass has its
+# own scoping and its own arms in ``test/app/delivery/test_adoption.py``; a
+# filter mutant there is that file's kill to own, not a re-pointing of this one.
 # ---------------------------------------------------------------------------
-
-
-def _seed_supervisor_mailbox(
-    sessions,
-    *,
-    mailbox_id: str,
-    terminal_id: str,
-    session_name: str,
-    pending_ids: list[int],
-    created_at: datetime,
-):
-    with sessions.begin() as db:
-        db.add(
-            TerminalModel(
-                id=terminal_id,
-                tmux_session=session_name,
-                tmux_window=terminal_id,
-                provider="kiro_cli",
-                lifecycle_generation=1,
-            )
-        )
-        db.add(
-            MailboxModel(
-                id=mailbox_id,
-                session_name=session_name,
-                role="supervisor",
-                current_terminal_id=terminal_id,
-                generation=1,
-                consumed_through_id=0,
-                schema_version=1,
-                created_at=_NOW,
-                updated_at=_NOW,
-            )
-        )
-        for row_id in pending_ids:
-            db.add(
-                InboxModel(
-                    id=row_id,
-                    sender_id="worker-1",
-                    receiver_id=terminal_id,
-                    logical_receiver_id=mailbox_id,
-                    message=f"pending-{row_id}",
-                    orchestration_type="send_message",
-                    status=MessageStatus.PENDING.value,
-                    created_at=created_at,
-                )
-            )
-
-
-def test_reconcile_pull_mode_pending_count_filters_by_mailbox_id(f424_db, monkeypatch, caplog):
-    """Kill [3401,68] logical_receiver_id == mb.id on the gate-5 pending count."""
-    from cli_agent_orchestrator.services.config_service import ConfigService
-    from cli_agent_orchestrator.services.inbox_service import InboxService
-
-    old = datetime.now(timezone.utc) - timedelta(seconds=120)
-    _seed_supervisor_mailbox(
-        f424_db,
-        mailbox_id="mb-a",
-        terminal_id="term-a",
-        session_name="sess-a",
-        pending_ids=[11, 12],
-        created_at=old,
-    )
-    _seed_supervisor_mailbox(
-        f424_db,
-        mailbox_id="mb-b",
-        terminal_id="term-b",
-        session_name="sess-b",
-        pending_ids=[21, 22, 23, 24, 25],
-        created_at=old,
-    )
-
-    def _cfg(path, default=None, **_kw):
-        if path == "supervisor.mailbox_pull":
-            return True
-        if path == "supervisor.teammate_push":
-            return False
-        return default
-
-    monkeypatch.setattr(ConfigService, "get", staticmethod(_cfg))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-        lambda tid: tid in {"term-a", "term-b"},
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-        lambda tid: False,
-    )
-    _fx158_gate5_last_warn.clear()
-    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.services.inbox_service"):
-        InboxService().reconcile_pull_mode_notifications()
-
-    pending_by_tid: dict[str, int] = {}
-    for rec in caplog.records:
-        if rec.msg == "native_fallback_engaged terminal=%s reason=%s pending=%d":
-            tid, _reason, pending = rec.args
-            pending_by_tid[tid] = pending
-    assert pending_by_tid["term-a"] == 2
-    assert pending_by_tid["term-b"] == 5
-
-
-def test_reconcile_pull_mode_push_selects_only_own_mailbox_rows(f424_db, monkeypatch):
-    """Sibling of [3401]/[3423]: push payload must be filtered by mb.id."""
-    from cli_agent_orchestrator.services.config_service import ConfigService
-
-    old = datetime.now(timezone.utc) - timedelta(seconds=120)
-    _seed_supervisor_mailbox(
-        f424_db,
-        mailbox_id="mb-a",
-        terminal_id="term-a",
-        session_name="sess-a",
-        pending_ids=[101],
-        created_at=old,
-    )
-    _seed_supervisor_mailbox(
-        f424_db,
-        mailbox_id="mb-b",
-        terminal_id="term-b",
-        session_name="sess-b",
-        pending_ids=[202, 203],
-        created_at=old,
-    )
-
-    def _cfg(path, default=None, **_kw):
-        if path in {
-            "supervisor.mailbox_pull",
-            "supervisor.teammate_push",
-            "supervisor.wake.native",
-        }:
-            return True
-        return default
-
-    pushed: dict[str, tuple[int, ...]] = {}
-
-    def _push(tid, messages):
-        pushed[tid] = tuple(m.id for m in messages)
-        return PushOutcome(pushed=True, reason="pushed", message_ids=tuple(m.id for m in messages))
-
-    monkeypatch.setattr(ConfigService, "get", staticmethod(_cfg))
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
-        lambda tid: tid in {"term-a", "term-b"},
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
-        lambda tid: True,
-    )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push_reported",
-        _push,
-    )
-    InboxService().reconcile_pull_mode_notifications()
-    assert pushed["term-a"] == (101,)
-    assert pushed["term-b"] == (202, 203)

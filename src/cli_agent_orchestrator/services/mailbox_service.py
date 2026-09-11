@@ -98,40 +98,12 @@ def _address_ids(db: Any, mailbox_id: str) -> list[str]:
     ]
 
 
-def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
-    """Check if terminal_id is the current incarnation of a supervisor mailbox with pull enabled.
-
-    Returns True only when:
-    - CAO_SUPERVISOR_MAILBOX_PULL / supervisor.mailbox_pull is truthy
-    - terminal_id resolves to a mailbox with role == "supervisor"
-    - mailbox.current_terminal_id == terminal_id (current incarnation)
-    - mailbox.schema_version is compatible (== 1)
-    """
-    from cli_agent_orchestrator.services.config_service import ConfigService
-
-    if not ConfigService.get("supervisor.mailbox_pull"):
-        return False
-    with SessionLocal() as db:
-        mailbox: Any = (
-            db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
-        )
-        if mailbox is None:
-            return False
-        if mailbox.role != "supervisor":
-            return False
-        if mailbox.current_terminal_id != terminal_id:
-            return False
-        schema_version = getattr(mailbox, "schema_version", 1)
-        if schema_version != 1:
-            return False
-        return True
-
-
 def is_supervisor_role_terminal(terminal_id: str, db: Any | None = None) -> bool:
     """F210 D2: True when terminal_id is the current incarnation of a supervisor mailbox.
 
-    Same query shape as :func:`is_supervisor_mailbox_pull_terminal`, minus every
-    precondition that could re-arm composer injection against a supervisor pane:
+    The role, and ONLY the role. WP-ARCH 3c K8 deleted the pull-mode sibling this
+    was carved out of; what mattered about the carve-out is that it dropped every
+    precondition that could re-arm composer injection against a supervisor pane —
     ``supervisor.mailbox_pull`` (a config flag must not defeat the exemption) and
     ``schema_version`` (a schema-mismatched supervisor is still a supervisor).
     """
@@ -1431,13 +1403,9 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                     except Exception:
                         logger.debug("f642_ack_ledger_failed", exc_info=True)
             db.commit()
-            # FX193: disarm nudge on cursor advance (eager cancellation)
-            try:
-                from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
-
-                nudge_discipline.on_cursor_advance(terminal_id, _f178_mailbox_id)
-            except Exception:
-                pass
+            # WP-ARCH 3c K7: the FX193 nudge disarm is gone with the nudge. There
+            # is no scheduled pane nudge left to cancel — the ladder that armed
+            # one is deleted, and the queue re-offers on a lease instead.
             # F203 D5: boundary notify primary producer — on the reachable
             # cursor-advance path (no episode precondition).  The watchdog
             # secondary producer stays as a fallback.
@@ -1456,20 +1424,10 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 )
 
                 _remove_supervisor_pending_flag_if_drained()
-            # F178: mark correlated CC inbox entries as read (post-commit, best-effort)
-            if _f178_cc_inbox_path and _f178_acked_row_ids:
-                from cli_agent_orchestrator.services.teammate_push_service import (
-                    mark_cc_inbox_entries_read,
-                )
-
-                try:
-                    mark_cc_inbox_entries_read(
-                        inbox_path=Path(_f178_cc_inbox_path),
-                        mailbox_id=_f178_mailbox_id,
-                        acked_row_ids=_f178_acked_row_ids,
-                    )
-                except Exception as exc:
-                    logger.debug("f178: best-effort cc_inbox mark-read failed: %s", exc)
+            # WP-ARCH 3c K2: F178's cc_inbox mark-read is gone with the file it
+            # marked. ``teammate_push_service`` owned both the writer and this
+            # reader; with no entries written there are none to mark read, and
+            # the ack watermark above is what records consumption now.
             return {
                 "mailbox_id": mailbox.id,
                 "consumed_through_id": up_to_id,
@@ -1645,12 +1603,7 @@ def consume_on_native_delivery(inbox_row_id: int) -> dict[str, Any]:
         # scheduled nudge and re-evaluate the pending sentinel so the doorbell /
         # re-push machinery sees the consumption immediately.
         if result["status_flipped"] and mailbox_id:
-            try:
-                from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
-
-                nudge_discipline.on_cursor_advance(row.receiver_id, str(mailbox_id))
-            except Exception:
-                logger.debug("f783 nudge disarm best-effort failed", exc_info=True)
+            # WP-ARCH 3c K7: the nudge disarm that sat here is gone with the nudge.
             try:
                 from cli_agent_orchestrator.clients.database import (
                     _remove_supervisor_pending_flag_if_drained,

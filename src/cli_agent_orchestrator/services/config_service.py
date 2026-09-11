@@ -166,10 +166,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     # read None (falsy) no matter what the table declared, which is why native
     # seat delivery was unreachable without an operator editing settings.json.
     # Keep each value identical to its ENV_REGISTRY tuple (asserted by test).
-    "supervisor.teammate_push": True,
-    "supervisor.mailbox_pull": True,
     "supervisor.watchdog.quiescence": True,
-    "supervisor.doorbell": False,
     "auth.jwks_uri": "",
     "auth.audience": "",
     "auth.issuer": "",
@@ -213,21 +210,14 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         20,
     ),
     "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
-    # F747 (#747): pull-mode drain is the live posture; an opt-in never used.
-    "CAO_SUPERVISOR_MAILBOX_PULL": ("supervisor.mailbox_pull", "bool", True),
-    # F747 (#747): native agent-message delivery is the DEFAULT seat surface.
-    "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", True),
-    # F747 (#747): the seat prompt is never a message tunnel -- ships OFF.
-    "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", False),
-    # FX170: native wake config paths (D11)
-    # Canonical source is cc_session_registry.WAKE_NATIVE_DEFAULT; duplicated
-    # here because the registry dict is evaluated at import-time before service
-    # imports resolve, and a test asserts the two agree.
-    # WP-ARCH 3b / A1.5: True from 3b. Once the seat's composer injection is
-    # role-gated away in every switch position, this is the seat's ONLY carrier,
-    # and leaving it False would buy silence instead of a paste — which is #604,
-    # not a fix.
-    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", True),
+    # WP-ARCH 3c: four keys are gone with the surfaces they gated.
+    # ``supervisor.mailbox_pull`` and ``supervisor.teammate_push`` were K2's --
+    # the pull-mode reconciler and the file pusher, both deleted.
+    # ``supervisor.doorbell`` was K3a's. ``supervisor.wake.native`` gated the
+    # native ring as an option, and after K8 the native channel is the seat's
+    # ONLY carrier: a flag that can turn off the sole carrier buys silence, which
+    # is #604 rather than a setting. The wake keys BELOW this line survive and
+    # are still resolved -- they tune the one carrier rather than switching it.
     "CAO_SUPERVISOR_WAKE_MIN_VERSION": ("supervisor.wake.min_version", "str", "2.1.0"),
     "CAO_SUPERVISOR_WAKE_MAX_VERSION": ("supervisor.wake.max_version", "str", "2.2.0"),
     "CAO_SUPERVISOR_WAKE_PRIORITY": ("supervisor.wake.priority", "str", "next"),
@@ -552,9 +542,6 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
-        "supervisor.mailbox_pull",
-        "supervisor.teammate_push",
-        "supervisor.doorbell",
         "supervisor.watchdog.quiescence",
         "supervisor.watchdog.quiescence_grace_s",
         "supervisor.watchdog.no_progress",

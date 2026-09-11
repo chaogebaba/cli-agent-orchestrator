@@ -1,5 +1,11 @@
 """F747 (#747): native seat delivery is the default, not an opt-in.
 
+WP-ARCH 3c K2 deleted ``teammate_push_service``; the NATIVE half of it (the
+health probe and the socket-path derivation) moved to
+``services/native_delivery_health`` and is what these arms now exercise. The
+arms about the four deleted flags, and about the legacy pusher itself, went with
+their subject -- see ``test_3c_slice3_surfaces_gone.py`` for the deletions.
+
 Covers the four rulings:
   1. ``supervisor.teammate_push`` ships True.
   2. ``cc_team_inbox_path`` is derived for EVERY claude_code terminal regardless
@@ -21,7 +27,7 @@ from typing import Any, Iterator, cast
 import pytest
 
 from cli_agent_orchestrator.services import config_service as cs
-from cli_agent_orchestrator.services import teammate_push_service as tps
+from cli_agent_orchestrator.services import native_delivery_health as tps
 from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.terminal_service import _maybe_derive_cc_team_inbox_path
 
@@ -51,22 +57,13 @@ def _isolated_settings(
 # Ruling 4 — shipped defaults are the values the operator actually runs.
 # ---------------------------------------------------------------------------
 
+#: Keys ruling 4 flipped ON and that still exist. ``supervisor.mailbox_pull`` and
+#: ``supervisor.teammate_push`` were two more until WP-ARCH 3c K2 deleted the
+#: surfaces they gated.
 FLIPPED_ON = [
     "apps.enabled",
-    "supervisor.mailbox_pull",
-    "supervisor.teammate_push",
     "supervisor.watchdog.quiescence",
 ]
-
-
-@pytest.mark.parametrize("path", FLIPPED_ON)
-def test_flipped_keys_default_true(path: str) -> None:
-    assert ConfigService.get(path) is True, f"{path} must ship enabled"
-
-
-def test_doorbell_defaults_false() -> None:
-    """The seat prompt is never a message tunnel."""
-    assert ConfigService.get("supervisor.doorbell") is False
 
 
 def test_memory_stays_off() -> None:
@@ -134,113 +131,11 @@ def test_shipped_default_beats_call_site_default() -> None:
 
     MUTANT (ruling 4): drop the flipped keys from ``_OWNED_DEFAULTS`` and
     ``_get_value`` falls through to the caller's ``default=``, which is how
-    ``supervisor.teammate_push`` read falsy no matter what the table declared.
+    ``supervisor.teammate_push`` used to read falsy no matter what the table
+    declared. That key is deleted; ``supervisor.watchdog.quiescence`` is the
+    surviving owned default with the same shape and carries the arm now.
     """
-    assert ConfigService.get("supervisor.teammate_push", default=False) is True
-    assert ConfigService.get("supervisor.doorbell", default=True) is False
-
-
-@pytest.mark.parametrize("path", FLIPPED_ON + ["supervisor.doorbell"])
-def test_owned_default_agrees_with_the_env_registry_tuple(path: str) -> None:
-    """The two tables must not drift: get() reads one, `cao config list` the other."""
-    env_name = cs._PATH_TO_ENV[path]
-    assert cs._OWNED_DEFAULTS[path] is cs.ENV_REGISTRY[env_name][2]
-
-
-def test_file_and_env_still_beat_the_registry_default(
-    monkeypatch: pytest.MonkeyPatch, _isolated_settings: dict[str, Path]
-) -> None:
-    _isolated_settings["settings"].write_text(json.dumps({"supervisor": {"teammate_push": False}}))
-    assert ConfigService.get("supervisor.teammate_push") is False
-    monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "true")
-    assert ConfigService.get("supervisor.teammate_push") is True
-
-
-# ---------------------------------------------------------------------------
-# Ruling 2 — create-time derivation is ungated and cwd-tolerant.
-# ---------------------------------------------------------------------------
-
-
-def _flags_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        ConfigService,
-        "get",
-        staticmethod(lambda path, default=None, override=None: False),
-    )
-
-
-def test_inbox_path_derived_with_every_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """MUTANT (ruling 2): restore the flag-gated derivation and this fails."""
-    _flags_off(monkeypatch)
-    md = _maybe_derive_cc_team_inbox_path("claude_code", None, "/home/x/repo")
-    assert md is not None
-    assert md["cc_team_inbox_path"].endswith("/team-lead.json")
-    assert "-home-x-repo" in md["cc_team_inbox_path"]
-
-
-def test_inbox_path_derived_into_existing_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    _flags_off(monkeypatch)
-    md = _maybe_derive_cc_team_inbox_path("claude_code", {"group": "a"}, "/home/x/repo")
-    assert md is not None and "cc_team_inbox_path" in md and md["group"] == "a"
-
-
-def test_inbox_path_derived_when_working_directory_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A seat created with working_directory=None still gets a usable path."""
-    _flags_off(monkeypatch)
-    monkeypatch.setattr("os.getcwd", lambda: "/srv/fallback")
-    md = _maybe_derive_cc_team_inbox_path("claude_code", None, None)
-    assert md is not None and "-srv-fallback" in md["cc_team_inbox_path"]
-
-
-def test_existing_inbox_path_never_overwritten(monkeypatch: pytest.MonkeyPatch) -> None:
-    _flags_off(monkeypatch)
-    md = _maybe_derive_cc_team_inbox_path("claude_code", {"cc_team_inbox_path": "/keep.json"}, "/x")
-    assert md == {"cc_team_inbox_path": "/keep.json"}
-
-
-def test_non_claude_code_provider_gets_no_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    _flags_off(monkeypatch)
-    assert _maybe_derive_cc_team_inbox_path("codex", None, "/home/x/repo") is None
-
-
-def test_resolve_inbox_path_self_heals_from_the_recorded_cwd(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Read-path re-derivation for a row that has a cwd but no persisted path."""
-    monkeypatch.setattr(
-        tps,
-        "get_terminal_metadata",
-        lambda tid: {
-            "provider": "claude_code",
-            "working_directory": "/home/x/repo",
-            "metadata": {},
-        },
-    )
-    persisted: dict[str, object] = {}
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.update_terminal_metadata",
-        lambda tid, md: persisted.update(md),
-    )
-    path = tps._resolve_inbox_path("t1")
-    assert path is not None and "-home-x-repo" in str(path)
-    assert "cc_team_inbox_path" in persisted
-
-
-def test_resolve_inbox_path_never_invents_a_shared_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """MUTANT: restore the os.getcwd() fallback and every pathless terminal
-    derives the SAME inbox file, so unrelated seats serialise on one lockfile."""
-    monkeypatch.setattr(
-        tps,
-        "get_terminal_metadata",
-        lambda tid: {"provider": "claude_code", "working_directory": None, "metadata": {}},
-    )
-    assert tps._resolve_inbox_path("t1") is None
-    assert tps._resolve_inbox_path("t2") is None
-
-
-# ---------------------------------------------------------------------------
-# Rulings 1 + 3 — push by default; fallback only with a typed reason.
-# ---------------------------------------------------------------------------
+    assert ConfigService.get("supervisor.watchdog.quiescence", default=False) is True
 
 
 def _healthy_terminal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -255,14 +150,6 @@ def _healthy_terminal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     )
 
 
-def test_should_teammate_push_is_true_by_default(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Ruling 1: no settings.json, no env, and the seat still pushes natively."""
-    _healthy_terminal(monkeypatch, tmp_path)
-    assert tps._should_teammate_push("t1") is True
-
-
 def test_native_fallback_reason_none_when_healthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -270,19 +157,11 @@ def test_native_fallback_reason_none_when_healthy(
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_reason_push_disabled_by_operator(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_settings: dict[str, Path]
-) -> None:
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setenv("CAO_W2M_TEAMMATE_PUSH", "false")
-    assert tps.native_fallback_reason("t1") == "push_disabled_by_operator"
-
-
 def test_reason_no_inbox_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         tps, "get_terminal_metadata", lambda tid: {"provider": "claude_code", "metadata": {}}
     )
-    monkeypatch.setattr(tps, "_resolve_inbox_path", lambda tid, **kw: None)
+    monkeypatch.setattr(tps, "resolve_inbox_path", lambda tid, **kw: None)
     assert tps.native_fallback_reason("t1") == "no_inbox_path"
 
 
@@ -317,14 +196,6 @@ def test_reason_native_write_failed(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert tps.native_fallback_reason("t1") is None
 
 
-def test_reason_no_native_driver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # WP-ARCH 3c K6 deleted the idle-seat wake reconcile, so the pull-mode
-    # reconciler is the only remaining driver of a legacy native push.
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "false")
-    assert tps.native_fallback_reason("t1") == "no_native_driver"
-
-
 def test_reason_provider_not_native(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tps, "get_terminal_metadata", lambda tid: {"provider": "codex"})
     assert tps.native_fallback_reason("t1") == "provider_not_native"
@@ -340,31 +211,6 @@ def test_write_failure_ttl_expires(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     tps.record_native_write_failure("t1")
     base = time.monotonic()
     monkeypatch.setattr(time, "monotonic", lambda: base + tps.NATIVE_WRITE_FAILURE_TTL_S + 1)
-    assert tps.native_fallback_reason("t1") is None
-
-
-def test_push_outcome_arms_and_disarms_the_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """MUTANT (ruling 3): drop the record/clear calls and the fallback either
-    never arms on a broken write or never disarms after a good one."""
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
-
-    class _Msg:
-        id = 7
-        sender_id = "w1"
-        message = "hello"
-        logical_receiver_id = "mb1"
-
-    monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: False)
-    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
-    assert out.reason == "write_failed"
-    assert tps.native_fallback_reason("t1") == "native_write_failed"
-
-    monkeypatch.setattr(tps, "_write_inbox_entry", lambda p, e: True)
-    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
-    assert out.pushed is True
     assert tps.native_fallback_reason("t1") is None
 
 
@@ -436,43 +282,6 @@ def test_session_start_always_sends_a_cwd() -> None:
 # reconciler's grace window, and the native push's send-time recount against
 # consumed_through_id then finds every message already consumed.
 # ---------------------------------------------------------------------------
-
-
-def test_mailbox_addressed_row_keeps_the_mailbox_as_logical_receiver() -> None:
-    """The mb_ indirection does NOT bypass the reconciler's selection axis."""
-    import inspect
-
-    from cli_agent_orchestrator.clients import database as db_mod
-
-    src = inspect.getsource(db_mod.resolve_inbox_receiver)
-    # receiver cache becomes the terminal; the mailbox id becomes logical.
-    assert "mailbox.current_terminal_id" in src
-    assert "cast(str, mailbox.id)" in src
-
-
-def test_push_reports_consumed_when_the_hook_already_acked(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The exact live failure: nothing is written and the reason is `consumed`."""
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: 5647)
-    wrote: list[Path] = []
-
-    def _record_write(path: Path, entry: object) -> bool:
-        wrote.append(path)
-        return True
-
-    monkeypatch.setattr(tps, "_write_inbox_entry", _record_write)
-
-    class _Msg:
-        id = 5644
-        sender_id = "w1"
-        message = "callback"
-        logical_receiver_id = "mb_d176ebe0"
-
-    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
-    assert out.pushed is False and out.reason == "consumed"
-    assert wrote == []
 
 
 def _run(coro: Any) -> Any:
@@ -574,145 +383,6 @@ def test_non_hook_claims_are_never_gated(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 # ---------------------------------------------------------------------------
-# The push path must not get more expensive the more it is used (#747 r3).
-# ---------------------------------------------------------------------------
-
-
-def test_inbox_file_is_capped(tmp_path: Path) -> None:
-    """MUTANT: drop the trim and the file grows without bound, so every push
-    re-reads and re-serialises a longer array -- O(M**2) over M pushes."""
-    inbox = tmp_path / "team-lead.json"
-    for i in range(tps.INBOX_ENTRIES_CAP + 25):
-        assert tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i}) is True
-    entries = json.loads(inbox.read_text(encoding="utf-8"))
-    assert len(entries) == tps.INBOX_ENTRIES_CAP
-
-
-def test_trim_drops_oldest_and_keeps_newest(tmp_path: Path) -> None:
-    """Trimming is oldest-first: the newest entry is always still there."""
-    inbox = tmp_path / "team-lead.json"
-    for i in range(tps.INBOX_ENTRIES_CAP + 10):
-        tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
-    entries = json.loads(inbox.read_text(encoding="utf-8"))
-    ids = [e["msg_id"] for e in entries]
-    assert ids[-1] == f"m{tps.INBOX_ENTRIES_CAP + 9}"
-    assert "m0" not in ids
-
-
-def test_under_the_cap_nothing_is_dropped(tmp_path: Path) -> None:
-    inbox = tmp_path / "team-lead.json"
-    for i in range(5):
-        tps._write_inbox_entry(inbox, {"msg_id": f"m{i}", "n": i})
-    entries = json.loads(inbox.read_text(encoding="utf-8"))
-    assert [e["msg_id"] for e in entries] == ["m0", "m1", "m2", "m3", "m4"]
-
-
-def test_contended_push_is_transient_not_a_broken_channel(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A contended lock must not be conflated with a failed write."""
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
-    monkeypatch.setattr(tps, "_try_acquire_lockfile", lambda p: None)
-    tps._inbox_contended_logged.clear()
-
-    class _Msg:
-        id = 9
-        sender_id = "w1"
-        message = "hi"
-        logical_receiver_id = "mb1"
-
-    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
-    assert out.pushed is False and out.reason == "inbox_contended"
-    assert tps.native_fallback_reason("t1") is None
-
-
-def test_contended_row_is_logged_once_not_once_per_tick(caplog: pytest.LogCaptureFixture) -> None:
-    """The reconciler retries a contended row every tick; the log must not."""
-    import logging
-
-    tps._inbox_contended_logged.clear()
-    caplog.set_level(logging.INFO, logger=tps.logger.name)
-    for _ in range(5):
-        tps._log_inbox_contended_once("t1", (7,))
-    lines = [r.getMessage() for r in caplog.records if "inbox_contended" in r.getMessage()]
-    assert len(lines) == 1
-    assert "rows=7" in lines[0]
-
-
-# --- the three probes the r3 ruling names ------------------------------------
-
-
-def test_a_one_push_lands_the_other_is_contended_and_left_for_the_reconciler(
-    tmp_path: Path,
-) -> None:
-    """(a) Two concurrent pushes to one inbox: one lands, one is contended.
-
-    The contended one writes NOTHING, which is what leaves its row PENDING for
-    the reconciler's next tick to carry.
-    """
-    inbox = tmp_path / "team-lead.json"
-    lock = Path(str(inbox.resolve()) + ".lock")
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-
-    first = tps._write_inbox_entry(inbox, {"msg_id": "a", "n": 1})
-    assert first is True
-
-    # Hold the lock exactly as a concurrent writer would.
-    import os as _os
-
-    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
-    try:
-        second = tps._write_inbox_entry(inbox, {"msg_id": "b", "n": 2})
-    finally:
-        _os.close(held)
-        lock.unlink(missing_ok=True)
-
-    assert second is None, "a contended push reports contention, not success or failure"
-    assert [e["msg_id"] for e in json.loads(inbox.read_text())] == ["a"]
-
-    # The reconciler's next tick carries it, and then it lands.
-    assert tps._write_inbox_entry(inbox, {"msg_id": "b", "n": 2}) is True
-    assert [e["msg_id"] for e in json.loads(inbox.read_text())] == ["a", "b"]
-
-
-def test_b_a_contended_push_never_blocks(tmp_path: Path) -> None:
-    """(b) MUTANT: restore the 1s blocking acquire and this wall-clock bound fails.
-
-    Two attempts plus one short pause, so the whole contended path is bounded by
-    a small multiple of the retry pause -- never the second it used to cost.
-    """
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(str(inbox.resolve()) + ".lock")
-    import os as _os
-    import time as _time
-
-    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
-    try:
-        started = _time.monotonic()
-        assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is None
-        elapsed = _time.monotonic() - started
-    finally:
-        _os.close(held)
-        lock.unlink(missing_ok=True)
-
-    budget = tps.INBOX_LOCK_RETRY_PAUSE_S * 4 + 0.2
-    assert elapsed < budget, f"contended push took {elapsed:.3f}s, budget {budget:.3f}s"
-
-
-def test_c_an_uncontended_push_is_still_synchronous(tmp_path: Path) -> None:
-    """The ruling keeps the fast path fast: no pause when nothing contends."""
-    import time as _time
-
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    started = _time.monotonic()
-    assert tps._write_inbox_entry(inbox, {"msg_id": "only"}) is True
-    assert (_time.monotonic() - started) < tps.INBOX_LOCK_RETRY_PAUSE_S
-
-
-# ---------------------------------------------------------------------------
 # Cache eviction must not scale with the number of terminals ever seen (#747 r4).
 # ---------------------------------------------------------------------------
 
@@ -778,202 +448,15 @@ def test_invalidate_still_drops_the_terminal_and_session_entries() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A permanent lock error is a BROKEN channel, not a busy one (r7 repair 1).
+# WP-ARCH 3c K2: the push-path blocks below this line are GONE with their subject
 # ---------------------------------------------------------------------------
-
-
-def test_permanent_lock_error_is_a_write_failure_not_contention(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """MUTANT: swallow the PermissionError back into `return None` and this fails.
-
-    Verdict r1's blocker: every OSError from os.open became None, the caller read
-    that as inbox_contended, the write-failure ledger was never armed, and
-    native_fallback_reason kept answering healthy -- so the hook gate suppressed
-    the fallback indefinitely for a seat whose inbox can never be written.
-    """
-    _healthy_terminal(monkeypatch, tmp_path)
-    monkeypatch.setattr(tps, "get_mailbox_consumption_cursor", lambda tid: None)
-    tps.clear_native_write_failure("t1")
-
-    real_open = os.open
-
-    def _deny(path: Any, *a: Any, **k: Any) -> Any:
-        if str(path).endswith(".lock"):
-            raise PermissionError(13, "Permission denied")
-        return real_open(path, *a, **k)
-
-    monkeypatch.setattr(os, "open", _deny)
-
-    class _Msg:
-        id = 11
-        sender_id = "w1"
-        message = "hi"
-        logical_receiver_id = "mb1"
-
-    out = tps.attempt_teammate_push_reported("t1", [cast(Any, _Msg())])
-    assert out.pushed is False
-    assert out.reason == "write_failed", f"permanent error reported as {out.reason!r}"
-
-    monkeypatch.setattr(os, "open", real_open)
-    assert tps.native_fallback_reason("t1") == "native_write_failed"
-
-
-def test_permanent_lock_error_returns_false_from_the_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The writer's own contract: False (failure), never None (contention)."""
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    real_open = os.open
-
-    def _deny(path: Any, *a: Any, **k: Any) -> Any:
-        if str(path).endswith(".lock"):
-            raise PermissionError(13, "Permission denied")
-        return real_open(path, *a, **k)
-
-    monkeypatch.setattr(os, "open", _deny)
-    assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is False
-
-
-def test_a_held_lock_is_still_only_contention(tmp_path: Path) -> None:
-    """The repair must not turn an ordinary race into a failure."""
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(str(inbox.resolve()) + ".lock")
-    import os as _os
-
-    held = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
-    try:
-        assert tps._write_inbox_entry(inbox, {"msg_id": "y"}) is None
-    finally:
-        _os.close(held)
-        lock.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# r9 repair 1: the TOCTOU verify must classify permanent errors as failures.
-# r9 repair 2: the vanished-holder path is a race, and is now pinned.
-# ---------------------------------------------------------------------------
-
-
-def test_a_real_unwritable_directory_is_a_write_failure(tmp_path: Path) -> None:
-    """A REAL filesystem permission denial -- chmod, no patching.
-
-    The parent directory is made unwritable, so the very first O_CREAT raises
-    EACCES from the kernel. That is permanent, so the writer must report False
-    (write failure), never None (contention).
-    """
-    if os.geteuid() == 0:
-        pytest.skip("root ignores directory permission bits")
-    d = tmp_path / "locked"
-    d.mkdir()
-    inbox = d / "team-lead.json"
-    inbox.write_text("[]", encoding="utf-8")
-    os.chmod(d, 0o500)  # r-x: traversable and readable, NOT writable
-    try:
-        assert tps._write_inbox_entry(inbox, {"msg_id": "x"}) is False
-    finally:
-        os.chmod(d, 0o700)
-
-
-def test_permanent_error_on_the_toctou_verify_is_a_write_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """MUTANT target: restore `except OSError: return None` on the verify and
-    this fails.
-
-    This branch is only reachable after a STALE lock is reclaimed, so a real
-    chmod cannot deterministically fail exactly here without also failing the
-    unlink or the re-open before it. The permission error is therefore injected
-    at the one call the branch guards, which is the narrowest way to pin the
-    classification the verdict found wrong.
-    """
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(str(inbox.resolve()) + ".lock")
-    lock.write_text("", encoding="utf-8")
-    # Backdate it past the stale threshold so the reclaim path is taken.
-    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
-    os.utime(lock, (old, old))
-
-    real_stat = os.stat
-
-    def _deny_stat(path: Any, *a: Any, **k: Any) -> Any:
-        if str(path).endswith(".lock"):
-            raise PermissionError(13, "Permission denied")
-        return real_stat(path, *a, **k)
-
-    seen: list[str] = []
-
-    def _stat_after_reclaim(path: Any, *a: Any, **k: Any) -> Any:
-        # Call 1 is the stale check; call 2 is the TOCTOU verify that follows
-        # the reclaim. Fail ONLY call 2 and let every later call succeed.
-        #
-        # That exactness is the point. An earlier version failed call 2 AND
-        # every call after it, so under the mutation the retry's stale-check
-        # stat raised instead and the writer still returned False -- the test
-        # passed on mutated code and the variant patch survived. Isolating the
-        # single call is what makes this witness discriminating.
-        if str(path).endswith(".lock"):
-            seen.append("x")
-            if len(seen) == 2:
-                raise PermissionError(13, "Permission denied")
-        return real_stat(path, *a, **k)
-
-    monkeypatch.setattr(os, "stat", _stat_after_reclaim)
-    assert tps._write_inbox_entry(inbox, {"msg_id": "y"}) is False
-    monkeypatch.setattr(os, "stat", real_stat)
-    lock.unlink(missing_ok=True)
-
-
-def test_a_vanished_holder_is_a_race_not_a_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """r9 repair 2: the holder disappearing mid-reclaim is contention.
-
-    The verdict noted this behaviour was right but untested. If the lock the
-    stale check saw is already gone by the time we unlink it, another writer
-    reclaimed it: a race. The writer must report None so the reconciler carries
-    the row, NOT False, which would engage the fallback surface on a healthy
-    seat.
-    """
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(str(inbox.resolve()) + ".lock")
-    lock.write_text("", encoding="utf-8")
-    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
-    os.utime(lock, (old, old))
-
-    def _vanished(path: Any, *a: Any, **k: Any) -> None:
-        raise FileNotFoundError(2, "No such file or directory")
-
-    monkeypatch.setattr(os, "unlink", _vanished)
-    assert tps._write_inbox_entry(inbox, {"msg_id": "z"}) is None
-
-
-def test_a_holder_that_beats_us_to_the_reclaim_is_a_race(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The other half of the vanished-holder path: we unlink, someone else
-    re-creates before our open. Also a race, also None."""
-    inbox = tmp_path / "team-lead.json"
-    inbox.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(str(inbox.resolve()) + ".lock")
-    lock.write_text("", encoding="utf-8")
-    old = time.time() - (tps._LOCK_STALE_SECONDS + 60)
-    os.utime(lock, (old, old))
-
-    real_open = os.open
-    calls: list[str] = []
-
-    def _taken(path: Any, *a: Any, **k: Any) -> Any:
-        if str(path).endswith(".lock"):
-            calls.append("x")
-            raise FileExistsError(17, "File exists")
-        return real_open(path, *a, **k)
-
-    monkeypatch.setattr(os, "open", _taken)
-    assert tps._write_inbox_entry(inbox, {"msg_id": "w"}) is None
-    monkeypatch.setattr(os, "open", real_open)
-    lock.unlink(missing_ok=True)
+# Four sections lived here and every one of them tested the legacy FILE carrier:
+# the inbox file's size cap and trim, the lockfile's contention-vs-permanent-error
+# distinction, the TOCTOU verify, and the stale-holder reclaim races. That writer,
+# its lockfile and its file are deleted with ``teammate_push_service``; there is
+# no file to cap, no lock to contend for and no holder to reclaim from.
+#
+# What replaced the concern is not another file test. The queue's own store takes
+# a lease per row and its contention is SQLite's, exercised in
+# ``test/adapters/test_queue_store.py`` against a real database rather than
+# against a JSON file and an advisory lock.

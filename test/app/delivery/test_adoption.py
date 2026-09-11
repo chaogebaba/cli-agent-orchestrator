@@ -603,3 +603,90 @@ def test_a_row_whose_receiver_vanished_is_adopted_and_dies_on_its_budget(env) ->
     attempts = store.attempts_for(queued.msg_id)
     assert attempts, "an unreachable receiver must still record an attempt"
     assert any("pane_absent" in (a.detail or "") or a.outcome for a in attempts), attempts
+
+
+# -- slice 3: the pre-flip seat row, end to end ------------------------------
+
+
+def test_a_pre_flip_seat_row_takes_one_native_write_and_zero_pastes(env) -> None:
+    """The plan's slice-3 acceptance, and the case slice 2's B1 was about.
+
+    A row written to the legacy inbox BEFORE the flip has no ``delivery_msg``
+    counterpart, and after slice 3 it has no legacy carrier either: the doorbell,
+    the pull reconciler and the pane nudge are all deleted. Adoption is the whole
+    of its path, and the assertion is on the EMISSION — one native socket write,
+    zero pastes — because "nothing pasted" alone is satisfied by silence, and
+    silence at the seat is #604.
+    """
+    sessions, _store, tick, carrier, injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="PRE_FLIP_CALLBACK")
+        row_id = int(row.id)
+
+    tick.run_once()
+
+    assert len(carrier.writes) == 1, "the pre-flip row produced no native wake"
+    assert injector.pastes == [], "a supervisor receiver is never pasted (K8)"
+    assert _status(sessions, row_id) == MessageStatus.ADOPTED.value
+
+
+def test_the_worker_injector_refuses_a_supervisor_terminal() -> None:
+    """K8 as a property of the CALL GRAPH, asserted at the injector itself.
+
+    The ban is not only that nothing currently routes a seat row to the pane
+    injector — it is that doing so would be REFUSED. A future caller that routes
+    wrongly gets ``paste_attempted``, a finding and a row that dies on its
+    attempt budget, rather than a silent paste into a human's composer.
+    """
+    from unittest.mock import patch
+
+    from cli_agent_orchestrator.core.delivery import AttemptOutcome
+    from cli_agent_orchestrator.services.queue_carrier import PaneWorkerInjector
+
+    sent: list[str] = []
+    with (
+        patch(
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
+            return_value=True,
+        ),
+        patch.object(PaneWorkerInjector, "_send", lambda *a, **k: sent.append("sent")),
+    ):
+        result = PaneWorkerInjector().inject(terminal_id=SEAT, line="never pasted")
+
+    assert result.outcome is AttemptOutcome.PASTE_ATTEMPTED
+    assert result.detail == "paste_attempted"
+    assert sent == [], "the injector reached its send path for a supervisor target"
+
+
+def test_the_worker_injector_still_pastes_a_worker() -> None:
+    """The negative control: K8 removed a path, not the pane carrier.
+
+    Without this arm, an injector that refused EVERYTHING would satisfy the
+    refusal arm above while breaking every worker's delivery.
+    """
+    from unittest.mock import patch
+
+    from cli_agent_orchestrator.core.delivery import AttemptOutcome, InjectionResult
+    from cli_agent_orchestrator.services.queue_carrier import PaneWorkerInjector
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.mailbox_service.probe_supervisor_role",
+            return_value=False,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.inbox_service._dialog_gate_active",
+            return_value=False,
+        ),
+        patch.object(
+            PaneWorkerInjector,
+            "_send",
+            staticmethod(
+                lambda *a, **k: InjectionResult(outcome=AttemptOutcome.DELIVERED, detail="pane")
+            ),
+        ),
+    ):
+        result = PaneWorkerInjector().inject(terminal_id=WORKER, line="pasted")
+
+    assert result.outcome is AttemptOutcome.DELIVERED

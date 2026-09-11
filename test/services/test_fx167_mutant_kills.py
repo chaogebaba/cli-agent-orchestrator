@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # M10: f138_notify_confirmed_gone_report_failed routes through _f166_notify_once
 # ---------------------------------------------------------------------------
@@ -41,7 +40,10 @@ class TestM10ConfirmedGoneDedup:
         env = real_sqlite_env
         TestSession = env["TestSession"]
 
-        from cli_agent_orchestrator.clients.database import OrphanReconcileJobModel, ProcessIncarnationModel
+        from cli_agent_orchestrator.clients.database import (
+            OrphanReconcileJobModel,
+            ProcessIncarnationModel,
+        )
 
         now = datetime.now(timezone.utc)
         inc_id = "inc_m10_" + str(uuid.uuid4())[:4]
@@ -83,12 +85,15 @@ class TestM10ConfirmedGoneDedup:
         def mock_create_inbox_message(**kwargs):
             send_calls.append(kwargs)
 
-        with patch(
-            "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
-            return_value="supervisor_m10",
-        ), patch(
-            "cli_agent_orchestrator.clients.database.create_inbox_message",
-            side_effect=mock_create_inbox_message,
+        with (
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.get_current_supervisor_terminal_id",
+                return_value="supervisor_m10",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.create_inbox_message",
+                side_effect=mock_create_inbox_message,
+            ),
         ):
             from cli_agent_orchestrator.services.orphan_reconcile_service import (
                 f138_notify_confirmed_gone_report_failed,
@@ -129,6 +134,7 @@ class TestM10ConfirmedGoneDedup:
 def _find_hook_path() -> Path:
     """Locate f162-register-inbox.sh via ROOT_REPO conftest helper (worktree-safe)."""
     from test.conftest import ROOT_REPO
+
     if ROOT_REPO is not None:
         candidate = ROOT_REPO / ".claude" / "hooks" / "f162-register-inbox.sh"
         if candidate.exists():
@@ -158,19 +164,29 @@ class TestM11HookLeadSessionIdMatch:
         target_session_id = "aaaaaaaa-1111-2222-3333-444444444444"
 
         # D9 hook scans: ~/.claude/projects/*/SESSION_ID/subagents/*.meta.json
-        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir = (
+            fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        )
         project_dir.mkdir(parents=True)
-        (project_dir / "agent1.meta.json").write_text(json.dumps({
-            "teamName": "correct-team",
-        }))
+        (project_dir / "agent1.meta.json").write_text(
+            json.dumps(
+                {
+                    "teamName": "correct-team",
+                }
+            )
+        )
 
         # A second project dir for a DIFFERENT session (should NOT be scanned)
         other_session = "bbbbbbbb-5555-6666-7777-888888888888"
         other_dir = fake_home / ".claude" / "projects" / "myproject" / other_session / "subagents"
         other_dir.mkdir(parents=True)
-        (other_dir / "agent2.meta.json").write_text(json.dumps({
-            "teamName": "wrong-team",
-        }))
+        (other_dir / "agent2.meta.json").write_text(
+            json.dumps(
+                {
+                    "teamName": "wrong-team",
+                }
+            )
+        )
 
         # Create the teams directories — the hook will register
         # ~/.claude/teams/<teamName>/inboxes/team-lead.json
@@ -223,14 +239,16 @@ exit 0
 
         result = subprocess.run(
             ["bash", str(wrapper_script)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
 
         # The hook should have called curl with the correct inbox path
         assert result.returncode == 0, f"Hook failed: stderr={result.stderr}"
-        assert curl_capture.exists(), (
-            f"Hook did not call curl (no metadata update). stdout={result.stdout} stderr={result.stderr}"
-        )
+        assert (
+            curl_capture.exists()
+        ), f"Hook did not call curl (no metadata update). stdout={result.stdout} stderr={result.stderr}"
 
         payload = json.loads(curl_capture.read_text())
         registered_path = payload.get("metadata", {}).get("cc_team_inbox_path", "")
@@ -253,7 +271,9 @@ exit 0
         # Session with NO meta.json files at all
         target_session_id = "zzzzzzzz-0000-0000-0000-000000000000"
         # Create the projects dir structure but no meta.json
-        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir = (
+            fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        )
         project_dir.mkdir(parents=True)
 
         stdin_json = json.dumps({"session_id": target_session_id})
@@ -288,7 +308,9 @@ exit 0
 
         result = subprocess.run(
             ["bash", str(wrapper_script)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
 
         assert result.returncode == 0, f"Hook failed: {result.stderr}"
@@ -298,10 +320,12 @@ exit 0
             f"Payload: {curl_capture.read_text() if curl_capture.exists() else 'N/A'}"
         )
         # Should have warned to stderr
-        assert "warn" in result.stderr.lower() or "no match" in result.stderr.lower() or \
-               "0 match" in result.stderr.lower() or result.stderr.strip() != "", (
-            "Hook should warn to stderr when no match found"
-        )
+        assert (
+            "warn" in result.stderr.lower()
+            or "no match" in result.stderr.lower()
+            or "0 match" in result.stderr.lower()
+            or result.stderr.strip() != ""
+        ), "Hook should warn to stderr when no match found"
 
     def test_multiple_matches_registers_nothing(self, tmp_path):
         """When multiple meta.json files yield distinct teamNames for the same
@@ -312,14 +336,24 @@ exit 0
         target_session_id = "aaaaaaaa-1111-2222-3333-444444444444"
 
         # Two meta.json files with DIFFERENT teamNames under the same session
-        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir = (
+            fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        )
         project_dir.mkdir(parents=True)
-        (project_dir / "agent1.meta.json").write_text(json.dumps({
-            "teamName": "team-alpha",
-        }))
-        (project_dir / "agent2.meta.json").write_text(json.dumps({
-            "teamName": "team-beta",
-        }))
+        (project_dir / "agent1.meta.json").write_text(
+            json.dumps(
+                {
+                    "teamName": "team-alpha",
+                }
+            )
+        )
+        (project_dir / "agent2.meta.json").write_text(
+            json.dumps(
+                {
+                    "teamName": "team-beta",
+                }
+            )
+        )
 
         # Create both team dirs
         for tn in ["team-alpha", "team-beta"]:
@@ -360,7 +394,9 @@ exit 0
 
         result = subprocess.run(
             ["bash", str(wrapper_script)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
 
         assert result.returncode == 0, f"Hook failed: {result.stderr}"
@@ -437,10 +473,12 @@ class TestM12Gate5WarnRateLimit:
         # Patch: pull-mode on, supervisor is pull-mode, teammate_push returns False (unregistered)
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-                "supervisor.teammate_push": True,
-            }.get(key, default)),
+            staticmethod(
+                lambda key, default=None, override=None: {
+                    "supervisor.mailbox_pull": True,
+                    "supervisor.teammate_push": True,
+                }.get(key, default)
+            ),
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -456,8 +494,9 @@ class TestM12Gate5WarnRateLimit:
 
         from cli_agent_orchestrator.services import inbox_service as _is_mod
 
-        # Clear any pre-existing state in the rate-limit dict
-        _is_mod._fx158_gate5_last_warn.clear()
+        # WP-ARCH 3c K2: the fx158 gate-5 rate-limit dict is deleted with the
+        # pull-mode reconciler that was its only writer, so there is no
+        # pre-existing state to clear here.
 
         monkeypatch.setattr(time, "monotonic", lambda: fake_time[0])
 
@@ -484,7 +523,9 @@ class TestM12Gate5WarnRateLimit:
         # Tick 1: first observation → should WARN (transition)
         svc.reconcile_pull_mode_notifications()
         tick1_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert len(tick1_warns) == 1, f"Tick 1: expected 1 WARN, got {len(tick1_warns)}: {tick1_warns}"
+        assert (
+            len(tick1_warns) == 1
+        ), f"Tick 1: expected 1 WARN, got {len(tick1_warns)}: {tick1_warns}"
 
         # Tick 2: +30s (within 60s window) → suppressed
         fake_time[0] = 1030.0
@@ -501,9 +542,9 @@ class TestM12Gate5WarnRateLimit:
         warn_calls.clear()
         svc.reconcile_pull_mode_notifications()
         tick3_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert len(tick3_warns) == 0, (
-            f"Tick 3 (+59s): expected 0 WARN (suppressed), got {len(tick3_warns)}"
-        )
+        assert (
+            len(tick3_warns) == 0
+        ), f"Tick 3 (+59s): expected 0 WARN (suppressed), got {len(tick3_warns)}"
 
     def test_warn_re_emits_after_60s(self, real_sqlite_env, monkeypatch):
         """After 60s elapse, the WARN is emitted again (rate-limit window expired)."""
@@ -557,9 +598,11 @@ class TestM12Gate5WarnRateLimit:
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.config_service.ConfigService.get",
-            staticmethod(lambda key, default=None, override=None: {
-                "supervisor.mailbox_pull": True,
-            }.get(key, default)),
+            staticmethod(
+                lambda key, default=None, override=None: {
+                    "supervisor.mailbox_pull": True,
+                }.get(key, default)
+            ),
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -573,6 +616,7 @@ class TestM12Gate5WarnRateLimit:
         fake_time = [2000.0]
 
         from cli_agent_orchestrator.services import inbox_service as _is_mod
+
         _is_mod._fx158_gate5_last_warn.clear()
 
         monkeypatch.setattr(time, "monotonic", lambda: fake_time[0])
@@ -588,6 +632,7 @@ class TestM12Gate5WarnRateLimit:
         monkeypatch.setattr(_is_mod.logger, "warning", capture_warning)
 
         from cli_agent_orchestrator.services.inbox_service import InboxService
+
         monkeypatch.setattr(InboxService, "recover_stale_deliveries", lambda self, **kw: None)
 
         svc = InboxService()
@@ -601,6 +646,6 @@ class TestM12Gate5WarnRateLimit:
         warn_calls.clear()
         svc.reconcile_pull_mode_notifications()
         tick2_warns = [w for w in warn_calls if "native_fallback_engaged" in w]
-        assert len(tick2_warns) == 1, (
-            f"After 61s: expected WARN re-emission, got {len(tick2_warns)}"
-        )
+        assert (
+            len(tick2_warns) == 1
+        ), f"After 61s: expected WARN re-emission, got {len(tick2_warns)}"

@@ -54,13 +54,29 @@ def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
     This is the DELIVERY_TICKS constant materialized for a specific watchdog.
     The tick order and set are identical to the pre-D12 hardcoded body.
 
-    NOTE: convergence_tick is imported at CALL TIME (not build time) to support
+    NOTE: the delivery tick is resolved at CALL TIME (not build time) to support
     test patching — the original _run_ticks also imported per-call.
+
+    WP-ARCH 3c K7: the first entry used to be the watchdog's
+    ``_fx191_convergence_tick``, a throttled call into
+    ``delivery_service.convergence_tick``. Both are deleted with the obligation
+    ladder, so the roster is re-pointed at the real scheduled observer,
+    ``DeliveryTick.run_once``. A simulation whose first tick drove a function
+    that returned immediately at the shipped position was simulating the wrong
+    system; this makes the sim's delivery step the one production runs.
     """
 
-    def _convergence(now: float) -> None:
-        from cli_agent_orchestrator.services.delivery_service import convergence_tick
-        convergence_tick()
+    def _delivery(now: float) -> None:
+        # The composition root holds the built tick (``bootstrap.py`` keeps it on
+        # the runtime precisely so a caller can drive ``run_once`` directly), and
+        # it is absent for a position that is not served — in which case there is
+        # no delivery step to simulate and this is correctly a no-op.
+        from cli_agent_orchestrator import bootstrap
+
+        runtime = bootstrap.current_runtime()
+        tick = runtime.delivery_tick if runtime is not None else None
+        if tick is not None:
+            tick.run_once()
 
     def _poll_unarmed(now: float) -> None:
         watchdog.poll_unarmed_statuses(now=now)
@@ -81,7 +97,7 @@ def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
         watchdog.tick_quiescence(now=now)
 
     return [
-        Tick("_fx191_convergence_tick", _convergence),
+        Tick("delivery_tick", _delivery),
         Tick("poll_unarmed_statuses", _poll_unarmed),
         Tick("refresh_screen_fingerprints", _refresh_screen),
         Tick("notify_due", _notify_due),
@@ -223,7 +239,7 @@ class SimDriver:
 # ---------------------------------------------------------------------------
 
 DELIVERY_TICK_NAMES = [
-    "_fx191_convergence_tick",
+    "delivery_tick",
     "poll_unarmed_statuses",
     "refresh_screen_fingerprints",
     "notify_due",

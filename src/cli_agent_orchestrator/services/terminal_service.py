@@ -1847,11 +1847,11 @@ def _maybe_derive_cc_team_inbox_path(
         return metadata
     _wd = working_directory or os.getcwd()
     try:
-        from cli_agent_orchestrator.services.teammate_push_service import (
-            _derive_cc_team_inbox_path,
+        from cli_agent_orchestrator.services.native_delivery_health import (
+            derive_cc_team_inbox_path,
         )
 
-        _inbox_path = _derive_cc_team_inbox_path(_wd)
+        _inbox_path = derive_cc_team_inbox_path(_wd)
     except Exception:
         return metadata
     if _inbox_path is None:
