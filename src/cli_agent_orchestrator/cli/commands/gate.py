@@ -23,6 +23,7 @@ needs to prove AC-A1's restart arm at the CLI — a round re-rendered from rows.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import click
@@ -295,6 +296,13 @@ def ask(
 @click.option("--caller", "caller_conversation", default="supervisor", show_default=True)
 @click.option("--caller-epoch", type=int, default=0, show_default=True)
 @click.option("--request-id", "client_request_id", default=None)
+@click.option(
+    "--wait",
+    "wait_s",
+    type=int,
+    default=0,
+    help="After answering, wait up to N seconds for the asker to actually receive it.",
+)
 @click.option("--db", "db_path", default=None, help="Work this database directly, no server.")
 @click.option("--json", "as_json", is_flag=True)
 def answer(
@@ -304,10 +312,17 @@ def answer(
     caller_conversation: str,
     caller_epoch: int,
     client_request_id: str | None,
+    wait_s: int,
     db_path: str | None,
     as_json: bool,
 ) -> None:
-    """Answer a durable question by id (refused if settled, expired or superseded)."""
+    """Answer a durable question by id (refused if settled, expired or superseded).
+
+    ``--wait`` is the parity flag for the tool's blocking side: it holds until the
+    ASKER has consumed the answer, so an operator sees that the lane actually
+    resumed rather than only that a row was written.  ANSWERED is not proof of
+    receipt, and this is the flag that lets you tell the difference.
+    """
     request_id = client_request_id or _derived_request_id(question_id, answer_text)
     if db_path is not None:
         from cli_agent_orchestrator.core.gate import GateError
@@ -323,6 +338,8 @@ def answer(
             )
         except GateError as exc:
             raise click.ClickException(f"{getattr(exc, 'code', 'E_GATE')}: {exc}")
+        if wait_s > 0:
+            record = _wait_for_receipt_offline(db_path, question_id, wait_s) or record
         _emit(_payload_from_record(record), as_json)
         return
     body = _post(
@@ -335,7 +352,10 @@ def answer(
             "caller_epoch": caller_epoch,
         },
     )
-    _emit(body["question"] if "question" in body else body, as_json)
+    payload = body["question"] if "question" in body else body
+    if wait_s > 0:
+        payload = _wait_for_receipt(question_id, wait_s) or payload
+    _emit(payload, as_json)
 
 
 @gate.command("escalate")
@@ -416,6 +436,61 @@ def question(question_id: str, db_path: str | None, as_json: bool) -> None:
         _emit(_payload_from_record(record), as_json)
         return
     _emit(_get(f"/gate/questions/{question_id}"), as_json)
+
+
+@gate.command("sweep")
+@click.option("--db", "db_path", default=None, help="Work this database directly, no server.")
+@click.option("--json", "as_json", is_flag=True)
+def sweep(db_path: str | None, as_json: bool) -> None:
+    """Run one expiry-and-retry sweep now, instead of waiting out the daemon's period.
+
+    Expires every question past its deadline — each becomes exactly one anomaly —
+    and re-sends the notices that never landed.
+    """
+    if db_path is not None:
+        expired, retried = _question_service(db_path).sweep()
+        payload = {
+            "expired": [_payload_from_record(q) for q in expired],
+            "notices_retried": [q.question_id for q in retried],
+        }
+    else:
+        payload = _post("/gate/sweep", {})
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+        return
+    expired_items = payload.get("expired") or []
+    click.echo(
+        f"expired {len(expired_items)}, notices retried {len(payload.get('notices_retried') or [])}"
+    )
+    for item in expired_items:
+        click.echo(_question_line(item))
+
+
+def _wait_for_receipt(question_id: str, wait_s: int) -> dict[str, Any] | None:
+    """Poll the served question until the asker has consumed the answer."""
+    deadline = time.monotonic() + float(wait_s)
+    payload: dict[str, Any] | None = None
+    while True:
+        body = _get(f"/gate/questions/{question_id}")
+        payload = body.get("question") if "question" in body else body
+        if isinstance(payload, dict) and payload.get("consumed_at"):
+            return payload
+        if time.monotonic() >= deadline:
+            return payload
+        time.sleep(1.0)
+
+
+def _wait_for_receipt_offline(db_path: str, question_id: str, wait_s: int) -> Any:
+    """The ``--db`` twin of :func:`_wait_for_receipt`, over the local store."""
+    deadline = time.monotonic() + float(wait_s)
+    service = _question_service(db_path)
+    while True:
+        record = service.get(question_id)
+        if record is not None and record.consumed_at is not None:
+            return record
+        if time.monotonic() >= deadline:
+            return record
+        time.sleep(1.0)
 
 
 def _payload_from_record(record: Any) -> dict[str, Any]:

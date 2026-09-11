@@ -10,12 +10,15 @@ that the two surfaces name one route.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.adapters.store.migrator import migrate
+from cli_agent_orchestrator.bootstrap import build_gate_question_service
 from cli_agent_orchestrator.cli.commands.gate import gate
 
 
@@ -144,3 +147,86 @@ def test_a_repeated_ask_says_it_replayed(db: str) -> None:
     code, out = _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1")
     assert code == 0
     assert "replayed: nothing new was recorded" in out
+
+
+# -- slice B2: the sweep verb and the receipt wait --------------------------
+
+
+def test_sweep_expires_what_is_overdue_and_says_so(db: str) -> None:
+    code, out = _run(
+        db,
+        "ask",
+        "accept?",
+        "--dispatch",
+        "w1",
+        "--request-id",
+        "cr1",
+        "--expires-in",
+        "1",
+        "--json",
+    )
+    assert code == 0, out
+    asked = json.loads(out)
+    time.sleep(1.2)
+
+    code, out = _run(db, "sweep", "--json")
+    assert code == 0, out
+    result = json.loads(out)
+    assert [q["question_id"] for q in result["expired"]] == [asked["question_id"]]
+
+    code, out = _run(db, "sweep")
+    assert code == 0 and "expired 0" in out
+
+
+def test_sweep_leaves_a_question_that_is_not_due(db: str) -> None:
+    _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1", "--json")
+    code, out = _run(db, "sweep", "--json")
+    assert code == 0
+    assert json.loads(out)["expired"] == []
+
+
+def test_answer_wait_returns_once_the_asker_has_consumed(db: str) -> None:
+    """The parity flag for the tool's blocking side (R28).
+
+    ``--wait`` holds until the answer has actually been RECEIVED, so an operator
+    can tell "I wrote a row" from "the lane resumed". Here the consumption is
+    simulated by another thread doing what a waiting asker's tool call does.
+    """
+    asked = json.loads(
+        _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1", "--json")[1]
+    )
+
+    def _consume_soon() -> None:
+        time.sleep(1.2)
+        service = build_gate_question_service(db)
+        question = service.require(asked["question_id"])
+        assert question.answer_event_id is not None
+        service.consume_answer(question.answer_event_id)
+
+    worker = threading.Thread(target=_consume_soon)
+    code, out = _run(db, "answer", asked["question_id"], "accept", "--json")
+    assert code == 0, out
+    worker.start()
+    try:
+        started = time.monotonic()
+        code, out = _run(db, "answer", asked["question_id"], "accept", "--wait", "15", "--json")
+        elapsed = time.monotonic() - started
+    finally:
+        worker.join()
+    assert code == 0, out
+    assert elapsed < 12.0
+    assert json.loads(out)["consumed_at"] is not None
+
+
+def test_answer_wait_gives_up_at_its_bound_and_still_reports(db: str) -> None:
+    """An un-consumed answer is reported as such, not as a hang or an error."""
+    asked = json.loads(
+        _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1", "--json")[1]
+    )
+    started = time.monotonic()
+    code, out = _run(db, "answer", asked["question_id"], "accept", "--wait", "2", "--json")
+    elapsed = time.monotonic() - started
+    assert code == 0, out
+    assert 1.0 <= elapsed < 8.0
+    payload = json.loads(out)
+    assert payload["state"] == "ANSWERED" and payload["consumed_at"] is None

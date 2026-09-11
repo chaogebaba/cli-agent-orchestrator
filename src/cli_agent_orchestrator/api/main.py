@@ -53,6 +53,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
 from cli_agent_orchestrator import bootstrap
+from cli_agent_orchestrator.api import routes_fork as routes_fork_module
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -1962,6 +1963,12 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    # WP-ARCH Amendment A slice B2: settle overdue gate questions into exactly
+    # one anomaly each, and re-send notices the transport lost. The daemon lives
+    # in api/routes_fork.py beside the routes it shares a service with, so the
+    # set of legacy files importing the new tree stays one fork-only module
+    # (test/adapters/truth/test_hook_points.py holds that set to an equality).
+    gate_question_task = asyncio.create_task(routes_fork_module.gate_question_expiry_daemon())
     watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
@@ -2084,6 +2091,11 @@ async def lifespan(app: FastAPI):
             pass
 
     # Cancel inbox reconciliation sweep on shutdown
+    gate_question_task.cancel()
+    try:
+        await gate_question_task
+    except asyncio.CancelledError:
+        pass
     inbox_reconcile_task.cancel()
     try:
         await inbox_reconcile_task

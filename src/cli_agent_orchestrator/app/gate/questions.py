@@ -47,6 +47,7 @@ from cli_agent_orchestrator.app.gate.ports import (
     RoundQuestion,
 )
 from cli_agent_orchestrator.app.gate.render import (
+    CallbackEnvelope,
     EnvelopeKind,
     IdentityRef,
     render_anomaly_envelope,
@@ -249,6 +250,49 @@ class GateQuestionService:
         """Whether this dispatch is waiting on an answer (the B2 reap predicate)."""
         return self._store.open_question_for_dispatch(dispatch_id) is not None
 
+    def retry_failed_notices(self, *, limit: int = 50) -> list[RoundQuestion]:
+        """Re-send the notices that never landed, and report which ones (B2).
+
+        The other half of the ask transaction's promise.  The ask commits an
+        intent saying somebody must be told; if the transport was down at that
+        moment the intent is ``FAILED`` (or still ``PENDING``, if no notifier was
+        wired) and this is what eventually discharges it.  Without this, a
+        question asked during a blip would sit open until it expired and the lane
+        would have waited the whole hour for nothing.
+
+        Each retry goes through the SAME ``_notify`` as the original, so a
+        success settles the intent ``SENT`` with its message id and a second
+        failure only bumps the attempt count.  A question that settled in the
+        meantime is not in the candidate set at all.
+        """
+        retried = self._store.notices_to_retry(limit=limit)
+        for record in retried:
+            self._notify(record, kind=EnvelopeKind.QUESTION)
+        return retried
+
+    def sweep(self, now: datetime | None = None) -> tuple[list[RoundQuestion], list[RoundQuestion]]:
+        """One daemon period: expire what is overdue, retry what never landed.
+
+        Returned as two lists rather than a count so a caller (and a test) can
+        say WHICH questions each half touched.  Expiry runs first: a question
+        that has just timed out should not also have its question notice
+        re-sent, and settling it first removes it from the retry candidates.
+        """
+        expired = self.sweep_expired(now)
+        retried = self.retry_failed_notices()
+        return expired, retried
+
+    def settlement(self, question_id: str) -> tuple[RoundQuestion, QuestionAnswer | None]:
+        """The question and its answer, for a waiting asker (B2's bounded poll).
+
+        One read of each, no transaction and nothing held open — a caller polls
+        this repeatedly and must not be the reason a writer waits.
+        """
+        record = self.require(question_id)
+        if record.answer_event_id is None:
+            return record, None
+        return record, self._store.get_answer(record.answer_event_id)
+
     # -- internals ---------------------------------------------------------
 
     def _ensure_dispatch(self, dispatch_id: str, *, position: str, round_id: str | None) -> None:
@@ -283,7 +327,7 @@ class GateQuestionService:
         """
         if self._notifier is None:
             return
-        envelope = (
+        envelope: CallbackEnvelope = (
             render_question_envelope(record, identity=self._identity(record))
             if kind is EnvelopeKind.QUESTION
             else render_anomaly_envelope(record, identity=self._identity(record))
@@ -293,6 +337,7 @@ class GateQuestionService:
                 question=record,
                 kind=kind.value,
                 classification=envelope.classification.value,
+                code=envelope.code,
                 lines=envelope.lines,
             )
         except Exception as exc:  # noqa: BLE001 — a failed notice is a row, never a raise

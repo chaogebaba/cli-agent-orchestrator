@@ -22,9 +22,23 @@ import pytest
 from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
 from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.app.gate.questions import GateQuestionService
+from cli_agent_orchestrator.app.gate.render import ANOMALY_QUESTION_EXPIRED
 from cli_agent_orchestrator.core import gate as g
 
 _NOW = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+
+
+def _intent(pool: Any, question_id: str) -> Any:
+    """The notice intent row for one question."""
+    return (
+        pool.connection()
+        .execute(
+            "SELECT state, msg_id, attempts, last_error FROM question_notice_intent "
+            "WHERE question_id = ?",
+            (question_id,),
+        )
+        .fetchone()
+    )
 
 
 class FakeClock:
@@ -39,13 +53,19 @@ class FakeNotifier:
     """Records every notice; optionally fails, to exercise the FAILED path."""
 
     def __init__(self, *, outcome: str = "ok") -> None:
-        self.calls: list[tuple[str, str, tuple[str, ...], str]] = []
+        self.calls: list[tuple[str, str, tuple[str, ...], str, str]] = []
         self.outcome = outcome
 
     def notify(
-        self, *, question: g.RoundQuestion, kind: str, classification: str, lines: Any
+        self,
+        *,
+        question: g.RoundQuestion,
+        kind: str,
+        classification: str,
+        code: str,
+        lines: Any,
     ) -> str | None:
-        self.calls.append((question.question_id, kind, tuple(lines), classification))
+        self.calls.append((question.question_id, kind, tuple(lines), code, classification))
         if self.outcome == "raise":
             raise RuntimeError("transport down")
         if self.outcome == "none":
@@ -167,9 +187,9 @@ def test_the_notifier_is_called_once_per_question_after_the_commit(
         position="dev",
     )
     assert len(notifier.calls) == 1
-    qid, kind, lines, classification = notifier.calls[0]
+    qid, kind, lines, code, classification = notifier.calls[0]
     assert qid == question.question_id and kind == "question"
-    assert classification == "expected"
+    assert code == "" and classification == "expected"
     assert len(lines) == 4
     intent = (
         pool.connection()
@@ -401,7 +421,7 @@ def test_provisioning_leaves_a_live_builder_alone(tmp_path: Path) -> None:
         )
     )
 
-    service.ask(
+    _asked, _ig = service.ask(
         dispatch_id="b1",
         question="accept?",
         client_request_id="cr1",
@@ -414,3 +434,187 @@ def test_provisioning_leaves_a_live_builder_alone(tmp_path: Path) -> None:
     assert survivor.role is g.DispatchRole.BUILDER, "an ask must not re-role a dispatch"
     assert survivor.position == "dev", "an ask must not re-position a dispatch"
     assert survivor.state is g.DispatchState.AWAITING_ANSWER  # only the state moves
+
+
+# -- slice B2: the retry sweep and the settlement read ----------------------
+
+
+def test_a_failed_notice_is_retried_by_the_sweep_and_never_double_sent(
+    tmp_path: Path,
+) -> None:
+    """The other half of the ask transaction's promise (B2).
+
+    The ask commits an intent saying somebody must be told.  If the transport was
+    down at that instant the intent is FAILED and the lane would otherwise wait
+    out its whole hour for a question nobody ever saw.  The sweep discharges it —
+    and once the retry lands, a LATER sweep must not send it again, because two
+    copies of one question is the context-noise the seat contract forbids.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier(outcome="raise")
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    assert len(notifier.calls) == 1  # the original attempt
+    assert _intent(pool, question.question_id)["state"] == "FAILED"
+
+    # The transport comes back; the sweep re-sends exactly once.
+    notifier.outcome = "ok"
+    _expired, retried = service.sweep()
+    assert [q.question_id for q in retried] == [question.question_id]
+    assert len(notifier.calls) == 2
+    row = _intent(pool, question.question_id)
+    assert row["state"] == "SENT" and row["attempts"] == 2
+
+    # And a later sweep has nothing to do: SENT is not a retry candidate.
+    _expired2, retried2 = service.sweep()
+    assert retried2 == []
+    assert len(notifier.calls) == 2
+
+
+def test_the_sweep_does_not_re_announce_a_question_that_was_answered(
+    tmp_path: Path,
+) -> None:
+    """A settled question leaves the retry set, whatever its notice intent says."""
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier(outcome="raise")
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    clock.value = _NOW + timedelta(minutes=1)
+    service.answer(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="seat",
+    )
+    notifier.calls.clear()
+    notifier.outcome = "ok"
+    _expired, retried = service.sweep()
+    assert retried == [] and notifier.calls == []
+
+
+def test_the_sweep_expires_before_it_retries(tmp_path: Path) -> None:
+    """Order matters: a question that has just timed out is not also re-asked.
+
+    Expiry first removes it from the retry candidates, so the seat gets ONE
+    anomaly rather than an anomaly and a fresh copy of a dead question.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier(outcome="raise")
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        expires_in_s=60,
+        position="dev",
+    )
+    notifier.calls.clear()
+    notifier.outcome = "ok"
+
+    clock.value = _NOW + timedelta(seconds=61)
+    expired, retried = service.sweep()
+    assert [q.question_id for q in expired] == [question.question_id]
+    assert retried == []
+    assert [call[1] for call in notifier.calls] == ["condition"]
+
+
+def test_the_anomaly_envelope_carries_a_distinguishing_code(tmp_path: Path) -> None:
+    """An expiry and an ordinary run condition share a wire KIND (A5's four).
+
+    A consumer that had to tell them apart by reading the summary prose would
+    break the first time the wording changed, so the code travels beside the
+    kind.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier()
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+    _asked, _ig = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        expires_in_s=60,
+        position="dev",
+    )
+    notifier.calls.clear()
+    clock.value = _NOW + timedelta(seconds=61)
+    service.sweep_expired()
+
+    assert [call[1] for call in notifier.calls] == ["condition"]
+    assert [call[3] for call in notifier.calls] == [ANOMALY_QUESTION_EXPIRED]
+    # A question notice, by contrast, needs no further discrimination.
+    _asked, _ig = service.ask(
+        dispatch_id="worker-2",
+        question="and this?",
+        client_request_id="cr2",
+        owner_conversation="seat",
+        position="dev",
+    )
+    assert notifier.calls[-1][1] == "question" and notifier.calls[-1][3] == ""
+
+
+def test_settlement_returns_the_question_and_its_answer(tmp_path: Path) -> None:
+    """What the bounded poll reads each iteration."""
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    service = GateQuestionService(store, clock=clock)
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    record, answer = service.settlement(question.question_id)
+    assert record.is_open and answer is None
+
+    clock.value = _NOW + timedelta(minutes=1)
+    service.answer(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="seat",
+    )
+    record, answer = service.settlement(question.question_id)
+    assert not record.is_open
+    assert answer is not None and answer.answer == "accept"
+
+
+def test_settlement_of_an_unknown_question_is_a_typed_refusal(tmp_path: Path) -> None:
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    service = GateQuestionService(SqliteGateStore(pool, clock=clock), clock=clock)
+    with pytest.raises(g.GateQuestionError) as exc:
+        service.settlement("nope")
+    assert exc.value.code is g.QuestionRefusal.QUESTION_NOT_FOUND

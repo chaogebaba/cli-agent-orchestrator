@@ -723,6 +723,7 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::GateQuestion => None,
         CommandId::GateQuestions => None,
         CommandId::GateShow => None,
+        CommandId::GateSweep => None,
         CommandId::AgentsStatus => None,
         CommandId::AutoAnswersTest => None,
         CommandId::BarrierCancel => None,
