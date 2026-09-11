@@ -330,6 +330,13 @@ def test_incident_mutations_compose_under_flock(tmp_path):
 
 
 def _install_fixture_home(monkeypatch, tmp_path):
+    # F703 (#558): find_artifact() re-resolves the sessions dir through
+    # resolve_codex_home(terminal_id) whenever that differs from the real
+    # provider plane home, and resolve_codex_home reads CODEX_HOME first --
+    # which conftest pins to an empty per-test temp dir. Pin it at the fake
+    # provider home so the re-resolution lands on the fixture artifact
+    # instead of overriding the patched provider_home() below.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "provider-home"))
     sessions = tmp_path / "provider-home" / "sessions" / "2026" / "07" / "17"
     sessions.mkdir(parents=True)
     artifact = sessions / f"rollout-{POSITIVE_UUID}.jsonl"

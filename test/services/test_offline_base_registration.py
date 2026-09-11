@@ -46,6 +46,12 @@ def fake_home(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    # F703 (#558): conftest pins CODEX_HOME to a per-test temp dir, and
+    # persona_context.resolve_codex_home consults CODEX_HOME BEFORE the
+    # provider_home()/Path.home() fallback. Patching Path.home alone no
+    # longer redirects the codex artifact lookup, so pin CODEX_HOME at the
+    # same fake home the test writes its rollout files into.
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
     return home
 
 
