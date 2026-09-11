@@ -11,8 +11,35 @@ scripts/wp_arch_2b/live-round.sh --box 007 --sha <fork-sha> \
 ```
 
 Exit status is the verdict: 0 for YES, 1 for NO, 2 for a harness failure.
-**A SKIP is never a pass** — a criterion the round did not exercise has not been
-met, and the verdict is NO.
+
+## Three outcomes, and the difference between two of them matters
+
+* **PASS / FAIL** — the criterion was exercised and the build met it, or did not.
+* **SKIP** — the workload that should have exercised the criterion did not
+  happen. **A SKIP is never a pass**, and it makes the verdict NO. This is the
+  rule that stops a round from certifying a criterion it never reached.
+* **N/A `[scope]`** — the criterion is one a BOX round cannot reach however well
+  it runs. Excluded from the verdict, reported with the scope that carries it
+  instead. This is not a softened SKIP: it exists because counting a structurally
+  unreachable criterion as a SKIP makes the verdict permanently NO, and a gate
+  that always says NO stops being read.
+
+The verdict line is therefore `FLIP-READY-BOX`, not `FLIP-READY`. A YES is
+**necessary** for the flip and not **sufficient**: the `N/A [LAPTOP-ONLY]`
+criteria are met separately, in the laptop flip acceptance run before
+`CAO_WORKER_TRUTH_STATUS` is turned on.
+
+Current scopes:
+
+| Criterion | Scope | Why a box cannot reach it |
+|---|---|---|
+| `prompt-awaiting` | `LAPTOP-ONLY` | Every box lane spawns `--dangerously-skip-permissions` and the add-terminal endpoint has no parameter to disable it, so no real card renders. A printed card does not substitute: the classifier requires it to be the live bottom region when the sampler fires. Met by a real permission card a human answers. |
+| `capped-parity` | `LAPTOP-ONLY` | No provider on a box is both projectable and cappable — `claude_code` has no entry in the cap-pattern table at all. Met by a codex seat that actually hits its cap. |
+| `certified-pane-silence` | `PENDING-COHORT` | No certified herdr cohort exists anywhere yet. Arms itself when WP-HERDR certifies one. |
+
+Adding to this table is a **ruling**, not a convenience. A criterion moves out of
+the box round only when the box genuinely cannot reach it and something else
+genuinely does.
 
 ## Six things that are easy to get wrong, each of which cost a round
 
@@ -49,15 +76,16 @@ met, and the verdict is NO.
 
 ## Known limits of the round
 
-* **`prompt-awaiting` cannot be driven.** Every lane spawns with
-  `--dangerously-skip-permissions` and the add-terminal endpoint has no
-  parameter to disable it, so no real card renders. A printed card does not
-  substitute: `_is_ink_selection_waiting` requires the card to be the live bottom
-  region when the sampler fires, which a `cat` cannot hold. The criterion is
-  covered by unit tests, not by the round.
-* **`capped-parity` reaches only the unsourced half on a codex-less box.**
-  `claude_code` has no entry in the cap-pattern table at all, so the only
-  cappable lane is one no allowlist projects. codex is the single provider that
-  is both projectable and cappable.
-* **`certified-pane-silence` needs a certified herdr cohort.** It skips until
-  one exists, which is WP-HERDR's to deliver.
+The three criteria above are scoped out and carried elsewhere. Beyond them:
+
+* **A codex lane needs the box `config.toml` fixed first.** The shipped
+  `auth.json` serves the OAuth provider, but a box's `config.toml` may point
+  `model_provider` at `aihub`, whose key exists only in a login shell and whose
+  gateway answers 403. `codex login status` still says "Logged in" in that state
+  — only `codex exec` settles it, so preflight with `codex exec`, never with
+  `login status`.
+* **pi needs a wrapper, not the bare install.** The working shape is bun's
+  `@earendil-works/pi-coding-agent` `cli.js` launched from a `~/.local/bin/pi`
+  wrapper using `exec -a pi`, because herdr keys on `argv[0]` and node 20 rejects
+  the node-shebang entry point. Without it the lane answers 500 "startup error
+  banner".

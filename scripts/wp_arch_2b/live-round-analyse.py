@@ -41,6 +41,7 @@ class Report:
     lines: list[str] = field(default_factory=list)
     failed: int = 0
     skipped: int = 0
+    not_applicable_count: int = 0
 
     def ok(self, name: str, detail: str) -> None:
         self.lines.append(f"PASS {name} — {detail}")
@@ -52,6 +53,23 @@ class Report:
     def skip(self, name: str, detail: str) -> None:
         self.skipped += 1
         self.lines.append(f"SKIP {name} — {detail}")
+
+    def not_applicable(self, name: str, scope: str, detail: str) -> None:
+        """A criterion this ENVIRONMENT cannot exercise, by construction.
+
+        Distinct from SKIP, and the distinction is the whole point.  A SKIP is a
+        workload that should have happened and did not, so it is never a pass and
+        it fails the verdict.  This is a criterion the box round CANNOT reach
+        however well it runs — so counting it as a SKIP would make the verdict
+        permanently NO and stop meaning anything, which is the failure mode that
+        turns a gate into a formality.
+
+        It is still not a pass.  It is excluded from the verdict and reported
+        under a scope that names WHERE it must be met instead, so nothing is
+        quietly dropped.
+        """
+        self.not_applicable_count += 1
+        self.lines.append(f"N/A  {name} [{scope}] — {detail}")
 
 
 def _rows(db: Path, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -225,7 +243,18 @@ def check_capped_parity(on: Path, off: Path, report: Report) -> None:
 
     on_count, off_count = count(on), count(off)
     if on_count == 0 and off_count == 0:
-        report.skip("capped-parity", "no cap was driven in either arm")
+        # LAPTOP-ONLY by ruling.  A cap cannot be driven on a projected lane
+        # from a box: ``claude_code`` has no entry in the cap-pattern table at
+        # all (providers/condition.py), and codex — the one provider that is
+        # both projectable and cappable — is not reliably authenticated on the
+        # fleet.  The criterion is met on the laptop instead, by a codex seat
+        # that actually hits its cap.
+        report.not_applicable(
+            "capped-parity",
+            "LAPTOP-ONLY",
+            "no provider on a box is both projectable and cappable; met by a real "
+            "codex cap in the laptop flip acceptance",
+        )
         return
     if on_count == off_count:
         report.ok("capped-parity", f"{on_count} usage.capped in both arms")
@@ -237,7 +266,20 @@ def check_prompt_awaiting(db: Path, report: Report) -> None:
     """AC-2b case 13: a sourced codex lane still reaches ``awaiting_input``."""
     rows = _rows(db, "SELECT terminal_id FROM worker_event WHERE kind = ?", (PROMPT_AWAITING,))
     if not rows:
-        report.skip("prompt-awaiting", "no dialog was driven in the on arm")
+        # LAPTOP-ONLY by ruling.  No automated workload can raise a dialog on a
+        # box: every lane spawns ``--dangerously-skip-permissions`` and the
+        # add-terminal endpoint has no parameter to disable it, so no real card
+        # renders; and a PRINTED card does not substitute, because
+        # ``_is_ink_selection_waiting`` requires the card to be the live bottom
+        # region at the instant the sampler fires, which a ``cat`` cannot hold.
+        # Met on the laptop instead, by a real permission card a human answers.
+        report.not_applicable(
+            "prompt-awaiting",
+            "LAPTOP-ONLY",
+            "a box lane cannot raise a real dialog (permissions are skipped and a "
+            "printed card does not latch); met by a human-answered card in the "
+            "laptop flip acceptance",
+        )
         return
     sourced = _sourced(db)
     on_sourced = [row["terminal_id"] for row in rows if row["terminal_id"] in sourced]
@@ -511,7 +553,16 @@ def check_certified_pane_silence(db: Path, report: Report) -> None:
         ("DIAG-CERTIFIED-SOURCE-STALE",),
     )
     if not stale:
-        report.skip("certified-pane-silence", "no certified source went stale in this arm")
+        # Not a SKIP either: there is no certified herdr cohort anywhere yet, so
+        # no round of any kind can reach this until WP-HERDR ships one.  Held
+        # open under its own scope rather than silently passing or permanently
+        # failing the verdict.
+        report.not_applicable(
+            "certified-pane-silence",
+            "PENDING-COHORT",
+            "no certified herdr terminal exists yet; this check arms itself when "
+            "WP-HERDR certifies a cohort",
+        )
         return
     offending: list[str] = []
     for row in stale:
@@ -611,8 +662,25 @@ def main() -> int:
     for line in report.lines:
         print(line)
     ready = report.failed == 0 and report.skipped == 0
-    print(f"checks: {len(report.lines)}  failed: {report.failed}  skipped: {report.skipped}")
-    print(f"FLIP-READY: {'YES' if ready else 'NO'}")
+    print(
+        f"checks: {len(report.lines)}  failed: {report.failed}  "
+        f"skipped: {report.skipped}  n/a: {report.not_applicable_count}"
+    )
+    # FLIP-READY-BOX, not FLIP-READY: this verdict covers the criteria a BOX
+    # round can reach.  The ``N/A`` lines above name the ones it cannot, and
+    # each names where it is met instead — the laptop flip acceptance, which the
+    # lead runs before flipping CAO_WORKER_TRUTH_STATUS.  A YES here is
+    # necessary for the flip and not sufficient for it.
+    print(f"FLIP-READY-BOX: {'YES' if ready else 'NO'}")
+    if report.not_applicable_count:
+        # The scope tag on each N/A line says where it IS carried, and the two
+        # scopes are not the same promise: LAPTOP-ONLY is met before the flip,
+        # PENDING-COHORT cannot be met by anyone yet.  Naming them together as
+        # "carried by the laptop acceptance" would overstate the second.
+        print(
+            f"  ({report.not_applicable_count} criterion/criteria are not reachable from a box; "
+            f"each N/A line names the scope that carries it)"
+        )
     return 0 if ready else 1
 
 
