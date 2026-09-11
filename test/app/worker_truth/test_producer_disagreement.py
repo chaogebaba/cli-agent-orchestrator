@@ -317,7 +317,13 @@ def test_a_classification_row_does_not_re_open_the_episode(rig: Rig) -> None:
     rig.classified(TERMINAL, "processing", origin="probe")
     rig.legacy(TERMINAL, "processing", origin="probe")
 
+    # Both halves: one WRITE — the cost the guard exists to bound — and one
+    # FINDING, which is what an operator reads.  The write count is the half
+    # that discriminates, because the store's own dedup held the finding at one
+    # even while the guard was defeated; the finding count is what says the
+    # suppression did not cost a report.
     assert counter.writes == 1
+    assert len(_findings(rig)) == 1
 
 
 def test_only_agreement_closes_the_episode(rig: Rig) -> None:
@@ -337,3 +343,4 @@ def test_only_agreement_closes_the_episode(rig: Rig) -> None:
     _edge(rig, "processing", origin="native")  # still the same episode
 
     assert counter.writes == 1
+    assert len(_findings(rig)) == 1
