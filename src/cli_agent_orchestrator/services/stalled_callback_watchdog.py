@@ -25,9 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     get_callback_status_since,
     get_terminal_metadata,
     insert_barrier_escalation_message,
-    insert_watchdog_auto_resume_message,
     list_pending_receiver_ids,
-    list_ready_backlog_observations,
     terminal_exists,
 )
 from cli_agent_orchestrator.constants import (
@@ -46,12 +44,13 @@ logger = logging.getLogger(__name__)
 WATCHDOG_SCREEN_TAIL_LINES = 45
 WATCHDOG_WAITING_ESCALATE_S = 2 * STALLED_CALLBACK_GRACE_SECONDS
 WATCHDOG_WAITING_REPEAT_FLOOR_S = 600
-AUTO_RESUME_PROVIDERS = frozenset({"codex"})
-AUTO_RESUME_BODY = (
-    "[watchdog auto-resume] your previous turn ended on a transient API error. "
-    "Continue your assigned task from where you left off; do not redo work that already "
-    "completed; the original callback contract stands."
-)
+# WP-ARCH 3c K4: the auto-resume machinery is gone. It lived inside
+# ``collect_due_notifications`` — the notifier deleted with the five muted ticks
+# — so its provider set, its body text, ``insert_watchdog_auto_resume_message``
+# and the three ``_Episode`` fields that tracked a reservation all lost their
+# only writer at once. The three fields were still READ by the join guard below,
+# which made that branch permanently take its ``None``/``False`` path: a guard
+# that cannot be false is not a guard, and leaving it would have read as one.
 # FX181 D2 row 1: the TERMINAL statuses for the aggregate quiescence predicate,
 # mapped to their message labels. Membership here IS the classification — a status
 # absent from this map is indeterminate and can never contribute to a ring.
@@ -101,9 +100,6 @@ class _Episode:
     quiet_since: float | None = None
     generation: int = 1
     revision: int = 0
-    auto_resumed: bool = False
-    resume_reserved_at: float | None = None
-    auto_resume_attempted_at: str | None = None
     waiting_last_push_at: float | None = None
     # F228-b: processing-no-progress tracker
     processing_since: float | None = None  # monotonic time PROCESSING was accepted
@@ -231,13 +227,7 @@ class StalledCallbackWatchdog:
             if terminal_id in self._paused:
                 return
             episode = self._episodes.get(terminal_id)
-            if (
-                episode is not None
-                and not episode.callback_seen
-                and not episode.fired
-                and episode.resume_reserved_at is None
-                and not episode.auto_resumed
-            ):
+            if episode is not None and not episode.callback_seen and not episode.fired:
                 episode.last_join_wall_at = wall_now
                 episode.revision += 1
                 return

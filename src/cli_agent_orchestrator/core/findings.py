@@ -91,6 +91,19 @@ class FindingCode(StrEnum):
                                     RETIRED from WP-ARCH 3c — accepted, never
                                     raised; see below.
 
+    **What an OPEN callback barrier means under always-on** (3c slice 4 ruling).
+    It does not gate delivery, and it must never gain the power to again. The
+    barrier is a per-MESSAGE hold: its members sit at ``status='held'`` and
+    become ``pending`` when the barrier completes, at which point the tick picks
+    them up like any other row. That is a property of those rows and of nothing
+    else. The deleted guard let an OPEN barrier change the whole subsystem's
+    MODE at boot — demoting a requested ``on`` to ``drain`` or ``off`` — which
+    was defensible only while two carriers existed and a barrier's members could
+    be split across two tables. With one carrier there is nothing to split, and
+    a fleet-wide mode change triggered by one held message is disproportionate
+    to the condition by construction. If a barrier state is ever worth acting
+    on again, the action is a FINDING naming it, never a mode change.
+
     Those two are the boot guard's, and the boot guard is gone.  It resolved
     ``CAO_DELIVERY_QUEUE``'s three positions against the queue's occupancy, which
     was a decision worth making while the queue and the legacy inbox were both
