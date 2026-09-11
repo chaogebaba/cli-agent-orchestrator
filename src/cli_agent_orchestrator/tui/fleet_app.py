@@ -50,8 +50,9 @@ forever (``:427-429``). The one item deliberately *not* restored is the
 script's launch-time window pin (``:490-545``): it swaps whatever sits at index
 1 out of the way, which renumbers a live worker's window and breaks every
 ``session:index`` reference already handed out. The window is created at index
-1 server-side instead, and appended when the slot is taken
-(``services/fleet_window_service.py:150-157``).
+1 server-side instead, and appended when the slot is taken — both fall out of
+the multiplexer's own lowest-free-index rule since #786 routed creation through
+``backend.create_window`` (``services/fleet_window_service.ensure_fleet_window``).
 
 **Section layout (F702 #557 "look" round).** The frame is the script's, section
 for section and blank line for blank line (``:336-450``): the ``▌`` header, the
@@ -137,6 +138,7 @@ from cli_agent_orchestrator.tui.model_effort_cell import (
     observation_detail,
 )
 from cli_agent_orchestrator.tui.status_cell import status_cell
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 __all__ = [
     "FleetApp",
@@ -374,9 +376,18 @@ def run_tmux(args: Sequence[str]) -> str | None:
 
     Mirrors ``fleet-tui.py:100-112`` — a failed tmux call degrades the widget
     that asked for it, it does not break the frame.
+
+    The argv comes from ``utils.tmux_command.tmux_argv``, the single
+    socket-aware builder (#786, same family as the fix that took the raw argv
+    out of ``services/fleet_window_service.py``). Outside a sandbox it yields
+    the identical ``["tmux", *args]``; inside one it binds ``-L
+    $CAO_TMUX_SOCKET`` so the peek reads the SANDBOX's tmux server instead of
+    silently escaping to the host's, and it RAISES when that binding is missing
+    rather than guessing — which the ``except`` below turns into this
+    function's documented "degrade the widget" answer.
     """
     try:
-        done = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=3)
+        done = subprocess.run(tmux_argv(*args), capture_output=True, text=True, timeout=3)
     except Exception:
         return None
     if done.returncode != 0:
