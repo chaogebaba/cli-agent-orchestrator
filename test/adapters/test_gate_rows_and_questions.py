@@ -15,6 +15,7 @@ question PRIMITIVE is 2b; here we exercise the ROWS and the ownership transactio
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -916,3 +917,158 @@ def test_two_concurrent_asks_race_on_the_index_and_one_is_refused() -> None:
         .fetchone()[0]
         == 1
     )
+
+
+# -- slice B2: the sweep's shape under a live server -------------------------
+
+
+def test_an_idle_sweep_takes_no_write_lock(tmp_path: Path) -> None:
+    """The property the 30-second daemon period turns on (B2).
+
+    An unconditional ``BEGIN IMMEDIATE`` would take the database's write lock
+    twice a minute forever, to discover almost always that nothing had expired —
+    beside a status monitor that wants the same lock.  Here a SECOND connection
+    holds an exclusive transaction while the sweep runs: a sweep that tried to
+    write would block and then raise ``database is locked``, so returning
+    cleanly IS the proof that it only read.
+
+    MUTANT: wrap the whole of ``expire_due_questions`` in
+    ``immediate_transaction`` and this arm goes red.
+    """
+    path = tmp_path / "gate.db"
+    _res, pool = migrate(path, busy_timeout_ms=200)
+    assert pool is not None
+    store = SqliteGateStore(pool, clock=FakeClock())
+    _dispatch(store, "d1")
+    _ask(store, ttl_s=3600)  # open, nowhere near its deadline
+
+    blocker = sqlite3.connect(str(path), isolation_level=None, timeout=0.2)
+    blocker.execute("PRAGMA busy_timeout = 200")
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert store.expire_due_questions(_NOW) == []
+        assert store.notices_to_retry()  # the retry read is lock-free too
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+def test_a_sweep_writes_once_per_period_not_once_per_row(tmp_path: Path) -> None:
+    """Ten overdue questions cost ONE update statement, not ten.
+
+    A per-row loop holds the write lock in proportion to the backlog, which is
+    exactly backwards: the worst pile-up would cause the longest stall for
+    everyone else.  The statement trace is the only way to state this that a
+    refactor cannot quietly break.
+    """
+    path = tmp_path / "gate.db"
+    _res, pool = migrate(path, busy_timeout_ms=5000)
+    assert pool is not None
+    store = SqliteGateStore(pool, clock=FakeClock())
+    for n in range(10):
+        _dispatch(store, f"d{n}")
+        _ask(store, dispatch_id=f"d{n}", request_id=f"cr{n}", ttl_s=60)
+
+    statements: list[str] = []
+    pool.connection().set_trace_callback(statements.append)
+    try:
+        expired = store.expire_due_questions(_NOW + timedelta(seconds=61))
+    finally:
+        pool.connection().set_trace_callback(None)
+
+    assert len(expired) == 10
+    question_updates = [
+        s for s in statements if s.strip().upper().startswith("UPDATE ROUND_QUESTION")
+    ]
+    dispatch_updates = [
+        s for s in statements if s.strip().upper().startswith("UPDATE GATE_DISPATCH")
+    ]
+    assert len(question_updates) == 1, question_updates
+    assert len(dispatch_updates) == 1, dispatch_updates
+    assert sum(1 for s in statements if s.strip().upper().startswith("BEGIN IMMEDIATE")) == 1
+
+
+def test_a_question_answered_between_the_read_and_the_write_is_not_expired(
+    store: SqliteGateStore,
+) -> None:
+    """The re-check inside the write transaction, stated directly.
+
+    The sweep reads its candidates without a lock, so between that read and the
+    write somebody may answer.  The write re-asserts ``state IN
+    ('PENDING','ESCALATED')`` over the selected ids, and the RETURNED list is
+    what it actually settled — which is what keeps AC-A7 at exactly one anomaly
+    per expiry rather than one per candidate.
+    """
+    _dispatch(store, "d1")
+    question = _ask(store, ttl_s=60)
+    store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert store.expire_due_questions(_NOW + timedelta(seconds=61)) == []
+    reloaded = store.get_question(question.question_id)
+    assert reloaded is not None and reloaded.state is g.QuestionState.ANSWERED
+
+
+def test_notices_to_retry_covers_pending_and_failed_but_never_a_settled_question(
+    store: SqliteGateStore,
+) -> None:
+    """Re-announcing an answered question would be worse than never announcing it."""
+    _dispatch(store, "d1")
+    _dispatch(store, "d2")
+    _dispatch(store, "d3")
+    never_tried = _ask(store, dispatch_id="d1", request_id="cr1")
+    failed = _ask(store, dispatch_id="d2", request_id="cr2")
+    settled = _ask(store, dispatch_id="d3", request_id="cr3")
+    store.mark_notice_failed(failed.question_id, error="database is locked")
+    store.answer_question(
+        question_id=settled.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert {q.question_id for q in store.notices_to_retry()} == {
+        never_tried.question_id,
+        failed.question_id,
+    }
+    store.mark_notice_sent(never_tried.question_id, msg_id="7")
+    assert [q.question_id for q in store.notices_to_retry()] == [failed.question_id]
+
+
+def test_notices_to_retry_orders_by_attempt_count(store: SqliteGateStore) -> None:
+    """A notice that has failed repeatedly must not starve one never tried."""
+    _dispatch(store, "d1")
+    _dispatch(store, "d2")
+    tried_twice = _ask(store, dispatch_id="d1", request_id="cr1")
+    fresh = _ask(store, dispatch_id="d2", request_id="cr2")
+    store.mark_notice_failed(tried_twice.question_id, error="x")
+    store.mark_notice_failed(tried_twice.question_id, error="x")
+    assert [q.question_id for q in store.notices_to_retry()] == [
+        fresh.question_id,
+        tried_twice.question_id,
+    ]
+
+
+def test_get_answer_returns_the_recorded_event(store: SqliteGateStore) -> None:
+    _dispatch(store, "d1")
+    question = _ask(store)
+    _settled, event = store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=1),
+    )
+    recorded = store.get_answer(event.answer_event_id)
+    assert recorded is not None and recorded.answer == "accept"
+    assert store.get_answer("nope") is None

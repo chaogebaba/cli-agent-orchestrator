@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -734,6 +735,8 @@ def build_gate_question_service(
     *,
     clock: Clock | None = None,
     notifier: object | None = None,
+    seat_id: str | None = None,
+    notify: bool = False,
 ) -> object:
     """A read/write :class:`GateQuestionService` over the LIVE database (slice B1).
 
@@ -764,7 +767,177 @@ def build_gate_question_service(
     if notifier is not None:
         assert isinstance(notifier, QuestionNotifier)
         typed = notifier
+    elif notify or seat_id is not None:
+        built = build_question_notifier(seat_id)
+        assert isinstance(built, QuestionNotifier)
+        typed = built
     return GateQuestionService(store, clock=resolved_clock, notifier=typed)
+
+
+# ---------------------------------------------------------------------------
+# The question notifier (WP-ARCH Amendment A, slice B2).
+#
+# THE one place a rendered question becomes a message the supervisor will see,
+# and the only legal one.  ``app`` and ``adapters`` may not import
+# ``clients`` (``new-code-never-imports-legacy``); the composition root may, and
+# that asymmetry is the whole design — ``app/gate`` is written and tested against
+# a Protocol, and the single call into the legacy write path lives here where a
+# reviewer can find it by grep.
+#
+# It writes ONE inbox row and stops.  With ``CAO_DELIVERY_QUEUE=on`` that row is
+# write-through into the durable delivery queue
+# (``clients/database.py`` -> ``services/queue_carrier.py`` ->
+# ``app/delivery/wiring.py``), and the delivery tick is what resolves the
+# receiver and wakes the seat over the native channel.  So there is deliberately
+# NO wake call, no doorbell and no pane paste here: the carrier already refuses a
+# paste to a seat, and a second path to the same seat is the duplicate-delivery
+# class the one-surface contract exists to prevent.  Adding one would not be an
+# optimisation, it would be a second source of truth about whether the
+# supervisor was told.
+# ---------------------------------------------------------------------------
+
+
+class _InboxQuestionNotifier:
+    """Turn a rendered envelope into one inbox row (``core.ports.QuestionNotifier``).
+
+    **Who it goes to is read off the question, not configured.**  A question's
+    ``owner_conversation`` IS the supervisor conversation that owns it — the
+    asker set it from its own ``CAO_CALLBACK_TERMINAL_ID`` and
+    ``claim_ownership`` rewrites it when the seat changes — so routing to it
+    means an ownership transfer redirects the notice for free, and there is no
+    second place recording where the seat is that could disagree with the rows.
+    ``CAO_GATE_SEAT_ID`` overrides it for a deployment that needs to, and is the
+    only knob.
+
+    ``sender_id`` is a fixed internal identity rather than the asking terminal:
+    the question is the GATE speaking about a lane, and attributing it to the
+    lane would make it a worker callback, which the barrier machinery treats
+    differently.
+
+    Failure is REPORTED, never raised.  The ask has already committed — the lane
+    IS suspended — so a write that loses to a lock must leave a retryable intent
+    behind rather than surface to the asker as "your question was not recorded".
+    ``database is locked`` is the case this is built for: transient, retried by
+    the sweep a period later, and counted in ``attempts`` so a PERSISTENT
+    failure becomes visible instead of silent.
+    """
+
+    #: Who the seat sees the question as coming from.
+    SENDER_ID = "cao-gate"
+
+    def __init__(self, receiver_id: str | None = None) -> None:
+        self._override = receiver_id or os.environ.get("CAO_GATE_SEAT_ID") or None
+
+    def _receiver(self, question: object) -> str | None:
+        if self._override:
+            return self._override
+        owner = getattr(question, "owner_conversation", "")
+        return str(owner) if owner else None
+
+    def notify(
+        self,
+        *,
+        question: object,
+        kind: str,
+        classification: str,
+        code: str,
+        lines: Sequence[str],
+    ) -> str | None:
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+
+        question_id = str(getattr(question, "question_id", ""))
+        receiver = self._receiver(question)
+        if receiver is None:
+            logger.warning("gate question %s has no resolvable seat to notify", question_id)
+            return None
+        try:
+            # NO ``supersede_key``, and the reason is load-bearing. F578
+            # supersession runs INSIDE the legacy insert's own transaction, which
+            # takes the write lock; the queue's write-through then cannot
+            # ``BEGIN IMMEDIATE`` on its own connection, returns None, and
+            # clients/database.py falls back to writing a legacy inbox row. The
+            # notice would still be durable, but it would have left the delivery
+            # queue — measured on a scratch home 2026-09-11: with a supersede key
+            # the row lands in ``inbox`` and ``delivery_msg`` stays empty;
+            # without one it lands in ``delivery_msg`` in state ``ready``.
+            #
+            # Nothing is lost by dropping it, because there is nothing to
+            # supersede: a RETRY only happens when the previous attempt raised,
+            # and an attempt that raised wrote no row at all.
+            message = create_inbox_message(
+                sender_id=self.SENDER_ID,
+                receiver_id=receiver,
+                message="\n".join(lines),
+            )
+        except Exception:
+            logger.warning(
+                "gate question notice could not be enqueued for %s "
+                "(kind=%s classification=%s code=%s)",
+                question_id or "?",
+                kind,
+                classification,
+                code,
+                exc_info=True,
+            )
+            return None
+        msg_id = getattr(message, "id", None)
+        return None if msg_id is None else str(msg_id)
+
+
+def build_question_notifier(receiver_id: str | None = None) -> object:
+    """The live :class:`~cli_agent_orchestrator.core.ports.QuestionNotifier`.
+
+    With no ``receiver_id`` each notice is routed to its own question's owning
+    conversation, which is the normal case.  Returned as ``object`` for the
+    reason the gate builders give.
+    """
+    return _InboxQuestionNotifier(receiver_id)
+
+
+def gate_question_sweep_period_s() -> int:
+    """The expiry daemon's period, read from the one place durations live."""
+    from cli_agent_orchestrator.core.timing import GATE_QUESTION_SWEEP_S
+
+    return int(GATE_QUESTION_SWEEP_S)
+
+
+def read_gate_question_settlement(
+    question_id: str, db_path: str | Path | None = None
+) -> dict[str, object] | None:
+    """Read one question and its answer READ-ONLY, then close (slice B2).
+
+    The bounded long poll calls this once per iteration and holds nothing
+    between iterations — no connection, no transaction, no pool.  That is the
+    property that matters: a waiting asker must never be the reason a writer
+    blocks, and a poll that kept a handle open for the length of the wait would
+    make every waiting lane a permanent reader on the coordination database.
+
+    ``mode=ro`` makes it structurally impossible for the wait path to take a
+    write lock at all, whatever a future edit does to it.
+    """
+    from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
+    from cli_agent_orchestrator.app.gate.render import question_payload
+
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ReadOnlyPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    try:
+        store = SqliteGateStore(pool, clock=SystemClock())
+        question = store.get_question(question_id)
+        if question is None:
+            return None
+        answer = None
+        if question.answer_event_id is not None:
+            recorded = store.get_answer(question.answer_event_id)
+            if recorded is not None:
+                answer = {
+                    "answer_event_id": recorded.answer_event_id,
+                    "answer": recorded.answer,
+                    "answered_by": recorded.answered_by,
+                    "answered_at": recorded.answered_at.isoformat(),
+                }
+        return {"question": dict(question_payload(question)), "answer": answer}
+    finally:
+        pool.close_all()
 
 
 def build_readonly_gate_store(db_path: str | Path | None = None) -> object:

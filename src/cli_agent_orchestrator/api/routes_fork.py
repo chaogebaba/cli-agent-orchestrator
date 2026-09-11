@@ -1,13 +1,18 @@
 """Fork-only API routes kept separate from the upstream-owned route table."""
 
 import asyncio
+import logging
+import time
 from typing import Any, Dict, List, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator import bootstrap
-from cli_agent_orchestrator.core.timing import GATE_QUESTION_EXPIRY_S
+from cli_agent_orchestrator.core.timing import (
+    GATE_QUESTION_EXPIRY_S,
+    GATE_QUESTION_WAIT_CAP_S,
+)
 from cli_agent_orchestrator.models.terminal import TerminalId
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -16,6 +21,8 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services.terminal_service import MAX_PEEK_TERMINAL_LINES
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -186,12 +193,16 @@ class GateAnswerRequest(BaseModel):
 def _gate_question_service() -> Any:
     """The question service, built on demand by the composition root.
 
+    ``notify=True``: this is the SERVER, so it is the process that owes the seat
+    a message when a question is asked or expires. Every other caller of this
+    builder (the offline CLI path) deliberately does not.
+
     Built per call rather than held as a module global: ``api`` is on the
     ``one-gate-writer`` forbidden list, so the only legal way to a gate store is
     through ``bootstrap``, and a cached handle would outlive a test that points
     the composition root somewhere else.
     """
-    return bootstrap.build_gate_question_service()
+    return bootstrap.build_gate_question_service(notify=True)
 
 
 def _gate_question_payload(question: Any) -> Dict:
@@ -233,6 +244,67 @@ def _raise_gate_question_error(exc: Exception) -> NoReturn:
             detail={"code": "E_GATE", "message": str(exc)},
         )
     raise exc
+
+
+#: How often a bounded wait re-reads the question.  A second is far below any
+#: human answering latency and far above the cost of one read-only open, so the
+#: poll is invisible to the asker and negligible to the database.
+_WAIT_POLL_S = 1.0
+
+
+def _read_settlement(question_id: str) -> Optional[Dict]:
+    """One READ-ONLY read of a question and its answer; nothing stays open."""
+    result = bootstrap.read_gate_question_settlement(question_id)
+    return None if result is None else dict(result)
+
+
+def _still_open(settlement: Dict) -> bool:
+    """Whether the waiting asker should keep waiting."""
+    question = settlement.get("question")
+    return bool(isinstance(question, dict) and question.get("is_open"))
+
+
+def _sweep_once() -> Any:
+    """Expire what is overdue and retry what never landed, through the gate writer.
+
+    ONE service, so the ``one-gate-writer`` contract holds: the daemon does not
+    get its own path to the rows, it makes the same call the ``/gate/sweep``
+    route makes.
+    """
+    service = _gate_question_service()
+    return service.sweep()
+
+
+async def gate_question_expiry_daemon() -> None:
+    """Settle overdue questions and re-send lost notices, every period (AC-A7).
+
+    Two obligations the ask transaction creates and cannot itself discharge: a
+    question nobody answers must become exactly one anomaly rather than a lane
+    that goes quiet, and a notice the transport lost must eventually arrive.
+
+    It is cheap when there is nothing to do, which matters because it runs
+    alongside the status monitor: the sweep READS first and opens a write
+    transaction only when it has rows to settle, so an idle fleet costs one
+    SELECT per period and takes no lock at all.  Never raises — a sweep that
+    failed must not take the server's lifespan down with it, and the next period
+    retries from the same durable rows.
+    """
+    period = bootstrap.gate_question_sweep_period_s()
+    logger.info("Gate question expiry daemon started (period=%ss)", period)
+    while True:
+        try:
+            expired, retried = await asyncio.to_thread(_sweep_once)
+            if expired or retried:
+                logger.info(
+                    "gate question sweep: expired=%d notices_retried=%d",
+                    len(expired),
+                    len(retried),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Gate question sweep failed")
+        await asyncio.sleep(period)
 
 
 @router.post("/gate/questions")
@@ -317,22 +389,91 @@ async def list_gate_questions_endpoint(
 @router.get("/gate/questions/{question_id}")
 async def get_gate_question_endpoint(
     question_id: str,
+    wait: int = Query(default=0, ge=0, le=GATE_QUESTION_WAIT_CAP_S),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """One question, with its recorded answer when it has settled."""
+    """One question, with its recorded answer once it has settled.
 
-    def _get() -> Any:
-        service = _gate_question_service()
-        question = service.get(question_id)
-        return question
+    ``wait`` turns this into a BOUNDED long poll, which is how a blocking asker
+    suspends without spinning a model loop: the worker's tool call sits in one
+    HTTP request instead of waking up to ask again.  Bounded and capped well
+    under ``MCP_REQUEST_TIMEOUT`` on purpose — a client that times out first
+    cannot tell "still waiting" from "the server died", and would then retry an
+    ask it has already made.  A longer wait is several of these in sequence.
 
-    question = await asyncio.to_thread(_get)
-    if question is None:
+    Each poll iteration opens the database READ-ONLY, reads, and closes before
+    sleeping again, so a waiting lane holds no connection, no transaction and no
+    pool between iterations and can never be the reason a writer blocks.
+    """
+    settlement = await asyncio.to_thread(_read_settlement, question_id)
+    if settlement is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "E_QUESTION_NOT_FOUND", "message": f"no such question: {question_id}"},
         )
+    if wait <= 0 or not _still_open(settlement):
+        return settlement
+
+    deadline = time.monotonic() + float(wait)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(min(_WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
+        settlement = await asyncio.to_thread(_read_settlement, question_id)
+        if settlement is None:  # pragma: no cover - a deleted row mid-wait
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "E_QUESTION_NOT_FOUND",
+                    "message": f"no such question: {question_id}",
+                },
+            )
+        if not _still_open(settlement):
+            break
+    return settlement
+
+
+@router.post("/gate/questions/{question_id}/consume")
+async def consume_gate_answer_endpoint(
+    question_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Record that the ASKER received the answer, releasing its dispatch (R28).
+
+    A separate call from reading the answer, because ANSWERED is not proof of
+    receipt: the window between a committed answer and a lane that actually has
+    it is a real crash window, and it is only visible because consumption is its
+    own record.  Idempotent — a second consume of the same event settles nothing
+    further.
+    """
+    from cli_agent_orchestrator.core.gate import GateError
+
+    def _consume() -> Any:
+        service = _gate_question_service()
+        question = service.require(question_id)
+        if question.answer_event_id is not None:
+            service.consume_answer(question.answer_event_id)
+        return service.require(question_id)
+
+    try:
+        question = await asyncio.to_thread(_consume)
+    except GateError as exc:
+        _raise_gate_question_error(exc)
     return _gate_question_payload(question)
+
+
+@router.post("/gate/sweep")
+async def sweep_gate_questions_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Run one expiry-and-retry sweep now, and report what it touched.
+
+    The same call the daemon makes every period, exposed so an operator (and an
+    acceptance run) can force one rather than wait out a cadence.
+    """
+    expired, retried = await asyncio.to_thread(_sweep_once)
+    return {
+        "expired": [_gate_question_payload(q) for q in expired],
+        "notices_retried": [q.question_id for q in retried],
+    }
 
 
 @router.post("/gate/questions/{question_id}/answer")

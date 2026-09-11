@@ -884,6 +884,21 @@ class GateStore(Protocol):
 
     def get_question(self, question_id: str) -> RoundQuestion | None: ...
 
+    def get_answer(self, answer_event_id: str) -> QuestionAnswer | None:
+        """The recorded answer event, for handing back to a waiting asker."""
+        ...
+
+    def notices_to_retry(self, *, limit: int = 50) -> list[RoundQuestion]:
+        """Open questions whose notice intent has not landed (PENDING or FAILED).
+
+        A READ, deliberately: the sweep decides what to re-send from it and then
+        re-sends, so a period in which nothing is outstanding costs one SELECT
+        and takes no write lock at all.  A question that has already settled is
+        excluded — re-announcing an answered question would be worse than never
+        having announced it.
+        """
+        ...
+
     def open_question_for_dispatch(self, dispatch_id: str) -> RoundQuestion | None:
         """The dispatch's PENDING/ESCALATED question, if it has one (AC-A10)."""
         ...
@@ -980,10 +995,11 @@ class QuestionNotifier(Protocol):
     The envelope arrives as already-rendered LINES rather than a
     ``CallbackEnvelope``: the renderer lives in ``app`` and ``core`` may not
     import it, and a notifier's job is transport, not judgement about what the
-    seat reads.  ``classification`` travels beside ``kind`` because A5 fixes the
-    wire at four kinds and an expiry shares one with every other run condition —
-    a transport that wanted to route them differently would otherwise have to
-    match on the prose of a summary line.
+    seat reads.  ``classification`` and ``code`` travel beside ``kind`` because
+    A5 fixes the wire at four kinds and an expiry shares one with every other run
+    condition: ``classification`` says whether anyone should be alarmed and
+    ``code`` says about what.  A transport lacking them would have to match on
+    the prose of a summary line.
 
     Returns the delivered message id.  Returning ``None`` or raising both mean
     the notice did NOT land, and the caller settles the intent ``FAILED`` for a
@@ -997,6 +1013,7 @@ class QuestionNotifier(Protocol):
         question: RoundQuestion,
         kind: str,
         classification: str,
+        code: str,
         lines: Sequence[str],
     ) -> str | None: ...
 

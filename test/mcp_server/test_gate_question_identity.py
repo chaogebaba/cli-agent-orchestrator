@@ -59,6 +59,29 @@ class _RouteClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
+    def get(self, path: str, **kwargs: Any) -> _Response:
+        """The bounded-wait read. Slice B2's blocking ask polls this."""
+        from fastapi import HTTPException
+
+        from cli_agent_orchestrator.api import routes_fork as rf
+
+        self.calls.append(("GET", path))
+        params = kwargs.get("params") or {}
+
+        async def _dispatch() -> Any:
+            return await rf.get_gate_question_endpoint(
+                question_id=path.split("/")[3],
+                wait=int(params.get("wait") or 0),
+                _scopes=["cao:read"],
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                payload = pool.submit(lambda: asyncio.run(_dispatch())).result(timeout=60)
+        except HTTPException as exc:
+            return _Response({"detail": exc.detail}, status_code=exc.status_code)
+        return _Response(payload)
+
     def post(self, path: str, **kwargs: Any) -> _Response:
         from fastapi import HTTPException
 
@@ -78,6 +101,10 @@ class _RouteClient:
                     question_id=path.split("/")[3],
                     body=rf.GateAnswerRequest(**body),
                     _scopes=scopes,
+                )
+            if path.endswith("/consume"):
+                return await rf.consume_gate_answer_endpoint(
+                    question_id=path.split("/")[3], _scopes=scopes
                 )
             raise AssertionError(path)  # pragma: no cover - only these two are called
 
@@ -104,8 +131,12 @@ def _ask(server: Any, question: str, request_id: str) -> Any:
     """
     return server.ask_supervisor(
         question=question,
-        default_answer="re-round",
         options=["accept", "re-round"],
+        # NON-blocking: these arms are about WHICH identity each tool reads, so
+        # the ask must return the recorded row rather than park in the wait loop.
+        # The blocking form's own behaviour is covered in test/api.
+        blocking=False,
+        default_answer="re-round",
         expires_in_s=3600,
         client_request_id=request_id,
     )

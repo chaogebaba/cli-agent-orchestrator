@@ -699,6 +699,14 @@ class SqliteGateStore:
         )
         return None if row is None else _row_to_question(row)
 
+    def get_answer(self, answer_event_id: str) -> QuestionAnswer | None:
+        row = (
+            self._pool.connection()
+            .execute(_ANSWER_SELECT + " WHERE answer_event_id = ?", (answer_event_id,))
+            .fetchone()
+        )
+        return None if row is None else _row_to_answer(row)
+
     def answer_question(
         self,
         *,
@@ -838,51 +846,105 @@ class SqliteGateStore:
     def expire_due_questions(self, now: datetime) -> list[RoundQuestion]:
         """Settle every open question past its deadline and release its dispatch.
 
-        The rows are read and updated in the SAME transaction and the changed rows
-        are RETURNED, so the caller emits one anomaly per question it actually
-        settled.  Re-reading "what is expired" afterwards would count a question
-        another sweep expired and send a second notice for it (AC-A7).
+        Read first, write only if there is something to settle.  This runs every
+        30 seconds beside the status monitor, so the shape matters more than the
+        SQL: an unconditional ``BEGIN IMMEDIATE`` would take the database's write
+        lock twice a minute forever to discover, almost always, that nothing had
+        expired.  A plain SELECT costs nothing under WAL and takes no lock, so an
+        idle fleet never competes with a writer at all.
+
+        When there IS work, it is TWO statements, not two per row: one bulk
+        UPDATE over the selected ids and one over their dispatches.  A per-row
+        loop would hold the write lock proportionally to how much had piled up,
+        which is exactly backwards — the worst backlog would cause the longest
+        stall.
+
+        The ids are re-checked inside the write (``state IN
+        ('PENDING','ESCALATED')``), so a question answered between the read and
+        the write is NOT expired; the returned list is what this call actually
+        settled, which is what lets the caller emit exactly one anomaly each
+        (AC-A7).
         """
         stamp = render_timestamp(now)
         conn = self._pool.connection()
-        expired: list[RoundQuestion] = []
-        with immediate_transaction(conn):
-            rows = conn.execute(
+        candidates = [
+            _row_to_question(row)
+            for row in conn.execute(
                 _QUESTION_SELECT + " WHERE state IN ('PENDING','ESCALATED') AND expires_at <= ?",
                 (stamp,),
             ).fetchall()
-            for row in rows:
-                record = _row_to_question(row)
-                changed = conn.execute(
-                    "UPDATE round_question SET state = ?, row_version = row_version + 1 "
-                    "WHERE question_id = ? AND state IN ('PENDING','ESCALATED')",
-                    (QuestionState.EXPIRED.value, record.question_id),
-                ).rowcount
-                if changed != 1:  # pragma: no cover - settled under the same lock
-                    continue
-                # The lane is no longer waiting on anything, so the dispatch must
-                # leave AWAITING_ANSWER or the run would project as awaiting an
-                # answer that can never arrive.  It is RESTORED to the state the
-                # ask suspended, not set to a fixed value: a PREPARED dispatch
-                # that asked a question would otherwise come back DISPATCHED, a
-                # state it had never been in.
-                conn.execute(
-                    "UPDATE gate_dispatch SET state = ? WHERE dispatch_id = ? AND state = ?",
-                    (
-                        _restored_state(record),
-                        record.dispatch_id,
-                        DispatchState.AWAITING_ANSWER.value,
-                    ),
-                )
-                expired.append(
-                    record.model_copy(
-                        update={
-                            "state": QuestionState.EXPIRED,
-                            "row_version": record.row_version + 1,
-                        }
-                    )
-                )
-        return expired
+        ]
+        if not candidates:
+            return []
+
+        ids = [q.question_id for q in candidates]
+        placeholders = ", ".join("?" for _ in ids)
+        with immediate_transaction(conn):
+            # Which of the candidates are STILL open now that we hold the lock.
+            settled_ids = [
+                row["question_id"]
+                for row in conn.execute(
+                    f"SELECT question_id FROM round_question WHERE question_id IN "
+                    f"({placeholders}) AND state IN ('PENDING','ESCALATED')",
+                    tuple(ids),
+                ).fetchall()
+            ]
+            if not settled_ids:
+                return []
+            settled_placeholders = ", ".join("?" for _ in settled_ids)
+            conn.execute(
+                f"UPDATE round_question SET state = ?, row_version = row_version + 1 "
+                f"WHERE question_id IN ({settled_placeholders})",
+                (QuestionState.EXPIRED.value, *settled_ids),
+            )
+            # The lanes are no longer waiting on anything, so their dispatches
+            # must leave AWAITING_ANSWER or the run would project as awaiting an
+            # answer that can never arrive.  Each is RESTORED to the state ITS
+            # OWN ask suspended — a correlated subquery rather than one fixed
+            # value, because a PREPARED dispatch that asked a question must not
+            # come back DISPATCHED, a state it had never been in.  Still one
+            # statement, so the sweep costs one write per period and not one per
+            # row.
+            conn.execute(
+                f"UPDATE gate_dispatch SET state = COALESCE(("
+                f"  SELECT NULLIF(q.dispatch_prior_state, '') FROM round_question q"
+                f"  WHERE q.dispatch_id = gate_dispatch.dispatch_id"
+                f"    AND q.question_id IN ({settled_placeholders})"
+                f"), ?) "
+                f"WHERE state = ? AND dispatch_id IN ("
+                f"  SELECT dispatch_id FROM round_question "
+                f"  WHERE question_id IN ({settled_placeholders}))",
+                (
+                    *settled_ids,
+                    DispatchState.DISPATCHED.value,
+                    DispatchState.AWAITING_ANSWER.value,
+                    *settled_ids,
+                ),
+            )
+
+        changed = set(settled_ids)
+        return [
+            q.model_copy(update={"state": QuestionState.EXPIRED, "row_version": q.row_version + 1})
+            for q in candidates
+            if q.question_id in changed
+        ]
+
+    def notices_to_retry(self, *, limit: int = 50) -> list[RoundQuestion]:
+        """Open questions whose notice intent has not landed yet.
+
+        A read with no transaction, ordered by attempt count so a notice that has
+        failed repeatedly does not starve one that has never been tried.  Settled
+        questions are excluded by the join condition: re-announcing a question
+        that has since been answered would be worse than never announcing it.
+        """
+        rows = self._pool.connection().execute(
+            _QUESTION_COLUMNS_QUALIFIED + " FROM round_question q"
+            " JOIN question_notice_intent i ON i.question_id = q.question_id"
+            " WHERE i.state IN ('PENDING','FAILED') AND q.state IN ('PENDING','ESCALATED')"
+            " ORDER BY i.attempts, q.question_id LIMIT ?",
+            (int(limit),),
+        )
+        return [_row_to_question(r) for r in rows]
 
     def mark_notice_sent(self, question_id: str, *, msg_id: str) -> None:
         conn = self._pool.connection()
@@ -1241,6 +1303,18 @@ _QUESTION_SELECT = (
     "owner_epoch, continuation_kind, continuation_ref, asked_at, expires_at, question, "
     "options_json, answer_schema, default_policy, blocking, state, answer_event_id, "
     "consumed_at, user_prompt_id, dispatch_prior_state, row_version FROM round_question"
+)
+
+#: The same column list as :data:`_QUESTION_SELECT`, qualified for the join in
+#: ``notices_to_retry``.  Spelled out rather than derived from the other string:
+#: a query built by rewriting another query is one edit away from being silently
+#: wrong, and these are the columns ``_row_to_question`` reads by name.
+_QUESTION_COLUMNS_QUALIFIED = (
+    "SELECT q.question_id, q.dispatch_id, q.round_id, q.client_request_id, "
+    "q.owner_conversation, q.owner_epoch, q.continuation_kind, q.continuation_ref, "
+    "q.asked_at, q.expires_at, q.question, q.options_json, q.answer_schema, "
+    "q.default_policy, q.blocking, q.state, q.answer_event_id, q.consumed_at, "
+    "q.user_prompt_id, q.dispatch_prior_state, q.row_version"
 )
 
 _ANSWER_SELECT = (

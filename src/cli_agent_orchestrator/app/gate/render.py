@@ -45,6 +45,7 @@ from cli_agent_orchestrator.core.gate import (
 )
 
 __all__ = [
+    "ANOMALY_QUESTION_EXPIRED",
     "CallbackEnvelope",
     "EnvelopeKind",
     "IdentityRef",
@@ -92,6 +93,12 @@ class CallbackEnvelope(BaseModel):
     #: Defaulted, so every 2a construction site stays valid and only the sites
     #: that mean ANOMALY say so.
     classification: NoticeClass = NoticeClass.EXPECTED
+    #: WHICH anomaly (or which condition), one level finer than
+    #: ``classification``.  The two are complementary, not alternatives:
+    #: ``classification`` answers "should anyone be alarmed", which is what A5
+    #: types; ``code`` answers "alarmed about what", which is what a consumer
+    #: routes on.  Empty for an envelope that needs no further discrimination.
+    code: str = ""
     renderer_version: str = "2b"
 
 
@@ -103,6 +110,12 @@ _RENDERER_VERSION = "2b"
 #: A single envelope line's budget.  Long enough for a real question, short
 #: enough that four lines stay four lines on a narrow pane.
 _MAX_LINE_BYTES = 160
+
+#: The code an expired question's envelope carries.  ``EnvelopeKind.CONDITION``
+#: is the WIRE kind (A5 admits four and no more); this is what separates an
+#: unanswered question from every other condition a run can be in, so a consumer
+#: routes on a token rather than on the wording of a summary line.
+ANOMALY_QUESTION_EXPIRED = "GATE-QUESTION-EXPIRED"
 
 
 def compute_pin_digest(pins: tuple[str, ...]) -> str:
@@ -354,9 +367,11 @@ def render_anomaly_envelope(question: object, *, identity: IdentityRef) -> Callb
     a question that timed out IS a condition the run is now in — nobody violated a
     rule and no result arrived.  The word "anomaly" survives in this function's
     name because that is what the acceptance criterion calls the event; the WIRE
-    stays four-valued and the envelope says ANOMALY in its typed
-    ``classification``, which is A5's own answer to this and the reason a
-    consumer never has to match on the prose of a summary line.
+    stays four-valued.  The envelope says ANOMALY in its typed
+    ``classification`` — A5's own answer to this dilemma — and names
+    :data:`ANOMALY_QUESTION_EXPIRED` in its ``code``, so a consumer knows both
+    that something is wrong and what, without ever matching on the prose of a
+    summary line.
 
     Exactly one of these per expired question is the caller's obligation, not this
     function's: it is a pure renderer, and the sweep that calls it emits only for
@@ -379,6 +394,7 @@ def render_anomaly_envelope(question: object, *, identity: IdentityRef) -> Callb
         pin_count=0,
         pin_digest=digest,
         classification=NoticeClass.ANOMALY,
+        code=ANOMALY_QUESTION_EXPIRED,
         renderer_version=_RENDERER_VERSION,
     )
 
