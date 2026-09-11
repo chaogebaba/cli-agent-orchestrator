@@ -204,7 +204,9 @@ def _install_failure_harness(monkeypatch, tmp_path, *, build_effect):
     monkeypatch.setattr(svc.fifo_manager, "stop_reader", lambda *_: calls.append("stop-fifo"))
     monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)
     monkeypatch.setattr(svc.provider_manager, "create_provider", create_provider)
-    monkeypatch.setattr(svc.provider_manager, "cleanup_provider", lambda *_: None)
+    monkeypatch.setattr(
+        svc.provider_manager, "cleanup_provider", lambda *_, preserve_session=False: None
+    )
     monkeypatch.setattr(svc.status_monitor, "clear_terminal", lambda *_: None)
     monkeypatch.setattr(svc, "dispatch_plugin_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(svc, "get_herdr_inbox_service", lambda: None)

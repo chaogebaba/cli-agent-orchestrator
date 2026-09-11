@@ -265,6 +265,38 @@ class RefuseDiscardLiveSessionError(RuntimeError):
         }
 
 
+class DiscardConfirmationError(RuntimeError):
+    """F913 AC-4 (#765 / blueprint fx913): an explicit discard of a protected
+    (live/resumable) session was requested but the confirmation contract was not
+    satisfied — ``confirm_discard`` must be LITERAL ``True`` (not merely truthy)
+    AND ``discard_reason`` must be a non-blank string. Deliberately discarding a
+    recoverable conversation is an audited decision, so it cannot be authorized
+    by a stray truthy value or an empty reason.
+
+    Subclasses ``RuntimeError`` so the DELETE-terminal HTTP boundary's existing
+    ``except RuntimeError`` maps it to a 409; :meth:`detail` supplies the typed
+    body.
+    """
+
+    code = "discard_confirmation_invalid"
+
+    def __init__(self, terminal_id: str, *, reason: str) -> None:
+        self.terminal_id = terminal_id
+        self.why = reason
+        super().__init__(self.code)
+
+    def detail(self) -> dict[str, Any]:
+        return {
+            "error": self.code,
+            "terminal_id": self.terminal_id,
+            "why": self.why,
+            "how": (
+                "to discard a live/resumable session pass confirm_discard=true "
+                "(literal) AND discard_reason=<non-blank reason>"
+            ),
+        }
+
+
 class ProfileMissingError(ValueError):
     """F786 (#643) D8: a NAMED agent profile could not be loaded, so the spawn is refused.
 
@@ -7747,32 +7779,86 @@ def _f867_resume_in_flight(terminal_id: str, root: dict[str, Any]) -> bool:
         return False
 
 
+def _f913_record_discard_tombstone(
+    terminal_id: str, *, caller_id: str | None, reason: str, provider: str | None
+) -> None:
+    """F913 AC-4: append an audit tombstone for an EXPLICIT discard of a
+    protected (live/resumable) session — caller, reason, provider and the bound
+    target identity. Best-effort: an audit-write failure must never block or
+    fail the reap the operator explicitly authorized.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            get_terminal_identity,
+            record_conversation_event,
+        )
+
+        _identity = get_terminal_identity(terminal_id)
+        _ikey = _identity.get("identity_key") if _identity else None
+        if not _ikey:
+            _ikey = f"conv_{terminal_id}"
+        record_conversation_event(
+            _ikey,
+            "explicit_discard",
+            terminal_id=terminal_id,
+            detail={
+                "caller_id": caller_id,
+                "reason": reason,
+                "provider": provider,
+                "scope": "terminal",
+            },
+        )
+        logger.info(
+            "f913 explicit_discard tombstone: terminal=%s caller=%s reason=%r",
+            terminal_id,
+            caller_id,
+            reason,
+        )
+    except Exception:
+        logger.debug("f913 discard tombstone write failed for %s", terminal_id, exc_info=True)
+
+
 def _f913_live_resumable(
     terminal_id: str, root: dict[str, Any]
 ) -> tuple[bool, bool, str | None, str]:
     """F913 (#765): decide whether a ``force`` delete would discard a LIVE,
-    RESUMABLE provider session.
+    RESUMABLE provider session. Returns ``(alive, resumable, provider, reason)``.
 
-    Returns ``(alive, resumable, provider, reason)``.
+    AC-1/AC-3/AC-7: this is now a thin ADAPTER over the ONE shared conservative
+    decision ``conversation_transition.evaluate_session_preservation`` — so the
+    public delete guard, the cascade, and any other boundary all consult the same
+    tri-state evaluator rather than a private conjunction. The adapter maps the
+    tri-state facts onto the boolean pair this guard historically used:
+      * ``alive``      = decision.alive != "no"  (unknown fails OPEN → alive)
+      * ``resumable``  = decision.recovery == "ready"  (only a validated durable
+                         artifact on an owned root advertises resumable)
+    Never raises — a failure degrades to a permissive (alive, non-resumable)
+    verdict, so a genuinely dead/non-resumable session is never falsely refused.
+    """
+    try:
+        from cli_agent_orchestrator.services.conversation_transition import (
+            evaluate_session_preservation,
+        )
 
-    ``alive`` — the provider session is present, per the issue's definition
-    ("process present or status not error/dead"). A terminal whose provider
-    process has EXITED reports :class:`TerminalStatus.ERROR`; anything else
-    (IDLE / PROCESSING / WAITING_USER_ANSWER / COMPLETED / RENDER_UNCERTAIN /
-    UNKNOWN) is treated as still-alive. A boundary-observation failure fails
-    OPEN as alive (we would rather ask for confirmation than silently discard),
-    but the paired ``resumable`` gate below still lets a truly dead-and-
-    non-resumable session through.
+        decision = evaluate_session_preservation(terminal_id)
+        alive = decision.alive != "no"
+        resumable = decision.recovery == "ready"
+        provider = decision.provider or root.get("provider")
+        reason = decision.reason or ("resumable" if resumable else "not_resumable")
+        return alive, bool(resumable), provider, reason
+    except Exception:
+        logger.debug("f913 shared preservation decision failed for %s", terminal_id, exc_info=True)
+        return True, False, root.get("provider"), "capture_error"
 
-    ``resumable`` — whether ``assign(resume_from=<terminal_id>)`` would succeed:
-    computed by :func:`_resolve_reap_resume_key` with ``force=False`` (the
-    force=True path deliberately reports ``abandoned_force_delete`` and must NOT
-    be used to decide the guard). A dead/unreachable session (no captured id,
-    dangling root link, capture error) is honestly non-resumable, so the guard
-    below never refuses the existing recovery reaps.
 
-    Never raises — a failure degrades to a permissive verdict for ``alive`` and
-    the resume resolver's own non-resumable verdict for ``resumable``.
+def _f913_live_resumable_legacy(
+    terminal_id: str, root: dict[str, Any]
+) -> tuple[bool, bool, str | None, str]:
+    """Pre-AC-1 direct computation, retained only as a reference implementation.
+
+    Never called on the production path (``_f913_live_resumable`` now delegates
+    to the shared evaluator); kept so the older store-independent reasoning is
+    visible for review.
     """
     # Resumability: ask the resume resolver as if this were a NON-force reap.
     try:
@@ -7881,6 +7967,7 @@ def delete_terminal(
     orphan: bool = False,
     caller_id: str | None = None,
     confirm_discard: bool = False,
+    discard_reason: str | None = None,
 ) -> dict[str, Any]:
     """Cascade-delete a terminal's managed descendant tree.
 
@@ -7908,7 +7995,7 @@ def delete_terminal(
     # an intent and without touching tmux. force=False never reaches this branch
     # (non-force delete already interrupts-and-preserves the session — the resume
     # contract), and confirm_discard=True is the deliberate opt-out.
-    if force and not confirm_discard:
+    if force:
         # F867 D2 precedence (ledger L6): a force delete racing a LIVE resume/
         # rebind of THIS terminal is a resume_in_progress 409 owned by
         # _delete_terminal_inner — NOT an F913 refusal. Defer to it so the D2
@@ -7919,8 +8006,27 @@ def delete_terminal(
                 terminal_id, root
             )
             if _f913_alive and _f913_resumable:
-                raise RefuseDiscardLiveSessionError(
-                    terminal_id, provider=_f913_provider, reason=_f913_reason
+                # The session is PROTECTED. It may only be discarded by an
+                # EXPLICIT, audited confirmation (AC-4): confirm_discard must be
+                # LITERAL True and discard_reason a non-blank string. Anything
+                # less refuses (RefuseDiscardLiveSessionError). A merely-truthy
+                # confirmation or a blank/absent reason is a typed contract error,
+                # not a silent discard.
+                if confirm_discard is not True:
+                    raise RefuseDiscardLiveSessionError(
+                        terminal_id, provider=_f913_provider, reason=_f913_reason
+                    )
+                if not (isinstance(discard_reason, str) and discard_reason.strip()):
+                    raise DiscardConfirmationError(
+                        terminal_id, reason="discard_reason must be a non-blank string"
+                    )
+                # Audited discard tombstone (AC-4): caller + reason + scope, bound
+                # to the target's identity. Best-effort — never blocks the reap.
+                _f913_record_discard_tombstone(
+                    terminal_id,
+                    caller_id=caller_id,
+                    reason=discard_reason,
+                    provider=_f913_provider,
                 )
 
     # F829 D2(a): PLANNED HIBERNATE gate — evaluated BEFORE the teardown intent is

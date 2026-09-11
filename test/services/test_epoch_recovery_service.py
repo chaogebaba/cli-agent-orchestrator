@@ -429,7 +429,11 @@ def test_addendum_rollback_requires_confirmed_death(
     detached = []
     monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", lambda _: detached.append("fifo"))
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _: detached.append("status"))
-    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: None)
+    monkeypatch.setattr(
+        terminal_service.provider_manager,
+        "cleanup_provider",
+        lambda _, *, preserve_session=False: None,
+    )
     monkeypatch.setattr(
         terminal_service, "delete_terminal_and_warm_intent",
         lambda *_a, **_k: {"terminal_deleted": True, "intent_deleted": False},

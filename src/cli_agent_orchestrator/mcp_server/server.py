@@ -4645,14 +4645,18 @@ _DELETE_409_PASSTHROUGH_INDICATORS = (
 )
 
 
-def _classify_delete_409(detail: str, terminal_id: str) -> Dict[str, Any]:
+def _classify_delete_409(detail: Any, terminal_id: str) -> Dict[str, Any]:
     """Map a 409 `detail` from DELETE /terminals to an MCP result dict.
 
-    Passes the API detail through verbatim for every recognized cause so the
-    caller can distinguish lease contention from cleanup deferral. Only a
-    detail that is empty or explicitly a cleanup-deferral falls back to the
-    generic provider-aware "cleanup is pending" message (F512, #367).
+    F913 AC-5: a STRUCTURED detail (a dict, e.g. the
+    ``refuse_discard_live_session`` body {error, how, terminal_id, provider,
+    reason, confirm_discard}) is returned to the caller as FIELDS, never
+    stringified — a client can then read detail["error"]/["how"] rather than
+    substring-matching a message. A string detail keeps the existing
+    passthrough/cleanup-deferral behaviour (F512, #367).
     """
+    if isinstance(detail, dict):
+        return {"success": False, "detail": detail}
     detail_l = str(detail).lower()
     if detail and any(ind in detail_l for ind in _DELETE_409_PASSTHROUGH_INDICATORS):
         return {
@@ -4689,7 +4693,19 @@ def delete_terminal(
             "interrupt then delete WITHOUT force, then "
             "assign(resume_from=<id>, inherit_pins=False, authority_files=[...]). "
             "Set confirm_discard=true only when you truly mean to abandon that "
-            "session (its provider context and any spent quota are lost)."
+            "session (its provider context and any spent quota are lost). When "
+            "confirm_discard=true you MUST also pass a non-blank discard_reason "
+            "(F913 AC-4) — the discard is audited."
+        ),
+    ),
+    discard_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "F913 AC-4: the audited reason for an explicit discard. REQUIRED "
+            "(non-blank) whenever confirm_discard=true is used to abandon a "
+            "live/resumable session; recorded as an explicit_discard tombstone "
+            "with the caller and scope. A blank/absent reason is a typed 409 "
+            "(discard_confirmation_invalid)."
         ),
     ),
     target_host: Optional[str] = Field(
@@ -4753,6 +4769,10 @@ def delete_terminal(
     # call receives the pydantic FieldInfo default; coerce anything that is not
     # a real bool True to False (default off, resume is the default path).
     confirm_discard = confirm_discard is True
+    # F913 AC-4: normalize discard_reason (a direct positional call receives the
+    # pydantic FieldInfo default); only a real non-blank str is forwarded.
+    if not isinstance(discard_reason, str) or not discard_reason.strip():
+        discard_reason = None
     try:
         # F172 input leniency: accept display form.
         terminal_id = _resolve_input_terminal_id(terminal_id)
@@ -4763,6 +4783,9 @@ def delete_terminal(
         # delete of a LIVE, RESUMABLE session proceeds only when meant.
         if confirm_discard:
             params["confirm_discard"] = True
+        # F913 AC-4: forward the audited discard reason when supplied.
+        if discard_reason is not None:
+            params["discard_reason"] = discard_reason
         # Upstream #693: a terminal created on a remote node has its record
         # there, so a target_host delete must bypass the local cao_http client
         # and address that node directly.

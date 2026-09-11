@@ -202,6 +202,133 @@ def commit_reap(terminal_id: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# F913 (#765) AC-1 / AC-3 / AC-7 — one shared, conservative preservation
+# decision, used at every destructive boundary and independent of ``force``.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SessionPreservationDecision:
+    """Blueprint fx913 D1: tri-state facts + the protection verdict.
+
+    ``alive``    ∈ {"yes","no","unknown"} — "yes" when an attributed process or a
+                  current active observation exists; "no" ONLY on authoritative
+                  death with no live owner/claim; ERROR/timeout/unreachable are
+                  "unknown", never "no".
+    ``recovery`` ∈ {"ready","pending","absent","unknown"} — "ready" needs
+                  supported resume + admitted (owned) root + captured id +
+                  validated durable artifact; "absent" is a POSITIVELY established
+                  no-recovery outcome, never an exception fallback.
+    ``protected`` = alive != "no" OR recovery != "absent". (owned-checkout dirty
+                  data is a later slice; not yet an input here.)
+    """
+
+    alive: str
+    recovery: str
+    protected: bool
+    provider: Optional[str] = None
+    reason: Optional[str] = None
+    resume_from: Optional[str] = None
+    identity_key: Optional[str] = None
+
+
+def evaluate_session_preservation(terminal_id: str) -> SessionPreservationDecision:
+    """AC-1: the ONE shared conservative decision. Consumes conversation/terminal
+    identity, the recovery manifest artifact resolvers, provider resume
+    capability and liveness. Provider adapters supply facts; this decides.
+
+    Conservative by construction and never raises — any evidence gap degrades
+    toward PROTECTED (alive="unknown"/recovery="unknown"), never toward a silent
+    discard. Independent of ``force`` (AC-7): the caller decides what to DO with a
+    protected verdict (refuse, or require an explicit confirmed discard), but the
+    verdict itself does not depend on the force flag.
+    """
+    # ---- liveness (alive) ----
+    alive = "unknown"
+    try:
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        obs = status_monitor.get_boundary_observation(terminal_id)
+        # An ERROR status is NOT proof of death (blueprint D1); a non-ERROR
+        # observation is a live/active signal → "yes". ERROR alone → "unknown".
+        alive = "unknown" if obs.status == TerminalStatus.ERROR else "yes"
+    except Exception:
+        logger.debug("f913 preservation liveness probe failed for %s", terminal_id, exc_info=True)
+        alive = "unknown"  # fail toward protected
+
+    # ---- recovery ----
+    recovery = "unknown"
+    provider: Optional[str] = None
+    reason: Optional[str] = None
+    resume_from: Optional[str] = None
+    identity_key: Optional[str] = None
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            get_conversation_identity,
+            get_terminal_identity,
+        )
+        from cli_agent_orchestrator.services.resume_service import provider_supports_resume
+        from cli_agent_orchestrator.services.session_artifact import (
+            ArtifactState,
+            resolve_artifact,
+        )
+
+        identity = get_terminal_identity(terminal_id)
+        if identity is None:
+            recovery, reason = "absent", "no_identity_row"
+        else:
+            provider = identity.get("provider") or None
+            identity_key = identity.get("identity_key")
+            root = get_conversation_identity(identity_key) if identity_key else None
+            supports = provider_supports_resume(provider) if provider else False
+            sid = identity.get("provider_session_id") or (
+                root.get("provider_session_id") if root else None
+            )
+            if not supports:
+                # Cannot advertise resume — but "no capability" is not "safe to
+                # discard": recovery is absent ONLY when there is also no artifact.
+                recovery, reason = "absent", f"provider_{provider}_not_resumable"
+            elif root is None or root.get("owner_principal") is None:
+                # Dangling/unowned root: a resume would be refused → not ready,
+                # but conservatively PENDING (an explicit claim can make it ready).
+                recovery, reason = "pending", "identity_owner_unknown"
+            elif not sid:
+                recovery, reason = "pending", "provider_session_id_never_captured"
+            else:
+                status = resolve_artifact(
+                    str(provider),
+                    provider_session_id=sid,
+                    provider_namespace=identity.get("provider_namespace")
+                    or (root.get("provider_namespace") if root else None),
+                    artifact_locator=root.get("artifact_locator") if root else None,
+                    cwd=identity.get("cwd"),
+                )
+                if status.state == ArtifactState.VALID:
+                    recovery, reason, resume_from = "ready", "resumable", terminal_id
+                elif status.state == ArtifactState.INACCESSIBLE:
+                    recovery, reason = "unknown", "session_artifact_unavailable"
+                elif status.state == ArtifactState.INVALID:
+                    recovery, reason = "unknown", "session_artifact_invalid"
+                else:  # MISSING
+                    recovery, reason = "absent", "session_artifact_missing"
+    except Exception:
+        logger.debug("f913 preservation recovery probe failed for %s", terminal_id, exc_info=True)
+        recovery = "unknown"  # fail toward protected
+
+    protected = alive != "no" or recovery != "absent"
+    return SessionPreservationDecision(
+        alive=alive,
+        recovery=recovery,
+        protected=protected,
+        provider=provider,
+        reason=reason,
+        resume_from=resume_from,
+        identity_key=identity_key,
+    )
+
+
+# ---------------------------------------------------------------------------
 # F829 D3: resume authorize -> classify -> claim (the pre-spawn gate)
 # ---------------------------------------------------------------------------
 

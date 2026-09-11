@@ -2619,7 +2619,9 @@ class TestDeleteTerminal:
 
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once()
-        mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
+        mock_provider_manager.cleanup_provider.assert_called_once_with(
+            "test1234", preserve_session=False
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -2674,7 +2676,9 @@ class TestDeleteTerminal:
 
         assert delete_terminal("test1234") is False
         mock_db_delete.assert_not_called()
-        mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
+        mock_provider_manager.cleanup_provider.assert_called_once_with(
+            "test1234", preserve_session=False
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")

@@ -203,6 +203,7 @@ from cli_agent_orchestrator.services.terminal_guard_service import (
 )
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    DiscardConfirmationError,
     OutputMode,
     RefuseDiscardLiveSessionError,
     TerminalCapExceeded,
@@ -8921,6 +8922,7 @@ async def delete_terminal(
     orphan: bool = False,
     caller_id: Optional[TerminalId] = None,
     confirm_discard: bool = False,
+    discard_reason: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
@@ -8943,6 +8945,10 @@ async def delete_terminal(
         # meant to abandon it. Default false — the resume path is the default.
         if confirm_discard:
             delete_kwargs["confirm_discard"] = True
+        # F913 AC-4: the audited discard reason (required with confirm_discard
+        # when the session is protected). Forwarded verbatim.
+        if discard_reason is not None:
+            delete_kwargs["discard_reason"] = discard_reason
         result = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
@@ -8978,6 +8984,16 @@ async def delete_terminal(
             terminal_id,
             e.provider,
             e.reason,
+            caller_id,
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
+    except DiscardConfirmationError as e:
+        # F913 AC-4: an explicit discard was requested without a valid literal
+        # confirmation + non-blank reason. Typed 409 with the structured body.
+        logger.warning(
+            "delete_terminal discard_confirmation_invalid terminal_id=%s why=%s caller=%s",
+            terminal_id,
+            e.why,
             caller_id,
         )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())

@@ -67,29 +67,30 @@ def test_confirm_discard_absent_is_not_forwarded(mock_delete):
 
 
 @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
-def test_refusal_409_surfaced_verbatim(mock_delete):
+def test_refusal_409_surfaced_as_structured_fields(mock_delete):
+    """AC-5: a dict 409 detail reaches the caller as FIELDS, not a stringified
+    message — assert field-level equality, not substring presence."""
     resp = MagicMock(status_code=409)
     resp.json.return_value = {"detail": _REFUSAL_DETAIL}
     mock_delete.return_value = resp
     result = delete_terminal("t1", force=True)
     assert result["success"] is False
-    # verbatim passthrough — the resume guidance reaches the caller.
-    assert "refuse_discard_live_session" in result["message"]
-    assert "resume_from=abcd1234" in result["message"]
+    assert result["detail"] == _REFUSAL_DETAIL  # field-level, not substring
+    assert result["detail"]["error"] == "refuse_discard_live_session"
+    assert result["detail"]["how"].endswith("resume_from=abcd1234)")
+    assert "message" not in result  # not collapsed into a flat string
 
 
 @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
-def test_mutant_swallow_refusal_is_caught(mock_delete):
-    """Mutant 'swallow-the-refusal' (drop the passthrough indicator): the 409
-    would collapse to the generic 'cleanup pending, retry' message and the
-    operator would never learn to resume. The correct code passes the refusal
-    detail through; asserting the resume guidance is present kills the mutant.
+def test_mutant_stringify_detail_is_caught(mock_delete):
+    """Mutant 'stringify-detail' (drop the isinstance(detail, dict) branch): the
+    dict 409 would collapse into a flat message string and the caller would lose
+    the structured fields. Asserting result['detail'] is the dict kills it.
     """
     resp = MagicMock(status_code=409)
     resp.json.return_value = {"detail": _REFUSAL_DETAIL}
     mock_delete.return_value = resp
     result = delete_terminal("t1", force=True)
     assert result["success"] is False
-    assert "refuse_discard_live_session" in result["message"]
-    # the generic cleanup-deferred fallback must NOT be what the caller sees.
-    assert "cleanup is pending" not in result["message"]
+    assert isinstance(result.get("detail"), dict)
+    assert result["detail"] == _REFUSAL_DETAIL

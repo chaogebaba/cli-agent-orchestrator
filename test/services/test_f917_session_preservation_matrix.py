@@ -363,6 +363,14 @@ class TestProviderMatrix:
 # ==========================================================================
 class TestF867D2Precedence:
     def _seed_resumable_pi(self, d, tid, session, ns):
+        # Write a REAL pi session artifact so the shared preservation evaluator
+        # resolves recovery="ready" (a validated durable artifact), making the
+        # lane genuinely resumable rather than merely flagged.
+        import os
+
+        os.makedirs(ns, exist_ok=True)
+        with open(os.path.join(ns, f"20260911_{tid}.jsonl"), "w") as fh:
+            fh.write('{"turn": 1}\n')
         d.create_terminal(
             terminal_id=tid,
             tmux_session=session,
@@ -403,7 +411,7 @@ class TestF867D2Precedence:
         )
 
     def test_force_defers_to_resume_in_progress_when_genuinely_resumable(
-        self, real_sqlite_env, monkeypatch
+        self, real_sqlite_env, tmp_path, monkeypatch
     ):
         """pass-after: with owner_principal set (genuinely resumable) AND a live
         provider-session lease held (resume in flight), force delete must raise
@@ -418,12 +426,13 @@ class TestF867D2Precedence:
         )
 
         tid = "l6defer1"
-        self._seed_resumable_pi(d, tid, "cao-l6", "/data/cao-scratch/x")
+        ns = str(tmp_path / "pi-ns")
+        self._seed_resumable_pi(d, tid, "cao-l6", ns)
         ct.attach_captured_uuid(
             tid,
             provider_session_id=tid,
             provider="pi_cli",
-            provider_namespace="/data/cao-scratch/x",
+            provider_namespace=ns,
         )
         self._mock_seams(monkeypatch)
 
@@ -454,10 +463,12 @@ class TestF867D2Precedence:
         # refused by F913 — the deliberate discard proceeds with confirm_discard.
         with pytest.raises(RefuseDiscardLiveSessionError):
             ts.delete_terminal(tid, force=True)
-        r = ts.delete_terminal(tid, force=True, confirm_discard=True)
+        r = ts.delete_terminal(
+            tid, force=True, confirm_discard=True, discard_reason="account switch"
+        )
         assert r["reaped"] and r["reaped"][0]["id"] == tid
 
-    def test_mutant_no_d2_deferral_is_caught(self, real_sqlite_env, monkeypatch):
+    def test_mutant_no_d2_deferral_is_caught(self, real_sqlite_env, tmp_path, monkeypatch):
         """Mutant 'no-d2-deferral' (F913 guard evaluated WITHOUT the
         _f867_resume_in_flight pre-check): with a genuinely resumable terminal
         and a live resume lease, the guard would raise refuse_discard_live_session
@@ -468,12 +479,13 @@ class TestF867D2Precedence:
         from cli_agent_orchestrator.services import provider_session_lease as psl
 
         tid = "l6defer2"
-        self._seed_resumable_pi(d, tid, "cao-l6b", "/data/cao-scratch/x")
+        ns = str(tmp_path / "pi-ns2")
+        self._seed_resumable_pi(d, tid, "cao-l6b", ns)
         ct.attach_captured_uuid(
             tid,
             provider_session_id=tid,
             provider="pi_cli",
-            provider_namespace="/data/cao-scratch/x",
+            provider_namespace=ns,
         )
         self._mock_seams(monkeypatch)
         held = psl.acquire_provider_session_lease(tid)
@@ -585,3 +597,194 @@ class TestAC6RetentionBarrier:
         prov, home, artifact = self._make_grok(tmp_path, monkeypatch, tid="ac6grkm0")
         prov.cleanup(preserve_session=True)
         assert artifact.exists()
+
+
+# ==========================================================================
+# B1 (verdict-f913-r1) — the retention barrier must hold through the REAL
+# ProviderManager.cleanup_provider seam, not just the direct adapter. The
+# reviewer's independent mutant (drop preserve_session forwarding in
+# ProviderManager.cleanup_provider) survived all shipped tests because they
+# bypassed the manager. These go through a real ProviderManager so that mutant
+# is killed, and a deletion-level completed-turn test reaches both.
+# ==========================================================================
+class TestAC6ManagerRetention:
+    def _make_pi(self, tmp_path, monkeypatch, tid="b1pia000"):
+        import cli_agent_orchestrator.providers.pi_cli as pi
+
+        monkeypatch.setattr(pi, "PI_RUNTIME_ROOT", tmp_path / "pi")
+        prov = pi.PiCliProvider(
+            tid, "cao-b1", f"win-{tid}", agent_profile="empirical_reviewer_lite"
+        )
+        prov.runtime_dir.mkdir(parents=True, exist_ok=True)
+        prov.session_dir.mkdir(parents=True, exist_ok=True)
+        artifact = prov.session_dir / f"20260911_{tid}.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+        prov.prompt_path.write_text("prompt")
+        return prov, artifact
+
+    def test_pi_manager_cleanup_preserve_retains_artifact(self, tmp_path, monkeypatch):
+        """B1 decisive witness: through a REAL ProviderManager, preserve_session=True
+        must reach the pi adapter and retain the artifact. Kills the
+        'drop manager forwarding' mutant that the direct-adapter tests missed.
+        """
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        prov, artifact = self._make_pi(tmp_path, monkeypatch)
+        manager = ProviderManager()
+        manager._providers[prov.terminal_id] = prov
+        assert manager.cleanup_provider(prov.terminal_id, preserve_session=True) is True
+        assert artifact.exists(), "AC-6 manager forwarding must retain the pi session artifact"
+        assert prov.terminal_id not in manager._providers  # provider map cleaned
+
+    def test_pi_manager_cleanup_non_preserve_removes_artifact(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        prov, artifact = self._make_pi(tmp_path, monkeypatch, tid="b1pib000")
+        manager = ProviderManager()
+        manager._providers[prov.terminal_id] = prov
+        assert manager.cleanup_provider(prov.terminal_id, preserve_session=False) is True
+        assert not artifact.exists()
+
+    def _make_grok(self, tmp_path, monkeypatch, tid="b1grk000"):
+        import cli_agent_orchestrator.providers.grok_cli as gk
+
+        home = tmp_path / "grok-home" / tid
+        monkeypatch.setattr(gk.GrokCliProvider, "_prepare_grok_home", lambda self: None)
+        monkeypatch.setattr(gk.GrokCliProvider, "_allocate_session_uuid", lambda self: "s-uuid")
+        prov = gk.GrokCliProvider(tid, "cao-b1g", f"win-{tid}")
+        monkeypatch.setattr(prov, "_home_path", lambda: home)
+        monkeypatch.setattr(prov, "_is_managed_home", lambda h: True)
+        monkeypatch.setattr(prov, "_stop_home_processes", lambda h: True)
+        sessions = home / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        artifact = sessions / "session.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+        return prov, home, artifact
+
+    def test_grok_manager_cleanup_preserve_retains_store(self, tmp_path, monkeypatch):
+        """B1: direct (in-memory) Grok manager coverage for the disposition."""
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        prov, home, artifact = self._make_grok(tmp_path, monkeypatch)
+        manager = ProviderManager()
+        manager._providers[prov.terminal_id] = prov
+        assert manager.cleanup_provider(prov.terminal_id, preserve_session=True) is True
+        assert artifact.exists(), "AC-6 manager forwarding must retain the grok session store"
+
+    def test_grok_restored_manager_cleanup_preserve_retains_store(self, tmp_path, monkeypatch):
+        """B1 / AC-6 'after a server restart drops in-memory provider instances':
+        with NO in-memory provider, the manager instantiates a fresh Grok adapter
+        from metadata and must still forward preserve_session to its cleanup.
+        """
+        import cli_agent_orchestrator.providers.grok_cli as gk
+        import cli_agent_orchestrator.providers.manager as mgr
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        tid = "b1grkr00"
+        home = tmp_path / "grok-restored" / tid
+        sessions = home / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        artifact = sessions / "session.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+
+        monkeypatch.setattr(gk.GrokCliProvider, "_prepare_grok_home", lambda self: None)
+        monkeypatch.setattr(gk.GrokCliProvider, "_allocate_session_uuid", lambda self: "s-uuid")
+        monkeypatch.setattr(gk.GrokCliProvider, "_home_path", lambda self: home)
+        monkeypatch.setattr(gk.GrokCliProvider, "_is_managed_home", lambda self, h: True)
+        monkeypatch.setattr(gk.GrokCliProvider, "_stop_home_processes", lambda self, h: True)
+        # Manager has no in-memory instance → takes the restored-Grok branch.
+        monkeypatch.setattr(
+            mgr,
+            "get_terminal_metadata",
+            lambda _tid: {
+                "provider": "grok_cli",
+                "tmux_session": "cao-b1gr",
+                "tmux_window": f"win-{tid}",
+                "agent_profile": "dev",
+            },
+        )
+        manager = ProviderManager()  # empty _providers
+        assert manager.cleanup_provider(tid, preserve_session=True) is True
+        assert artifact.exists(), "AC-6 restored-Grok path must retain the session store"
+
+
+# ==========================================================================
+# B1 (deletion-level) — a completed-turn pi lane deleted WITHOUT force through
+# the real reaper reaches ProviderManager.cleanup_provider with the retention
+# disposition derived from the resume verdict, and the artifact survives.
+# ==========================================================================
+class TestAC6DeletionLevelPreservation:
+    def test_completed_turn_pi_non_force_delete_retains_artifact(
+        self, real_sqlite_env, tmp_path, monkeypatch
+    ):
+        import cli_agent_orchestrator.clients.database as d
+        import cli_agent_orchestrator.providers.pi_cli as pi
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.services import conversation_transition as ct
+
+        tid = "b1del000"
+        # Real pi provider with a completed-turn artifact on disk.
+        monkeypatch.setattr(pi, "PI_RUNTIME_ROOT", tmp_path / "pi")
+        prov = pi.PiCliProvider(
+            tid, "cao-b1d", f"win-{tid}", agent_profile="empirical_reviewer_lite"
+        )
+        prov.runtime_dir.mkdir(parents=True, exist_ok=True)
+        prov.session_dir.mkdir(parents=True, exist_ok=True)
+        artifact = prov.session_dir / f"20260911_{tid}.jsonl"
+        artifact.write_text('{"turn": 1}\n')
+
+        # Seed a genuinely-resumable pi lane (owner_principal set) + a real
+        # ProviderManager holding this provider, so the reaper's cleanup_provider
+        # reaches the real adapter with the retention disposition.
+        d.create_terminal(
+            terminal_id=tid,
+            tmux_session="cao-b1d",
+            tmux_window=f"win-{tid}",
+            agent_profile="empirical_reviewer_lite",
+            provider="pi_cli",
+        )
+        d.mint_spawn_identity(
+            identity_key=f"conv_{tid}",
+            provider="pi_cli",
+            provider_namespace=str(prov.session_dir),
+            agent_profile="empirical_reviewer_lite",
+            model=None,
+            reasoning_effort=None,
+            origin_callback_ref=None,
+            current_terminal_id=tid,
+            cwd=str(prov.runtime_dir),
+            owner_principal="owner-1",
+        )
+        ct.attach_captured_uuid(
+            tid,
+            provider_session_id=tid,
+            provider="pi_cli",
+            provider_namespace=str(prov.session_dir),
+        )
+
+        manager = ProviderManager()
+        manager._providers[tid] = prov
+        monkeypatch.setattr(ts, "provider_manager", manager)
+        monkeypatch.setattr(ts, "get_backend", lambda: MagicMock())
+        # Keep tmux/lease/inbox seams inert; the real cleanup_provider must run.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.rebind_lease.acquire_rebind_lease",
+            lambda t: MagicMock(terminal_id=t),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.rebind_lease.release_rebind_lease", lambda _t: None
+        )
+        # The MagicMock rebind token cannot pass real validation; no-op it so the
+        # real _delete_terminal_under_lease body (incl. cleanup_provider) runs.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease",
+            lambda _tid, _token: None,
+        )
+
+        result = ts.delete_terminal(tid)  # NON-force preserving delete
+        # The reap ran and the pi transcript survived (resumable → retained).
+        assert artifact.exists(), (
+            "AC-6 deletion-level: a non-force delete of a resumable pi lane must "
+            "retain the session artifact through the real reaper + manager"
+        )
+        assert isinstance(result, dict)

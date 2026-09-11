@@ -313,7 +313,9 @@ class TestTerminalPluginEvents:
             "tmux_window": "developer-abcd",
             "agent_profile": "developer",
         }
-        mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
+        mock_provider_manager.cleanup_provider.side_effect = (
+            lambda *_, preserve_session=False: call_order.append("cleanup")
+        )
         mock_db_delete_terminal.side_effect = lambda *_a, **_k: (
             call_order.append("db_delete") or {"terminal_deleted": True, "intent_deleted": False}
         )

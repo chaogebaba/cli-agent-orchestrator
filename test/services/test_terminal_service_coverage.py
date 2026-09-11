@@ -567,7 +567,7 @@ class TestDeleteTerminal:
         assert result is True
         mock_tmux.stop_pipe_pane.assert_called_once_with("ses", "win")
         mock_tmux.kill_window.assert_called_once_with("ses", "win")
-        mock_pm.cleanup_provider.assert_called_once_with("tid1")
+        mock_pm.cleanup_provider.assert_called_once_with("tid1", preserve_session=False)
 
     @patch(
         "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",

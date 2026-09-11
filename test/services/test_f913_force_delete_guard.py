@@ -54,103 +54,72 @@ def _obs(status: TerminalStatus) -> MagicMock:
 
 
 # ==========================================================================
-# _f913_live_resumable — the decision helper (alive, resumable, provider, reason)
+# _f913_live_resumable — thin ADAPTER over the shared evaluator (AC-1). These
+# assert the tri-state → (alive, resumable) mapping; the shared evaluator's own
+# fact derivation is exercised in TestSharedPreservationEvaluator below.
 # ==========================================================================
+def _decision(alive, recovery, provider="codex", reason="resumable", resume_from=None):
+    from cli_agent_orchestrator.services.conversation_transition import (
+        SessionPreservationDecision,
+    )
+
+    return SessionPreservationDecision(
+        alive=alive,
+        recovery=recovery,
+        protected=(alive != "no" or recovery != "absent"),
+        provider=provider,
+        reason=reason,
+        resume_from=resume_from,
+    )
+
+
 class TestLiveResumableDecision:
-    def test_alive_and_resumable_when_processing_and_resolver_says_resumable(self):
-        with (
-            patch.object(ts, "_resolve_reap_resume_key", return_value=("sid", True, "resumable")),
-            patch.object(
-                ts.status_monitor,
-                "get_boundary_observation",
-                return_value=_obs(TerminalStatus.PROCESSING),
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_identity",
-                return_value={"provider": "codex"},
-            ),
+    def test_alive_and_resumable_when_ready(self):
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            return_value=_decision("yes", "ready"),
         ):
             alive, resumable, provider, reason = _f913_live_resumable(TID, _ROOT)
         assert alive is True and resumable is True
         assert provider == "codex" and reason == "resumable"
 
-    def test_dead_when_status_error(self):
-        with (
-            patch.object(ts, "_resolve_reap_resume_key", return_value=(None, True, "resumable")),
-            patch.object(
-                ts.status_monitor,
-                "get_boundary_observation",
-                return_value=_obs(TerminalStatus.ERROR),
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_identity",
-                return_value={"provider": "codex"},
-            ),
+    def test_dead_when_alive_no(self):
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            return_value=_decision("no", "ready"),
         ):
             alive, resumable, _prov, _reason = _f913_live_resumable(TID, _ROOT)
-        assert alive is False  # ERROR = provider process exited
-        assert resumable is True  # resolver still says resumable; guard uses AND
+        assert alive is False  # alive == "no" → not alive
+        assert resumable is True  # recovery ready → resumable
 
-    def test_liveness_fails_open_as_alive(self):
-        with (
-            patch.object(ts, "_resolve_reap_resume_key", return_value=(None, True, "resumable")),
-            patch.object(
-                ts.status_monitor,
-                "get_boundary_observation",
-                side_effect=RuntimeError("boom"),
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_identity",
-                return_value=None,
-            ),
+    def test_liveness_unknown_fails_open_as_alive(self):
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            return_value=_decision("unknown", "ready"),
         ):
-            alive, resumable, provider, _reason = _f913_live_resumable(TID, _ROOT)
-        assert alive is True  # fail OPEN: prefer asking to silently discarding
+            alive, resumable, _prov, _reason = _f913_live_resumable(TID, _ROOT)
+        assert alive is True  # unknown → alive (fail open)
         assert resumable is True
-        assert provider == "codex"  # falls back to root metadata
 
-    def test_nonresumable_when_resolver_says_so(self):
-        with (
-            patch.object(
-                ts,
-                "_resolve_reap_resume_key",
-                return_value=(None, False, "provider_session_id_never_captured"),
-            ),
-            patch.object(
-                ts.status_monitor,
-                "get_boundary_observation",
-                return_value=_obs(TerminalStatus.PROCESSING),
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_identity",
-                return_value={"provider": "codex"},
-            ),
+    def test_nonresumable_when_recovery_not_ready(self):
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            return_value=_decision("yes", "absent", reason="provider_session_id_never_captured"),
         ):
             alive, resumable, _prov, reason = _f913_live_resumable(TID, _ROOT)
         assert alive is True and resumable is False
         assert reason == "provider_session_id_never_captured"
 
-    def test_resolver_asked_with_force_false(self):
-        """The guard must ask resumability as if NOT forced — force=True would
-        report abandoned_force_delete (non-resumable) and defeat the guard.
-        """
-        with (
-            patch.object(
-                ts, "_resolve_reap_resume_key", return_value=(None, True, "resumable")
-            ) as resolver,
-            patch.object(
-                ts.status_monitor,
-                "get_boundary_observation",
-                return_value=_obs(TerminalStatus.PROCESSING),
-            ),
-            patch(
-                "cli_agent_orchestrator.clients.database.get_terminal_identity",
-                return_value={"provider": "codex"},
-            ),
+    def test_adapter_degrades_permissively_on_error(self):
+        """A failure in the shared evaluator degrades to (alive, non-resumable)
+        so a genuinely dead/non-resumable session is never falsely refused."""
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            side_effect=RuntimeError("boom"),
         ):
-            _f913_live_resumable(TID, _ROOT)
-        _args, kwargs = resolver.call_args
-        assert kwargs.get("force") is False
+            alive, resumable, provider, reason = _f913_live_resumable(TID, _ROOT)
+        assert alive is True and resumable is False
+        assert provider == "codex" and reason == "capture_error"
 
 
 # ==========================================================================
@@ -186,7 +155,10 @@ class TestDeleteTerminalGuard:
     def test_rule2_confirm_discard_bypasses_refusal(self):
         p_meta, p_dec, p_inner = self._patched(alive=True, resumable=True)
         with p_meta, p_dec, p_inner as inner:
-            result = delete_terminal(TID, force=True, confirm_discard=True)
+            # AC-4: confirm_discard now requires a non-blank discard_reason.
+            result = delete_terminal(
+                TID, force=True, confirm_discard=True, discard_reason="account switch"
+            )
         assert result == {"reaped": ["passed-through"]}
         inner.assert_called_once()
 
@@ -309,7 +281,7 @@ class TestNonForceBusyReportsResumable:
 # RULE-1 / RULE-2 / RULE-3 mutants at the guard level
 # ==========================================================================
 class TestGuardMutants:
-    def _run(self, *, alive, resumable, force=True, confirm_discard=False):
+    def _run(self, *, alive, resumable, force=True, confirm_discard=False, discard_reason="switch"):
         with (
             patch.object(ts, "get_terminal_metadata", return_value=dict(_ROOT)),
             patch.object(
@@ -319,7 +291,9 @@ class TestGuardMutants:
             ),
             patch.object(ts, "_delete_terminal_inner", return_value={"reaped": ["ok"]}),
         ):
-            return delete_terminal(TID, force=force, confirm_discard=confirm_discard)
+            return delete_terminal(
+                TID, force=force, confirm_discard=confirm_discard, discard_reason=discard_reason
+            )
 
     def test_mutant_m1_drop_guard_is_caught(self):
         """M1 'drop-the-guard' (never raise): a live+resumable force delete
@@ -343,3 +317,196 @@ class TestGuardMutants:
         """
         result = self._run(alive=False, resumable=True)
         assert result == {"reaped": ["ok"]}
+
+
+# ==========================================================================
+# AC-4 (blueprint fx913) — explicit discard requires LITERAL true confirmation
+# + a non-blank discard_reason, and records an audit tombstone.
+# ==========================================================================
+class TestAC4DiscardConfirmation:
+    def _patched(self, tombstone):
+        from cli_agent_orchestrator.services.terminal_service import DiscardConfirmationError
+
+        return DiscardConfirmationError, (
+            patch.object(ts, "get_terminal_metadata", return_value=dict(_ROOT)),
+            patch.object(
+                ts, "_f913_live_resumable", return_value=(True, True, "codex", "resumable")
+            ),
+            patch.object(ts, "_delete_terminal_inner", return_value={"reaped": ["ok"]}),
+            patch.object(ts, "_f913_record_discard_tombstone", tombstone),
+        )
+
+    def test_confirm_true_with_reason_proceeds_and_tombstones(self):
+        calls = []
+        tomb = MagicMock(side_effect=lambda *a, **k: calls.append((a, k)))
+        _err, (p_meta, p_dec, p_inner, p_tomb) = self._patched(tomb)
+        with p_meta, p_dec, p_inner, p_tomb:
+            result = ts.delete_terminal(
+                TID, force=True, confirm_discard=True, discard_reason="account switch"
+            )
+        assert result == {"reaped": ["ok"]}
+        assert tomb.called  # AC-4 tombstone recorded
+        assert tomb.call_args.kwargs.get("reason") == "account switch"
+
+    def test_confirm_true_blank_reason_is_refused(self):
+        err, (p_meta, p_dec, p_inner, p_tomb) = self._patched(MagicMock())
+        with p_meta, p_dec, p_inner, p_tomb:
+            with pytest.raises(err):
+                ts.delete_terminal(TID, force=True, confirm_discard=True, discard_reason="   ")
+
+    def test_confirm_true_no_reason_is_refused(self):
+        err, (p_meta, p_dec, p_inner, p_tomb) = self._patched(MagicMock())
+        with p_meta, p_dec, p_inner, p_tomb:
+            with pytest.raises(err):
+                ts.delete_terminal(TID, force=True, confirm_discard=True)
+
+    def test_mutant_truthy_confirm_accepted_is_caught(self):
+        """Mutant 'truthy-confirm' (confirm_discard treated as truthy, reason
+        unchecked): a discard with a blank reason would proceed. The correct
+        contract requires literal True + non-blank reason; asserting the blank
+        reason is refused kills the mutant.
+        """
+        err, (p_meta, p_dec, p_inner, p_tomb) = self._patched(MagicMock())
+        with p_meta, p_dec, p_inner, p_tomb:
+            with pytest.raises(err):
+                ts.delete_terminal(TID, force=True, confirm_discard=True, discard_reason="")
+
+
+# ==========================================================================
+# AC-1 / AC-7 — the shared evaluate_session_preservation tri-state decision,
+# force-independent. Exercises the fact derivation directly.
+# ==========================================================================
+class TestSharedPreservationEvaluator:
+    def _patch(self, *, obs_status, identity, root, supports, artifact_state):
+        from cli_agent_orchestrator.services.session_artifact import ArtifactState, ArtifactStatus
+
+        obs = MagicMock()
+        obs.status = obs_status
+        sm = MagicMock()
+        sm.get_boundary_observation.return_value = obs
+        return (
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_identity",
+                return_value=identity,
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_conversation_identity",
+                return_value=root,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.resume_service.provider_supports_resume",
+                return_value=supports,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_artifact.resolve_artifact",
+                return_value=ArtifactStatus(artifact_state, "/p"),
+            ),
+        )
+
+    def test_ready_when_supported_owned_and_artifact_valid(self):
+        from cli_agent_orchestrator.services.conversation_transition import (
+            evaluate_session_preservation,
+        )
+        from cli_agent_orchestrator.services.session_artifact import ArtifactState
+
+        ident = {"provider": "codex", "identity_key": "conv_x", "provider_session_id": "sid"}
+        root = {"owner_principal": "mb_o", "provider_session_id": "sid"}
+        p1, p2, p3, p4, p5 = self._patch(
+            obs_status=TerminalStatus.IDLE,
+            identity=ident,
+            root=root,
+            supports=True,
+            artifact_state=ArtifactState.VALID,
+        )
+        with p1, p2, p3, p4, p5:
+            d = evaluate_session_preservation(TID)
+        assert d.alive == "yes" and d.recovery == "ready" and d.protected is True
+        assert d.resume_from == TID
+
+    def test_error_status_is_unknown_not_dead(self):
+        from cli_agent_orchestrator.services.conversation_transition import (
+            evaluate_session_preservation,
+        )
+        from cli_agent_orchestrator.services.session_artifact import ArtifactState
+
+        ident = {"provider": "codex", "identity_key": "conv_x", "provider_session_id": "sid"}
+        root = {"owner_principal": "mb_o", "provider_session_id": "sid"}
+        p1, p2, p3, p4, p5 = self._patch(
+            obs_status=TerminalStatus.ERROR,
+            identity=ident,
+            root=root,
+            supports=True,
+            artifact_state=ArtifactState.VALID,
+        )
+        with p1, p2, p3, p4, p5:
+            d = evaluate_session_preservation(TID)
+        assert d.alive == "unknown"  # ERROR is not authoritative death
+        assert d.protected is True
+
+    def test_absent_recovery_when_missing_artifact_and_dead(self):
+        from cli_agent_orchestrator.services.conversation_transition import (
+            evaluate_session_preservation,
+        )
+        from cli_agent_orchestrator.services.session_artifact import ArtifactState
+
+        ident = {"provider": "codex", "identity_key": "conv_x", "provider_session_id": "sid"}
+        root = {"owner_principal": "mb_o", "provider_session_id": "sid"}
+        p1, p2, p3, p4, p5 = self._patch(
+            obs_status=TerminalStatus.ERROR,
+            identity=ident,
+            root=root,
+            supports=True,
+            artifact_state=ArtifactState.MISSING,
+        )
+        with p1, p2, p3, p4, p5:
+            d = evaluate_session_preservation(TID)
+        # alive unknown (ERROR) so still protected on the alive axis, but recovery
+        # is a positively-established absent.
+        assert d.recovery == "absent"
+
+    def test_force_independent_same_verdict(self):
+        """AC-7: the decision does not take force as input; the SAME facts yield
+        the SAME verdict regardless of any caller force intent (there is no force
+        parameter on the evaluator at all)."""
+        import inspect
+
+        from cli_agent_orchestrator.services.conversation_transition import (
+            evaluate_session_preservation,
+        )
+
+        sig = inspect.signature(evaluate_session_preservation)
+        assert "force" not in sig.parameters
+
+
+# ==========================================================================
+# AC-3 (structural) — the shared decision is the source the public delete guard
+# consults; _f913_live_resumable delegates to evaluate_session_preservation so
+# no destructive guard path re-implements the conjunction.
+# ==========================================================================
+class TestAC3SharedDecisionSourced:
+    def test_guard_helper_delegates_to_shared_evaluator(self):
+        called = {"n": 0}
+
+        def _fake(_tid):
+            called["n"] += 1
+            from cli_agent_orchestrator.services.conversation_transition import (
+                SessionPreservationDecision,
+            )
+
+            return SessionPreservationDecision(
+                alive="yes",
+                recovery="ready",
+                protected=True,
+                provider="codex",
+                reason="resumable",
+                resume_from=_tid,
+            )
+
+        with patch(
+            "cli_agent_orchestrator.services.conversation_transition.evaluate_session_preservation",
+            side_effect=_fake,
+        ):
+            alive, resumable, _p, _r = _f913_live_resumable(TID, _ROOT)
+        assert called["n"] == 1  # the guard helper consulted the shared evaluator
+        assert alive is True and resumable is True
