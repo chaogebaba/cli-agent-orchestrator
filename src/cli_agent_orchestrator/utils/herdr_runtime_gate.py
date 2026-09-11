@@ -19,6 +19,19 @@ the cohort would flip truth sources under a live occupant, which is exactly the
 class of surprise §8 forbids.  So the answer is resolved once per terminal per
 process and held until the terminal is forgotten at teardown.
 
+**A cao-server restart forgets every binding, and that is the safe direction.**
+The map is process-local, so terminals that survive a restart come back UNBOUND
+and therefore UNCERTIFIED until something re-binds them. The consequence is
+stated rather than hidden: after a restart a live certified terminal loses its
+§6(ii) mute and its certified-path gates, i.e. it reverts to the pre-H1 scraped
+lifecycle — the pane fallback it had before, never a state derived from nothing.
+That is the correct failure direction for a predicate whose whole job is deciding
+whom to believe, and it is why the answer is not persisted: a durable row would
+survive into a process whose backend, herdr binary or position file may all have
+changed, and §8's "never switch truth sources mid-occupant" would then be
+enforced against a fact nobody re-checked. Re-binding a surviving occupant at
+startup is a separate decision and needs its own evidence (H1 report, §8 note).
+
 This module is LEGACY (``utils/``) on purpose.  The predicate is read from three
 legacy callers — the herdr backend shim, the pi provider and the stalled
 callback watchdog — and from the composition-root side of the projector wiring;

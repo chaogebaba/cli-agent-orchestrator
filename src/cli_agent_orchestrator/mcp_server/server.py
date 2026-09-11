@@ -2749,6 +2749,10 @@ def _assign_impl(
             _fallback_profile = None
             _d9_position = None
             _d9_cell = None
+            # WP-HERDR D9 backend axis; "tmux" for every row that does not opt in,
+            # which is every row today.
+            _d9_backend = "tmux"
+            _d9_herdr_certified = False
             # F838 (#695) r2 — the guard-checked provider for a legacy alias,
             # carried INTO _create_terminal so creation never re-resolves from
             # the mutable store between validation and use (codex Blocker 2).
@@ -2995,6 +2999,13 @@ def _assign_impl(
                 return _cell_uncertified_refusal(f"cell outcome={_res.fallback_cell}")
 
             agent_profile = _res.spawn_profile
+            # WP-HERDR D9: the resolution's backend axis is operator-visible, so
+            # a row bound to herdr says so in the assign result rather than being
+            # a silent property of the routing file. The runtime predicate is
+            # re-resolved server-side (the shim and the backend are different
+            # processes); this is the reporting half.
+            _d9_backend = _res.backend
+            _d9_herdr_certified = _res.herdr_certified
             if _res.fallback_profile:
                 _fallback_profile = _res.fallback_profile
                 _d9_position = _res.fallback_position
@@ -3330,6 +3341,9 @@ def _assign_impl(
                 + _get_cleanup_nudge()
             ),
         }
+        if _d9_backend != "tmux":
+            result["backend"] = _d9_backend
+            result["herdr_certified"] = _d9_herdr_certified
         if authority_files:
             result["frozen_pins"] = [
                 {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}

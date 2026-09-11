@@ -732,3 +732,77 @@ async def test_adj_r3_buffer_is_cleared_on_close_no_cross_connection_replay(
         assert len(client._event_buffer) == 1
         await client.close()
         assert len(client._event_buffer) == 0
+
+
+async def test_subscribe_must_be_the_first_message_on_the_connection(socket_path: str) -> None:
+    """N5: the rule ``request_once`` exists for, pinned.
+
+    herdr 0.9.0 accepts ``events.subscribe`` only as a connection's FIRST
+    message; after a plain request it answers by resetting the connection. So a
+    client that means to stream must keep its connection clean, and the protocol
+    read and the snapshot have to happen somewhere else. This asserts the shape
+    rather than the server's reaction: on the STREAMING connection the client
+    sends exactly one message before ``events.subscribe``, namely nothing.
+    """
+    seen: list[tuple[int, str]] = []
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        # ``requests`` is ordered across every connection; the connection index
+        # is what distinguishes the stream from the one-shots.
+        seen.append((len(server._writers), str(request.get("method"))))
+        await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        await client.check_protocol()
+        await client.subscribe([{"type": "pane.updated"}])
+        await client.snapshot()
+        await client.close()
+
+    # The protocol read and the snapshot each opened their OWN connection, so by
+    # the time the stream's subscribe arrives more than one connection exists —
+    # and the FIRST connection carried no request before it.
+    stream_methods = [method for conns, method in seen if conns == 1]
+    assert stream_methods and stream_methods[0] == "events.subscribe"
+    assert [m for _c, m in seen].count(
+        "session.snapshot"
+    ) == 2, "check_protocol and snapshot each take a one-shot connection"
+
+
+async def test_an_absent_schema_version_does_not_auto_match_the_pin(socket_path: str) -> None:
+    """N6: 0.9.0 sends no ``schema_version``, and r1 defaulted the missing value
+    TO the pin — so the D7 check asserted something it had never read. An absent
+    schema is not a mismatch, but the pin it satisfies is ``protocol`` alone."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        await server.reply(request["id"], {"snapshot": {"panes": [], "protocol": HERDR_PROTOCOL}})
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        snapshot = await client.check_protocol()
+        assert snapshot["protocol"] == HERDR_PROTOCOL
+        assert "schema_version" not in snapshot
+        await client.close()
+
+
+async def test_a_present_but_wrong_schema_version_still_refuses(socket_path: str) -> None:
+    """The other half of N6: a future herdr that reintroduces the field is still
+    checked, rather than silently accepted."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        await server.reply(
+            request["id"],
+            {"snapshot": {"panes": [], "protocol": HERDR_PROTOCOL, "schema_version": 99}},
+        )
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        await client.connect()
+        with pytest.raises(HerdrProtocolMismatch):
+            await client.check_protocol()
+        await client.close()

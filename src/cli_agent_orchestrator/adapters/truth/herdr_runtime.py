@@ -87,6 +87,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Any
 
 from cli_agent_orchestrator.adapters.herdr.client import (
@@ -133,12 +134,42 @@ HERDR_STATUS_TO_EVENT: dict[str, EventKind] = {
 #: distinction visible to ``cao diag`` without giving it a state of its own.
 _UNSEEN_ACTIVITY_STATUSES = frozenset({"done"})
 
-#: The broadcast subscription this source sends.  A single ``pane.updated`` with
-#: NO pane filter, so a pane registered after connect is already covered — the
-#: same broadcast shape ``herdr_inbox_service`` uses, and the reason only ONE
-#: ``events.subscribe`` is ever sent per connection (herdr resets the connection
-#: on a second one).
-_SUBSCRIPTIONS: list[dict[str, Any]] = [{"type": "pane.updated"}]
+#: The broadcast half of this source's subscription.  ``pane.updated`` carries
+#: pane METADATA — creation, focus, revision bumps — and nothing else; measured
+#: on herdr 0.9.0, an echo into a pane produces zero frames.
+_BROADCAST_SUBSCRIPTIONS: list[dict[str, Any]] = [{"type": "pane.updated"}]
+
+#: The one frame that carries a lifecycle transition, spelled the way herdr
+#: spells it on the wire — DOTS, not underscores (see :meth:`_handle_event`).
+PANE_AGENT_STATUS_CHANGED = "pane.agent_status_changed"
+
+
+def _subscriptions_for(pane_id: str | None) -> list[dict[str, Any]]:
+    """The ONE ``events.subscribe`` this connection may send.
+
+    An agent-status transition does NOT emit ``pane.updated``.  It emits
+    ``pane.agent_status_changed``, which is a PER-PANE subscription — sent
+    without a ``pane_id`` herdr refuses it with ``missing field 'pane_id'`` and
+    closes the connection.  Measured on 0.9.0 (five ``report_agent`` transitions,
+    five ``pane.agent_status_changed`` pushes, not one accompanying
+    ``pane.updated``); upstream ``ogulcancelik/herdr#2115`` describes it.
+
+    So subscribing to the broadcast alone is a stream that can never carry the
+    lifecycle this source exists to read — which is exactly what the H1 live
+    round observed as total silence.
+
+    herdr resets the connection on a SECOND ``events.subscribe``, so the per-pane
+    spec cannot be added later; it is BATCHED into this one call, which herdr
+    accepts.  PR #502's reconnect-storm argument for replacing per-pane specs
+    with one broadcast applies to the SHARED ``herdr_inbox_service`` connection,
+    not here: this is one source per CAO terminal with its own connection and one
+    pane, so there is no storm to cause.
+    """
+    subscriptions = list(_BROADCAST_SUBSCRIPTIONS)
+    if pane_id:
+        subscriptions.append({"type": "pane.agent_status_changed", "pane_id": pane_id})
+    return subscriptions
+
 
 #: Reconnect backoff doubles each failure up to a ceiling.  The MULTIPLIER is a
 #: dimensionless ratio, not a duration, so it is a module constant here; the base
@@ -229,6 +260,12 @@ class HerdrRuntimeSource:
         # (``test_no_other_new_module_defines_a_duration_constant``), and this
         # module's backoff seconds are arg defaults for exactly the same reason.
         probe_keepalive_s: float = NO_SIGNAL_S / 4.0,
+        # How long a pushed frame vouches for the stream.  Generous on purpose:
+        # herdr's frames are edge-triggered, so a worker that holds one status
+        # legitimately pushes nothing, and the question this bound answers is
+        # "has the subscription gone dead", not "is the worker busy".  Past it
+        # the source stops asserting health rather than asserting a stale one.
+        stream_proof_ttl_s: float = NO_SIGNAL_S * 10.0,
     ) -> None:
         if not herdr_terminal_id and not pane_id:
             raise ValueError(
@@ -284,6 +321,11 @@ class HerdrRuntimeSource:
         self._bound_pane_id: str | None = pane_id
         self._probe_keepalive_s = probe_keepalive_s
         self._keepalive_task: asyncio.Task[None] | None = None
+        #: ``time.monotonic()`` of the last PUSHED frame that belonged to this
+        #: source.  ``None`` until the subscription delivers one — which is what
+        #: makes "never received a frame" distinguishable from "quiet worker".
+        self._last_push_at: float | None = None
+        self._stream_proof_ttl_s = stream_proof_ttl_s
 
     # -- EventSource ---------------------------------------------------------
 
@@ -318,13 +360,61 @@ class HerdrRuntimeSource:
                 pass
 
     def stop_sync(self) -> None:
-        """Signal the loop to end without awaiting it — teardown from sync code."""
+        """End the source from SYNC code, which is always another thread.
+
+        Every caller is a legacy worker thread: ``detach`` runs inside
+        ``terminal_service.detach_observation`` under the lifecycle lock, never on
+        the server loop.  ``Task.cancel()`` is not thread-safe — it reaches
+        ``loop.call_soon``, whose ``_check_thread`` raises ``RuntimeError:
+        Non-thread-safe operation invoked on an event loop other than the current
+        one``.  That was latent until the source actually ran on a loop; once it
+        did, teardown raised, and the raise happened BEFORE the caller dropped
+        this terminal's authority, so a deleted terminal stayed authoritative and
+        fallback-muted for the life of the process while its task and socket
+        leaked.
+
+        ``_stopping`` alone is not enough either: it is only observed at the next
+        frame or keepalive tick, and a parked ``async for`` may never reach one.
+        So the cancellation is HANDED to the loop, and the client is closed there
+        too — ``stop_sync`` previously never closed it at all.
+        """
         self._stopping.set()
-        self._stop_keepalive()
         task = self._task
         self._task = None
-        if task is not None:
-            task.cancel()
+        keepalive = self._keepalive_task
+        self._keepalive_task = None
+        client = self._client
+        self._client = None
+        loop = self._loop_of(task) or _installed_loop()
+        if loop is None or loop.is_closed():
+            # No loop to hand it to: the source was never scheduled (a test
+            # driving it by hand), so there is nothing running to cancel.
+            return
+
+        def _teardown() -> None:
+            for pending in (keepalive, task):
+                if pending is not None:
+                    pending.cancel()
+            if client is not None:
+                asyncio.ensure_future(client.close())
+
+        try:
+            loop.call_soon_threadsafe(_teardown)
+        except RuntimeError:  # pragma: no cover - loop closed under us
+            logger.debug(
+                "herdr runtime source %s teardown could not reach the loop",
+                self.terminal_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _loop_of(task: "asyncio.Task[None] | None") -> asyncio.AbstractEventLoop | None:
+        if task is None:
+            return None
+        try:
+            return task.get_loop()
+        except RuntimeError:  # pragma: no cover - defensive
+            return None
 
     # -- the run loop --------------------------------------------------------
 
@@ -371,18 +461,16 @@ class HerdrRuntimeSource:
         self._client = client
         await client.connect()
         await client.check_protocol()
-        await client.subscribe(_SUBSCRIPTIONS)
+        await client.subscribe(_subscriptions_for(self._bound_pane_id))
         logger.debug(
             "herdr runtime source %s subscribed (herdr_terminal_id=%s pane_id=%s)",
             self.terminal_id,
             self._herdr_terminal_id,
             self._bound_pane_id,
         )
-        # A live subscription IS this source's health, and it is the only thing
-        # that keeps the projector muting the pane fallback (§5/§6).  Bump the
-        # column immediately on connect and then on a heartbeat, so a worker that
-        # simply says nothing for a minute does not read as a dead source.
-        self._touch_source_probe()
+        # NOT a health bump.  A live subscription is not evidence that the
+        # subscription DELIVERS — r1's defect — so connecting proves nothing and
+        # the column stays NULL until a pushed frame arrives.
         self._start_keepalive()
         try:
             # Recipe step 2: snapshot after subscribing, apply current state, THEN
@@ -421,6 +509,23 @@ class HerdrRuntimeSource:
         and §5's source-level precedence silently never engages.  Nothing in the
         shipped adapter called this, which is why wiring it was a precondition
         for the seam binding at all rather than an optimisation.
+
+        **The column means "the push stream delivered", not "a socket is open",
+        and the distinction is the whole of the rule.**  r1 bumped it on connect,
+        on the connect-time snapshot, and on an unconditional keepalive.  For a
+        file-tailing source that reading is fine; for a PUSH-subscription source
+        it inverts the column's meaning — a subscription that is ACKed and
+        permanently silent becomes indistinguishable from one delivering every
+        transition, so the projector mutes the scraped lifecycle and the terminal
+        freezes at whatever the connect snapshot said, forever, while ``cao diag``
+        reports that frozen value as authoritative truth.  That is a false-idle
+        generator, and the H1 live round produced exactly the silent subscription
+        that triggers it.
+
+        So this is called from ONE place — a pushed frame that belongs — and the
+        keepalive only re-bumps while the last pushed frame is recent.  A source
+        that has never received a frame leaves the column NULL, reads UNHEALTHY,
+        and mutes nothing.
 
         Best-effort by the same rule :func:`~adapters.truth.wiring.emit` follows:
         a diagnostic may never raise into the thing it observes.
@@ -466,12 +571,32 @@ class HerdrRuntimeSource:
             task.cancel()
 
     async def _keepalive_loop(self) -> None:
-        """Bump source health while the subscription is up but quiet."""
+        """Re-bump source health while the stream is PROVEN and merely quiet.
+
+        A worker can legitimately hold one status for far longer than
+        ``NO_SIGNAL_S``, and herdr's frames are edge-triggered — an idle pane
+        pushes nothing.  So a proven stream needs a heartbeat or the projector
+        would doubt it for being calm.
+
+        The bound is what keeps that from re-creating the r1 defect: the
+        heartbeat only continues while a real frame arrived within
+        ``_stream_proof_ttl_s``.  Past that the source stops asserting health and
+        the projection degrades, which is the honest reading of a subscription
+        that has gone quiet for longer than the worker plausibly has.
+        """
         while not self._stopping.is_set():
             await asyncio.sleep(self._probe_keepalive_s)
             if self._stopping.is_set():
                 return
-            self._touch_source_probe()
+            if self._stream_is_proven():
+                self._touch_source_probe()
+
+    def _stream_is_proven(self) -> bool:
+        """Has a pushed frame arrived recently enough to vouch for the stream?"""
+        last = self._last_push_at
+        if last is None:
+            return False
+        return (time.monotonic() - last) <= self._stream_proof_ttl_s
 
     async def _apply_snapshot(self, client: HerdrClient) -> None:
         """Seed per-pane status from ``api snapshot`` without replaying history.
@@ -496,7 +621,10 @@ class HerdrRuntimeSource:
             return
         for pane in panes:
             if isinstance(pane, dict) and self._pane_belongs(pane):
-                self._process_pane(pane)
+                # pushed=False: a snapshot reports a LEVEL, not an edge, and a
+                # level the server volunteered on connect is no evidence that the
+                # subscription will ever deliver one.
+                self._process_pane(pane, pushed=False)
 
     # -- event handling ------------------------------------------------------
 
@@ -507,9 +635,20 @@ class HerdrRuntimeSource:
         under ``data.pane``; a broadcast ``pane.updated`` is the only kind this
         source subscribes to, so anything else is ignored defensively.
         """
-        raw_name = event.get("event") or event.get("type") or ""
-        event_name = str(raw_name).replace("_", ".")
-        if event_name != "pane.updated":
+        raw_name = str(event.get("event") or event.get("type") or "")
+        # herdr names its two schemas differently in pushed frames, and a blanket
+        # underscore->dot rewrite destroys the second family:
+        #   EventKind              underscores  pane_updated, pane_created,
+        #                                       tab_created, pane_agent_detected
+        #   SubscriptionEventKind  dots         pane.agent_status_changed,
+        #                                       pane.output_matched
+        # ``"pane.agent_status_changed".replace("_", ".")`` is
+        # ``pane.agent.status.changed``, so a branch added after the rewrite can
+        # never match.  Match the dotted family on the RAW name first.
+        if raw_name == PANE_AGENT_STATUS_CHANGED:
+            self._handle_agent_status_changed(event)
+            return
+        if raw_name.replace("_", ".") != "pane.updated":
             return
         data = event.get("data")
         data_dict = data if isinstance(data, dict) else {}
@@ -529,7 +668,36 @@ class HerdrRuntimeSource:
                 self._bound_session,
             )
             return
-        self._process_pane(pane_dict)
+        self._process_pane(pane_dict, pushed=True)
+
+    def _handle_agent_status_changed(self, event: dict[str, Any]) -> None:
+        """Route a per-pane ``pane.agent_status_changed`` frame.
+
+        Its payload is FLAT — ``{pane_id, workspace_id, agent, agent_status, …}``
+        — with no ``data.pane`` nesting, which :meth:`_pane_belongs` and
+        :meth:`_process_pane` already read correctly because both key off
+        ``pane_id`` / ``terminal_id`` / ``agent_session`` rather than the wrapper.
+
+        This is the ONLY frame that carries a lifecycle transition.  It is also
+        the only frame that counts as proof the push stream is alive — see
+        :meth:`_touch_source_probe`.
+        """
+        data = event.get("data")
+        pane = data if isinstance(data, dict) else event
+        if not isinstance(pane, dict):
+            return
+        if not self._pane_belongs(pane):
+            logger.debug(
+                "herdr runtime source %s ignored an agent_status frame: pane_id=%r "
+                "terminal_id=%r (bound pane_id=%r herdr_terminal_id=%r)",
+                self.terminal_id,
+                pane.get("pane_id"),
+                pane.get("terminal_id"),
+                self._bound_pane_id,
+                self._herdr_terminal_id,
+            )
+            return
+        self._process_pane(pane, pushed=True)
 
     def _pane_belongs(self, pane: dict[str, Any]) -> bool:
         """Whether this pane record is the one this source's terminal is bound to.
@@ -612,8 +780,13 @@ class HerdrRuntimeSource:
             self._bound_session = session
         self._learn_ephemeral(pane)
 
-    def _process_pane(self, pane: dict[str, Any]) -> None:
+    def _process_pane(self, pane: dict[str, Any], *, pushed: bool = False) -> None:
         """Map one pane record's ``agent_status`` to a boundary and emit it.
+
+        ``pushed`` says the record came off the SUBSCRIPTION rather than the
+        connect-time snapshot.  Only a pushed record proves the stream is
+        delivering, and only a pushed record bumps source health — see
+        :meth:`_touch_source_probe`.
 
         Edge-triggered on ``(pane_id, agent_status)``: a repeated status is not a
         new boundary.  A status with no mapping (``blocked``/``unknown``) updates
@@ -624,11 +797,14 @@ class HerdrRuntimeSource:
         status = pane.get("agent_status")
         if not isinstance(status, str) or not status:
             return
-        # A pane record that BELONGS is this source's proof of life, whether or
-        # not it carries a new boundary — a repeated ``working`` is still the
-        # stream delivering truth.  Bump health before the edge check so a busy
-        # worker that reports the same status for a minute stays healthy.
-        self._touch_source_probe()
+        if pushed:
+            # Proof of life, whether or not it carries a new boundary: a repeated
+            # ``working`` is still the STREAM delivering truth.  Bumped before the
+            # edge check so a busy worker reporting the same status for a minute
+            # stays healthy.  A SNAPSHOT record is deliberately not proof — see
+            # :meth:`_touch_source_probe`.
+            self._last_push_at = time.monotonic()
+            self._touch_source_probe()
         self._remember_identity(pane)
         if pane_id:
             self._tracked_panes.add(pane_id)
@@ -780,6 +956,9 @@ class HerdrRuntimeSource:
         # the resnapshot on reconnect re-emits the true current boundary as an
         # edge rather than suppressing it as a repeat.
         self._last_status.clear()
+        # And the stream is no longer proven: the next connection has to earn
+        # health with a pushed frame of its own, exactly as the first did.
+        self._last_push_at = None
 
     async def _close_client(self) -> None:
         client = self._client
@@ -839,6 +1018,12 @@ def attach(
         _sources[cao_terminal_id] = source
     _schedule(source)
     return source
+
+
+def _installed_loop() -> asyncio.AbstractEventLoop | None:
+    """The server loop recorded by the composition root, if any."""
+    with _lock:
+        return _loop
 
 
 def _schedule(source: HerdrRuntimeSource) -> None:

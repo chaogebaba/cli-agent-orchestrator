@@ -411,11 +411,15 @@ class HerdrClient:
         """
         snapshot = await self.snapshot()
         got_protocol = snapshot.get("protocol")
-        # 0.9.0 reports no separate schema number; the protocol number carries
-        # the wire contract on its own, so an absent schema version matches the
-        # pin rather than failing it.
-        got_schema = snapshot.get("schema_version", HERDR_SCHEMA_VERSION)
-        if got_protocol != HERDR_PROTOCOL or got_schema != HERDR_SCHEMA_VERSION:
+        # 0.9.0 reports no separate schema number, so an ABSENT one is not a
+        # mismatch — but it is not a match either, and defaulting it to the pin
+        # (r1) made the D7 check assert something it had not read. The pin is
+        # carried by ``protocol``; ``schema_version`` is compared only when the
+        # server actually sends it, so a future herdr that reintroduces it is
+        # still checked rather than silently accepted.
+        got_schema = snapshot.get("schema_version")
+        schema_mismatch = got_schema is not None and got_schema != HERDR_SCHEMA_VERSION
+        if got_protocol != HERDR_PROTOCOL or schema_mismatch:
             raise HerdrProtocolMismatch(
                 got_protocol=int(got_protocol) if isinstance(got_protocol, int) else -1,
                 got_schema=int(got_schema) if isinstance(got_schema, int) else -1,

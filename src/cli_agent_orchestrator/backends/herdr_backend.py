@@ -158,13 +158,21 @@ def attach_herdr_runtime_source(
         registry = _worker_truth_sources()
         if registry is None:
             return
+        if not terminal_certified(terminal_id):
+            # The source runs and appends events — that is what a live round
+            # observes — but it does NOT claim authority.  Registering an
+            # uncertified terminal would mute its scraped lifecycle behind a
+            # source no one has certified, and §1 is explicit that certification,
+            # not the backend setting, is what switches a terminal over.
+            return
         registry.add(terminal_id)
-        if terminal_certified(terminal_id):
-            # §6(ii): a CERTIFIED terminal's derived lifecycle stays muted even
-            # when this source is stale or gone — the cohort degrades rather than
-            # silently reverting to scraped lifecycle.  The flag rides on the
-            # registry because the projector may never ask an adapter anything.
-            registry.set_fallback_disabled(terminal_id)
+        # §6(ii): a CERTIFIED terminal's derived lifecycle stays muted even when
+        # this source is stale or gone — the cohort degrades rather than silently
+        # reverting to scraped lifecycle.  The flag rides on the registry because
+        # the projector may never ask an adapter anything.  The projector gates it
+        # on the source having actually delivered, so this mark alone cannot
+        # freeze a terminal on snapshot-only evidence.
+        registry.set_fallback_disabled(terminal_id)
     except Exception:
         logger.debug(
             "herdr runtime source attach failed for %s (non-fatal)", terminal_id, exc_info=True
@@ -190,15 +198,28 @@ def detach_herdr_runtime_source(terminal_id: str) -> None:
         from cli_agent_orchestrator.adapters.truth import herdr_runtime
 
         herdr_runtime.detach(terminal_id)
-        registry = _worker_truth_sources()
-        if registry is not None:
-            registry.discard(terminal_id)
-            registry.clear_fallback_disabled(terminal_id)
     except Exception:
         logger.debug(
             "herdr runtime source detach failed for %s (non-fatal)", terminal_id, exc_info=True
         )
     finally:
+        # In a FINALLY, and this is the load-bearing part: if stopping the source
+        # raises, the terminal must still lose its authority and its §6(ii) mute.
+        # The r1 ordering put these after the raise, so a deleted terminal stayed
+        # authoritative and fallback-muted for the life of the process — a
+        # terminal that publishes nothing, forever, from one failed teardown.
+        try:
+            registry = _worker_truth_sources()
+            if registry is not None:
+                # One transition, so no projection can observe the pair
+                # half-applied.
+                registry.forget(terminal_id)
+        except Exception:
+            logger.debug(
+                "herdr runtime registry cleanup failed for %s (non-fatal)",
+                terminal_id,
+                exc_info=True,
+            )
         forget_terminal(terminal_id)
 
 
@@ -850,6 +871,29 @@ class HerdrBackend(TerminalBackend):
                     out.append(str(tid))
         return out
 
+    def _terminal_id_for_window(self, session_name: str, window_name: str) -> Optional[str]:
+        """Reverse-resolve a CAO terminal id from a (session, window) pair.
+
+        ``kill_window`` is addressed by label and never sees a terminal id, which
+        is why the H1 detach anchor is ``terminal_service.detach_observation``.
+        This is the belt to that suspenders: resolve the window's pane and look it
+        up in the durable map, which F930 keys by CAO terminal id. Best-effort —
+        ``None`` simply means the terminal-id-bearing teardown remains the only
+        detach, which is the r1 behaviour.
+        """
+        try:
+            pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        except (TerminalBackendError, TerminalNotFoundError):
+            return None
+        # ``_pane_cache`` is the only structure keyed BY the CAO terminal id
+        # (F930 re-keyed ``_pane_id_map`` by (session, window), which is what we
+        # already hold and so cannot invert to a terminal). Seeded at create for
+        # every terminal this backend made, which is every terminal it can kill.
+        for terminal_id, (cached_pane_id, _cached_at) in dict(self._pane_cache).items():
+            if cached_pane_id == pane_id:
+                return terminal_id
+        return None
+
     def kill_window(self, session_name: str, window_name: str) -> bool:
         """Close a single terminal's TAB, collapsing the workspace only when it
         is the last tab (F881 #734, decision B).
@@ -872,6 +916,14 @@ class HerdrBackend(TerminalBackend):
         (``workspace close``) unchanged; this method only governs per-terminal
         teardown.
         """
+        # WP-HERDR H1 (N7): detach the lifecycle source here too, BEFORE the pane
+        # goes, while the pane id is still resolvable. Idempotent with the
+        # terminal-id-bearing teardown in ``terminal_service``, so both firing is
+        # correct rather than merely tolerated, and either one alone suffices.
+        _killed_terminal_id = self._terminal_id_for_window(session_name, window_name)
+        if _killed_terminal_id:
+            detach_herdr_runtime_source(_killed_terminal_id)
+
         # Resolve the workspace and this window's tab. If either cannot be
         # resolved the terminal/tab is already gone — nothing to close.
         try:

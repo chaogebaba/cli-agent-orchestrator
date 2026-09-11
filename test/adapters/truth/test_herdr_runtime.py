@@ -18,6 +18,7 @@ these reuse the lane-B fakes in ``test/adapters/truth/conftest.py`` (``store``,
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Iterator
@@ -446,7 +447,24 @@ class _RecordingStateStore:
         return []
 
 
-def test_an_applied_pane_event_bumps_source_health(
+def _recording_states(monkeypatch: pytest.MonkeyPatch) -> "_RecordingStateStore":
+    """Swap the installed runtime for one whose StateStore records probe bumps."""
+    from cli_agent_orchestrator.adapters.truth import wiring
+
+    runtime = wiring.producer_runtime()
+    assert runtime is not None
+    states = _RecordingStateStore()
+    monkeypatch.setattr(
+        wiring,
+        "_runtime",
+        wiring.ProducerRuntime(
+            store=runtime.store, clock=runtime.clock, state_store=states  # type: ignore[arg-type]
+        ),
+    )
+    return states
+
+
+def test_a_pushed_frame_bumps_source_health(
     ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Without this the projector never believes the source and §5 never engages.
@@ -455,20 +473,9 @@ def test_an_applied_pane_event_bumps_source_health(
     UNHEALTHY, so a source that never bumps it is muted-by-nothing: every derived
     pane event applies and source-level precedence is dead code.
     """
-    from cli_agent_orchestrator.adapters.truth import wiring
-
-    runtime = wiring.producer_runtime()
-    assert runtime is not None
-    states = _RecordingStateStore()
-    monkeypatch.setattr(
-        wiring,
-        "_runtime",
-        wiring.ProducerRuntime(
-            store=runtime.store, clock=runtime.clock, state_store=states  # type: ignore[arg-type]
-        ),
-    )
+    states = _recording_states(monkeypatch)
     source = _source()
-    source._process_pane(_pane("working"))
+    source._process_pane(_pane("working"), pushed=True)
     assert states.probes == [CAO_TID]
 
 
@@ -476,25 +483,84 @@ def test_source_health_is_bumped_even_when_the_status_did_not_change(
     ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A busy worker reporting ``working`` for a minute is a HEALTHY source, not
-    a silent one — so health is a heartbeat, not an event count."""
-    from cli_agent_orchestrator.adapters.truth import wiring
-
-    runtime = wiring.producer_runtime()
-    assert runtime is not None
-    states = _RecordingStateStore()
-    monkeypatch.setattr(
-        wiring,
-        "_runtime",
-        wiring.ProducerRuntime(
-            store=runtime.store, clock=runtime.clock, state_store=states  # type: ignore[arg-type]
-        ),
-    )
+    a silent one — so among PUSHED frames, health is a heartbeat and not an
+    event count."""
+    states = _recording_states(monkeypatch)
     source = _source()
-    source._process_pane(_pane("working"))
-    source._process_pane(_pane("working"))
-    source._process_pane(_pane("working"))
+    for _ in range(3):
+        source._process_pane(_pane("working"), pushed=True)
     assert len(states.probes) == 3
     assert ingest_on.kinds(CAO_TID) == [EventKind.TURN_STARTED.value]
+
+
+# --------------------------------------------------------------------------
+# r2: health is evidence the STREAM delivered, not evidence a socket is open
+# --------------------------------------------------------------------------
+
+
+def test_a_snapshot_record_is_not_proof_of_a_live_stream(
+    ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The r1 defect, pinned.
+
+    A subscription can be ACKed and permanently silent — measured on herdr 0.9.0
+    with the wrong subscription — and the connect-time snapshot still reports a
+    level.  If that level bumped health, the projector would mute the scraped
+    lifecycle and the terminal would freeze at whatever herdr said at attach,
+    forever, while ``cao diag`` called it authoritative.  A snapshot emits its
+    boundary and proves nothing.
+    """
+    states = _recording_states(monkeypatch)
+    source = _source()
+    source._process_pane(_pane("idle"), pushed=False)
+    assert ingest_on.kinds(CAO_TID) == [EventKind.TURN_ENDED.value]
+    assert states.probes == []
+    assert source._stream_is_proven() is False
+
+
+def test_the_keepalive_is_silent_until_the_stream_has_proven_itself(
+    ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A heartbeat for a stream that has never delivered is the r1 defect with
+    extra steps, so the keepalive asks first."""
+    states = _recording_states(monkeypatch)
+    source = _source()
+    assert source._stream_is_proven() is False
+    if source._stream_is_proven():  # pragma: no cover - the guard under test
+        source._touch_source_probe()
+    assert states.probes == []
+
+    source._process_pane(_pane("working"), pushed=True)
+    states.probes.clear()
+    assert source._stream_is_proven() is True
+    if source._stream_is_proven():
+        source._touch_source_probe()
+    assert states.probes == [CAO_TID]
+
+
+def test_stream_proof_expires(ingest_on: FakeEventStore) -> None:
+    """Past the TTL a source stops asserting health rather than asserting a stale
+    one — the bound that keeps the heartbeat from re-creating the r1 defect."""
+    source = HerdrRuntimeSource(
+        CAO_TID,
+        herdr_terminal_id=HERDR_TID,
+        socket_path="/u.sock",
+        stream_proof_ttl_s=0.0,
+    )
+    source._process_pane(_pane("working"), pushed=True)
+    assert source._stream_is_proven() is False
+
+
+def test_a_gap_revokes_the_stream_proof(
+    ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next connection earns health with a frame of its own, as the first did."""
+    _recording_states(monkeypatch)
+    source = _source()
+    source._process_pane(_pane("working"), pushed=True)
+    assert source._stream_is_proven() is True
+    source._emit_gap_degraded()
+    assert source._stream_is_proven() is False
 
 
 def test_a_gap_does_not_bump_source_health(
@@ -605,3 +671,144 @@ async def test_run_loop_emits_gap_degraded_on_stream_drop(ingest_on: FakeEventSt
     missing = ingest_on.of_kind(EventKind.PANE_MISSING, CAO_TID)
     assert missing, "a dropped stream degrades the source"
     assert missing[0].payload["reason"] == DegradedReason.NO_SIGNAL.value
+
+
+# --------------------------------------------------------------------------
+# r2: the subscription herdr actually pushes lifecycle on, and its wire naming
+# --------------------------------------------------------------------------
+
+#: A recorded ``pane.agent_status_changed`` frame, herdr 0.9.0. Two things make
+#: it the load-bearing fixture: the event name is DOT-separated, and the payload
+#: is FLAT — no ``data.pane`` wrapper. Captured on grok-box-010 by the herdr-fix
+#: lane (`/data/claude-scratch/cli-subagents/herdr-fix/push-stream.md` §3).
+AGENT_STATUS_FRAME: dict[str, Any] = {
+    "event": "pane.agent_status_changed",
+    "data": {
+        "pane_id": "w2:p1",
+        "workspace_id": "w2",
+        "terminal_id": HERDR_TID,
+        "agent": "codex",
+        "agent_status": "working",
+        "screen_detection_skipped": True,
+        "state_change_seq": 11,
+    },
+}
+
+#: A recorded ``pane_updated`` frame — UNDERSCORE-separated, nested under
+#: ``data.pane``. The two conventions are herdr's two schemas (EventKind uses
+#: underscores, SubscriptionEventKind uses dots), and a source has to read both.
+PANE_UPDATED_FRAME: dict[str, Any] = {
+    "event": "pane_updated",
+    "data": {"pane": {"pane_id": "w2:p1", "terminal_id": HERDR_TID, "agent_status": "idle"}},
+}
+
+
+def test_the_subscription_carries_this_source_s_own_pane_status_stream() -> None:
+    """The r1 silence, fixed at its cause.
+
+    An agent-status transition does not emit ``pane.updated`` — measured on
+    0.9.0, five transitions produced five ``pane.agent_status_changed`` pushes
+    and not one ``pane.updated``; upstream ogulcancelik/herdr#2115. So the
+    broadcast alone is a stream that can never carry the lifecycle this source
+    exists to read, and the per-pane spec must ride in the SAME subscribe,
+    because herdr resets the connection on a second one.
+    """
+    subs = herdr_runtime._subscriptions_for("w2:p1")
+    assert {"type": "pane.updated"} in subs
+    assert {"type": "pane.agent_status_changed", "pane_id": "w2:p1"} in subs
+    assert len(subs) == 2, "both specs batch into the ONE subscribe herdr allows"
+
+
+def test_the_per_pane_spec_is_omitted_when_no_pane_is_bound() -> None:
+    """herdr refuses ``pane.agent_status_changed`` without a ``pane_id`` and
+    CLOSES the connection, so a source with no pane id must not send it —
+    one malformed spec costs the whole stream."""
+    assert herdr_runtime._subscriptions_for(None) == [{"type": "pane.updated"}]
+
+
+def test_a_dot_named_agent_status_frame_is_read(ingest_on: FakeEventStore) -> None:
+    """The trap: ``"pane.agent_status_changed".replace("_", ".")`` is
+    ``pane.agent.status.changed``, so a branch behind the r1 normaliser could
+    never match. The dotted family is matched on the RAW name."""
+    source = HerdrRuntimeSource(CAO_TID, pane_id="w2:p1", socket_path="/u.sock")
+    source._handle_event(AGENT_STATUS_FRAME)
+    assert ingest_on.kinds(CAO_TID) == [EventKind.TURN_STARTED.value]
+    rows = ingest_on.of_kind(EventKind.TURN_STARTED, CAO_TID)
+    assert rows[0].payload["herdr_status"] == "working"
+    assert rows[0].terminal_id == CAO_TID
+
+
+def test_the_underscore_named_family_still_normalises(ingest_on: FakeEventStore) -> None:
+    """The other convention, unbroken: ``pane_updated`` -> ``pane.updated``."""
+    source = HerdrRuntimeSource(CAO_TID, pane_id="w2:p1", socket_path="/u.sock")
+    source._handle_event(PANE_UPDATED_FRAME)
+    assert ingest_on.kinds(CAO_TID) == [EventKind.TURN_ENDED.value]
+
+
+def test_a_pushed_agent_status_frame_proves_the_stream(
+    ingest_on: FakeEventStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The frame that carries lifecycle is the frame that vouches for health."""
+    states = _recording_states(monkeypatch)
+    source = HerdrRuntimeSource(CAO_TID, pane_id="w2:p1", socket_path="/u.sock")
+    source._handle_event(AGENT_STATUS_FRAME)
+    assert states.probes == [CAO_TID]
+    assert source._stream_is_proven() is True
+
+
+def test_an_agent_status_frame_for_another_pane_is_ignored(ingest_on: FakeEventStore) -> None:
+    """Binding is checked on the flat payload exactly as on the nested one."""
+    source = HerdrRuntimeSource(CAO_TID, pane_id="w9:p9", socket_path="/u.sock")
+    source._handle_event(AGENT_STATUS_FRAME)
+    assert ingest_on.rows == []
+
+
+# --------------------------------------------------------------------------
+# r2: teardown from a worker thread must reach the loop, never raise
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_sync_from_another_thread_cancels_without_raising(
+    ingest_on: FakeEventStore,
+) -> None:
+    """``detach`` runs on the terminal-delete WORKER THREAD, and
+    ``Task.cancel()`` is not thread-safe — it reaches ``loop.call_soon``, whose
+    ``_check_thread`` raises.  Before the loop fix this was latent (``_task`` was
+    always None off-loop); after it, teardown raised for real, and the raise
+    happened before the caller dropped the terminal's authority.
+    """
+    import threading
+
+    loop = asyncio.get_running_loop()
+    herdr_runtime.set_event_loop(loop)
+    source = HerdrRuntimeSource(CAO_TID, herdr_terminal_id=HERDR_TID, socket_path="/u.sock")
+
+    async def _park() -> None:
+        await asyncio.sleep(3600)
+
+    parked = asyncio.create_task(_park())
+    source._task = parked
+    await asyncio.sleep(0)
+
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            source.stop_sync()
+        except BaseException as exc:  # noqa: BLE001 - the whole point of the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    thread.join(timeout=5)
+    assert errors == [], f"stop_sync raised off-loop: {errors!r}"
+
+    # The cancellation was HANDED to the loop, so it lands on the next turn of
+    # it rather than inside the worker thread's call.
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if parked.done():
+            break
+    assert parked.done(), "the parked task outlived teardown"
+    herdr_runtime.set_event_loop(None)

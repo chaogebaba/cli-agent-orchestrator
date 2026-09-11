@@ -1455,6 +1455,21 @@ def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
     return issuance_ticks, issuance_boot_id
 
 
+def _active_backend_is_herdr() -> bool:
+    """Is this server actually running the herdr backend?
+
+    Read from the same ConfigService key the backend factory resolves
+    (``terminal.backend``), not from the routing row: the row states intent, and
+    the server's own backend is the fact.
+    """
+    try:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        return str(ConfigService.get("terminal.backend", default="tmux")) == "herdr"
+    except Exception:
+        return False
+
+
 def _bind_herdr_certification(
     terminal_id: Optional[str], agent_profile: Optional[str], provider: Optional[str]
 ) -> None:
@@ -1488,12 +1503,19 @@ def _bind_herdr_certification(
         from cli_agent_orchestrator.utils.agent_profiles import split_effective_name
         from cli_agent_orchestrator.utils.routing import herdr_cell_certified
 
-        split = split_effective_name(agent_profile or "")
-        if split is not None:
-            position, name_provider = split
-            certified = herdr_cell_certified(
-                position, name_provider or provider or "", positions_store_dir()
-            )[0]
+        # The BACKEND has to be herdr, and this is not a formality. A cell
+        # certified for herdr but spawned on tmux has no herdr source at all; a
+        # predicate that ignored the backend would still gate pi's scraper off
+        # and skip the pane sampler, leaving that terminal with no lifecycle
+        # producer whatsoever. Certification names the pair (cell, backend), so
+        # the predicate has to read both.
+        if _active_backend_is_herdr():
+            split = split_effective_name(agent_profile or "")
+            if split is not None:
+                position, name_provider = split
+                certified = herdr_cell_certified(
+                    position, name_provider or provider or "", positions_store_dir()
+                )[0]
     except Exception:
         logger.debug(
             "herdr certification could not be resolved for %s; treating as uncertified",

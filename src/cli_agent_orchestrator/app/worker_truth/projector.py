@@ -199,16 +199,34 @@ class StaticSourceRegistry:
     ) -> None:
         self._terminal_ids = set(terminal_ids)
         self._fallback_disabled_ids = set(fallback_disabled_ids)
+        # Writers are legacy WORKER THREADS (the backend shim, at terminal create
+        # and teardown); the reader is the projector, on the server loop.  A bare
+        # ``set`` is not the race a reviewer worries about — CPython's GIL makes
+        # ``add``/``discard``/``in`` individually atomic — but the pair
+        # ``discard`` + ``clear_fallback_disabled`` must not be observed
+        # half-applied, or a terminal reads unauthoritative AND fallback-muted
+        # for one projection, i.e. publishing nothing.  One lock, so teardown is
+        # one transition.
+        self._lock = threading.RLock()
 
     def add(self, terminal_id: str) -> None:
-        self._terminal_ids.add(terminal_id)
+        with self._lock:
+            self._terminal_ids.add(terminal_id)
 
     def discard(self, terminal_id: str) -> None:
-        self._terminal_ids.discard(terminal_id)
+        with self._lock:
+            self._terminal_ids.discard(terminal_id)
+
+    def forget(self, terminal_id: str) -> None:
+        """Drop BOTH marks as one transition — the teardown verb."""
+        with self._lock:
+            self._terminal_ids.discard(terminal_id)
+            self._fallback_disabled_ids.discard(terminal_id)
 
     def set_fallback_disabled(self, terminal_id: str) -> None:
         """Mark a certified herdr terminal (WP-HERDR §6(ii))."""
-        self._fallback_disabled_ids.add(terminal_id)
+        with self._lock:
+            self._fallback_disabled_ids.add(terminal_id)
 
     def clear_fallback_disabled(self, terminal_id: str) -> None:
         """Unmark it.  Called at TEARDOWN only.
@@ -218,13 +236,16 @@ class StaticSourceRegistry:
         its source is gone.  Clearing this on a gap would reinstate the silent
         revert the rule exists to prevent.
         """
-        self._fallback_disabled_ids.discard(terminal_id)
+        with self._lock:
+            self._fallback_disabled_ids.discard(terminal_id)
 
     def is_authoritative(self, terminal_id: str) -> bool:
-        return terminal_id in self._terminal_ids
+        with self._lock:
+            return terminal_id in self._terminal_ids
 
     def fallback_disabled(self, terminal_id: str) -> bool:
-        return terminal_id in self._fallback_disabled_ids
+        with self._lock:
+            return terminal_id in self._fallback_disabled_ids
 
 
 @dataclass(frozen=True)
@@ -453,8 +474,19 @@ class Projector:
         herdr terminal whose source has gone stale or detached must neither have
         its lifecycle handed back to the scraped pane NOR have the legacy path
         start publishing for it again.  One predicate, both consequences.
+
+        **§6(ii) is conditional on the source having EVER delivered**, and that
+        condition is what keeps it from being a false-idle generator.  A herdr
+        subscription can be ACKed and permanently silent — measured, on the wrong
+        subscription — and a cohort muted on that evidence freezes at whatever the
+        connect-time snapshot said while reporting it as authoritative truth.  So
+        a certified terminal whose source has never produced a pushed frame keeps
+        the pane fallback, exactly as it would have before H1; only a source that
+        has proven its stream earns the right to mute the alternative to itself.
+        ``last_source_probe_at`` IS that proof, because the herdr source now bumps
+        it from one place only: a pushed frame that belongs to it.
         """
-        if self._fallback_disabled(terminal_id):
+        if row.last_source_probe_at is not None and self._fallback_disabled(terminal_id):
             return True
         if not self._sources.is_authoritative(terminal_id):
             return False
