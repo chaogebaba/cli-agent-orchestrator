@@ -333,6 +333,79 @@ fn attach_verb() -> String {
     format!("attach{}session", "-")
 }
 
+/// The forbidden vocabulary that `src/catalog.rs` carries as **descriptive data**, budgeted
+/// per needle, per region, and per occurrence: `(path, needle, owning field, production, tests,
+/// why)`.
+///
+/// # Why this is a second mechanism rather than more rows in [`VERB_BUDGET`]
+///
+/// The two answer different questions, and merging them would blur both.
+///
+/// [`VERB_BUDGET`] answers *"which file may NAME the tmux attach verb, and how often on each side
+/// of `#[cfg(test)]`?"* — a question about one needle, whose companion test then follows the
+/// **builder** (`attach_argv`) to prove the verb only ever reaches a printed string.
+///
+/// This table answers a question that arrived with `command-catalog`: *"which needles appear in
+/// this crate as the catalog's own DATA about the CAO CLI surface, rather than as something this
+/// crate runs?"* `src/catalog.rs` is a table describing commands the operator may be shown, so a
+/// leaf literally named `attach` and a `handoff_reason` that names herdr's `os.execvp` are
+/// **descriptions of the hazard**, not the hazard. The `session attach` row is in fact this
+/// guard's ally: it is the row carrying `Policy::Handoff` and the reason string stating that
+/// attaching takes over the terminal, which is BR-1 written into the catalog.
+///
+/// # What keeps it from being a hole
+///
+/// Nothing here exempts a file, and nothing exempts a needle — an entry exempts exactly one
+/// `(file, needle)` pair from the blanket scan, and
+/// [`the_catalog_names_forbidden_vocabulary_only_as_descriptive_data`] then pays for it twice:
+///
+/// - **An exact count per region.** A third `attach` row, or a spawn added alongside the two
+///   existing rows, makes the production count 3 and reddens the guard.
+/// - **A per-occurrence field accounting.** Every occurrence must sit on a line that *begins*
+///   with the named struct field and carries no spawner, so swapping one row's `leaf_name` for a
+///   `Command::new("tmux").args([..])` — which leaves the count at 2 — reddens it too.
+///
+/// An exemption that arises because the tripwire happens not to cover a path is indistinguishable
+/// from a hole in the tripwire, which is why each pair is enumerated with its field and its count
+/// rather than implied by a file-level skip. (#321, `cao session attach` row added by f81fca7c)
+fn catalog_data_budget() -> Vec<(&'static str, String, &'static str, usize, usize, &'static str)> {
+    vec![
+        (
+            "src/catalog.rs",
+            format!("\"att{}\"", "ach"),
+            "leaf_name:",
+            2,
+            0,
+            "the two CLI leaves literally named `attach` — `cao identity attach` and `cao session \
+             attach`. `leaf_name` is the catalog's NAME for a command, the string the TUI renders \
+             in a menu; it is never assembled into an argv by this crate",
+        ),
+        (
+            "src/catalog.rs",
+            format!("exec{}", "vp"),
+            "handoff_reason:",
+            1,
+            0,
+            "the SessionAttach row's Policy::Handoff explanation, which names herdr's os.execvp as \
+             the REASON the TUI must hand the command to a new window instead of running it. \
+             Deleting it would delete the one place the catalog states this guard's own premise",
+        ),
+    ]
+}
+
+/// Is this `(file, needle)` pair accounted for as catalog data instead of by the blanket scan?
+///
+/// Deliberately keyed on both halves. A boolean "skip this file" would relax every needle at once
+/// — a `CommandExt` import in `src/catalog.rs` would then be invisible — and the needles this
+/// crate most needs guarded are precisely the ones the catalog has no reason to contain.
+fn is_budgeted_catalog_datum(path: &str, needle: &str) -> bool {
+    catalog_data_budget()
+        .iter()
+        .any(|(budgeted_path, budgeted_needle, ..)| {
+            *budgeted_path == path && budgeted_needle.as_str() == needle
+        })
+}
+
 /// The `attach_session` methods, and process replacement, appear in **no** Rust source here.
 ///
 /// Three of the four needles have **zero** legitimate uses anywhere in this crate, so they are
@@ -404,6 +477,15 @@ fn no_rust_source_calls_either_backend_attach_session() {
                 if VERB_BUDGET.iter().any(|(budgeted, ..)| budgeted == path) {
                     continue;
                 }
+            }
+
+            // Vocabulary the command catalog carries as DATA about the CAO CLI surface, exempt
+            // from the blanket scan for this `(file, needle)` pair only — and only because
+            // [`the_catalog_names_forbidden_vocabulary_only_as_descriptive_data`] replaces the
+            // scan with something stricter there: an exact count per region plus a per-occurrence
+            // assertion that each one is a named struct field and not a spawn.
+            if is_budgeted_catalog_datum(path, &needle) {
+                continue;
             }
 
             assert!(
@@ -566,6 +648,113 @@ fn the_attach_verb_is_only_ever_a_printed_string() {
         "no shell may be invoked anywhere in the hand-off path: session and window names come \
          from server responses, so a shell string would make them injection vectors (T-10, SR-1)"
     );
+}
+
+/// Every forbidden word in `src/catalog.rs` is **catalog data**, never something this crate runs.
+///
+/// This is what keeps [`catalog_data_budget`] honest, exactly as
+/// [`the_attach_verb_is_only_ever_a_printed_string`] keeps [`VERB_BUDGET`] honest. Without it the
+/// budget would license `catalog.rs` to spawn `tmux attach -t X` — the abbreviation is the same
+/// call as the long verb, which is the whole reason that needle exists — while the blanket scan
+/// stayed green.
+///
+/// # Three assertions, because the count alone is not the property
+///
+/// 1. **The exact count, per region.** Production and test sides are counted separately for the
+///    same reason `VERB_BUDGET` does it: a single total lets a stray production use hide behind a
+///    deleted test one. A third `attach` row reddens here.
+/// 2. **Per occurrence, the owning field.** The line must *begin* with the struct field named in
+///    the budget (`leaf_name:`, `handoff_reason:`). This is the assertion with teeth: replacing
+///    one row's `leaf_name: "attach"` with a `Command::new("tmux").args(["attach", ..])` leaves
+///    the count at 2 and would slip past a count-only check.
+/// 3. **No spawner on the line**, a cheap second net in the same spirit as the one in
+///    [`the_attach_verb_is_only_ever_a_printed_string`].
+///
+/// The final tally is the anti-vacuity check: if the needle stopped matching at all — a stripping
+/// change, a rename — `accounted` falls to zero and this test fails rather than passing on an
+/// empty loop. A guard that cannot fire is invisible to review. (#321)
+#[test]
+fn the_catalog_names_forbidden_vocabulary_only_as_descriptive_data() {
+    let test_marker = format!("#[cfg({})]", "test");
+
+    assert!(
+        !catalog_data_budget().is_empty(),
+        "the catalog data budget must not be empty while the blanket scan consults it — an empty \
+         table means the exemption path is dead code and the needles it covers are unguarded"
+    );
+
+    for (path, needle, field, allowed_production, allowed_tests, why) in catalog_data_budget() {
+        assert!(
+            allowed_production + allowed_tests > 0,
+            "{path}'s budget for {needle:?} totals zero occurrences, which is a whole-file \
+             exemption with nothing to account for — either the entry is stale and must be \
+             deleted so the blanket scan resumes, or the count is wrong ({why})"
+        );
+
+        let source = SOURCES
+            .iter()
+            .find(|(scanned, _)| *scanned == path)
+            .map(|(_, source)| code_only(source))
+            .unwrap_or_else(|| panic!("{path} must be listed in SOURCES to be budgeted"));
+
+        let (production, test_code) = source.split_once(&test_marker).unwrap_or_else(|| {
+            panic!("{path} must carry a #[cfg(test)] module for the region split to mean anything")
+        });
+
+        assert_eq!(
+            production.matches(needle.as_str()).count(),
+            allowed_production,
+            "{path} may contain {needle:?} exactly {allowed_production} time(s) in PRODUCTION \
+             code ({why}). More than that is how the forbidden vocabulary reaches a process \
+             instead of a menu label (BR-1, BR-4); fewer means the entry is stale and the \
+             exemption must be withdrawn"
+        );
+        assert_eq!(
+            test_code.matches(needle.as_str()).count(),
+            allowed_tests,
+            "{path} may contain {needle:?} exactly {allowed_tests} time(s) in TEST code ({why})"
+        );
+
+        let mut accounted = 0usize;
+        for (index, line) in production.lines().enumerate() {
+            if !line.contains(needle.as_str()) {
+                continue;
+            }
+            let number = index + 1;
+            assert!(
+                line.trim_start().starts_with(field),
+                "{path}:{number} contains {needle:?} but is not a `{field}` field of a catalog \
+                 row. The budget exempts this needle here ONLY as descriptive data about the CAO \
+                 CLI surface; an occurrence anywhere else is the spawn this guard exists to \
+                 forbid. Line: {line:?}"
+            );
+            for spawner in [
+                "Command::new",
+                ".args(",
+                ".run(",
+                "spawn(",
+                "status()",
+                "output()",
+                "process::",
+            ] {
+                assert!(
+                    !line.contains(spawner),
+                    "{path}:{number} names {needle:?} AND {spawner:?}: catalog rows describe \
+                     commands, they never run them (BR-1/BR-4). Line: {line:?}"
+                );
+            }
+            accounted += line.matches(needle.as_str()).count();
+        }
+
+        assert_eq!(
+            accounted,
+            allowed_production,
+            "every budgeted occurrence of {needle:?} in {path} must have been accounted for \
+             line by line; {accounted} were, but {allowed_production} are budgeted. A tally of \
+             zero means the needle no longer matches anything and this accounting has quietly \
+             become an empty loop"
+        );
+    }
 }
 
 /// **Every needle is findable in stripped code, and invisible inside a comment.**
