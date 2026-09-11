@@ -191,6 +191,26 @@ def test_ac4_duplicate_capture_cannot_confirm() -> None:
     assert out.reason == "awaiting_confirm"
 
 
+def test_ac4_sequence_duplicate_is_the_sole_dup_defense() -> None:
+    """A sample with a DIFFERENT fingerprint but the SAME sequence as the last
+    published one is still a duplicate capture and cannot confirm — here the
+    ``dup`` sequence-equality clause is the SOLE defense (held_matches passes on
+    the fingerprint inequality), so this pins ``not dup`` specifically."""
+    ctx = _ctx(last_status=TerminalStatus.PROCESSING)
+    s1 = _sample(
+        readiness=ReadinessFact(value=FactValue.PRESENT), filtered_fingerprint="a", sequence=7
+    )
+    first = reduce(s1, ctx)
+    assert first.next_context is not None
+    assert first.next_context.last_sequence == 7
+    s_seqdup = _sample(
+        readiness=ReadinessFact(value=FactValue.PRESENT), filtered_fingerprint="b", sequence=7
+    )
+    out = reduce(s_seqdup, first.next_context)
+    assert out.status is not TerminalStatus.IDLE
+    assert out.reason == "awaiting_confirm"
+
+
 def test_ac4_event_confirmed_lowers_immediately() -> None:
     ctx = _ctx(last_status=TerminalStatus.PROCESSING)
     s = _sample(
