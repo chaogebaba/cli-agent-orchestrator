@@ -1216,20 +1216,31 @@ class TestAC13SocketErrorsFallback:
         err = write_to_socket("/nonexistent/path.sock", '{"test":1}')
         assert err == "socket_enoent"
 
-    def test_econnrefused_does_not_raise(self, tmp_path):
+    def test_econnrefused_does_not_raise(self):
         """ConnectionRefusedError => returns error string."""
-        # Create a socket file that nothing listens on
-        sock_path = str(tmp_path / "dead.sock")
+        # AF_UNIX sun_path is capped at ~108 bytes, and pytest's ``tmp_path``
+        # blows straight past it under a box's long ``--basetemp``
+        # (``.../pytest-tmp/<32-hex>/popen-gwN/<testname>`` => OSError: AF_UNIX
+        # path too long).  Bind under a SHORT absolute root instead — the same
+        # shape ``test/adapters/herdr/test_client.py::socket_path`` uses.
+        import shutil as sh_mod
         import socket as sock_mod
 
-        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
-        s.bind(sock_path)
-        s.close()  # close without listening => ECONNREFUSED on connect
+        short_root = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+        tmpdir = tempfile.mkdtemp(prefix="fx170", dir=str(short_root))
+        try:
+            sock_path = os.path.join(tmpdir, "dead.sock")
+            # Create a socket file that nothing listens on
+            s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            s.bind(sock_path)
+            s.close()  # close without listening => ECONNREFUSED on connect
 
-        from cli_agent_orchestrator.services.cc_session_registry import write_to_socket
+            from cli_agent_orchestrator.services.cc_session_registry import write_to_socket
 
-        err = write_to_socket(sock_path, '{"test":1}')
-        assert err == "socket_econnrefused"
+            err = write_to_socket(sock_path, '{"test":1}')
+            assert err == "socket_econnrefused"
+        finally:
+            sh_mod.rmtree(tmpdir, ignore_errors=True)
 
     def test_eperm_does_not_raise(self, tmp_path):
         """PermissionError => returns error string."""
