@@ -106,7 +106,9 @@ def map_native_status(agent_status: str | None) -> TerminalStatus | None:
     }.get(agent_status)
 
 
-def attach_herdr_runtime_source(terminal_id: str, pane_id: Optional[str]) -> None:
+def attach_herdr_runtime_source(
+    terminal_id: str, pane_id: Optional[str], herdr_session: str = "cao"
+) -> None:
     """Bind the H1 herdr ``EventSource`` (seam A) to a freshly created terminal.
 
     This is the AC11 hook point for WP-HERDR: the adapter is a LEAF and may not
@@ -145,7 +147,12 @@ def attach_herdr_runtime_source(terminal_id: str, pane_id: Optional[str]) -> Non
     try:
         from cli_agent_orchestrator.adapters.truth import herdr_runtime
 
-        source = herdr_runtime.attach(terminal_id, pane_id=pane_id)
+        # ``herdr_session`` selects the SOCKET the source subscribes to.  The
+        # backend may be running against a non-default session (``cao-server
+        # --terminal herdr`` reads ``terminal.herdr_session``), and a source that
+        # defaulted to "cao" would connect to a different herdr server — or to
+        # nothing — and report silence that looks exactly like an idle worker.
+        source = herdr_runtime.attach(terminal_id, pane_id=pane_id, herdr_session=herdr_session)
         if source is None:
             return
         registry = _worker_truth_sources()
@@ -607,7 +614,7 @@ class HerdrBackend(TerminalBackend):
         # The session's ROOT terminal is a terminal like any other; leaving it
         # unattached would give the first worker of every session no lifecycle
         # source at all.  Same gate, same idempotence as ``create_window``.
-        attach_herdr_runtime_source(terminal_id, new_pane_id)
+        attach_herdr_runtime_source(terminal_id, new_pane_id, self._herdr_session)
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
@@ -758,7 +765,7 @@ class HerdrBackend(TerminalBackend):
 
         # WP-HERDR H1 seam A: bind the herdr lifecycle source to this terminal.
         # Inert unless CAO_HERDR_RUNTIME is set.
-        attach_herdr_runtime_source(terminal_id, new_pane_id)
+        attach_herdr_runtime_source(terminal_id, new_pane_id, self._herdr_session)
 
         logger.info(f"Created herdr tab in workspace {session_name}")
         return window_name
