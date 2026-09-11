@@ -96,15 +96,18 @@ def _pi_provider(terminal_id: str):
     return provider
 
 
-_WORKING_PANE = "\n".join(
-    [
-        "some transcript",
-        "─" * 40,
-        "│ ⠴ Working ──────────────────────────────│",
-        "─" * 40,
-        "  50% (auto)",
-    ]
-)
+#: A REAL captured pi pane showing the live working spinner — the same fixture
+#: the provider's own status-truth tests classify.  An invented buffer would not
+#: reach the whole-row ``_WORKING_ROW`` anchor and the "uncertified still
+#: scrapes" test would pass for the wrong reason (UNKNOWN either way).
+_WORKING_PANE = (
+    Path(__file__).resolve().parents[1]
+    / "providers"
+    / "fixtures"
+    / "status_truth"
+    / "pi_cli"
+    / "working-1.txt"
+).read_text(encoding="utf-8")
 
 
 def test_an_uncertified_pi_terminal_still_scrapes_its_chrome(
@@ -167,11 +170,14 @@ def test_the_watchdog_skips_certified_terminals(monkeypatch: pytest.MonkeyPatch)
     herdr_runtime_gate.bind_terminal("certified", True)
     herdr_runtime_gate.bind_terminal("plain", False)
 
+    from cli_agent_orchestrator.services import pane_liveness as pl_mod
     from cli_agent_orchestrator.services import stalled_callback_watchdog as mod
 
     observed: list[str] = []
+    # The watchdog imports ``pane_liveness`` inside the method, so the patch has
+    # to land on the singleton in its own module, not on a watchdog attribute.
     monkeypatch.setattr(
-        mod.pane_liveness,
+        pl_mod.pane_liveness,
         "observe",
         lambda terminal_id, now, monitor: observed.append(terminal_id),
     )
