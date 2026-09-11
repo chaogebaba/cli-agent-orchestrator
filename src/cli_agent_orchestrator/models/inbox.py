@@ -32,6 +32,14 @@ class MessageStatus(str, Enum):
     # supersession.
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
+    # WP-ARCH 3c: the row was handed to the delivery queue and the QUEUE row is
+    # now its delivery record. Terminal for the LEGACY inbox and for nothing
+    # else: the message itself is very much alive, under the ``msg_id`` the
+    # adoption line names. Audit-visible on purpose -- the row stays readable, so
+    # an operator can still see what the seat was owed and when it moved. It is a
+    # distinct value rather than a reuse of ``delivered`` or ``digested`` because
+    # those two assert something reached the receiver, which adoption does not.
+    ADOPTED = "adopted"
 
 
 class InboxMessage(BaseModel):

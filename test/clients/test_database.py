@@ -1614,7 +1614,15 @@ class TestInboxOperations:
         assert InboxMessageTraceEventModel.__tablename__ == "inbox_message_trace_event"
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
-        """Database-facing enum exposes all nine honest delivery states."""
+        """The database-facing enum exposes every honest delivery state.
+
+        The column is unconstrained text, so the enum is ADDITIVE: a value added
+        here needs no migration and an older row keeps reading. This arm is the
+        ledger of what has been added, and it was already stale before WP-ARCH 3c
+        -- F578 D23 added ``expired`` and ``superseded`` without extending it, so
+        it failed on base naming nine states against an enum of eleven. Brought
+        current here, with ``adopted`` (3c) as the twelfth.
+        """
         assert [status.value for status in MessageStatus] == [
             "pending",
             "held",
@@ -1625,6 +1633,9 @@ class TestInboxOperations:
             "digested",
             "parked",
             "cancelled",
+            "expired",
+            "superseded",
+            "adopted",
         ]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")

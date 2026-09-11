@@ -354,6 +354,7 @@ def _build_delivery_tick(
         return None
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
+            LegacyInboxAdoption,
             LegacyReceiverDirectory,
             NativeSeatCarrier,
             PaneWorkerInjector,
@@ -374,6 +375,17 @@ def _build_delivery_tick(
             findings=findings,
             clock=clock,
             position=position,
+            # 3c: the fourth Protocol, and the one that keeps the legacy inbox
+            # from stranding rows now that its two carriers are deleted.
+            #
+            # Wired for both served positions, but it is a NO-OP outside ``on``
+            # and deliberately so: ``adopt_legacy_row`` refuses unless the queue
+            # owns new traffic, and an adopted row IS new queue traffic. Letting
+            # it run at ``drain`` would make that position accept inserts, which
+            # is the one thing ``drain`` exists not to do. The alternative —
+            # gating the wiring here instead — would put the same rule in two
+            # places and let them drift.
+            adopter=LegacyInboxAdoption(),
         )
     except Exception:  # noqa: BLE001 — a tick that cannot be built must not block boot
         logger.error(

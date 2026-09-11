@@ -652,8 +652,8 @@ def build_wake_payload(
         priority = ConfigService.get("supervisor.wake.priority", default="next")
 
     # F790 (#647): apply the seat-envelope body rule at the single point every
-    # native-ring caller funnels through (inbox_service:1324 / :3962 via
-    # doorbell_coalesce, delivery_service rung1). A `[CONDITION]`/`[watchdog]`
+    # native-ring caller funnels through (after WP-ARCH 3c K3b/K3c that is the
+    # delivery tick's NativeSeatCarrier). A `[CONDITION]`/`[watchdog]`
     # body collapses to None (ids-only ping); any other over-long body is capped.
     message_body = normalize_wake_body(message_body)
 

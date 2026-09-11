@@ -221,6 +221,59 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
         return None
 
 
+def adopt_legacy_row(fact: LegacyEnqueue) -> str | None:
+    """Enqueue one EXISTING legacy ``inbox`` row into the queue (WP-ARCH 3c).
+
+    Returns the ``msg_id`` the row now lives under, or ``None`` when the queue
+    does not own delivery.  The sibling of :func:`write_through`, and the
+    differences from it are all forced by the row already existing:
+
+    * ``legacy_message_id`` is the row's REAL id, not a fresh surrogate. That is
+      what makes ``cao diag <msg_id>`` join back to the inbox row an operator is
+      holding, and what lets the store recognise a re-adoption.
+    * ``idempotency_key`` is derived from that id, so adopting the same row twice
+      returns the SAME queue row instead of creating a second. The retire is the
+      primary guard and this is the backstop for the crash window between them.
+    * the F475 recent-duplicate window is NOT consulted. For new traffic that
+      window suppresses a genuine double send; here the row IS the message, it
+      has no counterpart yet, and "suppressing" it would drop the only copy —
+      the exact loss adoption exists to prevent.
+
+    Never raises into the caller: an adoption that cannot be written returns
+    ``None``, the legacy row stays PENDING, and the next tick tries again.
+    """
+    runtime = _runtime
+    if runtime is None or runtime.position is not SwitchPosition.ON:
+        return None
+    try:
+        message = runtime.store.enqueue(
+            EnqueueDraft(
+                idempotency_key=f"adopted-inbox:{fact.legacy_message_id}",
+                receiver_id=fact.receiver_id,
+                sender_id=fact.sender_id,
+                kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
+                payload=fact.message,
+                mode=QueueMode.LIVE,
+                expire_after_s=fact.expire_after_s,
+                supersede_key=fact.supersede_key,
+                content_hash=fact.content_hash,
+                park_warm=fact.park_warm,
+                barrier_id=fact.barrier_id,
+                barrier_member_key=fact.barrier_member_key,
+                enqueue_generation=fact.enqueue_generation,
+                legacy_message_id=fact.legacy_message_id,
+            )
+        )
+        return message.msg_id
+    except Exception:  # noqa: BLE001 — the net may never break the tick
+        logger.warning(
+            "delivery adoption failed for legacy row %s; it stays pending for the next tick",
+            fact.legacy_message_id,
+            exc_info=True,
+        )
+        return None
+
+
 def record_completion(receiver_id: str) -> tuple[str, ...]:
     """D8's completion-cancel, driven by the RECEIVER'S OWN completion.
 

@@ -703,11 +703,11 @@ def native_fallback_reason(terminal_id: str) -> Optional[str]:
         return "push_disabled_by_operator"
     if inbox_path is None:
         return "no_inbox_path"
-    if not ConfigService.get("supervisor.mailbox_pull") and not ConfigService.get(
-        "delivery.seat_wake_reconcile"
-    ):
-        # Nothing drives a push: neither the pull-mode reconciler nor the
-        # idle-seat wake reconcile is running, so native writes never happen.
+    if not ConfigService.get("supervisor.mailbox_pull"):
+        # Nothing drives a push: the pull-mode reconciler is not running, so
+        # native writes never happen. WP-ARCH 3c K6 deleted the idle-seat wake
+        # reconcile that used to be the other driver (this module itself is
+        # deleted in slice 3).
         return "no_native_driver"
     if _has_recent_native_write_failure(terminal_id):
         return "native_write_failed"

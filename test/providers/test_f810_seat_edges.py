@@ -2,21 +2,25 @@
 
 Covers the four named unit tests from the build brief:
 
-* overlay content for a claude_code supervisor contains the four F810 hook
+* overlay content for a claude_code supervisor contains the F810 hook
   registrations with the resolved binary path, dedupes against a pre-existing
   identical command, and (BLOCKER 4) is appended ONLY for a supervisor seat —
   ``test_worker_profile_gets_no_f810_edges`` /
   ``test_worker_overlay_is_byte_equivalent_to_no_role`` are the real negative
-  tests, and ``test_effective_project_plus_settings_composition_no_double_run``
-  is the effective project-plus-``--settings`` composition test;
-* register_inbox / supervisor_drain / rewake exit 0 on: no CAO_TERMINAL_ID,
-  empty stdin, server down (mock), malformed JSON;
-* the drain envelope text equals the root hook's format for one pending row and
-  one suppressed BUSY ping (golden strings);
-* transport_ejection emits exactly one native_unreachable condition per episode.
+  tests;
+* register_inbox / rewake exit 0 on: no CAO_TERMINAL_ID, empty stdin, server
+  down (mock), malformed JSON.
+
+WP-ARCH 3c K1: the supervisor_drain / supervisor_ack hooks are DELETED — they
+were a second seat carrier over the same message id, racing the server-side
+delivery tick with an ack watermark the tick never consulted (#506/#499). What
+survives here is exactly the pair the native carrier needs: ``register_inbox``
+(the registration edge that publishes the seat's socket — without it the server
+can reach no seat at all) and ``rewake`` (the residual idle-gap re-arm). The
+arms below pin BOTH their presence and the drain's absence.
 
 Mutants (see f810-build-report.md): drop the dedupe → duplicate registration;
-register PATCH without the idempotency GET; ejection emits every attempt.
+register PATCH without the idempotency GET.
 """
 
 from __future__ import annotations
@@ -25,7 +29,6 @@ import io
 import json
 import os
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,30 +41,11 @@ from cli_agent_orchestrator.providers.claude_code import (
 )
 
 _REGISTER_MOD = "cli_agent_orchestrator.hooks.register_inbox"
-_DRAIN_MOD = "cli_agent_orchestrator.hooks.supervisor_drain"
 _REWAKE_MOD = "cli_agent_orchestrator.hooks.rewake"
-
-#: The parent (root) repository that carries the legacy repo-local `.claude`
-#: hooks the overlay is replacing. Read-only reference. Resolved from the env
-#: (CLAUDE_PROJECT_DIR, as Claude Code sets it) or the known laptop checkout;
-#: the composition test does not REQUIRE it to exist (it uses the captured
-#: command shapes below), but asserts the `.sh` files when the repo is present.
-_PARENT_REPO = Path(
-    os.environ.get("CLAUDE_PROJECT_DIR", "/home/chao/VScode_projects/cli-subagents")
-)
-
-#: The ACTUAL parent-repo hook command strings, captured verbatim from
-#: /home/chao/VScode_projects/cli-subagents/.claude/settings.json (PostToolUse
-#: matcher ".*" drain leg; Stop rewake --arm leg). These are the shapes Claude
-#: Code composes ALONGSIDE the overlay until deliverable 3 removes them. They are
-#: DIFFERENT command strings from the overlay's `python -m …` shapes, so the D2
-#: command-string dedupe cannot merge them — the two co-execute (the 0.7 ms
-#: race). Embedded as literals so the concurrency test is box-independent.
-_PARENT_DRAIN_CMD = "$CLAUDE_PROJECT_DIR/.claude/hooks/supervisor-inbox-drain.sh"
-_PARENT_REWAKE_CMD = (
-    '"$CLAUDE_PROJECT_DIR/.claude/hooks/supervisor-only.sh" '
-    "$CLAUDE_PROJECT_DIR/.claude/hooks/f213-callback-rewake.sh --arm --source=stop"
-)
+#: WP-ARCH 3c K1: deleted. Kept as a literal so the arms below can assert the
+#: overlay never composes it again.
+_DRAIN_MOD = "cli_agent_orchestrator.hooks.supervisor_drain"
+_ACK_MOD = "cli_agent_orchestrator.hooks.supervisor_ack"
 
 
 @pytest.fixture
@@ -115,7 +99,7 @@ def _settings(role: str | None = "supervisor") -> dict:
 # ── overlay content ───────────────────────────────────────────────────────────
 
 
-def test_overlay_registers_the_four_f810_edges():
+def test_overlay_registers_the_surviving_f810_edges():
     h = _settings()["hooks"]
 
     def cmds(event: str) -> list[str]:
@@ -124,13 +108,21 @@ def test_overlay_registers_the_four_f810_edges():
     # register on SessionStart + PostToolUse(Agent|Task)
     assert any(_REGISTER_MOD in c for c in cmds("SessionStart"))
     assert any(_REGISTER_MOD in c for c in cmds("PostToolUse"))
-    # drain on SessionStart + PostToolUse(.*) + Stop
-    assert any(_DRAIN_MOD in c for c in cmds("SessionStart"))
-    assert any(_DRAIN_MOD in c for c in cmds("PostToolUse"))
-    assert any(_DRAIN_MOD in c for c in cmds("Stop"))
     # rewake on PostToolUse + Stop
     assert any(_REWAKE_MOD in c for c in cmds("PostToolUse"))
     assert any(_REWAKE_MOD in c for c in cmds("Stop"))
+
+
+def test_supervisor_overlay_composes_no_drain_or_ack_arm():
+    """WP-ARCH 3c K1: the seat's carrier is the server-side delivery tick, so no
+    hook may drain or ack the seat's inbox on ANY event — that was the second
+    carrier over one id (#506/#499). The registration edge must survive alongside
+    (deleting the whole is_supervisor block silences every seat)."""
+    h = _settings(role="supervisor")["hooks"]
+    every = [hk["command"] for blocks in h.values() for b in blocks for hk in b["hooks"]]
+    assert not any(_DRAIN_MOD in c for c in every), every
+    assert not any(_ACK_MOD in c for c in every), every
+    assert any(_REGISTER_MOD in c for c in every), every
 
 
 def test_overlay_commands_use_python_m_not_absolute_path():
@@ -140,7 +132,7 @@ def test_overlay_commands_use_python_m_not_absolute_path():
         for b in h[event]:
             for hk in b["hooks"]:
                 c = hk["command"]
-                if any(m in c for m in (_REGISTER_MOD, _DRAIN_MOD, _REWAKE_MOD)):
+                if any(m in c for m in (_REGISTER_MOD, _REWAKE_MOD)):
                     assert "-m" in c
                     assert ".claude" not in c
                     assert ".sh" not in c
@@ -182,32 +174,25 @@ def _f810_commands(settings: dict) -> list[str]:
         for blocks in hooks.values()
         for b in blocks
         for hk in b["hooks"]
-        if any(m in hk["command"] for m in (_REGISTER_MOD, _DRAIN_MOD, _REWAKE_MOD))
+        if any(m in hk["command"] for m in (_REGISTER_MOD, _REWAKE_MOD))
     ]
 
 
 def test_worker_profile_gets_no_f810_edges():
-    """A real (non-supervisor) worker profile: register/rewake absent entirely,
-    and drain present ONLY on the base D22 SessionStart edge — never on the F810
-    PostToolUse/Stop legs.
+    """A real (non-supervisor) worker profile: register/rewake absent entirely.
 
-    F810 #667 r3 (B4): the drain command DOES appear on a worker's SessionStart
-    (that edge is the unchanged base D22 drain), but on that edge the drain
-    module is SERVER-TRIGGER-ONLY — no ``claim=hook`` read, no ack. The
-    behavioural proof is ``test_worker_sessionstart_drain_is_server_trigger_only``
-    below; this test proves only the STRUCTURE (which edges carry which command)."""
+    WP-ARCH 3c K1 also removed the base D22 drain that used to appear on a
+    worker's SessionStart, so a worker overlay now carries no seat-delivery
+    command on ANY event."""
     h = _settings(role="developer")["hooks"]
 
     def cmds(event: str) -> list[str]:
         return [hk["command"] for b in h.get(event, []) for hk in b["hooks"]]
 
-    # No register / rewake anywhere for a worker.
     assert not any(_REGISTER_MOD in c for e in h for c in cmds(e))
     assert not any(_REWAKE_MOD in c for e in h for c in cmds(e))
-    # Drain only on SessionStart (base D22), NOT the F810 PostToolUse/Stop legs.
-    assert any(_DRAIN_MOD in c for c in cmds("SessionStart"))
-    assert not any(_DRAIN_MOD in c for c in cmds("PostToolUse"))
-    assert not any(_DRAIN_MOD in c for c in cmds("Stop"))
+    assert not any(_DRAIN_MOD in c for e in h for c in cmds(e))
+    assert not any(_ACK_MOD in c for e in h for c in cmds(e))
 
 
 def test_worker_overlay_is_byte_equivalent_to_no_role():
@@ -219,77 +204,28 @@ def test_worker_overlay_is_byte_equivalent_to_no_role():
 
 
 def test_worker_stop_block_matches_base_shape():
-    """A worker's Stop carries only marker+ack+turn (base shape) — no F810 drain
-    or rewake leg."""
+    """A worker's Stop carries only marker+turn (base shape) — no drain, ack or
+    rewake leg. WP-ARCH 3c K1 removed the ack leg that used to sit in between."""
     h = _settings(role="reviewer")["hooks"]
     stop_cmds = [hk["command"] for b in h["Stop"] for hk in b["hooks"]]
-    assert not any(_DRAIN_MOD in c or _REWAKE_MOD in c for c in stop_cmds)
+    assert not any(_DRAIN_MOD in c or _ACK_MOD in c or _REWAKE_MOD in c for c in stop_cmds)
 
 
 def test_supervisor_only_edges_present_for_supervisor():
-    """The positive control: a supervisor DOES get all four F810 edges."""
+    """The positive control: a supervisor DOES get the surviving F810 edges."""
     cmds = _f810_commands(_settings(role="supervisor"))
     assert any(_REGISTER_MOD in c for c in cmds)
-    assert any(_DRAIN_MOD in c for c in cmds)
     assert any(_REWAKE_MOD in c for c in cmds)
 
 
-def test_parent_sh_and_overlay_have_distinct_command_strings():
-    """Precondition for the concurrency tests below: the parent-repo `.sh` hook
-    commands and the overlay `python -m` commands are DIFFERENT strings, so the
-    D2 command-string dedupe CANNOT merge them. Until the parent repo drops its
-    copies (deliverable 3), Claude Code composes BOTH and starts them
-    concurrently — exactly the 0.7 ms race the verdict flagged. Uses the ACTUAL
-    parent command shapes (captured verbatim from the parent settings.json) and
-    the overlay shapes; when the live parent repo is present it ALSO cross-checks
-    that the captured shapes still match the on-disk settings.json (read-only)."""
-    overlay = _settings(role="supervisor")["hooks"]
-    overlay_drain = next(c for c in _f810_commands({"hooks": overlay}) if _DRAIN_MOD in c)
-    overlay_rewake = next(
-        hk["command"]
-        for b in overlay["Stop"]
-        for hk in b["hooks"]
-        if _REWAKE_MOD in hk["command"] and "--source=stop" in hk["command"]
-    )
+def test_concurrent_hook_claims_yield_a_single_winner(mailbox_db):
+    """The server-side read-as-claim is the dedupe of last resort.
 
-    # DIFFERENT command strings → the D2 dedupe leaves BOTH → they co-execute.
-    assert _PARENT_DRAIN_CMD != overlay_drain
-    assert _PARENT_REWAKE_CMD != overlay_rewake
-    merged = {
-        "PostToolUse": [{"hooks": [{"command": _PARENT_DRAIN_CMD}, {"command": overlay_drain}]}],
-        "Stop": [{"hooks": [{"command": _PARENT_REWAKE_CMD}, {"command": overlay_rewake}]}],
-    }
-    _dedupe_overlay_hooks_by_command(merged)
-    ptu = [hk["command"] for b in merged["PostToolUse"] for hk in b["hooks"]]
-    stop = [hk["command"] for b in merged["Stop"] for hk in b["hooks"]]
-    assert _PARENT_DRAIN_CMD in ptu and overlay_drain in ptu  # neither deduped
-    assert _PARENT_REWAKE_CMD in stop and overlay_rewake in stop
-
-    # Optional live cross-check: if the parent repo is present, the captured
-    # shapes must still equal the on-disk settings.json commands (read-only).
-    parent_settings = _PARENT_REPO / ".claude" / "settings.json"
-    if parent_settings.is_file():
-        parent = json.loads(parent_settings.read_text(encoding="utf-8"))["hooks"]
-
-        def pcmds(event: str) -> list[str]:
-            return [hk["command"] for b in parent.get(event, []) for hk in b.get("hooks", [])]
-
-        assert _PARENT_DRAIN_CMD in pcmds("PostToolUse")
-        assert _PARENT_REWAKE_CMD in pcmds("Stop")
-        assert (_PARENT_REPO / ".claude" / "hooks" / "supervisor-inbox-drain.sh").is_file()
-        assert (_PARENT_REPO / ".claude" / "hooks" / "f213-callback-rewake.sh").is_file()
-
-
-def test_concurrent_parent_and_overlay_drain_single_claim(mailbox_db):
-    """DRAIN single-claim under the 0.7 ms race. The parent `.sh` drain runs
-    ``cao messages list --to me --status pending --claim hook`` and the overlay
-    ``supervisor_drain`` runs ``GET /messages?…claim=hook`` — DIFFERENT commands,
-    but BOTH resolve to the SAME server read-as-claim
-    (``list_messages(receiver, claim='hook')`` → ``hook_claim_ids``). Fired
-    concurrently against ONE pending id, the server's UNIQUE(message_id, carrier)
-    claim lets exactly ONE win; the other returns the id NOT at all. This is the
-    server-side dedupe that HOLDS for the claim (the alternative the verdict
-    named)."""
+    Two concurrent ``list_messages(receiver, claim='hook')`` reads against ONE
+    pending id: the UNIQUE(message_id, carrier) claim lets exactly one win and
+    the other sees the id not at all. WP-ARCH 3c K1 removed the drain hook that
+    used to be the second racer here, but the invariant is what makes any future
+    hook-shaped reader safe, so it stays pinned."""
     import threading
 
     from cli_agent_orchestrator.clients.database import create_inbox_message
@@ -320,194 +256,13 @@ def test_concurrent_parent_and_overlay_drain_single_claim(mailbox_db):
     assert sum(r.count(msg.id) for r in results) == 1
 
 
-def _find_parent_rewake_hook():
-    """Locate the real parent-repo ``f213-callback-rewake.sh`` (read-only).
-
-    Order: explicit ``CAO_F810_PARENT_HOOK`` env → ``CLAUDE_PROJECT_DIR`` →
-    ``_PARENT_REPO``. Returns a Path or None (the caller skips when absent, e.g.
-    on a box that has no parent checkout)."""
-    candidates = []
-    env_hook = os.environ.get("CAO_F810_PARENT_HOOK")
-    if env_hook:
-        candidates.append(Path(env_hook))
-    proj = os.environ.get("CLAUDE_PROJECT_DIR")
-    if proj:
-        candidates.append(Path(proj) / ".claude" / "hooks" / "f213-callback-rewake.sh")
-    candidates.append(_PARENT_REPO / ".claude" / "hooks" / "f213-callback-rewake.sh")
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
-
-
-def test_actual_parent_sh_and_overlay_single_wake_persistent_row(tmp_path):
-    """B4 (r4): the ACTUAL parent ``.sh`` + overlay ``python -m`` pair against ONE
-    PERSISTENTLY pending row must produce EXACTLY ONE wake — the r3 EMPIRICAL gate
-    reproduced a DOUBLE wake here (overlay wins the lock, wakes id 42, releases;
-    the parent Stop watcher retries the freed lock for up to 15s, consults its OWN
-    state.json, and wakes id 42 again). The r4 fix is a one-directional shared
-    wake cursor: the parent reads/writes the overlay's
-    ``$CAO_HOME_DIR/f810-rewake-state.<tid>.json`` so a post-release retry sees the
-    id as already woken.
-
-    This runs the REAL scripts as subprocesses (reviewer driver shape,
-    /data/cao-scratch/30eb5f40/actual_pair_repro.py): a stub HTTP server serves id
-    42 on EVERY poll (persistent), the overlay is started first and holds
-    ``watcher.lock`` between two stability polls, and the parent is started inside
-    that window so its production 15s lock-retry fires. Assert exactly one exit 2
-    and one ``rewakeSummary`` across BOTH processes.
-
-    Skips when the parent ``.sh`` is not present (e.g. a box without the parent
-    checkout); the box A/B run in the report exercises the real pair."""
-    import json as _json
-    import subprocess
-    import threading
-    import time
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    parent_hook = _find_parent_rewake_hook()
-    if parent_hook is None:
-        pytest.skip("parent f213-callback-rewake.sh not present in this checkout")
-
-    # Fork ``src`` for the overlay subprocess' PYTHONPATH — resolve from this file
-    # (test/providers/…  → repo root is parents[2]).
-    fork_src = Path(__file__).resolve().parents[2] / "src"
-
-    home = tmp_path / "home"
-    lockdir = tmp_path / "lock"
-    datadir = tmp_path / "data"
-    for d in (home, lockdir, datadir):
-        d.mkdir(parents=True)
-
-    reqs: list[tuple[float, str]] = []
-    reqs_lock = threading.Lock()
-
-    class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
-            with reqs_lock:
-                reqs.append((time.monotonic(), self.path))
-            if self.path.startswith("/messages"):
-                body: dict = {
-                    "items": [
-                        {
-                            "id": 42,
-                            "sender_id": "wrk1",
-                            "message": "one persistent callback",
-                            "status": "pending",
-                        }
-                    ]
-                }
-            elif self.path.startswith("/terminals/"):
-                body = {"status": "ready"}
-            else:
-                body = {}
-            enc = _json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(enc)))
-            self.end_headers()
-            self.wfile.write(enc)
-
-        def log_message(self, *a: object) -> None:  # noqa: A003
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    th = threading.Thread(target=server.serve_forever, daemon=True)
-    th.start()
-    endpoint = f"http://127.0.0.1:{server.server_port}"
-
-    common = os.environ.copy()
-    common.update(
-        {
-            "CAO_TERMINAL_ID": "abcd1234",
-            "CAO_ENDPOINT": endpoint,
-            "CAO_API_BASE_URL": endpoint,
-            "CAO_HOME_DIR": str(home),
-            "CAO_DATA_DIR": str(datadir),
-            "F213_STATE_DIR": str(lockdir),  # shared watcher.lock dir
-            "F213_COOLDOWN_S": "300",
-            "F213_MAX_STREAK": "3",
-            "F213_OWNER_CHECK_CADENCE": "999",
-            "CAO_PROCESS_INCARNATION": "inc1",
-            "CAO_OVERLAY_HOOKS_ACTIVE": "1",
-        }
-    )
-    common.pop("CLAUDE_AGENT_ID", None)
-
-    overlay_env = common.copy()
-    overlay_env.update(
-        {
-            "PYTHONPATH": str(fork_src),
-            "F213_POLL_INTERVAL_S": "0.20",
-            "F213_STABILITY_POLLS": "2",
-            "F213_DEADLINE_S": "6",
-        }
-    )
-    parent_env = common.copy()
-    parent_env.update(
-        {
-            "F213_POLL_INTERVAL_S": "0.01",
-            "F213_STABILITY_POLLS": "2",
-            "F213_DEADLINE_S": "6",
-        }
-    )
-
-    overlay_cmd = [
-        sys.executable,
-        "-m",
-        "cli_agent_orchestrator.hooks.rewake",
-        "--arm",
-        "--source=stop",
-    ]
-    parent_cmd = [str(parent_hook), "--arm", "--source=stop"]
-
-    try:
-        overlay = subprocess.Popen(
-            overlay_cmd,
-            env=overlay_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        # Wait until the overlay has reached its first poll (it now holds the
-        # lock, between stability polls) before starting the parent.
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline:
-            with reqs_lock:
-                seen = any(p.startswith("/messages") for _, p in reqs)
-            if seen:
-                break
-            time.sleep(0.005)
-        else:
-            overlay.kill()
-            pytest.fail("overlay did not reach its first poll")
-
-        parent_started = time.monotonic()
-        parent = subprocess.Popen(
-            parent_cmd,
-            cwd=str(parent_hook.parent.parent.parent),
-            env=parent_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        overlay_out, _ = overlay.communicate(timeout=30)
-        parent_out, _ = parent.communicate(timeout=30)
-    finally:
-        server.shutdown()
-        th.join(timeout=2)
-
-    rcs = sorted([overlay.returncode, parent.returncode])
-    wake_summaries = [
-        out for out in (overlay_out.strip(), parent_out.strip()) if "rewakeSummary" in out
-    ]
-    # EXACTLY ONE wake across the real pair: one exit 2, one exit 0, one summary.
-    assert rcs == [0, 2], (rcs, overlay_out, parent_out)
-    assert len(wake_summaries) == 1, (overlay_out, parent_out)
-    # And the one wake names id 42.
-    assert '"id 42"' in wake_summaries[0] or "id 42" in wake_summaries[0]
+# WP-ARCH 3c K1/K5: the parent-repo ``supervisor-inbox-drain.sh`` /
+# ``f213-callback-rewake.sh`` pair and the overlay drain they raced are both
+# deleted, so the "two carriers, one id" co-execution arms that lived here
+# (``test_parent_sh_and_overlay_have_distinct_command_strings``,
+# ``test_actual_parent_sh_and_overlay_single_wake_persistent_row``) have no
+# subject left. The server-side claim uniqueness they leaned on is still pinned
+# by ``test_concurrent_hook_claims_yield_a_single_winner`` above.
 
 
 def test_dedupe_drops_second_identical_command_first_wins():

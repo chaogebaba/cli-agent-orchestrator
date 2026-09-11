@@ -22,6 +22,7 @@ here stays at the capability-flag surface phase 5 actually needs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
@@ -30,6 +31,7 @@ from cli_agent_orchestrator.core.delivery import (
     DeliveryAttempt,
     EnqueueDraft,
     InjectionResult,
+    LegacyAdoption,
     MsgState,
     QueueMessage,
     QueueMode,
@@ -67,6 +69,7 @@ __all__ = [
     "EventStore",
     "FindingStore",
     "GateStore",
+    "LegacyInboxAdopter",
     "PaneInjector",
     "ProviderAdapter",
     "QueueStore",
@@ -661,6 +664,46 @@ class PaneInjector(Protocol):
     """
 
     def inject(self, *, terminal_id: str, line: str) -> InjectionResult: ...
+
+
+@runtime_checkable
+class LegacyInboxAdopter(Protocol):
+    """Pulls orphaned legacy ``inbox`` rows into the queue (WP-ARCH 3c).
+
+    **Why a port rather than a call.** The tick owns the SCHEDULE and the
+    observability; only legacy can read the ``inbox`` table, and ``app`` may not
+    import it.  So the whole find-enqueue-retire runs on the legacy side, where
+    it can hold ONE transaction, and reports back as values.
+
+    **Why one transaction is the contract, not an implementation detail.** The
+    row must become invisible to the legacy pending-set in the same write that
+    creates its queue counterpart.  Enqueue-then-retire across two transactions
+    has a window in which both carriers own the id, which is #506; retire-then-
+    enqueue has one in which neither does, which is #604.  A crash between them
+    must leave the row in exactly one of the two sets.
+
+    **Why it exists at all.** ``write_through`` returns a detached model and adds
+    nothing to the inbox table, so a row physically present there has no
+    ``delivery_msg`` counterpart by construction.  Before 3c two legacy carriers
+    served those rows — the coalesced doorbell out of ``_f136_post_delivery`` and
+    the seat-wake reconcile — and this slice deletes both.  Adoption is what
+    replaces them, and it is strictly better than either: it retires the row
+    family instead of maintaining a second delivery path for it.
+
+    Two families reach the inbox at ``on``: rows that predate the flip, and
+    write-through fallbacks, which a lost ``BEGIN IMMEDIATE`` race against a
+    caller holding an open write transaction produces as ``database is locked``.
+    """
+
+    def adopt_orphans(self, *, limit: int) -> Sequence[LegacyAdoption]:
+        """Adopt up to ``limit`` orphaned rows and report each one.
+
+        Never raises: adoption is a safety net, and a net whose failure stops the
+        tick would take the serve step down with it.  An adopter that cannot run
+        returns an empty sequence, which degrades to the behaviour of a tick with
+        no adopter wired — the rows stay pending and are retried next tick.
+        """
+        ...
 
 
 @runtime_checkable

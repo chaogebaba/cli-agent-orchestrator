@@ -1196,31 +1196,14 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         ledger_hooks = [{"type": "command", "command": ledger_command, "timeout": 5}]
-        # F543 D22: the supervisor drain/ack hooks, relocated OUT of any
-        # ~/.claude / repo-local .claude/hooks copy and INTO this overlay,
-        # composed with the same env/credential shape as the four hooks above
-        # (Do-NOT 20). SHOULD-5: location only — F476 owns the delivered-state
-        # internals. Drain fires on SessionStart; ack on Stop.
-        drain_command = shlex.join(
-            [
-                "env",
-                f"CAO_API_BASE_URL={resolve_endpoint()}",
-                sys.executable,
-                "-m",
-                "cli_agent_orchestrator.hooks.supervisor_drain",
-            ]
-        )
-        drain_hooks = [{"type": "command", "command": drain_command, "timeout": 5}]
-        ack_command = shlex.join(
-            [
-                "env",
-                f"CAO_API_BASE_URL={resolve_endpoint()}",
-                sys.executable,
-                "-m",
-                "cli_agent_orchestrator.hooks.supervisor_ack",
-            ]
-        )
-        ack_hooks = [{"type": "command", "command": ack_command, "timeout": 5}]
+        # WP-ARCH 3c K1: the F543 D22 supervisor drain/ack hooks are GONE. They
+        # were a second seat carrier over the same message id, with an ack
+        # watermark the native carrier never consulted (#506/#499). The single
+        # seat carrier is now the server-side delivery tick
+        # (``app/delivery/tick.py`` → ``services/queue_carrier.NativeSeatCarrier``);
+        # the only hooks this overlay still composes for a seat are
+        # ``register_inbox`` (publishes the native socket) and ``rewake``
+        # (the residual idle-gap re-arm).
         # F792 (#649): the turn-boundary hook. Same env/credential shape as the
         # F507/F568 hooks. Fired on Stop (turn_ended), UserPromptSubmit and
         # PreToolUse (turn_active); the module classifies each event. The server
@@ -1236,15 +1219,14 @@ class ClaudeCodeProvider(BaseProvider):
             ]
         )
         turn_hooks = [{"type": "command", "command": turn_command, "timeout": 5}]
-        # F810 (#667) BLOCKER 4: the fork's seat-delivery edges (register / the
-        # PostToolUse+Stop drain legs / rewake) are appended ONLY for a
-        # server-authoritatively identified SUPERVISOR seat. The authority is the
-        # CAO agent profile's ``role`` field ("supervisor"), loaded from the
-        # server-side profile store via ``_load_profile`` — never a pane heuristic.
-        # For a worker (or any seat whose profile is absent/non-supervisor) these
-        # lists stay EMPTY and the F810 PostToolUse/Stop blocks are omitted, so the
-        # worker overlay is byte-equivalent to base (the base D22 ``drain_hooks``
-        # on SessionStart is unchanged and still applies to every seat).
+        # F810 (#667) BLOCKER 4: the fork's seat-delivery edges (register /
+        # rewake) are appended ONLY for a server-authoritatively identified
+        # SUPERVISOR seat. The authority is the CAO agent profile's ``role`` field
+        # ("supervisor"), loaded from the server-side profile store via
+        # ``_load_profile`` — never a pane heuristic. For a worker (or any seat
+        # whose profile is absent/non-supervisor) these lists stay EMPTY and the
+        # F810 PostToolUse/Stop blocks are omitted, so the worker overlay is
+        # byte-equivalent to base.
         is_supervisor = False
         try:
             # F826 merge: reuse the profile threaded in from initialize/
@@ -1255,7 +1237,7 @@ class ClaudeCodeProvider(BaseProvider):
             is_supervisor = bool(_profile is not None and _profile.role == "supervisor")
         except Exception:
             is_supervisor = False
-        # F810 (#667): the fork now OWNS the seat delivery edges. Three hooks
+        # F810 (#667): the fork now OWNS the seat delivery edges. Two hooks
         # ported from the old repository-local hook scripts into the same
         # `python -m cli_agent_orchestrator.hooks.<mod>` shape as the hooks above,
         # so a seat in ANY repo (or one that never spawned an in-harness Agent)
@@ -1263,13 +1245,12 @@ class ClaudeCodeProvider(BaseProvider):
         #   * register_inbox — publishes cc_team_inbox_path (the native socket) so
         #     the F783 native ring can reach the seat. SessionStart + PostToolUse
         #     (matcher Agent|Task, the subagent-spawn edge that creates the team
-        #     dir the derivation reads).
-        #   * supervisor_drain — now ALSO fires on PostToolUse (matcher .*) and
-        #     Stop, not SessionStart only: that is the edge a foreign seat was
-        #     missing, so its pending callbacks never entered context (F810 root
-        #     cause). It prints the digest envelope to stdout.
+        #     dir the derivation reads). This is the native carrier's REGISTRATION
+        #     EDGE: without it the server can reach no seat at all.
         #   * rewake — the F213 --arm callback watcher on Stop, async so the
         #     harness can hold it open to the idle gap; posttooluse arm re-arms it.
+        # WP-ARCH 3c K1 removed the third (supervisor_drain): a hook-side carrier
+        # racing the server-side delivery tick over one message id.
         register_command = shlex.join(
             [
                 "env",
@@ -1345,7 +1326,7 @@ class ClaudeCodeProvider(BaseProvider):
                 "SessionStart": [
                     {
                         "matcher": "startup|resume|clear|compact",
-                        "hooks": hooks + drain_hooks + register_hooks,
+                        "hooks": hooks + register_hooks,
                     }
                 ],
                 # OPEN edges (D7):
@@ -1398,20 +1379,17 @@ class ClaudeCodeProvider(BaseProvider):
                     },
                     # F810 (#667): register on the subagent-spawn matcher
                     # (Agent|Task — the edge that creates the team dir the socket
-                    # derivation reads), then drain + rewake on matcher .* (every
-                    # tool call) so a foreign-repo seat surfaces its callbacks on
-                    # its own turn rather than waiting for a SessionStart.
+                    # derivation reads), then rewake on matcher .* (every tool
+                    # call) so an idle-gap watcher stays armed across the turn.
                     # BLOCKER 4: supervisor-only; omitted entirely for workers so
                     # the worker PostToolUse block is byte-equivalent to base.
+                    # WP-ARCH 3c K1: the drain leg is gone — the server-side
+                    # delivery tick is the sole seat carrier.
                     *(
                         [
                             {
                                 "matcher": "Agent|Task",
                                 "hooks": register_hooks,
-                            },
-                            {
-                                "matcher": ".*",
-                                "hooks": drain_hooks,
                             },
                             {
                                 "matcher": ".*",
@@ -1430,16 +1408,16 @@ class ClaudeCodeProvider(BaseProvider):
                 ],
                 "Stop": [
                     {
-                        # F810 (#667): drain THEN rewake --arm on Stop (D2), after
-                        # the existing marker/ack/turn edges. Drain surfaces any
-                        # pending digest at the turn boundary; rewake arms the
-                        # async idle-gap watcher. BLOCKER 4: the F810 drain+rewake
-                        # legs are supervisor-only; a worker's Stop stays byte-
-                        # equivalent to base (marker + ack + turn only).
+                        # F810 (#667): rewake --arm on Stop (D2), after the
+                        # existing marker/turn edges — it arms the async idle-gap
+                        # watcher. BLOCKER 4: the rewake leg is supervisor-only; a
+                        # worker's Stop stays byte-equivalent to base (marker +
+                        # turn only). WP-ARCH 3c K1 removed the drain and ack legs
+                        # that used to sit between them.
                         "hooks": (
-                            marker_hooks + ack_hooks + turn_hooks + drain_hooks + rewake_stop_hooks
+                            marker_hooks + turn_hooks + rewake_stop_hooks
                             if is_supervisor
-                            else marker_hooks + ack_hooks + turn_hooks
+                            else marker_hooks + turn_hooks
                         ),
                     }
                 ],

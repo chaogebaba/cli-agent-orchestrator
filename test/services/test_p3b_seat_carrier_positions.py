@@ -1,25 +1,24 @@
 """The seat's carrier, per queue position (WP-ARCH 3b, §A1.5, AC-3b case 17).
 
-**These assert an EMISSION, not merely the absence of a paste.** An arm that
-checks only for silence certifies silence, and silence at the seat is #604 — the
-failure this whole phase exists to remove. The gate's r1 round found exactly that
-hole: a non-serving position produced no paste AND no native write, and the unit
-suite of the day was satisfied because it counted pastes.
+**WP-ARCH 3c K3b/K3c REVERSED the polarity of the first half of this file.**
 
-The positions do not share a carrier, and that is the design rather than an
-accident:
+3b's rule was "assert an EMISSION, not merely the absence of a paste", because
+silence at the seat is #604 and an arm that counts only pastes certifies it. That
+still holds — but the emitter moved. The legacy F136 chain's wake ran through the
+coalescer into ``ring_supervisor_doorbell``; both are deleted, because a second
+carrier over a row the tick already owns is the duplicate delivery this phase
+removes. So the arms below now pin the ABSENCE of a legacy emission, and the
+positive emission they used to own lives with the carrier that does it:
+``test/app/delivery/test_seat_wake.py`` for ``DeliveryTick.serve`` → ``wake_seat``.
 
 * **`on`** — the queue's tick owns the seat and emits through ``wake_seat``.
-  That path is covered in ``test/app/delivery/test_seat_wake.py``.
-* **`off`, `drain`** — the queue does not serve the seat, so the only remaining
-  carrier is the F136 chain into ``ring_supervisor_doorbell``, which is why A1.5
-  flips ``supervisor.wake.native``'s shipped default to True. THIS file covers
-  those two.
+* **`off`, `drain`** — nothing serves the seat any more. That is not a hole left
+  open: those positions are deleted outright in 3c slice 4 (``on`` becomes the
+  sole position), and ``CAO_DELIVERY_QUEUE=on`` is what ships today.
 
-The break r1 shipped was in that chain: ``cc_inbox_path`` is K2's pull-mode file,
-``supervisor.mailbox_pull`` ships False, so the runner returned ``no_path``,
-``written`` stayed 0, and ``_f136_post_delivery``'s ``written > 0`` gate held the
-doorbell shut. The seat was neither pasted nor woken.
+What survives here unchanged is the CURSOR: claim/commit must still advance so an
+acked or aged id is never re-emitted (#388), and the K2 content-channel write,
+which dies in slice 3.
 """
 
 from __future__ import annotations
@@ -136,25 +135,8 @@ class _Recorder:
     """Counts what each seam did, so an arm can assert an emission happened."""
 
     def __init__(self) -> None:
-        self.submits: list[dict[str, Any]] = []
         self.native_rings: list[tuple[str, int]] = []
         self.pane_writes: list[str] = []
-
-    def submit(self, terminal_id: str, max_row_id: int, **kwargs: Any) -> None:
-        """Stand in for the coalesce buffer, and ring THROUGH to the doorbell.
-
-        The runner hands its wake to ``doorbell_coalesce_service.submit``, which
-        merges near-simultaneous callbacks and flushes on the delivery loop. A
-        unit test has no loop bound, so a real submit would buffer forever and an
-        arm that stopped here would prove only that the runner tried. Calling
-        through to the ring is what makes the assertion cover the whole chain.
-        """
-        self.submits.append({"terminal_id": terminal_id, "row": max_row_id, **kwargs})
-        from cli_agent_orchestrator.services.doorbell_service import (
-            ring_supervisor_doorbell,
-        )
-
-        ring_supervisor_doorbell(terminal_id, max_row_id, **kwargs)
 
     def ring(self, terminal_id: str, max_row_id: int, **_kwargs: Any) -> str:
         self.native_rings.append((terminal_id, max_row_id))
@@ -167,21 +149,16 @@ class _Recorder:
 def _drive(position: SwitchPosition, recorder: _Recorder) -> None:
     """Run one delivery cycle at ``position`` and record what emitted.
 
-    Counted at the SEAMS — the coalesce submit and the doorbell ring — and never
-    from a rendered transcript, which #613 showed can report zero emitters on a
-    seat where emitters had in fact fired.
+    Counted at the SEAMS — the doorbell ring and the pane write — and never from a
+    rendered transcript, which #613 showed can report zero emitters on a seat
+    where emitters had in fact fired. (The coalesce seam that used to sit between
+    the runner and the ring is deleted; 3c K3c.)
     """
     service = InboxService()
-    coalesce = MagicMock()
-    coalesce.submit.side_effect = recorder.submit
     with (
         patch(
             "cli_agent_orchestrator.app.delivery.wiring.queue_position",
             return_value=position,
-        ),
-        patch(
-            "cli_agent_orchestrator.services.doorbell_coalesce.doorbell_coalesce_service",
-            coalesce,
         ),
         patch(
             "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
@@ -208,18 +185,25 @@ def _drive(position: SwitchPosition, recorder: _Recorder) -> None:
         service._f136_post_delivery(SEAT_TERMINAL, outcome)
 
 
+def _wake_cursor(sessions) -> int:
+    with sessions.begin() as db:
+        mb = db.query(MailboxModel).filter_by(id="mb_p3b_sup").one()
+        return int(mb.callback_notified_through_id or 0)
+
+
 @pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
-def test_the_seat_is_woken_natively_in_every_non_queue_position(
-    seat_db, position: SwitchPosition
-) -> None:
-    """An EMISSION per position, at the shipped defaults (§A1.5).
+def test_the_legacy_chain_emits_nothing_in_any_position(seat_db, position: SwitchPosition) -> None:
+    """WP-ARCH 3c K3c: the F136 chain rings NOBODY.
 
-    The gate's r1 round is the reason this is parametrised over positions rather
-    than asserted once: the `on` arm passed, a non-serving position produced
-    nothing at all, and no unit case noticed because every one counted pastes.
+    Its ring ran through the coalescer, which is deleted, and the delivery tick
+    is the seat's single carrier. So the assertion that used to demand an
+    emission here now demands its absence — a ring reintroduced on this path is
+    the duplicate delivery over one id that 3c exists to remove.
 
-    A run where the ring count is zero fails, and it fails in the direction that
-    matters — a paste is an ugly carrier, silence is the bug.
+    This is NOT a silence certificate for the seat: the positive emission is
+    owned by ``test/app/delivery/test_seat_wake.py`` (``DeliveryTick.serve`` ->
+    ``wake_seat``), and these non-queue positions are themselves deleted in
+    slice 4.
     """
     with seat_db.begin() as db:
         _seat(db)
@@ -228,34 +212,38 @@ def test_the_seat_is_woken_natively_in_every_non_queue_position(
     recorder = _Recorder()
     _drive(position, recorder)
 
-    assert recorder.native_rings, (
-        f"the seat received NO native wake under {position.value}: "
-        "neither pasted nor woken is #604, not a fix"
+    assert recorder.native_rings == [], (
+        f"the legacy F136 chain rang the seat under {position.value}: "
+        "that is a second carrier over a row the tick owns"
     )
     assert recorder.pane_writes == [], "a supervisor-role receiver is never pasted (K8)"
 
 
 @pytest.mark.parametrize("position", NON_QUEUE_POSITIONS, ids=lambda p: p.value)
-def test_the_wake_advances_the_cursor_so_an_acked_id_never_re_rings(
+def test_the_run_advances_the_cursor_so_an_acked_id_is_never_reclaimed(
     seat_db, position: SwitchPosition
 ) -> None:
-    """The content channel is optional; the CURSOR is not (#388).
+    """The ring is gone; the CURSOR is not (#388).
 
-    Dropping the ``no_path`` refusal must not drop the claim/commit that gates an
-    acked or aged id. So the same epoch is driven twice: the first cycle rings,
-    the second finds nothing above the cursor and does not.
+    Deleting the wake transport must not delete the claim/commit that gates an
+    acked or aged id, so the same epoch is driven twice: the first cycle advances
+    the cursor past the row, the second finds nothing above it and writes
+    nothing.
     """
     with seat_db.begin() as db:
         _seat(db)
-        _callback(db)
+        row = _callback(db)
+        row_id = int(row.id)
 
     first = _Recorder()
     _drive(position, first)
-    assert len(first.native_rings) == 1
+    assert _wake_cursor(seat_db) == row_id, "the first cycle must advance the wake cursor"
 
+    before = _wake_cursor(seat_db)
     second = _Recorder()
     _drive(position, second)
-    assert second.native_rings == [], "a re-run above an advanced cursor must not re-ring"
+    assert _wake_cursor(seat_db) == before, "a re-run must not re-claim an id below the cursor"
+    assert second.native_rings == []
     assert second.pane_writes == []
 
 
@@ -284,7 +272,7 @@ def test_a_seat_with_a_content_channel_still_writes_the_file(seat_db, tmp_path) 
         _drive(SwitchPosition.DRAIN, recorder)
 
     assert written, "a configured content channel must still be written"
-    assert recorder.native_rings, "and the wake still rings"
+    assert recorder.native_rings == [], "but 3c K3c leaves the wake to the tick"
 
 
 class _WrittenResult:
@@ -698,33 +686,14 @@ def test_the_write_through_row_satisfies_the_public_message_shape(flip_env) -> N
     assert message.status is MessageStatus.PENDING
 
 
-def test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery(flip_env) -> None:
-    """K6 is a kill-list entry, not a component to integrate (D11).
-
-    It is server-side, so it is a genuine improvement on the dead client-side
-    hook, but it repairs a NOTIFICATION path rather than making the durable row's
-    observation unconditional, and it drives the legacy inbox. Left running at
-    `on` it is a second wake emitter over rows the tick already owns — the
-    emitter count case 17 forbids. Caught from a live sandbox log, where its
-    daemon announced itself while the queue was serving.
-    """
-    from cli_agent_orchestrator.services import seat_wake_reconcile
-
-    sessions, store, install = flip_env
-    with sessions.begin() as db:
-        _seat(db)
-
-    install(SwitchPosition.ON)
-    assert seat_wake_reconcile.reconcile_seat_wakes() == [], "K6 must be silent at `on`"
-
-    # And it is NOT muted in the positions where the queue does not serve the
-    # seat, because there it is still part of the legacy chain.
-    install(SwitchPosition.DRAIN)
-    assert seat_wake_reconcile._queue_owns_delivery() is False
+# WP-ARCH 3c K6: ``test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery``
+# pinned the mute on ``services/seat_wake_reconcile``. The module is DELETED —
+# a mute is a flag in front of a second emitter, and 3c removes the emitter — so
+# there is nothing left to mute or to assert a mute on.
 
 
 # ---------------------------------------------------------------------------
-# #741 — the mute is ROW-SCOPED, because the read-only inbox is not an EMPTY one.
+# #741 → WP-ARCH 3c: the row-scoped mute is REPLACED, not relaxed.
 #
 # The box live round under `on` found the seat silent and every live queue row
 # dead with attempts=0. Its log carries the mechanism verbatim: three
@@ -734,279 +703,17 @@ def test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery(flip_env
 # open write transaction on the SAME file. The fallback wrote a legacy row, and
 # a terminal-wide mute then left that row with NO carrier at all.
 #
-# These arms fix the SCOPE of the mute, not the lock. The lock is a genuine
-# race that the fallback exists to survive; what may not survive it is silence.
-# ---------------------------------------------------------------------------
-
-
-def _doorbell_decision(terminal_id: str, row_id: int) -> str:
-    """The REAL ``ring_supervisor_doorbell``, driven to its first decision.
-
-    Deliberately not the ``_drive`` harness above: that one patches the doorbell
-    with a recorder, so the module's own mute never runs and an arm written on it
-    would certify a mute it never reached. The K3 surface is the subject here, so
-    it is the thing that has to be called.
-
-    F747 (#747) took the ``supervisor.doorbell`` default OUT of that call site
-    (the registry is the tier that owns it now, and it ships False), so a stub
-    that echoes the CALL-SITE default answers ``None`` and the ring is skipped at
-    the outer gate before the ``queue_owns`` MUTE this helper exists to probe is
-    ever consulted. The shipped posture is OFF and is pinned where it belongs,
-    in ``test_f747_native_default.py``; this arm is about the mute, not the flag,
-    so it says which posture it needs -- the same shape as ``_seat_meta_and_flags``
-    in ``test_f803_wake_only_no_consume.py``.
-    """
-    from cli_agent_orchestrator.services import doorbell_service
-
-    with patch.object(
-        doorbell_service.ConfigService,
-        "get",
-        side_effect=lambda key, default=None: True if key == "supervisor.doorbell" else default,
-    ):
-        return doorbell_service.ring_supervisor_doorbell(terminal_id, row_id)
-
-
-def test_a_legacy_row_at_on_keeps_its_carrier(seat_db) -> None:
-    """The `on` arm the position sweep above could not have: a row in the LEGACY
-    inbox while the switch says the queue owns delivery.
-
-    Two surfaces, because one alone would not have caught the round's shape:
-    ``deliver_pending`` is what moves the row, and K3's ring is what wakes the
-    seat about it. Both were muted terminal-wide, so the row had no carrier at
-    all -- which is #604 with a switch in front of it.
-    """
-    with seat_db.begin() as db:
-        _seat(db)
-        row = _callback(db)
-        row_id = int(row.id)
-
-    with patch(
-        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
-        return_value=SwitchPosition.ON,
-    ):
-        skips: list[str] = []
-        service = InboxService()
-        with (
-            patch.object(
-                InboxService, "_log_delivery_skip", side_effect=lambda t, r: skips.append(r)
-            ),
-            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
-            patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
-        ):
-            service.deliver_pending(SEAT_TERMINAL)
-        assert "queue_owns_delivery" not in skips, (
-            "a row the queue does not own lost its only carrier at `on`: the legacy "
-            "inbox is read-only from the flip, not empty (#741)"
-        )
-
-        # The doorbell flag is pinned ON by the helper so this reaches the mute;
-        # the returned value is the queue_owns decision, not the shipped posture.
-        assert (
-            _doorbell_decision(SEAT_TERMINAL, row_id) != "skipped_disabled"
-        ), "K3 stayed muted for a row the tick will never serve"
-
-
-def test_the_mute_still_holds_when_the_queue_owns_everything(seat_db) -> None:
-    """The other direction, and the one that keeps the fix honest.
-
-    With NO legacy row for the receiver the queue owns everything it is owed, so
-    every D6 surface stays quiet -- otherwise this change would have replaced a
-    silent seat with the duplicate family the phase exists to close.
-    """
-    with seat_db.begin() as db:
-        _seat(db)
-
-    with patch(
-        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
-        return_value=SwitchPosition.ON,
-    ):
-        skips: list[str] = []
-        service = InboxService()
-        with (
-            patch.object(
-                InboxService, "_log_delivery_skip", side_effect=lambda t, r: skips.append(r)
-            ),
-            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", MagicMock()),
-            patch("cli_agent_orchestrator.services.inbox_service.provider_manager", MagicMock()),
-        ):
-            service.deliver_pending(SEAT_TERMINAL)
-        assert skips == ["queue_owns_delivery"], skips
-        assert _doorbell_decision(SEAT_TERMINAL, 0) == "skipped_disabled"
-
-
-def test_the_predicate_names_which_rows_the_queue_owns(seat_db) -> None:
-    """The predicate itself, so a regression names the cause and not a symptom."""
-    from cli_agent_orchestrator.services.queue_carrier import queue_owns_receiver_delivery
-
-    with seat_db.begin() as db:
-        _seat(db)
-
-    with patch(
-        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
-        return_value=SwitchPosition.ON,
-    ):
-        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is True
-
-        with seat_db.begin() as db:
-            _callback(db)
-        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is False
-
-    # #738 retired `shadow`; `drain` is the non-serving position this now asks
-    # about. The assertion is unchanged: outside `on` the queue owns nothing.
-    with patch(
-        "cli_agent_orchestrator.app.delivery.wiring.queue_position",
-        return_value=SwitchPosition.DRAIN,
-    ):
-        assert queue_owns_receiver_delivery(SEAT_TERMINAL) is False
-
-
-# ---------------------------------------------------------------------------
-# #741 r3 — the POSITIVE carrier arms for K2 and K6.
+# #741 answered that by un-muting the legacy carriers for exactly those
+# receivers, which is why the arms that lived here drove `deliver_pending`, the
+# K3 doorbell, K2's writer and the K6 reconcile, and why they asked a row-scoped
+# predicate. 3c answers it at the SOURCE: the tick adopts every orphaned PENDING
+# row into the queue and retires it, so the set those carriers existed to serve
+# is emptied on a schedule instead. Two of those carriers are deleted in this
+# slice and the predicate has collapsed to the coarse switch, so every arm here
+# was asserting against machinery that no longer exists.
 #
-# The r1 EMPIRICAL adjudication ruled the existing `on` coverage a SHOULD-level
-# hole: `test_a_legacy_row_at_on_keeps_its_carrier` drives `deliver_pending` and
-# K3, and `test_the_predicate_names_which_rows_the_queue_owns` drives the
-# predicate in isolation, but NOTHING put a pending legacy row at `on` through
-# K2's `write_supervisor_callback_notification` or K6's per-mailbox reconcile.
-# Those two call sites are where #741 moved the mute from a module-wide return
-# to a receiver-scoped question, so a regression that reverts either one to the
-# coarse `queue_owns_delivery()` would have been invisible: the predicate would
-# still be correct and the row would still have no carrier.
-#
-# Both arms therefore call the REAL public entry point and assert an EMISSION,
-# in the same spirit as the file's opening note — an arm that checks only for
-# the absence of a mute certifies nothing about whether anything was carried.
+# Their replacement is `test/app/delivery/test_adoption.py`, which asserts the
+# EMISSION the adopted row produces rather than the absence of a mute — the
+# standard this file's opening note sets and the one B2 found these arms had
+# stopped meeting.
 # ---------------------------------------------------------------------------
-
-
-def test_a_legacy_row_at_on_keeps_the_k2_content_carrier(flip_env, tmp_path) -> None:
-    """K2's writer must WRITE for a row the queue does not own.
-
-    `write_supervisor_callback_notification` is the single public native
-    callback writer, and 3b muted it terminal-wide on `queue_owns_delivery()`.
-    At `on` the legacy inbox stops accepting inserts but does not become empty,
-    so that mute stranded every row still in it: K2 returned
-    `skipped/queue_owns_delivery` and the durable native entry was never
-    written. The assertion is on the written FILE, not merely on the return
-    kind, because a writer that reports success and leaves no entry is the same
-    silent seat with a friendlier log line.
-    """
-    from cli_agent_orchestrator.clients.database import _inbox_message_from_row
-    from cli_agent_orchestrator.services.teammate_push_service import (
-        write_supervisor_callback_notification,
-    )
-
-    sessions, _store, install = flip_env
-    with sessions.begin() as db:
-        _seat(db)
-        row = _callback(db)
-        message = _inbox_message_from_row(row)
-
-    inbox_path = tmp_path / "k2-native-inbox.json"
-
-    install(SwitchPosition.ON)
-    result = write_supervisor_callback_notification(
-        inbox_path=inbox_path,
-        mailbox_id="mb_p3b_sup",
-        message=message,
-    )
-
-    assert result.reason != "queue_owns_delivery", (
-        "K2 was muted for a row the queue does not own: the legacy inbox is "
-        "read-only from the flip, not empty, so this row's only content "
-        "carrier just refused it (#741)"
-    )
-    assert result.kind == "written", result
-    assert inbox_path.exists(), "K2 reported a carry and wrote no durable entry"
-
-    entries = json.loads(inbox_path.read_text())
-    assert len(entries) == 1, entries
-
-
-def test_k2_stays_muted_when_the_queue_owns_every_row(flip_env, tmp_path) -> None:
-    """The other direction: with no legacy row, K2 must stay silent.
-
-    Without this arm the repair above would be satisfied by deleting the mute,
-    which restores the duplicate-carrier family (#506) this phase closes.
-    """
-    from datetime import timezone
-
-    from cli_agent_orchestrator.models.inbox import InboxMessage, OrchestrationType
-    from cli_agent_orchestrator.services.teammate_push_service import (
-        write_supervisor_callback_notification,
-    )
-
-    sessions, _store, install = flip_env
-    with sessions.begin() as db:
-        _seat(db)
-
-    # A message the QUEUE holds: shaped like a delivered row, absent from the
-    # legacy inbox, which is exactly the disjointness the predicate relies on.
-    message = InboxMessage(
-        id=9001,
-        sender_id=WORKER_TERMINAL,
-        receiver_id=SEAT_TERMINAL,
-        message="QUEUE_OWNED",
-        orchestration_type=OrchestrationType.SEND_MESSAGE,
-        status=MessageStatus.PENDING,
-        created_at=datetime.now(timezone.utc),
-    )
-    inbox_path = tmp_path / "k2-muted-inbox.json"
-
-    install(SwitchPosition.ON)
-    result = write_supervisor_callback_notification(
-        inbox_path=inbox_path,
-        mailbox_id="mb_p3b_sup",
-        message=message,
-    )
-
-    assert result.kind == "skipped"
-    assert result.reason == "queue_owns_delivery"
-    assert not inbox_path.exists(), "the muted writer still produced a second carrier"
-
-
-def test_a_legacy_row_at_on_keeps_the_k6_reconcile_carrier(flip_env, monkeypatch) -> None:
-    """K6's per-mailbox reconcile must still wake a seat holding a legacy row.
-
-    #741 moved this mute from a sweep-wide `return []` into the per-mailbox
-    loop. `test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery`
-    covers the muted direction only, so a regression that restored the sweep-wide
-    return would pass every shipped test while leaving an idle seat unwoken for
-    rows the tick will never serve — #604 with a switch in front of it.
-    """
-    from cli_agent_orchestrator.services import seat_wake_reconcile
-    from cli_agent_orchestrator.services.teammate_push_service import PushOutcome
-
-    pushes: list[tuple[str, tuple[int, ...]]] = []
-
-    def _record(terminal_id, messages, *, mailbox_id=""):
-        ids = tuple(int(m.id) for m in messages)
-        pushes.append((terminal_id, ids))
-        return PushOutcome(pushed=True, reason="pushed", message_ids=ids)
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.teammate_push_service." "attempt_teammate_push_reported",
-        _record,
-    )
-
-    sessions, _store, install = flip_env
-    with sessions.begin() as db:
-        _seat(db)
-        row = _callback(db)
-        row_id = int(row.id)
-
-    # Past the 90 s default grace window, which is what the reconcile adopts.
-    later = datetime.now() + timedelta(seconds=600)
-
-    install(SwitchPosition.ON)
-    decisions = seat_wake_reconcile.reconcile_seat_wakes(now=later)
-
-    assert decisions, (
-        "K6 skipped the whole mailbox at `on` while a pending legacy row sat in "
-        "it: the row's tick counterpart does not exist, so nothing else will "
-        "wake this seat (#741)"
-    )
-    decision = decisions[0]
-    assert decision.terminal_id == SEAT_TERMINAL
-    assert decision.outcome == "woken", decision
-    assert pushes == [(SEAT_TERMINAL, (row_id,))], pushes

@@ -1137,3 +1137,59 @@ def test_the_wake_line_carries_every_field_a_round_parses(harness: Harness, capl
     # And `receiver=` must be parseable by the round's own regex, unquoted and
     # whitespace-free, because that is how the collector reads it.
     assert re.search(r"receiver=(\S+)", line).group(1) == SEAT
+
+
+# ------------------------------------- WP-ARCH 3c: the tick is the SOLE carrier
+
+
+def test_3c_a_pending_seat_row_reaches_the_seat_with_no_coalescer_bound(
+    harness: Harness,
+) -> None:
+    """K3c's acceptance, taken from the emission rather than from an import.
+
+    Before 3c the seat's native wake reached the socket through
+    ``services/doorbell_coalesce``, bound at ``InboxService.run`` to
+    ``ring_supervisor_doorbell``. That module is deleted, and nothing in the tick
+    ever referenced it — which is precisely the claim that needs a test rather
+    than an assertion in a commit message. Nothing is patched, stubbed or bound
+    here: a pending row is enqueued and ONE tick is run, and the write has to
+    appear at the carrier seam.
+
+    The failure this guards is the one the phase exists to remove in the other
+    direction: if the tick had in fact been leaning on the coalescer, deleting it
+    would leave an idle seat silent, and silence at the seat is #604.
+    """
+    row = harness.enqueue("k_3c_no_coalescer")
+
+    harness.tick.run_once(now=harness.clock.now())
+
+    assert len(harness.carrier.writes) == 1, (
+        "one tick must carry a pending seat row to the socket with no coalescer "
+        "and no doorbell in the path"
+    )
+    assert harness.carrier.writes[0].terminal_id == harness.directory.resolve(SEAT).terminal_id
+    assert harness.injector.pastes == [], "and never through the pane (K8)"
+
+    attempts = harness.queue.attempts_for(row.msg_id)
+    assert [a.carrier for a in attempts] == ["seat_wake"], (
+        "exactly one carrier may touch the id: a second entry here is the "
+        "duplicate delivery 3c removes"
+    )
+
+
+def test_3c_a_second_tick_inside_the_lease_adds_no_second_carrier(
+    harness: Harness,
+) -> None:
+    """The re-ring the deleted coalescer's flush used to be able to produce.
+
+    Its buffer flushed on a timer owned by the delivery loop, not by the lease,
+    so a flush landing inside a live lease put a second emission on one id. With
+    the tick as the sole carrier the lease is what gates re-emission, so ticking
+    again inside it must add neither a write nor an attempt row.
+    """
+    row = harness.enqueue("k_3c_release")
+    harness.tick.run_once(now=harness.clock.now())
+    harness.tick.run_once(now=harness.clock.now())
+
+    assert len(harness.carrier.writes) == 1
+    assert len(harness.queue.attempts_for(row.msg_id)) == 1

@@ -11240,36 +11240,151 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
     )
 
 
-def has_pending_legacy_messages(receiver_id: str) -> bool:
-    """Does this receiver hold at least one PENDING row in the LEGACY inbox?
+def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
+    """Hand PENDING legacy ``inbox`` rows to the queue, one row per transaction.
 
-    WP-ARCH 3b, #741: the row-scoped half of D6's mute. At ``on`` the legacy
-    inbox is read-only but it is not EMPTY, and every row still in it is one the
-    queue does NOT own -- ``write_through`` writes a detached model and adds
+    WP-ARCH 3c. Returns ``(legacy_message_id, msg_id, receiver_id)`` per adopted
+    row. Never raises: adoption is a safety net and the caller is the delivery
+    tick, whose serve step must run whatever happens here.
+
+    **Why this exists.** ``write_through`` returns a detached model and adds
     nothing to this table, so a row physically present here has no
-    ``delivery_msg`` counterpart by construction. Two families reach it: rows
-    that predate the flip, which S6 says must "drain through the old path", and
-    the write-through fallbacks a lost ``BEGIN IMMEDIATE`` race produces.
+    ``delivery_msg`` counterpart by construction, and the tick serves only queue
+    rows. Two families reach it at ``on``: rows that predate the flip, and
+    write-through fallbacks, which a lost ``BEGIN IMMEDIATE`` race against a
+    caller holding an open write transaction produces as ``database is locked``.
+    Until 3c both were carried by the legacy doorbell and the seat-wake
+    reconcile. That slice deletes both, so without this they have no carrier at
+    all, which is #604.
 
-    One indexed existence probe rather than a count: the caller only needs to
-    know whether the legacy carrier still has work, and a count would pay for
-    rows it never reads.
+    **The retire and the enqueue must not straddle a crash.** They cannot share
+    one transaction -- the enqueue writes the queue's own connection, a separate
+    SQLite attachment -- so the ORDER carries the guarantee instead, and it is
+    chosen for which duplicate a crash can produce:
+
+    * enqueue FIRST, then retire. A crash in between leaves the queue row live
+      and the legacy row still PENDING. The legacy row has no carrier (that is
+      the premise), so the message is delivered EXACTLY once, by the tick, and
+      the next adoption pass retires the stale legacy row for free -- the
+      idempotency key makes the re-enqueue return the SAME queue row rather than
+      a second one.
+    * retire first would invert that into the window where neither set owns the
+      row, which is the silent seat this whole phase removes.
+
+    So the crash-time failure mode is a tidy-up, never a loss and never a double
+    delivery. ``idempotency_key`` is the mechanism and it is derived from the
+    legacy row id, so re-adopting a row is a no-op at the store.
+
+    **HELD rows are deliberately out of scope.** A barrier member is not owed to
+    anyone yet; it becomes PENDING when its barrier completes, and the tick after
+    that adopts it.
     """
+    adopted: list[tuple[int, str, str]] = []
+    try:
+        from cli_agent_orchestrator.services.queue_carrier import (
+            adopt_enqueue,
+            legacy_enqueue_fact,
+        )
+    except Exception:  # noqa: BLE001 -- no bridge is "nothing to adopt"
+        logger.debug("wp_arch adoption bridge unavailable", exc_info=True)
+        return adopted
+
     try:
         with SessionLocal() as db:
-            mailbox_schema = _mailbox_schema_available(db)
-            row = (
-                db.query(InboxModel.id)
-                .filter(
-                    _pending_receiver_predicate(receiver_id, mailbox_schema),
-                    InboxModel.status == MessageStatus.PENDING.value,
-                )
-                .first()
+            rows = (
+                db.query(InboxModel)
+                .filter(InboxModel.status == MessageStatus.PENDING.value)
+                .order_by(InboxModel.id.asc())
+                .limit(max(1, int(limit)))
+                .all()
             )
-            return row is not None
-    except Exception:  # noqa: BLE001 -- an unanswerable probe must not break delivery
-        logger.debug("pending-legacy probe failed for %s", receiver_id, exc_info=True)
-        return False
+            candidates = [
+                (
+                    int(row.id),
+                    str(row.logical_receiver_id or row.receiver_id or ""),
+                    str(row.sender_id or ""),
+                    str(row.message or ""),
+                    row.created_at,
+                    str(row.orchestration_type or OrchestrationType.SEND_MESSAGE.value),
+                    bool(row.park_warm),
+                    row.barrier_id,
+                    row.barrier_member_key,
+                    row.enqueue_generation,
+                    row.expire_after_s,
+                    row.supersede_key,
+                )
+                for row in rows
+            ]
+    except Exception:  # noqa: BLE001
+        logger.debug("wp_arch adoption scan failed", exc_info=True)
+        return adopted
+
+    for (
+        legacy_id,
+        receiver_id,
+        sender_id,
+        message,
+        created_at,
+        orchestration_type,
+        park_warm,
+        barrier_id,
+        barrier_member_key,
+        enqueue_generation,
+        expire_after_s,
+        supersede_key,
+    ) in candidates:
+        if not receiver_id:
+            continue
+        try:
+            result = adopt_enqueue(
+                legacy_enqueue_fact(
+                    legacy_message_id=legacy_id,
+                    sender_id=sender_id,
+                    receiver_id=receiver_id,
+                    message=message,
+                    status=MessageStatus.PENDING.value,
+                    created_at=created_at or _utcnow(),
+                    orchestration_type=orchestration_type,
+                    is_callback=orchestration_type == OrchestrationType.SEND_MESSAGE.value,
+                    content_hash=_f475_compute_content_hash(_f475_normalize_message(message)),
+                    park_warm=park_warm,
+                    barrier_id=barrier_id,
+                    barrier_member_key=barrier_member_key,
+                    enqueue_generation=enqueue_generation,
+                    expire_after_s=expire_after_s,
+                    supersede_key=supersede_key,
+                )
+            )
+        except Exception:  # noqa: BLE001 -- one bad row must not stop the pass
+            logger.debug("wp_arch adoption enqueue failed for %s", legacy_id, exc_info=True)
+            continue
+        if result is None:
+            continue
+        msg_id = str(result)
+        try:
+            with SessionLocal() as db:
+                # Conditional on status: a concurrent legacy path that already
+                # moved the row out of PENDING wins, and this adoption becomes
+                # the tidy-up case described above rather than overwriting a
+                # terminal state someone else recorded.
+                changed = (
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.id == legacy_id,
+                        InboxModel.status == MessageStatus.PENDING.value,
+                    )
+                    .update(
+                        {InboxModel.status: MessageStatus.ADOPTED.value},
+                        synchronize_session=False,
+                    )
+                )
+                db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("wp_arch adoption retire failed for %s", legacy_id, exc_info=True)
+            continue
+        if changed:
+            adopted.append((legacy_id, msg_id, receiver_id))
+    return adopted
 
 
 def get_pending_messages(

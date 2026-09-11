@@ -110,6 +110,15 @@ class FindingCode(StrEnum):
     #: the per-table counts.  The rows were observational copies of messages
     #: the legacy inbox owned, so deleting them loses no delivery.
     DIAG_SHADOW_ROWS_RETIRED = "DIAG-SHADOW-ROWS-RETIRED"
+    #: The tick adopted a PENDING legacy ``inbox`` row that had no
+    #: ``delivery_msg`` counterpart, enqueuing it and retiring the legacy row in
+    #: one transaction (WP-ARCH 3c).  Counted per receiver because the number is
+    #: the question: adoption is the fallback path, so a count that climbs says
+    #: the write-through keeps losing its ``BEGIN IMMEDIATE`` race, which is a
+    #: defect to fix rather than a state to live in.  A row reaching here was
+    #: previously carried by the legacy doorbell and the seat-wake reconcile,
+    #: both deleted in this slice; without adoption it has no carrier at all.
+    DIAG_LEGACY_ROW_ADOPTED = "DIAG-LEGACY-ROW-ADOPTED"
 
 
 #: Codes that remain readable but which no code path raises any more (D9b).
