@@ -66,6 +66,7 @@ from cli_agent_orchestrator.clients.database import (
     list_terminals_by_provider_session_id,
     list_terminals_by_session,
     mark_terminal_init_ready,
+    mint_session_incarnation,
     settle_pending_orphan_messages,
     terminal_exists,
     update_last_active,
@@ -2588,6 +2589,25 @@ async def create_terminal(
                     _created_session = True
                     _created_window = True
                     _created_window_name = window_name
+
+                    # F218-a D15 (#783): mint this launch's session incarnation.
+                    # This is the single choke point every new *backend* session
+                    # passes through, so every launch gets exactly one mint and a
+                    # relaunch under a name already in use gets a different key —
+                    # Do-NOT 11's requirement, and the reason the second death of
+                    # a twice-launched ``cao-claude-orch5`` is not silent (M6).
+                    # Best-effort by design: a mint failure must never fail the
+                    # launch; resolve_session_incarnation then answers with the
+                    # deterministic adopted key instead of a per-call one.
+                    try:
+                        mint_session_incarnation(session_name)
+                    except Exception:
+                        logger.warning(
+                            "f218_incarnation_mint_failed session=%s",
+                            session_name,
+                            exc_info=True,
+                        )
+
                     delete_terminals_by_session(session_name)
 
                     # Persist forwarded env only after the tmux session actually

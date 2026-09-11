@@ -6,6 +6,7 @@ D15: resolve_session_incarnation is TOTAL (never returns None/empty).
 D16: Teardown suppression via durable intent rows.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -53,44 +54,65 @@ class AlarmResult:
 # ─── D15: Session incarnation derivation (TOTAL) ─────────────────────────────
 
 
-def resolve_session_incarnation(session_name: str, db: Session) -> str:
-    """D15: TOTAL derivation. tmux #{session_id} from session row, else "epoch:<int(created_at)>".
+def adopted_session_incarnation(session_name: str) -> str:
+    """D15 last resort: a deterministic key for a session with no incarnation row.
 
-    Never returns None and never returns "" — a NULL/empty key silently disables D5's
-    UNIQUE dedup under SQLite's distinct-NULLs rule. Unresolvable (no session row at all)
-    raises, which aborts and retries the mark rather than marking on a degenerate key.
+    Used for sessions CAO adopted, or that existed before ``session_incarnations``
+    was created, and as the caller-side guard against a database failure. Derived
+    from the session name alone, so it is byte-identical on every call in every
+    process — the one property D5 actually needs from a key it cannot mint:
+    two observations of the *same* death collapse onto one degradation row.
+
+    It deliberately does NOT vary per launch. That property belongs to
+    ``mint_session_incarnation``, which runs at session creation; a name-derived
+    key has no way to know which launch it is looking at, and inventing variation
+    here (``uuid4()``, ``now()``) is precisely mutants M24/M25 — the per-call
+    wall-clock key that disabled D5's UNIQUE dedup in production.
     """
-    from cli_agent_orchestrator.clients.database import SessionLocal
+    digest = hashlib.sha256(session_name.encode("utf-8")).hexdigest()[:16]
+    return f"epoch:adopted:{digest}"
 
-    # Try to get from session table — look for tmux_session_id or created_at
-    from sqlalchemy import text
 
-    row = db.execute(
-        text("SELECT created_at FROM sessions WHERE name = :name"),
-        {"name": session_name},
-    ).fetchone()
+def resolve_session_incarnation(session_name: str, db: Session) -> str:
+    """D15: TOTAL derivation — read the stored incarnation, never mint, never raise.
 
-    if row is None:
-        raise ValueError(
-            f"resolve_session_incarnation: no session row for {session_name!r} — "
-            "cannot derive incarnation; aborting mark"
+    Returns ``session_incarnations.incarnation`` verbatim when the row exists; the
+    row is written once per backend-session creation by ``mint_session_incarnation``
+    and is what makes two launches under one name distinguishable (Do-NOT 11).
+    Falls back to :func:`adopted_session_incarnation` when there is no row (adopted
+    or pre-migration session) or the read fails.
+
+    Never returns None and never returns "" — a NULL/empty key silently disables
+    D5's UNIQUE dedup under SQLite's distinct-NULLs rule (M24).
+
+    This function is a pure read: it performs no write, so it cannot be rolled back
+    by a caller's transaction into re-deriving a *different* value next call, and it
+    raises nothing, so no caller has any reason to invent a key of its own.
+    """
+    from cli_agent_orchestrator.clients.database import SessionIncarnationModel
+
+    try:
+        row = (
+            db.query(SessionIncarnationModel.incarnation)
+            .filter(SessionIncarnationModel.session_name == session_name)
+            .first()
         )
+    except SQLAlchemyError:
+        logger.warning(
+            "f218_incarnation_read_failed session=%s — using adopted key",
+            session_name,
+            exc_info=True,
+        )
+        return adopted_session_incarnation(session_name)
 
-    created_at = row[0]
-    if isinstance(created_at, str):
-        # Parse ISO format
-        try:
-            dt = datetime.fromisoformat(created_at)
-            return f"epoch:{int(dt.timestamp())}"
-        except (ValueError, TypeError):
-            pass
-    elif isinstance(created_at, datetime):
-        return f"epoch:{int(created_at.timestamp())}"
+    if row is not None and row[0]:
+        return str(row[0])
 
-    # Ultimate fallback — use session_name hash (deterministic, non-empty)
-    import hashlib
-
-    return f"epoch:{int(hashlib.sha256(session_name.encode()).hexdigest()[:8], 16)}"
+    logger.debug(
+        "f218_incarnation_no_row session=%s — using adopted key",
+        session_name,
+    )
+    return adopted_session_incarnation(session_name)
 
 
 # ─── D5: Mark degraded (CAS via UNIQUE constraint) ───────────────────────────

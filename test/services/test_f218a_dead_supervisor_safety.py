@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from cli_agent_orchestrator.backends.base import ScopeProbe
@@ -622,18 +623,33 @@ class TestAC21NotNullIncarnation:
         else:
             pytest.fail("session_incarnation column not found in session_degradations")
 
-    def test_fallback_is_deterministic(self, scratch_db):
-        """Same session probed twice yields same incarnation."""
-        # Insert a session row for the test
-        scratch_db.execute(
-            text("CREATE TABLE IF NOT EXISTS sessions (name TEXT PRIMARY KEY, created_at DATETIME)")
-        )
-        scratch_db.execute(
-            text("INSERT INTO sessions (name, created_at) VALUES (:n, :c)"),
-            {"n": "test-session", "c": "2026-08-15T01:00:00+00:00"},
-        )
-        scratch_db.commit()
+    def test_no_sessions_table_is_declared(self, scratch_db):
+        """#783 regression: the resolver must not read a table CAO never declares.
 
+        The original build queried ``SELECT created_at FROM sessions``. No such
+        table exists in ``Base.metadata`` (verified here) nor in the production
+        database, so the resolver raised ``OperationalError`` on every call and
+        the caller keyed the degradation row on a wall clock. The old test passed
+        only because it ran ``CREATE TABLE IF NOT EXISTS sessions`` itself.
+        """
+        assert "sessions" not in Base.metadata.tables
+        assert "session_incarnations" in Base.metadata.tables
+        # And the real schema the fixture builds has no such table either.
+        names = {
+            r[0]
+            for r in scratch_db.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        assert "sessions" not in names
+
+    def test_fallback_is_deterministic(self, scratch_db):
+        """Same session probed twice yields the same incarnation — real path, no fixture table.
+
+        Exercises the resolver against the schema the product actually has. No
+        ``session_incarnations`` row exists for this name, which is the adopted /
+        pre-migration case, so the answer is the deterministic name-derived key.
+        """
         from cli_agent_orchestrator.services.session_degradation_service import (
             resolve_session_incarnation,
         )
@@ -644,6 +660,209 @@ class TestAC21NotNullIncarnation:
         assert inc1 != ""
         assert inc1 is not None
         assert inc1.startswith("epoch:")
+
+    def test_stored_incarnation_is_returned_verbatim(self, scratch_db):
+        """A minted row wins over the adopted fallback, and is read back byte-identical."""
+        from cli_agent_orchestrator.clients.database import SessionIncarnationModel
+        from cli_agent_orchestrator.services.session_degradation_service import (
+            adopted_session_incarnation,
+            resolve_session_incarnation,
+        )
+
+        scratch_db.add(
+            SessionIncarnationModel(
+                session_name="cao-claude-orch5",
+                incarnation="epoch:1789108902:7",
+                launch_seq=7,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        scratch_db.commit()
+
+        resolved = resolve_session_incarnation("cao-claude-orch5", scratch_db)
+        assert resolved == "epoch:1789108902:7"
+        assert resolved != adopted_session_incarnation("cao-claude-orch5")
+        # Deterministic across probes (M25): the stored string, never recomputed.
+        assert resolve_session_incarnation("cao-claude-orch5", scratch_db) == resolved
+
+    def test_relaunch_under_same_name_gets_a_different_incarnation(self, tmp_path, monkeypatch):
+        """Do-NOT 11 / M6: two launches of ONE name must not share a dedup key.
+
+        ``cao-claude-orch5`` was relaunched twice under the same name on
+        2026-08-15; if the second launch inherits the first launch's key, the
+        second death dedups against the first and is never alarmed.
+        """
+        db_path = tmp_path / "mint.db"
+        eng = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(bind=eng)
+        Local = sessionmaker(bind=eng)
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", Local)
+
+        first = db_mod.mint_session_incarnation("cao-claude-orch5")
+        second = db_mod.mint_session_incarnation("cao-claude-orch5")
+        third = db_mod.mint_session_incarnation("cao-claude-orch5")
+
+        assert first != second != third
+        assert len({first, second, third}) == 3
+        for value in (first, second, third):
+            assert value
+            assert value.startswith("epoch:")
+        # The launch counter is what separates same-second relaunches.
+        assert first.endswith(":1")
+        assert second.endswith(":2")
+        assert third.endswith(":3")
+
+        # And the reader sees only the latest launch.
+        with Local() as read_db:
+            from cli_agent_orchestrator.services.session_degradation_service import (
+                resolve_session_incarnation,
+            )
+
+            assert resolve_session_incarnation("cao-claude-orch5", read_db) == third
+
+    def test_two_deaths_one_row_when_no_incarnation_row_exists(self, scratch_db):
+        """M24 kill: the adopted path must still dedup — one row, not two.
+
+        This is the production failure (#783) in miniature: two observations of
+        the same death, no ``session_incarnations`` row to key on. With the old
+        wall-clock fallback these produced two rows a second apart.
+        """
+        from cli_agent_orchestrator.services.session_degradation_service import (
+            mark_degraded,
+            resolve_session_incarnation,
+        )
+
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
+            first = mark_degraded(
+                db=scratch_db,
+                session_name="cao-adopted",
+                session_incarnation=resolve_session_incarnation("cao-adopted", scratch_db),
+                cause="session_gone",
+            )
+            # Commit between marks, exactly as the fifo_reader pipeline does —
+            # mark_degraded's IntegrityError path rolls the session back, which
+            # would otherwise discard the first (uncommitted) row too.
+            scratch_db.commit()
+            time.sleep(1.1)  # the old fallback's resolution was whole seconds
+            second = mark_degraded(
+                db=scratch_db,
+                session_name="cao-adopted",
+                session_incarnation=resolve_session_incarnation("cao-adopted", scratch_db),
+                cause="session_gone",
+            )
+
+        assert first.newly_marked is True
+        assert second.newly_marked is False
+        rows = (
+            scratch_db.query(SessionDegradationModel)
+            .filter_by(session_name="cao-adopted", cause="session_gone")
+            .count()
+        )
+        assert rows == 1
+
+    def test_caller_mints_no_incarnation_key_of_its_own(self):
+        """#783 / M24: the fifo_reader call site must not build an incarnation itself.
+
+        The original caller answered a resolver failure with
+        ``f"epoch:{int(datetime.now(timezone.utc).timestamp())}"`` — a wall-clock
+        reading, fresh on every call. Totality is the *service's* contract; a
+        caller that invents a key when the resolver disappoints it is how M24 got
+        in. [STATIC] over the pipeline's code, comments stripped so the narrative
+        comment that quotes the old bug cannot satisfy its own assertion.
+        """
+        import inspect
+
+        from cli_agent_orchestrator.services import fifo_reader as fifo_mod
+
+        source = inspect.getsource(fifo_mod.FifoManager._f218_confirmed_gone_pipeline)
+        code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+        assert "datetime.now" not in code, "M24: incarnation key must not be a wall-clock reading"
+        assert 'f"epoch:' not in code, "the call site must not format an incarnation string"
+        assert "resolve_session_incarnation(" in code
+
+    def test_resolver_is_total_even_against_a_broken_session(self):
+        """D15: the resolver returns a usable key rather than raising, whatever the DB does.
+
+        This is what lets the call site above own no fallback. A session whose
+        every query raises stands in for a poisoned transaction or a missing table.
+        """
+        from cli_agent_orchestrator.services.session_degradation_service import (
+            adopted_session_incarnation,
+            resolve_session_incarnation,
+        )
+
+        class _BrokenSession:
+            def query(self, *_a, **_k):
+                raise OperationalError("SELECT 1", {}, Exception("no such table: whatever"))
+
+        value = resolve_session_incarnation("cao-claude-orch5", _BrokenSession())
+        assert value == adopted_session_incarnation("cao-claude-orch5")
+        assert value
+        assert value != ""
+
+    def test_adopted_key_is_stable_across_time_and_distinct_per_session(self):
+        """The last-resort key must not vary with the clock (M25) but must vary by name."""
+        from cli_agent_orchestrator.services.session_degradation_service import (
+            adopted_session_incarnation,
+        )
+
+        before = adopted_session_incarnation("cao-claude-orch5")
+        time.sleep(1.1)
+        after = adopted_session_incarnation("cao-claude-orch5")
+        assert before == after
+        assert before != adopted_session_incarnation("cao-claude-orch1")
+        assert before
+
+    def test_migration_creates_table_on_an_old_schema_database(self, tmp_path, monkeypatch):
+        """The migration must work on a DB created BEFORE session_incarnations existed."""
+        import sqlite3
+
+        db_path = tmp_path / "old.db"
+        # A database at the old schema: session_degradations present, no
+        # session_incarnations.
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE session_degradations ("
+                "id TEXT PRIMARY KEY, session_name TEXT NOT NULL, "
+                "session_incarnation TEXT NOT NULL, cause TEXT NOT NULL)"
+            )
+        with sqlite3.connect(str(db_path)) as conn:
+            names = {
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        assert "session_incarnations" not in names
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=False
+        )
+        db_mod._migrate_f218_session_incarnations()
+
+        with sqlite3.connect(str(db_path)) as conn:
+            cols = {r[1]: r for r in conn.execute("PRAGMA table_info(session_incarnations)")}
+            assert set(cols) == {"session_name", "incarnation", "launch_seq", "created_at"}
+            assert cols["incarnation"][3] == 1, "incarnation must be NOT NULL (D15)"
+            assert cols["session_name"][5] == 1, "session_name is the PK"
+            # Pre-existing rows are untouched.
+            assert conn.execute("SELECT count(*) FROM session_degradations").fetchone()[0] == 0
+
+        # Idempotent — a second run on the same DB is a no-op, not an error.
+        db_mod._migrate_f218_session_incarnations()
+        with sqlite3.connect(str(db_path)) as conn:
+            assert (
+                conn.execute(
+                    "SELECT count(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='session_incarnations'"
+                ).fetchone()[0]
+                == 1
+            )
 
 
 # ─── AC22: Deliberate teardown suppressed durably ────────────────────────────
