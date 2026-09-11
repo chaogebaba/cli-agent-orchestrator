@@ -537,3 +537,52 @@ async def test_stop_waits_for_the_tick_that_is_in_flight() -> None:
         wiring.reset_producers()
 
     assert finished == [1]
+
+
+# ------------------------------------------- the provider allowlist (D9c)
+
+
+def test_the_allowlist_admits_only_the_named_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D9c: the allowlist is the operator's control, the registry is the fact."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda terminal_id: {"provider": "codex" if terminal_id == "t-codex" else "kiro"},
+    )
+    allowlist = bootstrap._ProviderAllowlist(frozenset({"codex"}))
+
+    assert allowlist("t-codex") is True
+    assert allowlist("t-kiro") is False
+
+
+def test_an_unresolvable_provider_is_not_admitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The predicate narrows and never widens: it is consulted only for a
+    terminal already marked projected, so failing closed leaves the pane in
+    charge rather than suppressing it."""
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda terminal_id: None,
+    )
+
+    assert bootstrap._ProviderAllowlist(frozenset({"codex"}))("t-gone") is False
+
+
+def test_the_provider_is_read_once_per_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D1e forbids a database read on the getter path, and this predicate sits on
+    it.  A terminal's provider is fixed for its lifetime, so one read is enough —
+    and the teardown path drops the entry with the rest of its state, so a
+    recycled id cannot inherit it."""
+    reads: list[str] = []
+
+    def counting(terminal_id: str) -> dict[str, str]:
+        reads.append(terminal_id)
+        return {"provider": "codex"}
+
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", counting)
+    allowlist = bootstrap._ProviderAllowlist(frozenset({"codex"}))
+
+    for _ in range(5):
+        allowlist("t-codex")
+    allowlist.forget("t-codex")
+    allowlist("t-codex")
+
+    assert reads == ["t-codex", "t-codex"]

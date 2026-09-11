@@ -55,7 +55,9 @@ from cli_agent_orchestrator.app.worker_truth.mapping import (
     implied_state,
     legacy_state,
 )
+from cli_agent_orchestrator.app.worker_truth.publisher import PublishTransition
 from cli_agent_orchestrator.core.events import (
+    AnyKind,
     Confidence,
     DecisionKind,
     EventDraft,
@@ -93,6 +95,20 @@ def _no_check(terminal_id: str) -> bool:
 
 def _no_producer_check(event: "WorkerEvent", row: "ProjectedState") -> bool:
     """The default producer-disagreement check: none."""
+    return False
+
+
+def _no_publish(
+    terminal_id: str,
+    state: WorkerState,
+    *,
+    causing_kind: "AnyKind | None",
+    degraded_reason: DegradedReason | None,
+    event_id: str | None,
+    since: datetime,
+) -> bool:
+    """The default publisher: none.  The projection moves and nobody reads it,
+    which is every arm before the cutover and the ``off`` position after it."""
     return False
 
 
@@ -259,6 +275,7 @@ class Projector:
         legacy_check: Callable[[str], bool] | None = None,
         health: SourceHealthWriter | None = None,
         producer_check: Callable[[WorkerEvent, ProjectedState], bool] | None = None,
+        publisher: PublishTransition | None = None,
     ) -> None:
         self._events = events
         self._states = states
@@ -297,6 +314,11 @@ class Projector:
         # ``legacy_check`` is: a projector must stay runnable without the
         # diagnostics that ride on it.
         self._producer_check = producer_check if producer_check is not None else _no_producer_check
+        # D1's publisher.  Absent until the cutover switch resolves ``on``, and
+        # absent is the shape of every arm before it: the projection moves and
+        # nothing reads it, which is what made phase 1's "no behaviour change"
+        # true by construction.
+        self._publisher: PublishTransition = publisher if publisher is not None else _no_publish
 
     # -------------------------------------------------------------------- apply
 
@@ -343,6 +365,13 @@ class Projector:
             else:
                 outcome = self._transition(row, event)
 
+            # D1 — the cutover's publish, inside the same critical section that
+            # decided the move.  Outside it, a second fold could land between the
+            # decision and the publish and the two would reach the egress in the
+            # wrong order, which is last-write-wins arriving one layer up from
+            # where this phase removed it.
+            self._publish(outcome, causing_kind=event.kind)
+
             # Run for EVERY event, muted ones included.  A muted
             # ``status.legacy_published`` is exactly where a disagreement begins —
             # the pane said one thing, the healthy source said another — so
@@ -371,6 +400,30 @@ class Projector:
         if event.kind in DERIVED_ALWAYS_KINDS:
             return False
         return self._projected(event.terminal_id, row)
+
+    def _publish(self, outcome: ProjectionOutcome, *, causing_kind: AnyKind | None) -> None:
+        """Hand an APPLIED move to the publisher.  Caller holds the lock.
+
+        Only an applied move: a diagonal changed nothing to publish, a muted
+        event was not applied, and a decision row never reaches here.  The row is
+        re-read rather than reconstructed from the outcome, because ``since`` and
+        the standing degraded reason are the store's answer and the outcome
+        carries neither — and ``since`` is what the fleet row's ``status_since``
+        will be read from.
+        """
+        if not outcome.applied or outcome.to_state is None:
+            return
+        current = self._states.get(outcome.terminal_id)
+        if current is None:  # pragma: no cover - the row was just written
+            return
+        self._publisher(
+            outcome.terminal_id,
+            outcome.to_state,
+            causing_kind=causing_kind,
+            degraded_reason=current.degraded_reason,
+            event_id=outcome.decision_event_id,
+            since=current.since,
+        )
 
     def _projected(self, terminal_id: str, row: ProjectedState) -> bool:
         """Does the projection own this terminal's status? (D1e.)
@@ -666,7 +719,15 @@ class Projector:
                 last_event = self._last_event(terminal_id, row.last_event_seq)
                 if last_event is None:
                     continue
-                outcomes.append(self._degrade_no_signal(row, last_event, now))
+                outcome = self._degrade_no_signal(row, last_event, now)
+                outcomes.append(outcome)
+                # Offered to the publisher like any other applied move, and
+                # refused by it: the mark above has just been lowered, because
+                # a terminal is only here when its source went silent.  The
+                # handover is the point — the pane path is publishing for this
+                # terminal again, and a projected ``unknown`` on top of it would
+                # be the cutover turning a source outage into a status outage.
+                self._publish(outcome, causing_kind=None)
 
         # The durational check runs for EVERY terminal, not only the ones this
         # pass degraded.  ``DIAG-LEGACY-DISAGREE`` is defined by how long a

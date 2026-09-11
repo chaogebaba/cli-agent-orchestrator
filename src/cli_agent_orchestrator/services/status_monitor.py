@@ -24,12 +24,14 @@ from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
     PYTE_QUIESCENCE_DELAY_S,
 )
+from cli_agent_orchestrator.core.events import PROJECTION_ORIGIN
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
     FreshToken,
     NativeEvidence,
     PassOutcome,
     ProbeEvidence,
+    ProjectionEvidence,
     ReceiverState,
     ReceiverStateStore,
     pass_outcome_for_source,
@@ -295,6 +297,12 @@ class StatusMonitor:
         # not interleave with notify_input_sent, or a freshly-armed gate can
         # be consumed by a decision taken against stale state.
         self._lock = threading.RLock()
+        # WP-ARCH phase 2 (D1e): the status cutover's predicate, or None when the
+        # cutover is off — which is every boot until an operator sets
+        # CAO_WORKER_TRUTH_STATUS=on with a non-empty provider allowlist.  None
+        # means "no terminal is projected", so every path below is phase-1
+        # behaviour by construction rather than by assertion.
+        self._is_projected: object | None = None
         self._buffers: Dict[str, str] = {}
         # Monotonic per-terminal byte-buffer generation.  A provider that
         # remembers positions across get_status() calls needs an explicit reset
@@ -825,9 +833,13 @@ class StatusMonitor:
         captured_at_mono: float | None = None,
         raw_classification: object | None = None,
         probe_evidence: ProbeEvidence | None = None,
-        origin: Literal["incremental", "probe", "forced", "native", "native_poll"] | None = None,
+        origin: (
+            Literal["incremental", "probe", "forced", "native", "native_poll", "worker_truth"]
+            | None
+        ) = None,
         fresh_token: FreshToken | None = None,
         native_evidence: NativeEvidence | None = None,
+        projection_evidence: ProjectionEvidence | None = None,
         slot: Literal["incremental", "fresh"] | None = None,
     ) -> None:
         """Build and publish one receiver observation. Caller holds ``_lock``."""
@@ -880,6 +892,7 @@ class StatusMonitor:
                 raw_classification=raw_classification,
                 probe_evidence=probe_evidence,
                 native_evidence=native_evidence,
+                projection_evidence=projection_evidence,
             ),
             fresh_token=fresh_token,
             slot=slot,
@@ -1241,9 +1254,32 @@ class StatusMonitor:
             observation_metadata = None
         with self._lock:
             pass_outcome: PassOutcome = "aborted"
+            # WP-ARCH phase 2, D1/D1b — read ONCE, before any rule runs, so the
+            # whole pass is decided by one answer.  A predicate re-read partway
+            # through could suppress the publish while the latch had already
+            # moved, which is neither of the two states this phase allows.
+            projected = self._projected(terminal_id)
             try:
                 if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                     pass_outcome = "stale_seq"
+                elif projected:
+                    # D1: the projection is this terminal's publisher of record,
+                    # so the pane path classifies and records (D1c, I7) and
+                    # writes nothing.  D1b: the sticky-ready latch and the revert
+                    # arming do not apply either — they exist to stop an
+                    # unreliable READING from flapping, and a fold is not a
+                    # reading but an ordered event whose every cell the
+                    # transition table has already classified.  Applying them on
+                    # top would let a `turn.started` from the worker's own record
+                    # be refused because the pane had last been read as idle,
+                    # which is #439's mechanism arriving through the new path.
+                    #
+                    # The observation SEQUENCE still advances: it is this
+                    # terminal's count of readings, the fencing the egress
+                    # stamps, and it belongs to the pass rather than to the
+                    # publisher.
+                    self._observe_locked(terminal_id, detected)
+                    pass_outcome = pass_outcome_for_source(pass_source, "no_change")
                 else:
                     last = self._last_status.get(terminal_id)
                     self._observe_locked(terminal_id, detected)
@@ -1346,7 +1382,19 @@ class StatusMonitor:
                 # reading recorded.
                 _wt_pane_classification.record_pane_classification(
                     terminal_id,
-                    self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
+                    # The WOULD-BE publish.  For an unprojected terminal that is
+                    # the latch's own value, as it has always been.  For a
+                    # projected one the latch no longer moves and holds the
+                    # PROJECTION's status, so reading it here would record the
+                    # projection as the pane's opinion — and D5's comparison,
+                    # which exists precisely for these terminals, would agree
+                    # with itself forever.  What the pane would have published,
+                    # with the latch suppressed, is the classification itself.
+                    (
+                        detected
+                        if projected
+                        else self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+                    ),
                     None,
                     "incremental",
                     pass_outcome,
@@ -1357,20 +1405,28 @@ class StatusMonitor:
                     # re-entrant lock, exactly as the egress producer takes it.
                     monitor=self,
                 )
+                # D1's other half: for a projected terminal the pane path does
+                # not publish.  Adding the projection as a writer without
+                # removing this one would buy a race rather than a cutover — the
+                # slot both land in is last-write-wins, and this writer fires per
+                # output chunk.
                 try:
                     evidence_kwargs = (
                         {"raw_classification": raw_classification}
                         if pass_source != "forced" and raw_classification is not None
                         else {}
                     )
-                    self._publish_observation(
-                        terminal_id,
-                        latched_status=self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
-                        pass_outcome=pass_outcome,
-                        frame_source="incremental",
-                        metadata=observation_metadata,
-                        **evidence_kwargs,
-                    )
+                    if not projected:
+                        self._publish_observation(
+                            terminal_id,
+                            latched_status=self._last_status.get(
+                                terminal_id, TerminalStatus.UNKNOWN
+                            ),
+                            pass_outcome=pass_outcome,
+                            frame_source="incremental",
+                            metadata=observation_metadata,
+                            **evidence_kwargs,
+                        )
                 except Exception:
                     try:
                         self._log_receiver_publish_failure(terminal_id)
@@ -1380,61 +1436,84 @@ class StatusMonitor:
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
         if publish_external:
+            self._announce_published(terminal_id, detected, screen_spinner_override)
+
+    def _announce_published(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        screen_spinner_override: Optional[TerminalStatus] = None,
+    ) -> None:
+        """Everything a published status change does BESIDES the observation.
+
+        Extracted from ``_apply_detection`` so WP-ARCH phase 2's projection
+        publisher drives the same four consumers the pane path does, rather than
+        a subset: the event bus (the SSE stream and every in-process subscriber),
+        the auto-responder's published-status record, the children-ledger
+        reconcile, and the condition classifier at a transition.  A cutover that
+        moved the status but stopped the announcement would be a behaviour change
+        dressed as a producer swap — the fleet would update and nothing watching
+        would learn.
+
+        Runs OFF the monitor's lock, taking it only for the reads it needs, for
+        the reason the pane path always has: a subscriber must never be able to
+        re-enter the monitor while the latch state is mid-update.
+        """
+        with self._lock:
+            self._drop_seq_seen[terminal_id] = bus.get_drop_seq(terminal_id)
+            self._last_publish_monotonic[terminal_id] = _clock()
+            fusion_reason = self._status_fusion_reason.get(terminal_id)
+        payload = {"status": detected.value}
+        if fusion_reason is not None:
+            payload["fusion_reason"] = fusion_reason
+        bus.publish(f"terminal.{terminal_id}.status", payload)
+        __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
+        # F579 D17: publish-time children-ledger reconcile. Track the
+        # consecutive non-PROCESSING streak and drop stranded ledger entries
+        # once a lost SubagentStop has held the seat non-PROCESSING for K
+        # ticks; also runs the age-out on every publish (the firing-15 fix).
+        try:
+            if detected == TerminalStatus.PROCESSING:
+                self._non_processing_streak[terminal_id] = 0
+            else:
+                self._non_processing_streak[terminal_id] = (
+                    self._non_processing_streak.get(terminal_id, 0) + 1
+                )
+            from cli_agent_orchestrator.clients.database import (
+                reconcile_children_on_publish,
+            )
+
+            reconcile_children_on_publish(
+                terminal_id,
+                detected.value,
+                self._non_processing_streak.get(terminal_id, 0),
+                _CHILDREN_RECONCILE_K_TICKS,
+            )
+        except Exception:
+            logger.debug("children reconcile on publish failed", exc_info=True)
+        if screen_spinner_override is not None:
+            logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
+        logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+
+        # F611 (#467): a published status transition is EXACTLY the "one
+        # event per terminal transition" seam (§3/D4). Classify the current
+        # pane for a provider condition and fan the ONE result to the three
+        # surfaces (fleet field / supervisor inbox / CLI). SEPARATE from the
+        # status publish above — never touches fuse_status (D1/AC2). Runs
+        # off the lock; any failure is swallowed inside the helper.
+        try:
             with self._lock:
-                self._drop_seq_seen[terminal_id] = bus.get_drop_seq(terminal_id)
-                self._last_publish_monotonic[terminal_id] = _clock()
-                fusion_reason = self._status_fusion_reason.get(terminal_id)
-            payload = {"status": detected.value}
-            if fusion_reason is not None:
-                payload["fusion_reason"] = fusion_reason
-            bus.publish(f"terminal.{terminal_id}.status", payload)
-            __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
-            # F579 D17: publish-time children-ledger reconcile. Track the
-            # consecutive non-PROCESSING streak and drop stranded ledger entries
-            # once a lost SubagentStop has held the seat non-PROCESSING for K
-            # ticks; also runs the age-out on every publish (the firing-15 fix).
+                cond_buffer = self._buffers.get(terminal_id, "")
+            cond_provider = None
             try:
-                if detected == TerminalStatus.PROCESSING:
-                    self._non_processing_streak[terminal_id] = 0
-                else:
-                    self._non_processing_streak[terminal_id] = (
-                        self._non_processing_streak.get(terminal_id, 0) + 1
-                    )
-                from cli_agent_orchestrator.clients.database import (
-                    reconcile_children_on_publish,
-                )
-
-                reconcile_children_on_publish(
-                    terminal_id,
-                    detected.value,
-                    self._non_processing_streak.get(terminal_id, 0),
-                    _CHILDREN_RECONCILE_K_TICKS,
-                )
+                cond_provider = provider_manager.get_provider(terminal_id)
             except Exception:
-                logger.debug("children reconcile on publish failed", exc_info=True)
-            if screen_spinner_override is not None:
-                logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
-            logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
-
-            # F611 (#467): a published status transition is EXACTLY the "one
-            # event per terminal transition" seam (§3/D4). Classify the current
-            # pane for a provider condition and fan the ONE result to the three
-            # surfaces (fleet field / supervisor inbox / CLI). SEPARATE from the
-            # status publish above — never touches fuse_status (D1/AC2). Runs
-            # off the lock; any failure is swallowed inside the helper.
-            try:
-                with self._lock:
-                    cond_buffer = self._buffers.get(terminal_id, "")
                 cond_provider = None
-                try:
-                    cond_provider = provider_manager.get_provider(terminal_id)
-                except Exception:
-                    cond_provider = None
-                self._classify_and_deliver_condition(
-                    terminal_id, cond_provider, cond_buffer, status=detected
-                )
-            except Exception:
-                logger.debug("condition detection at transition failed", exc_info=True)
+            self._classify_and_deliver_condition(
+                terminal_id, cond_provider, cond_buffer, status=detected
+            )
+        except Exception:
+            logger.debug("condition detection at transition failed", exc_info=True)
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
@@ -2158,6 +2237,140 @@ class StatusMonitor:
         except Exception:
             logger.debug("condition delivery failed for %s", terminal_id, exc_info=True)
 
+    # ----- WP-ARCH phase 2: the status cutover (D1, D1d, D1e) ---------------
+
+    def enable_projection(self, view: object) -> None:
+        """Hand the monitor D1e's predicate.  Called ONLY when the switch is on.
+
+        ``view`` is a ``core.ports.SourceHealthView`` — one method,
+        ``is_projected(terminal_id)``, answering the conjunction D1d needs: an
+        authoritative source is registered for this terminal AND it is healthy
+        now AND the operator allowlisted its provider.  One question, because two
+        questions at a call site is how the predicate came to be cited for the
+        other in the first place.
+
+        The composition root calls this, and it is the only caller: ``services``
+        may not reach into ``app`` or ``adapters``, so the view arrives as an
+        object satisfying a Protocol and this module never names its type.  With
+        the switch off it is never called, so ``_is_projected`` stays ``None``
+        and every path below is exactly phase-1 behaviour — the code to be wrong
+        does not run.
+        """
+        self._is_projected = view
+
+    def disable_projection(self) -> None:
+        """Drop the predicate.  Every terminal reads unprojected again.
+
+        The whole-fleet fallback, and the reason the read below cannot fail open:
+        with the projector stopped mid-session the composition root drops the
+        view, and the pane path resumes for everything (AC-2b case 11c).
+        """
+        self._is_projected = None
+
+    def _projected(self, terminal_id: str) -> bool:
+        """Is the projection this terminal's publisher of record? (D1e.)
+
+        **Absence is not projected**, and every failure direction is that one: no
+        view wired, an unknown terminal, a source that never probed, a provider
+        off the allowlist, or an exception on the way to the answer.  Unknown
+        degrades to legacy, never to "healthy" — a predicate that answered
+        "projected" by default would invert I1 rather than enforce it, suppressing
+        the pane path for a fleet with nothing publishing in its place.
+
+        A dictionary lookup under the view's own lock, never a database read:
+        this sits on ``get_status``, which is the backend-aware poll path.
+        """
+        view = self._is_projected
+        if view is None:
+            return False
+        try:
+            return bool(view.is_projected(terminal_id))
+        except Exception:
+            logger.debug("projection predicate failed for %s", terminal_id, exc_info=True)
+            return False
+
+    def is_projected(self, terminal_id: str) -> bool:
+        """The cutover's predicate, for a caller outside this module (D7).
+
+        Public because the codex submit path has to ask it: with the rollout
+        source authoritative, a submission that has not confirmed is deferred
+        rather than recovered by reading the pane.  One predicate, asked by
+        everything that acts on it — a second answer to "is this terminal
+        projected" is how D1d came to cite one for the other.
+        """
+        return self._projected(terminal_id)
+
+    def publish_projection(
+        self,
+        terminal_id: str,
+        status: TerminalStatus,
+        *,
+        event_id: Optional[str] = None,
+        worker_state: str = "",
+        since: Optional[str] = None,
+    ) -> bool:
+        """D1 — publish a projected status through the single legacy egress.
+
+        The composition root's adapter calls this from the projector's fold.  It
+        is the projection's ONLY way into the legacy status path, and it does
+        exactly what the pane path's accepted branch does, minus the latch:
+
+        * assigns ``_last_status``, which is the value read by
+          ``get_published_status`` and, through fusion, by ``get_status`` — the
+          publisher is the single writer of value for a projected terminal, and
+          the pane path's own assignment is suppressed in the same decision;
+        * clears ``_status_fusion_reason``, because a stored pane-derived label
+          (``resync_after_drop`` is written outside the fusion path) would
+          otherwise ride along on a projected observation that no rule touched;
+        * publishes through ``_publish_observation`` with ``origin="worker_truth"``,
+          so the egress stamps the lifecycle generation, the window identity and
+          the observation epoch — the fencing a cross-incarnation publish needs
+          without reading a pane;
+        * announces the change to the same four consumers the pane path does.
+
+        Returns whether the observation was published.  Never raises: it runs
+        inside the projector's critical section, and a publisher that could raise
+        into the fold would make the cutover a status outage.
+        """
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+        except Exception:
+            metadata = None
+        if metadata is None:
+            logger.debug("no metadata for projected publish of %s", terminal_id)
+            return False
+
+        evidence = ProjectionEvidence(
+            event_id=event_id or "",
+            worker_state=worker_state,
+            since=since or "",
+        )
+        try:
+            with self._lock:
+                self._last_status[terminal_id] = status
+                self._status_fusion_reason.pop(terminal_id, None)
+                self._observe_locked(terminal_id, status)
+                self._publish_observation(
+                    terminal_id,
+                    latched_status=status,
+                    pass_outcome="accepted",
+                    frame_source="incremental",
+                    metadata=metadata,
+                    origin=PROJECTION_ORIGIN,
+                    projection_evidence=evidence,
+                )
+        except Exception:
+            try:
+                self._log_receiver_publish_failure(terminal_id)
+            except Exception:
+                pass
+            return False
+
+        self._announce_published(terminal_id, status)
+        return True
+
     def get_published_status(self, terminal_id: str) -> Optional[TerminalStatus]:
         """Return the pre-fusion latched status, or None if never published.
 
@@ -2223,6 +2436,31 @@ class StatusMonitor:
         """
         if status is None:
             return None, None
+
+        # WP-ARCH phase 2, D1d — the read-time half of the cutover.
+        #
+        # D1 stops the pane path WRITING; without this the pane path would go on
+        # READING. Rule 3a converts a published IDLE or COMPLETED into PROCESSING
+        # on pane evidence alone, so the projection would be latched and the next
+        # pane delta would downgrade it on read: #485 verbatim, arriving through
+        # the seam this phase built, and I1 false as designed rather than as
+        # implemented.
+        #
+        # ALL FOUR rules are bypassed, not just the pane-delta pair. Rule 2's
+        # ``WAITING_USER_ANSWER`` is not lost, and that is a build-order fact
+        # rather than a claim: the projection carries the state as
+        # ``prompt.awaiting``, which is in ``DERIVED_ALWAYS_KINDS`` and folds even
+        # while the source is healthy — but only because D1f gave that kind a
+        # derived producer for EVERY provider. Keeping rule 2 on top would be a
+        # second mechanism for one fact, which is the defect D1b objects to in
+        # the latch.
+        #
+        # The gate is INSIDE ``fuse_status`` rather than in its callers: there
+        # are five call sites and one of them is outside this module entirely
+        # (``services/receiver_state_view.py``), so a per-caller guard is one
+        # missed call site away from being no guard.
+        if self._projected(terminal_id):
+            return status, None
 
         with self._lock:
             try:

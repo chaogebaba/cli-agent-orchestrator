@@ -13,6 +13,7 @@ import time
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -1302,6 +1303,28 @@ class CodexSubmitStuckError(Exception):
     import cycle; the translation lives in the seam, which already imports
     ``DeliveryDeferredError``.
     """
+
+
+def _deferred_submission(terminal_id: str, excerpt: str) -> Exception:
+    """WP-ARCH phase 2, D7 — the deferral that replaces the pane ladder.
+
+    Built here rather than raised at the call site so the lazy import stays in
+    one place: ``providers`` may not import ``draft_guard`` at module scope
+    without closing a provider → draft_guard → status_monitor → manager →
+    provider cycle (see :class:`CodexSubmitStuckError`).
+
+    The exception TYPE is the one the two stuck arms in ``terminal_service``
+    already translate to, so the vocabulary its callers see is unchanged: a
+    retry-safe deferred delivery, not a crash and not a pretend-success.
+    """
+    from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
+
+    return DeliveryDeferredError(
+        f"F435/D7: codex terminal {terminal_id} has an authoritative rollout "
+        f"source and no submission event for this dispatch within the poll "
+        f"budget; deferring rather than recovering from the pane. "
+        f"Last composer lines:\n{excerpt}"
+    )
 
 
 def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
@@ -4727,6 +4750,34 @@ class CodexProvider(BaseProvider):
             pre_paste_chip_count=pre_paste_chip,
         )
 
+    def _projection_owns_submission(self) -> bool:
+        """D7 — is the projection this terminal's publisher of record?
+
+        The CUTOVER's predicate, deliberately, and not a freshly-invented
+        "is the source healthy" test beside it.  Two predicates for one question
+        is how the read-time bypass came to cite the wrong one; and tying the
+        deferral to the same switch is what makes ``CAO_WORKER_TRUTH_STATUS``
+        unset mean "today's behaviour, everywhere" rather than "today's
+        behaviour, except here".
+        """
+        try:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            # ``is True`` rather than a truthiness test, and it is the same
+            # fail-safe direction the whole phase uses: anything that is not an
+            # unambiguous yes reads as NOT projected, and the ladder runs.  A
+            # monitor that has been replaced by a double answers with the double,
+            # and a double is truthy — so truthiness here would silently turn
+            # every test that stubs the monitor into a deferral.
+            return status_monitor.is_projected(self.terminal_id) is True
+        except Exception:
+            logger.debug(
+                "F435/D7: projection predicate unavailable for %s",
+                self.terminal_id,
+                exc_info=True,
+            )
+            return False
+
     def verify_submission_after_send(
         self,
         metadata: dict[str, Any],
@@ -4990,9 +5041,58 @@ class CodexProvider(BaseProvider):
                 )
                 return
 
+        def _projection_confirms() -> bool:
+            """WP-ARCH phase 2, D7 — the STRUCTURAL confirmation, as an event.
+
+            The same fact ``_rollout_confirms`` reads out of the file, read
+            instead out of the worker-truth log, where the codex rollout tailer
+            has already put it: a ``submission.confirmed`` row for this terminal
+            past the dispatch baseline.  It is the cheaper read of the two (one
+            indexed query rather than a file walk plus a SQLite history scan),
+            and it is the one that survives the substrate changing under it —
+            F643 and F643b are both "the transcript moved", and the tailer owns
+            that question now.
+
+            Inert unless worker-truth ingestion is on, so with the phase-1 switch
+            off this returns False and the ladder below is reached exactly as it
+            is today.
+            """
+            if baseline is None:
+                return False
+            try:
+                from cli_agent_orchestrator import bootstrap as _wt_bootstrap
+                from cli_agent_orchestrator.core.events import EventKind
+
+                runtime = _wt_bootstrap.current_runtime()
+                store = None if runtime is None else runtime.event_store
+                if store is None:
+                    return False
+                since = datetime.fromtimestamp(baseline.baseline_wall, UTC)
+                rows = store.read(
+                    self.terminal_id,
+                    since=since,
+                    kinds=frozenset({EventKind.SUBMISSION_CONFIRMED}),
+                    limit=1,
+                )
+                return bool(rows)
+            except Exception:
+                logger.debug(
+                    "F435/D7: worker-truth submission check failed for %s",
+                    self.terminal_id,
+                    exc_info=True,
+                )
+                return False
+
         # Primary signal: poll rollout file for the user event
         poll_deadline = time.monotonic() + CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS
         while time.monotonic() < poll_deadline:
+            if _projection_confirms():
+                logger.info(
+                    "F435/D7 submit-verify: terminal %s confirmed via the "
+                    "worker-truth submission event",
+                    self.terminal_id,
+                )
+                return
             if _rollout_confirms():
                 logger.info(
                     "F435 submit-verify: terminal %s confirmed via rollout " "structural signal",
@@ -5017,6 +5117,32 @@ class CodexProvider(BaseProvider):
                     )
                     return
             time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
+
+        # WP-ARCH phase 2, D7 — the ladder is not entered for a terminal whose
+        # source is authoritative.
+        #
+        # The ladder below reads the pane to decide whether a submit stuck, and
+        # #555 is what that costs when the pane cannot be read: the incident's
+        # death was not the readiness gate, which proceeds anyway, but the
+        # composer read after it raising on an unreadable pane.  With the rollout
+        # source healthy there is a structural answer available and the pane adds
+        # nothing to it — the poll above has just spent its whole budget failing
+        # to find one, so the honest conclusion is "not submitted yet", not "let
+        # us go and squint at the screen".
+        #
+        # ``DeliveryDeferredError`` is deliberately the exception the two stuck
+        # arms in ``terminal_service`` already raise, so the outcome vocabulary
+        # its callers see is unchanged: the dispatch is retried later rather than
+        # recovered by a keystroke nobody can prove is needed.
+        #
+        # Gated on the CUTOVER's own predicate rather than a second one.  With
+        # ``CAO_WORKER_TRUTH_STATUS`` unset this is False for every terminal and
+        # the ladder runs exactly as it does today, which is what keeps the
+        # switch a single decision.  2c deletes the ladder and its nine
+        # solely-owned constants; this is the behaviour change that has to come
+        # first and be observed.
+        if self._projection_owns_submission():
+            raise _deferred_submission(self.terminal_id, _excerpt_now())
 
         # Rollout poll exhausted without confirmation. Check if stuck.
         # Recovery Enter fires ONLY if pane shows a stuck owned chip AND
