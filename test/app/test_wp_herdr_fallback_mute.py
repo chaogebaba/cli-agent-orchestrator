@@ -85,11 +85,37 @@ def test_the_same_event_APPLIES_on_an_uncertified_terminal_with_a_stale_source()
     assert row is not None and row.state is WorkerState.BUSY
 
 
-def test_derived_lifecycle_is_muted_even_with_no_source_probe_at_all() -> None:
-    """A DETACHED source — the column was never written — is the harder case:
-    ``_source_healthy`` reads NULL as unhealthy, so precedence alone would apply
-    the pane event.  §6(ii) must still mute it."""
+def test_a_source_that_has_never_delivered_does_NOT_mute() -> None:
+    """The r1 rule, reversed on evidence — and this is the whole of B2.
+
+    r1 muted a certified terminal unconditionally, including when its source had
+    produced nothing.  A herdr subscription can be ACKed and permanently silent
+    (measured on 0.9.0 with the wrong subscription), and the connect-time
+    snapshot still reports a level — so that rule froze the terminal at whatever
+    herdr said at attach, forever, while reporting it as authoritative truth.
+
+    ``last_source_probe_at`` is NULL here, which after r2 means exactly one
+    thing: no pushed frame has ever arrived.  A cohort must not be muted on that,
+    so the pane keeps the lifecycle, precisely as it would have before H1.
+    """
     projector, events, states, clock = _wired()
+    assert states.get(CERTIFIED) is None
+    outcome = _project(projector, events, _derived(CERTIFIED, EventKind.TURN_STARTED, clock))
+    assert outcome.applied is True
+    row = states.get(CERTIFIED)
+    assert row is not None and row.state is WorkerState.BUSY
+
+
+def test_the_mute_engages_once_the_stream_has_proven_itself() -> None:
+    """And then it holds, stale source or not — §6(ii)'s actual claim.
+
+    The bump is what the herdr source does on a pushed frame and on nothing else,
+    so a non-NULL column is the projector's proof that the stream delivered at
+    least once.  From that point a certified terminal degrades rather than
+    reverting, which is the rule r1 was reaching for.
+    """
+    projector, events, states, clock = _wired()
+    _go_stale(states, CERTIFIED, clock)  # bumped once, then aged out
     outcome = _project(projector, events, _derived(CERTIFIED, EventKind.TURN_STARTED, clock))
     assert outcome.applied is False
 
