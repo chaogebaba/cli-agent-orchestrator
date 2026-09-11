@@ -16,10 +16,7 @@ AC4/AC6 (below) are unchanged by r3.
 
 from __future__ import annotations
 
-import concurrent.futures
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 
 class TestF158AfterCommitFallback:

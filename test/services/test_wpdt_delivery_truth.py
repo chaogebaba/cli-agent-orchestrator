@@ -10,15 +10,9 @@ AC7/AC8: doctrine arming + flag-flip rollback for that same deleted plane; see
      the note at the foot of this file.
 """
 
-import asyncio
 import json
-import os
-import re
-import threading
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # AC4: F152 producer — cc_team_inbox_path at creation + self-heal
