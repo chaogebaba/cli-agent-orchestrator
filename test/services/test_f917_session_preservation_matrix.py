@@ -788,3 +788,121 @@ class TestAC6DeletionLevelPreservation:
             "retain the session artifact through the real reaper + manager"
         )
         assert isinstance(result, dict)
+
+
+# ==========================================================================
+# Resume-defect #6 (observed 03:16Z) — reaping a RESUMED terminal mid-init must
+# RELEASE its leaked resume_claim so the NEXT resume succeeds AT ONCE, not after
+# the 600s claim TTL. Fits AC-2/AC-6 (a preserved session is resumable now).
+# ==========================================================================
+class TestResumeClaimReleaseOnReap:
+    def _seed(self, d, *, identity_key, orig_tid, resumed_tid):
+        import cli_agent_orchestrator.clients.database as dbm
+
+        # Root minted for the ORIGINAL terminal (current_terminal_id=orig).
+        d.mint_spawn_identity(
+            identity_key=identity_key,
+            provider="codex",
+            provider_namespace="/ns",
+            agent_profile="dev",
+            model=None,
+            reasoning_effort=None,
+            origin_callback_ref=None,
+            current_terminal_id=orig_tid,
+            cwd="/w",
+            owner_principal="owner-1",
+        )
+        # The RESUMED terminal's identity row shares the identity_key (a new
+        # incarnation whose resume has NOT yet published).
+        with dbm.SessionLocal.begin() as db:
+            db.add(
+                dbm.TerminalIdentityModel(
+                    terminal_id=resumed_tid,
+                    provider="codex",
+                    agent_profile="dev",
+                    cwd="/w",
+                    session_name="s",
+                    base_name=resumed_tid,
+                    lifecycle="live",
+                    identity_key=identity_key,
+                )
+            )
+
+    def test_reap_during_init_releases_claim_next_resume_succeeds(self, real_sqlite_env):
+        import cli_agent_orchestrator.clients.database as d
+        from cli_agent_orchestrator.services import conversation_transition as ct
+
+        key, orig, resumed = "conv_r6a", "r6origaa", "r6resmaa"
+        self._seed(d, identity_key=key, orig_tid=orig, resumed_tid=resumed)
+
+        # A resume takes the single claim (generation 0 -> 1).
+        assert d.claim_resume(key, 0, "supervisor-1") is True
+        # A concurrent second resume is refused while the claim is held.
+        assert d.claim_resume(key, 1, "supervisor-2") is False
+
+        # Reap the resumed incarnation mid-init → compensator releases the claim.
+        released = ct.release_resume_claim_on_reap(resumed)
+        assert released == key
+
+        # pass-after: the very next resume claim succeeds IMMEDIATELY (no TTL
+        # wait). generation is now 1 (bumped by the first claim).
+        assert d.claim_resume(key, 1, "supervisor-2") is True
+
+    def test_no_release_when_terminal_is_published_current(self, real_sqlite_env):
+        """A published resume already cleared the claim; if this terminal IS the
+        current_terminal_id the compensator must NOT touch an (unrelated) claim."""
+        import cli_agent_orchestrator.clients.database as d
+        from cli_agent_orchestrator.services import conversation_transition as ct
+
+        key, cur = "conv_r6b", "r6curbbb"
+        d.mint_spawn_identity(
+            identity_key=key,
+            provider="codex",
+            provider_namespace="/ns",
+            agent_profile="dev",
+            model=None,
+            reasoning_effort=None,
+            origin_callback_ref=None,
+            current_terminal_id=cur,
+            cwd="/w",
+            owner_principal="owner-1",
+        )
+        with d.SessionLocal.begin() as db:
+            db.add(
+                d.TerminalIdentityModel(
+                    terminal_id=cur,
+                    provider="codex",
+                    agent_profile="dev",
+                    cwd="/w",
+                    session_name="s",
+                    base_name=cur,
+                    lifecycle="live",
+                    identity_key=key,
+                )
+            )
+        assert d.claim_resume(key, 0, "supervisor-1") is True
+        released = ct.release_resume_claim_on_reap(cur)  # cur IS current → skip
+        assert released is None
+
+    def test_no_release_when_no_claim(self, real_sqlite_env):
+        import cli_agent_orchestrator.clients.database as d
+        from cli_agent_orchestrator.services import conversation_transition as ct
+
+        key, orig, resumed = "conv_r6c", "r6origcc", "r6resmcc"
+        self._seed(d, identity_key=key, orig_tid=orig, resumed_tid=resumed)
+        # No claim taken → nothing to release.
+        assert ct.release_resume_claim_on_reap(resumed) is None
+
+    def test_variant_drop_release_is_detected(self, real_sqlite_env, monkeypatch):
+        """Variant patch 'drop-the-release' (compensator is a no-op / not called):
+        the claim stays held and the next resume is refused. Simulated by NOT
+        calling the compensator; asserting the next claim FAILS proves the
+        release is load-bearing (the shipped test above asserts it SUCCEEDS).
+        """
+        import cli_agent_orchestrator.clients.database as d
+
+        key, orig, resumed = "conv_r6d", "r6origdd", "r6resmdd"
+        self._seed(d, identity_key=key, orig_tid=orig, resumed_tid=resumed)
+        assert d.claim_resume(key, 0, "supervisor-1") is True
+        # WITHOUT the release (the variant), the next resume is still refused.
+        assert d.claim_resume(key, 1, "supervisor-2") is False

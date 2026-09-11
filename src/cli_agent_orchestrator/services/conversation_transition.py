@@ -201,10 +201,55 @@ def commit_reap(terminal_id: str) -> Optional[str]:
     return cast(str, key)
 
 
-# ---------------------------------------------------------------------------
-# F913 (#765) AC-1 / AC-3 / AC-7 — one shared, conservative preservation
-# decision, used at every destructive boundary and independent of ``force``.
-# ---------------------------------------------------------------------------
+def release_resume_claim_on_reap(terminal_id: str) -> Optional[str]:
+    """F913 resume-defect #6 (03:16Z): release a resume_claim held for a RESUMED
+    terminal that is being reaped before its resume published.
+
+    A resume takes the identity's single ``resume_claim`` (claim_resume, D3
+    step 4) and clears it only at ``verify_and_publish_resume``. If the resumed
+    incarnation is DELETED before that (e.g. a non-force reap during deferred
+    init), the claim is leaked: nothing in the reap path clears it, and
+    ``reconcile_stale_claims`` only frees claims older than ``resume.claim_ttl_s``
+    (600s), so the very next ``assign(resume_from=...)`` is refused
+    ``session_resume_in_progress`` for up to ten minutes and no verb releases it
+    early (``cao identity release`` refuses a young claim too). That violates the
+    AC-2/AC-6 preservation contract — a preserved session must be resumable AT
+    ONCE, not after a TTL.
+
+    Releases the claim (``clear_resume_claim``, event ``resume_reaped``) when:
+      * the reaped terminal is linked to a conversation root, AND
+      * that root currently holds an active ``resume_claim``, AND
+      * the resume has NOT published this incarnation as ``current_terminal_id``
+        (publish would already have cleared the claim; a still-present claim on a
+        not-yet-current terminal is exactly the leaked-mid-resume case).
+    Returns the identity_key it cleared, else None. Never raises — a
+    compensator failure must not fail the reap it accompanies.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import clear_resume_claim
+
+        root = _root_for_terminal(terminal_id)
+        if root is None:
+            return None
+        if not root.get("resume_claim"):
+            return None
+        # A published resume already cleared the claim; if current_terminal_id is
+        # THIS terminal the resume completed and any claim is unrelated — do not
+        # touch it. The leak case is a claim still held while this incarnation is
+        # NOT the published current terminal.
+        if root.get("current_terminal_id") == terminal_id:
+            return None
+        key = root["identity_key"]
+        clear_resume_claim(key, event="resume_reaped")
+        logger.info(
+            "f913 resume_reaped: released leaked resume_claim on %s for reaped terminal %s",
+            key,
+            terminal_id,
+        )
+        return cast(str, key)
+    except Exception:
+        logger.debug("f913 resume_reaped claim release failed for %s", terminal_id, exc_info=True)
+        return None
 
 
 @dataclass(frozen=True)

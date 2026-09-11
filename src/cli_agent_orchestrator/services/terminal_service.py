@@ -8165,6 +8165,15 @@ def delete_terminal(
                 _f829_ct.commit_hibernate(_f829_hib_decision)
         except Exception:
             logger.debug("f829 conversation transition write failed", exc_info=True)
+        # F913 resume-defect #6: if this reaped terminal held an unpublished
+        # resume_claim (a resume reaped mid-init), release it now so the NEXT
+        # assign(resume_from=...) succeeds immediately instead of waiting out the
+        # claim TTL (AC-2/AC-6: a preserved session is resumable at once).
+        # Best-effort and self-guarded — never turns a completed reap into an error.
+        try:
+            _f829_ct.release_resume_claim_on_reap(terminal_id)
+        except Exception:
+            logger.debug("f913 resume_reaped claim release failed", exc_info=True)
         return _f829_result
     finally:
         # D16: Close intent in finally — runs on success, failure, exception alike
