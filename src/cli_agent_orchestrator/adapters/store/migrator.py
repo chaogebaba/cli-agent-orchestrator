@@ -466,6 +466,27 @@ CREATE TABLE IF NOT EXISTS answer_delivery_intent (
   settled_at      TEXT)
 """
 
+# The notification intent, committed IN the ask transaction (slice B1; §10.2 P2).
+#
+# §10.2 requires the notice to commit with the question and the blueprint names
+# no table for it, so this is B1's addition, recorded as a build-time amendment
+# rather than smuggled.  Without it there is an instant in which a lane is
+# suspended and the only record of the obligation to tell anybody is in the
+# memory of the process that just committed — exactly the crash window the
+# effect-intent pattern exists to close, one table further down.
+#
+# ``attempts`` and ``last_error`` are what make a FAILED notice retryable by a
+# sweep instead of a row that merely records that something went wrong once.
+_QUESTION_NOTICE_INTENT_DDL = """
+CREATE TABLE IF NOT EXISTS question_notice_intent (
+  question_id TEXT PRIMARY KEY,
+  state       TEXT NOT NULL CHECK (state IN ('PENDING','SENT','FAILED')),
+  msg_id      TEXT,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT,
+  settled_at  TEXT)
+"""
+
 # Append-only; one row per ACCEPTED claim (DESIGN r2 non-blocking 1).  Identical
 # retries by ``client_request_id`` return this row.
 _OWNERSHIP_TRANSFER_DDL = """
@@ -683,6 +704,22 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
     ("question_answer", (_QUESTION_ANSWER_DDL,)),
     ("answer_delivery_intent", (_ANSWER_DELIVERY_INTENT_DDL,)),
     ("ownership_transfer", (_OWNERSHIP_TRANSFER_DDL,)),
+    (
+        # Slice B1.  An ADDITIVE step appended to the list, never an edit of an
+        # existing DDL string: a deployment that has already applied the steps
+        # above gets this one and nothing else, which is the whole reason this
+        # file's rule at the top of the step list exists.
+        "question_notice_intent",
+        (
+            _QUESTION_NOTICE_INTENT_DDL,
+            # The expiry sweep scans open questions by deadline every 30s (B2).
+            # Partial on the two OPEN states so the index stays the size of the
+            # working set rather than of all history.
+            "CREATE INDEX IF NOT EXISTS ix_question_expiry "
+            "ON round_question(state, expires_at) "
+            "WHERE state IN ('PENDING','ESCALATED')",
+        ),
+    ),
 )
 
 

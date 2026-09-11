@@ -46,9 +46,13 @@ from cli_agent_orchestrator.core.gate import (
 __all__ = [
     "CallbackEnvelope",
     "EnvelopeKind",
+    "IdentityRef",
     "compute_pin_digest",
+    "render_anomaly_envelope",
     "render_brief",
     "render_callback",
+    "question_payload",
+    "render_question_envelope",
     "render_run_show",
     "run_show_payload",
 ]
@@ -81,11 +85,17 @@ class CallbackEnvelope(BaseModel):
     visible_bytes: int = Field(ge=0)
     pin_count: int = Field(ge=0)
     pin_digest: str
-    renderer_version: str = "2a"
+    renderer_version: str = "2b"
 
 
 _MAX_SUMMARY_LINES = 2
-_RENDERER_VERSION = "2a"
+#: Bumped for slice B1: the renderer now emits question and anomaly envelopes
+#: alongside 2a's brief and callback, so a consumer that pinned "2a" is looking
+#: at a different surface than one reading this.
+_RENDERER_VERSION = "2b"
+#: A single envelope line's budget.  Long enough for a real question, short
+#: enough that four lines stay four lines on a narrow pane.
+_MAX_LINE_BYTES = 160
 
 
 def compute_pin_digest(pins: tuple[str, ...]) -> str:
@@ -192,6 +202,172 @@ def render_callback(
         lines=lines,
         visible_bytes=visible,
         pin_count=len(pins),
+        pin_digest=digest,
+        renderer_version=_RENDERER_VERSION,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Question and anomaly envelopes (slice B1; §10.2 A5, AC-A7/AC-A11).
+#
+# Why these do not go through ``render_callback``.  That function takes a
+# ``RoundProjection`` and reads the run's lane, wp and round number off it — but a
+# non-gate lane asks a question with ``round_id`` NULL, so there IS no projection
+# to read, and inventing a synthetic round to satisfy the signature would put a
+# fake row in the store to make a renderer happy.  These take an identity VALUE
+# instead: the caller resolves who is asking (from rows, when there are rows) and
+# the renderer stays a pure function of what it is handed.
+#
+# The four-line budget and the derived pin digest are unchanged.  A question has
+# no dispatch pins of its own, so its digest is the stable empty-set digest,
+# which is deliberately distinguishable from "pins not computed".
+# ---------------------------------------------------------------------------
+
+
+class IdentityRef(BaseModel):
+    """Who is speaking and about what, for an envelope with no round to read.
+
+    ``context`` is optional exactly because a non-gate question has none: the
+    identity line collapses to ``who · ref`` rather than rendering an empty
+    middle field, so "this lane has no round" reads as an absence instead of as a
+    blank nobody can interpret.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    who: str = Field(min_length=1)
+    context: str = ""
+    ref: str = Field(min_length=1)
+
+    def line(self) -> str:
+        """The envelope's line 1."""
+        parts = [self.who] + ([self.context] if self.context else []) + [self.ref]
+        return " · ".join(parts)
+
+
+def _question_summary(question: object) -> tuple[str, ...]:
+    """At most two authored lines: the question, then its options.
+
+    Truncated rather than wrapped.  A wrapped question would silently grow the
+    envelope past four physical lines, which is the one thing the budget exists
+    to prevent; a truncated one is visibly incomplete and the pointer says where
+    the rest is.
+    """
+    from cli_agent_orchestrator.core.gate import RoundQuestion
+
+    assert isinstance(question, RoundQuestion)
+    lines = [_clip(question.question, _MAX_LINE_BYTES)]
+    if question.options:
+        lines.append(_clip("options: " + " | ".join(question.options), _MAX_LINE_BYTES))
+    return tuple(lines[:_MAX_SUMMARY_LINES])
+
+
+def _clip(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def render_question_envelope(
+    question: object,
+    *,
+    identity: IdentityRef,
+    artifact_ref: str = "",
+) -> CallbackEnvelope:
+    """The four-line QUESTION envelope a suspended lane raises (A5, AC-A11).
+
+    Line 1 identity, then the question and (when there are any) its options, then
+    a pointer naming the id to answer and the deadline.  The pointer carries the
+    computed ``[pins ok: N @ 8-hex]`` like every other envelope, so one reader can
+    audit all of them the same way; there is no ``build_attestation`` block here
+    either, which is the mutant AC-A11 kills.
+    """
+    from cli_agent_orchestrator.core.gate import RoundQuestion
+
+    assert isinstance(question, RoundQuestion)
+    summary = _question_summary(question)
+    digest = compute_pin_digest(())
+    ref = artifact_ref or f"cao gate answer {question.question_id}"
+    pointer = f"→ {ref} expires={question.expires_at.isoformat()} " f"[pins ok: 0 @ {digest}]"
+    lines = (identity.line(), *summary, pointer)
+    return CallbackEnvelope(
+        kind=EnvelopeKind.QUESTION,
+        lines=lines,
+        visible_bytes=sum(len(line) for line in lines) + len(lines),
+        pin_count=0,
+        pin_digest=digest,
+        renderer_version=_RENDERER_VERSION,
+    )
+
+
+def question_payload(question: object) -> dict[str, object]:
+    """One question as JSON — the ONE serialiser both surfaces use.
+
+    ``api`` returns this and ``cao gate --db`` prints it, so a ``--db``
+    transcript is evidence about the served surface rather than about a second
+    spelling of it.  It lives in ``app`` because ``api``, ``mcp_server`` and
+    ``cli`` are independent siblings in the layer contract and may not import one
+    another; a shared shape has to sit beneath all three.
+
+    ``is_open`` is included although it is derivable: a reader deciding whether a
+    lane is still waiting should not have to know that PENDING and ESCALATED are
+    the two open states, which is precisely the rule that would drift.
+    """
+    from cli_agent_orchestrator.core.gate import RoundQuestion
+
+    assert isinstance(question, RoundQuestion)
+    return {
+        "question_id": question.question_id,
+        "dispatch_id": question.dispatch_id,
+        "round_id": question.round_id,
+        "client_request_id": question.client_request_id,
+        "owner_conversation": question.owner_conversation,
+        "owner_epoch": question.owner_epoch,
+        "continuation_kind": question.continuation_kind.value,
+        "continuation_ref": question.continuation_ref,
+        "asked_at": question.asked_at.isoformat(),
+        "expires_at": question.expires_at.isoformat(),
+        "question": question.question,
+        "options": list(question.options),
+        "answer_schema": question.answer_schema,
+        "default_answer": question.default_answer,
+        "blocking": question.blocking,
+        "state": question.state.value,
+        "answer_event_id": question.answer_event_id,
+        "consumed_at": (None if question.consumed_at is None else question.consumed_at.isoformat()),
+        "is_open": question.is_open,
+        "row_version": question.row_version,
+    }
+
+
+def render_anomaly_envelope(question: object, *, identity: IdentityRef) -> CallbackEnvelope:
+    """The ONE envelope an expired question emits (AC-A7).
+
+    An expiry is carried as :attr:`EnvelopeKind.CONDITION` rather than a fifth
+    ``ANOMALY`` member: §10.2 A5 fixes the callback vocabulary at four kinds, and
+    a question that timed out IS a condition the run is now in — nobody violated a
+    rule and no result arrived.  The word "anomaly" survives in this function's
+    name because that is what the acceptance criterion calls the event; the WIRE
+    stays four-valued.
+
+    Exactly one of these per expired question is the caller's obligation, not this
+    function's: it is a pure renderer, and the sweep that calls it emits only for
+    the rows it actually settled.
+    """
+    from cli_agent_orchestrator.core.gate import RoundQuestion
+
+    assert isinstance(question, RoundQuestion)
+    digest = compute_pin_digest(())
+    summary = (
+        _clip(f"UNANSWERED, expired at {question.expires_at.isoformat()}", _MAX_LINE_BYTES),
+        _clip(f"asked: {question.question}", _MAX_LINE_BYTES),
+    )
+    pointer = f"→ cao gate question {question.question_id} [pins ok: 0 @ {digest}]"
+    lines = (identity.line(), *summary, pointer)
+    return CallbackEnvelope(
+        kind=EnvelopeKind.CONDITION,
+        lines=lines,
+        visible_bytes=sum(len(line) for line in lines) + len(lines),
+        pin_count=0,
         pin_digest=digest,
         renderer_version=_RENDERER_VERSION,
     )

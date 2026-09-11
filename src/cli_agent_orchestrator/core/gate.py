@@ -43,15 +43,18 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
+    "AnswerAdmissibility",
+    "AnswerDeliveryState",
     "ArtifactManifest",
     "ClaimOwnershipResult",
     "ConsumerCoverage",
     "ConsumerDisposition",
     "ConsumerState",
+    "ContinuationKind",
+    "DiffEntry",
     "Dispatch",
     "DispatchRole",
     "DispatchState",
-    "DiffEntry",
     "Disposition",
     "DispositionKind",
     "EffectIntent",
@@ -60,21 +63,30 @@ __all__ = [
     "EffectResult",
     "ExecutionTarget",
     "GateError",
+    "GateQuestionError",
     "GateRound",
     "GateRun",
+    "NoticeIntentState",
     "OpenFinding",
+    "QuestionAnswer",
+    "QuestionRefusal",
+    "QuestionState",
     "RepoBinding",
     "RoundProjection",
+    "RoundQuestion",
     "RoundState",
     "RunState",
     "Severity",
+    "answer_admissible",
     "compute_artifact_sha",
     "epoch_supersedes",
     "may_accept_round",
+    "next_question_state",
     "next_round_state",
     "next_run_state",
     "render_scratch_root",
     "run_awaiting_answer",
+    "validate_ask",
     "validate_disposition",
     "validate_max_rounds",
 ]
@@ -721,6 +733,340 @@ def epoch_supersedes(current_epoch: int, new_epoch: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# The question primitive (WP-ARCH Amendment A, slice B1; §10.2 P2, A2).
+#
+# A durable question is how a lane STOPS AND ASKS without dying.  The rows it
+# turns on already exist (``round_question``, ``question_answer``,
+# ``answer_delivery_intent``, created by 2a because ``claim_ownership`` rewrites
+# them); B1 adds the pure vocabulary those rows are read and written through, so
+# every rule a caller can get wrong — which transitions are legal, when an ask is
+# well formed, whether an answer is still admissible — is decidable with no
+# database and is tested by enumeration here.
+#
+# The waiting STATE is deliberately not a new ``TerminalStatus`` member: it is
+# ``QuestionState`` plus :class:`DispatchState.AWAITING_ANSWER` plus
+# :func:`run_awaiting_answer`.  ``WAITING_USER_ANSWER`` on a terminal is the
+# PROVIDER-DIALOG concept (a permission card in a pane) and conflating the two
+# would make one word mean two different waits.
+# ---------------------------------------------------------------------------
+
+
+class QuestionState(StrEnum):
+    """The lifecycle of one durable question (§10.2 P2, AC-A10).
+
+    ``PENDING`` and ``ESCALATED`` are both OPEN: each holds the one-open-question
+    slot the ``ux_question_open`` partial index enforces, which is why escalating
+    cannot be modelled as closing and re-asking.  ``ANSWERED`` and ``EXPIRED`` are
+    terminal — a question settles exactly once, and an answer racing its own
+    expiry is decided by one conditional transaction in the store, never by two
+    writes that could both win.
+    """
+
+    PENDING = "PENDING"
+    ESCALATED = "ESCALATED"
+    ANSWERED = "ANSWERED"
+    EXPIRED = "EXPIRED"
+
+
+class ContinuationKind(StrEnum):
+    """What the asker will resume INTO when the answer arrives (A2).
+
+    ``ASSIGNMENT`` is a worker lane suspended inside its own tool call: the
+    continuation ref is the dispatch, and resuming means the still-open call
+    returns.  ``JOURNAL_CHECKPOINT`` is a workflow script (slice C): the
+    continuation ref is ``<run_id>:<checkpoint_id>``, and resuming means the
+    re-executing script reads the journaled answer instead of asking again.  The
+    two differ in WHERE the continuation lives, which is why the kind is stored
+    rather than inferred from whether ``round_id`` is NULL.
+    """
+
+    ASSIGNMENT = "ASSIGNMENT"
+    JOURNAL_CHECKPOINT = "JOURNAL_CHECKPOINT"
+
+
+class NoticeIntentState(StrEnum):
+    """The state of the notification intent committed WITH the question (§10.2 P2).
+
+    The intent is written inside the ask transaction and settled AFTER it: a
+    notice that was never sent is therefore a ``PENDING`` row a sweep can find,
+    not a question nobody will ever hear about.  ``FAILED`` is retryable and
+    deliberately distinct from ``PENDING`` so a sweep can tell "not attempted"
+    from "attempted and lost".
+    """
+
+    PENDING = "PENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+
+
+class AnswerDeliveryState(StrEnum):
+    """The state of the answer's delivery back to the asker (§10.2 P2, R28).
+
+    ``CONSUMED`` is a SEPARATE record from ``ANSWERED`` on purpose: a committed
+    answer the asker never received is the exact crash window R28 names, and an
+    ANSWERED question with a ``PENDING`` delivery intent is how that window is
+    visible rather than indistinguishable from success.  The member list matches
+    the ``answer_delivery_intent`` CHECK constraint 2a already shipped.
+    """
+
+    PENDING = "PENDING"
+    SENT = "SENT"
+    CONSUMED = "CONSUMED"
+    FAILED = "FAILED"
+
+
+class QuestionRefusal(StrEnum):
+    """The typed reasons a question command is refused.
+
+    A code rather than a message because these cross an HTTP boundary and a
+    caller branches on them: ``ask_supervisor`` retried with the same
+    ``client_request_id`` must be able to tell "you already have an open question"
+    from "your epoch was superseded", and a prose string cannot be branched on
+    without parsing English.  An ``IntegrityError`` from ``ux_question_open``
+    leaking to a lane would be exactly that unbranchable failure.
+    """
+
+    DISPATCH_UNKNOWN = "E_DISPATCH_UNKNOWN"
+    QUESTION_EMPTY = "E_QUESTION_EMPTY"
+    QUESTION_OPEN = "E_QUESTION_OPEN"
+    QUESTION_NOT_FOUND = "E_QUESTION_NOT_FOUND"
+    QUESTION_SETTLED = "E_QUESTION_SETTLED"
+    QUESTION_EXPIRED = "E_QUESTION_EXPIRED"
+    OWNER_MISMATCH = "E_OWNER_MISMATCH"
+    EPOCH_SUPERSEDED = "E_EPOCH_SUPERSEDED"
+    ANSWER_CONFLICT = "E_ANSWER_CONFLICT"
+    DEFAULT_REQUIRED = "E_DEFAULT_REQUIRED"
+    ILLEGAL_TRANSITION = "E_ILLEGAL_TRANSITION"
+
+
+class GateQuestionError(GateError):
+    """A refused question command, carrying a branchable :class:`QuestionRefusal`.
+
+    A ``GateError`` subclass so every existing ``except GateError`` still catches
+    it, with ``code`` added so the API can translate one refusal into one status
+    and one machine-readable body instead of flattening every domain refusal into
+    the same 400.
+    """
+
+    def __init__(self, code: QuestionRefusal, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class RoundQuestion(BaseModel):
+    """One durable question (§10.2 P2).
+
+    ``round_id`` is nullable: a non-gate lane asks with no round at all, which is
+    why the question is bound to a DISPATCH and only optionally to a round.
+    ``owner_conversation``/``owner_epoch`` are the supervisor fence — they are
+    rewritten by ``claim_ownership`` while the question is open, so an answer from
+    a superseded conversation is refused rather than silently accepted.
+    ``default_answer`` is present only on a NON-blocking ask, where the asker
+    continues immediately and needs a caller-owned value to continue WITH.
+    """
+
+    model_config = _FROZEN
+
+    question_id: str = Field(min_length=1)
+    dispatch_id: str = Field(min_length=1)
+    round_id: str | None = None
+    client_request_id: str = Field(min_length=1)
+    owner_conversation: str = Field(min_length=1)
+    owner_epoch: int = Field(ge=0)
+    continuation_kind: ContinuationKind
+    continuation_ref: str = ""
+    asked_at: datetime
+    expires_at: datetime
+    question: str = Field(min_length=1)
+    options: tuple[str, ...] = ()
+    answer_schema: str | None = None
+    default_answer: str | None = None
+    blocking: bool = True
+    state: QuestionState = QuestionState.PENDING
+    answer_event_id: str | None = None
+    consumed_at: datetime | None = None
+    user_prompt_id: str | None = None
+    row_version: int = Field(ge=1)
+
+    @field_validator("asked_at", "expires_at")
+    @classmethod
+    def _aware_stamps(cls, value: datetime) -> datetime:
+        return _require_aware(value)
+
+    @field_validator("consumed_at")
+    @classmethod
+    def _aware_consumed(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _require_aware(value)
+
+    @property
+    def is_open(self) -> bool:
+        """True while the question holds the dispatch's one open-question slot."""
+        return self.state in (QuestionState.PENDING, QuestionState.ESCALATED)
+
+
+class QuestionAnswer(BaseModel):
+    """One submitted answer, append-only (§10.2 P2).
+
+    Append-only and keyed by its own event id so an answer is a FACT with a time
+    and an author, not a mutable field on the question.  ``client_request_id``
+    makes an identical retry return this row; a DIFFERENT answer under the same
+    request id is a conflict, because silently overwriting would let a retried
+    call change a decision the asker may already have acted on.
+    """
+
+    model_config = _FROZEN
+
+    answer_event_id: str = Field(min_length=1)
+    question_id: str = Field(min_length=1)
+    answer: str
+    answered_by: str = Field(min_length=1)
+    answered_at: datetime
+    client_request_id: str = Field(min_length=1)
+
+    _aware = field_validator("answered_at")(classmethod(lambda cls, v: _require_aware(v)))
+
+
+class AnswerAdmissibility(BaseModel):
+    """Whether an answer may be recorded, and if not, why (AC-A12).
+
+    A value rather than a bare bool because every refusal here becomes a typed
+    HTTP body: the caller must be able to distinguish "too late" from "not yours"
+    without reading prose.
+    """
+
+    model_config = _FROZEN
+
+    admissible: bool
+    code: QuestionRefusal | None = None
+    reason: str = ""
+
+
+def next_question_state(current: QuestionState, target: QuestionState) -> QuestionState:
+    """Return ``target`` if ``current -> target`` is legal, else raise (AC-A10).
+
+    ``ESCALATED`` is reachable ONLY from ``PENDING``: escalation is a one-way
+    step deeper into the same open slot, so a question cannot be de-escalated
+    back into the state a sweep treats as un-raised.  ``ANSWERED`` and ``EXPIRED``
+    are terminal from either open state and from nothing else — a settled
+    question re-settling is the mutant this table kills, because it would let an
+    expiry overwrite an answer the asker already consumed.
+    """
+    legal: dict[QuestionState, frozenset[QuestionState]] = {
+        QuestionState.PENDING: frozenset(
+            {QuestionState.ESCALATED, QuestionState.ANSWERED, QuestionState.EXPIRED}
+        ),
+        QuestionState.ESCALATED: frozenset({QuestionState.ANSWERED, QuestionState.EXPIRED}),
+        QuestionState.ANSWERED: frozenset(),
+        QuestionState.EXPIRED: frozenset(),
+    }
+    if target not in legal.get(current, frozenset()):
+        raise GateQuestionError(
+            QuestionRefusal.ILLEGAL_TRANSITION,
+            f"illegal question transition {current.value} -> {target.value}",
+        )
+    return target
+
+
+def validate_ask(
+    *,
+    blocking: bool,
+    default_answer: str | None,
+    question: str,
+    asked_at: datetime,
+    expires_at: datetime,
+) -> None:
+    """Check an ask is well formed BEFORE a row is minted (A2).
+
+    Two rules, and the second is the one worth stating.  A BLOCKING ask needs no
+    default: the caller is suspended inside its own tool call and will receive the
+    real answer or an expiry, so a default would be a value nothing ever reads.  A
+    NON-BLOCKING ask MUST carry one, because the caller continues immediately and
+    something must decide what it continues WITH — leaving that to the server
+    would put a policy decision in the wrong process, and leaving it empty would
+    let a lane proceed on a silently-invented answer.
+
+    The expiry window is also checked here: an ``expires_at`` at or before
+    ``asked_at`` is a question that is born expired, which the sweep would settle
+    before any surface could show it.
+    """
+    if not question.strip():
+        raise GateQuestionError(
+            QuestionRefusal.QUESTION_EMPTY, "a question must carry non-empty text"
+        )
+    if not blocking and (default_answer is None or default_answer == ""):
+        raise GateQuestionError(
+            QuestionRefusal.DEFAULT_REQUIRED,
+            "a non-blocking ask must carry a caller-owned default answer: the "
+            "caller continues immediately and something must decide what with",
+        )
+    if expires_at <= asked_at:
+        raise GateQuestionError(
+            QuestionRefusal.QUESTION_EXPIRED,
+            f"expires_at {expires_at.isoformat()} is not after asked_at "
+            f"{asked_at.isoformat()}: the question would be born expired",
+        )
+
+
+def answer_admissible(
+    question: RoundQuestion,
+    *,
+    caller_conversation: str,
+    caller_epoch: int,
+    now: datetime,
+) -> AnswerAdmissibility:
+    """Whether ``question`` may still be answered by this caller (AC-A12, P2).
+
+    Three independent checks, in the order a caller most needs them.
+
+    1. **Settled.**  ``ANSWERED``/``EXPIRED`` are terminal; a late answer is
+       refused rather than appended, so an asker that already consumed one answer
+       can never be handed a second.
+    2. **Expired in wall-clock terms.**  A row still reading ``PENDING`` past its
+       ``expires_at`` is refused HERE even before the sweep has run, so the answer
+       and the expiry cannot both be admitted by a race the sweep's cadence opens.
+    3. **Ownership.**  The conversation must match, and the caller's epoch must not
+       be SUPERSEDED by the row's.  :func:`epoch_supersedes` is reused rather than
+       re-derived: ownership is monotonic in the epoch in exactly one place, and a
+       second spelling of that rule is how the two could come to disagree.  A
+       caller whose epoch is AHEAD of the row is admitted — that is a claim that
+       has not yet rewritten this row, not a stale answer.
+    """
+    if question.state in (QuestionState.ANSWERED, QuestionState.EXPIRED):
+        return AnswerAdmissibility(
+            admissible=False,
+            code=QuestionRefusal.QUESTION_SETTLED,
+            reason=f"question {question.question_id} is already {question.state.value}",
+        )
+    if now >= question.expires_at:
+        return AnswerAdmissibility(
+            admissible=False,
+            code=QuestionRefusal.QUESTION_EXPIRED,
+            reason=(
+                f"question {question.question_id} expired at " f"{question.expires_at.isoformat()}"
+            ),
+        )
+    if caller_conversation != question.owner_conversation:
+        return AnswerAdmissibility(
+            admissible=False,
+            code=QuestionRefusal.OWNER_MISMATCH,
+            reason=(
+                f"question {question.question_id} is owned by "
+                f"{question.owner_conversation}, not {caller_conversation}"
+            ),
+        )
+    if epoch_supersedes(caller_epoch, question.owner_epoch):
+        return AnswerAdmissibility(
+            admissible=False,
+            code=QuestionRefusal.EPOCH_SUPERSEDED,
+            reason=(
+                f"caller epoch {caller_epoch} is superseded by the question's "
+                f"owner epoch {question.owner_epoch}"
+            ),
+        )
+    return AnswerAdmissibility(admissible=True)
+
+
+# ---------------------------------------------------------------------------
 # Projection shapes returned BY the store (§10.2).
 #
 # These live in ``core`` rather than ``app`` for one structural reason: the store
@@ -751,6 +1097,9 @@ class RoundProjection(BaseModel):
     effect_results: tuple[EffectResult, ...] = ()
     open_findings: tuple[OpenFinding, ...] = ()
     consumer_coverage: tuple[ConsumerCoverage, ...] = ()
+    #: The round's questions, so a re-projected round shows what it is waiting
+    #: on.  Defaulted to empty so every 2a construction site stays valid.
+    questions: tuple[RoundQuestion, ...] = ()
 
 
 class ClaimOwnershipResult(BaseModel):

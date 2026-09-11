@@ -173,12 +173,12 @@ class TestCoverageMatrix:
 
         # Sanity: roster must have tools
         assert len(rostered_tools) > 0, "No tools in roster"
-        assert len(surfaces) == 12, f"Expected 12 surfaces, got {len(surfaces)}"
+        assert len(surfaces) == 13, f"Expected 13 surfaces, got {len(surfaces)}"
 
-    def test_surface_count_is_twelve(self):
-        """The roster has exactly 12 entries (D3 frozen roster)."""
+    def test_surface_count_is_thirteen(self):
+        """The roster has 13 entries: D3's frozen 12, plus B1's gate questions."""
         surfaces = _load_surfaces()
-        assert len(surfaces) == 12, f"Expected 12 surfaces, got {len(surfaces)}"
+        assert len(surfaces) == 13, f"Expected 13 surfaces, got {len(surfaces)}"
 
     def test_each_surface_has_invariants_and_obligation(self):
         """Every surface row has non-empty invariants and obligation."""

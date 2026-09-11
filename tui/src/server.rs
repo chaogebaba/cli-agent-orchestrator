@@ -717,6 +717,11 @@ fn route(id: CommandId) -> Option<Route> {
         // HIDE: fork-only / ops commands left unclassified by the mandated default
         // (project.md). The TUI never routes them; these arms exist only because the match is
         // exhaustive on purpose. (WP-ARCH 2a r2, per the F865 r4 registration recipe)
+        CommandId::GateAnswer => None,
+        CommandId::GateAsk => None,
+        CommandId::GateEscalate => None,
+        CommandId::GateQuestion => None,
+        CommandId::GateQuestions => None,
         CommandId::GateShow => None,
         CommandId::AgentsStatus => None,
         CommandId::AutoAnswersTest => None,

@@ -9,12 +9,15 @@ comment naming the edit that must turn it red.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from cli_agent_orchestrator.app.gate import render as r
 from cli_agent_orchestrator.core import gate as g
+
+#: The fixed "now" the slice-B1 envelope arms are written against.
+_QT0 = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
 
 def _projection(
@@ -177,4 +180,102 @@ def test_ac_a11_callback_visible_bytes_audited() -> None:
         proj, kind=r.EnvelopeKind.RESULT, summary=("ok",), artifact_ref="cas://x"
     )
     assert env.visible_bytes == sum(len(line) for line in env.lines) + len(env.lines)
-    assert env.renderer_version == "2a"
+    assert env.renderer_version == "2b"
+
+
+# -- slice B1: the question and anomaly envelopes ---------------------------
+
+
+def _question(**overrides: object) -> g.RoundQuestion:
+    base: dict[str, object] = {
+        "question_id": "Q1",
+        "dispatch_id": "d1",
+        "client_request_id": "cr1",
+        "owner_conversation": "c1",
+        "owner_epoch": 1,
+        "continuation_kind": g.ContinuationKind.ASSIGNMENT,
+        "continuation_ref": "d1",
+        "asked_at": _QT0,
+        "expires_at": _QT0 + timedelta(hours=1),
+        "question": "accept, re-round or override?",
+        "options": ("accept", "re-round", "override"),
+        "row_version": 1,
+    }
+    base.update(overrides)
+    return g.RoundQuestion(**base)  # type: ignore[arg-type]
+
+
+def test_a_question_envelope_is_four_lines_with_at_most_two_authored() -> None:
+    """AC-A11's budget, on the envelope a suspended lane raises."""
+    envelope = r.render_question_envelope(
+        _question(), identity=r.IdentityRef(who="dev", context="WP-ARCH r3", ref="Q1")
+    )
+    assert envelope.kind is r.EnvelopeKind.QUESTION
+    assert len(envelope.lines) == 4
+    assert envelope.lines[0] == "dev · WP-ARCH r3 · Q1"
+    assert envelope.lines[1] == "accept, re-round or override?"
+    assert envelope.lines[2].startswith("options: ")
+    assert envelope.lines[3].startswith("→ ")
+
+
+def test_a_question_with_no_options_spends_only_one_authored_line() -> None:
+    envelope = r.render_question_envelope(
+        _question(options=()), identity=r.IdentityRef(who="dev", ref="Q1")
+    )
+    assert len(envelope.lines) == 3
+    assert envelope.lines[0] == "dev · Q1"  # no round: the context field collapses
+
+
+def test_a_long_question_is_clipped_rather_than_wrapped() -> None:
+    """A wrapped line would silently grow the envelope past its four-line budget.
+
+    MUTANT: wrap instead of clip and this goes red on the line count.
+    """
+    envelope = r.render_question_envelope(
+        _question(question="x" * 400, options=()), identity=r.IdentityRef(who="dev", ref="Q1")
+    )
+    assert len(envelope.lines) == 3
+    assert all("\n" not in line for line in envelope.lines)
+    assert envelope.lines[1].endswith("…")
+
+
+def test_an_anomaly_envelope_is_four_lines_and_names_the_deadline() -> None:
+    """AC-A7's expiry surface: one envelope, four lines, the id to look at."""
+    envelope = r.render_anomaly_envelope(
+        _question(state=g.QuestionState.EXPIRED), identity=r.IdentityRef(who="dev", ref="Q1")
+    )
+    assert len(envelope.lines) == 4
+    assert "UNANSWERED" in envelope.lines[1]
+    assert envelope.lines[3].startswith("→ cao gate question Q1")
+
+
+def test_neither_question_envelope_renders_a_build_attestation() -> None:
+    """The mutant AC-A11 kills: an attestation BLOCK instead of a derived digest."""
+    for envelope in (
+        r.render_question_envelope(_question(), identity=r.IdentityRef(who="dev", ref="Q1")),
+        r.render_anomaly_envelope(_question(), identity=r.IdentityRef(who="dev", ref="Q1")),
+    ):
+        body = "\n".join(envelope.lines)
+        assert "build_attestation" not in body
+        assert "[pins ok: 0 @ " in envelope.lines[-1]
+        assert envelope.pin_digest == r.compute_pin_digest(())
+        assert envelope.renderer_version == "2b"
+
+
+def test_an_expiry_is_carried_as_a_condition_not_a_fifth_envelope_kind() -> None:
+    """§10.2 A5 fixes the wire at four kinds; "anomaly" is the function's name only."""
+    envelope = r.render_anomaly_envelope(_question(), identity=r.IdentityRef(who="dev", ref="Q1"))
+    assert envelope.kind is r.EnvelopeKind.CONDITION
+    assert {k.value for k in r.EnvelopeKind} == {"result", "question", "violation", "condition"}
+
+
+def test_question_payload_is_the_one_serialiser_both_surfaces_use() -> None:
+    """A ``--db`` transcript must be evidence about the served surface."""
+    payload = r.question_payload(_question())
+    assert payload["question_id"] == "Q1"
+    assert payload["state"] == "PENDING"
+    assert payload["is_open"] is True
+    assert payload["options"] == ["accept", "re-round", "override"]
+    assert payload["expires_at"] == (_QT0 + timedelta(hours=1)).isoformat()
+    settled = r.question_payload(_question(state=g.QuestionState.ANSWERED))
+    assert settled["is_open"] is False

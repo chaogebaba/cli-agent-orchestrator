@@ -1,4 +1,4 @@
-# F254 D3 — UX Surface Roster (frozen at 12 surfaces)
+# F254 D3 — UX Surface Roster (13 surfaces; frozen at 12 until WP-ARCH A slice B1)
 #
 # Each row carries its invariant list and obligation string (E/C/S/L).
 # test/ux/test_coverage_matrix.py enforces that every obligation cell is filled.
@@ -87,3 +87,16 @@ name = "find_profiles / mark_base_ready / list_base_sessions / unregister_base"
 mcp_tools = ["find_profiles", "mark_base_ready", "list_base_sessions", "unregister_base"]
 invariants = ["UX-6"]
 obligation = "EC"
+
+# WP-ARCH Amendment A slice B1.  The roster's count assertions moved 12 -> 13
+# rather than these two tools being folded into S09: ``answer_user_prompt``
+# answers a PROVIDER DIALOG in somebody's pane, ``answer_question`` settles a
+# DURABLE gate row, and rostering them together would record two different waits
+# as one surface.  D3's freeze exists to stop an unrostered tool shipping, not to
+# stop a genuinely new surface being declared.
+[[surface]]
+id = "S13"
+name = "ask_supervisor / answer_question (durable gate questions)"
+mcp_tools = ["ask_supervisor", "answer_question"]
+invariants = ["UX-3"]
+obligation = "C"

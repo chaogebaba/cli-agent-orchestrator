@@ -17,7 +17,19 @@ authority.
 
 from __future__ import annotations
 
-from cli_agent_orchestrator.core.gate import ClaimOwnershipResult, RoundProjection
-from cli_agent_orchestrator.core.ports import GateStore
+from cli_agent_orchestrator.core.gate import (
+    ClaimOwnershipResult,
+    QuestionAnswer,
+    RoundProjection,
+    RoundQuestion,
+)
+from cli_agent_orchestrator.core.ports import GateStore, QuestionNotifier
 
-__all__ = ["ClaimOwnershipResult", "GateStore", "RoundProjection"]
+__all__ = [
+    "ClaimOwnershipResult",
+    "GateStore",
+    "QuestionAnswer",
+    "QuestionNotifier",
+    "RoundProjection",
+    "RoundQuestion",
+]

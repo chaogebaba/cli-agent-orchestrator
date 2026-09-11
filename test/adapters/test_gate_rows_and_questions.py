@@ -15,7 +15,7 @@ question PRIMITIVE is 2b; here we exercise the ROWS and the ownership transactio
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +26,9 @@ from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.core import gate as g
 
 TEST_BUSY_TIMEOUT_MS = 5000
+
+#: The fixed "now" the slice-B1 question arms are written against.
+_NOW = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
 
 class FakeClock:
@@ -289,3 +292,387 @@ def test_ac_a12_run_id_narrows_the_claim(store: SqliteGateStore) -> None:
         claimed_by="c2",
     )
     assert result.accepted and result.runs_rewritten == 1
+
+
+# -- slice B1: the question transactions ------------------------------------
+
+
+def _dispatch(store: SqliteGateStore, dispatch_id: str, *, round_id: str | None = None) -> None:
+    store.record_dispatch(
+        g.Dispatch(
+            dispatch_id=dispatch_id,
+            round_id=round_id,
+            role=g.DispatchRole.OTHER,
+            position="dev",
+            request_id=dispatch_id,
+        )
+    )
+
+
+def _ask(
+    store: SqliteGateStore,
+    *,
+    dispatch_id: str = "d1",
+    request_id: str = "cr1",
+    round_id: str | None = None,
+    owner: str = "c1",
+    epoch: int = 1,
+    ttl_s: int = 3600,
+) -> g.RoundQuestion:
+    return store.ask_question(
+        dispatch_id=dispatch_id,
+        round_id=round_id,
+        client_request_id=request_id,
+        owner_conversation=owner,
+        owner_epoch=epoch,
+        continuation_kind=g.ContinuationKind.ASSIGNMENT,
+        continuation_ref=dispatch_id,
+        question="accept, re-round or override?",
+        options=("accept", "re-round"),
+        blocking=True,
+        asked_at=_NOW,
+        expires_at=_NOW + timedelta(seconds=ttl_s),
+    )
+
+
+def test_ask_suspends_the_dispatch_and_records_the_notice_intent(
+    store: SqliteGateStore,
+) -> None:
+    """One transaction: the question, the suspension and the obligation to tell.
+
+    All three or none.  The dispatch reading ``awaiting_answer`` is what makes
+    ``run_awaiting_answer`` true, and the PENDING notice intent is what stops a
+    question from being something nobody will ever hear about.
+    """
+    _dispatch(store, "d1")
+    question = _ask(store)
+    assert question.state is g.QuestionState.PENDING
+    conn = store._pool.connection()  # noqa: SLF001
+    assert (
+        conn.execute("SELECT state FROM gate_dispatch WHERE dispatch_id='d1'").fetchone()[0]
+        == g.DispatchState.AWAITING_ANSWER.value
+    )
+    notice = conn.execute(
+        "SELECT state, msg_id, attempts FROM question_notice_intent WHERE question_id = ?",
+        (question.question_id,),
+    ).fetchone()
+    assert notice["state"] == "PENDING" and notice["msg_id"] is None and notice["attempts"] == 0
+
+
+def test_ask_is_idempotent_by_client_request_id(store: SqliteGateStore) -> None:
+    """A retried ask returns ITS OWN question, never "you already have one open".
+
+    The order inside the transaction is what this pins: if the open-slot check ran
+    first, a blocking lane retrying after a transport timeout would be refused for
+    the question it asked itself, which turns a recoverable retry into a wedge.
+    """
+    _dispatch(store, "d1")
+    first = _ask(store)
+    second = _ask(store)
+    assert second.question_id == first.question_id
+    count = (
+        store._pool.connection()  # noqa: SLF001
+        .execute("SELECT COUNT(*) FROM round_question")
+        .fetchone()[0]
+    )
+    assert count == 1
+
+
+def test_ac_a10_a_second_open_question_is_a_typed_refusal(store: SqliteGateStore) -> None:
+    """The index still decides; the adapter makes it branchable (AC-A10)."""
+    _dispatch(store, "d1")
+    _ask(store)
+    with pytest.raises(g.GateQuestionError) as exc:
+        _ask(store, request_id="cr2")
+    assert exc.value.code is g.QuestionRefusal.QUESTION_OPEN
+
+
+def test_ac_a10_an_escalated_question_still_holds_the_slot(store: SqliteGateStore) -> None:
+    """ESCALATED is open: escalating does not free the dispatch to ask again."""
+    _dispatch(store, "d1")
+    first = _ask(store)
+    escalated = store.escalate_question(first.question_id, now=_NOW)
+    assert escalated.state is g.QuestionState.ESCALATED
+    assert store.open_question_for_dispatch("d1") is not None
+    with pytest.raises(g.GateQuestionError) as exc:
+        _ask(store, request_id="cr2")
+    assert exc.value.code is g.QuestionRefusal.QUESTION_OPEN
+
+
+def test_ask_refuses_an_unknown_dispatch(store: SqliteGateStore) -> None:
+    with pytest.raises(g.GateQuestionError) as exc:
+        _ask(store, dispatch_id="nope")
+    assert exc.value.code is g.QuestionRefusal.DISPATCH_UNKNOWN
+
+
+def test_answer_records_the_event_and_its_delivery_intent(store: SqliteGateStore) -> None:
+    """ANSWERED is not proof of receipt: the delivery intent is a separate row (R28)."""
+    _dispatch(store, "d1")
+    question = _ask(store)
+    settled, event = store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=1),
+    )
+    assert settled.state is g.QuestionState.ANSWERED
+    assert settled.answer_event_id == event.answer_event_id
+    conn = store._pool.connection()  # noqa: SLF001
+    intent = conn.execute(
+        "SELECT state, settled_at FROM answer_delivery_intent WHERE answer_event_id = ?",
+        (event.answer_event_id,),
+    ).fetchone()
+    assert intent["state"] == "PENDING" and intent["settled_at"] is None
+    # The question no longer holds the slot, but the ASKER has not received the
+    # answer yet — so the dispatch is still suspended.
+    assert store.open_question_for_dispatch("d1") is None
+    assert (
+        conn.execute("SELECT state FROM gate_dispatch WHERE dispatch_id='d1'").fetchone()[0]
+        == g.DispatchState.AWAITING_ANSWER.value
+    )
+
+
+def test_consuming_the_answer_is_what_releases_the_dispatch(store: SqliteGateStore) -> None:
+    _dispatch(store, "d1")
+    question = _ask(store)
+    _settled, event = store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=1),
+    )
+    store.mark_answer_consumed(event.answer_event_id, now=_NOW + timedelta(minutes=2))
+    conn = store._pool.connection()  # noqa: SLF001
+    assert (
+        conn.execute("SELECT state FROM gate_dispatch WHERE dispatch_id='d1'").fetchone()[0]
+        == g.DispatchState.DISPATCHED.value
+    )
+    assert (
+        conn.execute(
+            "SELECT state FROM answer_delivery_intent WHERE answer_event_id = ?",
+            (event.answer_event_id,),
+        ).fetchone()[0]
+        == "CONSUMED"
+    )
+    reloaded = store.get_question(question.question_id)
+    assert reloaded is not None and reloaded.consumed_at is not None
+
+
+def test_an_identical_answer_retry_returns_the_recorded_one(store: SqliteGateStore) -> None:
+    _dispatch(store, "d1")
+    question = _ask(store)
+    _first, event = store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=1),
+    )
+    _second, replay = store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=2),
+    )
+    assert replay.answer_event_id == event.answer_event_id
+    count = (
+        store._pool.connection()  # noqa: SLF001
+        .execute("SELECT COUNT(*) FROM question_answer")
+        .fetchone()[0]
+    )
+    assert count == 1
+
+
+def test_a_different_answer_under_the_same_request_id_is_a_conflict(
+    store: SqliteGateStore,
+) -> None:
+    """Overwriting would change a decision the asker may already have acted on."""
+    _dispatch(store, "d1")
+    question = _ask(store)
+    store.answer_question(
+        question_id=question.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(minutes=1),
+    )
+    with pytest.raises(g.GateQuestionError) as exc:
+        store.answer_question(
+            question_id=question.question_id,
+            answer="re-round",
+            answered_by="seat",
+            client_request_id="ar1",
+            caller_conversation="c1",
+            caller_epoch=1,
+            now=_NOW + timedelta(minutes=2),
+        )
+    assert exc.value.code is g.QuestionRefusal.ANSWER_CONFLICT
+
+
+def test_the_answer_versus_expiry_race_settles_exactly_once(store: SqliteGateStore) -> None:
+    """Whichever settles first wins and the other is refused — never both.
+
+    Both directions matter, because the property is not "expiry loses" but "the
+    second writer is refused": an answer arriving after the sweep must not
+    resurrect the row, and a sweep running after an answer must not overwrite it.
+    """
+    # Arm 1: the sweep gets there first; the late answer is refused.
+    _dispatch(store, "d1")
+    swept_first = _ask(store, dispatch_id="d1", request_id="cr1", ttl_s=60)
+    expired = store.expire_due_questions(_NOW + timedelta(seconds=61))
+    assert [q.question_id for q in expired] == [swept_first.question_id]
+    with pytest.raises(g.GateQuestionError) as late:
+        store.answer_question(
+            question_id=swept_first.question_id,
+            answer="accept",
+            answered_by="seat",
+            client_request_id="ar1",
+            caller_conversation="c1",
+            caller_epoch=1,
+            now=_NOW + timedelta(seconds=62),
+        )
+    assert late.value.code is g.QuestionRefusal.QUESTION_SETTLED
+
+    # Arm 2: the answer gets there first; a later sweep leaves it alone.
+    _dispatch(store, "d2")
+    answered_first = _ask(store, dispatch_id="d2", request_id="cr2", ttl_s=60)
+    store.answer_question(
+        question_id=answered_first.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar2",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert store.expire_due_questions(_NOW + timedelta(seconds=61)) == []
+    reloaded = store.get_question(answered_first.question_id)
+    assert reloaded is not None and reloaded.state is g.QuestionState.ANSWERED
+
+
+def test_expiry_releases_the_dispatch_and_returns_only_what_it_settled(
+    store: SqliteGateStore,
+) -> None:
+    """AC-A7: one anomaly per settled question, so the sweep returns the rows it wrote."""
+    _dispatch(store, "d1")
+    question = _ask(store, ttl_s=60)
+    first = store.expire_due_questions(_NOW + timedelta(seconds=61))
+    second = store.expire_due_questions(_NOW + timedelta(seconds=62))
+    assert [q.question_id for q in first] == [question.question_id]
+    assert second == []  # a second sweep has nothing to notify about
+    assert (
+        store._pool.connection()  # noqa: SLF001
+        .execute("SELECT state FROM gate_dispatch WHERE dispatch_id='d1'")
+        .fetchone()[0]
+        == g.DispatchState.DISPATCHED.value
+    )
+
+
+def test_answer_refuses_after_a_claim_round_bound_and_round_free(
+    store: SqliteGateStore,
+) -> None:
+    """AC-A12 through the ANSWER path, on a round-bound AND a NULL-round question."""
+    _run, rnd = _open_run_and_round(store)
+    _dispatch(store, "d1", round_id=rnd.round_id)
+    _dispatch(store, "d2")
+    bound = _ask(store, dispatch_id="d1", request_id="cr1", round_id=rnd.round_id)
+    free = _ask(store, dispatch_id="d2", request_id="cr2", round_id=None)
+
+    result = store.claim_ownership(
+        prior_conversation="c1",
+        new_conversation="c2",
+        new_epoch=7,
+        client_request_id="claim1",
+        claimed_by="c2",
+    )
+    assert result.accepted and result.questions_rewritten == 2
+
+    for question in (bound, free):
+        with pytest.raises(g.GateQuestionError) as exc:
+            store.answer_question(
+                question_id=question.question_id,
+                answer="accept",
+                answered_by="c1",
+                client_request_id=f"ar-{question.question_id}",
+                caller_conversation="c1",
+                caller_epoch=1,
+                now=_NOW + timedelta(minutes=1),
+            )
+        # The rewrite moved the row to c2@7, so c1 is now a different owner.
+        assert exc.value.code is g.QuestionRefusal.OWNER_MISMATCH
+        with pytest.raises(g.GateQuestionError) as stale:
+            store.answer_question(
+                question_id=question.question_id,
+                answer="accept",
+                answered_by="c2",
+                client_request_id=f"ar2-{question.question_id}",
+                caller_conversation="c2",
+                caller_epoch=6,
+                now=_NOW + timedelta(minutes=1),
+            )
+        assert stale.value.code is g.QuestionRefusal.EPOCH_SUPERSEDED
+
+
+def test_project_round_carries_the_round_s_questions(store: SqliteGateStore) -> None:
+    """AC-A1's re-projection shows what the round is waiting on, from rows alone."""
+    _run, rnd = _open_run_and_round(store)
+    _dispatch(store, "d1", round_id=rnd.round_id)
+    question = _ask(store, round_id=rnd.round_id)
+    projection = store.project_round(rnd.round_id)
+    assert projection is not None
+    assert [q.question_id for q in projection.questions] == [question.question_id]
+
+
+def test_notice_intent_settles_sent_and_failed_distinctly(store: SqliteGateStore) -> None:
+    """FAILED is retryable and deliberately distinct from never-attempted PENDING."""
+    _dispatch(store, "d1")
+    question = _ask(store)
+    store.mark_notice_failed(question.question_id, error="transport down")
+    conn = store._pool.connection()  # noqa: SLF001
+    row = conn.execute(
+        "SELECT state, attempts, last_error FROM question_notice_intent WHERE question_id = ?",
+        (question.question_id,),
+    ).fetchone()
+    assert row["state"] == "FAILED" and row["attempts"] == 1 and row["last_error"]
+    store.mark_notice_sent(question.question_id, msg_id="4242")
+    row = conn.execute(
+        "SELECT state, attempts, msg_id, last_error FROM question_notice_intent "
+        "WHERE question_id = ?",
+        (question.question_id,),
+    ).fetchone()
+    assert row["state"] == "SENT" and row["attempts"] == 2 and row["msg_id"] == "4242"
+    assert row["last_error"] is None
+
+
+def test_questions_for_owner_filters_by_owner_state_and_round(store: SqliteGateStore) -> None:
+    _run, rnd = _open_run_and_round(store)
+    _dispatch(store, "d1", round_id=rnd.round_id)
+    _dispatch(store, "d2")
+    bound = _ask(store, dispatch_id="d1", request_id="cr1", round_id=rnd.round_id)
+    free = _ask(store, dispatch_id="d2", request_id="cr2")
+    store.escalate_question(free.question_id, now=_NOW)
+
+    assert {q.question_id for q in store.questions_for_owner(owner_conversation="c1")} == {
+        bound.question_id,
+        free.question_id,
+    }
+    assert [
+        q.question_id for q in store.questions_for_owner(states=(g.QuestionState.ESCALATED,))
+    ] == [free.question_id]
+    assert [q.question_id for q in store.questions_for_owner(round_id=rnd.round_id)] == [
+        bound.question_id
+    ]
+    assert store.questions_for_owner(owner_conversation="nobody") == []
