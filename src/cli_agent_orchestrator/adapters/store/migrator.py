@@ -418,6 +418,13 @@ CREATE TABLE IF NOT EXISTS gate_consumer_coverage (
   unresolved_dynamic    TEXT NOT NULL DEFAULT '[]')
 """
 
+# ``dispatch_prior_state`` (B1 r2) is in BOTH this DDL and ``ADDITIVE_COLUMNS``,
+# which is the pair this file's own note at the additive block describes and the
+# ``seat_digest.wake_count`` precedent uses: the CREATE reaches a FRESH install,
+# the ALTER reaches a deployment whose table already exists and for which
+# ``CREATE TABLE IF NOT EXISTS`` is a no-op.  Either alone covers half the
+# estate.
+#
 # The question store (§10.2, P2) — ROWS ONLY in 2a.  The question primitive
 # (``ask_supervisor``) and its wait adapters are 2b; ``claim_ownership`` (2a)
 # rewrites the PENDING/ESCALATED rows, so the table and the partial unique index
@@ -443,6 +450,7 @@ CREATE TABLE IF NOT EXISTS round_question (
   answer_event_id    TEXT,
   consumed_at        TEXT,
   user_prompt_id     TEXT,
+  dispatch_prior_state TEXT NOT NULL DEFAULT '',
   row_version        INTEGER NOT NULL DEFAULT 1)
 """
 
@@ -524,6 +532,11 @@ ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # durable half of I3's enforcement, the transport's content window being the
     # half a server bounce clears.
     ("seat_digest", "wake_count", "INTEGER NOT NULL DEFAULT 0"),
+    # B1 r2: the dispatch state an ask SUSPENDED, so releasing the question can
+    # restore it instead of fabricating one.  Without it, a PREPARED dispatch
+    # that asked a question came back DISPATCHED — a state it had never been in
+    # — because the release paths hardcoded a value.
+    ("round_question", "dispatch_prior_state", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)

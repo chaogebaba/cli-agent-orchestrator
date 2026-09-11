@@ -39,11 +39,13 @@ class FakeNotifier:
     """Records every notice; optionally fails, to exercise the FAILED path."""
 
     def __init__(self, *, outcome: str = "ok") -> None:
-        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+        self.calls: list[tuple[str, str, tuple[str, ...], str]] = []
         self.outcome = outcome
 
-    def notify(self, *, question: g.RoundQuestion, kind: str, lines: Any) -> str | None:
-        self.calls.append((question.question_id, kind, tuple(lines)))
+    def notify(
+        self, *, question: g.RoundQuestion, kind: str, classification: str, lines: Any
+    ) -> str | None:
+        self.calls.append((question.question_id, kind, tuple(lines), classification))
         if self.outcome == "raise":
             raise RuntimeError("transport down")
         if self.outcome == "none":
@@ -75,7 +77,7 @@ def test_ask_provisions_the_dispatch_when_a_position_is_offered(
     one.
     """
     service, store, _clock = wiring
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -106,7 +108,7 @@ def test_a_non_blocking_ask_is_refused_before_a_row_is_minted(
     """``validate_ask`` runs first, so a bad ask leaves no trace to clean up."""
     service, store, _clock = wiring
     with pytest.raises(g.GateQuestionError) as exc:
-        service.ask(
+        _asked, _ignored = service.ask(
             dispatch_id="worker-1",
             question="accept?",
             client_request_id="cr1",
@@ -124,7 +126,7 @@ def test_is_suspended_is_true_exactly_while_a_question_is_open(
     """The predicate B2's reap consults; here it is the read half only."""
     service, _store, clock = wiring
     assert service.is_suspended("worker-1") is False
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -156,7 +158,7 @@ def test_the_notifier_is_called_once_per_question_after_the_commit(
     notifier = FakeNotifier()
     service = GateQuestionService(store, clock=clock, notifier=notifier)
 
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept, re-round or override?",
         client_request_id="cr1",
@@ -165,8 +167,9 @@ def test_the_notifier_is_called_once_per_question_after_the_commit(
         position="dev",
     )
     assert len(notifier.calls) == 1
-    qid, kind, lines = notifier.calls[0]
+    qid, kind, lines, classification = notifier.calls[0]
     assert qid == question.question_id and kind == "question"
+    assert classification == "expected"
     assert len(lines) == 4
     intent = (
         pool.connection()
@@ -194,7 +197,7 @@ def test_a_notifier_that_does_not_land_settles_the_intent_failed(
     clock = FakeClock()
     store = SqliteGateStore(pool, clock=clock)
     service = GateQuestionService(store, clock=clock, notifier=FakeNotifier(outcome=outcome))
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -218,7 +221,7 @@ def test_with_no_notifier_wired_the_intent_stays_pending(
 ) -> None:
     """Slice B1 wires none; PENDING is what B2's sweep finds, not a lost notice."""
     service, store, _clock = wiring
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -244,7 +247,7 @@ def test_sweep_emits_exactly_one_anomaly_per_question_it_settled(tmp_path: Path)
     store = SqliteGateStore(pool, clock=clock)
     notifier = FakeNotifier()
     service = GateQuestionService(store, clock=clock, notifier=notifier)
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -267,7 +270,7 @@ def test_consume_answer_records_the_receipt(
     wiring: tuple[GateQuestionService, SqliteGateStore, FakeClock],
 ) -> None:
     service, store, clock = wiring
-    question = service.ask(
+    question, _replayed = service.ask(
         dispatch_id="worker-1",
         question="accept?",
         client_request_id="cr1",
@@ -299,14 +302,14 @@ def test_list_open_defaults_to_the_two_slot_holding_states(
     wiring: tuple[GateQuestionService, SqliteGateStore, FakeClock],
 ) -> None:
     service, _store, clock = wiring
-    open_q = service.ask(
+    open_q, _r1 = service.ask(
         dispatch_id="w1",
         question="a?",
         client_request_id="cr1",
         owner_conversation="seat",
         position="dev",
     )
-    settled_q = service.ask(
+    settled_q, _r2 = service.ask(
         dispatch_id="w2",
         question="b?",
         client_request_id="cr2",
@@ -326,3 +329,88 @@ def test_list_open_defaults_to_the_two_slot_holding_states(
         open_q.question_id,
         settled_q.question_id,
     }
+
+
+# -- B1 r2: escalation is heard, and a replay is not re-announced ------------
+
+
+def test_escalating_notifies_the_seat(tmp_path: Path) -> None:
+    """N10: a raise the seat never hears about has changed nothing.
+
+    Escalation exists to get a question in front of somebody who will decide it.
+    Without a notice the state moves in the database and no human learns
+    anything, which is the whole of what escalating is for.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier()
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    notifier.calls.clear()
+
+    service.escalate(question.question_id)
+    assert [call[0] for call in notifier.calls] == [question.question_id]
+    assert notifier.calls[0][1] == "question"
+
+
+def test_a_replayed_ask_is_not_announced_a_second_time(tmp_path: Path) -> None:
+    """One question, one notice. A retry must not put a second copy in front of the seat."""
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier()
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+    kwargs = dict(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    first, replayed_first = service.ask(**kwargs)  # type: ignore[arg-type]
+    second, replayed_second = service.ask(**kwargs)  # type: ignore[arg-type]
+
+    assert replayed_first is False and replayed_second is True
+    assert second.question_id == first.question_id
+    assert len(notifier.calls) == 1, "a replay must not be announced again"
+
+
+def test_provisioning_leaves_a_live_builder_alone(tmp_path: Path) -> None:
+    """N1: the guard §3.4 self-caught, now protected by a test rather than a scratch run."""
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    service = GateQuestionService(store, clock=clock)
+    store.record_dispatch(
+        g.Dispatch(
+            dispatch_id="b1",
+            role=g.DispatchRole.BUILDER,
+            position="dev",
+            request_id="b1",
+            state=g.DispatchState.DISPATCHED,
+        )
+    )
+
+    service.ask(
+        dispatch_id="b1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="grunt",
+    )
+
+    survivor = store.get_dispatch("b1")
+    assert survivor is not None
+    assert survivor.role is g.DispatchRole.BUILDER, "an ask must not re-role a dispatch"
+    assert survivor.position == "dev", "an ask must not re-position a dispatch"
+    assert survivor.state is g.DispatchState.AWAITING_ANSWER  # only the state moves

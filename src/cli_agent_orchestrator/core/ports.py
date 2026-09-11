@@ -849,14 +849,27 @@ class GateStore(Protocol):
         expires_at: datetime,
         answer_schema: str | None = None,
         default_answer: str | None = None,
-    ) -> RoundQuestion:
+    ) -> tuple[RoundQuestion, bool]:
         """Insert a PENDING question, suspend its dispatch and record the notice intent.
+
+        Returns the question and whether it was REPLAYED rather than written.
 
         Idempotent on ``client_request_id``: an identical retry returns the row it
         already wrote.  A SECOND open question for the same dispatch is refused
         with a typed :class:`~cli_agent_orchestrator.core.gate.GateQuestionError`
         (AC-A10) rather than leaking the ``ux_question_open`` ``IntegrityError``,
-        because a lane has to be able to branch on "you are already waiting".
+        because a lane has to be able to branch on "you are already waiting".  A
+        dispatch that has RETURNED, FAILED or been ABANDONED is refused too: a
+        finished lane has nobody left to answer to, and suspending it would make
+        the whole run project as awaiting an answer forever.
+        """
+        ...
+
+    def ensure_dispatch(self, dispatch: Dispatch) -> bool:
+        """Insert this dispatch only if none exists; True when it inserted.
+
+        ONE statement, so provisioning cannot clobber a dispatch recorded between
+        a check and an act — which ``record_dispatch``'s UPSERT would.
         """
         ...
 
@@ -967,7 +980,10 @@ class QuestionNotifier(Protocol):
     The envelope arrives as already-rendered LINES rather than a
     ``CallbackEnvelope``: the renderer lives in ``app`` and ``core`` may not
     import it, and a notifier's job is transport, not judgement about what the
-    seat reads.
+    seat reads.  ``classification`` travels beside ``kind`` because A5 fixes the
+    wire at four kinds and an expiry shares one with every other run condition —
+    a transport that wanted to route them differently would otherwise have to
+    match on the prose of a summary line.
 
     Returns the delivered message id.  Returning ``None`` or raising both mean
     the notice did NOT land, and the caller settles the intent ``FAILED`` for a
@@ -980,6 +996,7 @@ class QuestionNotifier(Protocol):
         *,
         question: RoundQuestion,
         kind: str,
+        classification: str,
         lines: Sequence[str],
     ) -> str | None: ...
 

@@ -279,3 +279,48 @@ def test_question_payload_is_the_one_serialiser_both_surfaces_use() -> None:
     assert payload["expires_at"] == (_QT0 + timedelta(hours=1)).isoformat()
     settled = r.question_payload(_question(state=g.QuestionState.ANSWERED))
     assert settled["is_open"] is False
+
+
+# -- B1 r2: A5's typed classification ---------------------------------------
+
+
+def test_the_expiry_envelope_is_a_condition_classified_anomaly() -> None:
+    """A5 carries BOTH: four kinds on the wire, and a typed EXPECTED/ANOMALY.
+
+    Asserted on the FIELD, never on ``lines``. The blueprint's own comment says
+    "typed, not a prefix match" precisely because a consumer that decided what an
+    envelope meant by reading the wording of a summary line would be silently
+    wrong the first time that wording changed.
+    """
+    envelope = r.render_anomaly_envelope(
+        _question(state=g.QuestionState.EXPIRED), identity=r.IdentityRef(who="dev", ref="Q1")
+    )
+    assert envelope.kind is r.EnvelopeKind.CONDITION
+    assert envelope.classification is g.NoticeClass.ANOMALY
+
+
+def test_an_ordinary_envelope_is_classified_expected() -> None:
+    """The default, so only the sites that MEAN anomaly say so."""
+    question_envelope = r.render_question_envelope(
+        _question(), identity=r.IdentityRef(who="dev", ref="Q1")
+    )
+    assert question_envelope.classification is g.NoticeClass.EXPECTED
+    callback = r.render_callback(
+        _projection(), kind=r.EnvelopeKind.RESULT, summary=("ok",), artifact_ref="cas://x"
+    )
+    assert callback.classification is g.NoticeClass.EXPECTED
+
+
+def test_the_classification_is_typed_not_a_string_prefix() -> None:
+    """The mutant: drop the field and discriminate on ``lines[1]`` again.
+
+    If ``classification`` were removed, the only separator left between an expiry
+    and any other CONDITION would be the prose, which is what A5 forbids.
+    """
+    anomaly = r.render_anomaly_envelope(_question(), identity=r.IdentityRef(who="dev", ref="Q1"))
+    expected = r.render_question_envelope(_question(), identity=r.IdentityRef(who="dev", ref="Q1"))
+    assert isinstance(anomaly.classification, g.NoticeClass)
+    assert anomaly.classification is not expected.classification
+    assert set(g.NoticeClass) == {g.NoticeClass.EXPECTED, g.NoticeClass.ANOMALY}
+    # And still no fifth kind: the wire vocabulary is unchanged.
+    assert {k.value for k in r.EnvelopeKind} == {"result", "question", "violation", "condition"}

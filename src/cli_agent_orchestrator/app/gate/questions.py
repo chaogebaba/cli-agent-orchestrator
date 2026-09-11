@@ -103,8 +103,14 @@ class GateQuestionService:
         answer_schema: str | None = None,
         default_answer: str | None = None,
         position: str | None = None,
-    ) -> RoundQuestion:
+    ) -> tuple[RoundQuestion, bool]:
         """Ask a durable question and suspend the asking dispatch (A2).
+
+        Returns the question and whether it was REPLAYED — an idempotent hit on
+        ``client_request_id`` rather than a new row.  Callers derive that key
+        deterministically, so asking the same text twice looks exactly like a
+        retry; a caller told nothing would act on an answer to an older question
+        (N6).
 
         ``position`` provisions the dispatch when one does not exist yet.  A
         question is bound to an ASSIGNMENT so the run can project as awaiting an
@@ -132,7 +138,7 @@ class GateQuestionService:
         if position is not None:
             self._ensure_dispatch(dispatch_id, position=position, round_id=round_id)
 
-        record = self._store.ask_question(
+        record, replayed = self._store.ask_question(
             dispatch_id=dispatch_id,
             round_id=round_id,
             client_request_id=client_request_id,
@@ -148,8 +154,11 @@ class GateQuestionService:
             answer_schema=answer_schema,
             default_answer=default_answer,
         )
-        self._notify(record, kind=EnvelopeKind.QUESTION)
-        return record
+        if not replayed:
+            # A replay has already been announced; announcing it again would put
+            # a second copy of one question in front of the seat.
+            self._notify(record, kind=EnvelopeKind.QUESTION)
+        return record, replayed
 
     def answer(
         self,
@@ -179,8 +188,15 @@ class GateQuestionService:
         user's answer returns on the SAME question the lane is suspended on.  A
         new question would be a second thing to answer and would leave the first
         one open behind it.
+
+        It NOTIFIES, and that is the point of escalating at all: a raise the seat
+        never hears about has changed nothing.  The store refuses to escalate a
+        question already past its deadline, so this can never spend a seat's
+        attention on a question the next sweep will expire (N10).
         """
-        return self._store.escalate_question(question_id, now=self._clock.now())
+        record = self._store.escalate_question(question_id, now=self._clock.now())
+        self._notify(record, kind=EnvelopeKind.QUESTION)
+        return record
 
     def consume_answer(self, answer_event_id: str) -> None:
         """Record that the asker RECEIVED the answer, releasing its dispatch (R28)."""
@@ -241,11 +257,12 @@ class GateQuestionService:
         ``record_dispatch`` upserts, so an unguarded call would rewrite a live
         gate dispatch's role, position and state — turning a BUILDER mid-round
         into a PREPARED ``OTHER`` because a lane happened to pass ``position``.
-        The existence check is the whole point of this method.
+        :meth:`GateStore.ensure_dispatch` is one statement, so the check and the
+        act cannot be separated by a concurrent write (N2); the earlier
+        ``get_dispatch`` then ``record_dispatch`` pair was check-then-act across
+        two transactions.
         """
-        if self._store.get_dispatch(dispatch_id) is not None:
-            return
-        self._store.record_dispatch(
+        self._store.ensure_dispatch(
             Dispatch(
                 dispatch_id=dispatch_id,
                 round_id=round_id,
@@ -272,7 +289,12 @@ class GateQuestionService:
             else render_anomaly_envelope(record, identity=self._identity(record))
         )
         try:
-            msg_id = self._notifier.notify(question=record, kind=kind.value, lines=envelope.lines)
+            msg_id = self._notifier.notify(
+                question=record,
+                kind=kind.value,
+                classification=envelope.classification.value,
+                lines=envelope.lines,
+            )
         except Exception as exc:  # noqa: BLE001 — a failed notice is a row, never a raise
             self._store.mark_notice_failed(record.question_id, error=repr(exc))
             return

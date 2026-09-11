@@ -297,14 +297,28 @@ def test_ac_a12_run_id_narrows_the_claim(store: SqliteGateStore) -> None:
 # -- slice B1: the question transactions ------------------------------------
 
 
-def _dispatch(store: SqliteGateStore, dispatch_id: str, *, round_id: str | None = None) -> None:
+def _dispatch(
+    store: SqliteGateStore,
+    dispatch_id: str,
+    *,
+    round_id: str | None = None,
+    state: g.DispatchState = g.DispatchState.DISPATCHED,
+    role: g.DispatchRole = g.DispatchRole.OTHER,
+    position: str = "dev",
+) -> None:
+    """Record a dispatch. DISPATCHED by default: a lane that is actually running.
+
+    The state matters now that a release RESTORES it rather than fabricating
+    ``DISPATCHED``, so the arms below say which state they mean.
+    """
     store.record_dispatch(
         g.Dispatch(
             dispatch_id=dispatch_id,
             round_id=round_id,
-            role=g.DispatchRole.OTHER,
-            position="dev",
+            role=role,
+            position=position,
             request_id=dispatch_id,
+            state=state,
         )
     )
 
@@ -319,7 +333,7 @@ def _ask(
     epoch: int = 1,
     ttl_s: int = 3600,
 ) -> g.RoundQuestion:
-    return store.ask_question(
+    record, _replayed = store.ask_question(
         dispatch_id=dispatch_id,
         round_id=round_id,
         client_request_id=request_id,
@@ -333,6 +347,7 @@ def _ask(
         asked_at=_NOW,
         expires_at=_NOW + timedelta(seconds=ttl_s),
     )
+    return record
 
 
 def test_ask_suspends_the_dispatch_and_records_the_notice_intent(
@@ -676,3 +691,228 @@ def test_questions_for_owner_filters_by_owner_state_and_round(store: SqliteGateS
         bound.question_id
     ]
     assert store.questions_for_owner(owner_conversation="nobody") == []
+
+
+# -- B1 r2: the dispatch guard, provisioning, escalation and the replay flag --
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [g.DispatchState.RETURNED, g.DispatchState.FAILED, g.DispatchState.ABANDONED],
+)
+def test_an_ask_on_a_settled_dispatch_is_refused(
+    store: SqliteGateStore, terminal: g.DispatchState
+) -> None:
+    """A finished lane has nobody left to answer to (review blocker B2).
+
+    Resurrecting it would make ``run_awaiting_answer`` true for the WHOLE run,
+    permanently, and there would be no record of what the dispatch had been.
+    Reachable from MCP ``ask_supervisor``, which passes the caller's terminal id
+    straight through as the dispatch id.
+
+    MUTANT: stop reading ``dispatch_row["state"]`` and this goes red on all three.
+    """
+    _dispatch(store, "d1", state=terminal)
+    with pytest.raises(g.GateQuestionError) as exc:
+        _ask(store)
+    assert exc.value.code is g.QuestionRefusal.DISPATCH_SETTLED
+    # And the refusal changed nothing.
+    assert (
+        store._pool.connection()  # noqa: SLF001
+        .execute("SELECT state FROM gate_dispatch WHERE dispatch_id='d1'")
+        .fetchone()[0]
+        == terminal.value
+    )
+
+
+@pytest.mark.parametrize("prior", [g.DispatchState.PREPARED, g.DispatchState.DISPATCHED])
+def test_a_release_restores_the_state_the_ask_suspended(
+    store: SqliteGateStore, prior: g.DispatchState
+) -> None:
+    """Both release paths restore, rather than fabricating ``DISPATCHED``.
+
+    A PREPARED dispatch that asked a question used to come back DISPATCHED — a
+    state it had never been in. The ask records what it suspended and the
+    releases put it back.
+    """
+    _dispatch(store, "d1", state=prior)
+    _dispatch(store, "d2", state=prior)
+    expiring = _ask(store, dispatch_id="d1", request_id="cr1", ttl_s=60)
+    consumed = _ask(store, dispatch_id="d2", request_id="cr2")
+    assert store.get_question(expiring.question_id).dispatch_prior_state is prior
+
+    store.expire_due_questions(_NOW + timedelta(seconds=61))
+    _settled, event = store.answer_question(
+        question_id=consumed.question_id,
+        answer="accept",
+        answered_by="seat",
+        client_request_id="ar1",
+        caller_conversation="c1",
+        caller_epoch=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+    store.mark_answer_consumed(event.answer_event_id, now=_NOW + timedelta(seconds=2))
+
+    conn = store._pool.connection()  # noqa: SLF001
+    for dispatch_id in ("d1", "d2"):
+        state = conn.execute(
+            "SELECT state FROM gate_dispatch WHERE dispatch_id = ?", (dispatch_id,)
+        ).fetchone()[0]
+        assert state == prior.value, f"{dispatch_id} was not restored to {prior.value}"
+
+
+def test_ensure_dispatch_never_clobbers_an_existing_one(store: SqliteGateStore) -> None:
+    """N1/N2: a live BUILDER survives an ask that names another position.
+
+    One statement, so the check and the act cannot be separated. The regression
+    this protects is concrete: ``record_dispatch`` UPSERTS, so an unguarded
+    provision turned a BUILDER mid-round into a PREPARED ``OTHER`` because a lane
+    happened to pass ``position``.
+    """
+    _dispatch(
+        store,
+        "b1",
+        state=g.DispatchState.DISPATCHED,
+        role=g.DispatchRole.BUILDER,
+        position="dev",
+    )
+    inserted = store.ensure_dispatch(
+        g.Dispatch(
+            dispatch_id="b1",
+            role=g.DispatchRole.OTHER,
+            position="grunt",
+            request_id="b1",
+            state=g.DispatchState.PREPARED,
+        )
+    )
+    assert inserted is False
+    survivor = store.get_dispatch("b1")
+    assert survivor is not None
+    assert survivor.role is g.DispatchRole.BUILDER
+    assert survivor.position == "dev"
+    assert survivor.state is g.DispatchState.DISPATCHED
+
+
+def test_ensure_dispatch_inserts_when_there_is_none(store: SqliteGateStore) -> None:
+    assert store.get_dispatch("fresh") is None
+    assert (
+        store.ensure_dispatch(
+            g.Dispatch(
+                dispatch_id="fresh",
+                role=g.DispatchRole.OTHER,
+                position="dev",
+                request_id="fresh",
+            )
+        )
+        is True
+    )
+    assert store.get_dispatch("fresh") is not None
+
+
+def test_escalating_an_overdue_question_is_refused(store: SqliteGateStore) -> None:
+    """N10: escalating into a state the next sweep expires spends attention for nothing."""
+    _dispatch(store, "d1")
+    question = _ask(store, ttl_s=60)
+    with pytest.raises(g.GateQuestionError) as exc:
+        store.escalate_question(question.question_id, now=_NOW + timedelta(seconds=61))
+    assert exc.value.code is g.QuestionRefusal.QUESTION_EXPIRED
+    reloaded = store.get_question(question.question_id)
+    assert reloaded is not None and reloaded.state is g.QuestionState.PENDING
+
+
+def test_the_ask_reports_whether_it_replayed(store: SqliteGateStore) -> None:
+    """N6: callers derive their keys, so a repeat is invisible unless we say so.
+
+    ``gate_round.py`` (slice C) asks "accept | re-round | override?" once per
+    round from the same lane; without the flag, round 2 would silently receive
+    round 1's answer and nobody would know nothing new had been recorded.
+    """
+    _dispatch(store, "d1")
+    kwargs = dict(
+        dispatch_id="d1",
+        round_id=None,
+        client_request_id="cr1",
+        owner_conversation="c1",
+        owner_epoch=1,
+        continuation_kind=g.ContinuationKind.ASSIGNMENT,
+        continuation_ref="d1",
+        question="accept?",
+        options=(),
+        blocking=True,
+        asked_at=_NOW,
+        expires_at=_NOW + timedelta(hours=1),
+    )
+    first, replayed_first = store.ask_question(**kwargs)  # type: ignore[arg-type]
+    second, replayed_second = store.ask_question(**kwargs)  # type: ignore[arg-type]
+    assert replayed_first is False
+    assert replayed_second is True
+    assert second.question_id == first.question_id
+
+
+def test_two_concurrent_asks_race_on_the_index_and_one_is_refused() -> None:
+    """N4: a REAL interleaving, not two ordered calls.
+
+    The ``IntegrityError -> E_QUESTION_OPEN`` translation was the one branch the
+    suite could not reach, and it is the branch that decides what a lane sees
+    when the index — not the SELECT — is what actually rejects it. Two threads
+    over one pool, each with its own connection, both asking on the same
+    dispatch: exactly one may win, and the loser must get a typed code rather
+    than a leaked sqlite error.
+    """
+    import tempfile
+    import threading
+
+    path = Path(tempfile.mkdtemp()) / "race.db"
+    _res, pool = migrate(path, busy_timeout_ms=10_000)
+    assert pool is not None
+    store = SqliteGateStore(pool, clock=FakeClock())
+    _dispatch(store, "d1")
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def _ask_once(request_id: str) -> None:
+        barrier.wait()
+        try:
+            record, replayed = store.ask_question(
+                dispatch_id="d1",
+                round_id=None,
+                client_request_id=request_id,
+                owner_conversation="c1",
+                owner_epoch=1,
+                continuation_kind=g.ContinuationKind.ASSIGNMENT,
+                continuation_ref="d1",
+                question=f"q {request_id}?",
+                options=(),
+                blocking=True,
+                asked_at=_NOW,
+                expires_at=_NOW + timedelta(hours=1),
+            )
+            with lock:
+                results.append((record.question_id, replayed))
+        except Exception as exc:  # noqa: BLE001 — the arm is about WHICH exception
+            with lock:
+                results.append(exc)
+
+    threads = [threading.Thread(target=_ask_once, args=(f"cr{n}",)) for n in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(results) == 2
+    winners = [r for r in results if isinstance(r, tuple)]
+    losers = [r for r in results if isinstance(r, Exception)]
+    assert len(winners) == 1, f"exactly one ask may win, got {results}"
+    assert len(losers) == 1
+    loser = losers[0]
+    assert isinstance(loser, g.GateQuestionError), f"leaked {type(loser).__name__}: {loser}"
+    assert loser.code is g.QuestionRefusal.QUESTION_OPEN
+    # And the database agrees: one open question on that dispatch, not two.
+    assert (
+        pool.connection()
+        .execute("SELECT COUNT(*) FROM round_question WHERE dispatch_id='d1'")
+        .fetchone()[0]
+        == 1
+    )

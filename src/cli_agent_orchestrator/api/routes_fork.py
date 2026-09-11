@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator import bootstrap
+from cli_agent_orchestrator.core.timing import GATE_QUESTION_EXPIRY_S
 from cli_agent_orchestrator.models.terminal import TerminalId
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -163,7 +164,8 @@ class GateAskRequest(BaseModel):
     round_id: Optional[str] = None
     options: List[str] = Field(default_factory=list)
     blocking: bool = True
-    expires_in_s: int = Field(default=3600, ge=1, le=86400)
+    #: Defaulted from ``core.timing``, the one home a duration has (§4c).
+    expires_in_s: int = Field(default=GATE_QUESTION_EXPIRY_S, ge=1, le=86400)
     continuation_kind: str = "ASSIGNMENT"
     continuation_ref: str = ""
     answer_schema: Optional[str] = None
@@ -271,10 +273,14 @@ async def ask_gate_question_endpoint(
         )
 
     try:
-        question = await asyncio.to_thread(_ask)
+        question, replayed = await asyncio.to_thread(_ask)
     except GateError as exc:
         _raise_gate_question_error(exc)
-    return _gate_question_payload(question)
+    payload = _gate_question_payload(question)
+    # Surfaced, not swallowed: callers derive their idempotency keys, so a
+    # repeated ask is indistinguishable from a retry unless the server says so.
+    payload["replayed"] = replayed
+    return payload
 
 
 @router.get("/gate/questions")

@@ -4626,7 +4626,13 @@ async def ask_supervisor(
         default_factory=list, description="Optional closed set of acceptable answers"
     ),
     expires_in_s: int = Field(
-        default=3600, description="Seconds before the question expires, 1..86400"
+        # MIRRORED from ``core.timing.GATE_QUESTION_EXPIRY_S``, not imported:
+        # ``mcp_server`` is legacy and importing the new tree here would add a
+        # file to the hook-point equality set for one integer. The SERVER
+        # validates against the real constant, so a drift is refused there
+        # rather than silently honoured (N5).
+        default=3600,
+        description="Seconds before the question expires, 1..86400",
     ),
     client_request_id: str = Field(
         default="", description="Idempotency key; derived from the question when omitted"

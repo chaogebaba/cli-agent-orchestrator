@@ -38,6 +38,7 @@ from cli_agent_orchestrator.app.gate.ports import RoundProjection
 from cli_agent_orchestrator.core.gate import (
     DispatchRole,
     GateError,
+    NoticeClass,
     OpenFinding,
     compute_artifact_sha,
     render_scratch_root,
@@ -85,6 +86,12 @@ class CallbackEnvelope(BaseModel):
     visible_bytes: int = Field(ge=0)
     pin_count: int = Field(ge=0)
     pin_digest: str
+    #: A5's SECOND discriminator, beside ``kind``.  Four kinds on the wire and a
+    #: typed EXPECTED/ANOMALY next to them is how the blueprint resolves "an
+    #: expiry is a CONDITION, but not an ordinary one" without a fifth kind.
+    #: Defaulted, so every 2a construction site stays valid and only the sites
+    #: that mean ANOMALY say so.
+    classification: NoticeClass = NoticeClass.EXPECTED
     renderer_version: str = "2b"
 
 
@@ -347,7 +354,9 @@ def render_anomaly_envelope(question: object, *, identity: IdentityRef) -> Callb
     a question that timed out IS a condition the run is now in — nobody violated a
     rule and no result arrived.  The word "anomaly" survives in this function's
     name because that is what the acceptance criterion calls the event; the WIRE
-    stays four-valued.
+    stays four-valued and the envelope says ANOMALY in its typed
+    ``classification``, which is A5's own answer to this and the reason a
+    consumer never has to match on the prose of a summary line.
 
     Exactly one of these per expired question is the caller's obligation, not this
     function's: it is a pure renderer, and the sweep that calls it emits only for
@@ -369,6 +378,7 @@ def render_anomaly_envelope(question: object, *, identity: IdentityRef) -> Callb
         visible_bytes=sum(len(line) for line in lines) + len(lines),
         pin_count=0,
         pin_digest=digest,
+        classification=NoticeClass.ANOMALY,
         renderer_version=_RENDERER_VERSION,
     )
 

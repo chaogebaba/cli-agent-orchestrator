@@ -27,6 +27,8 @@ from typing import Any
 
 import click
 
+from cli_agent_orchestrator.core.timing import GATE_QUESTION_EXPIRY_S
+
 __all__ = ["gate"]
 
 
@@ -105,10 +107,33 @@ def _derived_request_id(*parts: str) -> str:
     return "cli-" + hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:24]
 
 
+def _reject_live_db(db_path: str) -> str:
+    """Refuse ``--db`` when it resolves to the SERVER's own database (N8).
+
+    ``--db`` exists so an operator can work a scratch file with no server, and it
+    is a second, unauthenticated writer: the HTTP path is scope-gated, this one
+    opens any sqlite path it is handed.  Pointed at the live database it would
+    write the coordination store from outside the server, beside cao-server's own
+    pool and past every scope check. The served route is the path for that, and
+    it is one line away.
+    """
+    from pathlib import Path as _Path
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    if _Path(db_path).expanduser().resolve() == _Path(DATABASE_FILE).resolve():
+        raise click.ClickException(
+            "--db refuses the live database: it would write the coordination "
+            "store from outside the server and past every scope check. Drop --db "
+            "to use the served route, which is scope-gated."
+        )
+    return db_path
+
+
 def _question_service(db_path: str) -> Any:
     from cli_agent_orchestrator.bootstrap import build_gate_question_service
 
-    return build_gate_question_service(db_path)
+    return build_gate_question_service(_reject_live_db(db_path))
 
 
 def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -154,9 +179,12 @@ def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 def _question_line(payload: dict[str, Any]) -> str:
     options = payload.get("options") or []
     suffix = f"  options: {' | '.join(options)}" if options else ""
+    # A replay returns an EXISTING question; saying so is the difference between
+    # "recorded" and "you already asked this" (N6).
+    replay = "  (replayed: nothing new was recorded)" if payload.get("replayed") else ""
     return (
         f"{payload['question_id']}  [{payload['state']}] "
-        f"dispatch={payload['dispatch_id']} expires={payload['expires_at']}\n"
+        f"dispatch={payload['dispatch_id']} expires={payload['expires_at']}{replay}\n"
         f"  {payload['question']}{suffix}"
     )
 
@@ -181,7 +209,14 @@ def _emit(payload: dict[str, Any], as_json: bool) -> None:
     default=None,
     help="Idempotency key; a repeat returns the same question.",
 )
-@click.option("--expires-in", "expires_in_s", type=int, default=3600, show_default=True)
+@click.option(
+    "--expires-in",
+    "expires_in_s",
+    type=int,
+    default=GATE_QUESTION_EXPIRY_S,
+    show_default=True,
+    help="Seconds before the question expires.",
+)
 @click.option(
     "--non-blocking/--blocking",
     "non_blocking",
@@ -215,7 +250,7 @@ def ask(
         from cli_agent_orchestrator.core.gate import GateError
 
         try:
-            record = _question_service(db_path).ask(
+            record, replayed = _question_service(db_path).ask(
                 dispatch_id=dispatch_id,
                 question=question,
                 client_request_id=request_id,
@@ -230,7 +265,9 @@ def ask(
             )
         except GateError as exc:
             raise click.ClickException(f"{getattr(exc, 'code', 'E_GATE')}: {exc}")
-        _emit(_payload_from_record(record), as_json)
+        payload = _payload_from_record(record)
+        payload["replayed"] = replayed
+        _emit(payload, as_json)
         return
     body = _post(
         "/gate/questions",

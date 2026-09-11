@@ -107,3 +107,40 @@ def test_question_shows_a_human_line_without_json(db: str) -> None:
 def test_questions_says_so_when_there_are_none(db: str) -> None:
     code, out = _run(db, "questions")
     assert code == 0 and "no questions" in out
+
+
+# -- B1 r2: --db may never point at the live database (review N8) -----------
+
+
+def test_db_refuses_the_live_database(tmp_path: Path, monkeypatch) -> None:
+    """``--db`` is a second, unauthenticated writer; it must not reach production.
+
+    The served route is scope-gated (`SCOPE_WRITE|SCOPE_ADMIN`); this path opens
+    whatever sqlite file it is handed, with no scope check, beside cao-server's
+    own pool. Pointed at the live coordination database it would write it from
+    outside the server and past every control. The flag exists so an operator can
+    work a SCRATCH file, and that use is untouched.
+    """
+    live = tmp_path / "live.db"
+    live.touch()
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", live)
+    result = CliRunner().invoke(gate, ["questions", "--db", str(live)])
+    assert result.exit_code != 0
+    assert "--db refuses the live database" in result.output
+
+
+def test_db_still_accepts_a_scratch_database(db: str) -> None:
+    """The acceptance use is unaffected by the guard."""
+    code, out = _run(db, "questions")
+    assert code == 0 and "no questions" in out
+
+
+def test_a_repeated_ask_says_it_replayed(db: str) -> None:
+    """N6: the operator is told that nothing new was recorded."""
+    first = json.loads(
+        _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1", "--json")[1]
+    )
+    assert first["replayed"] is False
+    code, out = _run(db, "ask", "accept?", "--dispatch", "w1", "--request-id", "cr1")
+    assert code == 0
+    assert "replayed: nothing new was recorded" in out

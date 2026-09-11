@@ -68,6 +68,7 @@ from cli_agent_orchestrator.core.gate import (
     RunState,
     Severity,
     answer_admissible,
+    dispatch_may_be_suspended,
     epoch_supersedes,
     next_question_state,
     next_round_state,
@@ -503,8 +504,15 @@ class SqliteGateStore:
         expires_at: datetime,
         answer_schema: str | None = None,
         default_answer: str | None = None,
-    ) -> RoundQuestion:
+    ) -> tuple[RoundQuestion, bool]:
         """Ask, suspend and record the notice intent in ONE transaction.
+
+        Returns the question and whether it was REPLAYED — an idempotent hit on
+        ``client_request_id`` rather than a new row.  The flag is returned rather
+        than swallowed because the keys callers derive are deterministic: asking
+        the same text twice is indistinguishable from a retry, and a caller that
+        believed it had asked something new would act on an answer to an older
+        question (N6).
 
         The order inside the transaction is deliberate and the idempotency check
         comes first: a lane that retries after a timeout must get its OWN
@@ -523,7 +531,7 @@ class SqliteGateStore:
                 (client_request_id, dispatch_id),
             ).fetchone()
             if prior is not None:
-                return _row_to_question(prior)
+                return _row_to_question(prior), True
 
             dispatch_row = conn.execute(
                 "SELECT state FROM gate_dispatch WHERE dispatch_id = ?", (dispatch_id,)
@@ -533,6 +541,19 @@ class SqliteGateStore:
                     QuestionRefusal.DISPATCH_UNKNOWN,
                     f"no such dispatch: {dispatch_id}; a question is bound to an "
                     "assignment so the run can project as awaiting an answer",
+                )
+            # The state is READ, not merely fetched.  A RETURNED, FAILED or
+            # ABANDONED dispatch flipped back into AWAITING_ANSWER would make
+            # ``run_awaiting_answer`` true for the WHOLE run, permanently:
+            # nobody is going to answer a question asked by a lane that has
+            # already finished, and there would be no record of what the
+            # dispatch had been before.
+            prior_state = DispatchState(dispatch_row["state"])
+            if not dispatch_may_be_suspended(prior_state):
+                raise GateQuestionError(
+                    QuestionRefusal.DISPATCH_SETTLED,
+                    f"dispatch {dispatch_id} is {prior_state.value} and cannot be "
+                    "suspended: a finished lane has nobody left to answer to",
                 )
 
             open_row = conn.execute(
@@ -570,8 +591,9 @@ class SqliteGateStore:
                     "INSERT INTO round_question (question_id, dispatch_id, round_id, "
                     "client_request_id, owner_conversation, owner_epoch, continuation_kind, "
                     "continuation_ref, asked_at, expires_at, question, options_json, "
-                    "answer_schema, default_policy, blocking, state, row_version) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "answer_schema, default_policy, blocking, state, dispatch_prior_state, "
+                    "row_version) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         record.question_id,
                         record.dispatch_id,
@@ -593,10 +615,11 @@ class SqliteGateStore:
                         record.default_answer,
                         1 if record.blocking else 0,
                         record.state.value,
+                        prior_state.value,
                         record.row_version,
                     ),
                 )
-            except sqlite3.IntegrityError as exc:  # pragma: no cover - index race
+            except sqlite3.IntegrityError as exc:
                 # Two concurrent asks: the index, not the SELECT above, is what
                 # actually decided.  Translated so a lane still branches on a code.
                 raise GateQuestionError(
@@ -613,7 +636,7 @@ class SqliteGateStore:
                 "VALUES (?, ?, 0)",
                 (record.question_id, NoticeIntentState.PENDING.value),
             )
-            return record
+            return record, False
 
     def get_dispatch(self, dispatch_id: str) -> Dispatch | None:
         row = (
@@ -622,6 +645,40 @@ class SqliteGateStore:
             .fetchone()
         )
         return None if row is None else _row_to_dispatch(row)
+
+    def ensure_dispatch(self, dispatch: Dispatch) -> bool:
+        """Insert this dispatch only if none exists; report whether it inserted.
+
+        ONE statement, so the check and the act cannot be separated.  The
+        two-call shape it replaces — ``get_dispatch`` then ``record_dispatch`` —
+        was check-then-act across two transactions, and a ``record_dispatch``
+        landing between them was still clobbered by the UPSERT (N2).
+        """
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "INSERT INTO gate_dispatch (dispatch_id, round_id, role, position, "
+                "routing_revision, conversation_id, terminal_incarnation, request_id, "
+                "effect_id, pins, brief_blob_sha, state, outcome) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(dispatch_id) DO NOTHING",
+                (
+                    dispatch.dispatch_id,
+                    dispatch.round_id,
+                    dispatch.role.value,
+                    dispatch.position,
+                    dispatch.routing_revision,
+                    dispatch.conversation_id,
+                    dispatch.terminal_incarnation,
+                    dispatch.request_id,
+                    dispatch.effect_id,
+                    json.dumps(list(dispatch.pins)),
+                    dispatch.brief_blob_sha,
+                    dispatch.state.value,
+                    dispatch.outcome,
+                ),
+            )
+            return cursor.rowcount == 1
 
     def get_question(self, question_id: str) -> RoundQuestion | None:
         row = (
@@ -743,6 +800,12 @@ class SqliteGateStore:
             return settled, event
 
     def escalate_question(self, question_id: str, *, now: datetime) -> RoundQuestion:
+        """Raise PENDING to ESCALATED, refusing a question already past its deadline.
+
+        The expiry check is here and not only in the sweep: without it an overdue
+        PENDING row can be escalated into a state the very next sweep expires,
+        so the escalation would cost a seat's attention and change nothing (N10).
+        """
         conn = self._pool.connection()
         with immediate_transaction(conn):
             row = conn.execute(
@@ -753,6 +816,12 @@ class SqliteGateStore:
                     QuestionRefusal.QUESTION_NOT_FOUND, f"no such question: {question_id}"
                 )
             record = _row_to_question(row)
+            if now >= record.expires_at:
+                raise GateQuestionError(
+                    QuestionRefusal.QUESTION_EXPIRED,
+                    f"question {question_id} expired at {record.expires_at.isoformat()} "
+                    "and cannot be escalated: the next sweep would settle it anyway",
+                )
             next_question_state(record.state, QuestionState.ESCALATED)
             conn.execute(
                 "UPDATE round_question SET state = ?, row_version = row_version + 1 "
@@ -793,11 +862,14 @@ class SqliteGateStore:
                     continue
                 # The lane is no longer waiting on anything, so the dispatch must
                 # leave AWAITING_ANSWER or the run would project as awaiting an
-                # answer that can never arrive.
+                # answer that can never arrive.  It is RESTORED to the state the
+                # ask suspended, not set to a fixed value: a PREPARED dispatch
+                # that asked a question would otherwise come back DISPATCHED, a
+                # state it had never been in.
                 conn.execute(
                     "UPDATE gate_dispatch SET state = ? WHERE dispatch_id = ? AND state = ?",
                     (
-                        DispatchState.DISPATCHED.value,
+                        _restored_state(record),
                         record.dispatch_id,
                         DispatchState.AWAITING_ANSWER.value,
                     ),
@@ -840,8 +912,10 @@ class SqliteGateStore:
         """Record the RECEIPT and release the dispatch (R28).
 
         ``ANSWERED`` says a decision exists; this says the asker has it.  The
-        dispatch returns to ``DISPATCHED`` here and nowhere else, so a run reads
-        as awaiting an answer for exactly as long as somebody is actually waiting.
+        dispatch is RESTORED here to whatever the ask suspended — the other
+        release is :meth:`expire_due_questions`, which restores it the same way,
+        and between them a run reads as awaiting an answer for exactly as long as
+        somebody is actually waiting.
         """
         stamp = render_timestamp(now)
         conn = self._pool.connection()
@@ -864,13 +938,13 @@ class SqliteGateStore:
                 "UPDATE round_question SET consumed_at = ? WHERE question_id = ?",
                 (stamp, row["question_id"]),
             )
+            question = self._load_question_locked(conn, str(row["question_id"]))
             conn.execute(
-                "UPDATE gate_dispatch SET state = ? WHERE state = ? AND dispatch_id = "
-                "(SELECT dispatch_id FROM round_question WHERE question_id = ?)",
+                "UPDATE gate_dispatch SET state = ? WHERE state = ? AND dispatch_id = ?",
                 (
-                    DispatchState.DISPATCHED.value,
+                    _restored_state(question),
                     DispatchState.AWAITING_ANSWER.value,
-                    row["question_id"],
+                    question.dispatch_id,
                 ),
             )
 
@@ -1097,6 +1171,14 @@ class SqliteGateStore:
 
     # -- locked helpers ----------------------------------------------------
 
+    def _load_question_locked(self, conn: sqlite3.Connection, question_id: str) -> RoundQuestion:
+        row = conn.execute(_QUESTION_SELECT + " WHERE question_id = ?", (question_id,)).fetchone()
+        if row is None:  # pragma: no cover - the caller has just read the answer
+            raise GateQuestionError(
+                QuestionRefusal.QUESTION_NOT_FOUND, f"no such question: {question_id}"
+            )
+        return _row_to_question(row)
+
     def _get_run_locked(self, conn: sqlite3.Connection, run_id: str) -> GateRun:
         row = conn.execute(
             "SELECT run_id, wp, lane, workflow_source_sha, input_sha, owner_conversation, "
@@ -1158,13 +1240,27 @@ _QUESTION_SELECT = (
     "SELECT question_id, dispatch_id, round_id, client_request_id, owner_conversation, "
     "owner_epoch, continuation_kind, continuation_ref, asked_at, expires_at, question, "
     "options_json, answer_schema, default_policy, blocking, state, answer_event_id, "
-    "consumed_at, user_prompt_id, row_version FROM round_question"
+    "consumed_at, user_prompt_id, dispatch_prior_state, row_version FROM round_question"
 )
 
 _ANSWER_SELECT = (
     "SELECT answer_event_id, question_id, answer, answered_by, answered_at, "
     "client_request_id FROM question_answer"
 )
+
+
+def _restored_state(question: RoundQuestion) -> str:
+    """The dispatch state a release should put back.
+
+    The state the ask recorded, or ``DISPATCHED`` for a row written before the
+    column existed — a question asked by a lane that was live, which is what
+    ``DISPATCHED`` says, and the only defensible guess when the row does not say.
+    """
+    return (
+        question.dispatch_prior_state.value
+        if question.dispatch_prior_state
+        else (DispatchState.DISPATCHED.value)
+    )
 
 
 def _row_to_question(row: sqlite3.Row) -> RoundQuestion:
@@ -1189,6 +1285,9 @@ def _row_to_question(row: sqlite3.Row) -> RoundQuestion:
         answer_event_id=row["answer_event_id"],
         consumed_at=(None if row["consumed_at"] is None else parse_timestamp(row["consumed_at"])),
         user_prompt_id=row["user_prompt_id"],
+        dispatch_prior_state=(
+            DispatchState(row["dispatch_prior_state"]) if row["dispatch_prior_state"] else None
+        ),
         row_version=row["row_version"],
     )
 

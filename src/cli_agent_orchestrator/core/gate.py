@@ -66,6 +66,8 @@ __all__ = [
     "GateQuestionError",
     "GateRound",
     "GateRun",
+    "LIVE_DISPATCH_STATES",
+    "NoticeClass",
     "NoticeIntentState",
     "OpenFinding",
     "QuestionAnswer",
@@ -79,6 +81,7 @@ __all__ = [
     "Severity",
     "answer_admissible",
     "compute_artifact_sha",
+    "dispatch_may_be_suspended",
     "epoch_supersedes",
     "may_accept_round",
     "next_question_state",
@@ -815,6 +818,25 @@ class AnswerDeliveryState(StrEnum):
     FAILED = "FAILED"
 
 
+class NoticeClass(StrEnum):
+    """EXPECTED or ANOMALY, typed — A5's second discriminator (§10.2 A5).
+
+    A5 fixes the callback vocabulary at four KINDS and carries this beside it,
+    which is how "an expiry is a CONDITION, but not an ordinary one" is said
+    without a fifth kind.  The blueprint's own comment is explicit that it is
+    "typed, not a prefix match": the alternative is a consumer that decides what
+    an envelope means by reading the wording of a summary line, and the first
+    time that wording changes the consumer is silently wrong.
+
+    Slice B1 has no other CONDITION producer, so nothing can be confused today.
+    A6's condition rows are what make the ambiguity live, and a field added after
+    the first consumer is written is a field the consumer already worked around.
+    """
+
+    EXPECTED = "expected"
+    ANOMALY = "anomaly"
+
+
 class QuestionRefusal(StrEnum):
     """The typed reasons a question command is refused.
 
@@ -827,6 +849,7 @@ class QuestionRefusal(StrEnum):
     """
 
     DISPATCH_UNKNOWN = "E_DISPATCH_UNKNOWN"
+    DISPATCH_SETTLED = "E_DISPATCH_SETTLED"
     QUESTION_EMPTY = "E_QUESTION_EMPTY"
     QUESTION_OPEN = "E_QUESTION_OPEN"
     QUESTION_NOT_FOUND = "E_QUESTION_NOT_FOUND"
@@ -886,6 +909,10 @@ class RoundQuestion(BaseModel):
     answer_event_id: str | None = None
     consumed_at: datetime | None = None
     user_prompt_id: str | None = None
+    #: The dispatch state this ask SUSPENDED, so a release restores it rather
+    #: than fabricating one.  ``None`` only for a row written before the column
+    #: existed.
+    dispatch_prior_state: DispatchState | None = None
     row_version: int = Field(ge=1)
 
     @field_validator("asked_at", "expires_at")
@@ -939,6 +966,25 @@ class AnswerAdmissibility(BaseModel):
     admissible: bool
     code: QuestionRefusal | None = None
     reason: str = ""
+
+
+#: The dispatch states an ask may suspend.  A dispatch that has RETURNED, FAILED
+#: or been ABANDONED is finished, and there is nobody left to answer to.
+LIVE_DISPATCH_STATES: frozenset[DispatchState] = frozenset(
+    {DispatchState.PREPARED, DispatchState.DISPATCHED, DispatchState.AWAITING_ANSWER}
+)
+
+
+def dispatch_may_be_suspended(state: DispatchState) -> bool:
+    """Whether an ask may move this dispatch into ``AWAITING_ANSWER``.
+
+    2a built no dispatch transition table and this does not add one — it answers
+    exactly one question, the one an ask has to ask.  A terminal dispatch flipped
+    back into ``AWAITING_ANSWER`` would make :func:`run_awaiting_answer` true for
+    the WHOLE run, permanently, because nobody is going to answer a question
+    asked by a lane that already returned.
+    """
+    return state in LIVE_DISPATCH_STATES
 
 
 def next_question_state(current: QuestionState, target: QuestionState) -> QuestionState:
