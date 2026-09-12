@@ -242,8 +242,22 @@ def test_sandbox_guard_runs_before_reconcile_or_mutation(reconcile_env, monkeypa
 #: a TOML document rather than moving its bytes around.
 _TEXT_PROCESSORS = frozenset(
     {
-        "grep", "egrep", "fgrep", "sed", "awk", "gawk", "cut", "tr",
-        "head", "tail", "sort", "uniq", "xargs", "eval", "read", "source",
+        "grep",
+        "egrep",
+        "fgrep",
+        "sed",
+        "awk",
+        "gawk",
+        "cut",
+        "tr",
+        "head",
+        "tail",
+        "sort",
+        "uniq",
+        "xargs",
+        "eval",
+        "read",
+        "source",
     }
 )
 
@@ -272,15 +286,24 @@ _REDIRECT_RE = re.compile(r">>?\s*(\"[^\"]*\"|'[^']*'|[^\s|&;<>]+)")
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 
-def _taint_toml_vars(code_lines: "list[tuple[int, str]]") -> "dict[str, bool]":
+def _taint_toml_vars(
+    code_lines: "list[tuple[int, str]]",
+) -> "dict[int, dict[str, bool]]":
     """Single forward pass marking shell variables that *hold a TOML path*.
 
-    Returns ``{variable: names_providers_toml}``. A variable is tainted when it
+    Returns ``{lineno: {variable: names_providers_toml}}`` — the taint state as it
+    stands when that line EXECUTES, not one final map. A variable is tainted when it
     is assigned a word containing ``.toml`` (``f="$d/_clauses.toml"``), or
     assigned from another tainted variable (``g="$f"``); a ``for x in *.toml``
     header taints the loop variable the same way. The flag distinguishes
     providers.toml handles from the (legitimately copied) ``_clauses.toml`` /
     ``routing.toml`` ones, so check (3) can stay pointed at providers.toml.
+
+    Per-line snapshots, not one final map (the N4 clear-after-use hole): with a
+    single return value a later harmless reassignment (``_n4="$HOME/README.md"``
+    after ``_n4=…/providers.toml``) rewrote history for every EARLIER line, so
+    ``awk … "$_n4"`` between the two assignments read as untainted and was
+    accepted. Each line is now judged against the taint state at that line.
 
     Deliberately NOT a shell parser. Known blind spots, each one a shape the
     guard below cannot see (N4-class holes, named rather than left silent):
@@ -303,7 +326,12 @@ def _taint_toml_vars(code_lines: "list[tuple[int, str]]") -> "dict[str, bool]":
       (a function body called later) is not tracked.
     """
     tainted: "dict[str, bool]" = {}
+    snapshots: "dict[int, dict[str, bool]]" = {}
     for _lineno, raw in code_lines:
+        # Snapshot BEFORE this line's own assignment is applied: the line is a
+        # *use* of whatever the earlier lines established, so a self-referencing
+        # write (``f="$f"``) sees the value it read, exactly as the shell would.
+        snapshots[_lineno] = dict(tainted)
         match = _ASSIGN_RE.match(raw) or _FOR_IN_RE.match(raw)
         if not match:
             continue
@@ -319,7 +347,7 @@ def _taint_toml_vars(code_lines: "list[tuple[int, str]]") -> "dict[str, bool]":
                 tainted[name] = any(tainted[v] for v in inherited)
             else:
                 tainted.pop(name, None)
-    return tainted
+    return snapshots
 
 
 def _assert_installer_delegates(contents: str) -> None:
@@ -349,13 +377,18 @@ def _assert_installer_delegates(contents: str) -> None:
             "D6 delegates that to `cao config reconcile`"
         )
 
-    tainted = _taint_toml_vars(code_lines)
+    # The taint state AT EACH LINE (see _taint_toml_vars): a later reassignment
+    # must not retroactively un-taint an earlier use, which is the N4
+    # clear-after-use hole (``_n4=…/providers.toml`` … ``awk … "$_n4"`` …
+    # ``_n4="$HOME/README.md"``).
+    tainted_at = _taint_toml_vars(code_lines)
 
     # (4a) No provider-stanza reasoning anywhere in executable text.
     assert ".profiles." not in code, "install.sh reasons about provider stanzas"
 
     for lineno, raw in code_lines:
         lowered_line = raw.lower()
+        tainted = tainted_at.get(lineno, {})
         refs = {v for v in _VAR_REF_RE.findall(raw) if v in tainted}
         if "toml" not in lowered_line and not refs:
             continue
@@ -441,6 +474,11 @@ _INSTALLER_MUTANTS = {
     ),
     "n4_two_hop_indirection": (
         '_a="$REPO_DIR/orchestrator/routing.toml"\n_b="$_a"\nhead -n 20 "$_b"\n'
+    ),
+    "n4_taint_cleared_after_use": (
+        '_n4="$HOME/.aws/cli-agent-orchestrator/providers.toml"\n'
+        "awk -F= '{print $1}' \"$_n4\"\n"
+        '_n4="$HOME/README.md"\n'
     ),
     "n4_loop_glob_indirection": (
         'for _t in "$CAO_STORE_DIR"/*.toml; do\n    sed -n "1p" "$_t"\ndone\n'

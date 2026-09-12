@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -20,12 +20,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from cli_agent_orchestrator.backends.base import ScopeProbe
 from cli_agent_orchestrator.clients.database import (
     Base,
+    DeliveryObligationModel,
     F218TeardownIntentModel,
     PaneExitTombstoneModel,
     SessionDegradationModel,
-    DeliveryObligationModel,
 )
-
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -134,7 +133,10 @@ class TestAC2SessionScopeClassification:
         from cli_agent_orchestrator.services.session_degradation_service import mark_degraded
 
         # First mark
-        with patch("cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended", return_value=False):
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
             r1 = mark_degraded(
                 db=scratch_db,
                 session_name="cao-test",
@@ -148,7 +150,10 @@ class TestAC2SessionScopeClassification:
         assert r1.newly_marked is True
 
         # Second mark (same session+incarnation+cause) — dedup
-        with patch("cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended", return_value=False):
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
             r2 = mark_degraded(
                 db=scratch_db,
                 session_name="cao-test",
@@ -167,7 +172,10 @@ class TestAC2SessionScopeClassification:
         """Relaunched same-named session → second degradation row (D15)."""
         from cli_agent_orchestrator.services.session_degradation_service import mark_degraded
 
-        with patch("cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended", return_value=False):
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
             r1 = mark_degraded(
                 db=scratch_db,
                 session_name="cao-test2",
@@ -176,7 +184,10 @@ class TestAC2SessionScopeClassification:
             )
             scratch_db.commit()
 
-        with patch("cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended", return_value=False):
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
             r2 = mark_degraded(
                 db=scratch_db,
                 session_name="cao-test2",
@@ -187,7 +198,9 @@ class TestAC2SessionScopeClassification:
 
         assert r1.newly_marked is True
         assert r2.newly_marked is True
-        count = scratch_db.query(SessionDegradationModel).filter_by(session_name="cao-test2").count()
+        count = (
+            scratch_db.query(SessionDegradationModel).filter_by(session_name="cao-test2").count()
+        )
         assert count == 2
 
 
@@ -236,8 +249,11 @@ class TestAC5TombstonePrecedesSignal:
 
         before = datetime.now(timezone.utc)
         probe = ScopeProbe(
-            scope="window_gone", session_present=True,
-            sibling_windows=(), samples=2, evidence=(),
+            scope="window_gone",
+            session_present=True,
+            sibling_windows=(),
+            samples=2,
+            evidence=(),
         )
         result = record(
             db=scratch_db,
@@ -279,8 +295,11 @@ class TestAC6TombstoneBarrier:
         from cli_agent_orchestrator.services.pane_tombstone_service import record, require_tombstone
 
         probe = ScopeProbe(
-            scope="unknown", session_present=None,
-            sibling_windows=None, samples=1, evidence=(),
+            scope="unknown",
+            session_present=None,
+            sibling_windows=None,
+            samples=1,
+            evidence=(),
         )
         res = record(
             db=scratch_db,
@@ -351,8 +370,11 @@ class TestAC8Honesty:
         from cli_agent_orchestrator.services.pane_tombstone_service import record
 
         probe = ScopeProbe(
-            scope="window_gone", session_present=True,
-            sibling_windows=(), samples=2, evidence=(),
+            scope="window_gone",
+            session_present=True,
+            sibling_windows=(),
+            samples=2,
+            evidence=(),
         )
         result = record(
             db=scratch_db,
@@ -415,7 +437,10 @@ class TestAC10ExactlyOnceAlarm:
         """Second concurrent mark returns newly_marked=False."""
         from cli_agent_orchestrator.services.session_degradation_service import mark_degraded
 
-        with patch("cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended", return_value=False):
+        with patch(
+            "cli_agent_orchestrator.services.teardown_intent_service.is_teardown_intended",
+            return_value=False,
+        ):
             r1 = mark_degraded(
                 db=scratch_db,
                 session_name="s",
@@ -513,6 +538,7 @@ class TestAC15TypedDeleteErrors:
 
     def test_detail_never_empty_format(self):
         """Type name is always present even when str(e) is empty."""
+
         # Simulate the format used in the handler
         class SilentException(Exception):
             def __str__(self):
@@ -522,6 +548,7 @@ class TestAC15TypedDeleteErrors:
         detail = f"{type(e).__name__}: {str(e) or 'no detail'}"
         assert detail.startswith("SilentException: ")
         import re
+
         assert re.match(r"^[A-Za-z_]\w*: ", detail)
 
 
@@ -553,9 +580,12 @@ class TestAC17AlarmNoInjection:
         """Static check: new service files have no composer injection in code (not comments)."""
         import ast
         import inspect
-        from cli_agent_orchestrator.services import session_degradation_service
-        from cli_agent_orchestrator.services import pane_tombstone_service
-        from cli_agent_orchestrator.services import teardown_intent_service
+
+        from cli_agent_orchestrator.services import (
+            pane_tombstone_service,
+            session_degradation_service,
+            teardown_intent_service,
+        )
 
         forbidden = ("send_keys", "paste_buffer", "load_buffer")
         for mod in (session_degradation_service, pane_tombstone_service, teardown_intent_service):
@@ -565,15 +595,15 @@ class TestAC17AlarmNoInjection:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute):
                     for fb in forbidden:
-                        assert node.attr != fb, (
-                            f"Attribute access .{fb} found in {mod.__name__} line {node.lineno}"
-                        )
+                        assert (
+                            node.attr != fb
+                        ), f"Attribute access .{fb} found in {mod.__name__} line {node.lineno}"
                 if isinstance(node, ast.Call):
                     if isinstance(node.func, ast.Attribute):
                         for fb in forbidden:
-                            assert node.func.attr != fb, (
-                                f"Call to .{fb}() found in {mod.__name__} line {node.lineno}"
-                            )
+                            assert (
+                                node.func.attr != fb
+                            ), f"Call to .{fb}() found in {mod.__name__} line {node.lineno}"
 
 
 # ─── AC18: F217 separation ───────────────────────────────────────────────────
@@ -585,9 +615,12 @@ class TestAC18F217Separation:
     def test_no_f217_identifiers_in_new_services(self):
         """Static: new services have no F217 write-off references."""
         import inspect
-        from cli_agent_orchestrator.services import session_degradation_service
-        from cli_agent_orchestrator.services import pane_tombstone_service
-        from cli_agent_orchestrator.services import teardown_intent_service
+
+        from cli_agent_orchestrator.services import (
+            pane_tombstone_service,
+            session_degradation_service,
+            teardown_intent_service,
+        )
 
         for mod in (session_degradation_service, pane_tombstone_service, teardown_intent_service):
             source = inspect.getsource(mod)
@@ -603,9 +636,7 @@ class TestAC21NotNullIncarnation:
 
     def test_schema_not_null(self, scratch_db):
         """PRAGMA table_info reports notnull=1 for session_incarnation."""
-        result = scratch_db.execute(
-            text("PRAGMA table_info(pane_exit_tombstones)")
-        ).fetchall()
+        result = scratch_db.execute(text("PRAGMA table_info(pane_exit_tombstones)")).fetchall()
         for col in result:
             if col[1] == "session_incarnation":
                 assert col[3] == 1, "session_incarnation must be NOT NULL"
@@ -613,9 +644,7 @@ class TestAC21NotNullIncarnation:
         else:
             pytest.fail("session_incarnation column not found")
 
-        result2 = scratch_db.execute(
-            text("PRAGMA table_info(session_degradations)")
-        ).fetchall()
+        result2 = scratch_db.execute(text("PRAGMA table_info(session_degradations)")).fetchall()
         for col in result2:
             if col[1] == "session_incarnation":
                 assert col[3] == 1, "session_incarnation must be NOT NULL"
@@ -874,9 +903,9 @@ class TestAC22TeardownSuppression:
     def test_teardown_intent_committed_and_suppresses(self, scratch_db):
         """Intent suppresses the alarm."""
         from cli_agent_orchestrator.services.teardown_intent_service import (
-            open_intent,
             close_intent,
             is_teardown_intended,
+            open_intent,
         )
 
         intent_id = open_intent(
@@ -888,15 +917,15 @@ class TestAC22TeardownSuppression:
         assert intent_id is not None
 
         # Verify it suppresses
-        assert is_teardown_intended(
-            session_name="cao-test", terminal_id=None, db=scratch_db
-        ) is True
+        assert (
+            is_teardown_intended(session_name="cao-test", terminal_id=None, db=scratch_db) is True
+        )
 
         # Close it
         close_intent(intent_id, scratch_db)
-        assert is_teardown_intended(
-            session_name="cao-test", terminal_id=None, db=scratch_db
-        ) is False
+        assert (
+            is_teardown_intended(session_name="cao-test", terminal_id=None, db=scratch_db) is False
+        )
 
     def test_expired_intent_does_not_suppress(self, scratch_db):
         """Expired intent → alarm fires normally."""
@@ -914,9 +943,10 @@ class TestAC22TeardownSuppression:
         scratch_db.add(row)
         scratch_db.commit()
 
-        assert is_teardown_intended(
-            session_name="cao-test-expired", terminal_id=None, db=scratch_db
-        ) is False
+        assert (
+            is_teardown_intended(session_name="cao-test-expired", terminal_id=None, db=scratch_db)
+            is False
+        )
 
 
 # ─── AC23: One tick, one verdict ─────────────────────────────────────────────
@@ -928,14 +958,15 @@ class TestAC23OneTickOneVerdict:
     def test_no_default_db_parameter(self):
         """Static: db is required, no default."""
         import inspect
+
         from cli_agent_orchestrator.services.delivery_service import is_target_confirmed_dead
 
         sig = inspect.signature(is_target_confirmed_dead)
         db_param = sig.parameters.get("db")
         assert db_param is not None
-        assert db_param.default is inspect.Parameter.empty, (
-            "is_target_confirmed_dead must have db as required (no default) — S2/M28"
-        )
+        assert (
+            db_param.default is inspect.Parameter.empty
+        ), "is_target_confirmed_dead must have db as required (no default) — S2/M28"
 
 
 # ─── AC24: memory_max stored verbatim ────────────────────────────────────────
@@ -949,8 +980,11 @@ class TestAC24MemoryMaxVerbatim:
         from cli_agent_orchestrator.services.pane_tombstone_service import record
 
         probe = ScopeProbe(
-            scope="window_gone", session_present=True,
-            sibling_windows=(), samples=2, evidence=(),
+            scope="window_gone",
+            session_present=True,
+            sibling_windows=(),
+            samples=2,
+            evidence=(),
         )
         result = record(
             db=scratch_db,
@@ -982,8 +1016,11 @@ class TestAC24MemoryMaxVerbatim:
         from cli_agent_orchestrator.services.pane_tombstone_service import record
 
         probe = ScopeProbe(
-            scope="window_gone", session_present=True,
-            sibling_windows=(), samples=2, evidence=(),
+            scope="window_gone",
+            session_present=True,
+            sibling_windows=(),
+            samples=2,
+            evidence=(),
         )
         result = record(
             db=scratch_db,
@@ -1018,6 +1055,7 @@ class TestMutantKills:
     def test_m2_no_tombstone_no_signal(self, scratch_db):
         """M2: D4 barrier removed → AC6 (signal count == 0)."""
         from cli_agent_orchestrator.services.pane_tombstone_service import require_tombstone
+
         assert require_tombstone("nonexistent", scratch_db) is None
 
     def test_m5_counter_must_reach_2(self):
@@ -1045,9 +1083,12 @@ class TestMutantKills:
 
     def test_m12_detail_never_empty(self):
         """M12: bare str(e) → AC15 (detail matches ^ClassName:)."""
+
         # Format: f"{type(e).__name__}: {str(e) or 'no detail'}"
         class E(Exception):
-            def __str__(self): return ""
+            def __str__(self):
+                return ""
+
         detail = f"{type(E()).__name__}: {str(E()) or 'no detail'}"
         assert detail.startswith("E: ")
 
@@ -1055,11 +1096,12 @@ class TestMutantKills:
         """M15: Token leak → AC17 static + Do-NOT 6 regex."""
         import inspect
         import re
+
         from cli_agent_orchestrator.services import pane_tombstone_service
 
         source = inspect.getsource(pane_tombstone_service)
         # \btoken\b(?!_) — matches 'token' but not 'token_hash'
-        hits = re.findall(r'\btoken\b(?!_)', source)
+        hits = re.findall(r"\btoken\b(?!_)", source)
         # Filter out comments and string literals that mention "token" conceptually
         # The expected pattern is only token_hash references
         for hit in hits:
@@ -1079,9 +1121,7 @@ class TestMutantKills:
     def test_m24_nullable_incarnation_breaks_dedup(self, scratch_db):
         """M24: Nullable session_incarnation → SQLite distinct NULLs defeat UNIQUE."""
         # Verify column is NOT NULL via PRAGMA
-        result = scratch_db.execute(
-            text("PRAGMA table_info(session_degradations)")
-        ).fetchall()
+        result = scratch_db.execute(text("PRAGMA table_info(session_degradations)")).fetchall()
         for col in result:
             if col[1] == "session_incarnation":
                 assert col[3] == 1, "Must be NOT NULL to preserve UNIQUE dedup"
@@ -1091,6 +1131,7 @@ class TestMutantKills:
     def test_m28_db_has_no_default(self):
         """M28: db=None fallback → AC23 (no default)."""
         import inspect
+
         from cli_agent_orchestrator.services.delivery_service import is_target_confirmed_dead
 
         sig = inspect.signature(is_target_confirmed_dead)
@@ -1111,9 +1152,11 @@ class TestScopeProbeIntegration:
         client._has_session_via_cli.return_value = True
         backend = TmuxBackend(client=client)
 
-        with patch.object(backend, "enumerate_windows", return_value=("ok", [
-            {"name": "worker-1"}, {"name": "worker-2"}
-        ])):
+        with patch.object(
+            backend,
+            "enumerate_windows",
+            return_value=("ok", [{"name": "worker-1"}, {"name": "worker-2"}]),
+        ):
             probe = backend.session_scope_probe("test-session", window_name="supervisor")
 
         assert probe.scope == "window_gone"
@@ -1191,16 +1234,176 @@ class TestDeliveryTargetLiveness:
     def test_default_is_presumed_live(self):
         from cli_agent_orchestrator.services.delivery_service import DeliveryTarget
 
-        t = DeliveryTarget(
-            terminal_id="t", tmux_session="s", tmux_window="w", cc_inbox_path=None
-        )
+        t = DeliveryTarget(terminal_id="t", tmux_session="s", tmux_window="w", cc_inbox_path=None)
         assert t.liveness == "presumed_live"
 
     def test_confirmed_dead_explicit(self):
         from cli_agent_orchestrator.services.delivery_service import DeliveryTarget
 
         t = DeliveryTarget(
-            terminal_id="t", tmux_session="s", tmux_window="w",
-            cc_inbox_path=None, liveness="confirmed_dead"
+            terminal_id="t",
+            tmux_session="s",
+            tmux_window="w",
+            cc_inbox_path=None,
+            liveness="confirmed_dead",
         )
         assert t.liveness == "confirmed_dead"
+
+
+# ─── B1 (merge-review r1): the PRODUCTION WIRE, not the unit seam ────────────
+#
+# The r1 review reverted the whole ``terminal_service.py`` mint hunk and the
+# F218-a acceptance module stayed green: every test above calls
+# ``mint_session_incarnation`` (or the resolver) directly, so none of them can
+# tell whether ``create_terminal`` still mints on a real backend launch. These
+# three drive the REAL ``create_terminal`` through a backend double: one mint
+# per successful NEW session, none for an added window, none for a failed
+# create. Reverting terminal_service.py:2672-2688 makes the first one red.
+
+
+@pytest.mark.usefixtures("isolated_memory_db")
+class TestAC21IncarnationMintWiring:
+    """D15 (#783) exactly-once: every backend session creation mints, nobody else does."""
+
+    @staticmethod
+    def _wire(mock_load_profile, mock_gen_id, mock_tmux, mock_provider_manager):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        mock_gen_id.return_value = "test1234"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.mint_session_incarnation")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_new_session_mints_exactly_once(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        mock_mint,
+    ):
+        """A successful NEW-session create mints once, for the session the backend made."""
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        self._wire(mock_load_profile, mock_gen_id, mock_tmux, mock_provider_manager)
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", session_name="cao-mint", new_session=True)
+
+        mock_tmux.create_session.assert_called_once()
+        mock_mint.assert_called_once_with("cao-mint")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.mint_session_incarnation")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_added_window_never_mints(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_session_env,
+        mock_delete_terminals_by_session,
+        mock_mint,
+    ):
+        """An added window joins a LIVE session: the incarnation is the session's own."""
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        self._wire(mock_load_profile, mock_gen_id, mock_tmux, mock_provider_manager)
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_get_session_env.return_value = {}
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", session_name="cao-live")
+
+        mock_tmux.create_window.assert_called_once()
+        mock_tmux.create_session.assert_not_called()
+        mock_mint.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.mint_session_incarnation")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_failed_session_creation_never_mints(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_delete_terminals_by_session,
+        mock_mint,
+    ):
+        """No backend session exists, so no incarnation may be minted for the name."""
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        self._wire(mock_load_profile, mock_gen_id, mock_tmux, mock_provider_manager)
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_tmux.create_session.side_effect = RuntimeError("backend create failed")
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        with pytest.raises(Exception):
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-mint", new_session=True
+            )
+
+        mock_mint.assert_not_called()

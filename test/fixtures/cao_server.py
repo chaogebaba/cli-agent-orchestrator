@@ -355,35 +355,6 @@ class _JWKSServer:
 _PROVIDER_BINARIES = {"kiro_cli": "kiro-cli", "claude_code": "claude", "codex": "codex"}
 
 
-# F993 (#841): the ONLY signals that may downgrade a failed POST /sessions to a
-# skip. Each can mean just one thing: the provider binary is not on this host.
-# Everything else — including "initialization timed out" and any message that
-# merely names the provider — is a real failure and must surface as one.
-#
-# The fixture previously skipped on any 5xx whose body contained the provider
-# name, which is essentially every provider-related 500, so a server defect
-# reported green. The genuine host-capability gates run pre-flight instead
-# (--run-live and shutil.which), placed there because a 5xx skip is too late
-# once a real CLI has begun its login flow.
-_HOST_CANNOT_RUN_MARKERS = (
-    "not installed",
-    "command not found",
-    "no such file or directory",
-)
-
-
-def provider_missing_from_host(status_code: int, body: str) -> bool:
-    """True only when a failed session create means the binary is absent here.
-
-    Deliberately narrow: a provider that starts but never reaches idle
-    ("initialization timed out") is a defect, not a host fact, and must fail.
-    """
-    if status_code < 500:
-        return False
-    lowered = body.lower()
-    return any(marker in lowered for marker in _HOST_CANNOT_RUN_MARKERS)
-
-
 # ---------------------------------------------------------------------------
 # Core spawn helper (exposed for self-tests)
 # ---------------------------------------------------------------------------
@@ -730,29 +701,32 @@ def cao_terminal(
         },
     )
     if resp.status_code not in (200, 201):
-        # F993 (#841): this used to skip on any 5xx whose body named the
-        # provider, which is essentially every provider-related 500 — the four
-        # specific markers were decoration and a real server defect reported
-        # green. The genuine host-capability cases are already handled ABOVE,
-        # before the request is sent: the --run-live gate and the shutil.which
-        # probe, placed pre-flight precisely because (as the comment there
-        # says) a 5xx skip is too late once a real CLI has begun its login
-        # flow. So only signals that can ONLY mean "this host cannot run the
-        # binary" skip here; everything else fails.
+        # F993 (#841) r2: NO post-response skip survives here. The r1 fix kept a
+        # narrow substring classifier over the 5xx body ("not installed" /
+        # "command not found" / "no such file or directory"), and the merge
+        # review drove a REAL server defect straight through it:
         #
-        # "initialization timed out" is deliberately NOT in this set. A
-        # provider that starts but never reaches idle is a real failure — it is
-        # the F933 class, where fuse_status held a quiescent terminal at
-        # PROCESSING for ~11s against a 15s budget. That was caught only
-        # because the test that hit it does not use this fixture.
-        body = resp.text
-        if provider_missing_from_host(resp.status_code, body):
-            pytest.skip(
-                f"provider {provider!r} is not installed on this host "
-                f"(HTTP {resp.status_code}): {body[:200]}"
-            )
+        #   status=500
+        #   body=Internal database open failed: No such file or directory: '/data/cao.db'
+        #   provider_missing_from_host=True   -> the test skipped and reported green.
+        #
+        # The phrase does not identify a missing provider executable: a missing
+        # database, working directory, profile, socket or config file all read
+        # the same way. Host capability is decided PRE-FLIGHT, before the request
+        # is sent (the --run-live gate and the shutil.which probe above), which is
+        # also the only place it can be decided without racing a real CLI's login
+        # flow. Every response that is not 200/201 is therefore a failure, and
+        # `test/fixtures/test_cao_server_host_gate.py` drives this very fixture
+        # function with the body above to prove it raises rather than skips.
+        #
+        # No server-side structured "provider executable absent" field exists to
+        # classify on instead: the create route renders an unexpected exception as
+        # ``detail=f"Failed to create session: {str(e)}"`` (api/main.py), and a
+        # missing binary surfaces as the OS's bare FileNotFoundError text -- the
+        # same shape as every other missing path.
         raise RuntimeError(
-            f"POST /sessions failed for provider {provider!r}: HTTP {resp.status_code} {body}"
+            f"POST /sessions failed for provider {provider!r}: HTTP {resp.status_code} "
+            f"{resp.text}"
         )
     data = resp.json()
     terminal_id = data["id"]
