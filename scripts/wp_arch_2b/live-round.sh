@@ -157,6 +157,35 @@ if tmux has-session -t "\$ARM_SESSION" 2>/dev/null; then
   exit 2
 fi
 
+# Herdr has persistent workspaces rather than tmux sessions.  Killing
+# cao-server does not remove one, so an aborted arm otherwise makes the next
+# `cao launch` answer "Session already exists" even though its port is clean.
+# Close only this harness arm's exact label; never sweep another workspace.
+python3 - "\$ARM_SESSION" <<'CLEAN_HERDR'
+import json
+import subprocess
+import sys
+
+target = sys.argv[1]
+try:
+    raw = subprocess.check_output(
+        ["herdr", "--session", "cao", "workspace", "list"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    body = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+for workspace in body.get("result", {}).get("workspaces", []):
+    if workspace.get("label") == target:
+        subprocess.run(
+            ["herdr", "--session", "cao", "workspace", "close", workspace["workspace_id"]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+CLEAN_HERDR
+
 # Seed providers.toml the way install.sh does — copy the default only when the
 # arm's fresh home has none — so the provider model defaults are the repo's
 # rather than whatever a bare home implies.
