@@ -126,6 +126,14 @@ export HOME=$BOXHOME
 # HOME to the workload home for credentials, but herdr itself remains at
 # /home/box/.local/bin on provisioned images.
 export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:/home/box/.local/bin:/home/box/.bun/bin:\$PATH"
+# The built-in CAO ``developer`` profile is enough for most providers, but
+# Kiro also requires a matching base agent manifest.  Provisioned boxes carry
+# the repo's kiro_dev manifest; seed the generic name used by this harness.
+if [ ! -f "\$HOME/.kiro/agents/developer.json" ] &&
+   [ -f "\$HOME/.kiro/agents/kiro_dev.json" ]; then
+  mkdir -p "\$HOME/.kiro/agents"
+  cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/developer.json"
+fi
 
 cd $BOXHOME/cli-subagents/cli-agent-orchestrator || exit 2
 git fetch origin >/dev/null 2>&1
