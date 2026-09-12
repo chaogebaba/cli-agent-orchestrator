@@ -96,6 +96,9 @@ ROUND=$REMOTE_SCRATCH/\$ARM
 rm -rf "\$ROUND"; mkdir -p "\$ROUND"
 export CAO_HOME_DIR="\$ROUND/home"
 export CAO_WORKER_TRUTH_INGEST=1
+# The analyser must distinguish a herdr-backed cohort from an ordinary tmux
+# arm; record the seam precondition explicitly rather than infer it later.
+export CAO_HERDR_RUNTIME=1
 export CAO_DELIVERY_QUEUE=on
 export CAO_WORKER_TRUTH_STATUS=$status_env
 export CAO_WORKER_TRUTH_STATUS_PROVIDERS=$providers_env
