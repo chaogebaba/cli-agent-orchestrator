@@ -486,7 +486,9 @@ class TerminalBackend(ABC):
         """
         return False
 
-    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+    def get_pane_id(
+        self, terminal_id: str, session_name: str = "", window_name: str = ""
+    ) -> Optional[str]:
         """Resolve terminal_id to backend-specific pane identifier.
 
         Only meaningful for backends that use event-based inbox delivery.
@@ -498,7 +500,8 @@ class TerminalBackend(ABC):
             window_name: Optional window name for window-based fallback lookup
 
         Returns:
-            Backend-specific pane identifier
+            Backend-specific pane identifier, or None when a cached identifier
+            is confirmed retired
 
         Raises:
             NotImplementedError: If backend does not support pane ID resolution

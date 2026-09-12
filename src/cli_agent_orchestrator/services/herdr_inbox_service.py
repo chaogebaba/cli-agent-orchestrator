@@ -709,6 +709,8 @@ class HerdrInboxService:
                     backend = get_backend()
                     backend.invalidate_pane(terminal_id, term_session or "", term_window)
                     new_pane_id = backend.get_pane_id(terminal_id, term_session or "", term_window)
+                    if new_pane_id is None:
+                        raise RuntimeError("retired pane has no live replacement")
                 except Exception as e:
                     logger.warning(
                         "Reconcile: tab %s live but pane re-resolve failed for %s (%s); "

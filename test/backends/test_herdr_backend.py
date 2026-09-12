@@ -912,6 +912,11 @@ def test_get_pane_id_fresh_map_hit_skips_refresh(monkeypatch):
     monkeypatch.setattr(
         backend, "_refresh_pane_id_map", lambda: called.__setitem__("n", called["n"] + 1)
     )
+    monkeypatch.setattr(
+        backend,
+        "_list_native_records",
+        lambda _noun, _key: ("ok", [{"pane_id": "w1:p1"}]),
+    )
     assert backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0") == "w1:p1"
     assert called["n"] == 0  # fresh hit, no refresh
 
@@ -934,6 +939,11 @@ def test_get_pane_id_stale_map_refreshes(monkeypatch):
         backend._pane_id_map_ts = time.time()
 
     monkeypatch.setattr(backend, "_refresh_pane_id_map", fake_refresh)
+    monkeypatch.setattr(
+        backend,
+        "_list_native_records",
+        lambda _noun, _key: ("ok", [{"pane_id": "w2:p5"}]),
+    )
 
     # Stale hit must NOT be returned; refresh fires and yields the new id.
     assert backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0") == "w2:p5"
