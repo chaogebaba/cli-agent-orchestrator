@@ -91,6 +91,9 @@ dependencies = [
     # by the pinned browser replay probes; newer impersonation tables are not
     # silently accepted by this lane without a new live calibration.
     "curl-cffi==0.13.0",
+    # F862 Amendment D workspace connector: gitignore-semantics matcher used by
+    # workspace_connector/ignore_rules.py for manifest containment.
+    "pathspec==0.12.0",
 ]
 
 [project.optional-dependencies]
