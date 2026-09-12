@@ -30,6 +30,8 @@ _GATE_TABLES = {
     "question_answer",
     "answer_delivery_intent",
     "ownership_transfer",
+    # Slice B1's addition: the notification intent that commits WITH the ask.
+    "question_notice_intent",
 }
 
 
@@ -72,6 +74,10 @@ def test_migration_up_over_older_schema(tmp_path: Path) -> None:
                 "answer_delivery_intent",
                 "ownership_transfer",
                 "round_question_indexes",
+                # B1's step carries an index ON round_question, so it has to be
+                # stripped with it — left in, the "older schema" pass would try
+                # to index a table this arm has deliberately not created.
+                "question_notice_intent",
             }
         )
         r1, p1 = migrate(path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
@@ -123,3 +129,42 @@ def test_gate_step_failure_records_finding_and_survives_boot(tmp_path: Path) -> 
         .fetchall()
     )
     assert any(row[1] == "gate_broken" for row in rows)
+
+
+def test_the_prior_state_column_reaches_an_existing_deployment(tmp_path: Path) -> None:
+    """B1 r2's column is in the CREATE DDL *and* ``ADDITIVE_COLUMNS``.
+
+    Either alone covers half the estate: ``CREATE TABLE IF NOT EXISTS`` is a
+    no-op against a table 2a already created, so the CREATE reaches only fresh
+    installs; the ALTER reaches only tables that already exist. This arm is the
+    second half — a database whose ``round_question`` predates the column must
+    gain it on the next migrate, because without it every release would fabricate
+    a dispatch state.
+    """
+    path = tmp_path / "old.db"
+    _r1, pool = migrate(path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
+    assert pool is not None
+    conn = pool.connection()
+    # Rebuild the table as 2a shipped it: same columns, minus the new one.
+    conn.execute("ALTER TABLE round_question RENAME TO round_question_old")
+    conn.execute(
+        "CREATE TABLE round_question ("
+        "question_id TEXT PRIMARY KEY, dispatch_id TEXT NOT NULL, round_id TEXT, "
+        "client_request_id TEXT NOT NULL, owner_conversation TEXT NOT NULL, "
+        "owner_epoch INTEGER NOT NULL, continuation_kind TEXT NOT NULL, "
+        "continuation_ref TEXT NOT NULL, asked_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+        "question TEXT NOT NULL, options_json TEXT NOT NULL DEFAULT '[]', "
+        "answer_schema TEXT, default_policy TEXT, blocking INTEGER NOT NULL, "
+        "state TEXT NOT NULL, answer_event_id TEXT, consumed_at TEXT, user_prompt_id TEXT, "
+        "row_version INTEGER NOT NULL DEFAULT 1)"
+    )
+    conn.execute("DROP TABLE round_question_old")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(round_question)")}
+    assert "dispatch_prior_state" not in columns  # the pre-r2 shape
+    pool.close_all()
+
+    result, pool2 = migrate(path, busy_timeout_ms=TEST_BUSY_TIMEOUT_MS)
+    assert result.ok and pool2 is not None
+    columns = {row[1] for row in pool2.connection().execute("PRAGMA table_info(round_question)")}
+    assert "dispatch_prior_state" in columns
+    assert "additive_columns" in result.steps_applied

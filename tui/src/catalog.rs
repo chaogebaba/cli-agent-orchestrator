@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 117;
+const COMMAND_COUNT: usize = 122;
 
 /// What the TUI does with a command.
 ///
@@ -273,6 +273,11 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
+    CommandId::GateAnswer,
+    CommandId::GateAsk,
+    CommandId::GateEscalate,
+    CommandId::GateQuestion,
+    CommandId::GateQuestions,
     CommandId::GateShow,
     CommandId::DiagFindings,
     CommandId::DiagMsg,
@@ -515,7 +520,19 @@ pub enum CommandId {
     /// `cao config reconcile`
     ConfigReconcile,
 
-    // `cao gate *` — WP-ARCH Amendment A slice 2a
+    // `cao gate *` — WP-ARCH Amendment A slice 2a (`show`) and slice B1 (the
+    // durable-question verbs).  Kept contiguous: every lane that adds a CLI leaf
+    // touches this file, and a scattered group is how two lanes collide in it.
+    /// `cao gate answer`
+    GateAnswer,
+    /// `cao gate ask`
+    GateAsk,
+    /// `cao gate escalate`
+    GateEscalate,
+    /// `cao gate question`
+    GateQuestion,
+    /// `cao gate questions`
+    GateQuestions,
     /// `cao gate show`
     GateShow,
 
@@ -1555,6 +1572,56 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::GateAnswer => Command {
+            id: CommandId::GateAnswer,
+            parent: Some("gate"),
+            leaf_name: "answer",
+            summary: "Answer a durable question by id (refused if settled, expired or superseded).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "question_id", required: true, kind: ParamKind::Text }, Param { name: "answer_text", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::GateAsk => Command {
+            id: CommandId::GateAsk,
+            parent: Some("gate"),
+            leaf_name: "ask",
+            summary: "Record a durable question and suspend the asking dispatch.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "question", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::GateEscalate => Command {
+            id: CommandId::GateEscalate,
+            parent: Some("gate"),
+            leaf_name: "escalate",
+            summary: "Raise a PENDING question to ESCALATED, keeping the same id.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "question_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::GateQuestion => Command {
+            id: CommandId::GateQuestion,
+            parent: Some("gate"),
+            leaf_name: "question",
+            summary: "Show one question and whether it has settled.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "question_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
+        CommandId::GateQuestions => Command {
+            id: CommandId::GateQuestions,
+            parent: Some("gate"),
+            leaf_name: "questions",
+            summary: "List questions, newest first; open ones unless --state says otherwise.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
         CommandId::GateShow => Command {
             id: CommandId::GateShow,
             parent: Some("gate"),
@@ -1983,17 +2050,22 @@ mod tests {
     /// was removed: one compared an observational queue against the legacy inbox, the other the
     /// projection against the legacy published status, and neither has a side left to compare.
     /// Only the third bucket moves → **24/18/74 = 116**.
+    ///
+    /// WP-ARCH Amendment A slice B1 then added the five durable-question verbs
+    /// (`gate ask`, `answer`, `escalate`, `questions`, `question`) — all HIDE by
+    /// the mandated default, since none has been reviewed for in-pane use →
+    /// **24/19/79 = 122**.
     #[test]
     fn the_policy_distribution_is_twentyfour_eighteen_seventyfour() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 19, "expected 19 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 74, "expected 74 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 79, "expected 79 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            117,
-            "the three policy counts must account for all 117 leaf commands of the Click tree"
+            122,
+            "the three policy counts must account for all 122 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -2003,8 +2075,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            117,
-            "DISPLAY_ORDER must list 117 DISTINCT commands; a duplicate would let one command go \
+            122,
+            "DISPLAY_ORDER must list 122 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -2158,6 +2230,11 @@ mod tests {
                     CommandId::BarrierStatus => CommandId::BarrierStatus,
                     CommandId::BaseRegister => CommandId::BaseRegister,
                     CommandId::ConfigReconcile => CommandId::ConfigReconcile,
+                    CommandId::GateAnswer => CommandId::GateAnswer,
+                    CommandId::GateAsk => CommandId::GateAsk,
+                    CommandId::GateEscalate => CommandId::GateEscalate,
+                    CommandId::GateQuestion => CommandId::GateQuestion,
+                    CommandId::GateQuestions => CommandId::GateQuestions,
                     CommandId::GateShow => CommandId::GateShow,
                     CommandId::DiagFindings => CommandId::DiagFindings,
                     CommandId::DiagMsg => CommandId::DiagMsg,
@@ -2280,6 +2357,11 @@ mod tests {
                 CommandId::BarrierStatus,
                 CommandId::BaseRegister,
                 CommandId::ConfigReconcile,
+                CommandId::GateAnswer,
+                CommandId::GateAsk,
+                CommandId::GateEscalate,
+                CommandId::GateQuestion,
+                CommandId::GateQuestions,
                 CommandId::GateShow,
                 CommandId::DiagFindings,
                 CommandId::DiagMsg,

@@ -126,9 +126,10 @@ class TestCoverageMatrix:
                 if (sid, kind_char) not in found_marks:
                     missing.append(f"{sid} kind={kind_char} ({surface['name']})")
 
-        assert not missing, (
-            f"Coverage matrix has {len(missing)} empty obligation cell(s):\n"
-            + "\n".join(f"  - {m}" for m in missing)
+        assert (
+            not missing
+        ), f"Coverage matrix has {len(missing)} empty obligation cell(s):\n" + "\n".join(
+            f"  - {m}" for m in missing
         )
 
     def test_no_unrostered_mcp_tools(self):
@@ -153,14 +154,20 @@ class TestCoverageMatrix:
         # Known non-UX utilities excluded from the roster per D3's frozen scope.
         # These are infrastructure/memory tools, not subagent-orchestration surfaces.
         _KNOWN_NON_UX = {
-            "memory_store", "memory_recall", "memory_forget",
-            "codex_review", "emit_ui", "load_skill", "get_compact_marker",
+            "memory_store",
+            "memory_recall",
+            "memory_forget",
+            "codex_review",
+            "emit_ui",
+            "load_skill",
+            "get_compact_marker",
             # Cluster/broker plumbing from upstream #693 (one-agent-per-pod EKS
             # topology): a lease is acquired from the elastic broker and handed
             # back on completion. Not subagent-orchestration surfaces — the roster
             # is frozen at 12 by the two assertions below, and these carry no UX
             # obligation of their own.
-            "assign_elastic", "complete_assignment",
+            "assign_elastic",
+            "complete_assignment",
         }
 
         # Check: every extracted tool (minus known exclusions) must be rostered
@@ -173,12 +180,12 @@ class TestCoverageMatrix:
 
         # Sanity: roster must have tools
         assert len(rostered_tools) > 0, "No tools in roster"
-        assert len(surfaces) == 12, f"Expected 12 surfaces, got {len(surfaces)}"
+        assert len(surfaces) == 13, f"Expected 13 surfaces, got {len(surfaces)}"
 
-    def test_surface_count_is_twelve(self):
-        """The roster has exactly 12 entries (D3 frozen roster)."""
+    def test_surface_count_is_thirteen(self):
+        """The roster has 13 entries: D3's frozen 12, plus B1's gate questions."""
         surfaces = _load_surfaces()
-        assert len(surfaces) == 12, f"Expected 12 surfaces, got {len(surfaces)}"
+        assert len(surfaces) == 13, f"Expected 13 surfaces, got {len(surfaces)}"
 
     def test_each_surface_has_invariants_and_obligation(self):
         """Every surface row has non-empty invariants and obligation."""
@@ -188,6 +195,4 @@ class TestCoverageMatrix:
             assert surface.get("obligation"), f"{surface['id']} missing obligation"
             # Obligation chars must be from {E, C, S, L}
             for char in surface["obligation"]:
-                assert char in "ECSL", (
-                    f"{surface['id']} has invalid obligation char '{char}'"
-                )
+                assert char in "ECSL", f"{surface['id']} has invalid obligation char '{char}'"

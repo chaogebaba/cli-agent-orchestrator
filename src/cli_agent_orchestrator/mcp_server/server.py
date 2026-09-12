@@ -1,6 +1,7 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -4596,6 +4597,119 @@ async def answer_user_prompt(
     # F172 input leniency.
     terminal_id = _resolve_input_terminal_id(terminal_id)
     return _send_user_prompt_answer(terminal_id, answer)
+
+
+def _gate_question_route(path: str, *, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST to a ``/gate/questions`` route, translating a typed refusal.
+
+    The tools below go over HTTP to the SAME handlers ``cao gate ask|answer``
+    calls (standing invariant #535/F680): one service call, reached two ways, so
+    the CLI verb and the tool cannot drift into meaning different things.  A
+    refused command arrives as a 4xx whose body carries the domain ``code``, and
+    it is re-raised as a ``ValueError`` carrying that code so the agent sees
+    something it can act on rather than a bare HTTP status.
+    """
+    response = cao_http.post(
+        path, json=payload, headers=_api_headers() or None, timeout=_mcp_timeout()
+    )
+    if response.status_code >= 400:
+        raise ValueError(str(_extract_structured_detail(response, f"{path} refused")))
+    result: Dict[str, Any] = response.json()
+    return result
+
+
+def _stable_request_id(*parts: str) -> str:
+    """A caller-owned idempotency key derived from what is being asked.
+
+    Derived rather than random on purpose: a lane that retries the SAME ask after
+    a transport timeout must get its own question back, and a fresh uuid each
+    attempt would instead produce a second ask that the one-open-question index
+    then refuses — turning a recoverable retry into a hard failure.
+    """
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+    return digest[:32]
+
+
+@mcp.tool()
+async def ask_supervisor(
+    question: str = Field(description="The question to put to the supervisor"),
+    default_answer: str = Field(
+        description=(
+            "The answer this lane proceeds with if the supervisor does not "
+            "answer. Required: this form returns immediately"
+        )
+    ),
+    options: List[str] = Field(
+        default_factory=list, description="Optional closed set of acceptable answers"
+    ),
+    expires_in_s: int = Field(
+        # MIRRORED from ``core.timing.GATE_QUESTION_EXPIRY_S``, not imported:
+        # ``mcp_server`` is legacy and importing the new tree here would add a
+        # file to the hook-point equality set for one integer. The SERVER
+        # validates against the real constant, so a drift is refused there
+        # rather than silently honoured (N5).
+        default=3600,
+        description="Seconds before the question expires, 1..86400",
+    ),
+    client_request_id: str = Field(
+        default="", description="Idempotency key; derived from the question when omitted"
+    ),
+) -> Dict[str, Any]:
+    """Record a durable question for the supervisor and continue immediately.
+
+    The question becomes a row the supervisor can answer by id from any session,
+    so it survives a server restart and does not depend on anyone reading a pane.
+    This NON-BLOCKING form returns as soon as the question is recorded, which is
+    why ``default_answer`` is mandatory: this lane keeps working, and something
+    has to decide what it keeps working WITH. Read the answer later with
+    ``cao gate question <id>``.
+    """
+    terminal_id = _current_terminal_id()
+    if not terminal_id:
+        raise ValueError("CAO_TERMINAL_ID not set - cannot identify the asking lane")
+    _callback_url, supervisor_id = _callback_route()
+    owner = supervisor_id or os.environ.get("CAO_CALLBACK_TERMINAL_ID") or "supervisor"
+    payload: Dict[str, Any] = {
+        "dispatch_id": terminal_id,
+        "question": question,
+        "client_request_id": client_request_id or _stable_request_id(terminal_id, question),
+        "owner_conversation": owner,
+        "options": list(options),
+        "blocking": False,
+        "default_answer": default_answer,
+        "expires_in_s": int(expires_in_s),
+        "position": os.environ.get("CAO_AGENT_NAME") or "worker",
+    }
+    return _gate_question_route("/gate/questions", payload=payload)
+
+
+@mcp.tool()
+async def answer_question(
+    question_id: str = Field(description="The question id to answer"),
+    answer: str = Field(description="The answer text"),
+    client_request_id: str = Field(
+        default="", description="Idempotency key; derived from the answer when omitted"
+    ),
+) -> Dict[str, Any]:
+    """Answer a durable question a lane is waiting on, by id.
+
+    Refused if the question already settled, if its deadline has passed, or if
+    this conversation's ownership was superseded by a later claim. An identical
+    retry returns the recorded answer; a DIFFERENT answer under the same
+    idempotency key is a conflict rather than a silent overwrite.
+
+    This is not ``answer_user_prompt``: that answers a PROVIDER DIALOG in
+    somebody's pane, this settles a recorded question in the gate.
+    """
+    terminal_id = _current_terminal_id() or "supervisor"
+    payload: Dict[str, Any] = {
+        "answer": answer,
+        "answered_by": terminal_id,
+        "client_request_id": client_request_id
+        or _stable_request_id(question_id, answer, terminal_id),
+        "caller_conversation": terminal_id,
+    }
+    return _gate_question_route(f"/gate/questions/{question_id}/answer", payload=payload)
 
 
 @mcp.tool()

@@ -1198,6 +1198,44 @@ def build_gate_service(db_path: str | Path | None = None, *, clock: Clock | None
     return GateRoundService(store, clock=resolved_clock)
 
 
+def build_gate_question_service(
+    db_path: str | Path | None = None,
+    *,
+    clock: Clock | None = None,
+    notifier: object | None = None,
+) -> object:
+    """A read/write :class:`GateQuestionService` over the LIVE database (slice B1).
+
+    A SECOND builder beside :func:`build_gate_service` rather than a method on the
+    round service, because a question has no round when a non-gate lane asks one:
+    binding the question commands to the round aggregate would make a round the
+    thing every question needs, which is what the nullable ``round_id`` column
+    exists to deny.  Both builders open their own pool over the same file; SQLite
+    in WAL serialises the writers, and the gate's transactions are short.
+
+    ``notifier`` is the :class:`~cli_agent_orchestrator.core.ports.QuestionNotifier`
+    port.  In slice B1 every caller passes ``None`` and the notice intent stays
+    ``PENDING`` — this is the seam slice B2 fills with a closure over the delivery
+    queue, and it lives HERE because that closure must reach
+    ``clients.database``, which ``app`` and ``adapters`` may not import and the
+    composition root may.  Annotated ``object`` for the reason
+    :func:`build_gate_service` gives.
+    """
+    from cli_agent_orchestrator.adapters.store.gate import SqliteGateStore
+    from cli_agent_orchestrator.app.gate.questions import GateQuestionService
+    from cli_agent_orchestrator.core.ports import QuestionNotifier
+
+    resolved_clock: Clock = clock if clock is not None else SystemClock()
+    path = Path(db_path) if db_path is not None else _default_db_path()
+    pool = ConnectionPool(path, busy_timeout_ms=_default_busy_timeout_ms())
+    store = SqliteGateStore(pool, clock=resolved_clock)
+    typed: QuestionNotifier | None = None
+    if notifier is not None:
+        assert isinstance(notifier, QuestionNotifier)
+        typed = notifier
+    return GateQuestionService(store, clock=resolved_clock, notifier=typed)
+
+
 def build_readonly_gate_store(db_path: str | Path | None = None) -> object:
     """A read-only :class:`SqliteGateStore` for ``cao gate show``.
 
