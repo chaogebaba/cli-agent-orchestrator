@@ -118,7 +118,11 @@ export HOME=$BOXHOME
 # launch is accepted, and the provider pane sits at ``command not found`` until
 # the 180 s init timeout — which is what "the round produced no lanes" looks
 # like.  Lifted from scripts/box-e2e-launch.sh, where five gate rounds put it.
-export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH"
+# herdr is installed in the box login prefix, while CAO and provider CLIs
+# are installed under the workload home.  Keep both prefixes: the round sets
+# HOME to the workload home for credentials, but herdr itself remains at
+# /home/box/.local/bin on provisioned images.
+export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:/home/box/.local/bin:/home/box/.bun/bin:\$PATH"
 
 cd $BOXHOME/cli-subagents/cli-agent-orchestrator || exit 2
 git fetch origin >/dev/null 2>&1
