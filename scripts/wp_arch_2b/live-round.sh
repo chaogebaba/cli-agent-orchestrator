@@ -159,6 +159,15 @@ fi
 # Started WITHOUT a subshell so ``\$!`` is this arm's server pid.  The teardown
 # below needs to stop exactly this process: the box is shared, and a pattern
 # kill there has already taken out another lane's server by accident.
+SERVER_PID=""
+SERIES_PID=""
+cleanup_arm() {
+  [ -n "\$SERIES_PID" ] && kill "\$SERIES_PID" 2>/dev/null || true
+  [ -n "\$SERVER_PID" ] && kill "\$SERVER_PID" 2>/dev/null || true
+}
+# A lane/auth failure is a harness failure, but it must not leave a server
+# bound to the shared port for the next arm or another box user.
+trap cleanup_arm EXIT
 cao-server --terminal herdr >"\$ROUND/server.log" 2>&1 &
 SERVER_PID=\$!
 for _ in \$(seq 1 60); do
