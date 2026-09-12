@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from test.adapters.conftest import TEST_BUSY_TIMEOUT_MS, FakeClock
 
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.core.delivery import (
     EnqueueDraft,
     QueueMode,
     SwitchPosition,
+    WriteThroughDisposition,
 )
 from cli_agent_orchestrator.core.findings import FindingCode
 from cli_agent_orchestrator.core.switches import Rejected
@@ -101,7 +103,10 @@ async def test_with_the_switch_unset_the_hooks_write_nothing(
     assert wiring.queue_enabled() is False
 
     for legacy_id in range(1, 6):
-        assert wiring.write_through(fact(legacy_id)) is None
+        assert (
+            wiring.write_through(fact(legacy_id)).disposition
+            is WriteThroughDisposition.NOT_ATTEMPTED
+        )
 
     assert runtime.queue_store is not None
     assert runtime.queue_store.count() == 0
@@ -119,11 +124,28 @@ async def test_on_arms_the_hooks_so_the_off_arm_is_a_difference(
     assert wiring.queue_enabled() is True
 
     for legacy_id in range(1, 6):
-        assert wiring.write_through(fact(legacy_id)) is not None
+        assert wiring.write_through(fact(legacy_id)).disposition is WriteThroughDisposition.ACCEPTED
 
     assert runtime.queue_store is not None
     assert runtime.queue_store.count() == 5
     assert runtime.queue_store.count(mode=QueueMode.LIVE) == 5
+
+    await bootstrap.shutdown_worker_truth()
+
+
+async def test_duplicate_write_through_still_returns_the_typed_acceptance(
+    db_path: Path, clock: FakeClock
+) -> None:
+    runtime = await boot(db_path, "on", clock)
+    first = wiring.write_through(replace(fact(101), content_hash="same-content"))
+    duplicate = wiring.write_through(replace(fact(202), content_hash="same-content"))
+
+    assert first.disposition is WriteThroughDisposition.ACCEPTED
+    assert duplicate.disposition is WriteThroughDisposition.ACCEPTED
+    assert duplicate.surrogate_id == first.surrogate_id
+    assert duplicate.msg_id == first.msg_id
+    assert runtime.queue_store is not None
+    assert runtime.queue_store.count() == 1
 
     await bootstrap.shutdown_worker_truth()
 
@@ -170,7 +192,10 @@ async def test_a_retired_position_refuses_the_subsystem_and_not_the_boot(
     assert bootstrap.delivery_health_component() == "rejected/#738"
 
     for legacy_id in range(1, 4):
-        assert wiring.write_through(fact(legacy_id)) is None
+        assert (
+            wiring.write_through(fact(legacy_id)).disposition
+            is WriteThroughDisposition.NOT_ATTEMPTED
+        )
 
     await bootstrap.shutdown_worker_truth()
 
@@ -331,11 +356,13 @@ async def test_a_served_position_arms_the_hooks_and_registers_the_tick(
     before = rebooted.queue_store.count()
     if position == "on":
         assert wiring.queue_owns_new_traffic() is True
-        assert wiring.write_through(fact(101)) is not None, "the write-through is the path"
+        assert (
+            wiring.write_through(fact(101)).disposition is WriteThroughDisposition.ACCEPTED
+        ), "the write-through is the path"
         assert rebooted.queue_store.count(mode=QueueMode.LIVE) == before + 1
     else:
         assert wiring.queue_owns_new_traffic() is False
-        assert wiring.write_through(fact(101)) is None
+        assert wiring.write_through(fact(101)).disposition is WriteThroughDisposition.NOT_ATTEMPTED
         assert rebooted.queue_store.count() == before
 
     await bootstrap.shutdown_worker_truth()

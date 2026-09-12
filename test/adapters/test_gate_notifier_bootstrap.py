@@ -33,9 +33,9 @@ import pytest
 
 from cli_agent_orchestrator import bootstrap
 from cli_agent_orchestrator.adapters.store.migrator import migrate
+from cli_agent_orchestrator.clients.database import InboxInsertDisposition, InboxInsertResult
 from cli_agent_orchestrator.core import gate as g
 from cli_agent_orchestrator.core.ports import QuestionNotifier
-from cli_agent_orchestrator.clients.database import InboxInsertDisposition, InboxInsertResult
 
 _NOW = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 

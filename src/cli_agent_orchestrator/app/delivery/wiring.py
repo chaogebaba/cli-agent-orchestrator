@@ -172,9 +172,9 @@ def write_through(fact: LegacyEnqueue) -> WriteThroughResult:
     here is the F475 window check, because at ``on`` there is no legacy row for
     the legacy predicate to find.
 
-    Never raises into the caller: a queue that cannot be written returns
-    ``None``, and the caller writes its legacy row. That degrades to the
-    pre-flip behaviour rather than losing the message.
+    Never raises into the caller: a queue that cannot be written returns a
+    typed ``REFUSED`` result, and the caller writes its legacy row. That degrades
+    to the pre-flip behaviour rather than losing the message.
     """
     runtime = _runtime
     if runtime is None or runtime.position is not SwitchPosition.ON:
@@ -193,7 +193,11 @@ def write_through(fact: LegacyEnqueue) -> WriteThroughResult:
         if duplicate is not None and duplicate.legacy_message_id is not None:
             # A suppressed duplicate returns the EXISTING row, which is what the
             # legacy path returns today — never a fabricated id.
-            return int(duplicate.legacy_message_id), duplicate.msg_id
+            return WriteThroughResult(
+                WriteThroughDisposition.ACCEPTED,
+                surrogate_id=int(duplicate.legacy_message_id),
+                msg_id=duplicate.msg_id,
+            )
 
         surrogate = runtime.store.next_surrogate_id()
         message = runtime.store.enqueue(
