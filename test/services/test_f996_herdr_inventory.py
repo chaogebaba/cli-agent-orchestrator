@@ -55,7 +55,15 @@ def env(monkeypatch: pytest.MonkeyPatch) -> HerdrBackend:
         ("pane", "list"): _response(
             "panes",
             [
-                {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                {
+                    "pane_id": "w1:p1",
+                    "tab_id": "w1:t1",
+                    "workspace_id": "w1",
+                    # F926 #778: herdr may report unknown for a healthy
+                    # wrapped launch; inventory liveness is pane ownership,
+                    # not the agent_status tell.
+                    "agent_status": "unknown",
+                },
                 {"pane_id": "w1:p3", "tab_id": "w1:t3", "workspace_id": "w1"},
             ],
         ),

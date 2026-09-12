@@ -170,11 +170,12 @@ def test_ac4b_unreadable_window_defers_then_clean_scan_purges(
 
 
 @pytest.mark.requires_herdr
-def test_ac5_herdr_inherits_error_liveness_and_never_auto_purges(
+def test_ac5_herdr_classifies_absence_as_gone_and_never_auto_purges(
     monkeypatch, purge_effects
 ) -> None:
+    """A missing herdr workspace is gone, but must never trigger auto-purge."""
     backend = HerdrBackend()
-    assert backend.window_liveness("cao-session", "old") == "error"
+    assert backend.window_liveness("cao-session", "old") == "gone"
     assert backend.get_session_windows("cao-session") == []
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: [_row("herdr", "old")])
