@@ -20,6 +20,8 @@ never stringified into the answer.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -33,6 +35,47 @@ from cli_agent_orchestrator.chatgpt_web_runner.errors import (
 #: The model/effort this lane is certified to read (findings §1, D6).
 REQUIRED_MODEL_SLUG = "gpt-5-6-thinking"
 REQUIRED_THINKING_EFFORT = "extended"
+
+
+_VOLATILE_FIELDS = {
+    "create_time",
+    "update_time",
+    "request_id",
+    "request_time",
+    "telemetry",
+    "timing",
+}
+
+
+def canonical_conversation_digest(body: dict[str, Any]) -> str:
+    """Hash the authoritative conversation while ignoring presentation noise.
+
+    Branch identity is retained: conversation/current node, mapping ids and
+    parent/child edges, role/content parts, status/end-turn, and tool result
+    payloads (including their result digests) all survive canonicalisation.
+    Volatile request timestamps/telemetry are omitted recursively. Deterministic
+    key and mapping ordering makes page-reload parity comparable to detached GET.
+    """
+
+    def clean(value: Any, *, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {
+                str(k): clean(v, key=str(k))
+                for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+                if str(k).lower() not in _VOLATILE_FIELDS
+            }
+        if isinstance(value, list):
+            # Mapping order is semantically irrelevant; all other arrays (parts,
+            # children) retain order because it affects rendered branch meaning.
+            if key == "mapping":
+                return [clean(value_item) for value_item in value]
+            return [clean(item) for item in value]
+        return value
+
+    canonical = clean(body)
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 #: Terminal sentinel framing the model must emit exactly once (D6).
 #: ``END_REVIEW:<run-id>:<bundle-sha>``.

@@ -62,7 +62,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 #: The file name inside the attempt directory. Stable: a restart finds it by name.
 SEND_INTENT_FILENAME = "send_intent.json"
@@ -87,6 +87,43 @@ class IntentState(str, Enum):
     DISPATCHED = "dispatched"
     #: A send was correlated. Reads only.
     OBSERVED = "observed"
+
+
+class AttemptState(str, Enum):
+    """Amendment D's durable attempt states.
+
+    ``IntentState`` above remains as the compatibility view used by the shipped
+    Amendment C runner.  This enum is the authoritative one-use-mint ledger for
+    Amendment D; keeping the two fields separate makes migration fail closed
+    without reinterpreting existing records.
+    """
+
+    LOCKED = "LOCKED"
+    OWNED_BROWSER_READY = "OWNED_BROWSER_READY"
+    CONNECTOR_READY = "CONNECTOR_READY"
+    INPUT_READY = "INPUT_READY"
+    INTERCEPT_ARMED = "INTERCEPT_ARMED"
+    SEND_INTENT = "SEND_INTENT"
+    RELAY_BOUND_OR_SKIPPED = "RELAY_BOUND_OR_SKIPPED"
+    COMPOSER_MINT_TRIGGERED = "COMPOSER_MINT_TRIGGERED"
+    REQUEST_HELD = "REQUEST_HELD"
+    MINT_RESERVED = "MINT_RESERVED"
+    PYTHON_POST_INVOKED = "PYTHON_POST_INVOKED"
+    RAW_SSE_RELAY = "RAW_SSE_RELAY"
+    GET_VERIFY = "GET_VERIFY"
+    BROWSER_FULFIL = "BROWSER_FULFIL"
+    VALIDATE_PUBLISH = "VALIDATE/PUBLISH"
+    ABANDONED_PRE_INVOKE = "ABANDONED_PRE_INVOKE"
+    ACK_UNKNOWN = "ACK_UNKNOWN"
+    ERROR = "ERROR"
+
+
+_TERMINAL_ATTEMPT_STATES = {
+    AttemptState.ABANDONED_PRE_INVOKE.value,
+    AttemptState.ACK_UNKNOWN.value,
+    AttemptState.ERROR.value,
+    AttemptState.VALIDATE_PUBLISH.value,
+}
 
 
 class SendIntentViolation(Exception):
@@ -120,6 +157,36 @@ class SendIntentRecord:
     deadline_at: Optional[float] = None
     #: Free-form, redacted breadcrumbs. Never carries a token or a page dump.
     notes: List[str] = field(default_factory=list)
+
+    # --- Amendment D one-use mint / relay custody -----------------------
+    attempt_state: str = AttemptState.LOCKED.value
+    profile_epoch: Optional[str] = None
+    mint_id: Optional[str] = None
+    mint_ordinal: int = 1
+    relay_token_hash: Optional[str] = None
+    relay_token_expires_at: Optional[float] = None
+    bound_at: Optional[float] = None
+    subscriber_id: Optional[str] = None
+    skipped_at: Optional[float] = None
+    pre_send_conversation_id: Optional[str] = None
+    pre_send_current_node: Optional[str] = None
+    attempt_nonce: Optional[str] = None
+    body_sha256: Optional[str] = None
+    header_names: List[str] = field(default_factory=list)
+    page_generation: Optional[int] = None
+    context_generation: Optional[int] = None
+    cdp_session_generation: Optional[int] = None
+    reserved_at: Optional[float] = None
+    invoked_at: Optional[float] = None
+    route_disposition: Optional[str] = None
+    page_disposition: Optional[str] = None
+    absence_observed: bool = False
+    irreconcilable: bool = False
+    supersedes_unresolved: Optional[str] = None
+    relay_status: Optional[str] = None
+    verified_node_id: Optional[str] = None
+    conversation_digest: Optional[str] = None
+    fulfilled_at: Optional[float] = None
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -196,6 +263,12 @@ class SendIntentLog:
         attempt_id: str,
         prompt_sha: str,
         deadline_at: Optional[float] = None,
+        profile_epoch: Optional[str] = None,
+        mint_id: Optional[str] = None,
+        mint_ordinal: int = 1,
+        relay_token_hash: Optional[str] = None,
+        relay_token_expires_at: Optional[float] = None,
+        supersedes_unresolved: Optional[str] = None,
     ) -> SendIntentRecord:
         """Persist the PENDING intent. Call BEFORE the submit-triggering action.
 
@@ -207,9 +280,226 @@ class SendIntentLog:
             attempt_id=attempt_id,
             prompt_sha=prompt_sha,
             deadline_at=deadline_at,
+            profile_epoch=profile_epoch,
+            mint_id=mint_id,
+            mint_ordinal=mint_ordinal,
+            relay_token_hash=relay_token_hash,
+            relay_token_expires_at=relay_token_expires_at,
+            supersedes_unresolved=supersedes_unresolved,
         )
         self._write(record)
         return record
+
+    def create_locked_attempt(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        prompt_sha: str,
+        deadline_at: float,
+        profile_epoch: str,
+        mint_id: str,
+        mint_ordinal: int,
+        relay_token_hash: str,
+        relay_token_expires_at: float,
+        supersedes_unresolved: Optional[str] = None,
+    ) -> SendIntentRecord:
+        """Atomically persist ``LOCKED`` and the relay-token hash.
+
+        The raw token is deliberately not accepted by this API.  Consequently
+        there is no intermediate row or serializer that can leak it: callers
+        hash first, then receive the value out-of-band exactly once.
+        """
+        if self.path.exists():
+            raise SendIntentViolation(f"attempt {attempt_id} already exists")
+        return self.open_attempt(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            prompt_sha=prompt_sha,
+            deadline_at=deadline_at,
+            profile_epoch=profile_epoch,
+            mint_id=mint_id,
+            mint_ordinal=mint_ordinal,
+            relay_token_hash=relay_token_hash,
+            relay_token_expires_at=relay_token_expires_at,
+            supersedes_unresolved=supersedes_unresolved,
+        )
+
+    def transition(self, state: AttemptState, **fields: Any) -> SendIntentRecord:
+        """Persist one Amendment D state transition.
+
+        Terminal rows are immutable, and a reserved mint can never move back
+        before ``MINT_RESERVED``.  More specific helpers below enforce the
+        transition's required evidence.
+        """
+        rec = self.record
+        if rec.attempt_state in _TERMINAL_ATTEMPT_STATES:
+            raise SendIntentViolation(
+                f"attempt {rec.attempt_id} is terminal at {rec.attempt_state}; transition refused"
+            )
+        for key, value in fields.items():
+            if key not in SendIntentRecord.__dataclass_fields__:
+                raise SendIntentViolation(f"unknown durable field {key!r}")
+            if key == "relay_token_hash" and rec.relay_token_hash not in (None, value):
+                raise SendIntentViolation("relay token hash is immutable")
+            setattr(rec, key, value)
+        rec.attempt_state = state.value
+        self._write(rec)
+        return rec
+
+    def record_send_intent(
+        self,
+        *,
+        conversation_id: Optional[str],
+        current_node: Optional[str],
+        attempt_nonce: str,
+    ) -> SendIntentRecord:
+        """Persist the pre-composer uncertainty boundary (D6)."""
+        if not attempt_nonce:
+            raise SendIntentViolation("SEND_INTENT requires a non-empty attempt nonce")
+        return self.transition(
+            AttemptState.SEND_INTENT,
+            pre_send_conversation_id=conversation_id,
+            pre_send_current_node=current_node,
+            attempt_nonce=attempt_nonce,
+        )
+
+    def record_relay_bound(self, *, subscriber_id: str, bound_at: float) -> SendIntentRecord:
+        """Consume the one relay subscriber; rebinding is never allowed."""
+        rec = self.record
+        if rec.bound_at is not None or rec.subscriber_id is not None:
+            raise SendIntentViolation("relay_already_bound")
+        if rec.skipped_at is not None or rec.reserved_at is not None:
+            raise SendIntentViolation("relay_closed")
+        return self.transition(
+            AttemptState.RELAY_BOUND_OR_SKIPPED,
+            subscriber_id=subscriber_id,
+            bound_at=bound_at,
+        )
+
+    def record_relay_skipped(self, *, skipped_at: float) -> SendIntentRecord:
+        rec = self.record
+        if rec.bound_at is not None:
+            raise SendIntentViolation("bound relay cannot be marked skipped")
+        return self.transition(AttemptState.RELAY_BOUND_OR_SKIPPED, skipped_at=skipped_at)
+
+    def record_request_held(
+        self,
+        *,
+        body_sha256: str,
+        header_names: Sequence[str],
+        page_generation: int,
+        context_generation: int,
+        cdp_session_generation: int,
+    ) -> SendIntentRecord:
+        """Persist only non-secret proof identifying the live holder."""
+        return self.transition(
+            AttemptState.REQUEST_HELD,
+            body_sha256=body_sha256,
+            header_names=sorted({str(name).lower() for name in header_names}),
+            page_generation=page_generation,
+            context_generation=context_generation,
+            cdp_session_generation=cdp_session_generation,
+        )
+
+    def reserve_mint(self, *, reserved_at: Optional[float] = None) -> SendIntentRecord:
+        """Write and fsync the one-way consumption point before network I/O."""
+        rec = self.record
+        if rec.reserved_at is not None or rec.attempt_state in {
+            AttemptState.MINT_RESERVED.value,
+            AttemptState.PYTHON_POST_INVOKED.value,
+            AttemptState.RAW_SSE_RELAY.value,
+            AttemptState.GET_VERIFY.value,
+            AttemptState.BROWSER_FULFIL.value,
+        }:
+            raise SendIntentViolation("mint already reserved/spent; second invocation refused")
+        # ``_write`` fsyncs the file and directory before returning.
+        return self.transition(
+            AttemptState.MINT_RESERVED,
+            reserved_at=time.time() if reserved_at is None else reserved_at,
+        )
+
+    def record_python_post_invoked(self, *, invoked_at: Optional[float] = None) -> SendIntentRecord:
+        rec = self.record
+        if rec.attempt_state != AttemptState.MINT_RESERVED.value or rec.reserved_at is None:
+            raise SendIntentViolation("Python POST requires a fsynced MINT_RESERVED row")
+        if rec.invoked_at is not None:
+            raise SendIntentViolation("mint already invoked; second POST refused")
+        return self.transition(
+            AttemptState.PYTHON_POST_INVOKED,
+            invoked_at=time.time() if invoked_at is None else invoked_at,
+        )
+
+    def record_ack_unknown(
+        self,
+        *,
+        route_disposition: Optional[str],
+        page_disposition: str,
+        absence_observed: bool = False,
+        irreconcilable: bool = False,
+    ) -> SendIntentRecord:
+        if page_disposition not in {"quarantined", "closed", "live"}:
+            raise SendIntentViolation("ACK_UNKNOWN requires a valid page disposition")
+        return self.transition(
+            AttemptState.ACK_UNKNOWN,
+            route_disposition=route_disposition,
+            page_disposition=page_disposition,
+            absence_observed=absence_observed,
+            irreconcilable=irreconcilable,
+        )
+
+    def record_abandoned_pre_invoke(
+        self, *, route_disposition: str, page_disposition: str
+    ) -> SendIntentRecord:
+        if route_disposition != "aborted":
+            raise SendIntentViolation(
+                "ABANDONED_PRE_INVOKE is resend-safe only after holder-owned abort"
+            )
+        if page_disposition not in {"quarantined", "closed"}:
+            raise SendIntentViolation("page must be closed or quarantined before profile release")
+        return self.transition(
+            AttemptState.ABANDONED_PRE_INVOKE,
+            route_disposition=route_disposition,
+            page_disposition=page_disposition,
+        )
+
+    def can_fresh_same_turn_mint(self) -> bool:
+        rec = self.record
+        return (
+            rec.attempt_state == AttemptState.ABANDONED_PRE_INVOKE.value
+            and rec.route_disposition == "aborted"
+            and rec.page_disposition in {"quarantined", "closed"}
+        )
+
+    def restart_action(self) -> str:
+        """Return the D6 recovery action for the current durable row."""
+        state = self.record.attempt_state
+        if state in {
+            AttemptState.LOCKED.value,
+            AttemptState.OWNED_BROWSER_READY.value,
+            AttemptState.CONNECTOR_READY.value,
+            AttemptState.INPUT_READY.value,
+            AttemptState.INTERCEPT_ARMED.value,
+        }:
+            return "restart_from_locked"
+        if state in {
+            AttemptState.SEND_INTENT.value,
+            AttemptState.RELAY_BOUND_OR_SKIPPED.value,
+            AttemptState.COMPOSER_MINT_TRIGGERED.value,
+            AttemptState.REQUEST_HELD.value,
+        }:
+            return "ack_unknown_reconcile_never_mint"
+        if state in {
+            AttemptState.MINT_RESERVED.value,
+            AttemptState.PYTHON_POST_INVOKED.value,
+            AttemptState.RAW_SSE_RELAY.value,
+        }:
+            return "get_reconcile_mint_spent"
+        if state == AttemptState.GET_VERIFY.value:
+            return "resume_get_verify"
+        if state == AttemptState.BROWSER_FULFIL.value:
+            return "reload_compare_never_fulfil"
+        return "terminal"
 
     def load(self) -> Optional[SendIntentRecord]:
         """Re-attach to a record left by a previous process, or None if absent.
@@ -266,6 +556,15 @@ class SendIntentLog:
             )
         rec.state = IntentState.DISPATCHED.value
         rec.submits_dispatched += 1
+        # Amendment D's durable view records that the composer trigger happened;
+        # the legacy ``state`` field remains for AC-20 compatibility.
+        if rec.attempt_state in {
+            AttemptState.LOCKED.value,
+            AttemptState.INTERCEPT_ARMED.value,
+            AttemptState.SEND_INTENT.value,
+            AttemptState.RELAY_BOUND_OR_SKIPPED.value,
+        }:
+            rec.attempt_state = AttemptState.COMPOSER_MINT_TRIGGERED.value
         self._write(rec)
         return rec
 

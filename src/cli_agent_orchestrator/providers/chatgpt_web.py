@@ -26,10 +26,14 @@ or launch. NOT keyed on ``_is_gate_position`` (D15 makes that true for
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,6 +57,20 @@ _RUNNER_DONE = re.compile(r"^\s*\[chatgpt_web\]\s+(FINDINGS-READY|DONE)\b", re.M
 _RUNNER_INVALID = re.compile(r"^\s*\[chatgpt_web\]\s+FINDINGS-INVALID\b", re.MULTILINE)
 _RUNNER_ERROR = re.compile(r"^\s*\[chatgpt_web\]\s+ERROR\b", re.MULTILINE)
 _RUNNER_WAIT = re.compile(r"^\s*\[chatgpt_web\]\s+WAIT_USER\b", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class ChatGptWebAttemptHandle:
+    """Pre-intent handle returned before browser work (D3/AC-27)."""
+
+    attempt_id: str
+    relay_url: str
+    relay_token: str
+    relay_token_expires_at: float
+
+
+def _new_attempt_id() -> str:
+    return secrets.token_urlsafe(18)
 
 
 class ChatGptWebProvider(BaseProvider):
@@ -113,6 +131,60 @@ class ChatGptWebProvider(BaseProvider):
     @property
     def paste_enter_count(self) -> int:
         return 1
+
+    def start_attempt(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        prompt_sha: str = "",
+        deadline_s: float = 1800.0,
+        profile_epoch: str = "",
+        artifacts_dir: Optional[Path] = None,
+        supersedes_unresolved: Optional[str] = None,
+    ) -> ChatGptWebAttemptHandle:
+        """Mint relay token atomically with the pre-intent ``LOCKED`` row.
+
+        Only the SHA-256 token digest is persisted. The clear token is returned
+        in this handle exactly once and is never logged or written to an attempt
+        artifact. The relay registry is process-local and transient by design.
+        """
+        from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+        from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import (
+            get_relay_hub,
+            hash_relay_token,
+        )
+
+        aid = attempt_id or _new_attempt_id()
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + max(1.0, float(deadline_s))
+        root = artifacts_dir or Path(os.environ.get("CAO_ARTIFACTS_DIR") or _RUNTIME_ROOT)
+        intent = SendIntentLog(root / "attempts" / aid)
+        intent.create_locked_attempt(
+            run_id=run_id or aid,
+            attempt_id=aid,
+            prompt_sha=prompt_sha,
+            deadline_at=expires_at,
+            profile_epoch=profile_epoch,
+            mint_id=aid,
+            mint_ordinal=1,
+            relay_token_hash=hash_relay_token(token),
+            relay_token_expires_at=expires_at,
+            supersedes_unresolved=supersedes_unresolved,
+        )
+        get_relay_hub().register(
+            attempt_id=aid,
+            token_hash=hash_relay_token(token),
+            expires_at=expires_at,
+            intent_log=intent,
+        )
+        endpoint = os.environ.get("CAO_ENDPOINT", "http://127.0.0.1:8990").rstrip("/")
+        return ChatGptWebAttemptHandle(
+            attempt_id=aid,
+            relay_url=f"{endpoint}/providers/chatgpt-web/attempts/{aid}/stream",
+            relay_token=token,
+            relay_token_expires_at=expires_at,
+        )
 
     # ── D14 backstop ────────────────────────────────────────────────────────
 

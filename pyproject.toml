@@ -87,6 +87,10 @@ dependencies = [
     "markdown-it-py>=4.0.0",
     # not just a dev dependency — or every `cao` command would fail to import.
     "psutil>=5.9.0,<7",
+    # F862 Amendment D's one-shot origin sender. 0.13.0 is the posture measured
+    # by the pinned browser replay probes; newer impersonation tables are not
+    # silently accepted by this lane without a new live calibration.
+    "curl-cffi==0.13.0",
 ]
 
 [project.optional-dependencies]

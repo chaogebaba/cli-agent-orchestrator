@@ -57,6 +57,7 @@ from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import require_relay_token
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
@@ -2435,6 +2436,25 @@ def _require_agui_enabled() -> None:
 
     if not _agui_enabled():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AG-UI surface disabled")
+
+
+@app.get("/providers/chatgpt-web/attempts/{attempt_id}/stream")
+async def chatgpt_web_attempt_stream(
+    attempt_id: str,
+    # Dependency order is contractual: ordinary CAO auth wins with 401 before
+    # the attempt-scoped relay secret is inspected (Amendment D, AC-27).
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _relay: Any = Depends(require_relay_token),
+):
+    """Relay one origin SSE body byte-for-byte to its sole trusted subscriber."""
+    from fastapi.responses import StreamingResponse
+
+    relay, binding = _relay
+    return StreamingResponse(
+        relay.bytes_for(binding),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/events")
