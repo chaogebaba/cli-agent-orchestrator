@@ -757,6 +757,85 @@ class HerdrBackend(TerminalBackend):
 
     # --- Window/tab lifecycle ---
 
+    def _list_native_records(
+        self, noun: Literal["workspace", "tab", "pane"], key: str
+    ) -> tuple[Literal["ok", "error"], list[dict[str, object]] | None]:
+        """Read one herdr native inventory without collapsing lookup failure."""
+        try:
+            result = self._run_herdr([noun, "list"], check=False)
+            if result.returncode != 0:
+                return ("error", None)
+            data = self._parse_herdr_json(result.stdout)
+            records = data.get(key)
+            if not isinstance(records, list):
+                return ("error", None)
+            return (
+                "ok",
+                [cast(dict[str, object], record) for record in records if isinstance(record, dict)],
+            )
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            AttributeError,
+            TypeError,
+        ):
+            return ("error", None)
+
+    def enumerate_windows(
+        self, session_name: str
+    ) -> tuple[Literal["ok", "error"], List[Dict[str, object]] | None]:
+        """Enumerate tabs that still own a pane in the requested workspace."""
+        state, workspaces = self._list_native_records("workspace", "workspaces")
+        if state == "error" or workspaces is None:
+            return ("error", None)
+
+        workspace_id: str | None = None
+        for workspace in workspaces:
+            if workspace.get("label") == session_name and workspace.get("workspace_id"):
+                workspace_id = str(workspace["workspace_id"])
+                break
+        if workspace_id is None:
+            return ("ok", [])
+
+        state, tabs = self._list_native_records("tab", "tabs")
+        if state == "error" or tabs is None:
+            return ("error", None)
+        state, panes = self._list_native_records("pane", "panes")
+        if state == "error" or panes is None:
+            return ("error", None)
+
+        pane_by_tab: dict[str, str] = {}
+        for pane in panes:
+            tab_id = pane.get("tab_id")
+            pane_id = pane.get("pane_id")
+            if tab_id and pane_id:
+                pane_by_tab.setdefault(str(tab_id), str(pane_id))
+
+        windows: List[Dict[str, object]] = []
+        for tab in tabs:
+            if str(tab.get("workspace_id", "")) != workspace_id:
+                continue
+            tab_id = tab.get("tab_id")
+            label = tab.get("label")
+            pane_id = pane_by_tab.get(str(tab_id)) if tab_id else None
+            if not label or pane_id is None:
+                continue
+            windows.append(
+                {
+                    "name": str(label),
+                    "index": str(len(windows)),
+                    "pane_id": pane_id,
+                }
+            )
+        return ("ok", windows)
+
+    def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
+        """Project the classified native inventory onto the fleet list port."""
+        state, windows = self.enumerate_windows(session_name)
+        return windows if state == "ok" and windows is not None else []
+
     def create_window(
         self,
         session_name: str,
@@ -1705,7 +1784,25 @@ class HerdrBackend(TerminalBackend):
             "foreground process pid"
         )
 
-    def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
+    def _cached_pane_id_if_live(
+        self,
+        terminal_id: str,
+        pane_id: str,
+        session_name: str,
+        window_name: str,
+    ) -> Optional[str]:
+        """Return a cached pane unless the native pane list proves it retired."""
+        state, panes = self._list_native_records("pane", "panes")
+        if state == "error" or panes is None:
+            return pane_id
+        if any(str(pane.get("pane_id", "")) == pane_id for pane in panes):
+            return pane_id
+        self.invalidate_pane(terminal_id, session_name, window_name)
+        return None
+
+    def get_pane_id(
+        self, terminal_id: str, session_name: str = "", window_name: str = ""
+    ) -> Optional[str]:
         """Resolve CAO terminal_id to herdr pane_id.
 
         Prefers the durable ``_pane_id_map`` (rebuilt from ``api snapshot``).
@@ -1741,7 +1838,12 @@ class HerdrBackend(TerminalBackend):
             if (
                 time.time() - self._pane_id_map_ts
             ) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
-                return self._pane_id_map[map_key]
+                return self._cached_pane_id_if_live(
+                    terminal_id,
+                    self._pane_id_map[map_key],
+                    session_name,
+                    window_name,
+                )
             # Map is stale (or a miss). Rebuild, then trust it ONLY if the
             # rebuild succeeded — _refresh_pane_id_map leaves the timestamp
             # untouched on failure, so re-check freshness here. Without this
@@ -1754,7 +1856,12 @@ class HerdrBackend(TerminalBackend):
             if (
                 time.time() - self._pane_id_map_ts
             ) < _PANE_ID_MAP_TTL and map_key in self._pane_id_map:
-                return self._pane_id_map[map_key]
+                return self._cached_pane_id_if_live(
+                    terminal_id,
+                    self._pane_id_map[map_key],
+                    session_name,
+                    window_name,
+                )
 
         # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
@@ -1763,7 +1870,7 @@ class HerdrBackend(TerminalBackend):
             tombstone("TS-0004")
             pane_id, cached_at = self._pane_cache[terminal_id]
             if time.time() - cached_at < _PANE_CACHE_TTL:
-                return pane_id
+                return self._cached_pane_id_if_live(terminal_id, pane_id, session_name, window_name)
         if session_name and window_name:
             from cli_agent_orchestrator.utils.tombstones import tombstone
 

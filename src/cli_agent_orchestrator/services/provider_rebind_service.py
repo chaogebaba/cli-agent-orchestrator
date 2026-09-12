@@ -181,6 +181,10 @@ async def _wait_for_backend_proof(
     pane = backend.get_pane_id(
         terminal_id, metadata["tmux_session"], metadata["tmux_window"]
     )
+    if pane is None:
+        # F996 (#844): get_pane_id refuses a cached id whose native pane is
+        # gone; there is no live pane to prove delivery against.
+        raise RuntimeError("herdr_pane_unresolved")
     before_event_gen = svc.get_native_event_gen(terminal_id, pane)
     if guard is None:
         svc.register_terminal(terminal_id, pane, False)
