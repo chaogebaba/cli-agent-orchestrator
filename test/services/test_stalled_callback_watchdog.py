@@ -1,10 +1,8 @@
 """Stalled-callback watchdog tests — the liveness half, after WP-ARCH 3c K4.
 
 K4 demoted this service to episode bookkeeping plus pane sampling. What is left
-here follows it: the arming and settling of an episode, the poller, the
-fingerprint clocks, and ``emit_pre_delete_notice`` — the one notice path that
-survives. Every arm that observed the watchdog through the deleted stall sweep
-is accounted for in a note where it stood.
+here follows it: arming and settlement, pane resync, question reconciliation,
+and ``emit_pre_delete_notice`` — the one notice path that survives.
 """
 
 from pathlib import Path
@@ -24,10 +22,6 @@ from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCal
 # of completion. There is no due-time capture left to feed. The provider
 # classification they exercised in passing is still covered from a real recorded
 # sample below, in ``test_positive_grok_sample_still_classifies_unknown``.
-
-
-def _mark_screen_sampled(svc, terminal_id="worker1"):
-    svc._episodes[terminal_id].last_screen_fp = "sample"
 
 
 @pytest.fixture(autouse=True)
@@ -106,226 +100,9 @@ def _watchdog_grok_provider() -> GrokCliProvider:
 #     baseline and only treats a LATER difference as movement, which the two
 #     fingerprint arms kept below pin directly on the episode clock.
 #
-# What survives of "did this worker answer" is ``callback_seen``, and it is still
-# read by three live paths — ``poll_unarmed_statuses`` and
-# ``refresh_screen_fingerprints`` skip an episode that has it,
-# ``emit_pre_delete_notice`` returns None on it, and ``_gc_fired_episodes``
-# collects on it. The arms below observe it there instead.
+# What survives of "did this worker answer" is ``callback_seen``. The deletion
+# notice reads it directly and the episode collector uses it after firing.
 # ---------------------------------------------------------------------------
-
-
-def test_watchdog_polls_idle_status_when_no_post_task_status_event():
-    """The poller is the watchdog's only status source when no event arrives.
-
-    WP-ARCH 3c K4 moved where this is observed, not what it asserts. The arm
-    used to read the monitor once and then watch the notice fall due three ticks
-    later; the notice is gone, so it now reads the EFFECT the poll has on the
-    episode. That effect is still load-bearing: ``idle_since`` is one of the
-    three clocks ``refresh_screen_fingerprints`` requires before it will sample
-    a terminal's pane at all, so a poll that fails to record the status leaves
-    the episode invisible to the sampler.
-    """
-    svc = StalledCallbackWatchdog(grace_seconds=3)
-    svc.record_inbound_task("worker1", "caller1", "developer")
-    assert svc._episodes["worker1"].idle_since is None
-
-    with patch(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-        return_value=TerminalStatus.IDLE,
-    ) as mock_get_status:
-        svc.poll_unarmed_statuses(now=10.0)
-
-    mock_get_status.assert_called_once_with("worker1")
-    episode = svc._episodes["worker1"]
-    assert episode.status is TerminalStatus.IDLE
-    assert episode.idle_since == 10.0
-
-
-def test_watchdog_polls_already_idle_episode_and_unarms_when_processing():
-    """A poll that comes back PROCESSING UNARMS an already-idle episode.
-
-    The un-arming is the point, and it survives K4 intact: ``record_status``
-    clears ``idle_since`` and drops the retained fingerprint on any non-terminal
-    status. The arm used to prove it by showing no notice ever fell due; it now
-    reads the cleared clock, which is the state the deleted sweep was reading.
-    """
-    svc = StalledCallbackWatchdog(grace_seconds=3)
-    svc.record_inbound_task("worker1", "caller1", "developer")
-    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
-
-    with patch(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
-        return_value=TerminalStatus.PROCESSING,
-    ) as mock_get_status:
-        svc.poll_unarmed_statuses(now=12.0)
-
-    mock_get_status.assert_called_once_with("worker1")
-    episode = svc._episodes["worker1"]
-    assert episode.status is TerminalStatus.PROCESSING
-    assert episode.idle_since is None
-    assert episode.last_screen_fp is None
-
-
-def test_watchdog_screen_fingerprint_change_resets_idle_timer():
-    """A pane that is still changing restarts the idle clock; a static one does not.
-
-    WP-ARCH 3c K4 renamed this arm (it was
-    ``..._resets_idle_timer_then_static_fires``) because its second half — the
-    notice that fell due once the pane went static — has no code left. The first
-    half is the anti-false-idle rule itself and is untouched by the slice:
-    ``refresh_screen_fingerprints`` takes the first sample as a baseline, treats
-    a LATER difference as movement and restarts whichever clocks are armed, and
-    leaves them alone when the sample repeats. The three ``get_history`` frames
-    are unchanged, so the sampler is driven exactly as before.
-    """
-    svc = StalledCallbackWatchdog(grace_seconds=3)
-    svc.record_inbound_task("worker1", "caller1", "developer")
-    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-
-    backend = MagicMock()
-    backend.get_history.side_effect = ["frame 1", "frame 2", "frame 2"]
-    metadata = {"id": "worker1", "tmux_session": "cao-test", "tmux_window": "win"}
-
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.list_all_terminals",
-            return_value=[metadata],
-        ),
-        patch(
-            "cli_agent_orchestrator.backends.registry.get_backend",
-            return_value=backend,
-        ),
-        patch(
-            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
-            return_value=None,
-        ),
-    ):
-        episode = svc._episodes["worker1"]
-        svc.refresh_screen_fingerprints(now=10.5)
-        # Baseline only: the first sample is not evidence of movement.
-        assert episode.last_screen_fp is not None
-        assert episode.idle_since == 10.0
-
-        svc.refresh_screen_fingerprints(now=12.0)
-        # "frame 2" differs from "frame 1" -> the idle clock restarts.
-        assert episode.idle_since == 12.0
-
-        svc.refresh_screen_fingerprints(now=14.0)
-        # "frame 2" again -> a static pane must NOT restart it.
-        assert episode.idle_since == 12.0
-
-    backend.get_history.assert_any_call(
-        "cao-test",
-        "win",
-        tail_lines=45,
-        strip_escapes=True,
-    )
-
-
-def test_watchdog_excludes_rotating_codex_prompt_from_liveness_fingerprint():
-    svc = StalledCallbackWatchdog(grace_seconds=3)
-    svc.record_inbound_task("worker1", "caller1", "developer")
-    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-
-    backend = MagicMock()
-    backend.get_history.side_effect = [
-        "stable output\n› Summarize recent commits\n? for shortcuts",
-        "stable output\n› Explain this codebase\n? for shortcuts",
-    ]
-    provider = MagicMock()
-    provider.liveness_exclude_patterns = [r"^\s*›", r"\?\s+for shortcuts"]
-    metadata = {"id": "worker1", "tmux_session": "cao-test", "tmux_window": "win"}
-
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.list_all_terminals",
-            return_value=[metadata],
-        ),
-        patch(
-            "cli_agent_orchestrator.backends.registry.get_backend",
-            return_value=backend,
-        ),
-        patch(
-            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
-            return_value=provider,
-        ),
-    ):
-        episode = svc._episodes["worker1"]
-        svc.refresh_screen_fingerprints(now=10.5)
-        svc.refresh_screen_fingerprints(now=12.0)
-
-    # WP-ARCH 3c K4: the arm used to prove the filter worked by showing the
-    # notice still fell due on schedule. The filter is upstream of that and is
-    # untouched — ``_filtered_liveness_tail`` drops the provider's excluded lines
-    # before the fingerprint is taken — so the surviving statement of the same
-    # property is that the rotating prompt did not count as movement and the idle
-    # clock never restarted. If the filter regresses, the second frame differs,
-    # ``idle_since`` becomes 12.0 and this fails.
-    assert episode.idle_since == 10.0
-
-
-def test_watchdog_keeps_spinner_ticks_as_liveness_signal():
-    svc = StalledCallbackWatchdog(grace_seconds=3)
-    svc.record_inbound_task("worker1", "caller1", "developer")
-    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-
-    backend = MagicMock()
-    backend.get_history.side_effect = [
-        "• Working (1s • esc to interrupt)\n› Summarize recent commits\n? for shortcuts",
-        "• Working (2s • esc to interrupt)\n› Explain this codebase\n? for shortcuts",
-    ]
-    provider = MagicMock()
-    provider.liveness_exclude_patterns = [r"^\s*›", r"\?\s+for shortcuts"]
-    metadata = {"id": "worker1", "tmux_session": "cao-test", "tmux_window": "win"}
-
-    with (
-        patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
-            return_value=metadata,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.list_all_terminals",
-            return_value=[metadata],
-        ),
-        patch(
-            "cli_agent_orchestrator.backends.registry.get_backend",
-            return_value=backend,
-        ),
-        patch(
-            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
-            return_value=provider,
-        ),
-    ):
-        episode = svc._episodes["worker1"]
-        svc.refresh_screen_fingerprints(now=10.5)
-        svc.refresh_screen_fingerprints(now=12.0)
-
-    # The counterpart to the arm above, and the reason the filter has to be
-    # narrow: a spinner tick is NOT in the exclude list, so it reaches the
-    # fingerprint and restarts the clock. A filter wide enough to swallow it
-    # would show up here as ``idle_since == 10.0``.
-    assert episode.idle_since == 12.0
 
 
 def test_watchdog_suppresses_notification_after_callback_to_recorded_caller():
@@ -371,7 +148,6 @@ def test_f92_barrier_routed_callback_to_mailbox_suppresses_notification():
     # Arm everything a firing needs, so the empty result below can ONLY be caused
     # by the callback having cleared the episode. Without this the assertion is
     # vacuous -- it passes on an unfixed build because nothing could fire anyway.
-    _mark_screen_sampled(svc)
 
     assert svc._episodes["worker1"].callback_seen is True
     assert _emit_deletion_notice(svc) is None
@@ -389,7 +165,6 @@ def test_f92_fix_does_not_silence_the_genuine_hang_push():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
 
     assert svc._episodes["worker1"].callback_seen is False
     notice = _emit_deletion_notice(svc)
@@ -413,7 +188,6 @@ def test_f92_callback_from_an_unrelated_third_party_still_does_not_clear():
         svc.record_callback_if_to_caller("worker1", "mb_other")
 
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
 
     assert svc._episodes["worker1"].callback_seen is False
     assert _emit_deletion_notice(svc) is not None
@@ -434,7 +208,6 @@ def test_f92_callback_to_new_current_caller_does_not_clear_older_episode():
     assert episode.callback_seen is False, "old caller episode was cleared by new caller callback"
 
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
 
     notice = _emit_deletion_notice(svc)
     assert notice is not None
@@ -517,7 +290,6 @@ def test_watchdog_resets_on_new_task_after_firing():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
 
     first = _emit_deletion_notice(svc)
     assert first is not None and first.source_generation == 1
@@ -530,7 +302,6 @@ def test_watchdog_resets_on_new_task_after_firing():
 
     svc.record_inbound_task("worker1", "caller1", "developer")
     svc.record_status("worker1", TerminalStatus.IDLE, now=20.0)
-    _mark_screen_sampled(svc)
 
     second = _emit_deletion_notice(svc)
     assert second is not None
@@ -550,7 +321,6 @@ def test_caller_messages_replace_fired_episode_with_fresh_alarm():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
-    _mark_screen_sampled(svc)
 
     assert _emit_deletion_notice(svc) is not None
     episode = svc._episodes["worker1"]
@@ -669,14 +439,8 @@ def test_caller_messages_replace_fired_episode_with_fresh_alarm():
 # inbox is the delivery queue's problem now, and the queue's own arms live under
 # ``test/app/delivery/``.
 #
-# Two helpers went with them — ``_waiting_inbox_fakes`` (pending rows, status,
-# auto-responder gate and the grace constant) and ``_relational_watchdog_fakes``
-# / ``_arm_watchdog_episode`` (a live-terminal set plus a patched
-# ``_fresh_frame_decides_running``). READER'S NOTE: K4 leaves
-# ``_fresh_frame_decides_running`` and ``_blockers_locked`` in the service with
-# no caller at all — ``collect_due_notifications`` was the only one. They are
-# dead code in the shipped build, and this file deliberately does not invent
-# coverage for them.
+# Their waiting-inbox and relational fixtures went with them; neither deleted
+# evaluator has a replacement in this service.
 # ---------------------------------------------------------------------------
 
 
@@ -689,8 +453,8 @@ def test_positive_grok_sample_still_classifies_unknown():
     real capture from the 2026-07-20 incident, kept in the fixtures tree
     precisely so a classifier change cannot quietly turn it into a ready prompt.
     The classification is what the whole liveness half of the watchdog reads:
-    ``_fresh_frame_decides_running`` and ``status_monitor.resync_from_pane_tail``
-    both consume it, so UNKNOWN here is the difference between "we do not know"
+    ``status_monitor.resync_from_pane_tail`` consumes it, so UNKNOWN here is the
+    difference between "we do not know"
     and a false IDLE.
 
     The second half of the old arm drove ``collect_due_notifications`` over the

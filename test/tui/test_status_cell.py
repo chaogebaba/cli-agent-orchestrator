@@ -1,10 +1,7 @@
-"""F702 (#557) D4/AC2: table-driven tests for the pure fleet STATUS cell.
+"""Table-driven tests for the pure fleet STATUS cell.
 
-The table covers every ``status`` value and every ``condition`` value the
-server can emit, their cross product, the ``delegating (N)`` and
-``wedge_suspect`` overrides, and the unknown-value fallbacks. Each case asserts
-``.plain`` and ``.style`` (blueprint B12), so mutating one value's glyph fails
-exactly one case.
+The table covers every live status and condition, delegation, and unknown-value
+fallbacks. Retired metadata must not override those live facts.
 """
 
 from __future__ import annotations
@@ -63,7 +60,6 @@ def row(**kw: Any) -> Dict[str, Any]:
         "condition": None,
         "delegating": False,
         "children_count": 0,
-        "wedge_suspect": False,
     }
     base.update(kw)
     return base
@@ -130,7 +126,7 @@ def test_status_with_condition(
         assert cell.style == style
         return
     if condition == "WAITING_ON_SUBAGENTS":
-        # F792 (#649): a calm `· waiting` headline for every non-wedge status,
+        # F792 (#649): a calm `· waiting` headline for every status,
         # never the `⚠ …` headline (see tui/status_cell.py:_WAITING_ON_SUBAGENTS).
         assert cell.plain == "· waiting"
         assert cell.style == cond_style
@@ -232,28 +228,14 @@ def test_transient_overload_headlines_yellow() -> None:
     assert cell.style == "yellow"
 
 
-def test_busy_still_shows_on_a_wedge_row_whose_status_is_not_quiescent() -> None:
-    """A wedge suspect at `unknown` keeps its tag — the fixture row (term-0032)."""
-    cell = status_cell(row(status="unknown", wedge_suspect=True, condition="BUSY"))
-    assert cell.plain == "x WEDGE? [BUSY]"
-    assert cell.style == "bold red"
+def test_retired_wedge_metadata_cannot_override_live_status() -> None:
+    """Mutant: restoring the old wedge branch makes this render ``WEDGE?``."""
+    cell = status_cell(row(status="processing", wedge_suspect=True))
+    assert cell.plain == "● working"
+    assert cell.style == "green"
 
 
 # ─── overrides ────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("status,_plain,_style", STATUS_CASES)
-def test_wedge_suspect_outranks_every_status(status: str, _plain: str, _style: str) -> None:
-    cell = status_cell(row(status=status, wedge_suspect=True))
-    assert cell.plain == "x WEDGE?"
-    assert cell.style == "bold red"
-
-
-@pytest.mark.parametrize("condition,_cond_style", CONDITION_CASES)
-def test_wedge_keeps_its_style_under_any_condition(condition: str, _cond_style: str) -> None:
-    cell = status_cell(row(status="error", wedge_suspect=True, condition=condition))
-    assert cell.plain == f"x WEDGE? [{condition}]"
-    assert cell.style == "bold red"
 
 
 @pytest.mark.parametrize("status", ["idle", "completed"])
@@ -268,11 +250,6 @@ def test_delegating_without_count_renders_zero() -> None:
     assert status_cell(row(delegating=True)).plain == "◇ delegating (0)"
     assert status_cell(row(delegating=True, children_count=None)).plain == "◇ delegating (0)"
     assert status_cell(row(delegating=True, children_count="two")).plain == "◇ delegating (0)"
-
-
-def test_wedge_outranks_delegating() -> None:
-    cell = status_cell(row(delegating=True, children_count=3, wedge_suspect=True))
-    assert cell.plain == "x WEDGE?"
 
 
 def test_delegating_with_condition() -> None:
@@ -379,7 +356,6 @@ TERMINAL_KEYS = {
     "reasoning_effort",
     "reparented_from",
     "config_stale",
-    "wedge_suspect",
 }
 
 
@@ -453,8 +429,8 @@ def test_wake_alarm_fixture() -> None:
         "wake_streak",
     }
     cells = [status_cell(t) for t in data["terminals"]]
-    assert [c.plain for c in cells] == ["◌ idle", "x WEDGE? [BUSY]"]
-    assert [c.style for c in cells] == ["yellow", "bold red"]
+    assert [c.plain for c in cells] == ["◌ idle", "· unknown [BUSY]"]
+    assert [c.style for c in cells] == ["yellow", "green"]
 
 
 def test_empty_session_fixture() -> None:

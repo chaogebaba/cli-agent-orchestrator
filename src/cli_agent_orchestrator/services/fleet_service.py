@@ -177,22 +177,6 @@ def _is_config_stale(row: dict[str, Any], canonical_hash: str | None) -> bool | 
     return stored_hash != canonical_hash
 
 
-def _is_wedge_suspect(row: dict[str, Any]) -> bool | None:
-    """F295 Half 2 AC10: check if a grok_cli terminal is wedge-suspected."""
-    if row.get("provider") != "grok_cli":
-        return None
-    metadata = row.get("metadata")
-    if not isinstance(metadata, dict):
-        return None
-    cao_ns = metadata.get("cao")
-    if not isinstance(cao_ns, dict):
-        return None
-    suspect = cao_ns.get("wedge_suspect")
-    if suspect is True:
-        return True
-    return None
-
-
 def _child_procs(terminal_id: str) -> list[str] | None:
     """F899 (#751): comms of the live tool subprocesses under this pane, or None.
 
@@ -601,8 +585,6 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "reparented_from": row.get("reparented_from"),
                 # F295 AC2: config_stale for grok_cli terminals
                 "config_stale": _is_config_stale(row, grok_canonical_hash),
-                # F295 Half 2 AC10: wedge_suspect for grok_cli terminals
-                "wedge_suspect": _is_wedge_suspect(row),
             }
         )
     # F476 B5-r2: include wake-exhaustion alarms in fleet projection

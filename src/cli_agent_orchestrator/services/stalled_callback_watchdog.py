@@ -5,35 +5,22 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 import re
 import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from cli_agent_orchestrator.clients.database import (
-    DeliveryObligationModel,
-    InboxModel,
-    MailboxModel,
-    SessionLocal,
     _utcnow,
-    cancel_pending_watchdog_message,
-    create_inbox_message,
     get_callback_status_since,
     get_terminal_metadata,
     insert_barrier_escalation_message,
-    list_pending_receiver_ids,
     terminal_exists,
 )
-from cli_agent_orchestrator.constants import (
-    CAO_WAITING_INBOX_GRACE_SECONDS,
-    STALLED_CALLBACK_GRACE_SECONDS,
-    WAITING_INBOX_PUSH_FLOOR_S,
-)
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.constants import STALLED_CALLBACK_GRACE_SECONDS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import receiver_state_view
@@ -41,24 +28,6 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
-WATCHDOG_SCREEN_TAIL_LINES = 45
-WATCHDOG_WAITING_ESCALATE_S = 2 * STALLED_CALLBACK_GRACE_SECONDS
-WATCHDOG_WAITING_REPEAT_FLOOR_S = 600
-# WP-ARCH 3c K4: the auto-resume machinery is gone. It lived inside
-# ``collect_due_notifications`` — the notifier deleted with the five muted ticks
-# — so its provider set, its body text, ``insert_watchdog_auto_resume_message``
-# and the three ``_Episode`` fields that tracked a reservation all lost their
-# only writer at once. The three fields were still READ by the join guard below,
-# which made that branch permanently take its ``None``/``False`` path: a guard
-# that cannot be false is not a guard, and leaving it would have read as one.
-# FX181 D2 row 1: the TERMINAL statuses for the aggregate quiescence predicate,
-# mapped to their message labels. Membership here IS the classification — a status
-# absent from this map is indeterminate and can never contribute to a ring.
-_QUIESCENT_STATUS_LABELS = {
-    TerminalStatus.IDLE: "idle",
-    TerminalStatus.COMPLETED: "completed",
-    TerminalStatus.ERROR: "error",
-}
 
 
 def _filtered_liveness_tail(tail: str, patterns: list[str]) -> str:
@@ -79,37 +48,8 @@ class _Episode:
     last_join_wall_at: datetime | None = None
     callback_seen: bool = False
     fired: bool = False
-    idle_since: float | None = None
-    # FX193 D2: Live terminal status for busy-gating nudge repeats.
-    # Written by record_status(); read by delivery_service._check_safety_gates().
-    status: TerminalStatus = TerminalStatus.UNKNOWN
-    # Fingerprint of the pane's rendered tail, used as a status-independent
-    # liveness signal: a worker whose screen is still changing (spinner ticks,
-    # streaming output) is NOT idle, whatever the status pipeline claims.
-    # Guards against false fires when status detection latches a stale ready
-    # state (observed live: pyte screen divergence latched COMPLETED through
-    # a whole busy codex turn).
-    last_screen_fp: str | None = None
-    # FX181 B1: quiescence-scoped quiet clock. Deliberately SEPARATE from
-    # idle_since: idle_since drives the per-worker stall notice (notify_due),
-    # whose semantics must stay byte-unchanged (AC3), and which treats ERROR as
-    # not-idle. D2 row 1 makes ERROR a TERMINAL state for the aggregate
-    # quiescence predicate, so the quiescence clock runs on IDLE/COMPLETED/ERROR
-    # and is cleared by every other status. Widening idle_since itself would
-    # have made the per-worker notifier fire on ERROR panes.
-    quiet_since: float | None = None
     generation: int = 1
     revision: int = 0
-    waiting_last_push_at: float | None = None
-    # F228-b: processing-no-progress tracker
-    processing_since: float | None = None  # monotonic time PROCESSING was accepted
-    last_np_fp: str | None = None  # last fingerprint taken WHILE processing
-    last_progress_at: float | None = None  # monotonic time of last FP change while processing
-    np_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
-    last_np_hint: str | None = None  # sanitized bounded last-line hint from filtered tail
-    # F295 Half 2 D9: absolute-age wedge arm (grok_cli only)
-    wedge_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
-    wedge_flagged: bool = False  # whether wedge_suspect is currently set
 
 
 @dataclass(frozen=True)
@@ -137,7 +77,6 @@ class StalledCallbackWatchdog:
         self._paused: set[str] = set()
         self._generation_by_terminal: dict[str, int] = {}
         self._callback_fences: dict[str, int] = {}
-        self._chain_notified: set[tuple[str, int, str, int]] = set()
         self._parity_clock = clock
 
     @contextmanager
@@ -168,19 +107,8 @@ class StalledCallbackWatchdog:
             return copy.deepcopy(self._episodes.get(terminal_id)), time.monotonic()
 
     def resume_terminal(self, terminal_id: str, snapshot) -> None:
-        episode, started = snapshot
-        elapsed = time.monotonic() - started
+        episode, _started = snapshot
         with self._lock:
-            if episode is not None and episode.idle_since is not None:
-                episode.idle_since += elapsed
-            # FX181 B1: the quiescence clock is shifted by the same pause span
-            if episode is not None and episode.quiet_since is not None:
-                episode.quiet_since += elapsed
-            # F228-b D4: shift NP clocks by pause duration
-            if episode is not None and episode.processing_since is not None:
-                episode.processing_since += elapsed
-            if episode is not None and episode.last_progress_at is not None:
-                episode.last_progress_at += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -188,20 +116,10 @@ class StalledCallbackWatchdog:
     def repair_terminal_after_resume_failure(self, terminal_id: str, snapshot) -> None:
         """Best-effort, non-raising P14 repair used before releasing quarantine locks."""
         try:
-            episode, started = snapshot
-            elapsed = time.monotonic() - started
+            episode, _started = snapshot
         except Exception:
-            episode, elapsed = None, 0.0
+            episode = None
         with self._lock:
-            if episode is not None and episode.idle_since is not None:
-                episode.idle_since += elapsed
-            if episode is not None and episode.quiet_since is not None:
-                episode.quiet_since += elapsed
-            # F228-b D4: shift NP clocks by pause duration
-            if episode is not None and episode.processing_since is not None:
-                episode.processing_since += elapsed
-            if episode is not None and episode.last_progress_at is not None:
-                episode.last_progress_at += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -316,21 +234,6 @@ class StalledCallbackWatchdog:
             self._episodes.pop(terminal_id, None)
             self._generation_by_terminal.pop(terminal_id, None)
             self._callback_fences.pop(terminal_id, None)
-            self._chain_notified = {
-                key
-                for key in self._chain_notified
-                if key[0] != terminal_id and key[2] != terminal_id
-            }
-
-    def _blockers_locked(self, worker_id: str) -> list[tuple[str, _Episode]]:
-        return [
-            (terminal_id, episode)
-            for terminal_id, episode in self._episodes.items()
-            if episode.caller_id == worker_id
-            and not episode.callback_seen
-            and terminal_id not in self._paused
-            and terminal_exists(terminal_id)
-        ]
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
@@ -358,65 +261,23 @@ class StalledCallbackWatchdog:
         status: TerminalStatus,
         now: float | None = None,
     ) -> None:
-        now = time.monotonic() if now is None else now
+        """Apply the two surviving status-event effects.
+
+        WP-ARCH 3c removed every time-driven episode evaluator, so status,
+        quiet, fingerprint, no-progress and wedge clocks no longer belong on
+        an episode. Status events still collect a settled fired episode and
+        trigger the boundary-pull seam on a consumption boundary.
+        """
+        del now
         with self._lock:
             if terminal_id in self._paused:
                 return
-            episode = self._episodes.get(terminal_id)
-            if episode is None:
+            if terminal_id not in self._episodes:
                 return
-            # FX193 D2: persist status on the episode for safety-gate reads
-            episode.status = status
-            if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
-                if episode.idle_since is None:
-                    episode.idle_since = now
-                    episode.last_screen_fp = None
-            else:
-                episode.idle_since = None
-                episode.last_screen_fp = None
-            # FX181 B1 / D2 row 1: the quiescence quiet clock runs on every
-            # TERMINAL status — IDLE, COMPLETED **and ERROR** — and is cleared by
-            # anything else. Maintained alongside idle_since so notify_due keeps
-            # its exact pre-FX181 semantics (AC3).
-            if status in {
-                TerminalStatus.IDLE,
-                TerminalStatus.COMPLETED,
-                TerminalStatus.ERROR,
-            }:
-                if episode.quiet_since is None:
-                    episode.quiet_since = now
-            else:
-                episode.quiet_since = None
-            # F228-b: track PROCESSING entry/exit for no-progress clock
-            if status == TerminalStatus.PROCESSING:
-                if episode.processing_since is None:
-                    # New uninterrupted processing episode begins
-                    episode.processing_since = now
-                    episode.last_np_fp = None
-                    episode.last_progress_at = None
-                    episode.np_fired_key = None
-                    episode.last_np_hint = None
-            else:
-                # Any non-PROCESSING status ends the uninterrupted processing episode
-                if episode.processing_since is not None:
-                    episode.processing_since = None
-                    episode.last_np_fp = None
-                    episode.last_progress_at = None
-                    episode.np_fired_key = None
-                    episode.last_np_hint = None
-                    # F295 Half 2: clear wedge state on status transition
-                    episode.wedge_flagged = False
-                    episode.wedge_fired_key = None
-            # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
-        # WP-ARCH 3c K7: the FX193 status feed into nudge discipline is gone with
-        # the nudge. There is no scheduled pane nudge to coalesce or cancel.
 
-        # FX194 D1: notify boundary pull service on consumption boundaries
-        # (idle transition = a consumption boundary where pull can deliver)
         if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             try:
-                # Look up the mailbox for this terminal
                 from cli_agent_orchestrator.clients.database import MailboxModel, SessionLocal
                 from cli_agent_orchestrator.services.boundary_pull_service import (
                     boundary_pull_service,
@@ -518,48 +379,25 @@ class StalledCallbackWatchdog:
                 )
 
     def refresh_screen_fingerprints(self, now: float | None = None) -> None:
+        """Sample live panes for resync and question-marker reconciliation.
+
+        The former episode-clock consumers were deleted with their evaluators.
+        This surviving low-frequency sampler has exactly two effects: re-drive
+        status from the retained pane tail and reconcile a durable question
+        marker. It keeps the historical method name because the run loop and
+        simulation driver call that public seam.
+        """
         now = time.monotonic() if now is None else now
-
-        # F506 Fork A pick (i): the sampler widens from "terminals with an armed
-        # episode" to ALL live terminals with a readable pane — the #361 incident
-        # happened with no episode armed, so episode-scoped sampling could never
-        # see it (AC17). The armed-episode set is still tracked separately for the
-        # episode-clock / no-progress bookkeeping below.
-        with self._lock:
-            armed_episode_ids = {
-                terminal_id
-                for terminal_id, episode in self._episodes.items()
-                if terminal_id not in self._paused
-                and not episode.callback_seen
-                and not episode.fired
-                # FX181 S1: an episode is fingerprint-tracked when EITHER clock is
-                # armed. ERROR members carry quiet_since only (idle_since stays
-                # None so notify_due keeps its pre-FX181 semantics, AC3), and
-                # without this they had no anti-false-idle protection at all.
-                # F228-b B1: PROCESSING terminals included for NP fingerprint tracking.
-                and (
-                    episode.idle_since is not None
-                    or episode.quiet_since is not None
-                    or episode.processing_since is not None
-                )
-            }
-
-        # Enumerate the widened set: all live terminals UNION armed episodes.
-        # Failure to enumerate degrades to episode-only (never worse than pre-F506).
         try:
             from cli_agent_orchestrator.clients.database import list_all_terminals
 
-            live_ids = [row["id"] for row in list_all_terminals()]
+            sample_ids = [row["id"] for row in list_all_terminals()]
         except Exception:
             logger.debug("pane sampler: live-terminal enumeration failed", exc_info=True)
-            live_ids = []
-        sample_ids = list(dict.fromkeys([*live_ids, *armed_episode_ids]))
+            sample_ids = []
         if not sample_ids:
             return
 
-        # AC1 / D1: the SINGLE sampler is now pane_liveness.observe — this method
-        # performs no pane capture of its own. observe() owns the one
-        # capture -> filter -> sha256 pipeline (net sampler count stays 1).
         from cli_agent_orchestrator.services.pane_liveness import pane_liveness
         from cli_agent_orchestrator.services.status_monitor import status_monitor
         from cli_agent_orchestrator.utils.herdr_runtime_gate import (
@@ -567,92 +405,15 @@ class StalledCallbackWatchdog:
         )
 
         for terminal_id in sample_ids:
-            # WP-HERDR H1 §8 / F506 Do-NOT #1: a CERTIFIED terminal's lifecycle
-            # comes from the herdr EventSource, and ``observe`` is the tree's one
-            # pane sampler. Registering a certified terminal here would make seam
-            # A a SECOND sampler for the same fact — the exact thing F506 was
-            # built to end (net sampler count stays 1). So the certified cohort
-            # is skipped: no capture, no fingerprint, no resync from the pane
-            # tail. Everything for an uncertified terminal is unchanged.
             if herdr_lifecycle_authoritative(terminal_id):
                 continue
             observation = pane_liveness.observe(terminal_id, now=now, monitor=status_monitor)
             if observation is None:
-                # No usable sample this tick (capture outage / unreadable pane).
-                # Nothing to reconcile — matches the pre-F506 `continue`.
                 continue
-
-            # D15: re-derive from the independent pane sample after a signalled
-            # stream drop, plus the low-frequency PROCESSING/ERROR backstop
-            # (F794 #651 added ERROR). This adds no capture: peek() returns the
-            # tail observe() already retained.
             retained = pane_liveness.peek(terminal_id, now=now)
             if retained is not None:
                 status_monitor.resync_from_pane_tail(terminal_id, retained.filtered_tail, now=now)
-
-            # F507: reconcile the question marker for terminals holding an open
-            # marker or classified WAITING (level-triggered, D9). Cheap and
-            # sampler-independent.
             self._reconcile_question_marker(terminal_id)
-
-            if terminal_id not in armed_episode_ids:
-                continue
-
-            fingerprint = observation.fingerprint
-            fp_changed = observation.fp_changed
-            with self._lock:
-                episode = self._episodes.get(terminal_id)
-                if (
-                    episode is None
-                    or episode.callback_seen
-                    or episode.fired
-                    or (
-                        episode.idle_since is None
-                        and episode.quiet_since is None
-                        and episode.processing_since is None
-                    )
-                ):
-                    continue
-                if episode.last_screen_fp is None:
-                    episode.last_screen_fp = fingerprint
-                elif episode.last_screen_fp != fingerprint:
-                    # A visibly-changing pane restarts whichever clocks are armed.
-                    # idle_since is only restarted, never started: an ERROR pane
-                    # must not become idle-notifiable (AC3).
-                    if episode.idle_since is not None:
-                        episode.idle_since = now
-                    # FX181 B1: the quiescence clock inherits the same
-                    # anti-false-idle reset (AC7)
-                    if episode.quiet_since is not None:
-                        episode.quiet_since = now
-                    episode.last_screen_fp = fingerprint
-
-                # F228-b: update no-progress fingerprint for PROCESSING terminals
-                if episode.processing_since is not None and episode.np_fired_key is None:
-                    # Sanitized hint from the SAME filtered tail (no extra I/O).
-                    hint_lines = [
-                        ln.strip() for ln in observation.filtered_tail.splitlines() if ln.strip()
-                    ]
-                    raw_hint = hint_lines[-1] if hint_lines else ""
-                    # Sanitize: terminal text is untrusted
-                    sanitized_hint = (
-                        raw_hint.replace('"', "'").replace("\n", " ").replace("\r", " ")
-                    )
-                    sanitized_hint = "".join(c if c.isprintable() else "?" for c in sanitized_hint)
-                    if len(sanitized_hint) > 80:
-                        sanitized_hint = sanitized_hint[:77] + "..."
-                    episode.last_np_hint = sanitized_hint if sanitized_hint else None
-
-                    if episode.last_np_fp is None:
-                        # First baseline (AWAITING_BASELINE -> CLOCK_RUNNING)
-                        episode.last_np_fp = fingerprint
-                        episode.last_progress_at = now
-                    elif episode.last_np_fp != fingerprint:
-                        # Progress: screen changed — reset stall clock
-                        episode.last_np_fp = fingerprint
-                        episode.last_progress_at = now
-                    # else: same fingerprint — clock keeps running (no-op)
-            del fp_changed  # bookkeeping uses last_screen_fp deltas directly
 
     def _reconcile_question_marker(self, terminal_id: str) -> None:
         """F507 level-triggered reconcile: run only when there is something to do.
@@ -677,112 +438,6 @@ class StalledCallbackWatchdog:
             question_state.reconcile(terminal_id, metadata)
         except Exception:
             logger.debug("question_marker reconcile failed for %s", terminal_id, exc_info=True)
-
-    def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
-        from cli_agent_orchestrator.backends.registry import get_backend
-        from cli_agent_orchestrator.providers.manager import provider_manager
-        from cli_agent_orchestrator.services.seam_activation import receiver_state_active
-        from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-        try:
-            metadata = get_terminal_metadata(terminal_id)
-            provider = provider_manager.get_provider(terminal_id)
-            if metadata is None or provider is None:
-                return False, None
-            if not receiver_state_active("watchdog.pane_classify"):
-                frame = get_backend().capture_viewport(
-                    metadata["tmux_session"], metadata["tmux_window"]
-                )
-                rows = frame.splitlines()
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    ScreenClassification,
-                    ScreenClassificationResult,
-                    screen_classification_result,
-                )
-
-                if status_monitor._signal_emitting(provider):
-                    classification = screen_classification_result(
-                        provider.emit_screen_signals(rows),
-                        (),
-                        provider.capabilities.liveness_anchor,
-                    )
-                else:
-                    classification = ScreenClassificationResult(
-                        ScreenClassification(
-                            provider.get_status_from_screen(rows), "none", None, None
-                        ),
-                        (),
-                    )
-                idle_reason = provider.classify_idle_reason(rows, classification)
-                return (
-                    classification.status == TerminalStatus.PROCESSING
-                    and classification.provider_signal == "RUNNING_PATTERN",
-                    idle_reason if isinstance(idle_reason, str) else None,
-                )
-            proof = status_monitor.prove_terminal_identity(terminal_id)
-            frame = get_backend().capture_viewport(
-                metadata["tmux_session"], metadata["tmux_window"]
-            )
-            captured_at = time.monotonic()
-            rows = frame.splitlines()
-            if status_monitor._signal_emitting(provider):
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    screen_classification_result,
-                )
-
-                prior = status_monitor.receiver_state_store.prior_classification(
-                    (
-                        terminal_id,
-                        int(metadata["lifecycle_generation"]),
-                        str(metadata["tmux_window"]),
-                    ),
-                    prefer_fresh=True,
-                )
-                classification = screen_classification_result(
-                    provider.emit_screen_signals(rows),
-                    () if prior is None else prior.signals,
-                    provider.capabilities.liveness_anchor,
-                )
-            else:
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    ScreenClassification,
-                    ScreenClassificationResult,
-                )
-
-                legacy_status = provider.get_status_from_screen(rows)
-                classification = ScreenClassificationResult(
-                    ScreenClassification(legacy_status, "none", None, None), ()
-                )
-            token = status_monitor.publish_fresh_observation(
-                terminal_id,
-                rows,
-                captured_at,
-                classification,
-                "fresh_capture",
-                proof,
-            )
-            view = status_monitor.receiver_state_store.snapshot_view(
-                (
-                    terminal_id,
-                    int(metadata["lifecycle_generation"]),
-                    str(metadata["tmux_window"]),
-                ),
-                require_fresh=True,
-                max_age_s=2.0,
-                recovery_state=metadata.get("recovery_state"),
-                token=token,
-            )
-            if view is None or view.raw_classification is None:
-                return False, None
-            classification = view.raw_classification
-            idle_reason = provider.classify_idle_reason(rows, classification)
-            return (
-                classification.status == TerminalStatus.PROCESSING
-                and classification.provider_signal == "RUNNING_PATTERN",
-                idle_reason if isinstance(idle_reason, str) else None,
-            )
-        except Exception:
-            return False, None
 
     @staticmethod
     def _persist_notice(notice: WatchdogNotice) -> None:

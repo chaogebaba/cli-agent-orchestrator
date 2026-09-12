@@ -621,7 +621,7 @@ def sort_terminals(terminals: Sequence[TerminalState]) -> List[TerminalState]:
 def status_row(term: TerminalState) -> Mapping[str, Any]:
     """The row mapping :func:`status_cell` reads, projected from a `TerminalState`.
 
-    Deliberately narrow: `status_cell` is documented to read exactly these five
+    Deliberately narrow: `status_cell` is documented to read exactly these four
     keys, and building the projection by hand keeps ``TerminalState.extra``
     (a read-only mapping) out of a deep copy.
     """
@@ -630,7 +630,6 @@ def status_row(term: TerminalState) -> Mapping[str, Any]:
         "condition": term.condition,
         "delegating": term.delegating,
         "children_count": term.children_count,
-        "wedge_suspect": term.wedge_suspect,
     }
 
 

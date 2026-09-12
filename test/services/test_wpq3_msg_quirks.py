@@ -365,7 +365,6 @@ def _armed(provider="codex"):
     service = StalledCallbackWatchdog(grace_seconds=3)
     service.record_inbound_task("worker", "caller", "developer")
     service.record_status("worker", TerminalStatus.IDLE, now=10.0)
-    service._episodes["worker"].last_screen_fp = "stable"
     metadata = {
         "id": "worker",
         "caller_id": "caller",
@@ -490,7 +489,6 @@ def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):
         episode.inbound_at,
         episode.episode_started_wall_at,
         episode.last_join_wall_at,
-        episode.idle_since,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog",
@@ -516,7 +514,6 @@ def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):
         current.inbound_at,
         current.episode_started_wall_at,
         current.last_join_wall_at,
-        current.idle_since,
     ) == before
 
 

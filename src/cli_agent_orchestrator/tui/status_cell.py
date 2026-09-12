@@ -1,52 +1,7 @@
-"""F702 (#557) D4: the fleet STATUS cell, as one pure function.
+"""Pure renderer for one fleet STATUS cell.
 
-:func:`status_cell` maps a single terminal row of the ``build_fleet()``
-projection (``services/fleet_service.py:236-272``) to one
-:class:`rich.text.Text` carrying glyph, text, and style together. It is the
-object the ``DataTable`` stores, so ``get_cell_at(...)`` returns it and tests
-assert ``.plain`` and ``.style`` (blueprint B12).
-
-**Pure.** No I/O, no clock, no cross-fetch state (D2): the same row always
-renders the same cell. Nothing here raises — an unrecognised ``status`` or
-``condition`` renders visibly as ``? <value>`` rather than blowing up a table
-refresh.
-
-Vocabulary covered, enumerated from the server:
-
-* ``status`` — every :class:`~cli_agent_orchestrator.models.terminal.TerminalStatus`
-  value (``models/terminal.py:23-32``): ``unknown``, ``idle``, ``processing``,
-  ``completed``, ``waiting_user_answer``, ``render_uncertain``, ``error``.
-* ``condition`` — the F611 (#467) fleet labels published by
-  ``ConditionDelivery._fleet_label`` (``providers/condition.py:743-752``):
-  ``CAPPED``, ``BLOCKED`` (from ``DIALOG_BLOCKED``), ``AUTH`` (from
-  ``AUTH_EXPIRED``), and the remaining
-  :class:`~cli_agent_orchestrator.providers.condition.ConditionKind` values
-  verbatim — ``NET_INTERRUPTED``, ``CONTEXT_EXHAUSTED``, ``PROC_EXITED``,
-  ``TRANSIENT_OVERLOAD``, ``BUSY``. ``None`` means no condition. The two raw
-  kinds that the label mapping rewrites are accepted defensively as well.
-  F752 (#609): a ``BUSY`` label is DROPPED on an ``idle``/``completed`` row —
-  the two halves contradict, and the cell never renders a contradiction.
-* ``delegating`` / ``children_count`` — F568 D12c: an IDLE/COMPLETED seat with
-  children in flight renders ``delegating (N)``.
-* ``wedge_suspect`` — F295 Half 2 AC10.
-
-Parity with the retiring stdlib script (root repo ``scripts/fleet-tui.py:229-242``)
-is held on the **glyph and colour** of every ``status`` value and of
-``wedge_suspect``. One deliberate divergence: that script truncates the status
-name to eight characters (``f"· {st[:8]}"``) because it draws fixed-width ANSI,
-which renders ``render_uncertain`` as ``render_u``. A ``DataTable`` sizes its own
-columns, so the full value is written here.
-
-``fusion_changed`` is **not** rendered in this cell — D3 gives it its own ``*``
-column.
-
-**F777 (#634) scope add — a typed condition headlines the cell.** A non-BUSY
-condition (already confidence-filtered to high/medium by the delivery seam)
-replaces the bare status word: ``⚠ CAPPED (completed)`` instead of
-``· completed [CAPPED]``, styled by the condition. The raw status word is kept
-as a dim parenthetical (and remains in the COND column / peek detail). BUSY is
-the exception — it asserts live work, so it stays a dim ``[BUSY]`` tag on the
-status word. ``wedge_suspect`` still outranks any condition.
+The cell renders live status, delegation and typed conditions from the current
+fleet projection. Unknown values remain visible rather than breaking refresh.
 """
 
 from __future__ import annotations
@@ -56,7 +11,6 @@ from typing import Any, Dict, Final, Mapping, Tuple
 from rich.text import Text
 
 # ─── Styles ported from scripts/fleet-tui.py:229-242 ──────────────────────────
-STYLE_WEDGE: Final[str] = "bold red"
 STYLE_WORKING: Final[str] = "green"
 STYLE_WAITING: Final[str] = "yellow"
 STYLE_QUIET: Final[str] = "dim"
@@ -168,13 +122,10 @@ _WAITING_ON_SUBAGENTS_CELL: Final[Tuple[str, str]] = ("· waiting", STYLE_WAITIN
 def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
     """The status half of the cell: (text, style), before any condition suffix.
 
-    Precedence: ``wedge_suspect`` (the script checks it first and it outranks
-    every status), then ``delegating`` (F568 D12c — the server has already
+    Precedence: ``delegating`` (F568 D12c — the server has already
     restricted it to IDLE/COMPLETED seats with children, so this branch never
     hides a working or errored seat), then the status vocabulary.
     """
-    if row.get("wedge_suspect"):
-        return "x WEDGE?", STYLE_WEDGE
     if row.get("delegating"):
         count = row.get("children_count")
         n = count if isinstance(count, int) and not isinstance(count, bool) else 0
@@ -192,8 +143,8 @@ def _base_cell(row: Mapping[str, Any]) -> Tuple[str, str]:
 def _contradicts_status(raw_status: Any, raw_condition: Any) -> bool:
     """True when the condition claims live work but the status says otherwise.
 
-    Read off the row's raw ``status``, not the rendered cell: ``wedge_suspect``
-    and ``delegating`` rewrite the text but not the underlying status, and a
+    Read off the row's raw ``status``, not the rendered cell: ``delegating``
+    rewrites the text but not the underlying status, and a
     delegating seat is IDLE/COMPLETED by construction — its stale ``BUSY`` is
     exactly as wrong there as on a plain idle row.
     """
@@ -205,8 +156,8 @@ def _contradicts_status(raw_status: Any, raw_condition: Any) -> bool:
 def _raw_status_word(row: Mapping[str, Any]) -> str:
     """The bare status word for a headlined condition's ``(…)`` parenthetical.
 
-    Always the row's underlying ``status`` (never the ``delegating``/
-    ``wedge_suspect`` rewrite), because that is the raw status the operator
+    Always the row's underlying ``status`` (never the ``delegating`` rewrite),
+    because that is the raw status the operator
     wants preserved when a condition takes the headline. Unknown/empty status
     falls back to the raw string so nothing is silently dropped.
     """
@@ -222,8 +173,8 @@ def status_cell(row: Mapping[str, Any]) -> Text:
 
     Args:
         row: one entry of the ``terminals`` list from ``build_fleet()``. Only
-            ``status``, ``condition``, ``delegating``, ``children_count`` and
-            ``wedge_suspect`` are read; every key is optional and any value may
+            ``status``, ``condition``, ``delegating`` and ``children_count``
+            are read; every key is optional and any value may
             be of an unexpected type.
 
     Returns:
@@ -233,9 +184,8 @@ def status_cell(row: Mapping[str, Any]) -> Text:
     F777 (#634) scope add: a typed, non-BUSY condition HEADLINES the cell —
     ``⚠ CAPPED (completed)`` rather than ``· completed [CAPPED]`` — styled by
     the condition, with the raw status word kept as a dim parenthetical. BUSY
-    stays a dim ``[BUSY]`` suffix tag on the status word (it asserts live work,
-    not a stall). ``wedge_suspect`` still outranks any condition and keeps its
-    own style/label with the condition as a tag.
+    stays a dim ``[BUSY]`` suffix tag on the status word because it asserts
+    live work rather than an actionable stall.
     """
     text, style = _base_cell(row)
     raw_condition = row.get("condition")
@@ -245,21 +195,18 @@ def status_cell(row: Mapping[str, Any]) -> Text:
         return Text(text, style=style)
 
     # F792 (#649): the waiting-on-subagents condition renders as a calm
-    # `· waiting` headline (never `⚠`, never a `[TAG]` suffix) — unless a wedge
-    # is present, which outranks every condition and keeps its own headline.
-    if str(raw_condition) == _WAITING_ON_SUBAGENTS and style != STYLE_WEDGE:
+    # `· waiting` headline (never `⚠`, never a `[TAG]` suffix).
+    if str(raw_condition) == _WAITING_ON_SUBAGENTS:
         wait_text, wait_style = _WAITING_ON_SUBAGENTS_CELL
         return Text(wait_text, style=wait_style)
 
     condition = str(raw_condition)
     condition_style = _CONDITION_STYLES.get(condition)
-    is_wedge = style == STYLE_WEDGE
     tag_only = condition in _TAG_ONLY_CONDITIONS
 
-    # BUSY (and any wedge row) keep the status word and append the tag — a wedge
-    # is the loudest signal on the row and never yields its headline, and BUSY
-    # is live work rather than an actionable stall.
-    if tag_only or is_wedge:
+    # BUSY keeps the status word and appends the tag because it is live work
+    # rather than an actionable stall.
+    if tag_only:
         if condition_style is None:
             suffix = f" [? {condition}]"
             cell_style = STYLE_UNKNOWN_VALUE
@@ -268,8 +215,7 @@ def status_cell(row: Mapping[str, Any]) -> Text:
             cell_style = condition_style
         base_length = len(text)
         text = f"{text}{suffix}"
-        # A wedge keeps its own style; otherwise the condition owns it.
-        cell = Text(text, style=STYLE_WEDGE if is_wedge else cell_style)
+        cell = Text(text, style=cell_style)
         if condition in _QUIET_CONDITION_TAGS:
             cell.stylize(STYLE_QUIET_TAG, base_length, len(text))
         return cell

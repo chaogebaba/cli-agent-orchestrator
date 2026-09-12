@@ -664,7 +664,6 @@ def test_wpm1_watchdog_notice_uses_episode_scoped_inflight_query(wpm1_db):
     watchdog.record_inbound_task("sender", "receiver", "developer")
     _ambiguous(sender="sender", receiver="receiver")
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
-    watchdog._episodes["sender"].last_screen_fp = "stable"
     assert watchdog.emit_pre_delete_notice("sender") is None
     assert not watchdog._episodes["sender"].fired
 
@@ -675,7 +674,6 @@ def test_wpm1_watchdog_pending_callback_failure_transition_fires_once(wpm1_db, f
     watchdog.record_inbound_task("sender", "receiver", "developer")
     message = create_inbox_message("sender", "receiver", "callback")
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
-    watchdog._episodes["sender"].last_screen_fp = "stable"
 
     assert watchdog.emit_pre_delete_notice("sender") is None
     episode = watchdog._episodes["sender"]
@@ -705,7 +703,6 @@ def test_wpm1_watchdog_terminal_failure_only_callback_fires_once(wpm1_db, failur
     with wpm1_db.begin() as db:
         db.get(InboxModel, message.id).status = failure_status.value
     watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
-    watchdog._episodes["sender"].last_screen_fp = "stable"
 
     assert watchdog.emit_pre_delete_notice("sender") is not None
     assert watchdog.emit_pre_delete_notice("sender") is None

@@ -23,8 +23,7 @@
       "resolved_model": "claude-opus-5",
       "reasoning_effort": "high",
       "reparented_from": null,
-      "config_stale": false,
-      "wedge_suspect": false
+      "config_stale": false
     },
     {
       "id": "term-0022",
@@ -48,8 +47,7 @@
       "resolved_model": "gpt-5.1-codex",
       "reasoning_effort": "high",
       "reparented_from": null,
-      "config_stale": false,
-      "wedge_suspect": false
+      "config_stale": false
     },
     {
       "id": "term-0023",
@@ -73,8 +71,7 @@
       "resolved_model": "kiro-default",
       "reasoning_effort": null,
       "reparented_from": null,
-      "config_stale": false,
-      "wedge_suspect": false
+      "config_stale": false
     }
   ],
   "wake_exhaustion_alarms": []

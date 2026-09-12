@@ -9,7 +9,7 @@ no payload, because the case they describe is "the fetch produced nothing".
 | `healthy.json` | supervisor plus a working and a completed worker |
 | `error_latched.json` | #439 shape: `status="error"` while `init_state`/`init_health` stayed `ready`; one of the two also carries `condition="CAPPED"` |
 | `delegating.json` | F568 D12c: an idle seat with `delegating=true`, `children_count=2`, and its two working children |
-| `wake_alarm.json` | non-empty `wake_exhaustion_alarms`, plus a `wedge_suspect` + `config_stale` worker |
+| `wake_alarm.json` | non-empty `wake_exhaustion_alarms`, plus a `config_stale` worker |
 | `empty_session.json` | a session with no terminals |
 | `fetch_timeout.json` | marker: the fetch timed out after two consecutive failures; no payload |
 | `never_fetched.json` | marker: app start, nothing has arrived yet; no payload |
@@ -22,7 +22,7 @@ A payload fixture is exactly what `GET /sessions/<name>/fleet` returns
 `id`, `profile`, `provider`, `window_index`, `window_name`, `parent_id`, `depth`,
 `orphan`, `status`, `condition`, `fusion_changed`, `fusion_reason`, `delegating`,
 `children_count`, `init_state`, `init_health`, `since_last_input`, `lifecycle`,
-`resolved_model`, `reparented_from`, `config_stale`, `wedge_suspect`.
+`resolved_model`, `reparented_from`, `config_stale`.
 `test/tui/test_status_cell.py` asserts that key set, so a server-side projection
 change that adds or drops a key fails here first.
 

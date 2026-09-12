@@ -23,8 +23,7 @@
       "resolved_model": "claude-opus-5",
       "reasoning_effort": "high",
       "reparented_from": null,
-      "config_stale": false,
-      "wedge_suspect": false
+      "config_stale": false
     },
     {
       "id": "term-0032",
@@ -48,8 +47,7 @@
       "resolved_model": "cline-pass/glm-5.3",
       "reasoning_effort": "high",
       "reparented_from": null,
-      "config_stale": true,
-      "wedge_suspect": true
+      "config_stale": true
     }
   ],
   "wake_exhaustion_alarms": [

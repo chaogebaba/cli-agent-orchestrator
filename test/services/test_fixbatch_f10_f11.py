@@ -292,8 +292,6 @@ def test_f11_refresh_keeps_existing_episode_unchanged(monkeypatch, send_environm
         with watcher._lock:
             episode = watcher._episodes["base-source"]
             episode.callback_seen = callback_seen
-            episode.idle_since = 0.0
-            episode.last_screen_fp = "stable"
 
         terminals.send_input(
             "base-source",

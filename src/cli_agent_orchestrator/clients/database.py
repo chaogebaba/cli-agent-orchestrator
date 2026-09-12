@@ -74,14 +74,6 @@ _ImmediateResult = TypeVar("_ImmediateResult")
 
 
 @dataclass(frozen=True)
-class ReadyBacklogObservation:
-    receiver_id: str
-    oldest_message_id: int
-    oldest_pending_age_seconds: float
-    has_open_delivering_attempt: bool
-    attempt_fingerprint: tuple[int, datetime | None, datetime | None, datetime | None]
-
-
 class NoticeInsertOutcome(str, Enum):
     INSERTED = "inserted"
     FAILED_BEFORE_COMMIT = "failed_before_commit"
@@ -9475,75 +9467,6 @@ def list_pending_receiver_ids() -> List[str]:
         return [row[0] for row in rows]
 
 
-def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
-    """Snapshot pending backlogs and delivery-attempt progress in one DB session."""
-    with SessionLocal() as db:
-        pending = (
-            db.query(InboxModel)
-            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
-            .filter(InboxModel.status == MessageStatus.PENDING.value)
-            .order_by(InboxModel.receiver_id, InboxModel.created_at, InboxModel.id)
-            .all()
-        )
-        oldest_by_receiver: dict[str, InboxModel] = {}
-        for message in pending:
-            oldest_by_receiver.setdefault(message.receiver_id, message)
-        if not oldest_by_receiver:
-            return []
-
-        receiver_ids = list(oldest_by_receiver)
-        attempts = (
-            db.query(InboxDeliveryAttemptModel)
-            .filter(InboxDeliveryAttemptModel.receiver_terminal_id.in_(receiver_ids))
-            .all()
-        )
-        progress: dict[str, tuple[int, datetime | None, datetime | None, datetime | None, bool]] = (
-            {}
-        )
-
-        def latest(left: datetime | None, right: datetime | None) -> datetime | None:
-            if left is None:
-                return right
-            if right is None:
-                return left
-            return max(left, right)
-
-        for attempt in attempts:
-            receiver_id = cast(str, attempt.receiver_terminal_id)
-            count, started, settled, last, has_open = progress.get(
-                receiver_id, (0, None, None, None, False)
-            )
-            attempt_started = cast(datetime, attempt.started_at)
-            attempt_settled = cast(datetime | None, attempt.settled_at)
-            attempt_last = cast(datetime, attempt.last_at)
-            progress[receiver_id] = (
-                count + 1,
-                latest(started, attempt_started),
-                latest(settled, attempt_settled),
-                latest(last, attempt_last),
-                has_open or attempt_settled is None,
-            )
-
-        now = _utcnow()
-        result = []
-        for receiver_id, oldest in oldest_by_receiver.items():
-            count, started, settled, last, has_open = progress.get(
-                receiver_id, (0, None, None, None, False)
-            )
-            result.append(
-                ReadyBacklogObservation(
-                    receiver_id=receiver_id,
-                    oldest_message_id=oldest.id,
-                    oldest_pending_age_seconds=max(
-                        0.0, (now - _as_utc(oldest.created_at)).total_seconds()
-                    ),
-                    has_open_delivering_attempt=has_open,
-                    attempt_fingerprint=(count, started, settled, last),
-                )
-            )
-        return result
-
-
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata and its warm intent through the universal seam."""
     # cast: the result widened to Dict[str, Any] when F631 added `resume_key`.
@@ -11139,28 +11062,6 @@ def insert_watchdog_auto_resume_message(terminal_id: str, message: str) -> Watch
         return WatchdogInsertResult("uncertain" if commit_started else "failed_before_commit")
     finally:
         db.close()
-
-
-def cancel_pending_watchdog_message(message_id: int, terminal_id: str) -> bool:
-    """Cancel exactly one still-pending auto-resume row by guarded CAS."""
-    with SessionLocal.begin() as db:
-        changed = (
-            db.query(InboxModel)
-            .filter(
-                InboxModel.id == message_id,
-                InboxModel.sender_id == f"watchdog:{terminal_id}",
-                InboxModel.receiver_id == terminal_id,
-                InboxModel.status == MessageStatus.PENDING.value,
-            )
-            .update(
-                {
-                    InboxModel.status: MessageStatus.CANCELLED.value,
-                    InboxModel.failure_reason: "auto_resume_superseded",
-                },
-                synchronize_session=False,
-            )
-        )
-        return changed == 1
 
 
 def insert_identity_authority_notice(

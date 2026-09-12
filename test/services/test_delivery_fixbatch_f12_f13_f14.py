@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,13 +16,10 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
-    InboxDeliveryAttemptModel,
-    InboxModel,
     begin_delivery_attempt,
     begin_delivery_attempt_if_no_other_delivering,
     create_inbox_message,
     get_message_trace,
-    list_ready_backlog_observations,
     make_admission_proof,
     settle_delivery_attempt,
 )
@@ -472,56 +468,3 @@ def test_f14_three_ambiguities_atomically_block_fourth_tagged_open(delivery_db):
     )
     assert fourth.kind == "stale_admission"
     assert len(get_message_trace(message.id)["attempts"]) == 3
-
-
-# ---------------------------------------------------------------------------
-# F13/F353 ready-backlog ALERT arms -- REMOVED by WP-ARCH 3c K4.
-#
-# Four arms stood here, all driving ``StalledCallbackWatchdog.tick_ready_backlog``:
-#
-#   * ``test_f13_ready_backlog_alert_once_and_never_retries_receiver`` -- the
-#     alert composes once per receiver past its grace and never re-fires for the
-#     same receiver;
-#   * ``test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock``
-#     -- an open delivering attempt suppresses the alert, and a fingerprint change
-#     (progress) restarts the grace clock;
-#   * ``test_f353_ready_backlog_no_alert_when_delivery_busy_gate_says_busy`` and
-#     ``test_f353_ready_backlog_alert_fires_when_deliverable_and_unattempted`` --
-#     the F353 busy gate, read through ``get_boundary_observation``, decides
-#     between silence and an alert.
-#
-# K4 deletes ``tick_ready_backlog`` with the other four muted ticks and takes
-# ``collect_due_notifications``/``_push_notice`` -- the composer every one of
-# these arms observed through -- with it. Nothing here survives the cut: the
-# grace clock, the once-per-receiver dedup key and the busy gate were all fields
-# and branches INSIDE the deleted tick, not shared helpers it called.
-#
-# What does survive is the OBSERVATION the tick consumed, and the arm below keeps
-# pinning it: ``list_ready_backlog_observations`` still reports the receiver, the
-# oldest pending row, its age, whether an attempt is open, and the coalescing
-# fingerprint. That is the half with a live reader today -- the delivery tick's
-# adoption pass (``test/app/delivery/test_adoption.py``) is what acts on a
-# stranded PENDING row now, and it acts by adopting the row rather than by
-# alerting a caller about it.
-#
-# ``_backlog_observation`` and ``_boundary_observation`` went with the arms. The
-# surviving arm builds real rows through ``begin_delivery_attempt`` rather than
-# stubbing an observation, so it never needed either.
-# ---------------------------------------------------------------------------
-
-
-def test_f13_backlog_fingerprint_observes_coalesced_deferred_last_at(delivery_db):
-    message = create_inbox_message("sender", "receiver", "payload")
-    first = begin_delivery_attempt([message], "receiver", "grok_cli", "same", 4)
-    settle_delivery_attempt(first, MessageStatus.PENDING, "deferred", reason="delivery_deferred")
-    before = list_ready_backlog_observations()[0].attempt_fingerprint
-    time.sleep(0.001)
-    second = begin_delivery_attempt([message], "receiver", "grok_cli", "same", 4)
-    settle_delivery_attempt(second, MessageStatus.PENDING, "deferred", reason="delivery_deferred")
-    after = list_ready_backlog_observations()[0].attempt_fingerprint
-
-    assert before[:3] == after[:3]
-    assert before[3] != after[3]
-    with delivery_db() as db:
-        assert db.query(InboxDeliveryAttemptModel).count() == 1
-        assert db.get(InboxModel, message.id).status == MessageStatus.PENDING.value

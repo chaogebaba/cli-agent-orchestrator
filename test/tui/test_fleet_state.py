@@ -31,7 +31,6 @@ RAW = {
             "resolved_model": "opus",
             "reparented_from": None,
             "config_stale": False,
-            "wedge_suspect": False,
         }
     ],
     "wake_exhaustion_alarms": [{"mailbox_id": 7, "wake_streak": 4}],
@@ -52,7 +51,7 @@ def test_from_dict_types_every_terminal_key() -> None:
     assert (row.init_state, row.init_health) == ("ready", "healthy")
     assert row.since_last_input == 12.5
     assert (row.lifecycle, row.resolved_model, row.reparented_from) == ("durable", "opus", None)
-    assert (row.config_stale, row.wedge_suspect) == (False, False)
+    assert row.config_stale is False
     assert state.wake_exhaustion_alarms[0]["wake_streak"] == 4
 
 
@@ -149,7 +148,6 @@ def test_window_index_accepts_the_stringified_shape_the_server_sends() -> None:
     assert TerminalState.from_dict({"id": "a"}).window_index is None
 
 
-
 def test_terminal_error_is_a_typed_first_class_key() -> None:
     """F789 (#646): terminal_error round-trips as a typed field, not `extra`."""
     from cli_agent_orchestrator.tui.fleet_state import TerminalState
@@ -162,3 +160,15 @@ def test_terminal_error_is_a_typed_first_class_key() -> None:
     assert TerminalState.from_dict({"id": "t1"}).terminal_error is None
     # Non-string → coerced to None by _as_opt_str's contract path.
     assert TerminalState.from_dict({"id": "t1", "terminal_error": None}).terminal_error is None
+
+
+def test_retired_wedge_wire_value_cannot_override_live_status() -> None:
+    from cli_agent_orchestrator.tui.fleet_app import status_row
+    from cli_agent_orchestrator.tui.status_cell import status_cell
+
+    raw = {"id": "t1", "status": "processing", "wedge_suspect": True}
+    row = TerminalState.from_dict(raw)
+
+    assert row.extra["wedge_suspect"] is True
+    assert not hasattr(row, "wedge_suspect")
+    assert status_cell(status_row(row)).plain == "● working"

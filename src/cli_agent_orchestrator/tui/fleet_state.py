@@ -51,7 +51,6 @@ _TERMINAL_KEYS: frozenset[str] = frozenset(
         "effort_obs",
         "reparented_from",
         "config_stale",
-        "wedge_suspect",
     }
 )
 
@@ -168,7 +167,6 @@ class TerminalState:
     effort_obs: Mapping[str, Any] | None = None
     reparented_from: str | None = None
     config_stale: bool = False
-    wedge_suspect: bool = False
     extra: Mapping[str, Any] = field(default=_EMPTY_MAP)
 
     @classmethod
@@ -201,7 +199,6 @@ class TerminalState:
             effort_obs=_as_obs_map(raw.get("effort_obs")),
             reparented_from=_as_opt_str(raw.get("reparented_from")),
             config_stale=bool(raw.get("config_stale")),
-            wedge_suspect=bool(raw.get("wedge_suspect")),
             extra=MappingProxyType(extra) if extra else _EMPTY_MAP,
         )
 

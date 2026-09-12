@@ -555,7 +555,6 @@ def _capped_codex_payload() -> Dict[str, Any]:
                 "reasoning_effort": "high",
                 "reparented_from": None,
                 "config_stale": False,
-                "wedge_suspect": False,
             }
         ],
         "wake_exhaustion_alarms": [],
@@ -613,8 +612,8 @@ async def test_error_latched_and_wake_alarm_fixtures_render_their_named_values(
     async with app2.run_test() as pilot:
         await settle(pilot, feed2)
         status = PARITY_VIEW.index("STATUS")
-        assert plain(app2.table, 1, status) == "x WEDGE? [BUSY]"
-        assert cell(app2.table, 1, status).style == "bold red"
+        assert plain(app2.table, 1, status) == "· unknown [BUSY]"
+        assert cell(app2.table, 1, status).style == "green"
         assert len(app2.state.wake_exhaustion_alarms) >= 1
 
 

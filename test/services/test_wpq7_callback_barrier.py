@@ -452,7 +452,6 @@ def test_f92_digested_callback_durably_suppresses_when_recorder_missed(barrier_d
     # durable inbox must still be enough to suppress the loss notice and leave
     # the episode un-fired.
     watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
-    episode.last_screen_fp = "sample"
     assert watchdog.emit_pre_delete_notice("worker-a") is None
     assert not episode.fired
 
@@ -472,7 +471,6 @@ def test_f92_combined_partial_barrier_row_does_not_clear_missing_worker(barrier_
 
     episode = watchdog._episodes["worker-b"]
     watchdog.record_status("worker-b", TerminalStatus.IDLE, now=10.0)
-    episode.last_screen_fp = "sample"
 
     # WP-ARCH 3c K4: the observation point is ``emit_pre_delete_notice``, the
     # notice emitter that survives K4's cut of the tick-driven half. Both halves
@@ -480,8 +478,7 @@ def test_f92_combined_partial_barrier_row_does_not_clear_missing_worker(barrier_
     # that fired at 1/2 must NOT be mistaken for worker-b's own callback
     # (``callback_seen`` stays False), and BECAUSE it is not, worker-b is still
     # owed a notice — the emitter returns one naming worker-b rather than
-    # returning None. The ``_fresh_frame_decides_running`` stub went with the tick
-    # that consulted it; the deletion path takes no screen sample.
+    # returning None. The deletion path takes no screen sample.
     notice = watchdog.emit_pre_delete_notice("worker-b")
 
     assert notice is not None
