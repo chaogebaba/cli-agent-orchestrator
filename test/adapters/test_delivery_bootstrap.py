@@ -20,10 +20,12 @@ Three switch criteria live here:
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from test.adapters.conftest import TEST_BUSY_TIMEOUT_MS, FakeClock
+from unittest.mock import patch
 
 import pytest
 
@@ -432,3 +434,39 @@ async def test_no_live_subsystem_in_bootstrap_calls_itself_shadow() -> None:
         "bootstrap.py describes a subsystem as 'shadow'; if it is merely not "
         "wired to the supervisor loop, say that instead (#738):\n" + "\n".join(offenders)
     )
+
+
+async def test_a_refused_queue_write_is_typed_and_never_a_silent_none(
+    db_path: Path, clock: FakeClock
+) -> None:
+    """B2 r2: refusal has its own disposition, distinct from "not attempted".
+
+    The three dispositions are only useful if they are actually three. A caller
+    must be able to tell "the queue is not the carrier" (``NOT_ATTEMPTED``, write
+    the legacy row, nothing is wrong) from "the queue IS the carrier and it just
+    refused" (``REFUSED``, write the legacy row, and a gate notice must NOT be
+    reported as sent). Collapsing either into a bare ``None`` is the defect the
+    review found, so both the value and the ``REFUSED``/``NOT_ATTEMPTED``
+    distinction are asserted here.
+
+    MUTANT: return ``None``/``NOT_ATTEMPTED`` from ``write_through``'s except
+    branch and the ``is WriteThroughDisposition.REFUSED`` assertion goes red.
+    """
+    runtime = await boot(db_path, "on", clock)
+    assert runtime.queue_store is not None
+
+    with patch.object(
+        runtime.queue_store, "enqueue", side_effect=sqlite3.OperationalError("database is locked")
+    ):
+        refused = wiring.write_through(fact(301))
+
+    assert refused.disposition is WriteThroughDisposition.REFUSED
+    assert refused.disposition is not WriteThroughDisposition.NOT_ATTEMPTED
+    assert refused.surrogate_id is None and refused.msg_id is None
+    assert runtime.queue_store.count() == 0
+
+    # The queue recovers: the same call is ACCEPTED, so REFUSED is the exception
+    # and not the only disposition this path can produce.
+    assert wiring.write_through(fact(302)).disposition is WriteThroughDisposition.ACCEPTED
+
+    await bootstrap.shutdown_worker_truth()

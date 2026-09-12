@@ -618,3 +618,153 @@ def test_settlement_of_an_unknown_question_is_a_typed_refusal(tmp_path: Path) ->
     with pytest.raises(g.GateQuestionError) as exc:
         service.settlement("nope")
     assert exc.value.code is g.QuestionRefusal.QUESTION_NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# B2 r2: one notice per question under a live claim, and a typed outcome on
+# every branch of the send bookkeeping.
+# ---------------------------------------------------------------------------
+
+
+def _intent_with_claim(pool: Any, question_id: str) -> Any:
+    return (
+        pool.connection()
+        .execute(
+            "SELECT state, msg_id, attempts, claim_token, claim_until "
+            "FROM question_notice_intent WHERE question_id = ?",
+            (question_id,),
+        )
+        .fetchone()
+    )
+
+
+class BlockingNotifier:
+    """Holds the send open so a second sweep runs against an IN-FLIGHT claim.
+
+    A ``FakeNotifier`` returns instantly, and an instant send makes the race
+    unreachable: by the time the second sweep looks, the intent is SENT and out
+    of the candidate set for a reason that has nothing to do with the claim. This
+    notifier blocks after recording the call, which is the state the review's
+    repro put the system in.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[str] = []
+
+    def notify(
+        self,
+        *,
+        question: g.RoundQuestion,
+        kind: str,
+        classification: str,
+        code: str,
+        lines: Any,
+    ) -> str | None:
+        self.calls.append(question.question_id)
+        if len(self.calls) > 1:
+            # A SECOND send is the defect itself. Returning here rather than
+            # blocking keeps the arm reporting a duplicate instead of hanging on
+            # it, which is what a mutant that releases the claim early would
+            # otherwise do to this test.
+            return f"msg-{len(self.calls)}"
+        self.entered.set()
+        assert self.release.wait(timeout=30), "the test never released the send"
+        return f"msg-{len(self.calls)}"
+
+
+def test_a_sweep_cannot_duplicate_a_notice_whose_send_is_still_in_flight(tmp_path: Path) -> None:
+    """B2.2's first window, at the service level: in-flight send, racing sweep.
+
+    The review produced two notices for one question by running a sweep while the
+    ask's enqueue was still on the wire. With the claim taken BEFORE the send, the
+    sweep has no candidate: it returns an empty list — a typed outcome — and sends
+    nothing, so the seat gets one question.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = BlockingNotifier()
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+
+    import threading
+
+    asked: list[Any] = []
+
+    def _ask() -> None:
+        asked.append(
+            service.ask(
+                dispatch_id="worker-1",
+                question="accept?",
+                client_request_id="cr1",
+                owner_conversation="seat",
+                position="dev",
+            )
+        )
+
+    thread = threading.Thread(target=_ask)
+    thread.start()
+    assert notifier.entered.wait(timeout=30), "the ask never reached the notifier"
+
+    # The send is hanging. A periodic sweep runs NOW — the review's repro. The
+    # release is in a finally so a mutant that lets the sweep send fails the
+    # assertions below instead of leaking the blocked ask thread into teardown.
+    try:
+        _expired, retried = service.sweep()
+        assert retried == [], "a claimed notice is not a retry candidate"
+        assert len(notifier.calls) == 1, "and it sent nothing while the first send is in flight"
+    finally:
+        notifier.release.set()
+        thread.join(timeout=30)
+
+    assert not thread.is_alive(), "the ask thread must have finished"
+    question = asked[0][0]
+    assert notifier.calls == [question.question_id], "exactly one notice for one question"
+    row = _intent_with_claim(pool, question.question_id)
+    assert row["state"] == "SENT" and row["msg_id"] == "msg-1"
+    assert row["claim_token"] == "", "a settled send releases its lease"
+
+
+def test_a_send_bookkeeping_failure_is_typed_and_leaves_the_notice_retryable(
+    tmp_path: Path,
+) -> None:
+    """B2.2's second window: the queue accepted, then the CAS lost.
+
+    ``mark_notice_sent`` returns whether its compare-and-set won. The service must
+    read that answer rather than assume it: here a foreign claim is forced onto
+    the row after the send, so the settlement CAS loses, and the intent must stay
+    retryable rather than being reported as sent on a write that did not happen.
+    The arm asserts the return value as well, because a swallowed ``False`` is the
+    bare-success the review asked to be impossible.
+    """
+    _result, pool = migrate(tmp_path / "gate.db", busy_timeout_ms=5000)
+    assert pool is not None
+    clock = FakeClock()
+    store = SqliteGateStore(pool, clock=clock)
+    notifier = FakeNotifier()
+    service = GateQuestionService(store, clock=clock, notifier=notifier)
+
+    question, _replayed = service.ask(
+        dispatch_id="worker-1",
+        question="accept?",
+        client_request_id="cr1",
+        owner_conversation="seat",
+        position="dev",
+    )
+    # The CAS on a token that is not the row's cannot settle anything, and says so.
+    assert (
+        store.mark_notice_sent(question.question_id, msg_id="stolen", claim_token="not-the-token")
+        is False
+    )
+    assert store.mark_notice_failed(question.question_id, error="x", claim_token="stale") is False
+    # The row is untouched by either: still SENT from the send that DID land, with
+    # its own message id rather than the late writer's.
+    row = _intent_with_claim(pool, question.question_id)
+    assert (row["state"], row["msg_id"]) == (
+        "SENT",
+        "msg-1",
+    ), "a lost CAS must not overwrite the settled outcome"

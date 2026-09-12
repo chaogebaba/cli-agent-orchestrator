@@ -1085,3 +1085,141 @@ def test_notice_claim_excludes_concurrent_retry_and_uses_cas(store: SqliteGateSt
         store.mark_notice_sent(question.question_id, msg_id="wrong", claim_token="stale") is False
     )
     assert store.mark_notice_sent(question.question_id, msg_id="right", claim_token=token) is True
+
+
+def test_two_concurrent_sweeps_claim_one_notice_and_the_loser_is_not_silent() -> None:
+    """B2.2: a REAL interleaving on one durable lease, not two ordered calls.
+
+    The review's repro had a sweep select a notice while the first send was still
+    in flight, because ``notices_to_retry`` is a read with no claim. The claim is
+    what closes it, and the claim is only a claim if two threads racing it leave
+    exactly one winner — a sequential test would pass against a ``SELECT`` plus a
+    later ``UPDATE`` just as happily.
+
+    The loser's outcome is TYPED and empty (``[]`` / ``None``), never an
+    exception: a sweep that lost the race made no mistake and must not log one.
+    """
+    import tempfile
+    import threading
+
+    path = Path(tempfile.mkdtemp()) / "claim-race.db"
+    _res, pool = migrate(path, busy_timeout_ms=10_000)
+    assert pool is not None
+    store = SqliteGateStore(pool, clock=FakeClock())
+    _dispatch(store, "d-race")
+    question = _ask(store, dispatch_id="d-race")
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def _sweep_once(claimant: str) -> None:
+        barrier.wait()
+        try:
+            with lock:
+                results.append(
+                    store.claim_notices_to_retry(limit=10, claimant=claimant, now=_NOW, lease_s=60)
+                )
+        except Exception as exc:  # noqa: BLE001 — the arm is about WHICH exception
+            with lock:
+                results.append(exc)
+
+    threads = [threading.Thread(target=_sweep_once, args=(f"sweep{n}",)) for n in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(results) == 2
+    losers = [r for r in results if isinstance(r, Exception)]
+    assert losers == [], f"a lost claim is not an error, got {losers}"
+    winners = [r for r in results if isinstance(r, list) and r]
+    empties = [r for r in results if isinstance(r, list) and not r]
+    assert len(winners) == 1 and len(empties) == 1, f"exactly one claim may win, got {results}"
+    claimed = winners[0]
+    assert [q.question_id for q, _token in claimed] == [question.question_id]
+
+    # And exactly one lease is on the row: the loser left no second token behind.
+    row = (
+        pool.connection()
+        .execute(
+            "SELECT claim_token, attempts FROM question_notice_intent WHERE question_id = ?",
+            (question.question_id,),
+        )
+        .fetchone()
+    )
+    assert row["claim_token"] == claimed[0][1]
+    assert row["attempts"] == 1, "a lost claim must not burn an attempt"
+
+
+def test_a_retry_after_a_lost_lease_reuses_one_claim_path_and_one_key(
+    store: SqliteGateStore,
+) -> None:
+    """A lease that expires makes the notice claimable again — never a second row.
+
+    The crash window is send-committed-then-bookkeeping-failed. The claim lease is
+    what lets the sweep pick the notice up again, and the STABLE key the notifier
+    derives from the question id (asserted in the notifier's own arm) is what
+    makes that second attempt recover the existing queue row rather than create a
+    delivery beside it. What the store owes here is the other half: after a failed
+    send releases its claim, the next claim is a NEW token, and the stale token
+    can no longer settle anything.
+    """
+    _dispatch(store, "d-lease")
+    question = _ask(store, dispatch_id="d-lease")
+
+    first = store.claim_notices_to_retry(limit=10, claimant="sweep", now=_NOW, lease_s=60)
+    assert len(first) == 1
+    stale_token = first[0][1]
+    assert store.mark_notice_failed(
+        question.question_id, error="send died", claim_token=stale_token
+    )
+
+    second = store.claim_notices_to_retry(limit=10, claimant="sweep", now=_NOW, lease_s=60)
+    assert len(second) == 1 and second[0][0].question_id == question.question_id
+    fresh_token = second[0][1]
+    assert fresh_token != stale_token
+
+    # The old token is dead: a late writer holding it cannot settle the intent.
+    assert (
+        store.mark_notice_sent(question.question_id, msg_id="late", claim_token=stale_token)
+        is False
+    )
+    assert (
+        store.mark_notice_sent(question.question_id, msg_id="real", claim_token=fresh_token) is True
+    )
+    row = (
+        store._pool.connection()  # noqa: SLF001
+        .execute(
+            "SELECT state, msg_id, claim_token FROM question_notice_intent WHERE question_id = ?",
+            (question.question_id,),
+        )
+        .fetchone()
+    )
+    assert (row["state"], row["msg_id"], row["claim_token"]) == ("SENT", "real", "")
+
+
+def test_notices_to_retry_excludes_a_claimed_notice(store: SqliteGateStore) -> None:
+    """The READ view honours the claim too, not just the claiming write.
+
+    ``notices_to_retry`` is the lock-free read the daemon and any observer use to
+    ask "what is still owed", and it is the predicate the review's repro tripped
+    over: a notice whose send is in flight is not owed a second send. The write
+    side is covered by the arms above; this is the read that has to agree with it,
+    or the two disagree and the sweep acts on the read.
+    """
+    _dispatch(store, "d-read")
+    question = _ask(store, dispatch_id="d-read")
+    assert [q.question_id for q in store.notices_to_retry()] == [question.question_id]
+
+    first = store.claim_notices_to_retry(limit=10, claimant="sweep", now=_NOW, lease_s=60)
+    assert len(first) == 1 and first[0][0].question_id == question.question_id
+
+    # In flight: the read says nothing is owed.
+    assert store.notices_to_retry() == []
+
+    # The lease expires (or the send failed and released it): owed again.
+    released = store.claim_notices_to_retry(
+        limit=10, claimant="sweep", now=_NOW + timedelta(seconds=61), lease_s=60
+    )
+    assert [q.question_id for q, _t in released] == [question.question_id]

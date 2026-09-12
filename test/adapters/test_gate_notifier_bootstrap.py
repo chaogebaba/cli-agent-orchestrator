@@ -18,6 +18,13 @@ Both are tested against the real notifier with ``create_inbox_message`` patched,
 which is the seam — the notifier reaches it by a late import inside the method
 precisely so this is patchable and so ``bootstrap`` carries no import-time
 dependency on the legacy client.
+
+The r2 arms at the end go one layer further out, because the defect they exist
+for is only reachable that way: a patched ``create_inbox_message`` can assert what
+the notifier returns, but not whether the REAL write path refused, and the review
+reproduced a refusal being reported as SENT off the legacy surrogate id. Those
+arms therefore run ``create_inbox_message`` itself over a real file with both
+schemas, the delivery queue armed at ``on``, and a real queue store in it.
 """
 
 from __future__ import annotations
@@ -334,3 +341,228 @@ def test_notice_retries_reuse_one_stable_queue_idempotency_key() -> None:
             )
     keys = [call.kwargs["idempotency_key"] for call in create.call_args_list]
     assert keys[0] == keys[1] == "gate-question-notice:Q1:question:expected"
+
+
+# ---------------------------------------------------------------------------
+# B2 r2: the refusal must stay a refusal, and one question must be one row.
+#
+# The arms above reach the notifier with ``create_inbox_message`` patched, which
+# proves the notifier's own branch but not the thing the review reproduced: the
+# REAL write path, with the delivery queue armed, refusing.  The review's repro
+# was exactly this shape — ``CAO_DELIVERY_QUEUE=on``, the queue refusing, and the
+# intent coming back SENT off the legacy surrogate id.  So these arms run the
+# real ``create_inbox_message`` over a real file with both schemas, the delivery
+# runtime installed at ``on``, and a real queue store in it.
+# ---------------------------------------------------------------------------
+
+
+class _GateClock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+
+@pytest.fixture
+def live_notice_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A real file, both schemas, a seat, and the delivery queue armed at ``on``."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.adapters.store.queue import SqliteQueueStore
+    from cli_agent_orchestrator.app.delivery import wiring
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.core.delivery import SwitchPosition
+
+    db_file = tmp_path / "notice.sqlite"
+    engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    database.Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "SessionLocal", sessions)
+
+    result, pool = migrate(db_file, busy_timeout_ms=5000)
+    assert result.ok, result
+    assert pool is not None
+    with sessions.begin() as db:
+        db.add(
+            database.TerminalModel(
+                id="seat-abc",
+                tmux_session="cao-n",
+                tmux_window="seat-abc",
+                provider="claude_code",
+                init_state="ready",
+            )
+        )
+
+    clock = _GateClock()
+    store = SqliteQueueStore(pool, clock=clock)
+    wiring.install_delivery(
+        wiring.DeliveryRuntime(store=store, clock=clock, position=SwitchPosition.ON)
+    )
+    try:
+        yield pool
+    finally:
+        wiring.reset_delivery()
+        pool.close_all()
+        engine.dispose()
+
+
+def _count(pool: Any, table: str) -> int:
+    return int(pool.connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def test_a_queue_refusal_is_never_reported_as_sent(live_notice_env: Any) -> None:
+    """B2.1, on the real path: a refused queue write is not acceptance.
+
+    The review's repro, reproduced as an arm.  With the queue armed at ``on`` and
+    the write-through refusing (``database is locked``), the legacy fallback still
+    writes an ``inbox`` row with an integer id — and inferring acceptance from
+    that id is exactly the defect.  The notifier must answer ``None``, so the
+    intent settles FAILED and the sweep retries, rather than claiming the seat was
+    told when the queue never took the row.
+    """
+    pool = live_notice_env
+    notifier = bootstrap.build_question_notifier()
+    with patch(
+        "cli_agent_orchestrator.services.queue_carrier.write_through_enqueue",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        msg_id = notifier.notify(
+            question=_question(), kind="question", classification="expected", code="", lines=("a",)
+        )
+
+    assert msg_id is None, "a queue refusal carries no message id"
+    assert _count(pool, "delivery_msg") == 0, "the queue did not take the row"
+    assert (
+        _count(pool, "inbox") == 1
+    ), "the legacy fallback wrote one — and must not be read as SENT"
+
+
+def test_a_typed_queue_refusal_is_also_never_reported_as_sent(live_notice_env: Any) -> None:
+    """The other spelling of a refusal: the write-through returns REFUSED itself.
+
+    The arm above covers the exceptional fallback; this one covers the ordinary
+    typed refusal the delivery wiring produces when the queue write fails. Both
+    must reach the notifier as "the queue did not take it", and neither may be
+    inferred from the legacy surrogate id the fallback then writes.
+
+    MUTANT: accept any ``InboxInsertResult`` regardless of disposition, or read
+    ``message.message.id`` instead of ``carrier_id`` — both re-admit the defect.
+    """
+    pool = live_notice_env
+    notifier = bootstrap.build_question_notifier()
+    from cli_agent_orchestrator.app.delivery.wiring import (
+        WriteThroughDisposition,
+        WriteThroughResult,
+    )
+
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.write_through",
+        return_value=WriteThroughResult(WriteThroughDisposition.REFUSED),
+    ):
+        msg_id = notifier.notify(
+            question=_question(), kind="question", classification="expected", code="", lines=("a",)
+        )
+
+    assert msg_id is None
+    assert _count(pool, "inbox") == 1, "the legacy fallback is the carrier it degraded to"
+    assert _count(pool, "delivery_msg") == 0
+
+
+def test_the_accepted_path_writes_one_queue_row_and_no_legacy_row(live_notice_env: Any) -> None:
+    """The positive control for the arm above: same call, queue healthy.
+
+    Without this, "the refusal returns None" could be satisfied by a notifier that
+    never accepts anything.
+    """
+    pool = live_notice_env
+    notifier = bootstrap.build_question_notifier()
+    msg_id = notifier.notify(
+        question=_question(), kind="question", classification="expected", code="", lines=("a", "b")
+    )
+    assert msg_id is not None
+    assert _count(pool, "delivery_msg") == 1
+    assert _count(pool, "inbox") == 0
+
+
+def test_a_retry_after_a_lost_claim_writes_no_second_queue_row(live_notice_env: Any) -> None:
+    """B2.2's second window, end to end.
+
+    The review's crash window: the queue ACCEPTS, then the bookkeeping that would
+    mark the intent SENT loses its lock.  The intent stays retryable and the sweep
+    calls the notifier again — so the only thing standing between that and a
+    duplicate delivery is the queue seeing the SAME key twice.  Here the same
+    question is notified twice through the real notifier and the real queue store;
+    one row must exist, and both calls must come away with the same id.
+    """
+    pool = live_notice_env
+    notifier = bootstrap.build_question_notifier()
+
+    first = notifier.notify(
+        question=_question(), kind="question", classification="expected", code="", lines=("a",)
+    )
+    retry = notifier.notify(
+        question=_question(), kind="question", classification="expected", code="", lines=("a",)
+    )
+
+    assert first is not None and first == retry, "one logical notice, one queue identity"
+    assert _count(pool, "delivery_msg") == 1, "the retry must not enqueue a second delivery"
+
+
+def test_the_write_through_outcome_is_typed_all_the_way_to_the_caller(
+    live_notice_env: Any,
+) -> None:
+    """Every branch of the queue seam is TYPED, on the real path.
+
+    The notifier can only refuse a fallback if the caller is told WHICH fallback
+    it got, so the chain is asserted at the seam itself: the accepted path, the
+    delivery-wiring refusal, and a failure of the bridge INTO the wiring module
+    all have to arrive as three distinguishable ``InboxInsertDisposition``
+    values. The reported defect was a bare ``None``/legacy id, which is why the
+    notifier's own arms cannot stand alone here — both non-accepted branches make
+    the notifier answer ``None``, and a chain that collapsed them would look
+    identical from there.
+
+    MUTANT: ``queue_carrier.write_through_enqueue``'s except branch (the bridge
+    could not reach the wiring at all) and the choke point's refused conversion
+    are each mutated to their "legacy accepted" spelling.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        InboxInsertDisposition,
+        InboxInsertResult,
+        create_inbox_message,
+    )
+
+    pool = live_notice_env
+
+    accepted = create_inbox_message(
+        sender_id="cao-gate", receiver_id="seat-abc", message="a", return_outcome=True
+    )
+    assert isinstance(accepted, InboxInsertResult)
+    assert accepted.disposition is InboxInsertDisposition.QUEUE_ACCEPTED
+    assert accepted.carrier_id is not None
+
+    # The queue store refuses: the wiring's own typed REFUSED, converted by the
+    # choke point into the caller-visible QUEUE_REFUSED.
+    with patch(
+        "cli_agent_orchestrator.services.queue_carrier.write_through_enqueue",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        refused = create_inbox_message(
+            sender_id="cao-gate", receiver_id="seat-abc", message="b", return_outcome=True
+        )
+    assert isinstance(refused, InboxInsertResult)
+    assert refused.disposition is InboxInsertDisposition.QUEUE_REFUSED
+    assert refused.carrier_id is None
+
+    # The BRIDGE fails before it can even hand the fact over: still REFUSED, and
+    # never "not attempted" — the queue was the active carrier either way.
+    with patch(
+        "cli_agent_orchestrator.app.delivery.wiring.write_through",
+        side_effect=RuntimeError("bridge down"),
+    ):
+        bridged = create_inbox_message(
+            sender_id="cao-gate", receiver_id="seat-abc", message="c", return_outcome=True
+        )
+    assert isinstance(bridged, InboxInsertResult)
+    assert bridged.disposition is InboxInsertDisposition.QUEUE_REFUSED
+    assert bridged.disposition is not InboxInsertDisposition.LEGACY_ACCEPTED
+    assert _count(pool, "delivery_msg") == 1, "only the accepted arm reached the queue"
