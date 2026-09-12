@@ -127,17 +127,23 @@ class TestHerdrInboxServiceRegistration:
 class TestHerdrInboxServiceRegisterReconnect:
     """Registering a terminal must NOT touch the socket.
 
-    The subscription is a single broadcast pane.updated (no pane_id) covering
-    every pane, so a newly registered pane's events already arrive on the live
-    connection. Registration therefore only updates the in-memory maps — it must
-    never close the socket or write a second events.subscribe (herdr 0.7.x resets
-    the connection on a second subscribe, which caused past reconnect storms).
+    herdr resets the connection on a second ``events.subscribe``, so registration
+    only updates the in-memory maps — it must never close the socket, write, or
+    schedule a reconnect. That rule is unchanged and is what this class pins.
+
+    The REASON stated here used to be "a single broadcast pane.updated covers
+    every pane, so a newly registered pane's events already arrive". F969 #818
+    disproved it: on herdr 0.9.0 an agent-status transition emits
+    ``pane.agent_status_changed`` (per-pane) and never the broadcast, so a pane
+    registered after connect gets NO lifecycle edge until the next reconnect.
+    That is a known, documented limit of the single-subscribe constraint — see
+    ``_subscribe_all_events`` — and it is why the identity marker is stamped
+    from a level read instead. Not a reason to subscribe again here.
     """
 
     def test_register_while_connected_does_not_touch_socket(self):
-        """With broadcast subscription, a newly registered pane's events already
-        arrive — registration must NOT close the socket, write, or schedule a
-        reconnect coroutine."""
+        """Registration must NOT close the socket, write, or schedule a
+        reconnect coroutine — herdr resets on a second events.subscribe."""
         import asyncio
 
         service = HerdrInboxService(socket_path="/tmp/test.sock")
@@ -389,11 +395,23 @@ class TestHerdrInboxServiceReconnect:
     """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""
 
     def test_reconnect_resubscribe_sends_single_call_for_all_panes(self):
-        """On reconnect, the broadcast subscription is re-sent in ONE events.subscribe call.
+        """On reconnect, everything is re-sent in ONE events.subscribe call.
 
-        herdr resets the connection on a second events.subscribe, so re-subscribing
-        must be one combined call. The subscription is a broadcast pane.updated
-        (no pane_id) covering every pane, plus the two lifecycle events.
+        herdr resets the connection on a second events.subscribe, so
+        re-subscribing must be one combined call — that is what this test is
+        for, and it is unchanged.
+
+        F969 (#818) corrected WHAT that call contains. It used to be the
+        broadcast alone, on the premise that ``pane.updated`` carries
+        agent_status. It does not: on herdr 0.9.0 an agent-status transition
+        emits ``pane.agent_status_changed``, which is PER-PANE, and never an
+        accompanying ``pane.updated`` (measured; upstream
+        ogulcancelik/herdr#2115). Since the identity marker is stamped only from
+        a frame carrying ``agent``, that premise left the marker unstamped and
+        the pane carrier deferred EVERY delivery at ``identity_unverified``.
+
+        So the one call now also carries a per-pane spec for each pane known at
+        connect, batched — still one call.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._client = _FakeHerdrClient()
@@ -405,13 +423,23 @@ class TestHerdrInboxServiceReconnect:
 
         _run_async(service._subscribe_all_events())
 
-        # Exactly ONE broadcast subscribe (not one per pane).
+        # Still exactly ONE subscribe call, carrying everything.
         subscriptions = service._client.subscribed
         assert subscriptions is not None
         types = {s["type"] for s in subscriptions}
-        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
-        # Broadcast subscriptions carry no pane_id.
-        assert all("pane_id" not in s for s in subscriptions)
+        assert types == {
+            "pane.updated",
+            "pane.closed",
+            "workspace.closed",
+            "pane.agent_status_changed",
+        }
+        # The broadcast members still carry no pane_id ...
+        broadcast = [s for s in subscriptions if s["type"] != "pane.agent_status_changed"]
+        assert all("pane_id" not in s for s in broadcast)
+        # ... and the per-pane members carry exactly the known panes, since
+        # herdr refuses that type without one and closes the connection.
+        per_pane = [s for s in subscriptions if s["type"] == "pane.agent_status_changed"]
+        assert sorted(s["pane_id"] for s in per_pane) == ["pane-1", "pane-2"]
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"

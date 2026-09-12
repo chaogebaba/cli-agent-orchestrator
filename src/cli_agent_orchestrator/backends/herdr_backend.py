@@ -397,6 +397,12 @@ _PROVIDER_AGENT_MARKERS = {
     "antigravity_cli": "antigravity",
     "hermes": "hermes",
     "grok_cli": "grok",
+    # F969 #818 review N6: without these two, every pi and cline seat fails the
+    # identity proof at `expected_agent is None` — the proof cannot even be
+    # attempted. The marker names are herdr's own manifest ids, confirmed in the
+    # F926 override work (`pi.toml` id = "pi", `cline.toml` id = "cline").
+    "pi_cli": "pi",
+    "cline_cli": "cline",
 }
 
 # Staleness bound for the durable pane_id map (seconds). Herdr public pane_ids
@@ -1245,11 +1251,16 @@ class HerdrBackend(TerminalBackend):
             return NativeIdentityResult(None, None, "unavailable")
         result = self._run_herdr(["pane", "get", resolved_pane], check=False)
         foreground_process: str | None = None
+        snapshot_agent: str | None = None
         if result.returncode == 0:
             try:
                 data = self._parse_herdr_json(result.stdout)
                 pane_info = data.get("pane", data) if isinstance(data, dict) else data
                 foreground_process = cast(str | None, pane_info.get("foreground_process"))
+                # F969 (#818): the SAME reply already names the agent. This call
+                # was fetching it and throwing it away.
+                raw_agent = pane_info.get("agent")
+                snapshot_agent = raw_agent if isinstance(raw_agent, str) and raw_agent else None
             except (json.JSONDecodeError, AttributeError):
                 from cli_agent_orchestrator.utils.tombstones import tombstone
 
@@ -1257,7 +1268,28 @@ class HerdrBackend(TerminalBackend):
                 foreground_process = None
         marker = service.read_identity_marker(terminal_id)
         if marker is None or marker.pane_id != resolved_pane:
-            return NativeIdentityResult(None, foreground_process, "unavailable")
+            # F969 (#818): the marker is written ONLY from a pushed frame
+            # carrying a non-empty ``agent``, and on herdr 0.9.0 this service's
+            # subscription cannot deliver one — an agent-status transition emits
+            # ``pane.agent_status_changed`` (per-pane), never the broadcast
+            # ``pane.updated`` the loop listens to. So the marker was never
+            # stamped, this returned ``unavailable`` forever, and the pane
+            # carrier deferred EVERY delivery for EVERY provider.
+            #
+            # The edge is not the only evidence: the pane reply above reports
+            # the same fact as a LEVEL, and herdr names the agent within about a
+            # second of the process starting (F926/F935). Stamp from that, so
+            # later calls take the marker path and this stays a one-time cost.
+            #
+            # A stamp is REFUSED if the service does not currently bind this
+            # pane to this terminal — a snapshot of another pane would turn a
+            # missing proof into a wrong one, which is worse than no delivery.
+            if snapshot_agent is not None:
+                marker = service.stamp_identity_from_snapshot(
+                    terminal_id, resolved_pane, snapshot_agent
+                )
+            if marker is None or marker.pane_id != resolved_pane:
+                return NativeIdentityResult(None, foreground_process, "unavailable")
         verdict: Literal["match", "mismatch"] = (
             "match" if marker.agent == expected_agent else "mismatch"
         )

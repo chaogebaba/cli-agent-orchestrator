@@ -212,6 +212,22 @@ class HerdrInboxService:
                 self._invalidate_terminal_identity_locked(terminal_id)
         logger.info(f"Unregistered terminal {terminal_id}")
 
+    @staticmethod
+    def _record_is_trusted(record: "_IdentityRecord | None", now: float) -> bool:
+        """Is this identity record evidence we are willing to act on?
+
+        ONE definition, because two readers ask it (F969 #818 review B1). A
+        record is distrusted when it is quarantined, or when it is inside the
+        reconnect grace — during that window the socket has just come back and
+        the pre-reconnect marker has not been re-confirmed, so it is exactly the
+        evidence we do NOT want deciding anything.
+        """
+        if record is None or record.quarantined:
+            return False
+        if record.grace_started is not None and now - record.grace_started < RECONNECT_GRACE_S:
+            return False
+        return True
+
     def read_identity_marker(self, terminal_id: str) -> IdentityMarker | None:
         """Copy the authoritative marker for the terminal's current pane incarnation."""
         now = time.monotonic()
@@ -221,11 +237,80 @@ class HerdrInboxService:
                 return None
             generation = self._native_event_gen.get((terminal_id, pane_id), 0)
             record = self._identity_records.get((terminal_id, pane_id, generation))
-            if record is None or record.quarantined:
+            if not self._record_is_trusted(record, now):
                 return None
-            if record.grace_started is not None and now - record.grace_started < RECONNECT_GRACE_S:
-                return None
+            assert record is not None  # narrowed by _record_is_trusted
             return record.marker
+
+    def stamp_identity_from_snapshot(
+        self, terminal_id: str, pane_id: str, agent: str
+    ) -> IdentityMarker | None:
+        """Stamp the marker from a LEVEL read instead of a pushed edge (F969 #818).
+
+        The marker was only ever written from the socket event loop, i.e. from a
+        pushed frame carrying a non-empty ``agent``. On herdr 0.9.0 the
+        subscription this service holds cannot deliver one: an agent-status
+        transition emits ``pane.agent_status_changed`` (per-pane), never the
+        broadcast ``pane.updated`` this loop listens to (measured; upstream
+        ogulcancelik/herdr#2115). So the marker was never stamped, every identity
+        proof read ``unavailable``, and the pane carrier deferred EVERY delivery
+        for EVERY provider.
+
+        An edge is not the only evidence available. ``herdr pane get`` reports
+        the same fact as a LEVEL, and that read is reliable — herdr names the
+        agent within about a second of the process starting (F926/F935
+        measurements). This lets the caller supply that level reading when the
+        edge never came.
+
+        Refuses to stamp against a pane the service does not currently bind to
+        this terminal: a snapshot of some other pane is not evidence about this
+        one, and writing it would turn a missing proof into a WRONG proof — the
+        one outcome worse than no delivery. Returns the marker it stamped, or
+        None when it refused.
+        """
+        if not agent or not pane_id:
+            return None
+        now = time.monotonic()
+        with self._identity_guard:
+            # N2: BOTH directions. `_terminal_to_pane` alone leaves the reverse
+            # map free to disagree, and a half-consistent binding is exactly the
+            # state a recycle passes through.
+            bound = self._terminal_to_pane.get(terminal_id)
+            reverse = self._pane_to_terminal.get(pane_id)
+            if bound != pane_id or reverse != terminal_id:
+                logger.debug(
+                    "f969_snapshot_stamp_refused terminal=%s pane=%s bound=%r reverse=%r",
+                    terminal_id,
+                    pane_id,
+                    bound,
+                    reverse,
+                )
+                return None
+            generation = self._native_event_gen.get((terminal_id, pane_id), 0)
+            key = (terminal_id, pane_id, generation)
+            existing = self._identity_records.get(key)
+            # B1 (review r1): edge precedence is gated on the SAME trust
+            # predicate the reader uses. This branch is only reachable when
+            # `read_identity_marker` already returned None, so an untrusted
+            # record here is one it just REJECTED — quarantined, or inside the
+            # reconnect grace. Letting that beat a fresh level read would make
+            # this function exist only to resurrect distrusted evidence, and it
+            # produced a live `verdict=mismatch, agent=claude` against a pane
+            # whose `pane get` said `codex`. A trusted edge still wins; an
+            # untrusted one is overwritten by what the pane says NOW.
+            if self._record_is_trusted(existing, now):
+                assert existing is not None
+                return existing.marker
+            marker = IdentityMarker(agent, pane_id, generation)
+            self._identity_records[key] = _IdentityRecord(marker, now)
+            logger.info(
+                "f969_identity_stamped_from_snapshot terminal=%s pane=%s agent=%s gen=%s",
+                terminal_id,
+                pane_id,
+                agent,
+                generation,
+            )
+            return marker
 
     def _quarantine_identity_markers(self) -> None:
         with self._identity_guard:
@@ -739,16 +824,40 @@ class HerdrInboxService:
         _pane_to_terminal — no per-pane enumeration is needed. The pane.closed
         and workspace.closed lifecycle events are sent in the same call.
         """
-        subscriptions = [
+        from cli_agent_orchestrator.adapters.truth.herdr_runtime import (
+            PANE_AGENT_STATUS_CHANGED,
+        )
+
+        subscriptions: list[dict[str, Any]] = [
             {"type": "pane.updated"},
             {"type": "pane.closed"},
             {"type": "workspace.closed"},
         ]
+        # F969 (#818): the broadcast alone cannot carry a lifecycle transition.
+        # On herdr 0.9.0 an agent-status change emits PANE_AGENT_STATUS_CHANGED,
+        # which is PER-PANE, and never an accompanying pane.updated (measured;
+        # upstream ogulcancelik/herdr#2115). The H1 runtime source already
+        # batches that spec into its own single subscribe; the spelling is
+        # imported from there rather than repeated, because a second copy of a
+        # wire constant is how the two drift.
+        #
+        # LIMIT, and it is why this is the lesser half of the fix: herdr resets
+        # the connection on a SECOND events.subscribe, so this list is fixed at
+        # connect and cannot cover a pane registered later. Panes present now get
+        # the edge; every other pane depends on the LEVEL read in
+        # read_native_identity, which is what actually makes identity resolvable.
+        with self._identity_guard:
+            panes_at_connect = sorted({p for p in self._terminal_to_pane.values() if p})
+        subscriptions.extend(
+            {"type": PANE_AGENT_STATUS_CHANGED, "pane_id": pane_id} for pane_id in panes_at_connect
+        )
         assert self._client is not None
         await self._client.subscribe(subscriptions)
         logger.info(
-            "Subscribed to broadcast pane.updated + lifecycle events "
-            "in one events.subscribe call"
+            "Subscribed to broadcast pane.updated + lifecycle events + %d per-pane "
+            "%s specs in one events.subscribe call",
+            len(panes_at_connect),
+            PANE_AGENT_STATUS_CHANGED,
         )
 
     async def _event_loop(self) -> None:
