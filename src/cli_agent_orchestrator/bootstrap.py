@@ -839,10 +839,9 @@ def _resolve_status_cutover(
 
     if outcome.position is StatusPosition.ON:
         logger.warning(
-            "%s resolved to on, which sub-phase 2a does not implement: the "
-            "projection is NOT being published and every consumer still reads the "
-            "pane path. Unset %s until sub-phase 2b ships.",
-            STATUS_ENV_VAR,
+            "%s resolved to on: publication occurs only for terminals whose "
+            "source is registered authoritative by the herdr backend; tmux has no "
+            "such certification and therefore does not publish the projection.",
             STATUS_ENV_VAR,
         )
     return outcome

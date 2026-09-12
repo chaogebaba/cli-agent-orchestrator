@@ -155,13 +155,17 @@ fi
 # Started WITHOUT a subshell so ``\$!`` is this arm's server pid.  The teardown
 # below needs to stop exactly this process: the box is shared, and a pattern
 # kill there has already taken out another lane's server by accident.
-cao-server >"\$ROUND/server.log" 2>&1 &
+cao-server --terminal herdr >"\$ROUND/server.log" 2>&1 &
 SERVER_PID=\$!
 for _ in \$(seq 1 60); do
   curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "HARNESS: server never came up"; exit 2; }
+health_json=\$(curl -sf "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
+[ -n "\$health_json" ] || { echo "HARNESS: server never came up"; exit 2; }
+python3 -c 'import json,sys; data=json.loads(sys.argv[1]); expected="herdr"; actual=data.get("terminal_backend"); sys.exit(0 if actual == expected else 1)' "\$health_json" \
+  || { echo "HARNESS: server backend is not herdr: \$health_json"; exit 2; }
+echo "backend: herdr" >> "\$ROUND/server.log"
 
 # Three lanes: a codex (the allowlisted provider and the only one with a
 # rollout source), a claude_code (the second source), and a kiro — the
