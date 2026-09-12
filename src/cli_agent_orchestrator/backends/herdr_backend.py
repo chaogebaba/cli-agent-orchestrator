@@ -1875,7 +1875,14 @@ class HerdrBackend(TerminalBackend):
             from cli_agent_orchestrator.utils.tombstones import tombstone
 
             tombstone("TS-0005")
-            return self._resolve_pane_id_from_window(session_name, window_name)
+            try:
+                return self._resolve_pane_id_from_window(session_name, window_name)
+            except TerminalNotFoundError:
+                # A preceding pane-list refusal may have invalidated both
+                # caches.  If the replacement lookup also cannot find a pane,
+                # preserve the Optional contract instead of turning the second
+                # lookup into a stale-id resurrection or an exception.
+                return None
 
         raise TerminalNotFoundError(terminal_id)
 
