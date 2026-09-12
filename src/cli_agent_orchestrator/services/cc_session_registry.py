@@ -314,6 +314,18 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
             data = json.loads(entry.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        # F216 (#55): a registry file is externally written, so its TOP-LEVEL
+        # value can legally be a JSON ``null`` (or a list/number) as well as an
+        # object — a half-flushed or truncated write is the common way there.
+        # ``json.loads`` accepts all of those, and the membership test below
+        # then raises TypeError ("argument of type 'NoneType' is not iterable")
+        # OUT of read_registry, taking down every caller on the delivery path
+        # (doorbell ring, NativeSeatCarrier.emit, delivery_service) over one bad
+        # file. Same null-at-the-parse-surface class as the field-level ``or ""``
+        # normalisation below; ``read_peer_token`` already guards this way
+        # (F337-r2 S1). Skip the record, exactly like malformed JSON.
+        if not isinstance(data, dict):
+            continue
         # D13: Require minimum fields — messagingSocketPath is optional
         # (CC 2.1.232 dropped the field); sessionId + procStart suffice.
         if not all(k in data for k in ("sessionId", "procStart")):

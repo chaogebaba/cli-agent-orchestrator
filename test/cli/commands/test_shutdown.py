@@ -127,7 +127,12 @@ class TestShutdownCommand:
         assert result.exit_code == 0
         assert "Shutdown session 'session-1'" in result.output
         assert "Shutdown session 'session-3'" in result.output
-        assert "Failed to connect to cao-server" in result.output
+        # F241 (#64): the server ANSWERED 500 — the error names the served status,
+        # never "Failed to connect" (that wording sends the user to restart a
+        # server that is up, which on CAO kills live sessions). This mock builds
+        # the HTTPError without a response object, so only the head is printed.
+        assert "cao-server returned an error" in result.output
+        assert "connect" not in result.output.lower()
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_deferred_cleanup_is_failure(self, mock_delete, runner):
@@ -168,4 +173,9 @@ class TestShutdownCommand:
         result = runner.invoke(shutdown, ["--session", "cao-test"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        # F241 (#64): the server ANSWERED 500 — the error names the served status,
+        # never "Failed to connect" (that wording sends the user to restart a server
+        # that is up, which on CAO kills live sessions). This mock builds the
+        # HTTPError with no response object, so only the head is printed.
+        assert "cao-server returned an error" in result.output
+        assert "connect" not in result.output.lower()

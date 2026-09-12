@@ -9,7 +9,11 @@ from urllib.parse import quote
 import click
 import requests
 
-from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
+from cli_agent_orchestrator.cli.http import (
+    format_domain_detail,
+    response_detail,
+    served_error_message,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.http import CAOHttpClient
 
@@ -200,6 +204,11 @@ def list_sessions(as_json):
     """List all active CAO sessions."""
     try:
         sessions = _get_sessions()
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): the server ANSWERED — report its status and body, never
+        # "Failed to connect" (that wording sends the user to restart a server
+        # that is up, which on CAO kills live sessions).
+        raise click.ClickException(served_error_message(e))
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
@@ -478,6 +487,11 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        # F241 (#64): the server ANSWERED — report its status and body, never
+        # "Failed to connect" (that wording sends the user to restart a server
+        # that is up, which on CAO kills live sessions).
+        raise click.ClickException(served_error_message(e))
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 

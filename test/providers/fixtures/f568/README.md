@@ -32,5 +32,9 @@ a churning pane with `children_count == 0`, every eligible sample must yield
 
 - `../wpq1_claude_2_1_211/completed-composer.txt` → `False`
 - `../wpq1_claude_2_1_211/initial-empty-composer.txt` → `False`
-- codex / kiro / grok fixtures under `../` → `None` (no claude box; base-provider
-  `rule3a_busy_marker` returns `None`, so their rule-3a path is byte-identical)
+- codex / kiro / grok fixtures under `../` → `None` under `ClaudeCodeProvider`'s
+  marker (no claude box). The base-provider default is still `None`; codex, kiro
+  and grok have their OWN legs (F581 #438) asserted in
+  `test/providers/test_{codex,kiro,grok}_busy_marker.py`. cline has no leg —
+  `test_grok_busy_marker.py::TestClineHasNoLegAndWhy` pins the live 3.0.61
+  capture that disproved the one that was written

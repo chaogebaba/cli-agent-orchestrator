@@ -1259,3 +1259,87 @@ def test_launch_poll_window_covers_server_init_ceiling():
     margin = 60
     assert SESSION_START_POLL_TIMEOUT_S >= server_init_ceiling + margin
     assert SESSION_START_TIMEOUT_S >= server_init_ceiling + margin
+
+
+# ── F241 (#64): a SERVED error is never reported as a connection failure ──
+
+
+def _served_http_error(status_code, body, text=""):
+    """Build the requests.HTTPError a raise_for_status() would raise."""
+    import requests
+
+    response = MagicMock()
+    response.status_code = status_code
+    response.text = text
+    if body is None:
+        response.json.side_effect = ValueError("no json")
+    else:
+        response.json.return_value = body
+    error = requests.exceptions.HTTPError(f"{status_code} Server Error", response=response)
+    response.raise_for_status.side_effect = error
+    return response
+
+
+def test_launch_duplicate_session_name_reports_served_status_not_connect():
+    """F241 (#64): duplicate --session-name prints the server's 400 + the remedy.
+
+    Revert-sensitive: before the fix the HTTPError from raise_for_status() fell
+    into the blanket ``except RequestException`` arm and printed "Failed to
+    connect to cao-server: 400 …" — telling the user to restart the server, the
+    one action that destroys the live sessions the guard was protecting.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value = _served_http_error(
+            400, {"detail": "Session 'claude-orch6' already exists"}
+        )
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--session-name", "claude-orch6", "--yolo"],
+        )
+
+    assert result.exit_code != 0
+    assert "connect" not in result.output.lower()
+    assert "HTTP 400" in result.output
+    assert "Session 'claude-orch6' already exists" in result.output
+    assert "cao session attach claude-orch6" in result.output
+
+
+def test_launch_served_500_without_detail_reports_status_and_body():
+    """A served 500 with no ``detail`` still reports the status, never "connect"."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value = _served_http_error(500, None, text="Internal Server Error")
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+    assert result.exit_code != 0
+    assert "connect" not in result.output.lower()
+    assert "HTTP 500" in result.output
+    assert "Internal Server Error" in result.output
+
+
+def test_launch_genuine_connection_failure_still_says_failed_to_connect():
+    """The truthful arm is untouched: a real transport failure still says connect."""
+    runner = CliRunner()
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+        import requests
+
+        mock_post.side_effect = requests.exceptions.ConnectionError("Connection refused")
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+    assert result.exit_code != 0
+    assert "Failed to connect to cao-server" in result.output

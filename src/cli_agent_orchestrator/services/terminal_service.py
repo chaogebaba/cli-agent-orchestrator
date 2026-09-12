@@ -8613,16 +8613,30 @@ def quiesce_deferred_terminals_sync(terminals: list[dict]) -> None:
         quiesce_deferred_terminal_sync(terminal["id"])
 
 
-def quiesce_deferred_session_sync(session_name: str) -> None:
-    """Quiesce schedule-time session members before the leased DB snapshot."""
-    with _deferred_tasks_lock:
-        terminal_ids = [
-            terminal_id
-            for terminal_id, record in _deferred_tasks_by_terminal.items()
-            if record.session_name == session_name
-        ]
-    for terminal_id in terminal_ids:
-        quiesce_deferred_terminal_sync(terminal_id)
+def quiesce_session_teardown_set_sync(session_name: str) -> None:
+    """F167 (#27): quiesce the session's TEARDOWN SET before the leased snapshot.
+
+    Replaces the session-wide variant, which scanned the whole in-memory
+    deferred-task registry for ``record.session_name == session_name``. Two
+    reasons that variant is gone rather than kept:
+
+    * **Its key was not the teardown key.** ``record.session_name`` is whatever
+      ``schedule_deferred_init`` read out of the snapshot (``tmux_session``,
+      which is ``None`` when the metadata read came back empty), while the
+      teardown enumerates ``list_terminals_by_session``. A record that carries
+      no session name was therefore NEVER quiesced by a session close, and its
+      init task went on running into a teardown that was deleting its row —
+      the F167 failure mode, reached from the other side.
+    * **It was the F167 footgun itself.** A per-terminal caller that reached for
+      "the session one" cancelled every sibling's init (the original incident,
+      2026-08-13). Deleting the by-session-name scan means no future caller can
+      pick it up by mistake; the only session-shaped entry point takes the same
+      authoritative terminal list the teardown is about to delete.
+
+    Enumerates through the module-level ``list_terminals_by_session`` seam so a
+    caller's patched listing and the quiesce set stay the same set.
+    """
+    quiesce_deferred_terminals_sync(list_terminals_by_session(session_name))
 
 
 async def quiesce_deferred_terminals(terminals: list[dict]) -> None:

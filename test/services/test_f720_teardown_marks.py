@@ -162,7 +162,7 @@ def test_delete_session_deferred_cleanup_kill_runs_under_session_mark():
             return_value=None,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service.quiesce_session_teardown_set_sync",
             return_value=None,
         ),
         patch(

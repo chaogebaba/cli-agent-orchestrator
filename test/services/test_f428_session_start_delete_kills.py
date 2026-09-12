@@ -19,7 +19,6 @@ from cli_agent_orchestrator.services import session_lifecycle_lease as lifecycle
 from cli_agent_orchestrator.services import session_service
 from cli_agent_orchestrator.services.session_service import delete_session, start_session
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -122,7 +121,7 @@ def _patch_delete_seams(
             return_value=None,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service.quiesce_session_teardown_set_sync",
             return_value=None,
         ),
         patch(
@@ -253,9 +252,7 @@ async def test_start_admission_gate_uses_resolved_and_blocks_create():
     with (
         patch.object(session_service, "create_session", create),
         patch.object(session_service, "resolve_provider", resolve),
-        patch.object(
-            session_service, "require_provider_admitted", admit
-        ),
+        patch.object(session_service, "require_provider_admitted", admit),
         patch(
             "cli_agent_orchestrator.providers.manager.get_provider_class",
             MagicMock(return_value=_ProviderClass(False)),
@@ -277,9 +274,7 @@ def test_delete_denied_lifecycle_lease_raises_before_teardown():
     session_name = "cao-f428-m6"
     held = lifecycle_lease_mod.acquire_session_lifecycle_exclusive(session_name)
     assert held is not None
-    patches, _backend, delete_mock, finalized = _patch_delete_seams(
-        terminals=[{"id": "t-victim"}]
-    )
+    patches, _backend, delete_mock, finalized = _patch_delete_seams(terminals=[{"id": "t-victim"}])
     try:
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
             with pytest.raises(RuntimeError, match="resume_in_progress"):
@@ -518,13 +513,11 @@ def test_delete_quiesce_runs_before_lifecycle_lease():
         patches[3],
         patches[4],
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service.quiesce_session_teardown_set_sync",
             side_effect=_quiesce,
         ),
         patches[6],
-        patch.object(
-            lifecycle_lease_mod, "acquire_session_lifecycle_exclusive", side_effect=_acq
-        ),
+        patch.object(lifecycle_lease_mod, "acquire_session_lifecycle_exclusive", side_effect=_acq),
     ):
         result = delete_session(session_name)
     assert order[:2] == ["quiesce", "lease"]
