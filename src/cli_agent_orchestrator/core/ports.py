@@ -983,14 +983,41 @@ class GateStore(Protocol):
         ...
 
     def notices_to_retry(self, *, limit: int = 50) -> list[RoundQuestion]:
-        """Open questions whose notice intent has not landed (PENDING or FAILED).
+        """Open questions whose notice intent has not landed (read-only view)."""
+        ...
 
-        A READ, deliberately: the sweep decides what to re-send from it and then
-        re-sends, so a period in which nothing is outstanding costs one SELECT
-        and takes no write lock at all.  A question that has already settled is
-        excluded — re-announcing an answered question would be worse than never
-        having announced it.
-        """
+    def claim_notice(
+        self,
+        question_id: str,
+        *,
+        claimant: str,
+        now: datetime,
+        lease_s: int,
+    ) -> str | None:
+        """Claim one pending notice with a durable lease and CAS token."""
+        ...
+
+    def claim_notices_to_retry(
+        self,
+        *,
+        limit: int,
+        claimant: str,
+        now: datetime,
+        lease_s: int,
+    ) -> list[tuple[RoundQuestion, str]]:
+        """Atomically claim retry candidates and return their lease tokens."""
+        ...
+
+    def mark_notice_sent(
+        self, question_id: str, *, msg_id: str, claim_token: str | None = None
+    ) -> bool:
+        """Set SENT only for the current claim; return whether the CAS won."""
+        ...
+
+    def mark_notice_failed(
+        self, question_id: str, *, error: str, claim_token: str | None = None
+    ) -> bool:
+        """Set FAILED only for the current claim; return whether the CAS won."""
         ...
 
     def open_question_for_dispatch(self, dispatch_id: str) -> RoundQuestion | None:

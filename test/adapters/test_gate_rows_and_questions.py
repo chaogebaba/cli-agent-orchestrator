@@ -1072,3 +1072,16 @@ def test_get_answer_returns_the_recorded_event(store: SqliteGateStore) -> None:
     recorded = store.get_answer(event.answer_event_id)
     assert recorded is not None and recorded.answer == "accept"
     assert store.get_answer("nope") is None
+
+
+def test_notice_claim_excludes_concurrent_retry_and_uses_cas(store: SqliteGateStore) -> None:
+    _dispatch(store, "d-claim")
+    question = _ask(store, dispatch_id="d-claim")
+    first = store.claim_notices_to_retry(limit=10, claimant="sweep", now=_NOW, lease_s=60)
+    assert [q.question_id for q, _token in first] == [question.question_id]
+    token = first[0][1]
+    assert store.claim_notices_to_retry(limit=10, claimant="other", now=_NOW, lease_s=60) == []
+    assert (
+        store.mark_notice_sent(question.question_id, msg_id="wrong", claim_token="stale") is False
+    )
+    assert store.mark_notice_sent(question.question_id, msg_id="right", claim_token=token) is True

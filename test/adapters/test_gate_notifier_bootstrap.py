@@ -35,13 +35,22 @@ from cli_agent_orchestrator import bootstrap
 from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.core import gate as g
 from cli_agent_orchestrator.core.ports import QuestionNotifier
+from cli_agent_orchestrator.clients.database import InboxInsertDisposition, InboxInsertResult
 
 _NOW = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
 
 class _Message:
-    def __init__(self, message_id: int) -> None:
+    def __init__(self, message_id: int | None) -> None:
         self.id = message_id
+
+
+def _accepted(message_id: int | None) -> InboxInsertResult:
+    return InboxInsertResult(
+        _Message(message_id),
+        InboxInsertDisposition.QUEUE_ACCEPTED,
+        None if message_id is None else str(message_id),
+    )
 
 
 def _question(**overrides: Any) -> g.RoundQuestion:
@@ -70,7 +79,7 @@ def test_an_accepted_write_returns_the_message_id() -> None:
     notifier = bootstrap.build_question_notifier()
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(4242),
+        return_value=_accepted(4242),
     ) as create:
         msg_id = notifier.notify(
             question=_question(),
@@ -96,7 +105,7 @@ def test_the_receiver_is_read_off_the_question_not_configured() -> None:
     notifier = bootstrap.build_question_notifier()
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(1),
+        return_value=_accepted(1),
     ) as create:
         notifier.notify(
             question=_question(owner_conversation="seat-xyz"),
@@ -112,7 +121,7 @@ def test_an_explicit_receiver_overrides_the_question_s_owner() -> None:
     notifier = bootstrap.build_question_notifier("pinned-seat")
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(1),
+        return_value=_accepted(1),
     ) as create:
         notifier.notify(
             question=_question(), kind="question", classification="expected", code="", lines=("a",)
@@ -136,7 +145,7 @@ def test_the_notice_carries_no_supersede_key_so_the_queue_write_through_survives
     notifier = bootstrap.build_question_notifier()
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(1),
+        return_value=_accepted(1),
     ) as create:
         notifier.notify(
             question=_question(), kind="question", classification="expected", code="", lines=("a",)
@@ -172,7 +181,7 @@ def test_a_write_that_returns_no_id_is_also_a_failure() -> None:
     notifier = bootstrap.build_question_notifier()
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(None),  # type: ignore[arg-type]
+        return_value=_accepted(None),
     ):
         assert (
             notifier.notify(
@@ -247,7 +256,7 @@ def test_a_locked_write_leaves_a_retryable_intent_end_to_end(tmp_path: Path) -> 
 
     with patch(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        return_value=_Message(77),
+        return_value=_accepted(77),
     ):
         _expired, retried = service.sweep()
     assert [q.question_id for q in retried] == [question.question_id]
@@ -284,3 +293,44 @@ def test_the_notifier_opens_no_second_path_to_the_seat() -> None:
     for forbidden in ("wake_seat", "inject_worker", "doorbell", "send_keys", "paste"):
         assert forbidden not in body, f"the notifier must not reach {forbidden}"
     assert any("create_inbox_message" in name for name in called)
+
+
+def test_a_legacy_fallback_id_is_not_queue_acceptance() -> None:
+    """A legacy row can have an id even though the queue refused the write."""
+    notifier = bootstrap.build_question_notifier()
+    legacy = InboxInsertResult(_Message(99), InboxInsertDisposition.LEGACY_ACCEPTED)
+    with patch(
+        "cli_agent_orchestrator.clients.database.create_inbox_message",
+        return_value=legacy,
+    ):
+        assert (
+            notifier.notify(
+                question=_question(),
+                kind="question",
+                classification="expected",
+                code="",
+                lines=("a",),
+            )
+            is None
+        )
+
+
+def test_notice_retries_reuse_one_stable_queue_idempotency_key() -> None:
+    notifier = bootstrap.build_question_notifier()
+    with patch(
+        "cli_agent_orchestrator.clients.database.create_inbox_message",
+        side_effect=[_accepted(1), _accepted(1)],
+    ) as create:
+        for _ in range(2):
+            assert (
+                notifier.notify(
+                    question=_question(),
+                    kind="question",
+                    classification="expected",
+                    code="",
+                    lines=("a",),
+                )
+                == "1"
+            )
+    keys = [call.kwargs["idempotency_key"] for call in create.call_args_list]
+    assert keys[0] == keys[1] == "gate-question-notice:Q1:question:expected"

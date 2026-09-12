@@ -57,3 +57,4 @@ class LegacyEnqueue:
     barrier_id: int | None = None
     barrier_member_key: str | None = None
     enqueue_generation: int | None = None
+    idempotency_key: str | None = None

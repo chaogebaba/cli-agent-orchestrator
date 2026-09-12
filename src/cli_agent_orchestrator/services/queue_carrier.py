@@ -138,7 +138,7 @@ def queue_owns_new_traffic() -> bool:
         return False
 
 
-def write_through_enqueue(fact: Any) -> tuple[int, str] | None:
+def write_through_enqueue(fact: Any) -> Any:
     """Forward one new message to the queue's write-through (§6).
 
     A pass-through so ``clients/database.py`` reaches the new tree the way every
@@ -148,11 +148,30 @@ def write_through_enqueue(fact: Any) -> tuple[int, str] | None:
     """
     try:
         from cli_agent_orchestrator.app.delivery.wiring import write_through
+        from cli_agent_orchestrator.core.delivery import (
+            WriteThroughDisposition,
+            WriteThroughResult,
+        )
 
-        return write_through(fact)
+        result = write_through(fact)
+        if isinstance(result, WriteThroughResult):
+            return result
+        # Compatibility for a composition root that still returns the old tuple.
+        if result is None:
+            return WriteThroughResult(WriteThroughDisposition.NOT_ATTEMPTED)
+        return WriteThroughResult(
+            WriteThroughDisposition.ACCEPTED,
+            surrogate_id=int(result[0]),
+            msg_id=str(result[1]),
+        )
     except Exception:  # noqa: BLE001 — a write-through may never break a send
         logger.debug("wp_arch write_through unavailable", exc_info=True)
-        return None
+        from cli_agent_orchestrator.core.delivery import (
+            WriteThroughDisposition,
+            WriteThroughResult,
+        )
+
+        return WriteThroughResult(WriteThroughDisposition.REFUSED)
 
 
 def adopt_enqueue(fact: Any) -> str | None:

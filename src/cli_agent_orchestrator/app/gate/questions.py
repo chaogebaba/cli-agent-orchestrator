@@ -63,7 +63,10 @@ from cli_agent_orchestrator.core.gate import (
     validate_ask,
 )
 from cli_agent_orchestrator.core.ports import Clock
-from cli_agent_orchestrator.core.timing import GATE_QUESTION_EXPIRY_S
+from cli_agent_orchestrator.core.timing import (
+    GATE_NOTICE_CLAIM_LEASE_S,
+    GATE_QUESTION_EXPIRY_S,
+)
 
 __all__ = ["GateQuestionService"]
 
@@ -155,10 +158,18 @@ class GateQuestionService:
             answer_schema=answer_schema,
             default_answer=default_answer,
         )
-        if not replayed:
-            # A replay has already been announced; announcing it again would put
-            # a second copy of one question in front of the seat.
-            self._notify(record, kind=EnvelopeKind.QUESTION)
+        if not replayed and self._notifier is not None:
+            # Claim before sending.  The durable lease excludes a concurrent
+            # sweep, while the notifier's stable queue key makes a retry after
+            # send-before-CAS recover the existing row rather than duplicating it.
+            claim_token = self._store.claim_notice(
+                record.question_id,
+                claimant="ask",
+                now=now,
+                lease_s=GATE_NOTICE_CLAIM_LEASE_S,
+            )
+            if claim_token is not None:
+                self._notify(record, kind=EnvelopeKind.QUESTION, claim_token=claim_token)
         return record, replayed
 
     def answer(
@@ -265,9 +276,16 @@ class GateQuestionService:
         failure only bumps the attempt count.  A question that settled in the
         meantime is not in the candidate set at all.
         """
-        retried = self._store.notices_to_retry(limit=limit)
-        for record in retried:
-            self._notify(record, kind=EnvelopeKind.QUESTION)
+        claims = self._store.claim_notices_to_retry(
+            limit=limit,
+            claimant="sweep",
+            now=self._clock.now(),
+            lease_s=GATE_NOTICE_CLAIM_LEASE_S,
+        )
+        retried: list[RoundQuestion] = []
+        for record, claim_token in claims:
+            retried.append(record)
+            self._notify(record, kind=EnvelopeKind.QUESTION, claim_token=claim_token)
         return retried
 
     def sweep(self, now: datetime | None = None) -> tuple[list[RoundQuestion], list[RoundQuestion]]:
@@ -316,7 +334,13 @@ class GateQuestionService:
             )
         )
 
-    def _notify(self, record: RoundQuestion, *, kind: EnvelopeKind) -> None:
+    def _notify(
+        self,
+        record: RoundQuestion,
+        *,
+        kind: EnvelopeKind,
+        claim_token: str | None = None,
+    ) -> None:
         """Render the envelope and hand it to the notifier, AFTER the commit.
 
         Outside the transaction on purpose: a transport that blocks would hold the
@@ -341,12 +365,18 @@ class GateQuestionService:
                 lines=envelope.lines,
             )
         except Exception as exc:  # noqa: BLE001 — a failed notice is a row, never a raise
-            self._store.mark_notice_failed(record.question_id, error=repr(exc))
+            self._store.mark_notice_failed(
+                record.question_id, error=repr(exc), claim_token=claim_token
+            )
             return
         if msg_id is None:
-            self._store.mark_notice_failed(record.question_id, error="notifier returned no id")
+            self._store.mark_notice_failed(
+                record.question_id,
+                error="notifier returned no id",
+                claim_token=claim_token,
+            )
             return
-        self._store.mark_notice_sent(record.question_id, msg_id=msg_id)
+        self._store.mark_notice_sent(record.question_id, msg_id=msg_id, claim_token=claim_token)
 
     def _identity(self, record: RoundQuestion) -> IdentityRef:
         """The envelope's identity line, read from rows rather than passed in.

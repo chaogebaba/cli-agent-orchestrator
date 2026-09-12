@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar, cast
 
 from sqlalchemy import (
@@ -87,6 +88,21 @@ class NoticeInsertOutcome(str, Enum):
     FAILED_BEFORE_COMMIT = "failed_before_commit"
     UNCERTAIN_COMMIT = "uncertain_commit"
     FAILED_AFTER_COMMIT = "failed_after_commit"
+
+
+class InboxInsertDisposition(str, Enum):
+    QUEUE_ACCEPTED = "queue_accepted"
+    QUEUE_REFUSED = "queue_refused"
+    LEGACY_ACCEPTED = "legacy_accepted"
+
+
+@dataclass(frozen=True)
+class InboxInsertResult:
+    """The carrier that accepted a newly created inbox notice."""
+
+    message: InboxMessage
+    disposition: InboxInsertDisposition
+    carrier_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -10241,15 +10257,9 @@ def _queue_write_through(
     barrier_member_key: str | None,
     expire_after_s: int | None,
     supersede_key: str | None,
-) -> tuple[int, str] | None:
-    """Hand one new message to the queue instead of the inbox (§6, WP-ARCH 3b).
-
-    Returns ``(surrogate_id, msg_id)`` at position ``on``, and ``None``
-    everywhere else — ``off`` and ``drain`` write their legacy row exactly as
-    they do today. Never raises: a queue
-    that cannot be written returns ``None`` and the caller falls back to the
-    legacy insert, which degrades to the pre-flip behaviour rather than losing
-    the message.
+    idempotency_key: str | None,
+) -> Any:
+    """Hand one new message to the queue and preserve its typed outcome.
 
     The receiver written to the queue is the MAILBOX id where one exists (§5
     item 2), because queue rows are addressed to the durable mailbox and are not
@@ -10279,11 +10289,15 @@ def _queue_write_through(
                 enqueue_generation=fields.get("enqueue_generation"),
                 expire_after_s=expire_after_s,
                 supersede_key=supersede_key,
+                idempotency_key=idempotency_key,
             )
         )
     except Exception:  # noqa: BLE001 — a write-through may never break a send
         logger.debug("wp_arch_write_through_failed", exc_info=True)
-        return None
+        # Keep this legacy module at its one sanctioned queue hook point.  The
+        # normal bridge returns the typed core result; this exceptional fallback
+        # only needs the same two attributes for carrier classification.
+        return SimpleNamespace(disposition="refused", surrogate_id=None, msg_id=None)
 
 
 def _insert_routed_inbox_row(
@@ -10300,6 +10314,8 @@ def _insert_routed_inbox_row(
     created_at: datetime | None = None,
     expire_after_s: int | None = None,
     supersede_key: str | None = None,
+    idempotency_key: str | None = None,
+    return_outcome: bool = False,
 ) -> Any:
     """The single raw/logical insert choke point for WPQ7 routing.
 
@@ -10413,7 +10429,8 @@ def _insert_routed_inbox_row(
     # is properly bound.  This is OUTSIDE the fail-open handler: a failure here
     # means the caller's session is broken and we must NOT continue to insert.
     if _f475_dedup_hit_id is not None:
-        return db.query(InboxModel).filter(InboxModel.id == _f475_dedup_hit_id).one()
+        row = db.query(InboxModel).filter(InboxModel.id == _f475_dedup_hit_id).one()
+        return (row, InboxInsertDisposition.LEGACY_ACCEPTED, None) if return_outcome else row
 
     fields = _stamp_enqueue_generation(
         db,
@@ -10507,9 +10524,16 @@ def _insert_routed_inbox_row(
         barrier_member_key=barrier_member_key,
         expire_after_s=expire_after_s,
         supersede_key=supersede_key,
+        idempotency_key=idempotency_key,
     )
-    if _wt is not None:
-        surrogate_id, _queue_msg_id = _wt
+    _disposition = getattr(
+        getattr(_wt, "disposition", None), "value", getattr(_wt, "disposition", None)
+    )
+
+    if _disposition == "accepted":
+        surrogate_id = _wt.surrogate_id
+        if surrogate_id is None:
+            raise RuntimeError("queue accepted without a surrogate id")
         row = InboxModel(**fields)
         row.id = surrogate_id
         # The column defaults an INSERT would have applied have to be applied
@@ -10544,7 +10568,7 @@ def _insert_routed_inbox_row(
         # F642's ledger row is deliberately absent: D13 scopes it out, because
         # `delivery_msg`'s own state with its `delivery_attempt` rows is the
         # replacement authority (I5) and writing both would give one id two.
-        return row
+        return (row, InboxInsertDisposition.QUEUE_ACCEPTED, _wt.msg_id) if return_outcome else row
 
     row = InboxModel(**fields)
     db.add(row)
@@ -10573,7 +10597,12 @@ def _insert_routed_inbox_row(
             member.arrived_at = _barrier_now()
         _maybe_fire_completed_barrier(db, barrier)
     # F413: obligation + sentinel + doorbell now handled by the after_insert ORM listener.
-    return row
+    disposition = (
+        InboxInsertDisposition.QUEUE_REFUSED
+        if _disposition == "refused"
+        else InboxInsertDisposition.LEGACY_ACCEPTED
+    )
+    return (row, disposition, None) if return_outcome else row
 
 
 def attach_terminal_dispatch_barrier(
@@ -10967,7 +10996,10 @@ def create_inbox_message(
     park_warm: bool = False,
     expire_after_s: int | None = None,
     supersede_key: str | None = None,
-) -> InboxMessage:
+    *,
+    idempotency_key: str | None = None,
+    return_outcome: bool = False,
+) -> InboxMessage | InboxInsertResult:
     from cli_agent_orchestrator.services.stalled_callback_watchdog import (
         stalled_callback_watchdog,
     )
@@ -10982,6 +11014,8 @@ def create_inbox_message(
             park_warm=park_warm,
             expire_after_s=expire_after_s,
             supersede_key=supersede_key,
+            idempotency_key=idempotency_key,
+            return_outcome=return_outcome,
         )
 
 
@@ -11059,7 +11093,9 @@ def _create_inbox_message_unfenced(
     park_warm: bool = False,
     expire_after_s: int | None = None,
     supersede_key: str | None = None,
-) -> InboxMessage:
+    idempotency_key: str | None = None,
+    return_outcome: bool = False,
+) -> InboxMessage | InboxInsertResult:
     """Create inbox message with status=MessageStatus.PENDING.
 
     F475 dedup is enforced inside _insert_routed_inbox_row (the single choke
@@ -11091,8 +11127,14 @@ def _create_inbox_message_unfenced(
             park_warm=park_warm,
             expire_after_s=expire_after_s,
             supersede_key=supersede_key,
+            idempotency_key=idempotency_key,
+            return_outcome=return_outcome,
         )
         db.commit()
+        disposition = InboxInsertDisposition.LEGACY_ACCEPTED
+        carrier_id: str | None = None
+        if return_outcome:
+            inbox_msg, disposition, carrier_id = inbox_msg
         _refresh_if_persistent(db, inbox_msg)
         result = _inbox_message_from_row(inbox_msg)
         if result.barrier_id is not None and result.barrier_member_key is not None:
@@ -11104,7 +11146,7 @@ def _create_inbox_message_unfenced(
                 sender_id,
                 logical_receiver_id or receiver_cache,
             )
-        return result
+        return InboxInsertResult(result, disposition, carrier_id) if return_outcome else result
 
 
 def insert_watchdog_auto_resume_message(terminal_id: str, message: str) -> WatchdogInsertResult:

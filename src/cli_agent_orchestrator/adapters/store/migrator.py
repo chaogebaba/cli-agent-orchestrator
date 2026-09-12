@@ -492,7 +492,9 @@ CREATE TABLE IF NOT EXISTS question_notice_intent (
   msg_id      TEXT,
   attempts    INTEGER NOT NULL DEFAULT 0,
   last_error  TEXT,
-  settled_at  TEXT)
+  settled_at  TEXT,
+  claim_token TEXT NOT NULL DEFAULT '',
+  claim_until TEXT NOT NULL DEFAULT '')
 """
 
 # Append-only; one row per ACCEPTED claim (DESIGN r2 non-blocking 1).  Identical
@@ -537,6 +539,10 @@ ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # that asked a question came back DISPATCHED — a state it had never been in
     # — because the release paths hardcoded a value.
     ("round_question", "dispatch_prior_state", "TEXT NOT NULL DEFAULT ''"),
+    # B2 r2: one durable claim excludes concurrent sweeps; the stable queue key
+    # covers a worker crash after enqueue and before the CAS settlement.
+    ("question_notice_intent", "claim_token", "TEXT NOT NULL DEFAULT ''"),
+    ("question_notice_intent", "claim_until", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Ordered migration steps AFTER the finding table.  A tuple of (name, statements)

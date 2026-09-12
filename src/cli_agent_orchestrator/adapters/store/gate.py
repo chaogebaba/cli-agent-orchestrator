@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from cli_agent_orchestrator.adapters.store.connection import (
     SqliteConnectionSource,
@@ -930,45 +930,146 @@ class SqliteGateStore:
         ]
 
     def notices_to_retry(self, *, limit: int = 50) -> list[RoundQuestion]:
-        """Open questions whose notice intent has not landed yet.
-
-        A read with no transaction, ordered by attempt count so a notice that has
-        failed repeatedly does not starve one that has never been tried.  Settled
-        questions are excluded by the join condition: re-announcing a question
-        that has since been answered would be worse than never announcing it.
-        """
+        """Read retry candidates, excluding an active durable claim."""
+        now = render_timestamp(self._clock.now())
         rows = self._pool.connection().execute(
             _QUESTION_COLUMNS_QUALIFIED + " FROM round_question q"
             " JOIN question_notice_intent i ON i.question_id = q.question_id"
-            " WHERE i.state IN ('PENDING','FAILED') AND q.state IN ('PENDING','ESCALATED')"
+            " WHERE i.state IN ('PENDING','FAILED')"
+            " AND (i.claim_token = '' OR i.claim_until <= ?)"
+            " AND q.state IN ('PENDING','ESCALATED')"
             " ORDER BY i.attempts, q.question_id LIMIT ?",
-            (int(limit),),
+            (now, int(limit)),
         )
         return [_row_to_question(r) for r in rows]
 
-    def mark_notice_sent(self, question_id: str, *, msg_id: str) -> None:
+    def claim_notice(
+        self,
+        question_id: str,
+        *,
+        claimant: str,
+        now: datetime,
+        lease_s: int,
+    ) -> str | None:
+        """Claim one notice with a durable lease and compare-and-set token."""
+        token = f"{claimant}:{new_ulid()}"
+        until = render_timestamp(now + timedelta(seconds=int(lease_s)))
         conn = self._pool.connection()
         with immediate_transaction(conn):
-            conn.execute(
-                "UPDATE question_notice_intent SET state = ?, msg_id = ?, "
-                "attempts = attempts + 1, last_error = NULL, settled_at = ? "
-                "WHERE question_id = ?",
-                (
-                    NoticeIntentState.SENT.value,
-                    msg_id,
-                    render_timestamp(self._clock.now()),
-                    question_id,
-                ),
-            )
+            changed = conn.execute(
+                "UPDATE question_notice_intent SET claim_token = ?, claim_until = ?, "
+                "attempts = attempts + 1 WHERE question_id = ? "
+                "AND state IN ('PENDING','FAILED') "
+                "AND (claim_token = '' OR claim_until <= ?) "
+                "AND EXISTS (SELECT 1 FROM round_question q WHERE "
+                "q.question_id = question_notice_intent.question_id "
+                "AND q.state IN ('PENDING','ESCALATED'))",
+                (token, until, question_id, render_timestamp(now)),
+            ).rowcount
+        return token if changed == 1 else None
 
-    def mark_notice_failed(self, question_id: str, *, error: str) -> None:
+    def claim_notices_to_retry(
+        self,
+        *,
+        limit: int,
+        claimant: str,
+        now: datetime,
+        lease_s: int,
+    ) -> list[tuple[RoundQuestion, str]]:
+        """Claim retry candidates atomically so concurrent sweeps cannot duplicate."""
+        stamp = render_timestamp(now)
+        until = render_timestamp(now + timedelta(seconds=int(lease_s)))
+        conn = self._pool.connection()
+        claimed: list[tuple[str, str]] = []
+        with immediate_transaction(conn):
+            rows = conn.execute(
+                "SELECT i.question_id FROM question_notice_intent i "
+                "JOIN round_question q ON q.question_id = i.question_id "
+                "WHERE i.state IN ('PENDING','FAILED') "
+                "AND (i.claim_token = '' OR i.claim_until <= ?) "
+                "AND q.state IN ('PENDING','ESCALATED') "
+                "ORDER BY i.attempts, i.question_id LIMIT ?",
+                (stamp, int(limit)),
+            ).fetchall()
+            for row in rows:
+                token = f"{claimant}:{new_ulid()}"
+                changed = conn.execute(
+                    "UPDATE question_notice_intent SET claim_token = ?, claim_until = ?, "
+                    "attempts = attempts + 1 WHERE question_id = ? "
+                    "AND state IN ('PENDING','FAILED') "
+                    "AND (claim_token = '' OR claim_until <= ?)",
+                    (token, until, row["question_id"], stamp),
+                ).rowcount
+                if changed == 1:
+                    claimed.append((str(row["question_id"]), token))
+            if not claimed:
+                return []
+            placeholders = ", ".join("?" for _ in claimed)
+            question_rows = conn.execute(
+                _QUESTION_COLUMNS_QUALIFIED + " FROM round_question q "
+                "WHERE q.question_id IN (" + placeholders + ")",
+                tuple(question_id for question_id, _token in claimed),
+            ).fetchall()
+            by_id = {str(row["question_id"]): _row_to_question(row) for row in question_rows}
+            return [
+                (by_id[question_id], token)
+                for question_id, token in claimed
+                if question_id in by_id
+            ]
+
+    def mark_notice_sent(
+        self, question_id: str, *, msg_id: str, claim_token: str | None = None
+    ) -> bool:
         conn = self._pool.connection()
         with immediate_transaction(conn):
-            conn.execute(
-                "UPDATE question_notice_intent SET state = ?, attempts = attempts + 1, "
-                "last_error = ? WHERE question_id = ?",
-                (NoticeIntentState.FAILED.value, error[:500], question_id),
-            )
+            if claim_token is None:
+                changed = conn.execute(
+                    "UPDATE question_notice_intent SET state = ?, msg_id = ?, "
+                    "attempts = attempts + 1, last_error = NULL, claim_token = '', "
+                    "claim_until = '', settled_at = ? "
+                    "WHERE question_id = ?",
+                    (
+                        NoticeIntentState.SENT.value,
+                        msg_id,
+                        render_timestamp(self._clock.now()),
+                        question_id,
+                    ),
+                ).rowcount
+            else:
+                changed = conn.execute(
+                    "UPDATE question_notice_intent SET state = ?, msg_id = ?, "
+                    "last_error = NULL, claim_token = '', claim_until = '', settled_at = ? "
+                    "WHERE question_id = ? AND claim_token = ?",
+                    (
+                        NoticeIntentState.SENT.value,
+                        msg_id,
+                        render_timestamp(self._clock.now()),
+                        question_id,
+                        claim_token,
+                    ),
+                ).rowcount
+        return changed == 1
+
+    def mark_notice_failed(
+        self, question_id: str, *, error: str, claim_token: str | None = None
+    ) -> bool:
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            if claim_token is None:
+                changed = conn.execute(
+                    "UPDATE question_notice_intent SET state = ?, attempts = attempts + 1, "
+                    "last_error = ?, claim_token = '', claim_until = '' "
+                    "WHERE question_id = ?",
+                    (NoticeIntentState.FAILED.value, error[:500], question_id),
+                ).rowcount
+            else:
+                changed = conn.execute(
+                    "UPDATE question_notice_intent SET state = ?, last_error = ?, "
+                    "claim_token = '', claim_until = '' WHERE question_id = ? "
+                    "AND claim_token = ?",
+                    (NoticeIntentState.FAILED.value, error[:500], question_id, claim_token),
+                ).rowcount
+        return changed == 1
 
     def mark_answer_consumed(self, answer_event_id: str, *, now: datetime) -> None:
         """Record the RECEIPT and release the dispatch (R28).

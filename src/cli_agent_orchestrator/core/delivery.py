@@ -43,6 +43,8 @@ __all__ = [
     "DeadRow",
     "DeliveryAttempt",
     "EnqueueDraft",
+    "WriteThroughDisposition",
+    "WriteThroughResult",
     "GuardOutcome",
     "InjectionResult",
     "LegacyAdoption",
@@ -1019,6 +1021,23 @@ class EnqueueDraft(BaseModel):
     cancel_on_complete: bool = False
     is_notice: bool = False
     legacy_message_id: int | None = None
+
+
+class WriteThroughDisposition(StrEnum):
+    """What happened when a legacy send crossed the queue seam."""
+
+    NOT_ATTEMPTED = "not_attempted"
+    ACCEPTED = "accepted"
+    REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class WriteThroughResult:
+    """Typed result of the legacy-to-queue write-through."""
+
+    disposition: WriteThroughDisposition
+    surrogate_id: int | None = None
+    msg_id: str | None = None
 
 
 class QueueMessage(BaseModel):

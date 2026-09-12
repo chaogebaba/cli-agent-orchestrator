@@ -42,6 +42,8 @@ from cli_agent_orchestrator.core.delivery import (
     MsgKind,
     QueueMode,
     SwitchPosition,
+    WriteThroughDisposition,
+    WriteThroughResult,
 )
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
 from cli_agent_orchestrator.core.timing import DELIVERY_DEDUP_WINDOW_S
@@ -148,12 +150,12 @@ def queue_owns_new_traffic() -> bool:
     return queue_position() is SwitchPosition.ON
 
 
-def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
+def write_through(fact: LegacyEnqueue) -> WriteThroughResult:
     """Enqueue new traffic into the QUEUE instead of the legacy inbox (§6).
 
-    Returns ``(surrogate_id, msg_id)``, or ``None`` when the queue does not own
-    new traffic — in which case the caller writes its legacy row exactly as it
-    does today.
+    Returns a typed result. ``NOT_ATTEMPTED`` means the queue is not the active
+    carrier; ``REFUSED`` means it was active but the write failed and the caller
+    fell back to the legacy row.
 
     This is the flip §6 describes: "the legacy inbox goes read-only: it stops
     accepting inserts, existing rows drain through the old path, and new rows go
@@ -176,7 +178,7 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
     """
     runtime = _runtime
     if runtime is None or runtime.position is not SwitchPosition.ON:
-        return None
+        return WriteThroughResult(WriteThroughDisposition.NOT_ATTEMPTED)
     try:
         now = runtime.clock.now()
         duplicate = runtime.store.find_recent_duplicate(
@@ -196,7 +198,7 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
         surrogate = runtime.store.next_surrogate_id()
         message = runtime.store.enqueue(
             EnqueueDraft(
-                idempotency_key=f"live-inbox:{surrogate}",
+                idempotency_key=fact.idempotency_key or f"live-inbox:{surrogate}",
                 receiver_id=fact.receiver_id,
                 sender_id=fact.sender_id,
                 kind=MsgKind.CALLBACK if fact.is_callback else MsgKind.NOTE,
@@ -212,13 +214,17 @@ def write_through(fact: LegacyEnqueue) -> tuple[int, str] | None:
                 legacy_message_id=surrogate,
             )
         )
-        return surrogate, message.msg_id
+        return WriteThroughResult(
+            WriteThroughDisposition.ACCEPTED,
+            surrogate_id=surrogate,
+            msg_id=message.msg_id,
+        )
     except Exception:  # noqa: BLE001 — a queue write may never break a send
         logger.warning(
             "delivery write-through failed; the caller falls back to the legacy insert",
             exc_info=True,
         )
-        return None
+        return WriteThroughResult(WriteThroughDisposition.REFUSED)
 
 
 def adopt_legacy_row(fact: LegacyEnqueue) -> str | None:

@@ -42,6 +42,7 @@ __all__ = [
     "GATE_QUESTION_EXPIRY_S",
     "GATE_QUESTION_SWEEP_S",
     "GATE_QUESTION_WAIT_CAP_S",
+    "GATE_NOTICE_CLAIM_LEASE_S",
     "IDLE_STALL_AGE_S",
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
@@ -278,6 +279,10 @@ GATE_QUESTION_SWEEP_S = 30
 #: A longer wait is many of these in a row, each a fresh request holding nothing
 #: open between them.
 GATE_QUESTION_WAIT_CAP_S = 25
+
+# A send is excluded from concurrent sweeps for one bounded lease.  The queue
+# idempotency key makes a lease-expiry retry safe across the bookkeeping window.
+GATE_NOTICE_CLAIM_LEASE_S = 60
 
 #: The legacy stalled-notice age, MIRRORED here rather than imported.
 #:
