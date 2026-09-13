@@ -115,9 +115,15 @@ class WorkspaceTools:
         return None
 
     def _scope_gate(
-        self, tool: str, subject: str, scopes: tuple[str, ...], need: str
+        self,
+        tool: str,
+        subject: str,
+        scopes: tuple[str, ...] | None,
+        need: str,
     ) -> ToolOutcome | None:
-        if scopes and need not in scopes:
+        # ``None`` is reserved for trusted in-process callers.  HTTP wrappers
+        # always pass the authenticated token's tuple, including an empty one.
+        if scopes is not None and need not in scopes:
             self.audit.refusal(tool=tool, subject=subject, code=INSUFFICIENT_SCOPE)
             return _fail(INSUFFICIENT_SCOPE, f"This operation requires the '{need}' scope.")
         return None
@@ -134,7 +140,7 @@ class WorkspaceTools:
 
     # ---- tools ------------------------------------------------------------
 
-    def workspace_info(self, scopes: tuple[str, ...] = ()) -> ToolOutcome:
+    def workspace_info(self, scopes: tuple[str, ...] | None = None) -> ToolOutcome:
         """N4 (r4): summary only — workspace alias, reviewed commit and the
         manifest's entry count and byte total.  No directory listing."""
         subject = "workspace:/"
@@ -184,7 +190,7 @@ class WorkspaceTools:
         depth: int = 1,
         limit: int = 200,
         offset: int = 0,
-        scopes: tuple[str, ...] = (),
+        scopes: tuple[str, ...] | None = None,
     ) -> ToolOutcome:
         subject = path
         denied = self._scope_gate("workspace_list_directory", subject, scopes, "workspace.read")
@@ -210,7 +216,7 @@ class WorkspaceTools:
         *,
         start_line: int | None = None,
         end_line: int | None = None,
-        scopes: tuple[str, ...] = (),
+        scopes: tuple[str, ...] | None = None,
     ) -> ToolOutcome:
         subject = path
         denied = self._scope_gate("workspace_read_file", subject, scopes, "workspace.read")
@@ -244,7 +250,7 @@ class WorkspaceTools:
         glob: str | None = None,
         limit: int = 50,
         regex: bool = False,
-        scopes: tuple[str, ...] = (),
+        scopes: tuple[str, ...] | None = None,
     ) -> ToolOutcome:
         subject = query
         denied = self._scope_gate("workspace_search", subject, scopes, "workspace.search")
@@ -266,7 +272,7 @@ class WorkspaceTools:
             return _fail(refused, "The attempt's aggregate pull budget is exhausted.")
         return self._record("workspace_search", subject, data)
 
-    def workspace_git_status(self, scopes: tuple[str, ...] = ()) -> ToolOutcome:
+    def workspace_git_status(self, scopes: tuple[str, ...] | None = None) -> ToolOutcome:
         """N4 (r4): status runs with the manifest as its pathspec against the
         frozen worktree (clean by construction; a non-empty status is itself a
         build-stop signal)."""
@@ -293,7 +299,7 @@ class WorkspaceTools:
         path: str | None = None,
         offset: int = 0,
         max_bytes: int = 65536,
-        scopes: tuple[str, ...] = (),
+        scopes: tuple[str, ...] | None = None,
     ) -> ToolOutcome:
         """N4 (r4): the diff covers only manifest paths between the base commit
         and the reviewed commit named in the manifest."""

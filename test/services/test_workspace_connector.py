@@ -187,3 +187,100 @@ def test_manifest_binding_and_aggregate_budget(
     assert not first.is_error
     second = server.tools.workspace_read_file("allowed.txt")
     assert second.is_error and second.error == "PULL_BUDGET_EXHAUSTED"
+
+
+TOOL_SCOPE_CASES = (
+    ("workspace_info", {}, "workspace.read"),
+    ("workspace_list_directory", {"path": "."}, "workspace.read"),
+    ("workspace_read_file", {"path": "allowed.txt"}, "workspace.read"),
+    ("workspace_search", {"query": "canary"}, "workspace.search"),
+    ("workspace_git_status", {}, "git.read"),
+    ("workspace_git_diff", {}, "git.read"),
+)
+
+
+def _call_tool(
+    client: TestClient,
+    token: str,
+    name: str,
+    arguments: dict[str, object],
+    request_id: int,
+) -> dict[str, object]:
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+@pytest.mark.parametrize(("tool_name", "arguments", "required_scope"), TOOL_SCOPE_CASES)
+def test_http_tool_scope_matrix(
+    workspace: Path,
+    tool_name: str,
+    arguments: dict[str, object],
+    required_scope: str,
+) -> None:
+    """Every external wrapper propagates scopes: absent/wrong deny, exact scope permits."""
+    server = bind_attempt(
+        attempt_id=f"scope-{tool_name}",
+        frozen_worktree=workspace,
+        manifest=["allowed.txt"],
+        state_dir=workspace / f".{tool_name}-state",
+    )
+    no_scope = server.store.issue_tokens(client_id="none", scopes=[])["access_token"]
+    wrong_scope_name = {
+        "workspace.read": "workspace.search",
+        "workspace.search": "git.read",
+        "git.read": "workspace.read",
+    }[required_scope]
+    wrong_scope = server.store.issue_tokens(client_id="wrong", scopes=[wrong_scope_name])[
+        "access_token"
+    ]
+    right_scope = server.store.issue_tokens(client_id="right", scopes=[required_scope])[
+        "access_token"
+    ]
+
+    with TestClient(build_connector_app(server)) as client:
+        missing = _call_tool(client, no_scope, tool_name, arguments, 100)
+        wrong = _call_tool(client, wrong_scope, tool_name, arguments, 101)
+        allowed = _call_tool(client, right_scope, tool_name, arguments, 102)
+
+    assert missing["result"]["isError"] is True
+    assert required_scope in str(missing)
+    assert wrong["result"]["isError"] is True
+    assert required_scope in str(wrong)
+    assert allowed["result"]["isError"] is False
+
+
+def test_http_cross_attempt_token_is_rejected(workspace: Path) -> None:
+    server = bind_attempt(
+        attempt_id="expected-attempt",
+        frozen_worktree=workspace,
+        manifest=["allowed.txt"],
+        state_dir=workspace / ".cross-attempt-state",
+    )
+    token = server.store.issue_tokens(
+        client_id="other",
+        scopes=["workspace.read"],
+        attempt_id="other-attempt",
+    )["access_token"]
+    with TestClient(build_connector_app(server)) as client:
+        response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "workspace_info", "arguments": {}},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 403
+    assert response.json()["error"] == "PATH_NOT_IN_MANIFEST"
