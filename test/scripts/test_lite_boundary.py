@@ -93,6 +93,9 @@ def test_slice1_unresolved_source_debt_cannot_grow(current_findings):
         "from pathlib import Path; Path('policy-renamed.md').read_text(); purpose='compliance auditor'",
         "scheduler.start_compliance_auditor()",
         "from pathlib import Path; Path('BUGS.md').write_text('new audit state')",
+        "from builtins import open as consume; consume('BUGS.md')",
+        "scheduler.schedule('self-audit', periodic=True)",
+        "hooks.register('SessionStart', command='self-audit-gen.sh')",
     ],
 )
 def test_named_source_mutants_turn_boundary_red(source):

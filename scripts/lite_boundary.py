@@ -114,6 +114,31 @@ def _value(node: ast.AST, values: dict[str, str]) -> str:
 
 def scan_python(source: str, location: str) -> list[Finding]:
     tree = ast.parse(source, filename=location)
+    io_aliases = {
+        alias.asname: alias.name
+        for imported in ast.walk(tree)
+        if isinstance(imported, ast.ImportFrom)
+        for alias in imported.names
+        if alias.asname and alias.name in _IO
+    }
+    activation_calls = {
+        "register_hook",
+        "add_hook",
+        "create_task",
+        "schedule",
+        "dispatch",
+        "assign",
+        "invoke",
+        "add_job",
+        "create_timer",
+        "call_later",
+        "register",
+    }
+
+    def io_call(node: ast.Call) -> str:
+        name = _name(node.func).split(".")[-1]
+        return io_aliases.get(name, name)
+
     # Remove docstrings before traversing: historical citations are not I/O.
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -154,6 +179,10 @@ def scan_python(source: str, location: str) -> list[Finding]:
             call_name = _name(node.func)
             if re.search(r"self_?audit|compliance_auditor", call_name, re.IGNORECASE):
                 findings.add(Finding("source", location, "audit-activation", call_name))
+            if call_name.split(".")[-1] in activation_calls and any(
+                knowledge_domain(_value(arg, values)) for arg in ast.walk(node)
+            ):
+                findings.add(Finding("source", location, "audit-activation", call_name))
     scopes = [("<module>", tree.body)] + [
         (node.name, node.body)
         for node in ast.walk(tree)
@@ -169,11 +198,7 @@ def scan_python(source: str, location: str) -> list[Finding]:
         ]
         nodes = [node for root in roots for node in ast.walk(root)]
         calls = sorted(
-            {
-                _name(node.func).split(".")[-1]
-                for node in nodes
-                if isinstance(node, ast.Call) and _name(node.func).split(".")[-1] in _IO
-            }
+            {io_call(node) for node in nodes if isinstance(node, ast.Call) and io_call(node) in _IO}
         )
         domain = sorted(
             {_value(node, values) for node in nodes if knowledge_domain(_value(node, values))}
