@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import multiprocessing
+import os
 import secrets
+import shutil
+import socket
+import subprocess
+import time
 from pathlib import Path
+from test.fixtures.workspace_connector_loopback import CLIENT_SCRIPT, redacted_cases, run_listener
 
 import pytest
 from starlette.testclient import TestClient
@@ -284,3 +292,145 @@ def test_http_cross_attempt_token_is_rejected(workspace: Path) -> None:
         )
     assert response.status_code == 403
     assert response.json()["error"] == "PATH_NOT_IN_MANIFEST"
+
+
+def test_real_loopback_privilege_separated_bearer_guard(workspace: Path) -> None:
+    """D9: a different OS UID reaches real HTTP but cannot bypass the first guard."""
+    if os.name != "posix" or shutil.which("sudo") is None:
+        pytest.skip("requires POSIX and sudo -n permission to run the client as nobody")
+    client_command = ["sudo", "-n", "-u", "nobody", "/usr/bin/python3", "-I", "-c"]
+    privilege_probe = subprocess.run(
+        [*client_command, "import os; print(os.geteuid())"],
+        cwd="/",
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if privilege_probe.returncode:
+        pytest.skip("requires sudo -n permission to run the client as nobody")
+    assert int(privilege_probe.stdout) != os.geteuid()
+    server = bind_attempt(
+        attempt_id="external-attempt",
+        frozen_worktree=workspace,
+        manifest=["allowed.txt"],
+        state_dir=workspace / ".external-state",
+    )
+    tokens = {
+        "read": server.store.issue_tokens(client_id="read", scopes=["workspace.read"])[
+            "access_token"
+        ],
+        "empty": server.store.issue_tokens(client_id="empty", scopes=[])["access_token"],
+        "search": server.store.issue_tokens(client_id="search", scopes=["workspace.search"])[
+            "access_token"
+        ],
+        "attempt": server.store.issue_tokens(
+            client_id="attempt", scopes=["workspace.read"], attempt_id="another-attempt"
+        )["access_token"],
+        "manifest": server.store.issue_tokens(
+            client_id="manifest", scopes=["workspace.read"], manifest_digest="sha256:wrong"
+        )["access_token"],
+    }
+    context = multiprocessing.get_context("fork")
+    audit_reader, audit_writer = context.Pipe(duplex=False)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    host, port = listener.getsockname()
+    assert host == "127.0.0.1"
+    stop = context.Event()
+    process = context.Process(target=run_listener, args=(server, listener, stop, audit_writer))
+    process.start()
+    listener.close()
+    audit_writer.close()
+    try:
+        import urllib.error
+        import urllib.request
+
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                urllib.request.urlopen(f"http://{host}:{port}/mcp", timeout=0.5)
+            except urllib.error.HTTPError as response:
+                assert response.code == 401
+                break
+            except (OSError, TimeoutError):
+                assert process.is_alive(), "loopback listener exited before becoming ready"
+                assert time.monotonic() < deadline, "loopback listener did not become ready"
+                time.sleep(0.05)
+        external = subprocess.run(
+            [*client_command, CLIENT_SCRIPT],
+            input=json.dumps(
+                {
+                    "url": f"http://{host}:{port}/mcp/",
+                    "source_path": str(workspace / "allowed.txt"),
+                    "canary": "canary",
+                    "cases": redacted_cases(tokens),
+                }
+            ),
+            cwd="/",
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if external.returncode:
+            print("B2_LOOPBACK_CLIENT_FAILURE=" + external.stdout.strip())
+        assert external.returncode == 0, "privilege-separated client failed"
+        evidence = json.loads(external.stdout)
+        print("B2_LOOPBACK_EXTERNAL=" + json.dumps(evidence, sort_keys=True))
+        assert evidence["uid"] != os.geteuid()
+        assert evidence["source_readable"] is False
+        results = {row["name"]: row for row in evidence["results"]}
+        for name in ("unauthenticated", "unauthenticated-malformed", "invalid-token"):
+            assert results[name]["status"] == 401
+            assert results[name]["challenge"] is True
+            assert results[name]["canary"] is False
+        for name in ("empty-scope", "wrong-scope"):
+            assert results[name]["status"] == 200
+            assert results[name]["is_error"] is True
+            assert results[name]["scope_refusal"] is True
+            assert results[name]["canary"] is False
+        for name in ("wrong-attempt", "wrong-manifest"):
+            assert results[name]["status"] == 403
+            assert results[name]["error"] == PATH_NOT_IN_MANIFEST
+            assert results[name]["canary"] is False
+        assert results["unlisted-path"]["is_error"] is True
+        assert results["unlisted-path"]["canary"] is False
+        for index in range(5):
+            assert results[f"read-{index}"]["status"] == 200
+            assert results[f"read-{index}"]["is_error"] is False
+            assert results[f"read-{index}"]["canary"] is True
+    finally:
+        stop.set()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+    assert audit_reader.poll(5), "listener did not return its redacted audit projection"
+    projection = audit_reader.recv()
+    audit_reader.close()
+    assert len(projection) == 8
+    assert sum(row["result_digest"] is not None for row in projection) == 5
+    assert sum(row["refusal_code"] == "INSUFFICIENT_SCOPE" for row in projection) == 2
+    assert sum(row["refusal_code"] == PATH_NOT_IN_MANIFEST for row in projection) == 1
+    print(
+        "B2_LOOPBACK_AUDIT="
+        + json.dumps(
+            {
+                "attempt_ids": sorted({row["attempt_id"] for row in projection}),
+                "digests": sum(row["result_digest"] is not None for row in projection),
+                "insufficient_scope": sum(
+                    row["refusal_code"] == "INSUFFICIENT_SCOPE" for row in projection
+                ),
+                "path_not_in_manifest": sum(
+                    row["refusal_code"] == PATH_NOT_IN_MANIFEST for row in projection
+                ),
+                "rows": len(projection),
+            },
+            sort_keys=True,
+        )
+    )
+    serialized = json.dumps(projection)
+    assert "canary" not in serialized and "SECRET" not in serialized
+    assert all(token not in serialized for token in tokens.values())
+    assert all(row["attempt_id"] == "external-attempt" for row in projection)
